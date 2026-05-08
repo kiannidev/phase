@@ -8623,6 +8623,74 @@ mod tests {
     }
 
     #[test]
+    fn trigger_attack_if_cast_spell_with_mana_value_this_turn() {
+        let def = parse_trigger_line(
+            "Whenever this creature attacks, if you've cast a spell with mana value 4 or greater this turn, draw a card.",
+            "Rhino, Barreling Brute",
+        );
+        assert_eq!(def.mode, TriggerMode::Attacks);
+        assert_eq!(
+            def.condition,
+            Some(TriggerCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::SpellsCastThisTurn {
+                        scope: crate::types::ability::CountScope::Controller,
+                        filter: Some(TargetFilter::Typed(TypedFilter::card().properties(vec![
+                            FilterProp::Cmc {
+                                comparator: Comparator::GE,
+                                value: QuantityExpr::Fixed { value: 4 },
+                            }
+                        ]))),
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            })
+        );
+    }
+
+    #[test]
+    fn trigger_end_step_if_cast_both_creature_and_noncreature_this_turn() {
+        let def = parse_trigger_line(
+            "At the beginning of each end step, if you've cast both a creature spell and a noncreature spell this turn, create a Clue token.",
+            "Fae Offering",
+        );
+        assert_eq!(def.mode, TriggerMode::Phase);
+        match def.condition {
+            Some(TriggerCondition::And { conditions }) => {
+                assert_eq!(conditions.len(), 2);
+                assert!(conditions.iter().any(|condition| matches!(
+                    condition,
+                    TriggerCondition::QuantityComparison {
+                        lhs: QuantityExpr::Ref {
+                            qty: QuantityRef::SpellsCastThisTurn {
+                                scope: crate::types::ability::CountScope::Controller,
+                                filter: Some(TargetFilter::Typed(TypedFilter { type_filters, .. })),
+                            },
+                        },
+                        comparator: Comparator::GE,
+                        rhs: QuantityExpr::Fixed { value: 1 },
+                    } if type_filters == &vec![TypeFilter::Creature]
+                )));
+                assert!(conditions.iter().any(|condition| matches!(
+                    condition,
+                    TriggerCondition::QuantityComparison {
+                        lhs: QuantityExpr::Ref {
+                            qty: QuantityRef::SpellsCastThisTurn {
+                                scope: crate::types::ability::CountScope::Controller,
+                                filter: Some(TargetFilter::Typed(TypedFilter { type_filters, .. })),
+                            },
+                        },
+                        comparator: Comparator::GE,
+                        rhs: QuantityExpr::Fixed { value: 1 },
+                    } if type_filters == &vec![TypeFilter::Non(Box::new(TypeFilter::Creature))]
+                )));
+            }
+            other => panic!("expected compound trigger condition, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn trigger_opponent_draws_a_card() {
         let def = parse_trigger_line(
             "Whenever an opponent draws a card, you gain 1 life.",

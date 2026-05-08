@@ -1504,6 +1504,7 @@ fn detect_duration_this_turn(
         // forward-looking effect duration.
         "SolveConditionMet",
         "YouCastSpellThisTurn",
+        "YouCastSpellCountAtLeast",
         "YouCastNoncreatureSpellThisTurn",
         "YouGainedLifeThisTurn",
         "YouDiscardedCardThisTurn",
@@ -1516,6 +1517,7 @@ fn detect_duration_this_turn(
         "SourceEnteredThisTurn",
         "OpponentSearchedLibraryThisTurn",
         "CastSpellThisTurn",
+        "SpellsCastThisTurn",
         "AttackedThisTurn",
         "CounterAddedThisTurn",
         "NthSpellThisTurn",
@@ -1896,6 +1898,30 @@ mod tests {
         );
 
         assert!(!has_swallowed_detector(&parsed, "Duration_ThisTurn"));
+    }
+
+    #[test]
+    fn duration_this_turn_accepts_cast_restriction_turn_history_condition() {
+        let parsed = parse_named(
+            "Cast this spell only if you've cast another spell this turn.\nFlying",
+            "Illusory Angel",
+            &["Creature"],
+        );
+
+        assert!(!has_swallowed_detector(&parsed, "Duration_ThisTurn"));
+    }
+
+    #[test]
+    fn duration_this_turn_accepts_intervening_spell_history_condition() {
+        let parsed = parse_named(
+            "Vigilance, trample, haste\n\
+             Whenever Rhino attacks, if you've cast a spell with mana value 4 or greater this turn, draw a card.",
+            "Rhino, Barreling Brute",
+            &["Creature"],
+        );
+
+        assert!(!has_swallowed_detector(&parsed, "Duration_ThisTurn"));
+        assert!(!has_swallowed_detector(&parsed, "Condition_If"));
     }
 
     #[test]

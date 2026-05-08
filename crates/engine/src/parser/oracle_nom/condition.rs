@@ -1408,6 +1408,7 @@ fn parse_event_state_conditions(input: &str) -> OracleResult<'_, StaticCondition
         // "no creatures are on the battlefield"
         parse_no_on_battlefield,
     ))
+    .or(parse_you_cast_both_spell_kinds_this_turn)
     .or(parse_you_created_token_this_turn)
     .or(parse_you_discarded_card_this_turn)
     .or(parse_you_sacrificed_this_turn)
@@ -1862,8 +1863,8 @@ fn parse_cast_one_spell_this_turn(input: &str) -> OracleResult<'_, StaticConditi
 fn parse_one_spell_this_turn_after_cast(input: &str) -> OracleResult<'_, StaticCondition> {
     let rest = input;
     let (rest, _) = parse_article(rest)?;
-    let (rest, type_text) = take_until(" spell this turn").parse(rest)?;
-    let (rest, _) = tag(" spell this turn").parse(rest)?;
+    let (rest, type_text) = take_until(" this turn").parse(rest)?;
+    let (rest, _) = tag(" this turn").parse(rest)?;
     let Some(filter) = parse_spell_history_filter(type_text) else {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -1879,6 +1880,47 @@ fn parse_one_spell_this_turn_after_cast(input: &str) -> OracleResult<'_, StaticC
             },
             1,
         ),
+    ))
+}
+
+fn parse_you_cast_both_spell_kinds_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = alt((tag("you've cast both "), tag("you cast both "))).parse(input)?;
+    let (rest, first_text) = take_until(" and ").parse(rest)?;
+    let (rest, _) = tag(" and ").parse(rest)?;
+    let (rest, second_text) = take_until(" this turn").parse(rest)?;
+    let (rest, _) = tag(" this turn").parse(rest)?;
+    let Some(first_filter) = parse_spell_history_filter_with_optional_article(first_text) else {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    };
+    let Some(second_filter) = parse_spell_history_filter_with_optional_article(second_text) else {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    };
+    Ok((
+        rest,
+        StaticCondition::And {
+            conditions: vec![
+                make_quantity_ge(
+                    QuantityRef::SpellsCastThisTurn {
+                        scope: CountScope::Controller,
+                        filter: Some(first_filter),
+                    },
+                    1,
+                ),
+                make_quantity_ge(
+                    QuantityRef::SpellsCastThisTurn {
+                        scope: CountScope::Controller,
+                        filter: Some(second_filter),
+                    },
+                    1,
+                ),
+            ],
+        },
     ))
 }
 
@@ -2090,8 +2132,8 @@ fn parse_another_spell_this_turn(input: &str, minimum: u32) -> OracleResult<'_, 
             ),
         ));
     }
-    let (rest, type_text) = take_until(" spell this turn").parse(input)?;
-    let (rest, _) = tag(" spell this turn").parse(rest)?;
+    let (rest, type_text) = take_until(" this turn").parse(input)?;
+    let (rest, _) = tag(" this turn").parse(rest)?;
     let Some(filter) = parse_spell_history_filter(type_text) else {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -2108,6 +2150,14 @@ fn parse_another_spell_this_turn(input: &str, minimum: u32) -> OracleResult<'_, 
             minimum,
         ),
     ))
+}
+
+fn parse_spell_history_filter_with_optional_article(type_text: &str) -> Option<TargetFilter> {
+    let trimmed = type_text.trim();
+    let filter_text = parse_article(trimmed)
+        .ok()
+        .map_or(trimmed, |(rest, _)| rest.trim());
+    parse_spell_history_filter(filter_text)
 }
 
 pub(crate) fn parse_spell_history_filter(type_text: &str) -> Option<TargetFilter> {
@@ -4488,6 +4538,83 @@ mod tests {
             } => assert!(properties.contains(&FilterProp::Historic)),
             other => panic!("expected historic SpellsCastThisTurn GE 1, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn youve_cast_spell_with_mana_value_this_turn_counts_controller_spells() {
+        let (rest, c) =
+            parse_inner_condition("you've cast a spell with mana value 4 or greater this turn")
+                .unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::SpellsCastThisTurn {
+                                scope: CountScope::Controller,
+                                filter: Some(TargetFilter::Typed(TypedFilter { properties, .. })),
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            } => assert!(properties.contains(&FilterProp::Cmc {
+                comparator: Comparator::GE,
+                value: QuantityExpr::Fixed { value: 4 },
+            })),
+            other => panic!("expected mana-value filtered SpellsCastThisTurn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn youve_cast_both_creature_and_noncreature_spells_this_turn_is_compound() {
+        let (rest, c) = parse_inner_condition(
+            "you've cast both a creature spell and a noncreature spell this turn",
+        )
+        .unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::And { conditions } => {
+                assert_eq!(conditions.len(), 2);
+                assert!(conditions.iter().any(|condition| matches!(
+                    condition,
+                    StaticCondition::QuantityComparison {
+                        lhs: QuantityExpr::Ref {
+                            qty: QuantityRef::SpellsCastThisTurn {
+                                scope: CountScope::Controller,
+                                filter: Some(TargetFilter::Typed(TypedFilter { type_filters, .. })),
+                            },
+                        },
+                        comparator: Comparator::GE,
+                        rhs: QuantityExpr::Fixed { value: 1 },
+                    } if type_filters == &vec![TypeFilter::Creature]
+                )));
+                assert!(conditions.iter().any(|condition| matches!(
+                    condition,
+                    StaticCondition::QuantityComparison {
+                        lhs: QuantityExpr::Ref {
+                            qty: QuantityRef::SpellsCastThisTurn {
+                                scope: CountScope::Controller,
+                                filter: Some(TargetFilter::Typed(TypedFilter { type_filters, .. })),
+                            },
+                        },
+                        comparator: Comparator::GE,
+                        rhs: QuantityExpr::Fixed { value: 1 },
+                    } if type_filters == &vec![TypeFilter::Non(Box::new(TypeFilter::Creature))]
+                )));
+            }
+            other => panic!("expected compound SpellsCastThisTurn condition, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn you_cast_both_creature_and_noncreature_spells_this_turn_is_compound() {
+        let (rest, c) = parse_inner_condition(
+            "you cast both a creature spell and a noncreature spell this turn",
+        )
+        .unwrap();
+        assert_eq!(rest, "");
+        assert!(matches!(c, StaticCondition::And { conditions } if conditions.len() == 2));
     }
 
     #[test]

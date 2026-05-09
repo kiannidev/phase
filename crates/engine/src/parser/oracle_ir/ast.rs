@@ -566,6 +566,10 @@ pub(crate) enum TargetedImperativeAst {
     /// resolver iterates every matching permanent instead of prompting for one.
     ReturnAll {
         target: TargetFilter,
+        /// CR 107.1a + CR 608.2d: Optional counted subset for phrases such as
+        /// "return half the creatures they control, rounded up." `None`
+        /// preserves all/each mass-bounce semantics.
+        count: Option<QuantityExpr>,
     },
     /// CR 400.7: Return to the battlefield (zone change, not bounce).
     ReturnToBattlefield {

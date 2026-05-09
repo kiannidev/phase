@@ -14409,12 +14409,52 @@ mod tests {
             Effect::BounceAll {
                 target: TargetFilter::Typed(filter),
                 destination,
+                count,
             } => {
                 assert!(destination.is_none(), "default destination = owner's hand");
+                assert!(count.is_none(), "all/each bounce is uncounted");
                 assert_eq!(filter.type_filters, vec![TypeFilter::Creature]);
                 assert!(filter.controller.is_none(), "no controller scoping");
             }
             other => panic!("expected BounceAll, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn effect_bounce_counted_half_target_player_creatures() {
+        let e = parse_effect(
+            "Return half the creatures they control to their owner's hand, rounded up",
+        );
+        match e {
+            Effect::BounceAll {
+                target: TargetFilter::Typed(filter),
+                destination,
+                count:
+                    Some(QuantityExpr::DivideRounded {
+                        inner,
+                        divisor,
+                        rounding,
+                    }),
+            } => {
+                assert!(destination.is_none(), "default destination = owner's hand");
+                assert_eq!(filter.type_filters, vec![TypeFilter::Creature]);
+                assert_eq!(filter.controller, Some(ControllerRef::ScopedPlayer));
+                assert_eq!(divisor, 2);
+                assert_eq!(rounding, crate::types::ability::RoundingMode::Up);
+                match *inner {
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::ObjectCount {
+                                filter: TargetFilter::Typed(count_filter),
+                            },
+                    } => {
+                        assert_eq!(count_filter.type_filters, vec![TypeFilter::Creature]);
+                        assert_eq!(count_filter.controller, Some(ControllerRef::ScopedPlayer));
+                    }
+                    other => panic!("expected ObjectCount inner quantity, got {other:?}"),
+                }
+            }
+            other => panic!("expected counted BounceAll, got {other:?}"),
         }
     }
 

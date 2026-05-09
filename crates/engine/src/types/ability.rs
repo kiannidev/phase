@@ -3977,6 +3977,8 @@ pub enum Effect {
         target: TargetFilter,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         destination: Option<Zone>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        count: Option<QuantityExpr>,
     },
     Explore,
     /// CR 701.44d: Simultaneous multi-permanent explore instruction.

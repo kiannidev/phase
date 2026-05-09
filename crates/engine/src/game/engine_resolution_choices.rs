@@ -1110,10 +1110,10 @@ pub(super) fn handle_resolution_choice(
                         }
                     }
                 }
-                EffectKind::ChangeZone => {
+                EffectKind::ChangeZone | EffectKind::BounceAll => {
                     let dest_zone = destination.ok_or_else(|| {
                         EngineError::InvalidAction(
-                            "EffectZoneChoice missing destination for ChangeZone".to_string(),
+                            "EffectZoneChoice missing destination for zone move".to_string(),
                         )
                     })?;
                     for &card_id in &chosen {

@@ -991,10 +991,50 @@ pub(super) fn parse_targeted_action_ast(
         } else {
             (is_mass, target_text)
         };
-        let (target, _rem) = parse_target_with_ctx(target_text, ctx);
+        let counted_return = parse_count_expr(target_text).and_then(|(mut count, after_count)| {
+            let filter = extract_object_count_filter(&count)?;
+            if nom_primitives::scan_contains(rest_lower, "rounded up") {
+                count = match count {
+                    QuantityExpr::DivideRounded {
+                        inner,
+                        divisor,
+                        rounding: _,
+                    } => QuantityExpr::DivideRounded {
+                        inner,
+                        divisor,
+                        rounding: crate::types::ability::RoundingMode::Up,
+                    },
+                    other => other,
+                };
+            } else if nom_primitives::scan_contains(rest_lower, "rounded down") {
+                count = match count {
+                    QuantityExpr::DivideRounded {
+                        inner,
+                        divisor,
+                        rounding: _,
+                    } => QuantityExpr::DivideRounded {
+                        inner,
+                        divisor,
+                        rounding: crate::types::ability::RoundingMode::Down,
+                    },
+                    other => other,
+                };
+            }
+            if after_count.trim().is_empty() {
+                Some((filter, count))
+            } else {
+                None
+            }
+        });
+        let count = counted_return.as_ref().map(|(_, count)| count.clone());
+        let (target, _count_for_shape) = counted_return.unwrap_or_else(|| {
+            let (target, _rem) = parse_target_with_ctx(target_text, ctx);
+            #[cfg(debug_assertions)]
+            assert_no_compound_remainder(_rem, text);
+            (target, QuantityExpr::Fixed { value: 0 })
+        });
+        let is_mass = is_mass || count.is_some();
         let origin = super::infer_origin_zone(rest_lower);
-        #[cfg(debug_assertions)]
-        assert_no_compound_remainder(_rem, text);
 
         // CR 400.7: Single-object battlefield destinations use ChangeZone;
         // mass destinations use ChangeZoneAll. Only pure mass-bounce
@@ -1026,7 +1066,7 @@ pub(super) fn parse_targeted_action_ast(
                 // remain `ChangeZone { origin: Graveyard, destination: Hand }`,
                 // not `BounceAll` (whose resolver only scans the battlefield).
                 if is_mass && origin.is_none() {
-                    Some(TargetedImperativeAst::ReturnAll { target })
+                    Some(TargetedImperativeAst::ReturnAll { target, count })
                 } else if is_mass {
                     Some(TargetedImperativeAst::ReturnAllToZone {
                         target,
@@ -1060,7 +1100,7 @@ pub(super) fn parse_targeted_action_ast(
             // to hand — preserves the pre-existing behavior.
             None => {
                 if is_mass {
-                    Some(TargetedImperativeAst::ReturnAll { target })
+                    Some(TargetedImperativeAst::ReturnAll { target, count })
                 } else {
                     Some(TargetedImperativeAst::Return { target })
                 }
@@ -1190,9 +1230,10 @@ pub(super) fn lower_targeted_action_ast(ast: TargetedImperativeAst) -> Effect {
         // as-is; single-object refs (SelfRef / TriggeringSource / AttachedTo /
         // ParentTarget) cannot reach this AST variant because the bare
         // `tag("return ")` arm above handles those.
-        TargetedImperativeAst::ReturnAll { target } => Effect::BounceAll {
+        TargetedImperativeAst::ReturnAll { target, count } => Effect::BounceAll {
             target,
             destination: None,
+            count,
         },
         // CR 400.7: Return to battlefield is a zone change, not a bounce.
         TargetedImperativeAst::ReturnToBattlefield {

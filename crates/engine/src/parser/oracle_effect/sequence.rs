@@ -508,6 +508,7 @@ pub(crate) fn starts_bare_and_clause(text: &str) -> bool {
 fn starts_bare_and_clause_lower(s: &str) -> bool {
     // Split into multiple alt() groups chained with .or() for nom's tuple limit.
     let has_verb_prefix = alt((
+        value((), tag::<_, _, OracleError<'_>>("add ")),
         value((), tag::<_, _, OracleError<'_>>("create ")),
         value((), tag("destroy ")),
         value((), tag("draw ")),
@@ -1937,6 +1938,12 @@ mod tests {
     fn bare_and_splits_draw_and_lose() {
         let chunks = clause_texts("draw a card and lose 1 life");
         assert_eq!(chunks, vec!["draw a card", "lose 1 life"]);
+    }
+
+    #[test]
+    fn bare_and_splits_draw_and_add_mana() {
+        let chunks = clause_texts("draw that many cards and add that much {R}");
+        assert_eq!(chunks, vec!["draw that many cards", "add that much {R}"]);
     }
 
     #[test]

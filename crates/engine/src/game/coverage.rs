@@ -4604,6 +4604,7 @@ fn condition_feature(cond: &AbilityCondition) -> (&'static str, FeatureSupport) 
         AbilityCondition::CastVariantPaidInstead { .. } => ("CastVariantPaidInstead", Handled),
         AbilityCondition::IfAPlayerDoes => ("IfAPlayerDoes", Handled),
         AbilityCondition::QuantityCheck { .. } => ("QuantityCheck", Handled),
+        AbilityCondition::PreviousEffectAmount { .. } => ("PreviousEffectAmount", Handled),
         AbilityCondition::CastDuringPhase { .. } => ("CastDuringPhase", Handled),
         AbilityCondition::ManaColorSpent { .. } => ("ManaColorSpent", Handled),
         AbilityCondition::HasMaxSpeed => ("HasMaxSpeed", Handled),

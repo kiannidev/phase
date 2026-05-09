@@ -6609,6 +6609,14 @@ pub enum AbilityCondition {
         comparator: Comparator,
         rhs: QuantityExpr,
     },
+    /// CR 608.2c + CR 120.10: Compares the numeric result tracked from the
+    /// previous instruction in the same resolution, such as excess damage dealt
+    /// this way. Uses the same `last_effect_amount` channel that feeds
+    /// `QuantityRef::PreviousEffectAmount` / `EventContextAmount`.
+    PreviousEffectAmount {
+        comparator: Comparator,
+        rhs: QuantityExpr,
+    },
     /// CR 702.178a: The ability functions only while its controller has max speed.
     HasMaxSpeed,
     /// CR 725.1: "if you're the monarch" is true when the ability controller has the monarch designation.

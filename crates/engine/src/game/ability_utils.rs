@@ -1217,6 +1217,7 @@ fn defers_conditional_target_selection(sub: &ResolvedAbility) -> bool {
         &sub.condition,
         Some(AbilityCondition::WhenYouDo)
             | Some(AbilityCondition::QuantityCheck { .. })
+            | Some(AbilityCondition::PreviousEffectAmount { .. })
             | Some(AbilityCondition::AdditionalCostPaidInstead)
     ) || sub.target_choice_timing == TargetChoiceTiming::Resolution
 }

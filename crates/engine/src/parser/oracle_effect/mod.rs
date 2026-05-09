@@ -6480,13 +6480,20 @@ fn try_parse_mana_retention_rider(text: &str) -> Option<ManaExpiry> {
     nom_on_lower(text, &text.to_lowercase(), |input| {
         let (input, _) = tag::<_, _, OracleError<'_>>("until end of turn, ").parse(input)?;
         let (input, _) = alt((tag("you "), tag("they "))).parse(input)?;
+        let (input, _) = alt((tag("don't lose "), tag("don\u{2019}t lose "))).parse(input)?;
         let (input, _) = alt((
-            tag("don't lose this mana as steps and phases end"),
-            tag("don't lose unspent mana as steps and phases end"),
-            tag("don\u{2019}t lose this mana as steps and phases end"),
-            tag("don\u{2019}t lose unspent mana as steps and phases end"),
+            value((), tag("this mana")),
+            value((), tag("unspent mana")),
+            value(
+                (),
+                preceded(
+                    tag("unspent "),
+                    preceded(nom_primitives::parse_color, tag(" mana")),
+                ),
+            ),
         ))
         .parse(input)?;
+        let (input, _) = tag(" as steps and phases end").parse(input)?;
         let (input, _) = nom::combinator::opt(tag(".")).parse(input)?;
         nom::combinator::eof(input)?;
         Ok((input, ManaExpiry::EndOfTurn))
@@ -14089,6 +14096,24 @@ mod tests {
                     contribution: ManaContribution::Additional,
                 }, ..
             } if colors == &vec![ManaColor::Green]
+        ));
+    }
+
+    #[test]
+    fn effect_add_that_much_colored_mana_uses_event_context_amount() {
+        let e = parse_effect("Add that much {R}");
+        assert!(matches!(
+            e,
+            Effect::Mana {
+                produced: ManaProduction::AnyOneColor {
+                    count: QuantityExpr::Ref {
+                        qty: QuantityRef::EventContextAmount,
+                    },
+                    ref color_options,
+                    contribution: ManaContribution::Base,
+                },
+                ..
+            } if color_options == &vec![ManaColor::Red]
         ));
     }
 
@@ -25078,6 +25103,77 @@ mod tests {
             other => panic!("expected Mana with EndOfTurn expiry, got {other:?}"),
         }
         assert!(def.sub_ability.is_none());
+    }
+
+    #[test]
+    fn mana_retention_rider_folds_onto_bare_and_add_mana_followup() {
+        let def = super::parse_effect_chain(
+            "draw that many cards and add that much {R}. Until end of turn, you don't lose this mana as steps and phases end.",
+            AbilityKind::Spell,
+        );
+        assert!(matches!(
+            &*def.effect,
+            Effect::Draw {
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                },
+                ..
+            }
+        ));
+        let Some(mana_def) = def.sub_ability.as_ref() else {
+            panic!("expected mana followup");
+        };
+        assert!(matches!(
+            &*mana_def.effect,
+            Effect::Mana {
+                produced: ManaProduction::AnyOneColor {
+                    count: QuantityExpr::Ref {
+                        qty: QuantityRef::EventContextAmount,
+                    },
+                    ref color_options,
+                    ..
+                },
+                expiry: Some(ManaExpiry::EndOfTurn),
+                ..
+            } if color_options == &vec![ManaColor::Red]
+        ));
+        assert!(
+            mana_def.sub_ability.is_none(),
+            "mana retention rider must fold onto the mana followup"
+        );
+    }
+
+    #[test]
+    fn excess_damage_fight_followup_parses_condition_amount_and_retention() {
+        let def = super::parse_effect_chain(
+            "target creature you control fights target creature an opponent controls. If the creature the opponent controls is dealt excess damage this way, add that much {R}. Until end of turn, you don't lose unspent red mana as steps and phases end.",
+            AbilityKind::Spell,
+        );
+        assert!(matches!(&*def.effect, Effect::Fight { .. }));
+        let Some(mana_def) = def.sub_ability.as_ref() else {
+            panic!("expected mana followup");
+        };
+        assert!(matches!(
+            mana_def.condition,
+            Some(AbilityCondition::PreviousEffectAmount {
+                comparator: Comparator::GT,
+                rhs: QuantityExpr::Fixed { value: 0 },
+            })
+        ));
+        assert!(matches!(
+            &*mana_def.effect,
+            Effect::Mana {
+                produced: ManaProduction::AnyOneColor {
+                    count: QuantityExpr::Ref {
+                        qty: QuantityRef::EventContextAmount,
+                    },
+                    ref color_options,
+                    ..
+                },
+                expiry: Some(ManaExpiry::EndOfTurn),
+                ..
+            } if color_options == &vec![ManaColor::Red]
+        ));
     }
 }
 

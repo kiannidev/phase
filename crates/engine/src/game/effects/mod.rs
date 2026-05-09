@@ -1159,14 +1159,39 @@ fn extract_event_context_filter(effect: &Effect) -> Option<&TargetFilter> {
     }
 }
 
-fn previous_effect_amount_from_events(effect: &Effect, events: &[GameEvent]) -> Option<i32> {
-    let amount = match effect {
+fn previous_effect_amount_from_events(
+    ability: &ResolvedAbility,
+    events: &[GameEvent],
+) -> Option<i32> {
+    let amount = match &ability.effect {
         Effect::DealDamage { .. } | Effect::DamageAll { .. } | Effect::DamageEachPlayer { .. } => {
             events
                 .iter()
                 .filter_map(|event| match event {
                     GameEvent::DamageDealt { amount, .. } => {
                         Some(crate::game::arithmetic::u32_to_i32_saturating(*amount))
+                    }
+                    _ => None,
+                })
+                .sum()
+        }
+        Effect::Fight { .. } => {
+            let fight_target = ability.targets.iter().find_map(|target| match target {
+                TargetRef::Object(id) => Some(*id),
+                _ => None,
+            });
+            events
+                .iter()
+                .filter_map(|event| match (event, fight_target) {
+                    (
+                        GameEvent::DamageDealt {
+                            target: TargetRef::Object(id),
+                            excess,
+                            ..
+                        },
+                        Some(fight_target),
+                    ) if *id == fight_target => {
+                        Some(crate::game::arithmetic::u32_to_i32_saturating(*excess))
                     }
                     _ => None,
                 })
@@ -1383,7 +1408,7 @@ pub fn resolve_ability_chain(
             state.last_effect_amount = state.last_effect_count;
             state.last_effect_counts_by_player = counts_by_player;
         } else if let Some(amount) =
-            previous_effect_amount_from_events(&scoped_template.effect, scoped_events)
+            previous_effect_amount_from_events(&scoped_template, scoped_events)
         {
             state.last_effect_amount = Some(amount);
         }
@@ -1692,9 +1717,7 @@ pub fn resolve_ability_chain(
     // counters and also deals damage, but "damage dealt this way" must read only
     // `DamageDealt`; Coalition Relic's "counter removed this way" must read only
     // `CounterRemoved`.
-    if let Some(amount) =
-        previous_effect_amount_from_events(&ability.effect, &events[events_before..])
-    {
+    if let Some(amount) = previous_effect_amount_from_events(ability, &events[events_before..]) {
         state.last_effect_amount = Some(amount);
     }
 
@@ -2161,6 +2184,16 @@ fn evaluate_condition(
                 ability.controller,
                 ability.source_id,
             );
+            let r = crate::game::quantity::resolve_quantity(
+                state,
+                rhs,
+                ability.controller,
+                ability.source_id,
+            );
+            comparator.evaluate(l, r)
+        }
+        AbilityCondition::PreviousEffectAmount { comparator, rhs } => {
+            let l = state.last_effect_amount.unwrap_or(0);
             let r = crate::game::quantity::resolve_quantity(
                 state,
                 rhs,

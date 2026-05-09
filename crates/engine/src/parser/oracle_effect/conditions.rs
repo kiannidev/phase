@@ -1751,6 +1751,10 @@ pub(super) fn try_nom_condition_as_ability_condition(
         return Some(condition);
     }
 
+    if let Some(condition) = parse_previous_effect_excess_damage_condition(lower.as_str()) {
+        return Some(condition);
+    }
+
     // CR 702.62a: "it doesn't have [keyword]" / "it does not have [keyword]" — pronoun
     // subject lacks-keyword check (e.g., "If it doesn't have suspend, it gains suspend").
     // Mirrors the "~ doesn't have" / "this creature doesn't have" handler in oracle_condition.rs.
@@ -2064,6 +2068,25 @@ fn parse_cost_paid_object_type_filter(text: &str) -> Option<TypeFilter> {
     .ok()
     .map(|(_, filter)| filter)
     .or_else(|| parse_subtype(text).map(|(subtype, _)| TypeFilter::Subtype(subtype)))
+}
+
+fn parse_previous_effect_excess_damage_condition(lower: &str) -> Option<AbilityCondition> {
+    all_consuming((
+        alt((
+            tag::<_, _, OracleError<'_>>("the creature the opponent controls"),
+            tag("that creature"),
+            tag("that permanent"),
+            tag("a creature"),
+            tag("a permanent"),
+        )),
+        tag(" is dealt excess damage this way"),
+    ))
+    .parse(lower)
+    .ok()?;
+    Some(AbilityCondition::PreviousEffectAmount {
+        comparator: Comparator::GT,
+        rhs: QuantityExpr::Fixed { value: 0 },
+    })
 }
 
 fn parse_zone_change_object_matches_filter_condition(lower: &str) -> Option<AbilityCondition> {

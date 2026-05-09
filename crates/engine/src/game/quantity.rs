@@ -1053,8 +1053,10 @@ fn resolve_ref(
             u32_to_i32_saturating(state.exiled_from_hand_this_resolution)
         }
         // CR 603.7c: Numeric value from the triggering event.
-        // Falls back to last_effect_count for sub_ability continuations where
-        // current_trigger_event has no amount (e.g., "discard up to N, then draw that many").
+        // Falls back to the preceding effect's count or amount for sub_ability
+        // continuations where current_trigger_event has no amount (e.g.,
+        // "discard up to N, then draw that many"; "dealt excess damage this
+        // way, add that much {R}").
         QuantityRef::EventContextAmount => state
             .current_trigger_event
             .as_ref()
@@ -1064,6 +1066,7 @@ fn resolve_ref(
                     .and_then(|player| state.last_effect_counts_by_player.get(&player).copied())
             })
             .or(state.last_effect_count)
+            .or(state.last_effect_amount)
             .unwrap_or(0),
         // CR 603.7c: Power of the source object from the triggering event.
         // CR 400.7: Falls back to LKI cache for objects that have left their zone.

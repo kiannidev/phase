@@ -22772,6 +22772,30 @@ mod tests {
     }
 
     #[test]
+    fn issue_308_gain_life_then_prevent_all_damage_chain() {
+        // Issue #308 (Riot Control): "You gain 1 life for each creature your opponents
+        // control. Prevent all damage that would be dealt to you this turn." was reported
+        // as silently dropping the second sentence. The chain composition path must
+        // produce both effects: GainLife → sub_ability: PreventDamage.
+        let def = parse_effect_chain(
+            "You gain 1 life for each creature your opponents control. \
+             Prevent all damage that would be dealt to you this turn.",
+            AbilityKind::Spell,
+        );
+        let effects = collect_chain_effects(&def);
+        assert!(
+            effects.iter().any(|e| matches!(e, Effect::GainLife { .. })),
+            "GainLife missing from chain: {effects:?}"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::PreventDamage { .. })),
+            "PreventDamage missing from chain — second sentence was dropped: {effects:?}"
+        );
+    }
+
+    #[test]
     fn conjunction_predicate_and_not_split() {
         // "target creature gets +2/+2 and gains flying until end of turn"
         // "and" is in predicate, not a conjunction — should NOT split

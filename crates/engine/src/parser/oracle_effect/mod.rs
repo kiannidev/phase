@@ -47,8 +47,8 @@ use crate::types::ability::{
     ContinuousModification, ControllerRef, DamageModification, DamageSource,
     DelayedTriggerCondition, Duration, Effect, FilterProp, GainLifePlayer, GameRestriction,
     ManaProduction, ManaSpendPermission, MultiTargetSpec, ObjectProperty, ObjectScope,
-    PlayerFilter, PlayerScope, PreventionAmount, PtValue, QuantityExpr, QuantityRef,
-    ReplacementDefinition, RestrictionExpiry, RestrictionPlayerScope, RoundingMode,
+    PlayerFilter, PlayerScope, PreventionAmount, PreventionScope, PtValue, QuantityExpr,
+    QuantityRef, ReplacementDefinition, RestrictionExpiry, RestrictionPlayerScope, RoundingMode,
     StaticCondition, StaticDefinition, TargetChoiceTiming, TargetFilter, TargetSelectionMode,
     TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter, UnlessPayModifier,
     UntilCondition,
@@ -826,6 +826,137 @@ fn try_parse_global_damage_modification_replacement(text: &str) -> Option<Effect
     Some(Effect::AddTargetReplacement {
         replacement: Box::new(replacement),
         target: TargetFilter::None,
+    })
+}
+
+/// CR 615 + CR 614.1a + CR 514.2: Recognize the "conditional turn-bound damage
+/// prevention with optional counter rider" pattern emitted as a sub-clause of a
+/// chain that already chose a target. Example: Gatta and Luzzu's
+/// "If damage would be dealt to that creature this turn, prevent that damage
+/// and put that many +1/+1 counters on it."
+///
+/// The shape decomposes along four axes:
+/// - antecedent: `if damage would be dealt to <target> this turn,`
+/// - prevention: `prevent that damage`
+/// - optional rider: `and put that many [+1/+1 | +0/+1 | …] counter[s] on <target>`
+/// - terminal period
+///
+/// Emits `Effect::PreventDamage { amount: All, target: ParentTarget,
+/// scope: AllDamage }` with `duration: UntilEndOfTurn`, and (when the rider is
+/// present) a `PutCounter` sub-ability with `repeat_for: EventContextAmount`.
+/// The CR 615.5 prevented-amount stash by the runtime damage applier resolves
+/// the repeat count to the prevented amount per fired prevention event.
+///
+/// Distinct from `try_parse_next_time_source_damage_replacement` (which covers
+/// "the next time X would deal damage" — a depletion-by-event-source shape).
+/// This helper covers the prevent-by-recipient class where the shield persists
+/// for every damage event to the chosen target for the rest of the turn.
+fn try_parse_conditional_damage_prevention_with_followup(text: &str) -> Option<ParsedEffectClause> {
+    let lower = text.to_lowercase();
+    let lower = lower.as_str();
+    let (rest, _) = tag::<_, _, OracleError<'_>>("if damage would be dealt to ")
+        .parse(lower)
+        .ok()?;
+    // Match the target reference. Three cases for now:
+    // - "that creature" / "that planeswalker" / "that player" → ParentTarget anaphor
+    //   to the chosen target from the parent clause.
+    // - "~" → SelfRef (the source itself).
+    // - "you" → caster.
+    let (rest, target) = alt((
+        value(
+            TargetFilter::ParentTarget,
+            alt((
+                tag::<_, _, OracleError<'_>>("that creature"),
+                tag("that planeswalker"),
+                tag("that permanent"),
+                tag("that player"),
+            )),
+        ),
+        value(TargetFilter::SelfRef, tag("~")),
+        value(TargetFilter::Controller, tag("you")),
+    ))
+    .parse(rest)
+    .ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" this turn, ")
+        .parse(rest)
+        .ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>("prevent that damage")
+        .parse(rest)
+        .ok()?;
+
+    // Optional " and put that many <counter> counter(s) on <pronoun>" rider.
+    let counter_followup: Option<AbilityDefinition> =
+        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(" and put that many ").parse(rest) {
+            let (rest, counter_type) = alt((
+                value("P1P1", tag::<_, _, OracleError<'_>>("+1/+1")),
+                value("P0P1", tag("+0/+1")),
+                value("P1P0", tag("+1/+0")),
+                value("M1M1", tag("-1/-1")),
+                value("P0P2", tag("+0/+2")),
+                value("P2P0", tag("+2/+0")),
+            ))
+            .parse(rest)
+            .ok()?;
+            let (rest, _) = alt((
+                tag::<_, _, OracleError<'_>>(" counters on "),
+                tag(" counter on "),
+            ))
+            .parse(rest)
+            .ok()?;
+            // CR 608.2k: the anaphor here ("it" / "that creature" / "~") binds to
+            // the same target as the antecedent — the parent's chosen target.
+            let (rest, counter_target) = alt((
+                value(
+                    TargetFilter::ParentTarget,
+                    alt((
+                        tag::<_, _, OracleError<'_>>("it"),
+                        tag("that creature"),
+                        tag("that planeswalker"),
+                        tag("that permanent"),
+                    )),
+                ),
+                value(TargetFilter::SelfRef, tag("~")),
+            ))
+            .parse(rest)
+            .ok()?;
+            parse_optional_period_and_end(rest)?;
+            // CR 615.5 + CR 609.7: emit the rider as a `PutCounter` with `count: 1`
+            // and `repeat_for: EventContextAmount` so the runtime invokes the
+            // counter effect once per damage prevented this fire. Mirrors the
+            // shape produced for Brace for Impact and other "for each 1 damage
+            // prevented this way, put a counter on that creature" cards.
+            Some(AbilityDefinition {
+                repeat_for: Some(QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                }),
+                ..AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::PutCounter {
+                        counter_type: counter_type.to_string(),
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: counter_target,
+                    },
+                )
+            })
+        } else {
+            parse_optional_period_and_end(rest)?;
+            None
+        };
+
+    Some(ParsedEffectClause {
+        effect: Effect::PreventDamage {
+            amount: PreventionAmount::All,
+            target,
+            scope: PreventionScope::AllDamage,
+            damage_source_filter: None,
+        },
+        duration: Some(Duration::UntilEndOfTurn),
+        sub_ability: counter_followup.map(Box::new),
+        distribute: None,
+        multi_target: None,
+        condition: None,
+        optional: false,
+        unless_pay: None,
     })
 }
 
@@ -8996,6 +9127,40 @@ pub(crate) fn parse_effect_chain_ir(
             };
             clauses.push(ClauseIr {
                 parsed: parsed_clause(flip_effect),
+                boundary: chunk.boundary_after,
+                condition: None,
+                is_optional: false,
+                opponent_may_scope: None,
+                repeat_for: None,
+                player_scope: None,
+                delayed_condition: None,
+                prefix_delayed_condition: None,
+                intrinsic_continuation: None,
+                followup_continuation: None,
+                absorbed_by_followup: false,
+                multi_target: None,
+                where_x_expression: None,
+                is_otherwise: false,
+                unless_pay: None,
+                special: None,
+                source_text: normalized_text.to_string(),
+                target_selection_mode: TargetSelectionMode::Chosen,
+            });
+            continue;
+        }
+
+        // CR 615 + CR 514.2: "If damage would be dealt to <target> this turn,
+        // prevent that damage [and put that many <kind> counter(s) on <target>]"
+        // — sub-clause of a chain that already chose a target. Emits an
+        // `Effect::PreventDamage { amount: All, target: ParentTarget }` with
+        // `duration: UntilEndOfTurn` and (optionally) a counter rider sub-ability
+        // that fires once per damage prevented this way. Gatta and Luzzu is the
+        // motivating case; the same shape applies to any future card with this
+        // antecedent.
+        if let Some(parsed) = try_parse_conditional_damage_prevention_with_followup(normalized_text)
+        {
+            clauses.push(ClauseIr {
+                parsed,
                 boundary: chunk.boundary_after,
                 condition: None,
                 is_optional: false,
@@ -24203,6 +24368,177 @@ mod tests {
             replacement.expiry,
             Some(crate::types::ability::RestrictionExpiry::EndOfTurn)
         );
+    }
+
+    /// CR 615 + CR 615.5 + CR 514.2: Gatta and Luzzu's chained-target prevention
+    /// shield with a `+1/+1` counter rider. The chunk sequence "choose target
+    /// creature you control. If damage would be dealt to that creature this
+    /// turn, prevent that damage and put that many +1/+1 counters on it." must
+    /// lower into a `TargetOnly { Creature, You }` parent whose `sub_ability`
+    /// is `PreventDamage { All, ParentTarget, AllDamage }` with
+    /// `duration: UntilEndOfTurn` and a chained `PutCounter` that
+    /// repeats once per prevented damage and binds to the chosen creature
+    /// (`ParentTarget`, not `SelfRef`). The post-#319 anaphor binding for "it"
+    /// in the rider clause is the load-bearing assertion — the trigger source
+    /// is Gatta itself, but the rider must follow the parent target.
+    #[test]
+    fn gatta_and_luzzu_chained_prevention_with_counter_rider() {
+        use crate::parser::oracle_trigger::parse_trigger_line;
+        let trigger = parse_trigger_line(
+            "When ~ enters, choose target creature you control. \
+             If damage would be dealt to that creature this turn, prevent that \
+             damage and put that many +1/+1 counters on it.",
+            "Gatta and Luzzu",
+        );
+        let execute = trigger.execute.as_ref().expect("trigger should execute");
+        match &*execute.effect {
+            Effect::TargetOnly { target } => {
+                let TargetFilter::Typed(tf) = target else {
+                    panic!("expected typed target, got {target:?}");
+                };
+                assert!(matches!(
+                    tf.controller,
+                    Some(crate::types::ability::ControllerRef::You)
+                ));
+                assert!(tf
+                    .type_filters
+                    .contains(&crate::types::ability::TypeFilter::Creature));
+            }
+            other => panic!("expected TargetOnly outer, got {other:?}"),
+        }
+        let prevent = execute
+            .sub_ability
+            .as_deref()
+            .expect("TargetOnly should chain to PreventDamage");
+        assert_eq!(prevent.duration, Some(Duration::UntilEndOfTurn));
+        match &*prevent.effect {
+            Effect::PreventDamage {
+                amount,
+                target,
+                scope,
+                damage_source_filter,
+            } => {
+                assert_eq!(*amount, PreventionAmount::All);
+                assert_eq!(*target, TargetFilter::ParentTarget);
+                assert_eq!(*scope, PreventionScope::AllDamage);
+                assert!(damage_source_filter.is_none());
+            }
+            other => panic!("expected PreventDamage middle, got {other:?}"),
+        }
+        let counter = prevent
+            .sub_ability
+            .as_deref()
+            .expect("PreventDamage should chain to counter rider");
+        match &*counter.effect {
+            Effect::PutCounter {
+                counter_type,
+                count,
+                target,
+            } => {
+                assert_eq!(counter_type, "P1P1");
+                assert_eq!(*count, QuantityExpr::Fixed { value: 1 });
+                assert_eq!(*target, TargetFilter::ParentTarget);
+            }
+            other => panic!("expected PutCounter rider, got {other:?}"),
+        }
+        assert_eq!(
+            counter.repeat_for,
+            Some(QuantityExpr::Ref {
+                qty: QuantityRef::EventContextAmount,
+            })
+        );
+    }
+
+    /// CR 615 + CR 615.5: Building-block parser test for the conditional damage
+    /// prevention helper. Exercises the helper directly to lock in the four-axis
+    /// composition: antecedent target / period terminator / counter type / rider
+    /// pronoun. Three target shapes are covered; the fixed (`Fixed { 1 }`) +
+    /// repeat-for (`EventContextAmount`) shape is the per-damage-event repeat
+    /// contract Brace for Impact relies on at the runtime damage applier.
+    #[test]
+    fn try_parse_conditional_damage_prevention_recognises_target_creature_with_counter_rider() {
+        let parsed = try_parse_conditional_damage_prevention_with_followup(
+            "If damage would be dealt to that creature this turn, prevent that damage and put that many +1/+1 counters on it",
+        )
+        .expect("should match Gatta and Luzzu shape");
+        assert_eq!(parsed.duration, Some(Duration::UntilEndOfTurn));
+        match parsed.effect {
+            Effect::PreventDamage {
+                amount,
+                target,
+                scope,
+                ..
+            } => {
+                assert_eq!(amount, PreventionAmount::All);
+                assert_eq!(target, TargetFilter::ParentTarget);
+                assert_eq!(scope, PreventionScope::AllDamage);
+            }
+            other => panic!("expected PreventDamage, got {other:?}"),
+        }
+        let sub = parsed
+            .sub_ability
+            .as_deref()
+            .expect("counter rider should be present");
+        match &*sub.effect {
+            Effect::PutCounter {
+                counter_type,
+                count,
+                target,
+            } => {
+                assert_eq!(counter_type, "P1P1");
+                assert_eq!(*count, QuantityExpr::Fixed { value: 1 });
+                assert_eq!(*target, TargetFilter::ParentTarget);
+            }
+            other => panic!("expected PutCounter sub-ability, got {other:?}"),
+        }
+        assert_eq!(
+            sub.repeat_for,
+            Some(QuantityExpr::Ref {
+                qty: QuantityRef::EventContextAmount,
+            })
+        );
+    }
+
+    /// CR 615 + CR 514.2: The conditional prevention parser must accept the
+    /// shape without the counter rider. "If damage would be dealt to ~ this
+    /// turn, prevent that damage." is a complete sentence — the `sub_ability`
+    /// should be `None` and the shield still expires at end of turn.
+    #[test]
+    fn try_parse_conditional_damage_prevention_recognises_self_ref_without_rider() {
+        let parsed = try_parse_conditional_damage_prevention_with_followup(
+            "If damage would be dealt to ~ this turn, prevent that damage.",
+        )
+        .expect("should match self-ref prevention");
+        assert_eq!(parsed.duration, Some(Duration::UntilEndOfTurn));
+        match parsed.effect {
+            Effect::PreventDamage { target, amount, .. } => {
+                assert_eq!(target, TargetFilter::SelfRef);
+                assert_eq!(amount, PreventionAmount::All);
+            }
+            other => panic!("expected PreventDamage, got {other:?}"),
+        }
+        assert!(parsed.sub_ability.is_none());
+    }
+
+    /// CR 615 + CR 615.5: The conditional prevention parser must accept the
+    /// "you" antecedent variant (Hallow-style turn-bound shields). The shield
+    /// filter binds to `Controller` (the caster) and the rider (when present)
+    /// inherits the same anaphor.
+    #[test]
+    fn try_parse_conditional_damage_prevention_recognises_you_antecedent() {
+        let parsed = try_parse_conditional_damage_prevention_with_followup(
+            "If damage would be dealt to you this turn, prevent that damage.",
+        )
+        .expect("should match player-targeted prevention");
+        assert_eq!(parsed.duration, Some(Duration::UntilEndOfTurn));
+        match parsed.effect {
+            Effect::PreventDamage { target, amount, .. } => {
+                assert_eq!(target, TargetFilter::Controller);
+                assert_eq!(amount, PreventionAmount::All);
+            }
+            other => panic!("expected PreventDamage, got {other:?}"),
+        }
+        assert!(parsed.sub_ability.is_none());
     }
 
     #[test]

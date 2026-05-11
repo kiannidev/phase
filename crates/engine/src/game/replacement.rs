@@ -358,9 +358,19 @@ fn damage_done_applier(
 
             match amount {
                 PreventionAmount::All => {
-                    // CR 615: Prevent all damage — consume the shield
+                    // CR 615.1a: "Prevent all damage" is a duration-bound
+                    // unbounded shield, not a depletion shield — only
+                    // `PreventionAmount::Next(N)` is exhausted by use (CR 615.7).
+                    // The shield's lifetime is governed entirely by its `expiry`
+                    // (for resolution-time / "this turn" shields, cleanup at EOT
+                    // per CR 514.2; for static-attached shields like Phyrexian
+                    // Hydra / Pariah, the host permanent leaving the battlefield).
+                    // Marking the shield consumed here would limit a Gatta and
+                    // Luzzu / Pariah / Phyrexian Hydra shield to a single damage
+                    // event in the turn — wrong for the whole "all damage"
+                    // family. Leave the shield active so subsequent damage
+                    // events in the same turn re-fire the prevention.
                     prevented_amount = dmg;
-                    consume_prevention_shield(state, rid, None);
                     result = ApplyResult::Prevented;
                 }
                 PreventionAmount::Next(n) => {

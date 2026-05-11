@@ -358,6 +358,21 @@ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
                             && tag::<_, _, OracleError<'_>>("put ")
                                 .parse(remainder_trimmed)
                                 .is_ok();
+                    // CR 615 + CR 615.5: "[If damage would be dealt to <target>
+                    // this turn,] prevent that damage and put that many <kind>
+                    // counter(s) on <target>" — the rider is the prevention
+                    // follow-up, not a separate clause. The full sentence is
+                    // owned by `try_parse_conditional_damage_prevention_with_followup`
+                    // and bisecting here would strip the rider into a fresh
+                    // chunk whose "on it" pronoun re-binds to the trigger source
+                    // via `resolve_pronoun_target` instead of the parent
+                    // target. Same suppression shape as the "tap target
+                    // creature ... and put a stun counter on it" continuation.
+                    let prevent_then_put_continuation =
+                        nom_primitives::scan_contains(&before_lower, "prevent that damage")
+                            && tag::<_, _, OracleError<'_>>("put ")
+                                .parse(remainder_trimmed)
+                                .is_ok();
                     // CR 701.18a + CR 701.23: "search [zones] for [filter] and exile them"
                     // is a single compound search-and-exile action — keep it together so
                     // the imperative dispatcher can recognize the multi-zone pattern.
@@ -410,6 +425,7 @@ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
                     let suppress = nom_primitives::scan_contains(&before_lower, "from among")
                         || is_inside_temporal_prefix(&before_lower)
                         || targeted_compound_continuation
+                        || prevent_then_put_continuation
                         || search_with_that_name
                         || inside_except_clause
                         || choice_partition_remainder

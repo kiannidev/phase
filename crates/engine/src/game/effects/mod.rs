@@ -1941,6 +1941,18 @@ pub fn resolve_ability_chain(
         return Ok(());
     }
 
+    // CR 615.5: `PreventDamage` with a chained sub-ability installs the sub
+    // as the shield's `runtime_execute` continuation — it runs once per fired
+    // damage prevention event (Gatta and Luzzu's "prevent that damage and put
+    // that many +1/+1 counters on it"). The outer chain walker must NOT also
+    // resolve the sub-ability inline, or the rider would fire twice (once
+    // immediately when the shield is installed, and again from each
+    // post-replacement continuation). The shield is the single authority for
+    // the rider's execution lifecycle.
+    if matches!(ability.effect, Effect::PreventDamage { .. }) && ability.sub_ability.is_some() {
+        return Ok(());
+    }
+
     // Extract moved objects for result forwarding when forward_result is set.
     // Used for "put onto the battlefield attached to [source]" patterns where the
     // moved card becomes the sub-ability's source and the original source becomes a target.

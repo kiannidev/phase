@@ -1230,6 +1230,22 @@ fn detect_condition_if(
     if stripped.contains("if damage is prevented this way") {
         return;
     }
+    // CR 615 + CR 615.5: "If damage would be dealt to <target> this turn,
+    // prevent that damage [and put that many counters on it]" is encoded
+    // structurally as an `Effect::PreventDamage` whose `amount: All` +
+    // `duration: UntilEndOfTurn` IS the conditional gate (the shield fires
+    // only when matching damage is proposed; otherwise it sits dormant until
+    // cleanup). Gatta and Luzzu is the motivating case. The marker test is
+    // narrow: the `if`-clause body must lead with "prevent" so generic
+    // "if damage" patterns (e.g., damage-redirect replacements that DO want
+    // a separate `condition` field) aren't suppressed.
+    if stripped.contains("if damage would be dealt to") // allow-noncombinator: swallow detector marker scan on classified text
+        && stripped.contains("prevent that damage") // allow-noncombinator: swallow detector marker scan on classified text
+        && ast_json.contains("\"type\":\"PreventDamage\"")
+    // allow-noncombinator: structural AST-shape JSON probe
+    {
+        return;
+    }
     // CR 118.12 + CR 614.12a: "you may pay [cost]. If you don't, ..."
     // is encoded as `ReplacementMode::MayCost { decline }`; the decline
     // branch is the alternative instruction, not an uncaptured condition.

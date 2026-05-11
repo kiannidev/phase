@@ -1,6 +1,6 @@
 import { useCallback, useMemo } from "react";
 
-import type { GameObject } from "../../adapter/types.ts";
+import type { GameAction, GameObject, ObjectId } from "../../adapter/types.ts";
 import { CardImage } from "../card/CardImage.tsx";
 import { ModalPanelShell } from "../ui/ModalPanelShell.tsx";
 import { ScrollableCardStrip } from "../modal/ChoiceOverlay.tsx";
@@ -11,6 +11,8 @@ import { useUiStore } from "../../stores/uiStore.ts";
 import { useCanActForWaitingState, usePerspectivePlayerId } from "../../hooks/usePlayerId.ts";
 import { useGameDispatch } from "../../hooks/useGameDispatch.ts";
 import { getPlayerZoneIds, getWaitingForObjectChoiceIds } from "../../viewmodel/gameStateView.ts";
+import { collectObjectActions } from "../../viewmodel/cardActionChoice.ts";
+import { abilityChoiceLabel } from "../../viewmodel/costLabel.ts";
 
 interface ZoneViewerProps {
   zone: "graveyard" | "exile";
@@ -23,8 +25,23 @@ const ZONE_TITLES: Record<string, string> = {
   exile: "Exile",
 };
 
-function hasAdventureCreaturePermission(obj: GameObject): boolean {
-  return obj.casting_permissions?.some((p) => p.type === "AdventureCreature") ?? false;
+/**
+ * Filter `legalActionsByObject` entries for a zone-viewable card to the
+ * cast actions only. Engine authority — covers Adventure, Foretell, Plot,
+ * Suspend, Warp, and any future exile-cast permission without per-mechanic
+ * client-side branches.
+ */
+function castActionsForObject(
+  legalActionsByObject: Record<string, GameAction[]> | undefined,
+  objectId: ObjectId,
+): GameAction[] {
+  return collectObjectActions(legalActionsByObject, objectId).filter((a) =>
+    a.type === "CastSpell"
+    || a.type === "CastSpellAsSneak"
+    || a.type === "CastSpellAsWebSlinging"
+    || a.type === "CastSpellAsMiracle"
+    || a.type === "CastSpellAsMadness"
+  );
 }
 
 export function ZoneViewer({ zone, playerId, onClose }: ZoneViewerProps) {
@@ -32,6 +49,7 @@ export function ZoneViewer({ zone, playerId, onClose }: ZoneViewerProps) {
   const gameState = useGameStore((s) => s.gameState);
   const waitingFor = useGameStore((s) => s.waitingFor);
   const dispatch = useGameStore((s) => s.dispatch);
+  const legalActionsByObject = useGameStore((s) => s.legalActionsByObject);
   const dispatchAction = useGameDispatch();
   const currentPlayerId = usePerspectivePlayerId();
   const canActForWaitingState = useCanActForWaitingState();
@@ -75,17 +93,23 @@ export function ZoneViewer({ zone, playerId, onClose }: ZoneViewerProps) {
             innerClassName="flex items-center gap-2 lg:gap-3"
           >
             {cards.map((obj) => {
-              const canCastAdventure = zone === "exile" && isMyZone && hasPriority
-                && hasAdventureCreaturePermission(obj);
+              // CR 702.143a + CR 715.3a + CR 702.62a + CR 702.170d + CR 702.185a:
+              // Engine surfaces a CastSpell-family action for every legally
+              // castable exile-zone card (Adventure, Foretell, Suspend, Plot,
+              // Warp, etc.). The zone viewer surfaces whatever the engine
+              // reports — no per-mechanic permission inspection.
+              const castActions = zone === "exile" && isMyZone && hasPriority
+                ? castActionsForObject(legalActionsByObject, obj.id)
+                : [];
               const isValidTarget = currentLegalTargets.has(obj.id);
               return (
                 <ZoneCard
                   key={obj.id}
                   obj={obj}
                   isValidTarget={isValidTarget}
-                  canCastAdventure={canCastAdventure}
+                  castActions={castActions}
                   onTarget={() => dispatchAction({ type: "ChooseTarget", data: { target: { Object: obj.id } } })}
-                  onCastAdventure={() => dispatch({ type: "CastSpell", data: { object_id: obj.id, card_id: obj.card_id, targets: [] } })}
+                  onCast={(action) => dispatch(action)}
                 />
               );
             })}
@@ -99,15 +123,15 @@ export function ZoneViewer({ zone, playerId, onClose }: ZoneViewerProps) {
 function ZoneCard({
   obj,
   isValidTarget,
-  canCastAdventure,
+  castActions,
   onTarget,
-  onCastAdventure,
+  onCast,
 }: {
   obj: GameObject;
   isValidTarget: boolean;
-  canCastAdventure: boolean;
+  castActions: GameAction[];
   onTarget: () => void;
-  onCastAdventure: () => void;
+  onCast: (action: GameAction) => void;
 }) {
   const inspectObject = useUiStore((s) => s.inspectObject);
   const setPreviewSticky = useUiStore((s) => s.setPreviewSticky);
@@ -129,12 +153,13 @@ function ZoneCard({
     if (isValidTarget) onTarget();
   }, [obj.id, isValidTarget, onTarget, longPressFired]);
 
+  const canCast = castActions.length > 0;
   return (
     <div
       className={`shrink-0 cursor-pointer rounded transition-colors ${
         isValidTarget
           ? "ring-2 ring-amber-400/60 shadow-[0_0_12px_3px_rgba(201,176,55,0.8)]"
-          : canCastAdventure
+          : canCast
             ? "ring-1 ring-amber-500/60 hover:ring-amber-400"
             : "hover:ring-1 hover:ring-white/20"
       }`}
@@ -144,13 +169,21 @@ function ZoneCard({
       {...longPressHandlers}
     >
       <CardImage cardName={obj.name} size="normal" />
-      {canCastAdventure && !isValidTarget && (
-        <button
-          onClick={onCastAdventure}
-          className="mt-1 w-full rounded-md bg-amber-600/80 px-2 py-1 text-xs font-semibold text-white transition hover:bg-amber-500"
-        >
-          Cast Creature
-        </button>
+      {canCast && !isValidTarget && (
+        <div className="mt-1 flex flex-col gap-1">
+          {castActions.map((action, i) => {
+            const { label } = abilityChoiceLabel(action, obj);
+            return (
+              <button
+                key={i}
+                onClick={() => onCast(action)}
+                className="w-full rounded-md bg-amber-600/80 px-2 py-1 text-xs font-semibold text-white transition hover:bg-amber-500"
+              >
+                {label}
+              </button>
+            );
+          })}
+        </div>
       )}
     </div>
   );

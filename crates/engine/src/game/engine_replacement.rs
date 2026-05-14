@@ -272,6 +272,17 @@ pub(super) fn handle_replacement_choice(
                 create @ ProposedEvent::CreateToken { .. } => {
                     apply_create_token_after_replacement(state, create, events);
                 }
+                // CR 703.4q + CR 616.1: EmptyManaPool resume after a player has
+                // chosen one of several step-end mana handlers to apply. Real
+                // disposition walk + handler-list drain wire up in commit 2;
+                // for now the arm exists only for exhaustiveness because the
+                // pipeline is not yet seeded with `EmptyManaPool` events.
+                ProposedEvent::EmptyManaPool { .. } => {
+                    debug_assert!(
+                        false,
+                        "handle_replacement_choice: EmptyManaPool resume not wired (commit 2)"
+                    );
+                }
             }
 
             let mut waiting_for = WaitingFor::Priority {

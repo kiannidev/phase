@@ -108,6 +108,38 @@ pub struct StepEndManaHandler {
     pub action: StepEndManaAction,
 }
 
+/// CR 614.1a + CR 703.4q: Per-unit decision for the CR 703.4q step-end empty
+/// event. Each entry in `ProposedEvent::EmptyManaPool::units` describes one
+/// `ManaUnit` in the affected player's pool and how the replacement pipeline
+/// has chosen to resolve it.
+///
+/// `pool_index` is the unit's position in `ManaPool::mana` at the time the
+/// event was constructed. The disposition walker (commit 2) iterates in
+/// descending index order so removals don't invalidate later indices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnitDecision {
+    pub pool_index: usize,
+    pub color: ManaType,
+    pub disposition: UnitDisposition,
+}
+
+/// CR 614.1a + CR 614.6 + CR 703.4q: How a single unit in a step-end empty
+/// event will be resolved after the replacement pipeline finishes.
+///
+/// - `Drop`: default — the unit empties per CR 703.4q. A handler matching this
+///   unit may flip the disposition to `Keep` (CR 614.6) or `Recolor(_)`
+///   (CR 614.1a).
+/// - `Keep`: a `StepEndManaAction::Retain` handler has applied; the unit stays
+///   in the pool.
+/// - `Recolor(_)`: a `StepEndManaAction::Transform(_)` handler has applied; the
+///   unit stays in the pool with its color rewritten to the target type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnitDisposition {
+    Drop,
+    Keep,
+    Recolor(ManaType),
+}
+
 /// Display-layer projection of `ManaProduction` — typed pip descriptors the
 /// frontend renders verbatim. One variant per `ManaProduction` axis so no
 /// information is lost on the wire (e.g., colorless producers must surface as

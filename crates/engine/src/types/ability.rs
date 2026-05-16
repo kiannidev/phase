@@ -7719,7 +7719,7 @@ pub enum AbilityCondition {
     /// [filter] this way" checks the object paid as a cost for this resolving
     /// ability using its cost-payment-time public characteristics.
     CostPaidObjectMatchesFilter { filter: TargetFilter },
-    /// CR 611.2b: "if this [permanent] is tapped" — checks the source's tapped status.
+    /// CR 110.5b: "if this [permanent] is tapped" — checks the source's tapped status.
     /// For the untapped sense, wrap with `AbilityCondition::Not`.
     SourceIsTapped,
     /// CR 614.1a / CR 614.15: General "instead" self-replacement — wraps any
@@ -8067,7 +8067,7 @@ pub enum TriggerCondition {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         specific: Option<crate::game::dungeon::DungeonId>,
     },
-    /// CR 611.2b: "if this [permanent] is tapped" — checks the source's tapped status.
+    /// CR 110.5b: "if this [permanent] is tapped" — checks the source's tapped status.
     /// Negation ("untapped") is expressed via `Not { Box::new(SourceIsTapped) }`.
     SourceIsTapped,
     /// CR 701.27g: "if this [permanent] is transformed" — checks the source's transformed status.
@@ -8136,6 +8136,16 @@ pub enum TriggerCondition {
         destination: Zone,
         filter: TargetFilter,
     },
+    /// CR 603.4 + CR 603.6a + CR 110.5b: Intervening-if for an "enters
+    /// tapped" rider whose subject is the permanent named by the trigger
+    /// event (the entering permanent), NOT the permanent that owns the
+    /// ability. Distinct from `SourceIsTapped`, which checks the ability's
+    /// own source. Used by "Whenever a [filter] enters tapped" observer
+    /// triggers (Amulet of Vigor, Tiller Engine) and, via `Not`, "enters
+    /// untapped" (Charismatic Conqueror). Mirrors the source-vs-event-object
+    /// split already established by `SourceMatchesFilter` /
+    /// `ZoneChangeObjectMatchesFilter`.
+    ZoneChangeObjectIsTapped,
     /// CR 603.4 + CR 611.2b: Source-bound intervening-if predicate expressed
     /// as a normal target filter evaluated against the trigger source.
     SourceMatchesFilter { filter: TargetFilter },

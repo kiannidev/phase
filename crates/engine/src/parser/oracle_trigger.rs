@@ -1865,7 +1865,7 @@ fn static_condition_to_trigger_condition(sc: &StaticCondition) -> Option<Trigger
                     rhs: QuantityExpr::Fixed { value: 0 },
                 })
             }
-            // CR 611.2b: Not(SourceIsTapped) → source is untapped.
+            // CR 110.5b: Not(SourceIsTapped) → source is untapped.
             StaticCondition::SourceIsTapped => Some(TriggerCondition::Not {
                 condition: Box::new(TriggerCondition::SourceIsTapped),
             }),
@@ -1911,7 +1911,7 @@ fn static_condition_to_trigger_condition(sc: &StaticCondition) -> Option<Trigger
         StaticCondition::IsMonarch => Some(TriggerCondition::IsMonarch),
         // CR 702.131a: City's Blessing bridges directly.
         StaticCondition::HasCityBlessing => Some(TriggerCondition::HasCityBlessing),
-        // CR 611.2b: Source tapped state bridges for trigger conditions like
+        // CR 110.5b: Source tapped state bridges for trigger conditions like
         // "At the beginning of your upkeep, if this land is tapped, ..."
         StaticCondition::SourceIsTapped => Some(TriggerCondition::SourceIsTapped),
         // CR 113.6b: Source zone bridges for trigger conditions like
@@ -3657,11 +3657,20 @@ fn parse_damage_to_qualifier(after_verb: &str) -> Option<TargetFilter> {
         .map(|(_, filter)| filter)
 }
 
-/// CR 603.6a + CR 611.2b: After consuming the `"enter"` prefix in a ChangesZone
+/// CR 603.6a + CR 110.5b: After consuming the `"enter"` prefix in a ChangesZone
 /// trigger clause, recognize an optional tapped-state rider — `"enters tapped"`
 /// or `"enters untapped"` — and produce the corresponding intervening-if
-/// condition so the trigger only fires when the source's post-ETB tapped state
-/// matches.
+/// condition so the trigger only fires when the *entering* permanent's post-ETB
+/// tapped state matches.
+///
+/// The condition emitted is `ZoneChangeObjectIsTapped` (optionally `Not`-wrapped
+/// for the untapped sense): its runtime evaluator inspects the permanent named
+/// by the triggering zone-change event — i.e. the *entering* permanent — not the
+/// ability-owning source. This is required for observer triggers whose subject
+/// is another permanent (`valid_card` ≠ `SelfRef`), e.g. Amulet of Vigor seeing
+/// a different permanent enter tapped. For `SelfRef` triggers the entering
+/// permanent IS the source, so the evaluator's `source_id` fallback resolves to
+/// the same object.
 ///
 /// The `input` here is the remainder after `tag("enter")`, so the rider begins
 /// with `"s "` (the rest of "enters" plus a space) followed by the state word.
@@ -3701,10 +3710,10 @@ fn parse_enters_tapped_state_rider(input: &str) -> Option<TriggerCondition> {
 
     Some(if negated {
         TriggerCondition::Not {
-            condition: Box::new(TriggerCondition::SourceIsTapped),
+            condition: Box::new(TriggerCondition::ZoneChangeObjectIsTapped),
         }
     } else {
-        TriggerCondition::SourceIsTapped
+        TriggerCondition::ZoneChangeObjectIsTapped
     })
 }
 
@@ -3815,13 +3824,14 @@ fn try_parse_event(
             scan = scan.find(' ').map_or("", |i| scan[i + 1..].trim_start());
         }
 
-        // CR 603.6a + CR 611.2b: "enters untapped" / "enters tapped" — conditional
-        // ETB trigger gated on the source's tapped state at resolution time. The
-        // tapped-state check examines the object after ETB replacement effects
-        // (e.g. "enters tapped unless you control three or more Forests") have
-        // resolved, per CR 603.6a's "check at the moment the event fires". The
-        // `SourceIsTapped` runtime evaluator (game/triggers.rs) inspects
-        // `obj.tapped` on the triggering object, which by then reflects the
+        // CR 603.6a + CR 110.5b: "enters untapped" / "enters tapped" — conditional
+        // ETB trigger gated on the *entering* permanent's tapped state at
+        // trigger-check time. The tapped-state check examines the object after
+        // ETB replacement effects (e.g. "enters tapped unless you control three
+        // or more Forests") have resolved, per CR 603.6a's "check at the moment
+        // the event fires". The `ZoneChangeObjectIsTapped` runtime evaluator
+        // (game/triggers.rs) inspects `obj.tapped` on the object named by the
+        // triggering zone-change event, which by then reflects the
         // post-replacement state.
         if let Some(cond) = parse_enters_tapped_state_rider(after_enter) {
             def.condition = Some(cond);
@@ -7482,9 +7492,11 @@ mod tests {
         );
     }
 
-    // CR 603.6a + CR 611.2b: "When this land enters untapped, ..." — Gingerbread
-    // Cabin class. The trigger must carry `Not { Box::new(SourceIsTapped) }` so
-    // it only fires when the ETB-tapped replacement did NOT apply.
+    // CR 603.6a + CR 110.5b: "When this land enters untapped, ..." — Gingerbread
+    // Cabin class. The trigger must carry `Not { Box::new(ZoneChangeObjectIsTapped) }`
+    // so it only fires when the ETB-tapped replacement did NOT apply. For a
+    // SelfRef trigger the entering object IS the source, so the evaluator's
+    // `source_id` fallback resolves to the same permanent.
     #[test]
     fn trigger_etb_self_enters_untapped_attaches_condition() {
         let def = parse_trigger_line(
@@ -7497,7 +7509,7 @@ mod tests {
         assert_eq!(
             def.condition,
             Some(TriggerCondition::Not {
-                condition: Box::new(TriggerCondition::SourceIsTapped)
+                condition: Box::new(TriggerCondition::ZoneChangeObjectIsTapped)
             })
         );
         assert!(def.execute.is_some());
@@ -7561,9 +7573,12 @@ mod tests {
         ));
     }
 
-    // CR 603.6a + CR 611.2b: "Whenever a permanent you control enters tapped, ..." —
+    // CR 603.6a + CR 110.5b: "Whenever a permanent you control enters tapped, ..." —
     // Amulet of Vigor class. The `enters tapped` rider must set
-    // `SourceIsTapped` (fires only when entering tapped).
+    // `ZoneChangeObjectIsTapped` (fires only when the *entering* permanent is
+    // tapped — NOT the ability source). For observer triggers the entering
+    // permanent differs from the ability source, so the subject-correct variant
+    // is required.
     #[test]
     fn trigger_etb_subject_enters_tapped_attaches_condition() {
         let def = parse_trigger_line(
@@ -7572,11 +7587,36 @@ mod tests {
         );
         assert_eq!(def.mode, TriggerMode::ChangesZone);
         assert_eq!(def.destination, Some(Zone::Battlefield));
-        assert_eq!(def.condition, Some(TriggerCondition::SourceIsTapped));
+        assert_eq!(
+            def.condition,
+            Some(TriggerCondition::ZoneChangeObjectIsTapped)
+        );
+    }
+
+    // CR 603.6a + CR 110.5b: "Whenever an artifact or creature an opponent
+    // controls enters untapped, ..." — Charismatic Conqueror class. The
+    // `enters untapped` rider must wrap `ZoneChangeObjectIsTapped` in `Not`,
+    // and the subject is the entering (opponent's) permanent — an observer
+    // trigger where source ≠ entering object.
+    #[test]
+    fn trigger_etb_subject_enters_untapped_attaches_negated_condition() {
+        let def = parse_trigger_line(
+            "Whenever an artifact or creature an opponent controls enters untapped, they may tap that permanent. If they don't, you create a 1/1 white Vampire creature token with lifelink.",
+            "Charismatic Conqueror",
+        );
+        assert_eq!(def.mode, TriggerMode::ChangesZone);
+        assert_eq!(def.destination, Some(Zone::Battlefield));
+        assert_eq!(
+            def.condition,
+            Some(TriggerCondition::Not {
+                condition: Box::new(TriggerCondition::ZoneChangeObjectIsTapped)
+            })
+        );
     }
 
     // Guard: a bare "enters" (no tapped-state rider) must NOT attach a
-    // SourceIsTapped condition.
+    // tapped-state condition (neither `SourceIsTapped` nor
+    // `ZoneChangeObjectIsTapped`).
     #[test]
     fn trigger_etb_bare_enters_has_no_tapped_condition() {
         let def = parse_trigger_line(
@@ -7584,15 +7624,42 @@ mod tests {
             "Elvish Visionary",
         );
         assert_eq!(def.mode, TriggerMode::ChangesZone);
+        let is_tapped_condition = |c: &TriggerCondition| {
+            matches!(
+                c,
+                TriggerCondition::SourceIsTapped | TriggerCondition::ZoneChangeObjectIsTapped
+            )
+        };
         assert!(
-            !matches!(def.condition, Some(TriggerCondition::SourceIsTapped))
+            !def.condition.as_ref().is_some_and(is_tapped_condition)
                 && !matches!(
                     &def.condition,
                     Some(TriggerCondition::Not { condition })
-                        if matches!(**condition, TriggerCondition::SourceIsTapped)
+                        if is_tapped_condition(condition)
                 ),
-            "bare `enters` must not attach SourceIsTapped; got {:?}",
+            "bare `enters` must not attach a tapped-state condition; got {:?}",
             def.condition
+        );
+    }
+
+    // Guard: Genesis Chamber's "if ~ is untapped" intervening-if goes through
+    // `static_condition_to_trigger_condition` — a DIFFERENT parser path from
+    // `parse_enters_tapped_state_rider` — and must keep emitting the
+    // source-bound `SourceIsTapped` (the subject is the ability's own source,
+    // not a zone-change event object). This pins the two paths as distinct so
+    // the ETB-rider fix does not leak into source-bound intervening-ifs.
+    #[test]
+    fn trigger_intervening_if_source_untapped_keeps_source_is_tapped() {
+        let def = parse_trigger_line(
+            "Whenever a nontoken creature enters, if this artifact is untapped, that creature's controller creates a 1/1 colorless Myr artifact creature token.",
+            "Genesis Chamber",
+        );
+        assert_eq!(def.mode, TriggerMode::ChangesZone);
+        assert_eq!(
+            def.condition,
+            Some(TriggerCondition::Not {
+                condition: Box::new(TriggerCondition::SourceIsTapped)
+            })
         );
     }
 
@@ -7637,18 +7704,18 @@ mod tests {
         assert_eq!(
             parse_enters_tapped_state_rider("s untapped"),
             Some(TriggerCondition::Not {
-                condition: Box::new(TriggerCondition::SourceIsTapped)
+                condition: Box::new(TriggerCondition::ZoneChangeObjectIsTapped)
             })
         );
         assert_eq!(
             parse_enters_tapped_state_rider("s untapped "),
             Some(TriggerCondition::Not {
-                condition: Box::new(TriggerCondition::SourceIsTapped)
+                condition: Box::new(TriggerCondition::ZoneChangeObjectIsTapped)
             })
         );
         assert_eq!(
             parse_enters_tapped_state_rider("s tapped,"),
-            Some(TriggerCondition::SourceIsTapped)
+            Some(TriggerCondition::ZoneChangeObjectIsTapped)
         );
     }
 

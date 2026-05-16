@@ -2682,9 +2682,25 @@ pub(crate) fn check_trigger_condition(
         TriggerCondition::IsMonarch => state.monarch == Some(controller),
         // CR 702.131a: True when the controller has the city's blessing.
         TriggerCondition::HasCityBlessing => state.city_blessing.contains(&controller),
-        // CR 611.2b: True when the trigger source is tapped. Negation ("untapped")
+        // CR 110.5b: True when the trigger source is tapped. Negation ("untapped")
         // wraps via `Not { Box::new(SourceIsTapped) }`.
         TriggerCondition::SourceIsTapped => source_id
+            .and_then(|id| state.objects.get(&id))
+            .is_some_and(|obj| obj.tapped),
+        // CR 603.4 + CR 603.6a + CR 110.5b: "enters tapped" rider — the subject
+        // is the permanent named by the triggering zone-change event (the
+        // entering permanent), not the ability's own source. Resolve the
+        // entering object from `trigger_event`; fall back to `source_id` for
+        // the SelfRef case where the entering permanent IS the source.
+        // Negation ("enters untapped") wraps via `Not`. Permissive on a missing
+        // object: an unfindable id yields `false` here (so `Not` yields `true`),
+        // matching the `WasCast` arm's documented permissive-on-missing behavior.
+        TriggerCondition::ZoneChangeObjectIsTapped => trigger_event
+            .and_then(|e| match e {
+                GameEvent::ZoneChanged { object_id, .. } => Some(*object_id),
+                _ => None,
+            })
+            .or(source_id)
             .and_then(|id| state.objects.get(&id))
             .is_some_and(|obj| obj.tapped),
         // CR 701.27g: True when the trigger source is a transformed permanent (DFC
@@ -6868,14 +6884,24 @@ pub mod tests {
         ));
     }
 
-    // === CR 603.6a + CR 611.2b: "When ~ enters untapped/tapped" ETB gating ===
+    // === CR 603.6a + CR 110.5b: "When ~ enters untapped/tapped" ETB gating ===
     //
     // Gingerbread Cabin class ("When this land enters untapped, create a Food
-    // token.") relies on `Not { Box::new(SourceIsTapped) }` evaluating the
-    // post-replacement-pipeline tapped state of the source at trigger-check
-    // time. The parser already attaches the condition; these tests guard the
-    // runtime evaluator so an ETB tapped via the "enters tapped unless ..."
-    // replacement suppresses the Food trigger, and an ETB untapped fires it.
+    // token.") relies on `Not { Box::new(ZoneChangeObjectIsTapped) }` evaluating
+    // the post-replacement-pipeline tapped state of the entering permanent at
+    // trigger-check time. The parser already attaches the condition; these
+    // tests guard the runtime evaluator so an ETB tapped via the "enters tapped
+    // unless ..." replacement suppresses the Food trigger, and an ETB untapped
+    // fires it.
+    //
+    // NOTE: These two `source_enters_untapped_*` tests call
+    // `check_trigger_condition` with `trigger_event = None`, so the
+    // `ZoneChangeObjectIsTapped` evaluator resolves *only* via its
+    // `.or(source_id)` fallback path — the SelfRef case where the entering
+    // permanent IS the source. They exercise the fallback, not the
+    // event-object resolution path. The event-object path is covered by the
+    // real-pipeline observer tests in `effects/change_zone.rs`
+    // (`amulet_of_vigor_*`, `charismatic_conqueror_*`).
 
     #[test]
     fn source_enters_untapped_fires_when_object_untapped() {
@@ -6889,8 +6915,11 @@ pub mod tests {
         );
         state.objects.get_mut(&src).unwrap().tapped = false;
 
+        // SelfRef tapland: parser emits `Not(ZoneChangeObjectIsTapped)`. With
+        // `trigger_event = None` this resolves via the `.or(source_id)`
+        // fallback — exercising only the SelfRef (source == entering) path.
         let cond = TriggerCondition::Not {
-            condition: Box::new(TriggerCondition::SourceIsTapped),
+            condition: Box::new(TriggerCondition::ZoneChangeObjectIsTapped),
         };
         assert!(check_trigger_condition(
             &state,
@@ -6916,8 +6945,11 @@ pub mod tests {
         );
         state.objects.get_mut(&src).unwrap().tapped = true;
 
+        // SelfRef tapland: parser emits `Not(ZoneChangeObjectIsTapped)`. With
+        // `trigger_event = None` this resolves via the `.or(source_id)`
+        // fallback — exercising only the SelfRef (source == entering) path.
         let cond = TriggerCondition::Not {
-            condition: Box::new(TriggerCondition::SourceIsTapped),
+            condition: Box::new(TriggerCondition::ZoneChangeObjectIsTapped),
         };
         assert!(!check_trigger_condition(
             &state,
@@ -6928,27 +6960,62 @@ pub mod tests {
         ));
     }
 
+    // CR 603.6a + CR 110.5b: `ZoneChangeObjectIsTapped` resolves the *entering*
+    // permanent from the triggering `ZoneChanged` event, NOT the ability
+    // source. This test drives a real `ZoneChanged` event with the entering
+    // object distinct from `source_id` to pin the event-object resolution
+    // path (the `.or(source_id)` fallback is exercised separately by the
+    // SelfRef-tapland tests above).
     #[test]
-    fn source_enters_tapped_fires_when_object_tapped() {
-        // Amulet of Vigor class: "enters tapped" rider fires only for tapped
-        // ETBs.
+    fn zone_change_object_is_tapped_reads_entering_object_from_event() {
         let mut state = setup();
-        let src = create_object(
+        // Ability source — deliberately untapped, so a `source_id`-based read
+        // would yield `false`.
+        let ability_source = create_object(
             &mut state,
             CardId(1),
             PlayerId(0),
             "Amulet of Vigor".to_string(),
             Zone::Battlefield,
         );
-        state.objects.get_mut(&src).unwrap().tapped = true;
+        state.objects.get_mut(&ability_source).unwrap().tapped = false;
+        // The entering permanent — a *different* object, tapped.
+        let entering = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Lotus Field".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&entering).unwrap().tapped = true;
 
-        let cond = TriggerCondition::SourceIsTapped;
+        let event = GameEvent::ZoneChanged {
+            object_id: entering,
+            from: Some(Zone::Hand),
+            to: Zone::Battlefield,
+            record: Box::new(ZoneChangeRecord::test_minimal(
+                entering,
+                Some(Zone::Hand),
+                Zone::Battlefield,
+            )),
+        };
+        let cond = TriggerCondition::ZoneChangeObjectIsTapped;
+        // True: the *entering* object is tapped, even though `source_id` is not.
         assert!(check_trigger_condition(
             &state,
             &cond,
             PlayerId(0),
-            Some(src),
-            None,
+            Some(ability_source),
+            Some(&event),
+        ));
+        // The untapped-entering case must NOT satisfy the condition.
+        state.objects.get_mut(&entering).unwrap().tapped = false;
+        assert!(!check_trigger_condition(
+            &state,
+            &cond,
+            PlayerId(0),
+            Some(ability_source),
+            Some(&event),
         ));
     }
 

@@ -13,6 +13,7 @@ use nom::Parser;
 use super::oracle_cost::parse_oracle_cost;
 use super::oracle_effect::subject::{parse_restriction_modes, static_mode_needs_grant_propagation};
 use super::oracle_effect::{parse_effect_chain, strip_trailing_duration};
+use super::oracle_ir::context::ParseContext;
 use super::oracle_ir::static_ir::StaticIr;
 use super::oracle_nom::bridge::nom_on_lower;
 use super::oracle_nom::condition as nom_condition;
@@ -4528,20 +4529,22 @@ fn parse_spells_have_keyword(tp: &TextPair<'_>, text: &str) -> Option<StaticDefi
         // (Imoti, Celebrant of Bounty: "Spells you cast with mana value 6 or
         // greater have cascade."). Variable-X thresholds may be bound by the
         // keyword clause's trailing "where X is …" quantity (Abaddon class).
-        let mv_filter = parse_mana_value_suffix(cursor).and_then(|(prop, consumed)| {
-            let FilterProp::Cmc { comparator, value } = prop else {
-                return None;
-            };
-            let value = match where_x.as_ref() {
-                Some(qty) => bind_where_x_in_quantity_expr(value, qty)?,
-                None => match value {
-                    QuantityExpr::Fixed { .. } => value,
-                    _ => return None,
-                },
-            };
-            cursor = cursor[consumed..].trim_start();
-            Some(FilterProp::Cmc { comparator, value })
-        });
+        let mv_filter = parse_mana_value_suffix(cursor, &mut ParseContext::default()).and_then(
+            |(prop, consumed)| {
+                let FilterProp::Cmc { comparator, value } = prop else {
+                    return None;
+                };
+                let value = match where_x.as_ref() {
+                    Some(qty) => bind_where_x_in_quantity_expr(value, qty)?,
+                    None => match value {
+                        QuantityExpr::Fixed { .. } => value,
+                        _ => return None,
+                    },
+                };
+                cursor = cursor[consumed..].trim_start();
+                Some(FilterProp::Cmc { comparator, value })
+            },
+        );
         let _ = cursor; // qualifiers are optional; remaining slice is unused
 
         let base_filter = if type_part.is_empty() {

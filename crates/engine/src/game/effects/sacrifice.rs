@@ -1089,4 +1089,170 @@ mod tests {
             assert_eq!(*count, 0, "search for \"up to 0\" must allow 0 picks");
         }
     }
+
+    /// Issue #463 — Soul Shatter: "Each opponent sacrifices a creature or
+    /// planeswalker with the greatest mana value among creatures and
+    /// planeswalkers they control."
+    ///
+    /// CR 202.3 + CR 608.2h + CR 701.21a: each opponent's eligible pool must
+    /// be restricted to *that opponent's* permanents tied for the greatest
+    /// mana value among their own creatures/planeswalkers — never a global
+    /// battlefield maximum.
+    ///
+    /// The board is constructed so the two opponents have *different* maxima
+    /// and P2's max strictly exceeds P1's: P1 controls MV 2/3/5/5 (max 5),
+    /// P2 controls MV 1/6 (max 6). A global-aggregate bug would compute
+    /// max = 6 across both boards and offer P1 *nothing* (no MV-6 of P1's),
+    /// while offering P2 only their MV-6. Correct per-controller scoping
+    /// offers P1 exactly their two MV-5 permanents and P2 exactly their MV-6.
+    /// Each opponent's resolution is driven through `resolve_ability_chain`
+    /// with that opponent rebound as the acting controller — exactly what the
+    /// `player_scope` loop in `effects/mod.rs` does per opponent.
+    #[test]
+    fn soul_shatter_offers_only_per_opponent_greatest_mv_permanents() {
+        use crate::types::ability::{
+            AggregateFunction, Comparator, ControllerRef, FilterProp, ObjectProperty, QuantityExpr,
+            QuantityRef, TypeFilter, TypedFilter,
+        };
+        use crate::types::card_type::CoreType;
+        use crate::types::mana::ManaCost;
+
+        // 3-player game: caster P0, opponents P1 and P2.
+        let mut state = GameState::new(crate::types::format::FormatConfig::standard(), 3, 99);
+
+        // Place a creature/planeswalker for `owner` with the given mana value
+        // and core type, returning its ObjectId.
+        let place = |state: &mut GameState, owner: PlayerId, mv: u32, ty: CoreType| {
+            let id = create_object(
+                state,
+                CardId(state.next_object_id),
+                owner,
+                format!("P{}-MV{mv}", owner.0),
+                Zone::Battlefield,
+            );
+            let obj = state.objects.get_mut(&id).expect("object exists");
+            obj.card_types.core_types.push(ty);
+            obj.mana_cost = ManaCost::generic(mv);
+            id
+        };
+
+        // P1 controls MV 2, 3, 5, 5 — max is 5 (two permanents tied).
+        let p1_mv2 = place(&mut state, PlayerId(1), 2, CoreType::Creature);
+        let p1_mv3 = place(&mut state, PlayerId(1), 3, CoreType::Planeswalker);
+        let p1_mv5a = place(&mut state, PlayerId(1), 5, CoreType::Creature);
+        let p1_mv5b = place(&mut state, PlayerId(1), 5, CoreType::Planeswalker);
+        // P2 controls MV 1, 6 — max is 6, strictly greater than P1's max.
+        let p2_mv1 = place(&mut state, PlayerId(2), 1, CoreType::Creature);
+        let p2_mv6 = place(&mut state, PlayerId(2), 6, CoreType::Creature);
+
+        // The Soul Shatter target filter: Or[Typed(Creature, You, [Cmc]),
+        // Typed(Planeswalker, You, [Cmc])] where the Cmc prop carries the
+        // per-controller `Aggregate { Max, ManaValue, eligible-set }`.
+        let eligible_set = TargetFilter::Or {
+            filters: vec![
+                TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
+                TargetFilter::Typed(
+                    TypedFilter::default()
+                        .with_type(TypeFilter::Planeswalker)
+                        .controller(ControllerRef::You),
+                ),
+            ],
+        };
+        let superlative = FilterProp::Cmc {
+            comparator: Comparator::EQ,
+            value: QuantityExpr::Ref {
+                qty: QuantityRef::Aggregate {
+                    function: AggregateFunction::Max,
+                    property: ObjectProperty::ManaValue,
+                    filter: eligible_set,
+                },
+            },
+        };
+        let soul_shatter_target = TargetFilter::Or {
+            filters: vec![
+                TargetFilter::Typed(
+                    TypedFilter::creature()
+                        .controller(ControllerRef::You)
+                        .properties(vec![superlative.clone()]),
+                ),
+                TargetFilter::Typed(
+                    TypedFilter::default()
+                        .with_type(TypeFilter::Planeswalker)
+                        .controller(ControllerRef::You)
+                        .properties(vec![superlative]),
+                ),
+            ],
+        };
+
+        // Build the per-opponent sacrifice resolution. The `player_scope`
+        // loop (`effects/mod.rs`) rebinds `controller` to each opponent before
+        // resolving the chain; we mirror that here by constructing the chain
+        // with the opponent already bound as `controller`.
+        let make_per_opponent = |opponent: PlayerId| {
+            ResolvedAbility::new(
+                Effect::Sacrifice {
+                    target: soul_shatter_target.clone(),
+                    count: QuantityExpr::Fixed { value: 1 },
+                    min_count: 0,
+                },
+                vec![],
+                ObjectId(500),
+                opponent,
+            )
+        };
+
+        // --- Opponent P1: max over P1's board is 5; pool = the two MV-5. ---
+        let mut state_p1 = state.clone();
+        let mut events = Vec::new();
+        resolve_ability_chain(
+            &mut state_p1,
+            &make_per_opponent(PlayerId(1)),
+            &mut events,
+            0,
+        )
+        .unwrap();
+        match &state_p1.waiting_for {
+            WaitingFor::EffectZoneChoice { player, cards, .. } => {
+                assert_eq!(*player, PlayerId(1), "P1 is the chooser");
+                let mut got = cards.clone();
+                got.sort_by_key(|id| id.0);
+                let mut want = vec![p1_mv5a, p1_mv5b];
+                want.sort_by_key(|id| id.0);
+                assert_eq!(
+                    got, want,
+                    "P1 must be offered exactly their two MV-5 permanents \
+                     (a global max=6 bug would leave P1 with an empty pool)"
+                );
+                assert!(!cards.contains(&p1_mv2) && !cards.contains(&p1_mv3));
+                assert!(!cards.contains(&p2_mv1) && !cards.contains(&p2_mv6));
+            }
+            other => panic!("expected EffectZoneChoice for P1, got {other:?}"),
+        }
+
+        // --- Opponent P2: max over P2's board is 6; pool = the single MV-6. ---
+        let mut state_p2 = state.clone();
+        let mut events = Vec::new();
+        resolve_ability_chain(
+            &mut state_p2,
+            &make_per_opponent(PlayerId(2)),
+            &mut events,
+            0,
+        )
+        .unwrap();
+        // P2 has exactly one permanent at their max (MV-6) and one other; the
+        // single-permanent fast path auto-sacrifices it, so assert it landed
+        // in P2's graveyard and the MV-1 stayed on the battlefield.
+        assert!(
+            state_p2.players[2].graveyard.contains(&p2_mv6),
+            "P2's MV-6 (their per-board max) must be the sacrificed permanent"
+        );
+        assert!(
+            state_p2.battlefield.contains(&p2_mv1),
+            "P2's MV-1 is below their per-board max and must not be sacrificed"
+        );
+        assert!(
+            state_p2.battlefield.contains(&p1_mv5a) && state_p2.battlefield.contains(&p1_mv5b),
+            "P1's permanents are untouched when P2 is the sacrificing opponent"
+        );
+    }
 }

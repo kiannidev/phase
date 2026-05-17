@@ -8344,7 +8344,10 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
         // inputs of the form "spell from <zone> with mana value ..." the
         // suffix clause is past the type-phrase scan position.
         if let Ok((after_take, _)) = take_until::<_, _, E>("with mana value ").parse(rest) {
-            if let Some((prop, _)) = super::oracle_target::parse_mana_value_suffix(after_take) {
+            if let Some((prop, _)) = super::oracle_target::parse_mana_value_suffix(
+                after_take,
+                &mut ParseContext::default(),
+            ) {
                 if let TargetFilter::Typed(ref mut tf) = filter {
                     if !tf
                         .properties

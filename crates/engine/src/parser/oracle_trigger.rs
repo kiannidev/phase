@@ -6469,7 +6469,9 @@ pub(crate) fn parse_post_spell_modifier(modifier: &str) -> Option<TargetFilter> 
     // `parse_mana_value_suffix` combinator so the full set of comparator forms
     // (static N, X-variable, EventContextSourceManaValue) is supported here for
     // free alongside the search filter and target filter call sites.
-    if let Some((prop, consumed)) = super::oracle_target::parse_mana_value_suffix(modifier) {
+    if let Some((prop, consumed)) =
+        super::oracle_target::parse_mana_value_suffix(modifier, &mut ParseContext::default())
+    {
         if modifier[consumed..].trim().is_empty() {
             return Some(TargetFilter::Typed(
                 TypedFilter::default().properties(vec![prop]),

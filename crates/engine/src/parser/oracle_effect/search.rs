@@ -2013,7 +2013,9 @@ fn parse_search_filter_suffixes(
             }
         }
 
-        if let Some((prop, consumed)) = parse_mana_value_suffix(remaining) {
+        if let Some((prop, consumed)) =
+            parse_mana_value_suffix(remaining, &mut ParseContext::default())
+        {
             suffix.properties.push(prop);
             remaining = remaining[consumed..].trim_start();
             continue;

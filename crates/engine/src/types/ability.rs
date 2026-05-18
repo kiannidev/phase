@@ -1130,12 +1130,11 @@ pub enum ManaSpendRestriction {
 
 /// Duration for temporary effects.
 ///
-/// Player-axis variants (`UntilNextTurnOf`, `UntilNextUntapStepOf`) are
-/// parameterized by `PlayerScope` per the workspace "Parameterize, don't
-/// proliferate" principle. `PlayerScope::Controller` recovers the legacy
-/// "until your next turn" / "controller's next untap step" semantics; future
-/// `Target` / `Opponent` / `AllPlayers` readings unblock cards whose duration
-/// is bound to a non-controller player.
+/// Player-axis variants are parameterized by `PlayerScope` per the workspace
+/// "Parameterize, don't proliferate" principle. `PlayerScope::Controller`
+/// recovers the legacy "until your next turn" / "controller's next step"
+/// semantics; future `Target` / `Opponent` / `AllPlayers` readings unblock
+/// cards whose duration is bound to a non-controller player.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Duration {
     /// CR 514.2: Effect expires at end of turn (cleanup step).
@@ -1151,11 +1150,12 @@ pub enum Duration {
     /// CR 611.2a: Effect expires when the source object leaves the
     /// battlefield.
     UntilHostLeavesPlay,
-    /// CR 502.3 + CR 611.2a: Effect expires at the beginning of `player`'s
-    /// next untap step. `PlayerScope::Controller` corresponds to the legacy
-    /// "controller's next untap step" reading used by exert / "doesn't
-    /// untap" effects.
-    UntilNextUntapStepOf {
+    /// CR 500.1 + CR 611.2a: Effect expires at the beginning of `player`'s
+    /// next named phase/step. `Phase::Untap` covers exert / "doesn't untap"
+    /// effects (CR 502.3). `Phase::End` covers "until your next end step"
+    /// floating play-permission patterns such as Rocco, Street Chef (CR 513.1).
+    UntilNextStepOf {
+        step: Phase,
         player: PlayerScope,
     },
     /// CR 611.2b: "for as long as [condition]" — effect persists while condition holds.
@@ -7514,6 +7514,14 @@ pub struct AbilityDefinition {
     /// Produced by "each opponent discards", "each player draws", etc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub player_scope: Option<PlayerFilter>,
+    /// CR 101.4 + CR 800.4: Override the default APNAP turn-order start for
+    /// `player_scope` iteration. `None` = use the active player (standard
+    /// APNAP order per CR 101.4). `Some(ControllerRef::You)` = start with the
+    /// ability's controller (Join Forces: "Starting with you, each player may
+    /// pay any amount of mana"). The iteration site in `effects/mod.rs` reads
+    /// this via `players::apnap_order_from(state, starting_with, controller)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starting_with: Option<ControllerRef>,
     /// CR 115.1 + CR 701.9b: Selection mode for this ability's target slot(s).
     /// `Chosen` (default) = the controller chooses each target per CR 115.1.
     /// `Random` = the game uniformly selects from each slot's legal-target set
@@ -7637,6 +7645,7 @@ impl AbilityDefinition {
             cost_reduction: None,
             forward_result: false,
             player_scope: None,
+            starting_with: None,
             target_selection_mode: TargetSelectionMode::Chosen,
             repeat_until: None,
             sub_link: SubAbilityLink::ContinuationStep,
@@ -7645,6 +7654,13 @@ impl AbilityDefinition {
 
     pub fn player_scope(mut self, scope: PlayerFilter) -> Self {
         self.player_scope = Some(scope);
+        self
+    }
+
+    /// CR 101.4 + CR 800.4: Set the turn-order start for `player_scope`
+    /// iteration. See `AbilityDefinition::starting_with` doc for details.
+    pub fn starting_with(mut self, who: ControllerRef) -> Self {
+        self.starting_with = Some(who);
         self
     }
 
@@ -9784,6 +9800,14 @@ pub struct ResolvedAbility {
     /// When set, the effect iterates over matching players (each becomes the acting player).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub player_scope: Option<PlayerFilter>,
+    /// CR 101.4 + CR 800.4: Override the default APNAP turn-order start for
+    /// `player_scope` iteration. Carried through from `AbilityDefinition` so
+    /// the iteration site in `effects/mod.rs` can call
+    /// `players::apnap_order_from(state, starting_with, controller)`.
+    /// `None` = use active player (standard APNAP). `Some(ControllerRef::You)`
+    /// = start with `controller` (Join Forces: "Starting with you, ...").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starting_with: Option<ControllerRef>,
     /// CR 107.1b + CR 601.2f: The value of X chosen by the caster when this
     /// ability was cast/activated. `None` for abilities whose cost has no X.
     /// Read during resolution by `QuantityRef::Variable { name: "X" }`.
@@ -9873,6 +9897,7 @@ impl ResolvedAbility {
             unless_pay: None,
             distribution: None,
             player_scope: None,
+            starting_with: None,
             chosen_x: None,
             cost_paid_object: None,
             effect_context_object: None,
@@ -10758,7 +10783,12 @@ mod tests {
             Duration::UntilNextTurnOf {
                 player: PlayerScope::Controller,
             },
-            Duration::UntilNextUntapStepOf {
+            Duration::UntilNextStepOf {
+                step: Phase::Untap,
+                player: PlayerScope::Controller,
+            },
+            Duration::UntilNextStepOf {
+                step: Phase::End,
                 player: PlayerScope::Controller,
             },
             Duration::UntilHostLeavesPlay,

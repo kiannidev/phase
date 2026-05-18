@@ -19,6 +19,7 @@ use crate::types::game_state::{DayNight, GameState};
 use crate::types::identifiers::ObjectId;
 use crate::types::keywords::Keyword;
 use crate::types::layers::{ActiveContinuousEffect, Layer};
+use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 use crate::types::statics::StaticMode;
 
@@ -57,6 +58,29 @@ pub fn prune_end_of_combat_effects(state: &mut GameState) {
     }
 }
 
+/// CR 513.1 + CR 611.2a: Remove transient continuous effects whose
+/// `Duration::UntilNextStepOf { step: Phase::End, player: Controller }` expires at the start of
+/// `active_player`'s end step. Called from `turns.rs::auto_advance` at the
+/// End phase alongside `prune_end_step_casting_permissions` so any future
+/// parser arm that emits this duration on a `TimedContinuousEffect` (pump,
+/// control change, etc.) is pruned by its scheduled step rather than
+/// outliving it.
+pub fn prune_until_next_end_step_effects(state: &mut GameState, active_player: PlayerId) {
+    let before = state.transient_continuous_effects.len();
+    state.transient_continuous_effects.retain(|e| {
+        !(matches!(
+            e.duration,
+            Duration::UntilNextStepOf {
+                step: Phase::End,
+                player: PlayerScope::Controller
+            }
+        ) && e.controller == active_player)
+    });
+    if state.transient_continuous_effects.len() != before {
+        state.layers_dirty = true;
+    }
+}
+
 /// CR 514.2 + CR 611.2a: Remove `PlayFromExile` casting permissions whose
 /// `Duration::UntilEndOfTurn` expires at cleanup. Called from the cleanup step
 /// alongside `prune_end_of_turn_effects`.
@@ -81,7 +105,17 @@ pub fn prune_end_of_turn_casting_permissions(state: &mut GameState) {
                 duration: Duration::UntilNextTurnOf { .. } | Duration::Permanent,
                 ..
             } => true,
-            // UntilHostLeavesPlay / ForAsLongAs / UntilNextUntapStepOf:
+            // CR 513.1: `UntilNextStepOf { step: End }` is expired by
+            // `prune_end_step_casting_permissions` at the End phase entry,
+            // NOT at cleanup. Retain here.
+            CastingPermission::PlayFromExile {
+                duration:
+                    Duration::UntilNextStepOf {
+                        step: Phase::End, ..
+                    },
+                ..
+            } => true,
+            // UntilHostLeavesPlay / ForAsLongAs / UntilNextStepOf { step: Untap }:
             // these are pruned by their own systems (zone-exit cleanup, condition
             // re-evaluation, untap step). Retain here — they are not end-of-turn.
             CastingPermission::PlayFromExile { .. } => true,
@@ -115,6 +149,16 @@ pub fn prune_until_next_turn_casting_permissions(state: &mut GameState, active_p
                 granted_to,
                 ..
             } => *granted_to != active_player,
+            // CR 513.1 + CR 611.2a/b: `UntilNextStepOf { step: End }` is
+            // expired by `prune_end_step_casting_permissions` at the end
+            // step, NOT at the untap step. Retain here.
+            CastingPermission::PlayFromExile {
+                duration:
+                    Duration::UntilNextStepOf {
+                        step: Phase::End, ..
+                    },
+                ..
+            } => true,
             CastingPermission::PlayFromExile { .. }
             | CastingPermission::AdventureCreature
             | CastingPermission::ExileWithAltCost { .. }
@@ -123,6 +167,45 @@ pub fn prune_until_next_turn_casting_permissions(state: &mut GameState, active_p
             | CastingPermission::WarpExile { .. }
             // CR 702.170d: Plotted persists across turns; never pruned at the
             // untap step. Retention is zone-scoped (see zones::apply_zone_exit_cleanup).
+            | CastingPermission::Plotted { .. }
+            | CastingPermission::Foretold { .. } => true,
+        });
+    }
+}
+
+/// CR 513.1 + CR 611.2a/b: Remove `PlayFromExile` permissions granted to
+/// `active_player` whose `Duration::UntilNextStepOf { step: End, player: Controller }`
+/// expires at that player's next end step. Called at the start of the
+/// End phase in `turns.rs::auto_advance`.
+///
+/// CR 513.2 ordering: this prune runs BEFORE end-step triggers fire, so a
+/// new grant created by an end-step trigger (e.g., Rocco, Street Chef) is
+/// NOT wiped by the same end step's prune — the new trigger cannot back up
+/// per CR 513.2, so the new permission lands AFTER the prune completes.
+///
+/// 2023-05-12 Wizards ruling on Rocco, Street Chef: the permission outlives
+/// the granting permanent leaving the battlefield. This prune keys off the
+/// permission's `granted_to`, not the source object's presence on the
+/// battlefield.
+pub fn prune_end_step_casting_permissions(state: &mut GameState, active_player: PlayerId) {
+    for obj in state.objects.iter_mut().map(|(_, v)| v) {
+        obj.casting_permissions.retain(|p| match p {
+            CastingPermission::PlayFromExile {
+                duration:
+                    Duration::UntilNextStepOf {
+                        step: Phase::End,
+                        player: PlayerScope::Controller,
+                    },
+                granted_to,
+                exiled_by_ability_controller,
+                ..
+            } => exiled_by_ability_controller.unwrap_or(*granted_to) != active_player,
+            CastingPermission::PlayFromExile { .. }
+            | CastingPermission::AdventureCreature
+            | CastingPermission::ExileWithAltCost { .. }
+            | CastingPermission::ExileWithAltAbilityCost { .. }
+            | CastingPermission::ExileWithEnergyCost
+            | CastingPermission::WarpExile { .. }
             | CastingPermission::Plotted { .. }
             | CastingPermission::Foretold { .. } => true,
         });
@@ -169,7 +252,8 @@ pub fn prune_controller_untap_step_effects(state: &mut GameState, active_player:
     state.transient_continuous_effects.retain(|e| {
         if !matches!(
             e.duration,
-            Duration::UntilNextUntapStepOf {
+            Duration::UntilNextStepOf {
+                step: Phase::Untap,
                 player: PlayerScope::Controller
             }
         ) {

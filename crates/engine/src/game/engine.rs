@@ -3895,6 +3895,7 @@ fn handle_play_land(
                     events.push(GameEvent::LandPlayed {
                         object_id,
                         player_id: player,
+                        from_zone: origin_zone,
                     });
                     return Ok(next_waiting_for);
                 }
@@ -3923,6 +3924,7 @@ fn handle_play_land(
             events.push(GameEvent::LandPlayed {
                 object_id,
                 player_id: player,
+                from_zone: origin_zone,
             });
 
             return Ok(super::replacement::replacement_choice_waiting_for(
@@ -3950,6 +3952,7 @@ fn handle_play_land(
     events.push(GameEvent::LandPlayed {
         object_id,
         player_id: player,
+        from_zone: origin_zone,
     });
 
     // Player retains priority after playing a land
@@ -6632,7 +6635,8 @@ mod tests {
             Zone::Battlefield,
         );
         {
-            let duration = Duration::UntilNextUntapStepOf {
+            let duration = Duration::UntilNextStepOf {
+                step: Phase::Untap,
                 player: PlayerScope::Controller,
             };
             let obj = state.objects.get_mut(&vorinclex).unwrap();

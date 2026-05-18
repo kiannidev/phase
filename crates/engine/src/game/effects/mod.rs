@@ -1979,10 +1979,16 @@ fn resolve_chain_body(
     if let Some(ref scope) = ability.player_scope {
         let scoped_events_before = events.len();
         let controller = ability.controller;
-        let matching_players: Vec<PlayerId> = crate::game::players::apnap_order(state)
-            .into_iter()
-            .filter(|pid| matches_player_scope(state, *pid, scope, controller, ability.source_id))
-            .collect();
+        // CR 101.4 + CR 800.4: Join Forces overrides the APNAP anchor with
+        // "Starting with you"; otherwise this remains standard APNAP order.
+        let matching_players: Vec<PlayerId> = crate::game::players::apnap_order_from(
+            state,
+            ability.starting_with.clone(),
+            controller,
+        )
+        .into_iter()
+        .filter(|pid| matches_player_scope(state, *pid, scope, controller, ability.source_id))
+        .collect();
         let (scoped_template, after_scope) = split_player_scope_chain(ability);
 
         let initial_waiting_for = state.waiting_for.clone();

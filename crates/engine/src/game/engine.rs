@@ -13411,6 +13411,7 @@ mod phase_trigger_regression_tests {
             under_your_control: false,
             enters_attacking: false,
             owner_library: false,
+            track_exiled_by_source: false,
         };
         state.pending_continuation = Some(crate::types::game_state::PendingContinuation::new(
             Box::new(ResolvedAbility::new(
@@ -13464,6 +13465,7 @@ mod phase_trigger_regression_tests {
             under_your_control: false,
             enters_attacking: false,
             owner_library: false,
+            track_exiled_by_source: false,
         };
 
         let result = apply_as_current(&mut state, GameAction::SelectCards { cards: vec![] });

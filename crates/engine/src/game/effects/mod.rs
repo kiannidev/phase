@@ -1259,7 +1259,9 @@ fn affected_objects_from_events(effect: &Effect, events: &[GameEvent]) -> Vec<Ob
                 // to that zone makes a downstream "from among the milled cards"
                 // sub-ability resolve against exactly the milled cards.
                 Effect::Mill { destination, .. } => Some(*destination),
-                Effect::ExileTop { .. } => Some(crate::types::zones::Zone::Exile),
+                Effect::ExileTop { .. } | Effect::ExileFromTopUntil { .. } => {
+                    Some(crate::types::zones::Zone::Exile)
+                }
                 // CR 701.9a: discarded cards land in the graveyard; "for each
                 // card discarded this way" counts exactly those (CR 701.9c
                 // excludes a discard redirected by a replacement to another
@@ -1807,6 +1809,20 @@ fn previous_effect_counts_by_player_from_events(
     counts
 }
 
+fn mark_exile_choice_tracks_by_source(state: &mut GameState, source: ObjectId) {
+    if let WaitingFor::EffectZoneChoice {
+        source_id,
+        destination: Some(crate::types::zones::Zone::Exile),
+        track_exiled_by_source,
+        ..
+    } = &mut state.waiting_for
+    {
+        if *source_id == source {
+            *track_exiled_by_source = true;
+        }
+    }
+}
+
 /// Resolve an ability and follow its sub_ability chain using typed nested structs.
 /// No SVar lookup, no parse_ability(). The depth is bounded by the data structure.
 pub fn resolve_ability_chain(
@@ -1990,6 +2006,9 @@ fn resolve_chain_body(
         .filter(|pid| matches_player_scope(state, *pid, scope, controller, ability.source_id))
         .collect();
         let (scoped_template, after_scope) = split_player_scope_chain(ability);
+        let after_scope_needs_linked_exile = after_scope.as_ref().is_some_and(|tail| {
+            crate::game::exile_links::ability_contains_linked_exile_consumer(tail)
+        });
 
         let initial_waiting_for = state.waiting_for.clone();
         let mut paused = false;
@@ -2003,6 +2022,9 @@ fn resolve_chain_body(
             // CR 608.2e: Break if inner effect entered a player-choice state —
             // remaining players resume after the choice resolves via continuation.
             if state.waiting_for != initial_waiting_for {
+                if after_scope_needs_linked_exile {
+                    mark_exile_choice_tracks_by_source(state, ability.source_id);
+                }
                 let remaining = &matching_players[i + 1..];
                 let mut tail = after_scope.clone();
                 // Build continuation chain for remaining players in APNAP order.
@@ -2037,8 +2059,24 @@ fn resolve_chain_body(
         {
             state.last_effect_amount = Some(amount);
         }
+        let affected_ids = if next_sub_needs_tracked_set(ability) || after_scope_needs_linked_exile
+        {
+            affected_objects_from_events(&scoped_template.effect, scoped_events)
+        } else {
+            Vec::new()
+        };
+        if after_scope_needs_linked_exile {
+            for id in &affected_ids {
+                if state
+                    .objects
+                    .get(id)
+                    .is_some_and(|obj| obj.zone == crate::types::zones::Zone::Exile)
+                {
+                    crate::game::exile_links::push_tracked_by_source(state, *id, ability.source_id);
+                }
+            }
+        }
         if next_sub_needs_tracked_set(ability) {
-            let affected_ids = affected_objects_from_events(&scoped_template.effect, scoped_events);
             publish_tracked_set(state, affected_ids);
         }
         if !paused {
@@ -3552,7 +3590,7 @@ mod tests {
         ContinuousModification, ControllerRef, DelayedTriggerCondition, Duration, FilterProp,
         GainLifePlayer, ManaSpendPermission, PermissionGrantee, PlayerFilter, PlayerScope, PtValue,
         QuantityExpr, QuantityRef, SpellContext, StaticDefinition, TargetFilter, TargetRef,
-        TypeFilter, TypedFilter,
+        TypeFilter, TypedFilter, UntilCondition,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
@@ -3965,6 +4003,7 @@ mod tests {
             under_your_control: false,
             enters_attacking: false,
             owner_library: false,
+            track_exiled_by_source: false,
         };
 
         crate::game::engine::apply(
@@ -6497,6 +6536,7 @@ mod tests {
             under_your_control: false,
             enters_attacking: false,
             owner_library: false,
+            track_exiled_by_source: false,
         };
         state.pending_continuation =
             Some(PendingContinuation::new(Box::new(ResolvedAbility::new(
@@ -6530,6 +6570,7 @@ mod tests {
                 under_your_control: false,
                 enters_attacking: false,
                 owner_library: false,
+                track_exiled_by_source: false,
             },
             GameAction::SelectCards {
                 cards: vec![second],
@@ -7069,11 +7110,6 @@ mod tests {
                     .get(&CounterType::Generic("collection".to_string())),
                 Some(&1)
             );
-            assert!(state.exile_links.iter().any(|link| {
-                link.exiled_id == exiled
-                    && link.source_id == evelyn
-                    && matches!(link.kind, ExileLinkKind::TrackedBySource)
-            }));
             assert!(obj.casting_permissions.iter().any(|permission| {
                 matches!(
                     permission,
@@ -7087,6 +7123,268 @@ mod tests {
                 )
             }));
         }
+        assert!(
+            state.exile_links.is_empty(),
+            "tracked-set PlayFromExile permission must not create source exile links"
+        );
+    }
+
+    #[test]
+    fn player_scope_exile_links_for_exiled_by_source_tail_without_tracked_set() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Linked Exile Source".to_string(),
+            Zone::Battlefield,
+        );
+        let p0_top = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "P0 Top".to_string(),
+            Zone::Library,
+        );
+        let p1_top = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "P1 Top".to_string(),
+            Zone::Library,
+        );
+
+        let move_exiled = ResolvedAbility::new(
+            Effect::ChangeZoneAll {
+                origin: Some(Zone::Exile),
+                destination: Zone::Graveyard,
+                target: TargetFilter::ExiledBySource,
+                enter_tapped: false,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let mut exile = ResolvedAbility::new(
+            Effect::ExileTop {
+                player: TargetFilter::Controller,
+                count: QuantityExpr::Fixed { value: 1 },
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        exile.player_scope = Some(PlayerFilter::All);
+        exile.sub_ability = Some(Box::new(move_exiled));
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &exile, &mut events, 0).unwrap();
+
+        assert_eq!(state.objects[&p0_top].zone, Zone::Graveyard);
+        assert_eq!(state.objects[&p1_top].zone, Zone::Graveyard);
+        assert!(
+            state.exile_links.is_empty(),
+            "ExiledBySource tail must consume the temporary source links"
+        );
+    }
+
+    #[test]
+    fn player_scope_exile_until_links_for_exiled_by_source_tail() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Linked Exile Until Source".to_string(),
+            Zone::Battlefield,
+        );
+        let p0_top = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "P0 Top".to_string(),
+            Zone::Library,
+        );
+        let p1_top = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "P1 Top".to_string(),
+            Zone::Library,
+        );
+
+        let move_exiled = ResolvedAbility::new(
+            Effect::ChangeZoneAll {
+                origin: Some(Zone::Exile),
+                destination: Zone::Graveyard,
+                target: TargetFilter::ExiledBySource,
+                enter_tapped: false,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let mut exile_until = ResolvedAbility::new(
+            Effect::ExileFromTopUntil {
+                player: TargetFilter::Controller,
+                until: UntilCondition::NextMatches {
+                    filter: TargetFilter::Any,
+                },
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        exile_until.player_scope = Some(PlayerFilter::All);
+        exile_until.sub_ability = Some(Box::new(move_exiled));
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &exile_until, &mut events, 0).unwrap();
+
+        assert_eq!(state.objects[&p0_top].zone, Zone::Graveyard);
+        assert_eq!(state.objects[&p1_top].zone, Zone::Graveyard);
+        assert!(
+            state.exile_links.is_empty(),
+            "ExileFromTopUntil ExiledBySource tail must consume the temporary source links"
+        );
+    }
+
+    #[test]
+    fn player_scope_interactive_exile_tracks_for_exiled_by_source_tail() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Interactive Linked Exile Source".to_string(),
+            Zone::Battlefield,
+        );
+        let p0_a = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "P0 Grave A".to_string(),
+            Zone::Graveyard,
+        );
+        let p0_b = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "P0 Grave B".to_string(),
+            Zone::Graveyard,
+        );
+        let p1_a = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "P1 Grave A".to_string(),
+            Zone::Graveyard,
+        );
+        let p1_b = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(1),
+            "P1 Grave B".to_string(),
+            Zone::Graveyard,
+        );
+
+        let move_exiled = ResolvedAbility::new(
+            Effect::ChangeZoneAll {
+                origin: Some(Zone::Exile),
+                destination: Zone::Graveyard,
+                target: TargetFilter::ExiledBySource,
+                enter_tapped: false,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let mut exile = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Exile,
+                target: TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Card],
+                    controller: Some(ControllerRef::You),
+                    properties: vec![FilterProp::InZone {
+                        zone: Zone::Graveyard,
+                    }],
+                }),
+                owner_library: false,
+                enter_transformed: false,
+                under_your_control: false,
+                enter_tapped: false,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        exile.player_scope = Some(PlayerFilter::All);
+        exile.sub_ability = Some(Box::new(move_exiled));
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &exile, &mut events, 0).unwrap();
+
+        match &state.waiting_for {
+            WaitingFor::EffectZoneChoice {
+                player,
+                cards,
+                destination: Some(Zone::Exile),
+                track_exiled_by_source,
+                ..
+            } => {
+                assert_eq!(*player, PlayerId(0));
+                assert!(cards.contains(&p0_a));
+                assert!(cards.contains(&p0_b));
+                assert!(*track_exiled_by_source);
+            }
+            other => panic!("expected first EffectZoneChoice, got {other:?}"),
+        }
+
+        crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::SelectCards { cards: vec![p0_a] },
+        )
+        .unwrap();
+
+        assert_eq!(state.objects[&p0_a].zone, Zone::Exile);
+        assert!(state.exile_links.iter().any(|link| {
+            link.exiled_id == p0_a
+                && link.source_id == source
+                && matches!(link.kind, ExileLinkKind::TrackedBySource)
+        }));
+        match &state.waiting_for {
+            WaitingFor::EffectZoneChoice {
+                player,
+                cards,
+                destination: Some(Zone::Exile),
+                track_exiled_by_source,
+                ..
+            } => {
+                assert_eq!(*player, PlayerId(1));
+                assert!(cards.contains(&p1_a));
+                assert!(cards.contains(&p1_b));
+                assert!(*track_exiled_by_source);
+            }
+            other => panic!("expected second EffectZoneChoice, got {other:?}"),
+        }
+
+        crate::game::engine::apply(
+            &mut state,
+            PlayerId(1),
+            GameAction::SelectCards { cards: vec![p1_a] },
+        )
+        .unwrap();
+
+        assert_eq!(state.objects[&p0_a].zone, Zone::Graveyard);
+        assert_eq!(state.objects[&p1_a].zone, Zone::Graveyard);
+        assert_eq!(state.objects[&p0_b].zone, Zone::Graveyard);
+        assert_eq!(state.objects[&p1_b].zone, Zone::Graveyard);
+        assert!(state.exile_links.is_empty());
     }
 
     #[test]

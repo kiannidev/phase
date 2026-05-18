@@ -8154,6 +8154,7 @@ pub mod tests {
             false, // effect_enter_tapped
             None,  // controller_override
             &[],   // effect_enter_with_counters
+            false, // track_exiled_by_source
             &mut events,
         );
 

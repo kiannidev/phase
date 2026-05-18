@@ -916,6 +916,7 @@ export type WaitingFor =
       under_your_control?: boolean;
       enters_attacking?: boolean;
       owner_library?: boolean;
+      track_exiled_by_source?: boolean;
     } }
   | { type: "DrawnThisTurnTopdeckChoice"; data: { player: PlayerId; cards: ObjectId[]; count: number; min_count: number; life_payment: number; source_id: ObjectId } }
   | { type: "RetargetChoice"; data: { player: PlayerId; stack_entry_index: number; scope: RetargetScope; current_targets: TargetRef[]; legal_new_targets: TargetRef[] } }

@@ -1474,6 +1474,8 @@ pub enum WaitingFor {
         enters_attacking: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         owner_library: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        track_exiled_by_source: bool,
     },
     /// Player chooses which drawn-this-turn hand cards to put on top of their
     /// library. Each unchosen required card is kept by paying life.
@@ -4642,6 +4644,7 @@ mod tests {
             under_your_control: false,
             enters_attacking: false,
             owner_library: false,
+            track_exiled_by_source: false,
         }));
         variants.push(Box::new(WaitingFor::DefilerPayment {
             player: PlayerId(0),
@@ -4870,6 +4873,7 @@ mod tests {
             under_your_control: true,
             enters_attacking: false,
             owner_library: false,
+            track_exiled_by_source: false,
         };
         let json = serde_json::to_string(&wf).unwrap();
         let deserialized: WaitingFor = serde_json::from_str(&json).unwrap();

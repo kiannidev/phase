@@ -1302,6 +1302,7 @@ pub(super) fn handle_resolution_choice(
                 under_your_control,
                 enters_attacking,
                 owner_library: _,
+                track_exiled_by_source,
             },
             GameAction::SelectCards { cards: chosen },
         ) => {
@@ -1407,6 +1408,7 @@ pub(super) fn handle_resolution_choice(
                             enter_tapped,
                             controller_override,
                             &[],
+                            track_exiled_by_source,
                             events,
                         ) {
                             effects::change_zone::ZoneMoveResult::Done => {

@@ -30,6 +30,7 @@ pub(crate) mod engine_priority;
 pub(crate) mod engine_replacement;
 pub(crate) mod engine_resolution_choices;
 pub(crate) mod engine_stack;
+pub(crate) mod exile_links;
 pub mod filter;
 pub mod functioning_abilities;
 pub mod game_object;

@@ -462,6 +462,7 @@ pub fn route_debug_create_to_battlefield(
                 event,
                 None,
                 None,
+                false,
                 &mut events,
             );
             super::triggers::process_triggers(state, &events); // CR 603: Process triggers

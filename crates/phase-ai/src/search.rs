@@ -2489,6 +2489,7 @@ mod tests {
             source_id: source,
             remaining_players: Vec::new(),
             all_kept: Vec::new(),
+            scoped_players: Vec::new(),
         };
 
         let action = fallback_action(&state).expect("fallback returns an action");

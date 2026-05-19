@@ -2203,6 +2203,13 @@ pub enum WaitingFor {
         remaining_players: Vec<PlayerId>,
         /// Permanents chosen by previous players — protected from sacrifice.
         all_kept: Vec<ObjectId>,
+        /// CR 102.2 (two-player) / CR 102.3 (team multiplayer): the APNAP-ordered
+        /// set of players within the effect's `player_scope`. Only permanents
+        /// controlled by these players are subject to the sweep. Empty only on a
+        /// mid-resolution save/reload (`#[serde(default)]`), in which case
+        /// `sacrifice_unchosen` falls back to the full APNAP set.
+        #[serde(default)]
+        scoped_players: Vec<PlayerId>,
     },
     /// CR 707.10c: When a spell is copied, the controller may choose new targets.
     /// Each slot shows the current target and legal alternatives.

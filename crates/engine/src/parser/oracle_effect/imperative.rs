@@ -2225,6 +2225,16 @@ pub(super) fn parse_category_and_sacrifice_rest_pub(
     })
 }
 
+/// CR 110.4: The six permanent types — the expansion of the "of each permanent type" idiom.
+const PERMANENT_TYPE_CATEGORIES: [CoreType; 6] = [
+    CoreType::Artifact,
+    CoreType::Battle,
+    CoreType::Creature,
+    CoreType::Enchantment,
+    CoreType::Land,
+    CoreType::Planeswalker,
+];
+
 /// CR 101.4 + CR 701.21a: Parse the "from among ... an artifact, a creature, ..."
 /// or "an artifact, a creature, ... from among ..." pattern after "choose " has been stripped.
 ///
@@ -2238,6 +2248,31 @@ pub(super) fn parse_category_and_sacrifice_rest_pub(
 /// - Category list: `parse_category_item` composed with comma + "and" separator
 fn parse_category_and_sacrifice_rest(rest_lower: &str) -> Option<ChooseImperativeAst> {
     type E<'a> = OracleError<'a>;
+
+    // Pattern 3 (Liliana, Dreadhorde General): generalized "a permanent [they/you/that
+    // player] control[s] of each permanent type" — no enumerated category list, no
+    // "from among". CR 110.4 + CR 701.21a: expands to the six permanent types; "the
+    // rest" are sacrificed. Matching only through "of each permanent type" and
+    // discarding the remainder mirrors patterns 1 and 2 (no "sacrifice" token matched).
+    if let Ok((rest, _)) = tag::<_, _, E>("a permanent ").parse(rest_lower) {
+        let controller = alt((
+            tag::<_, _, E>("they control"),
+            tag("you control"),
+            tag("that player controls"),
+        ))
+        .parse(rest);
+        if let Ok((rest, _)) = controller {
+            if tag::<_, _, E>(" of each permanent type")
+                .parse(rest)
+                .is_ok()
+            {
+                return Some(ChooseImperativeAst::CategoryAndSacrificeRest {
+                    categories: PERMANENT_TYPE_CATEGORIES.to_vec(),
+                    chooser_scope: CategoryChooserScope::EachPlayerSelf,
+                });
+            }
+        }
+    }
 
     // Pattern 1: "from among the permanents [they/that player] control[s] an artifact, ..."
     if let Ok((after_from_among, _)) = tag::<_, _, E>("from among ").parse(rest_lower) {
@@ -7929,6 +7964,40 @@ mod tests {
                         CoreType::Creature,
                         CoreType::Enchantment,
                         CoreType::Land
+                    ]
+                );
+                assert_eq!(
+                    chooser_scope,
+                    crate::types::ability::CategoryChooserScope::EachPlayerSelf
+                );
+            }
+            other => panic!("Expected CategoryAndSacrificeRest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_choose_permanent_of_each_type_liliana_dreadhorde() {
+        // Liliana, Dreadhorde General −9: "Each opponent chooses a permanent they
+        // control of each permanent type and sacrifices the rest."
+        // The "Each opponent" actor prefix is stripped upstream; this exercises the
+        // post-strip body reaching parse_choose_ast.
+        let text = "choose a permanent they control of each permanent type";
+        let lower = text.to_lowercase();
+        let result = parse_choose_ast(text, &lower, &mut ParseContext::default());
+        match result {
+            Some(ChooseImperativeAst::CategoryAndSacrificeRest {
+                categories,
+                chooser_scope,
+            }) => {
+                assert_eq!(
+                    categories,
+                    vec![
+                        CoreType::Artifact,
+                        CoreType::Battle,
+                        CoreType::Creature,
+                        CoreType::Enchantment,
+                        CoreType::Land,
+                        CoreType::Planeswalker,
                     ]
                 );
                 assert_eq!(

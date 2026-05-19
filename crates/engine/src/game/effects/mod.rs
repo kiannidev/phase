@@ -2115,7 +2115,16 @@ fn resolve_chain_body(
     // while preserving `original_controller` so "you" quantities still read
     // the printed ability controller. The unscoped tail then resumes once
     // after the scoped loop, matching the printed instruction order.
-    if let Some(ref scope) = ability.player_scope {
+    // EXCEPTION: `ChooseAndSacrificeRest` is a self-iterating effect — its
+    // resolver walks the scoped player set itself (APNAP) and seeds the
+    // `WaitingFor::CategoryChoice` continuation. It must receive `player_scope`
+    // intact and must NOT be fanned out here, or every opponent's invocation
+    // would re-sweep the whole table. See `choose_and_sacrifice_rest::resolve`.
+    let driver_scope = ability
+        .player_scope
+        .as_ref()
+        .filter(|_| !matches!(ability.effect, Effect::ChooseAndSacrificeRest { .. }));
+    if let Some(scope) = driver_scope {
         let scoped_events_before = events.len();
         let controller = ability.controller;
         // CR 101.4 + CR 800.4: Join Forces overrides the APNAP anchor with

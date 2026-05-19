@@ -1,6 +1,6 @@
 use crate::game::players;
 use crate::types::ability::{
-    CategoryChooserScope, Effect, EffectError, EffectKind, ResolvedAbility,
+    CategoryChooserScope, Effect, EffectError, EffectKind, PlayerFilter, ResolvedAbility,
 };
 use crate::types::card_type::CoreType;
 use crate::types::events::GameEvent;
@@ -30,7 +30,21 @@ pub fn resolve(
     };
 
     // CR 101.4: Determine player order using APNAP.
-    let player_order = players::apnap_order(state);
+    // CR 102.2 (two-player) / CR 102.3 (team multiplayer): An ability with
+    // `player_scope` (e.g. Liliana, Dreadhorde General's "Each opponent …")
+    // restricts the choose-and-sacrifice to the scoped players only.
+    // `player_scope == None` (Cataclysm, Tragic Arrogance "each player") keeps
+    // the full table; `player_scope == All` is equivalent. For `Opponent`, the
+    // ability's own controller is excluded. In a two-player game the opponent
+    // set is the other player (CR 102.2); the CR 102.3 team definition only
+    // governs >2-player team games.
+    let scope = ability.player_scope.clone().unwrap_or(PlayerFilter::All);
+    let player_order: Vec<PlayerId> = players::apnap_order(state)
+        .into_iter()
+        .filter(|pid| {
+            super::matches_player_scope(state, *pid, &scope, ability.controller, ability.source_id)
+        })
+        .collect();
 
     if player_order.is_empty() {
         events.push(GameEvent::EffectResolved {
@@ -54,7 +68,7 @@ pub fn resolve(
 
     // If all categories are empty for all players, skip directly to sacrifice.
     if eligible.iter().all(|e| e.is_empty()) && remaining_players.is_empty() {
-        sacrifice_unchosen(state, &[], ability.source_id, events);
+        sacrifice_unchosen(state, &[], &player_order, ability.source_id, events);
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::ChooseAndSacrificeRest,
             source_id: ability.source_id,
@@ -72,6 +86,7 @@ pub fn resolve(
             ability.source_id,
             &remaining_players,
             Vec::new(),
+            &player_order,
             events,
         );
     }
@@ -80,7 +95,7 @@ pub fn resolve(
     if let Some(auto_choices) = try_auto_resolve(&eligible) {
         let kept: Vec<ObjectId> = auto_choices.iter().filter_map(|&opt| opt).collect();
         if remaining_players.is_empty() {
-            sacrifice_unchosen(state, &kept, ability.source_id, events);
+            sacrifice_unchosen(state, &kept, &player_order, ability.source_id, events);
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::ChooseAndSacrificeRest,
                 source_id: ability.source_id,
@@ -95,6 +110,7 @@ pub fn resolve(
             ability.source_id,
             &remaining_players,
             kept,
+            &player_order,
             events,
         );
     }
@@ -107,6 +123,7 @@ pub fn resolve(
         source_id: ability.source_id,
         remaining_players,
         all_kept: Vec::new(),
+        scoped_players: player_order,
     };
 
     events.push(GameEvent::EffectResolved {
@@ -180,10 +197,11 @@ pub(crate) fn advance_to_next_player(
     source_id: ObjectId,
     remaining: &[PlayerId],
     mut all_kept: Vec<ObjectId>,
+    scoped_players: &[PlayerId],
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
     if remaining.is_empty() {
-        sacrifice_unchosen(state, &all_kept, source_id, events);
+        sacrifice_unchosen(state, &all_kept, scoped_players, source_id, events);
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::ChooseAndSacrificeRest,
             source_id,
@@ -211,6 +229,7 @@ pub(crate) fn advance_to_next_player(
             source_id,
             &next_remaining,
             all_kept,
+            scoped_players,
             events,
         );
     }
@@ -227,6 +246,7 @@ pub(crate) fn advance_to_next_player(
             source_id,
             &next_remaining,
             all_kept,
+            scoped_players,
             events,
         );
     }
@@ -239,6 +259,7 @@ pub(crate) fn advance_to_next_player(
         source_id,
         remaining_players: next_remaining,
         all_kept,
+        scoped_players: scoped_players.to_vec(),
     };
 
     Ok(())
@@ -249,25 +270,50 @@ pub(crate) fn advance_to_next_player(
 pub(crate) fn sacrifice_unchosen_from_handler(
     state: &mut GameState,
     kept: &[ObjectId],
+    scoped_players: &[PlayerId],
     source_id: ObjectId,
     events: &mut Vec<GameEvent>,
 ) {
-    sacrifice_unchosen(state, kept, source_id, events);
+    sacrifice_unchosen(state, kept, scoped_players, source_id, events);
 }
 
 /// CR 701.21a: Sacrifice all permanents on the battlefield that were not chosen.
 fn sacrifice_unchosen(
     state: &mut GameState,
     kept: &[ObjectId],
+    scoped_players: &[PlayerId],
     source_id: ObjectId,
     events: &mut Vec<GameEvent>,
 ) {
-    // Collect all battlefield permanents not in the kept set.
+    // CR 701.21a: Sacrifice each permanent NOT chosen, restricted to the
+    // permanents controlled by the players within `player_scope`. A player
+    // outside the effect's scope (e.g. Liliana's controller, scope = Opponent)
+    // keeps their whole board.
+    // CR 102.2 (two-player) / CR 102.3 (team multiplayer): `scoped_players` is
+    // the APNAP-ordered scoped set computed in `resolve`. An empty
+    // `scoped_players` can only arise from a mid-`CategoryChoice` save/reload
+    // deserializing the `#[serde(default)]` field to `Vec::new()`. An empty set
+    // would make the `contains` filter sacrifice NOTHING — a silent wrong
+    // result. Fall back to the full APNAP set (pre-#519 all-players sweep):
+    // over-sweep at worst, never a silent no-op.
+    let effective_scope: Vec<PlayerId> = if scoped_players.is_empty() {
+        players::apnap_order(state)
+    } else {
+        scoped_players.to_vec()
+    };
+    // Collect all battlefield permanents not in the kept set, controlled by a
+    // player within scope.
     let to_sacrifice: Vec<ObjectId> = state
         .battlefield
         .iter()
         .copied()
-        .filter(|id| !kept.contains(id) && state.objects.get(id).is_some_and(|obj| !obj.is_emblem))
+        .filter(|id| {
+            !kept.contains(id)
+                && state
+                    .objects
+                    .get(id)
+                    .is_some_and(|obj| !obj.is_emblem && effective_scope.contains(&obj.controller))
+        })
         .collect();
 
     for obj_id in to_sacrifice {
@@ -316,6 +362,25 @@ mod tests {
             ObjectId(100),
             PlayerId(0),
         )
+    }
+
+    fn make_scoped_ability(
+        categories: Vec<CoreType>,
+        chooser_scope: CategoryChooserScope,
+        player_scope: Option<PlayerFilter>,
+        controller: PlayerId,
+    ) -> ResolvedAbility {
+        let mut ability = ResolvedAbility::new(
+            Effect::ChooseAndSacrificeRest {
+                categories,
+                chooser_scope,
+            },
+            vec![],
+            ObjectId(100),
+            controller,
+        );
+        ability.player_scope = player_scope;
+        ability
     }
 
     fn setup_two_player() -> GameState {
@@ -594,6 +659,146 @@ mod tests {
             apply(&mut clone, chooser, action.clone())
                 .unwrap_or_else(|e| panic!("candidate {action:?} failed to apply: {e:?}"));
         }
+    }
+
+    #[test]
+    fn opponent_scope_sweeps_only_opponent_board() {
+        use crate::game::engine::apply;
+        use crate::types::actions::GameAction;
+
+        // Liliana, Dreadhorde General −9: "Each opponent chooses a permanent they
+        // control of each permanent type and sacrifices the rest."
+        // player_scope = Opponent → only P1's board is swept; P0 (the Liliana
+        // controller) keeps its entire board.
+        //
+        // REVERTED-FIX MUTATION: without the §6 resolver/driver fix, `player_order`
+        // includes P0, so P0's non-kept permanents are sacrificed and the P0
+        // survive-assertions fail. Without the §6c empty-`scoped_players` fall-back,
+        // a save/reload would make the sweep sacrifice nothing and the P1
+        // positive-sweep assertion fails. Both halves are required to be
+        // discriminating.
+        let mut state = setup_two_player();
+        // Pin the active player explicitly so APNAP order and the post-filter
+        // `target_player` are deterministic, not a coincidence of the
+        // single-element `player_order`.
+        state.active_player = PlayerId(0);
+
+        // P0 (controller) — three permanents that MUST survive.
+        let p0_creature = add_battlefield_permanent(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "P0 Bear",
+            vec![CoreType::Creature],
+        );
+        let p0_creature2 = add_battlefield_permanent(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "P0 Lion",
+            vec![CoreType::Creature],
+        );
+        let p0_artifact = add_battlefield_permanent(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "P0 Sol Ring",
+            vec![CoreType::Artifact],
+        );
+
+        // P1 (opponent) — two creatures so the Creature category needs a real
+        // choice (no auto-resolve), proving the effect fires AND leaving exactly
+        // one non-kept creature to be swept.
+        let p1_keep = add_battlefield_permanent(
+            &mut state,
+            CardId(4),
+            PlayerId(1),
+            "P1 Bear",
+            vec![CoreType::Creature],
+        );
+        let p1_sacrificed = add_battlefield_permanent(
+            &mut state,
+            CardId(5),
+            PlayerId(1),
+            "P1 Lion",
+            vec![CoreType::Creature],
+        );
+
+        // Ability controlled by P0, scope = Opponent.
+        let ability = make_scoped_ability(
+            vec![CoreType::Creature],
+            CategoryChooserScope::EachPlayerSelf,
+            Some(PlayerFilter::Opponent),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        // The effect must address only P1 — P0 must NEVER be a target_player.
+        let eligible = match &state.waiting_for {
+            WaitingFor::CategoryChoice {
+                target_player,
+                eligible_per_category,
+                ..
+            } => {
+                assert_eq!(
+                    *target_player,
+                    PlayerId(1),
+                    "scoped effect must address the opponent, not the controller"
+                );
+                // P1 has two creatures eligible for the single Creature category.
+                assert_eq!(eligible_per_category.len(), 1);
+                assert_eq!(eligible_per_category[0].len(), 2);
+                eligible_per_category[0].clone()
+            }
+            other => panic!("Expected CategoryChoice for P1, got {other:?}"),
+        };
+        // Sanity: P1 keeps `p1_keep`, sacrifices `p1_sacrificed`.
+        assert!(eligible.contains(&p1_keep) && eligible.contains(&p1_sacrificed));
+
+        // DRIVE: P1 chooses to keep `p1_keep` for the Creature category. Apply it
+        // through the engine pipeline so the real continuation
+        // (`engine_resolution_choices.rs`) runs `sacrifice_unchosen`.
+        let action = GameAction::SelectCategoryPermanents {
+            choices: vec![Some(p1_keep)],
+        };
+        let result = apply(&mut state, PlayerId(1), action);
+        assert!(
+            result.is_ok(),
+            "SelectCategoryPermanents must apply cleanly"
+        );
+        // Two-player game: after P1's only choice the resolution completes — no
+        // further CategoryChoice is pending.
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::CategoryChoice { .. }),
+            "two-player scoped sweep completes after the single opponent chooses"
+        );
+
+        // DISCRIMINATING ASSERTION 1 — every P0 permanent still on the battlefield.
+        assert!(
+            state.battlefield.contains(&p0_creature),
+            "controller's creature must NOT be sacrificed by an Opponent-scoped effect"
+        );
+        assert!(
+            state.battlefield.contains(&p0_creature2),
+            "controller's second creature must NOT be sacrificed"
+        );
+        assert!(
+            state.battlefield.contains(&p0_artifact),
+            "controller's artifact must NOT be sacrificed"
+        );
+
+        // DISCRIMINATING ASSERTION 2 — the sweep ACTUALLY FIRED for P1.
+        // p1_keep survives (chosen); p1_sacrificed was swept. Without this,
+        // an empty-`scoped_players` no-op bug would pass assertion 1 vacuously.
+        assert!(
+            state.battlefield.contains(&p1_keep),
+            "opponent's chosen creature must survive"
+        );
+        assert!(
+            !state.battlefield.contains(&p1_sacrificed),
+            "opponent's non-kept creature MUST be sacrificed — proves the sweep fired"
+        );
     }
 
     #[test]

@@ -1795,6 +1795,7 @@ pub(super) fn handle_resolution_choice(
                 source_id,
                 remaining_players,
                 mut all_kept,
+                scoped_players,
             },
             GameAction::SelectCategoryPermanents { choices },
         ) => {
@@ -1855,7 +1856,11 @@ pub(super) fn handle_resolution_choice(
             if remaining_players.is_empty() {
                 // All players have chosen — sacrifice everything not kept.
                 effects::choose_and_sacrifice_rest::sacrifice_unchosen_from_handler(
-                    state, &all_kept, source_id, events,
+                    state,
+                    &all_kept,
+                    &scoped_players,
+                    source_id,
+                    events,
                 );
             } else if let Err(e) = effects::choose_and_sacrifice_rest::advance_to_next_player(
                 state,
@@ -1865,6 +1870,7 @@ pub(super) fn handle_resolution_choice(
                 source_id,
                 &remaining_players,
                 all_kept,
+                &scoped_players,
                 events,
             ) {
                 return Err(EngineError::InvalidAction(format!("{:?}", e)));

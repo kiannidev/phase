@@ -1478,6 +1478,10 @@ pub enum WaitingFor {
         owner_library: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         track_exiled_by_source: bool,
+        /// CR 701.68a: N for Blight N — number of -1/-1 counters to place.
+        /// Zero for all non-blight EffectZoneChoice uses.
+        #[serde(default)]
+        count_param: u32,
     },
     /// Player chooses which drawn-this-turn hand cards to put on top of their
     /// library. Each unchosen required card is kept by paying life.
@@ -4647,6 +4651,7 @@ mod tests {
             enters_attacking: false,
             owner_library: false,
             track_exiled_by_source: false,
+            count_param: 0,
         }));
         variants.push(Box::new(WaitingFor::DefilerPayment {
             player: PlayerId(0),
@@ -4876,6 +4881,7 @@ mod tests {
             enters_attacking: false,
             owner_library: false,
             track_exiled_by_source: false,
+            count_param: 0,
         };
         let json = serde_json::to_string(&wf).unwrap();
         let deserialized: WaitingFor = serde_json::from_str(&json).unwrap();

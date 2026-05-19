@@ -5839,11 +5839,10 @@ pub enum Effect {
     Endure {
         amount: u32,
     },
-    /// Blight N as an effect (target player blights N).
+    /// CR 701.68a: Blight N as an effect — the controller of this ability puts
+    /// N -1/-1 counters on a creature they control. Non-targeted controller choice.
     BlightEffect {
         count: u32,
-        #[serde(default = "default_target_filter_any")]
-        target: TargetFilter,
     },
     /// Alchemy digital-only: randomly pick card(s) from library matching filter,
     /// put to destination (default hand). No reveal, no shuffle, no player choice.
@@ -6498,7 +6497,6 @@ impl Effect {
             | Effect::SkipNextStep { target, .. }
             | Effect::AdditionalPhase { target, .. }
             | Effect::Double { target, .. }
-            | Effect::BlightEffect { target, .. }
             | Effect::SetLifeTotal { target, .. }
             | Effect::GiveControl { target, .. }
             | Effect::RemoveFromCombat { target, .. } => Some(target),
@@ -6634,6 +6632,10 @@ impl Effect {
             | Effect::Forage
             | Effect::CollectEvidence { .. }
             | Effect::Endure { .. }
+            // CR 701.68a: BlightEffect is a non-targeted controller choice — no
+            // targeting slot. The chosen creature is picked at resolution time
+            // via WaitingFor::EffectZoneChoice, not declared as a target.
+            | Effect::BlightEffect { .. }
             | Effect::ExploreAll { .. }
             | Effect::Seek { .. }
             | Effect::SetDayNight { .. }

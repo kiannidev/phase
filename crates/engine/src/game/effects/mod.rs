@@ -27,6 +27,7 @@ pub mod animate;
 pub mod attach;
 pub mod become_copy;
 pub mod become_monarch;
+pub mod blight;
 pub mod bolster;
 pub mod bounce;
 pub mod cascade;
@@ -1035,7 +1036,8 @@ pub fn resolve_effect(
         Effect::Double { .. } => double::resolve(state, ability, events),
         Effect::RuntimeHandled { .. } => Ok(()), // Handled by dedicated engine path
         Effect::Learn => learn::resolve(state, ability, events),
-        Effect::Forage | Effect::Endure { .. } | Effect::BlightEffect { .. } => {
+        Effect::BlightEffect { .. } => blight::resolve(state, ability, events),
+        Effect::Forage | Effect::Endure { .. } => {
             // These keyword actions are recognized by the parser but not yet implemented.
             // They're no-ops at runtime but count as supported for coverage.
             Ok(())
@@ -4004,6 +4006,7 @@ mod tests {
             enters_attacking: false,
             owner_library: false,
             track_exiled_by_source: false,
+            count_param: 0,
         };
 
         crate::game::engine::apply(
@@ -6537,6 +6540,7 @@ mod tests {
             enters_attacking: false,
             owner_library: false,
             track_exiled_by_source: false,
+            count_param: 0,
         };
         state.pending_continuation =
             Some(PendingContinuation::new(Box::new(ResolvedAbility::new(
@@ -6571,6 +6575,7 @@ mod tests {
                 enters_attacking: false,
                 owner_library: false,
                 track_exiled_by_source: false,
+                count_param: 0,
             },
             GameAction::SelectCards {
                 cards: vec![second],

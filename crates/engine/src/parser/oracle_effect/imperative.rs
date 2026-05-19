@@ -4623,7 +4623,6 @@ pub(super) fn parse_imperative_family_ast(
                 .unwrap_or(1);
             Some(ImperativeFamilyAst::GainKeyword(Effect::BlightEffect {
                 count,
-                target: crate::types::ability::TargetFilter::ParentTarget,
             }))
         }
         // Forage keyword action (CR 702.166a)

@@ -228,6 +228,7 @@ pub fn resolve_all(
                 enters_attacking: false,
                 owner_library: false,
                 track_exiled_by_source: false,
+                count_param: 0,
             };
             return Ok(());
         }

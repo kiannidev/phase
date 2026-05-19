@@ -2026,9 +2026,8 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         Effect::Endure { amount } => {
             d.push(("amount".into(), amount.to_string()));
         }
-        Effect::BlightEffect { count, target } => {
+        Effect::BlightEffect { count } => {
             d.push(("count".into(), count.to_string()));
-            d.push(("target".into(), fmt_target(target)));
         }
         Effect::Seek {
             filter,

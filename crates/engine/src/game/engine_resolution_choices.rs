@@ -1303,6 +1303,7 @@ pub(super) fn handle_resolution_choice(
                 enters_attacking,
                 owner_library: _,
                 track_exiled_by_source,
+                count_param,
             },
             GameAction::SelectCards { cards: chosen },
         ) => {
@@ -1444,6 +1445,39 @@ pub(super) fn handle_resolution_choice(
                 EffectKind::PutAtLibraryPosition => {
                     for &card_id in chosen.iter().rev() {
                         super::zones::move_to_library_at_index(state, card_id, Some(0), events);
+                    }
+                }
+                // CR 701.68a: Place `count_param` -1/-1 counters on the creature
+                // the controller chose. The choice is non-targeted; the pool was
+                // restricted to the controller's creatures in `blight::resolve`,
+                // with `count = 1`, `min_count = 1`, `up_to = false` — so `chosen`
+                // holds exactly one creature.
+                // CR 614.1 / CR 614.1a: route through `add_counter_with_replacement`
+                // so counter-doubling/modifying replacement effects apply.
+                EffectKind::BlightEffect => {
+                    let blighted = chosen[0];
+                    if count_param > 0 {
+                        effects::counters::add_counter_with_replacement(
+                            state,
+                            player,
+                            blighted,
+                            crate::types::counter::CounterType::Minus1Minus1,
+                            count_param,
+                            events,
+                        );
+                    }
+                    // CR 701.68c: Snapshot the chosen creature so spells and
+                    // abilities that refer back to "the creature you blighted"
+                    // resolve to it. The creature stays on the battlefield, so
+                    // the snapshot is taken from its live characteristics.
+                    if let Some(obj) = state.objects.get(&blighted) {
+                        let snapshot = crate::types::ability::CostPaidObjectSnapshot {
+                            object_id: blighted,
+                            lki: obj.snapshot_for_mana_spent(),
+                        };
+                        if let Some(cont) = state.pending_continuation.as_mut() {
+                            cont.chain.set_effect_context_object_recursive(snapshot);
+                        }
                     }
                 }
                 other => {

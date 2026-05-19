@@ -593,6 +593,7 @@ pub fn resolve(
             enters_attacking: effect_enters_attacking,
             owner_library,
             track_exiled_by_source,
+            count_param: 0,
         };
         // EffectResolved is emitted by the EffectZoneChoice handler after the player chooses
         // (matching the DiscardChoice pattern — single authority for the event).

@@ -1219,6 +1219,7 @@ export type DebugAction =
   | { type: "DrawCards"; data: { player_id: PlayerId; count: number } }
   | { type: "Mill"; data: { player_id: PlayerId; count: number } }
   | { type: "ShuffleLibrary"; data: { player_id: PlayerId } }
+  | { type: "Proliferate"; data: { player_id: PlayerId } }
   | { type: "SetBasePowerToughness"; data: { object_id: ObjectId; power: number | null; toughness: number | null } }
   | { type: "ModifyCounters"; data: { object_id: ObjectId; counter_type: CounterType; delta: number } }
   | { type: "SetTapped"; data: { object_id: ObjectId; tapped: boolean } }
@@ -1242,7 +1243,8 @@ export type DebugAction =
         characteristics: TokenCharacteristics;
         enter_with_counters?: [CounterType, number][];
       };
-    };
+    }
+  | { type: "CreateTokenCopy"; data: { source_id: ObjectId; owner: PlayerId } };
 
 export type GameAction =
   | { type: "PassPriority" }

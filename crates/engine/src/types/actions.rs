@@ -648,6 +648,9 @@ pub enum DebugAction {
     Mill { player_id: PlayerId, count: u32 },
     /// Shuffle a player's library.
     ShuffleLibrary { player_id: PlayerId },
+    /// Start a proliferate choice for a player using the real proliferate
+    /// resolver (CR 701.34a).
+    Proliferate { player_id: PlayerId },
 
     // ── Object Property Manipulation ──────────────────────────────────────
     /// Overwrite base power/toughness (layer 7a input). Marks layers dirty.
@@ -745,6 +748,12 @@ pub enum DebugAction {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         enter_with_counters: Vec<(CounterType, u32)>,
     },
+    /// Create a token copy of an existing object using the real copy-token
+    /// resolver (CR 707.2).
+    CreateTokenCopy {
+        source_id: ObjectId,
+        owner: PlayerId,
+    },
 }
 
 impl DebugAction {
@@ -822,6 +831,9 @@ impl DebugAction {
             }
             DebugAction::ShuffleLibrary { player_id } => {
                 format!("ShuffleLibrary ({})", player_label(*player_id))
+            }
+            DebugAction::Proliferate { player_id } => {
+                format!("Proliferate ({})", player_label(*player_id))
             }
             DebugAction::SetBasePowerToughness {
                 object_id,
@@ -938,6 +950,11 @@ impl DebugAction {
                     counters
                 )
             }
+            DebugAction::CreateTokenCopy { source_id, owner } => format!(
+                "CreateTokenCopy ({} for {})",
+                obj(*source_id),
+                player_label(*owner)
+            ),
         }
     }
 }

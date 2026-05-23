@@ -7365,6 +7365,14 @@ fn explicit_any_target_clause(effect: &Effect, lower: &str) -> bool {
         && nom_primitives::scan_contains(lower, "any target")
 }
 
+fn rewrite_triggering_spell_controller_to_parent_target_controller(effect: &mut Effect) {
+    each_target_filter_mut(effect, &mut |filter| {
+        if matches!(filter, TargetFilter::TriggeringSpellController) {
+            *filter = TargetFilter::ParentTargetController;
+        }
+    });
+}
+
 /// Replace the target filter on an effect with ParentTarget.
 /// Used for anaphoric "it"/"that creature" references in compound sub-effects.
 fn replace_target_with_parent(effect: &mut Effect) {
@@ -11676,6 +11684,12 @@ pub(crate) fn parse_effect_chain_ir(
             )
         {
             replace_target_with_parent(&mut clause.effect);
+        }
+        if clauses
+            .last()
+            .is_some_and(|prev| matches!(&prev.parsed.effect, Effect::Counter { .. }))
+        {
+            rewrite_triggering_spell_controller_to_parent_target_controller(&mut clause.effect);
         }
         // CR 614.1a + CR 701.5 + CR 608.2c: "Exile-after-cast/counter rider"
         // class — Toshiro Umezawa, Dire Fleet Daredevil's chained cousins,
@@ -19084,6 +19098,23 @@ mod tests {
             def.unless_pay.is_none(),
             "plain counter should have no unless_pay modifier"
         );
+    }
+
+    #[test]
+    fn counter_spell_damage_rider_targets_countered_spell_controller() {
+        let def = parse_effect_chain(
+            "Counter target spell. Ionize deals 2 damage to that spell's controller.",
+            AbilityKind::Spell,
+        );
+        assert!(matches!(*def.effect, Effect::Counter { .. }));
+        let sub = def.sub_ability.as_ref().expect("damage sub-ability");
+        assert!(matches!(
+            *sub.effect,
+            Effect::DealDamage {
+                target: TargetFilter::ParentTargetController,
+                ..
+            }
+        ));
     }
 
     /// CR 115.1 + CR 118.12 + CR 118.12a: "any target" effects (Rhystic

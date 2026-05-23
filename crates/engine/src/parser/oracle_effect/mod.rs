@@ -20859,7 +20859,7 @@ mod tests {
         assert!(matches!(
             e,
             Effect::Shuffle {
-                target: TargetFilter::Player
+                target: TargetFilter::ParentTarget
             }
         ));
     }

@@ -182,6 +182,7 @@ pub fn handle_activate_loyalty(
         pending.activation_cost = Some(crate::types::ability::AbilityCost::Loyalty {
             amount: loyalty_cost,
         });
+        record_loyalty_activation(state, pw_id, player);
         return Ok(WaitingFor::TargetSelection {
             player,
             pending_cast: Box::new(pending),

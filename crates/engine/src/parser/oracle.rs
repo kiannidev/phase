@@ -7778,18 +7778,31 @@ mod tests {
     fn for_each_prefix_creates_token() {
         // "for each opponent, create a 2/2 black Zombie creature token"
         use crate::parser::oracle_effect::parse_effect_chain;
+        use crate::types::ability::{QuantityExpr, QuantityRef};
         let def = parse_effect_chain(
             "for each opponent, create a 2/2 black Zombie creature token",
             crate::types::ability::AbilityKind::Spell,
         );
+        // CR 111.1 + CR 616.1: a bare single-clause "for each X, create a token"
+        // folds the iteration into the token's `count` (one batched CreateToken
+        // event), so it must NOT carry a repeat loop. See
+        // `try_fold_token_repeat_into_count`.
         assert!(
-            def.repeat_for.is_some(),
-            "repeat_for should be set for 'for each opponent'"
+            def.repeat_for.is_none(),
+            "bare for-each token must fold into count, not loop: {:?}",
+            def.repeat_for
         );
+        let Effect::Token { count, .. } = &*def.effect else {
+            panic!("inner effect should be Token, got {:?}", def.effect);
+        };
         assert!(
-            matches!(*def.effect, Effect::Token { .. }),
-            "inner effect should be Token, got {:?}",
-            def.effect,
+            matches!(
+                count,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::PlayerCount { .. }
+                }
+            ),
+            "count should carry the per-opponent quantity, got {count:?}"
         );
     }
 

@@ -12225,6 +12225,34 @@ pub(crate) fn parse_effect_chain_ir(
     }
 }
 
+/// CR 111.1 + CR 616.1: "For each X, create a [token]" creates all the tokens
+/// as a SINGLE event, not one event per iteration. When the repeated
+/// body is a bare token creation, fold the per-iteration quantity into the
+/// token's `count` so the runtime emits one `CreateToken` event. This makes
+/// token doublers (Doubling Season, Primal Vigor) and additive token
+/// replacements (Xorn) apply once to the whole batch under a single CR 616.1
+/// ordering choice, instead of re-prompting and re-doubling per iteration
+/// (Brass's Bounty, Hei Bai, Turn Stones).
+///
+/// "Bare" is enforced by the caller (no chained `sub_ability`) plus the checks
+/// here: a token attached to the iteration's object (`attach_to`, e.g. Asinine
+/// Antics' per-creature Roles) is per-iteration and must NOT fold. Only the
+/// canonical single-per-iteration `count` is folded; "create N per iteration"
+/// would need a product expression that no bare-token card uses, so it falls
+/// through to the existing `repeat_for` loop.
+fn try_fold_token_repeat_into_count(effect: &mut Effect, qty: &QuantityExpr) -> bool {
+    if let Effect::Token {
+        count, attach_to, ..
+    } = effect
+    {
+        if attach_to.is_none() && matches!(count, QuantityExpr::Fixed { value: 1 }) {
+            *count = qty.clone();
+            return true;
+        }
+    }
+    false
+}
+
 /// Lower an effect chain IR into a fully-assembled `AbilityDefinition`.
 ///
 /// This is the assembly half of the parse/lower split (Phase 48).
@@ -12542,6 +12570,22 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
                 } else {
                     def.repeat_for = Some(qty.clone());
                 }
+            } else if ir.clauses.len() == 1
+                && clause_ir.parsed.sub_ability.is_none()
+                && try_fold_token_repeat_into_count(def.effect.as_mut(), qty)
+            {
+                // CR 111.1 + CR 616.1: bare "for each X, create a token" folded
+                // into one batched CreateToken event — no loop. Conservatively
+                // restricted to a single-clause ability: a trailing sibling may
+                // reference the created tokens (a tracked set or "those tokens"
+                // anaphor — e.g. Ezuri's Predation's fight pairing depends on the
+                // per-iteration creation), and we do not yet distinguish such
+                // token-referencing siblings from independent ones (e.g. Moogles'
+                // Valor's "creatures you control gain indestructible"), so we keep
+                // the loop for all multi-clause cases. The chained-body guard
+                // reads `clause_ir.parsed.sub_ability` (the non-TargetOnly path
+                // attaches it after this point via `clause_sub`, so
+                // `def.sub_ability` is not yet populated here).
             } else {
                 def.repeat_for = Some(qty.clone());
             }
@@ -20674,6 +20718,67 @@ mod tests {
                 qty: QuantityRef::CommanderCastFromCommandZoneCount
             })
         ));
+    }
+
+    // CR 111.1 + CR 616.1: "For each X, create a [token]" creates all tokens as
+    // one event. A bare, single-clause token creation folds the iteration
+    // quantity into `count` so the runtime emits a single CreateToken event
+    // (one replacement-ordering choice, one doubling), not one per land.
+    #[test]
+    fn for_each_create_token_folds_repeat_into_count() {
+        let def = parse_effect_chain(
+            "For each land you control, create a Treasure token",
+            AbilityKind::Spell,
+        );
+        let Effect::Token { count, .. } = &*def.effect else {
+            panic!("expected Token, got {:?}", def.effect);
+        };
+        // Folded: the per-land count lives on the token, not in a repeat loop.
+        assert!(
+            matches!(
+                count,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount { .. }
+                }
+            ),
+            "expected ObjectCount count, got {count:?}"
+        );
+        assert!(
+            def.repeat_for.is_none(),
+            "bare for-each token must not loop: {:?}",
+            def.repeat_for
+        );
+    }
+
+    // CR 303.7: A token attached to the iteration's object (Asinine Antics' Roles)
+    // is per-iteration and must keep the repeat loop — folding would collapse N
+    // distinct attachments into one.
+    #[test]
+    fn for_each_create_attached_token_does_not_fold() {
+        let def = parse_effect_chain(
+            "For each creature your opponents control, create a Cursed Role token attached to that creature",
+            AbilityKind::Spell,
+        );
+        assert!(matches!(*def.effect, Effect::Token { .. }));
+        assert!(
+            def.repeat_for.is_some(),
+            "attached token must stay a per-iteration loop"
+        );
+    }
+
+    // A trailing sibling clause may reference the created tokens ("those tokens"),
+    // so a multi-clause ability must keep the loop rather than batch-create.
+    #[test]
+    fn for_each_create_token_with_sibling_clause_does_not_fold() {
+        let def = parse_effect_chain(
+            "For each land you control, create a Treasure token. Draw a card.",
+            AbilityKind::Spell,
+        );
+        assert!(matches!(*def.effect, Effect::Token { .. }));
+        assert!(
+            def.repeat_for.is_some(),
+            "multi-clause for-each token must stay a loop"
+        );
     }
 
     #[test]

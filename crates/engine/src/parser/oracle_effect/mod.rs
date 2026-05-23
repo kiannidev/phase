@@ -17484,6 +17484,7 @@ mod tests {
             .as_deref()
             .expect("base Dig must be stored as else_ability");
         let Effect::Dig {
+            player: TargetFilter::Controller,
             count: base_count,
             keep_count: base_keep,
             up_to: base_up_to,

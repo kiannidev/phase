@@ -594,7 +594,7 @@ jobs:
         # `wrangler deploy` runs the [build] command in lobby-worker/wrangler.toml
         # (scripts/build-broker-wasm.sh release): cargo build -> wasm32,
         # wasm-bindgen, wasm-opt. The toolchain installed above is inherited.
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

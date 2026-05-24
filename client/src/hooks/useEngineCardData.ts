@@ -22,6 +22,13 @@ export interface EngineCardFace {
   triggers: unknown[];
   static_abilities: unknown[];
   replacements: unknown[];
+  /**
+   * Overlay-only: the selected locale's pre-formatted type line from the content
+   * sidecar (e.g. "Spontanzauber"). Absent for English and untranslated cards —
+   * callers fall back to formatting the structured `card_type`. Not part of the
+   * WASM `CardFace` shape; populated solely by the content-i18n overlay below.
+   */
+  localized_type_line?: string | null;
 }
 
 /**
@@ -75,6 +82,7 @@ export function useEngineCardData(cardName: string | null): EngineCardFace | nul
               ...result,
               name: localized.name ?? result.name,
               oracle_text: localized.oracle_text ?? result.oracle_text,
+              localized_type_line: localized.type_line ?? undefined,
             }
           : result,
       );

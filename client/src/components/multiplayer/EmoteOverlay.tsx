@@ -1,10 +1,22 @@
 import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
 
 const EMOTES = ["Good game", "Nice play", "Thinking...", "Hello!", "Oops"] as const;
 const EMOTE_KEYS = ["goodGame", "nicePlay", "thinking", "hello", "oops"] as const;
 const EMOTE_DISPLAY_MS = 3000;
+
+/**
+ * Emotes travel the wire as their canonical English text (`onSendEmote(emote)`),
+ * so a received emote arrives in English regardless of the sender's locale.
+ * Reverse-look-up the fixed emote set to render it in the *viewer's* language;
+ * an unrecognized string (shouldn't occur) falls back to the raw text.
+ */
+function localizedEmote(text: string, t: TFunction<"multiplayer">): string {
+  const idx = (EMOTES as readonly string[]).indexOf(text);
+  return idx >= 0 ? t(`emoteOverlay.options.${EMOTE_KEYS[idx]}`) : text;
+}
 
 interface EmoteOverlayProps {
   onSendEmote: (emote: string) => void;
@@ -46,7 +58,7 @@ export function EmoteOverlay({ onSendEmote, receivedEmote }: EmoteOverlayProps) 
               exit={{ opacity: 0, y: -10, scale: 0.9 }}
               transition={{ duration: 0.25 }}
             >
-              {displayedEmote.text}
+              {localizedEmote(displayedEmote.text, t)}
             </motion.div>
           )}
         </AnimatePresence>

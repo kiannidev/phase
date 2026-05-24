@@ -330,6 +330,7 @@ function CardPreviewInner({
         <ParsedAbilitiesPanel
           name={showOtherFace ? (engineBackFace?.name ?? backFaceName ?? "") : (obj?.name ?? engineFrontFace?.name ?? frontFaceName)}
           cardTypes={showOtherFace ? engineBackFace?.card_type : (obj?.card_types ?? engineFrontFace?.card_type)}
+          localizedTypeLine={showOtherFace ? engineBackFace?.localized_type_line : engineFrontFace?.localized_type_line}
           parseDetails={showOtherFace && backParseDetails ? backParseDetails : frontParseDetails}
           maxHeight={viewportHeight - margin * 2}
         />
@@ -658,14 +659,18 @@ function SupportSummary({ items }: { items: ParsedItem[] }) {
 interface ParsedAbilitiesPanelProps {
   name: string;
   cardTypes?: { supertypes: string[]; core_types: string[]; subtypes: string[] } | null;
+  /** Localized type line from the content sidecar; preferred over formatting
+   *  `cardTypes` when present (non-English locale with a translated card). */
+  localizedTypeLine?: string | null;
   parseDetails: ParsedItem[] | null;
   maxHeight?: number;
 }
 
-function ParsedAbilitiesPanel({ name, cardTypes, parseDetails, maxHeight }: ParsedAbilitiesPanelProps) {
+function ParsedAbilitiesPanel({ name, cardTypes, localizedTypeLine, parseDetails, maxHeight }: ParsedAbilitiesPanelProps) {
   const { t } = useTranslation("game");
   const items = parseDetails ?? [];
   const rulings = useCardRulings(name);
+  const typeLine = localizedTypeLine ?? (cardTypes ? formatTypeLine(cardTypes) : null);
 
   return (
     <div
@@ -678,8 +683,8 @@ function ParsedAbilitiesPanel({ name, cardTypes, parseDetails, maxHeight }: Pars
           <div className="text-sm font-semibold text-gray-200">{name}</div>
           <div className="text-[9px] uppercase tracking-widest text-gray-600">{t("preview.engineParse")}</div>
         </div>
-        {cardTypes && formatTypeLine(cardTypes) && (
-          <div className="text-[10px] text-gray-500 mt-0.5">{formatTypeLine(cardTypes)}</div>
+        {typeLine && (
+          <div className="text-[10px] text-gray-500 mt-0.5">{typeLine}</div>
         )}
         <SupportSummary items={items} />
       </div>

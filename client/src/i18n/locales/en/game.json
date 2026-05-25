@@ -752,6 +752,7 @@
       "title": "Choose Ring-bearer",
       "subtitle": "Choose a creature you control"
     },
+    "reorderHint": "Drag to reorder · the top card is drawn first",
     "scry": {
       "title": "Scry",
       "subtitle_one": "Look at the top {{count}} card of your library",

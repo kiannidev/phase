@@ -907,14 +907,33 @@ pub(super) fn handle_resolution_choice(
         }
         (
             WaitingFor::SurveilChoice { player, cards },
-            GameAction::SelectCards {
-                cards: to_graveyard,
-            },
+            GameAction::SelectCards { cards: top_cards },
         ) => {
+            // CR 701.25a: To surveil N, put any number of the looked-at cards into
+            // your graveyard and the rest on top of your library in any order. The
+            // action payload mirrors scry — it is the ordered keep-on-top set;
+            // every looked-at card not in it is put into the graveyard.
+            let all_cards = cards;
+            let to_graveyard: Vec<_> = all_cards
+                .iter()
+                .filter(|id| !top_cards.contains(id))
+                .copied()
+                .collect();
+            // CR 701.25a: every looked-at card not kept on top is put into the
+            // graveyard (emitting its zone-change events).
             for &obj_id in &to_graveyard {
-                if cards.contains(&obj_id) {
-                    zones::move_to_zone(state, obj_id, Zone::Graveyard, events);
-                }
+                zones::move_to_zone(state, obj_id, Zone::Graveyard, events);
+            }
+            // CR 701.25a: the kept cards rest on top of the library in the
+            // player's chosen order (top_cards[0] becomes the topmost card).
+            let player_state = state
+                .players
+                .iter_mut()
+                .find(|candidate| candidate.id == player)
+                .expect("player exists");
+            player_state.library.retain(|id| !top_cards.contains(id));
+            for (index, &card_id) in top_cards.iter().enumerate() {
+                player_state.library.insert(index, card_id);
             }
             ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
         }

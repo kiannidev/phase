@@ -20216,6 +20216,63 @@ mod tests {
     }
 
     #[test]
+    fn then_if_control_count_conditions_followup_transform() {
+        let def = parse_effect_chain(
+            "Create a tapped 0/1 black Wizard creature token with \"Whenever you cast a noncreature spell, this token deals 1 damage to each opponent.\" Then if you control four or more Wizards, transform ~.",
+            AbilityKind::Spell,
+        );
+
+        let Effect::Token {
+            static_abilities, ..
+        } = def.effect.as_ref()
+        else {
+            panic!("expected Token root, got {:?}", def.effect);
+        };
+        assert!(
+            static_abilities.iter().any(|static_def| {
+                static_def.modifications.iter().any(|modification| {
+                    matches!(modification, ContinuousModification::GrantTrigger { .. })
+                })
+            }),
+            "token should retain its quoted spell-cast trigger"
+        );
+
+        let transform = def
+            .sub_ability
+            .as_ref()
+            .expect("expected conditional transform follow-up");
+        assert!(matches!(
+            transform.effect.as_ref(),
+            Effect::Transform {
+                target: TargetFilter::SelfRef
+            }
+        ));
+        match transform.condition.as_ref() {
+            Some(AbilityCondition::QuantityCheck {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectCount { filter },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 4 },
+            }) => match filter {
+                TargetFilter::Typed(TypedFilter {
+                    controller: Some(ControllerRef::You),
+                    type_filters,
+                    ..
+                }) => assert!(
+                    type_filters.iter().any(
+                        |ty| matches!(ty, TypeFilter::Subtype(subtype) if subtype == "Wizard")
+                    ),
+                    "expected Wizard subtype filter, got {type_filters:?}"
+                ),
+                other => panic!("expected controller-scoped Wizard filter, got {other:?}"),
+            },
+            other => panic!("expected Wizard-count QuantityCheck, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn effect_animation_preserves_pump_and_keywords() {
         let def = parse_effect_chain(
             "Until end of turn, this creature becomes a Dragon, gets +5/+3, and gains flying and trample",

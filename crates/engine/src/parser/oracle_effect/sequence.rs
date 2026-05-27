@@ -405,6 +405,16 @@ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
             '"' if !in_single_quote => {
                 in_double_quote = !in_double_quote;
                 current.push(ch);
+                if !in_double_quote {
+                    let remainder = chars.clone().collect::<String>();
+                    if quote_closes_sentence_before_sequence(&current, &remainder) {
+                        push_clause_chunk(&mut chunks, &current, Some(ClauseBoundary::Sentence));
+                        current.clear();
+                        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+                            chars.next();
+                        }
+                    }
+                }
             }
             ',' if paren_depth == 0 && !in_single_quote && !in_double_quote => {
                 let remainder = chars.clone().collect::<String>();
@@ -604,6 +614,30 @@ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
 
     push_clause_chunk(&mut chunks, &current, None);
     chunks
+}
+
+fn quote_closes_sentence_before_sequence(current: &str, remainder: &str) -> bool {
+    let quoted_text_ends_sentence = current
+        .chars()
+        .rev()
+        .nth(1)
+        .is_some_and(|ch| matches!(ch, '.' | '!' | '?'));
+    if !quoted_text_ends_sentence {
+        return false;
+    }
+
+    let trimmed = remainder.trim_start();
+    let trimmed_lower = trimmed.to_ascii_lowercase();
+    let sequence_starts = alt((
+        tag::<_, _, OracleError<'_>>("then, if "),
+        tag("then if "),
+        tag("then "),
+        tag("if "),
+        tag("otherwise"),
+    ))
+    .parse(trimmed_lower.as_str())
+    .is_ok();
+    sequence_starts
 }
 
 fn split_comma_clause_boundary(current: &str, remainder: &str) -> Option<(ClauseBoundary, usize)> {
@@ -3304,6 +3338,20 @@ mod tests {
             .into_iter()
             .map(|c| c.text)
             .collect()
+    }
+
+    #[test]
+    fn quoted_token_ability_boundary_splits_before_then_if() {
+        let chunks = clause_texts(
+            "create a tapped 0/1 black Wizard creature token with \"Whenever you cast a noncreature spell, this token deals 1 damage to each opponent.\" Then if you control four or more Wizards, transform ~.",
+        );
+        assert_eq!(
+            chunks,
+            vec![
+                "create a tapped 0/1 black Wizard creature token with \"Whenever you cast a noncreature spell, this token deals 1 damage to each opponent.\"",
+                "Then if you control four or more Wizards, transform ~",
+            ]
+        );
     }
 
     // --- Bare " and " splitting: positive cases (should split) ---

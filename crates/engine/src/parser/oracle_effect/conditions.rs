@@ -59,9 +59,13 @@ fn type_filter_references_subtype(filter: &TypeFilter) -> bool {
 
 pub(crate) fn split_leading_conditional(text: &str) -> Option<(String, String)> {
     let lower = text.to_lowercase();
-    if tag::<_, _, OracleError<'_>>("if ")
-        .parse(lower.as_str())
-        .is_err()
+    if alt((
+        tag::<_, _, OracleError<'_>>("then, if "),
+        tag("then if "),
+        tag("if "),
+    ))
+    .parse(lower.as_str())
+    .is_err()
     {
         return None;
     }
@@ -128,7 +132,15 @@ pub(crate) fn strip_leading_general_conditional(
     if let Some((condition_fragment, body)) = split_leading_conditional(text) {
         let condition_lower = condition_fragment.to_lowercase();
         let cond_text = nom_on_lower(&condition_fragment, &condition_lower, |i| {
-            value((), tag("if ")).parse(i)
+            value(
+                (),
+                alt((
+                    tag::<_, _, OracleError<'_>>("then, if "),
+                    tag("then if "),
+                    tag("if "),
+                )),
+            )
+            .parse(i)
         })
         .map(|((), rest)| rest)
         .unwrap_or(&condition_fragment)

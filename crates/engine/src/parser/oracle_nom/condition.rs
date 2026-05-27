@@ -5626,6 +5626,35 @@ mod tests {
     }
 
     #[test]
+    fn test_control_count_ge_creature_subtype() {
+        let (rest, c) = parse_inner_condition("you control four or more wizards").unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::ObjectCount {
+                                filter: TargetFilter::Typed(typed),
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 4 },
+            } => {
+                assert!(
+                    typed
+                        .type_filters
+                        .contains(&TypeFilter::Subtype("Wizard".to_string())),
+                    "expected Wizard subtype filter, got {:?}",
+                    typed.type_filters
+                );
+                assert_eq!(typed.controller, Some(ControllerRef::You));
+            }
+            other => panic!("expected ObjectCount Wizard GE 4, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_graveyard_count_ge() {
         let (rest, c) =
             parse_inner_condition("you have five or more cards in your graveyard").unwrap();

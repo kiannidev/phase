@@ -5151,6 +5151,12 @@ fn try_parse_event(
         return Some(result);
     }
 
+    // CR 603.6c + CR 603.10a: "[subject] is/are returned to [possessive] hand" —
+    // bounce trigger. Maps to ChangesZone from Battlefield to Hand.
+    if let Some(result) = try_parse_returned_to_hand(subject, rest) {
+        return Some(result);
+    }
+
     // CR 701.13a: "[subject] is put into exile from [zone]" — explicit zone-change
     // form of the exile trigger (God-Eternal Oketra). Self-referential triggers
     // need trigger_zones beyond battlefield because the source is in exile when
@@ -9062,6 +9068,25 @@ fn parse_graveyard_origin_zone(input: &str) -> OracleResult<'_, Option<Zone>> {
     .parse(input)
 }
 
+/// CR 400.3: Shared parser for possessive hand forms in zone-change triggers.
+/// Recognises "your hand", "an opponent's hand", "its owner's hand",
+/// "their owner's hand", "their owners' hands", "a player's hand", "a hand",
+/// and bare "hand". Returns `Some(controller)` when the possessive constrains
+/// the destination owner, `None` when any player's hand matches.
+fn parse_hand_possessive(input: &str) -> OracleResult<'_, Option<ControllerRef>> {
+    alt((
+        value(Some(ControllerRef::You), tag("your hand")),
+        value(Some(ControllerRef::Opponent), tag("an opponent's hand")),
+        value(None, tag("its owner's hand")),
+        value(None, tag("their owner's hand")),
+        value(None, tag("their owners' hands")),
+        value(None, tag("a player's hand")),
+        value(None, tag("a hand")),
+        value(None, tag("hand")),
+    ))
+    .parse(input)
+}
+
 /// Parse "[subject] is/are put into [possessive] hand from [zone]" — dredge-style
 /// zone-change triggers that fire when a card moves from graveyard (or library) to
 /// its owner's hand. Mirrors `try_parse_put_into_graveyard` with hand as the
@@ -9082,25 +9107,9 @@ fn try_parse_put_into_hand_from(
     .parse(rest)
     .ok()?;
 
-    fn parse_hand_possessive(input: &str) -> OracleResult<'_, Option<TargetFilter>> {
-        alt((
-            value(
-                Some(TargetFilter::Typed(
-                    TypedFilter::default().controller(ControllerRef::You),
-                )),
-                tag("your hand"),
-            ),
-            value(
-                Some(TargetFilter::Typed(
-                    TypedFilter::default().controller(ControllerRef::Opponent),
-                )),
-                tag("an opponent's hand"),
-            ),
-            value(None, tag("a hand")),
-        ))
-        .parse(input)
-    }
-    let (after_hand, valid_target) = parse_hand_possessive.parse(after_verb).ok()?;
+    let (after_hand, hand_owner) = parse_hand_possessive.parse(after_verb).ok()?;
+    let valid_target =
+        hand_owner.map(|ctrl| TargetFilter::Typed(TypedFilter::default().controller(ctrl)));
 
     let after_hand = after_hand.trim_start();
     let origin = if let Ok((after_from, ())) =
@@ -9136,6 +9145,52 @@ fn try_parse_put_into_hand_from(
     // self-referential LTB pattern above.
     if filter_references_self(subject) {
         def.trigger_zones = vec![Zone::Battlefield, Zone::Graveyard, Zone::Exile];
+    }
+    Some((TriggerMode::ChangesZone, def))
+}
+
+/// CR 603.6c + CR 603.10a: "[subject] is/are returned to [possessive] hand" —
+/// zone-change trigger for bounce effects. The verb "returned" implies the
+/// object moved from the battlefield to a player's hand. Examples:
+/// - Warped Devotion: "Whenever a permanent is returned to a player's hand"
+/// - Azorius Aethermage: "Whenever a permanent is returned to your hand"
+/// - Stormfront Riders: "Whenever … is returned to your hand"
+///
+/// Maps to `ChangesZone` with `origin: Battlefield`, `destination: Hand`.
+/// The hand-owner qualifier ("your"/"opponent's") is merged into `valid_card`
+/// via `add_controller` so that `match_changes_zone` correctly filters by
+/// the bounced permanent's controller.
+fn try_parse_returned_to_hand(
+    subject: &TargetFilter,
+    rest: &str,
+) -> Option<(TriggerMode, TriggerDefinition)> {
+    let (after_verb, ()) = alt((
+        value((), tag::<_, _, OracleError<'_>>("is returned to ")),
+        value((), tag("are returned to ")),
+    ))
+    .parse(rest)
+    .ok()?;
+
+    let (_after_hand, hand_owner) = parse_hand_possessive.parse(after_verb).ok()?;
+
+    // CR 400.3: Objects always go to their owner's zone, so "your hand"
+    // means the bounced permanent was controlled by you. Merge the
+    // constraint into `valid_card` because `match_changes_zone` only
+    // inspects `valid_card`, not `valid_target`.
+    let valid_card = match hand_owner {
+        Some(ctrl) => add_controller(subject.clone(), ctrl),
+        None => subject.clone(),
+    };
+
+    let mut def = make_base();
+    def.mode = TriggerMode::ChangesZone;
+    def.origin = Some(Zone::Battlefield);
+    def.destination = Some(Zone::Hand);
+    def.valid_card = Some(valid_card);
+    // Self-referential bounce triggers (e.g. "when ~ is returned to your hand")
+    // must fire from hand because the source has already moved.
+    if filter_references_self(subject) {
+        def.trigger_zones = vec![Zone::Battlefield, Zone::Hand];
     }
     Some((TriggerMode::ChangesZone, def))
 }
@@ -12597,6 +12652,44 @@ mod tests {
             !def.trigger_zones.contains(&Zone::Exile),
             "non-self-ref LTB must not extend to exile"
         );
+    }
+
+    /// CR 603.6c: "Whenever a permanent is returned to a player's hand" — Warped Devotion.
+    #[test]
+    fn trigger_returned_to_a_players_hand() {
+        let def = parse_trigger_line(
+            "Whenever a permanent is returned to a player's hand, that player discards a card.",
+            "Warped Devotion",
+        );
+        assert_eq!(def.mode, TriggerMode::ChangesZone);
+        assert_eq!(def.origin, Some(Zone::Battlefield));
+        assert_eq!(def.destination, Some(Zone::Hand));
+        // "a permanent" — any permanent, not self-referential.
+        assert!(def.valid_card.is_some());
+        // "a player's hand" — no owner constraint.
+        assert!(def.valid_target.is_none());
+    }
+
+    /// CR 603.6c: "Whenever a permanent is returned to your hand" — Azorius Aethermage.
+    #[test]
+    fn trigger_returned_to_your_hand() {
+        let def = parse_trigger_line(
+            "Whenever a permanent is returned to your hand, you may pay {1}. If you do, draw a card.",
+            "Azorius Aethermage",
+        );
+        assert_eq!(def.mode, TriggerMode::ChangesZone);
+        assert_eq!(def.origin, Some(Zone::Battlefield));
+        assert_eq!(def.destination, Some(Zone::Hand));
+        // "your hand" — controller constraint merged into valid_card.
+        let vc = def.valid_card.as_ref().expect("valid_card should be set");
+        match vc {
+            TargetFilter::Typed(tf) => {
+                assert_eq!(tf.controller, Some(ControllerRef::You));
+            }
+            _ => panic!("expected Typed filter with controller"),
+        }
+        // Owner constraint is on valid_card, not valid_target.
+        assert!(def.valid_target.is_none());
     }
 
     #[test]

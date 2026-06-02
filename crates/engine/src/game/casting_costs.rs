@@ -873,12 +873,12 @@ pub(crate) fn resume_interrupted_cost_payment(
         .map(|o| o.controller)
         .unwrap_or(state.active_player);
     state.activation_cost_payment_paused = false;
-    if pending.activation_ability_index.is_some() {
+    if let Some(activation_ability_index) = pending.activation_ability_index {
         return push_activated_ability_to_stack(
             state,
             player,
             pending.object_id,
-            pending.activation_ability_index.unwrap(),
+            activation_ability_index,
             pending.ability,
             None,
             events,

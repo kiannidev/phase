@@ -19014,11 +19014,11 @@ mod crew_tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::card_type::CoreType;
-    use crate::types::statics::StaticMode;
-    use crate::types::StaticDefinition;
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::player::PlayerId;
+    use crate::types::statics::StaticMode;
     use crate::types::zones::Zone;
+    use crate::types::StaticDefinition;
 
     fn setup_game_at_main_phase() -> GameState {
         let mut state = new_game(42);
@@ -19218,8 +19218,12 @@ mod crew_tests {
             .unwrap()
             .static_definitions
             .push(StaticDefinition::new(StaticMode::CantCrew));
-        assert!(!super::static_abilities::object_has_cant_crew(&state, creature_a));
-        assert!(super::static_abilities::object_has_cant_crew(&state, creature_b));
+        assert!(!crate::game::static_abilities::object_has_cant_crew(
+            &state, creature_a
+        ));
+        assert!(crate::game::static_abilities::object_has_cant_crew(
+            &state, creature_b
+        ));
 
         let result = apply_as_current(
             &mut state,

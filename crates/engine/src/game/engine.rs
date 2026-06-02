@@ -5082,8 +5082,7 @@ fn handle_crew_activation(
         ));
     }
 
-    // Find eligible creatures: untapped creatures controlled by player, excluding the Vehicle
-    // TODO: CR 702.122c — filter out creatures with "can't crew Vehicles" restriction when implemented
+    // CR 702.122c: Exclude creatures with "can't crew Vehicles".
     let eligible_creatures: Vec<ObjectId> = state
         .battlefield
         .iter()
@@ -5099,6 +5098,7 @@ fn handle_crew_activation(
                             && o.card_types
                                 .core_types
                                 .contains(&crate::types::card_type::CoreType::Creature)
+                            && !super::static_abilities::object_has_cant_crew(state, id)
                     })
                     .unwrap_or(false)
         })
@@ -5205,6 +5205,11 @@ fn handle_crew_announcement(
         if obj.zone != Zone::Battlefield || obj.tapped {
             return Err(EngineError::InvalidAction(
                 "Creature is no longer eligible for crewing".to_string(),
+            ));
+        }
+        if super::static_abilities::object_has_cant_crew(state, cid) {
+            return Err(EngineError::InvalidAction(
+                "Creature can't crew Vehicles".to_string(),
             ));
         }
         total_power += obj.power.unwrap_or(0).max(0);
@@ -19009,6 +19014,8 @@ mod crew_tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::card_type::CoreType;
+    use crate::types::statics::StaticMode;
+    use crate::types::StaticDefinition;
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::player::PlayerId;
     use crate::types::zones::Zone;
@@ -19200,6 +19207,48 @@ mod crew_tests {
         assert!(matches!(result.waiting_for, WaitingFor::Priority { .. }));
         assert!(state.objects.get(&creature_a).unwrap().tapped);
         assert!(state.objects.get(&creature_b).unwrap().tapped);
+    }
+
+    #[test]
+    fn test_crew_excludes_creature_with_cant_crew() {
+        let (mut state, vehicle_id, creature_a, creature_b) = setup_crew_scenario();
+        state
+            .objects
+            .get_mut(&creature_b)
+            .unwrap()
+            .static_definitions
+            .push(StaticDefinition::new(StaticMode::CantCrew));
+        assert!(!super::static_abilities::object_has_cant_crew(&state, creature_a));
+        assert!(super::static_abilities::object_has_cant_crew(&state, creature_b));
+
+        let result = apply_as_current(
+            &mut state,
+            GameAction::CrewVehicle {
+                vehicle_id,
+                creature_ids: vec![],
+            },
+        )
+        .unwrap();
+
+        match result.waiting_for {
+            WaitingFor::CrewVehicle {
+                eligible_creatures, ..
+            } => {
+                assert!(eligible_creatures.contains(&creature_a));
+                assert!(!eligible_creatures.contains(&creature_b));
+            }
+            other => panic!("Expected CrewVehicle, got {:?}", other),
+        }
+
+        let err = apply_as_current(
+            &mut state,
+            GameAction::CrewVehicle {
+                vehicle_id,
+                creature_ids: vec![creature_b],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, EngineError::InvalidAction(_)));
     }
 
     #[test]

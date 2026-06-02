@@ -1028,6 +1028,19 @@ fn default_origin_zone() -> Zone {
     Zone::Hand
 }
 
+/// CR 118.3: Resume paying a discard cost after a replacement choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDiscardForCostResume {
+    pub player: PlayerId,
+    pub pending: PendingCast,
+    pub expected: usize,
+    pub legal_cards: Vec<ObjectId>,
+    pub chosen: Vec<ObjectId>,
+    /// Index into `chosen` whose discard was paused; that discard completes
+    /// during `handle_replacement_choice` before this resume runs.
+    pub paused_at_index: usize,
+}
+
 impl PendingCast {
     pub fn new(
         object_id: ObjectId,
@@ -4966,6 +4979,17 @@ pub struct GameState {
     #[serde(skip)]
     pub cost_payment_failed_flag: bool,
 
+    /// CR 118.3: Set when cost payment pauses on `NeedsReplacementChoice`
+    /// (discard/sacrifice during activation). Cleared when activation resumes.
+    #[serde(skip)]
+    pub activation_cost_payment_paused: bool,
+
+    /// CR 118.3: Resume state when `handle_discard_for_cost` pauses mid-loop
+    /// for a replacement choice. The card at `next_index` is completed by
+    /// `handle_replacement_choice`; resume continues at `next_index + 1`.
+    #[serde(skip)]
+    pub pending_discard_for_cost: Option<PendingDiscardForCostResume>,
+
     /// Pending cast info saved when entering ManaPayment state (X-cost or convoke).
     /// Consumed by the (ManaPayment, PassPriority) handler to finalize the cast.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5358,6 +5382,8 @@ impl GameState {
             stack_trigger_event_batches: HashMap::new(),
             lki_cache: HashMap::new(),
             cost_payment_failed_flag: false,
+            activation_cost_payment_paused: false,
+            pending_discard_for_cost: None,
             pending_cast: None,
             ring_level: HashMap::new(),
             ring_bearer: HashMap::new(),

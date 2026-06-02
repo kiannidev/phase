@@ -465,6 +465,12 @@ fn pay_activation_costs_after_target_selection(
                 ability_index,
             );
         pay_ability_cost(state, player, pending.object_id, activation_cost, events)?;
+        if super::casting::cost_payment_paused_for_replacement_choice(state) {
+            state.pending_cast = Some(Box::new(pending.clone()));
+            return Err(EngineError::InvalidAction(
+                "Cost payment paused for replacement choice".to_string(),
+            ));
+        }
         if should_record_loyalty {
             super::planeswalker::record_loyalty_activation(state, pending.object_id, player);
         }

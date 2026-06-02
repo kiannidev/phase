@@ -801,18 +801,89 @@ pub(crate) fn handle_discard_for_cost(
 
     // CR 601.2h: Discard each chosen card through the replacement pipeline
     // so Madness (CR 702.35) etc. can intercept.
-    for &card_id in chosen {
+    for (index, &card_id) in chosen.iter().enumerate() {
         match super::effects::discard::discard_as_cost(state, card_id, player, events) {
             super::effects::discard::DiscardOutcome::Complete => {}
-            super::effects::discard::DiscardOutcome::NeedsReplacementChoice(_) => {
-                // CR 118.3: Replacement choice during cost payment is extremely rare.
-                // TODO: Surface replacement choice to player during cost payment.
-                // For now, proceed — the discard was not completed, but the
-                // replacement pipeline has already handled the event.
+            super::effects::discard::DiscardOutcome::NeedsReplacementChoice(choice_player) => {
+                state.pending_cast = Some(Box::new(pending));
+                state.pending_discard_for_cost =
+                    Some(crate::types::game_state::PendingDiscardForCostResume {
+                        player,
+                        pending: state.pending_cast.as_ref().unwrap().as_ref().clone(),
+                        expected,
+                        legal_cards: legal_cards.to_vec(),
+                        chosen: chosen.to_vec(),
+                        paused_at_index: index,
+                    });
+                super::casting::pause_cost_payment_for_replacement_choice(state, choice_player);
+                return Ok(state.waiting_for.clone());
             }
         }
     }
 
+    finish_pending_cost_or_cast(state, player, pending, events)
+}
+
+/// CR 118.3: After a replacement choice during discard-for-cost payment, finish
+/// discarding any remaining cards and continue the cast/activation pipeline.
+pub(crate) fn resume_interrupted_cost_payment(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    if let Some(resume) = state.pending_discard_for_cost.take() {
+        let player = resume.player;
+        let pending = resume.pending;
+        state.pending_cast = Some(Box::new(pending.clone()));
+        for &card_id in resume.chosen.iter().skip(resume.paused_at_index + 1) {
+            match super::effects::discard::discard_as_cost(state, card_id, player, events) {
+                super::effects::discard::DiscardOutcome::Complete => {}
+                super::effects::discard::DiscardOutcome::NeedsReplacementChoice(choice_player) => {
+                    state.pending_discard_for_cost =
+                        Some(crate::types::game_state::PendingDiscardForCostResume {
+                            player,
+                            pending: pending.clone(),
+                            expected: resume.expected,
+                            legal_cards: resume.legal_cards.clone(),
+                            chosen: resume.chosen.clone(),
+                            paused_at_index: resume
+                                .chosen
+                                .iter()
+                                .position(|&id| id == card_id)
+                                .unwrap_or(resume.paused_at_index + 1),
+                        });
+                    super::casting::pause_cost_payment_for_replacement_choice(state, choice_player);
+                    return Ok(state.waiting_for.clone());
+                }
+            }
+        }
+        state.pending_cast = None;
+        state.activation_cost_payment_paused = false;
+        return finish_pending_cost_or_cast(state, player, pending, events);
+    }
+
+    let Some(pending) = state.pending_cast.take() else {
+        return Ok(WaitingFor::Priority {
+            player: state.active_player,
+        });
+    };
+    let pending = *pending;
+    let player = state
+        .objects
+        .get(&pending.object_id)
+        .map(|o| o.controller)
+        .unwrap_or(state.active_player);
+    state.activation_cost_payment_paused = false;
+    if pending.activation_ability_index.is_some() {
+        return push_activated_ability_to_stack(
+            state,
+            player,
+            pending.object_id,
+            pending.activation_ability_index.unwrap(),
+            pending.ability,
+            None,
+            events,
+        );
+    }
     finish_pending_cost_or_cast(state, player, pending, events)
 }
 

@@ -7710,6 +7710,19 @@ fn apply_mana_spell_grants(
     }
 }
 
+/// CR 118.3: Pause cost payment for a competing replacement effect.
+pub(crate) fn pause_cost_payment_for_replacement_choice(
+    state: &mut GameState,
+    choice_player: PlayerId,
+) {
+    state.waiting_for = super::replacement::replacement_choice_waiting_for(choice_player, state);
+}
+
+/// True when `pay_ability_cost` paused for `WaitingFor::ReplacementChoice`.
+pub(crate) fn cost_payment_paused_for_replacement_choice(state: &GameState) -> bool {
+    matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. })
+}
+
 /// Pay an activated ability's cost. Handles auto-payable cost components
 /// (`Tap`, `Mana`, `PayLife`, `Composite`, and self-referential zone costs)
 /// and passes through cost types that require interactive resolution.
@@ -7782,6 +7795,9 @@ fn pay_ability_cost_inner(
                     events,
                     excluded_sources,
                 )?;
+                if cost_payment_paused_for_replacement_choice(state) {
+                    return Ok(());
+                }
             }
         }
         AbilityCost::PayLife { amount } => {
@@ -7810,11 +7826,10 @@ fn pay_ability_cost_inner(
                 }
                 match super::sacrifice::sacrifice_permanent(state, source_id, player, events)? {
                     super::sacrifice::SacrificeOutcome::Complete => {}
-                    super::sacrifice::SacrificeOutcome::NeedsReplacementChoice(_) => {
-                        // CR 118.3: Replacement choice during cost payment is extremely rare.
-                        // TODO: Surface replacement choice to player during cost payment.
-                        // For now, proceed — the sacrifice was not completed, but the
-                        // replacement pipeline has already handled the event.
+                    super::sacrifice::SacrificeOutcome::NeedsReplacementChoice(choice_player) => {
+                        state.activation_cost_payment_paused = true;
+                        pause_cost_payment_for_replacement_choice(state, choice_player);
+                        return Ok(());
                     }
                 }
             } else {
@@ -7827,11 +7842,10 @@ fn pay_ability_cost_inner(
         AbilityCost::Discard { self_ref: true, .. } => {
             match super::effects::discard::discard_as_cost(state, source_id, player, events) {
                 super::effects::discard::DiscardOutcome::Complete => {}
-                super::effects::discard::DiscardOutcome::NeedsReplacementChoice(_) => {
-                    // CR 118.3: Replacement choice during cost payment is extremely rare.
-                    // TODO: Surface replacement choice to player during cost payment.
-                    // For now, proceed — the discard was not completed, but the
-                    // replacement pipeline has already handled the event.
+                super::effects::discard::DiscardOutcome::NeedsReplacementChoice(choice_player) => {
+                    state.activation_cost_payment_paused = true;
+                    pause_cost_payment_for_replacement_choice(state, choice_player);
+                    return Ok(());
                 }
             }
         }
@@ -9210,6 +9224,14 @@ pub fn handle_activate_ability(
                     ));
                 }
                 pay_ability_cost(state, player, source_id, cost, events)?;
+                if cost_payment_paused_for_replacement_choice(state) {
+                    let mut pending =
+                        PendingCast::new(source_id, CardId(0), resolved.clone(), ManaCost::NoCost);
+                    pending.activation_cost = ability_def.cost.clone();
+                    pending.activation_ability_index = Some(ability_index);
+                    state.pending_cast = Some(Box::new(pending));
+                    return Ok(state.waiting_for.clone());
+                }
             }
 
             let assigned_targets = flatten_targets_in_chain(&resolved);
@@ -9289,6 +9311,14 @@ pub fn handle_activate_ability(
             ));
         }
         pay_ability_cost(state, player, source_id, cost, events)?;
+        if cost_payment_paused_for_replacement_choice(state) {
+            let mut pending =
+                PendingCast::new(source_id, CardId(0), resolved.clone(), ManaCost::NoCost);
+            pending.activation_cost = ability_def.cost.clone();
+            pending.activation_ability_index = Some(ability_index);
+            state.pending_cast = Some(Box::new(pending));
+            return Ok(state.waiting_for.clone());
+        }
     }
 
     // Push to stack

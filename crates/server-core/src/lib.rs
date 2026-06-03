@@ -6,6 +6,7 @@ pub mod draft_session;
 pub mod draft_wire_guard;
 pub mod emote_guard;
 pub mod filter;
+pub mod game_action_payload_guard;
 pub mod game_reconnect_guard;
 #[cfg(test)]
 mod harness;
@@ -13,6 +14,7 @@ pub mod legacy_deck_guard;
 pub mod legacy_join_guard;
 pub mod lobby;
 pub mod lookup_join_guard;
+pub mod p2p_backup_guard;
 pub mod persist;
 pub mod protocol;
 pub mod reconnect;
@@ -37,6 +39,7 @@ pub use legacy_deck_guard::guard_legacy_deck;
 pub use legacy_join_guard::guard_legacy_join_game;
 pub use lobby::LobbyManager;
 pub use lookup_join_guard::guard_lookup_join_target;
+pub use p2p_backup_guard::{guard_p2p_backup, MAX_P2P_SNAPSHOT_LEN};
 pub use persist::{PersistedLobbyMeta, PersistedSession};
 pub use protocol::{
     AiSeatRequest, ClientMessage, DeckChoice, DeckData, LobbyGame, PlayerSlotInfo, SeatKind,
@@ -48,4 +51,7 @@ pub use session::{
     acting_player, acting_players, generate_game_code, generate_player_token, is_acting,
     SessionManager,
 };
-pub use spectator_wire_guard::{guard_spectate_draft, guard_spectator_join};
+pub use spectator_wire_guard::{
+    guard_draft_spectator_capacity, guard_game_spectator_capacity, guard_spectate_draft,
+    guard_spectator_join, MAX_DRAFT_SPECTATORS_PER_DRAFT, MAX_GAME_SPECTATORS_PER_GAME,
+};

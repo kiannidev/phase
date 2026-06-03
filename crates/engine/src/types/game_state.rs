@@ -308,6 +308,9 @@ pub enum NextSpellModifier {
     HasKeyword { keyword: Keyword },
     /// "The next spell you cast this turn can be cast as though it had flash."
     CastAsThoughFlash,
+    /// CR 118.9a: "The next [filter] spell you cast this turn can be cast without
+    /// paying its mana cost." Additional costs still apply (CR 118.8).
+    WithoutPayingManaCost,
 }
 
 /// CR 400.7: Snapshot of an object's properties at the time of a zone change,
@@ -950,6 +953,15 @@ pub struct PendingCast {
     pub card_id: CardId,
     pub ability: ResolvedAbility,
     pub cost: ManaCost,
+    /// CR 601.2f: The tax-inclusive base mana cost captured at announcement,
+    /// BEFORE any cost reductions/increases or {X} concretization. Lets the
+    /// full concrete cost be recomputed from scratch for any chosen X with
+    /// floors applied LAST (`concrete_cost_for_x`). `None` for activated /
+    /// mana-ability casts and for legacy/in-flight saved games — those paths
+    /// fall back to flooring the already-reduced `cost`. `NoCost` is a real
+    /// base, so `Option` is the only safe sentinel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_cost: Option<ManaCost>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_cost: Option<AbilityCost>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1028,6 +1040,17 @@ fn default_origin_zone() -> Zone {
     Zone::Hand
 }
 
+/// CR 601.2h + CR 616.1: Resume paying a discard cost after a replacement choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDiscardForCostResume {
+    pub player: PlayerId,
+    pub pending: PendingCast,
+    pub chosen: Vec<ObjectId>,
+    /// Index into `chosen` whose discard was paused; that discard completes
+    /// during `handle_replacement_choice` before this resume runs.
+    pub paused_at_index: usize,
+}
+
 impl PendingCast {
     pub fn new(
         object_id: ObjectId,
@@ -1040,6 +1063,7 @@ impl PendingCast {
             card_id,
             ability,
             cost,
+            base_cost: None,
             activation_cost: None,
             activation_ability_index: None,
             target_constraints: Vec::new(),
@@ -1437,6 +1461,13 @@ pub struct PlayerDeckPool {
     pub registered_commander: std::sync::Arc<Vec<DeckEntry>>,
     #[serde(default)]
     pub current_commander: std::sync::Arc<Vec<DeckEntry>>,
+    /// Oathbreaker RC: registered and current signature spell entries.
+    /// Empty for all non-Oathbreaker formats. Mirrors the commander Arc pair
+    /// so between-games persistence works correctly.
+    #[serde(default)]
+    pub registered_signature_spell: std::sync::Arc<Vec<DeckEntry>>,
+    #[serde(default)]
+    pub current_signature_spell: std::sync::Arc<Vec<DeckEntry>>,
     /// The declared bracket tier for this player's deck. Used by the AI to
     /// determine whether cEDH-specific policies apply (Phase 5 `ComboLinePolicy`,
     /// Phase 6 `CedhKeepablesMulligan`). Defaults to `Core` for backward
@@ -1662,6 +1693,10 @@ pub enum AlternativeCastKeyword {
     /// permanent enters with N time counters and isn't a creature until the last
     /// is removed. An end-step trigger removes one counter per turn.
     Impending,
+    /// CR 702.160a: Prototype alternative cost paid from hand. The resulting
+    /// spell/permanent uses the secondary power, toughness, and mana cost
+    /// characteristics while it is a creature.
+    Prototype,
 }
 
 /// CR 601.2b: Engine-authored cast-variant option for spells with more than
@@ -2606,6 +2641,12 @@ pub enum WaitingFor {
         options: Vec<u8>,
         option_names: Vec<String>,
     },
+    /// Digital-only Specialize: choose which color specialization to apply.
+    SpecializeColor {
+        player: PlayerId,
+        object_id: crate::types::identifiers::ObjectId,
+        options: Vec<crate::types::mana::ManaColor>,
+    },
     /// CR 118.3 + CR 601.2b + CR 605.3b: Player must select `count` objects
     /// from `choices` to pay a cost, then the engine resumes via `resume`.
     /// Replaces: DiscardForCost, SacrificeForCost, ReturnToHandForCost,
@@ -3217,6 +3258,7 @@ impl WaitingFor {
             | WaitingFor::ChooseRingBearer { player, .. }
             | WaitingFor::ChooseDungeon { player, .. }
             | WaitingFor::ChooseDungeonRoom { player, .. }
+            | WaitingFor::SpecializeColor { player, .. }
             | WaitingFor::PayCost { player, .. }
             | WaitingFor::ActivationCostOneOfChoice { player, .. }
             | WaitingFor::BlightChoice { player, .. }
@@ -3550,6 +3592,10 @@ pub enum CastingVariant {
     /// CR 702.127a: Cast an aftermath half of a split card from a graveyard.
     /// If it was cast from a graveyard, exile it any time it leaves the stack.
     Aftermath,
+    /// CR 702.146a-b + CR 712.8c: Cast transformed from graveyard for disturb
+    /// cost. The stack spell uses its back-face characteristics and the
+    /// permanent enters the battlefield back face up on resolution.
+    Disturb,
     /// CR 601.2a: Cast from graveyard via a static permission source (e.g. Lurrus).
     /// Stores the granting permanent's ObjectId for per-turn tracking.
     /// CR 400.7: Zone change creates new ObjectId, naturally resetting permission.
@@ -3717,11 +3763,50 @@ pub enum CastingVariant {
     /// with N time counters (from the keyword) and is not a creature while any
     /// remain. At the beginning of your end step one time counter is removed.
     Impending,
+    /// CR 702.160a: Cast from hand prototyped. The printed mana cost is replaced
+    /// by the prototype cost during cast preparation, and the object is tagged so
+    /// stack display plus layer evaluation use the secondary mana cost and P/T
+    /// while it is a creature.
+    Prototype,
 }
 
 impl CastingVariant {
     pub fn is_normal(&self) -> bool {
         *self == CastingVariant::Normal
+    }
+
+    /// CR 118.9a: Only one alternative cost can be applied to a spell.
+    pub fn uses_alternative_cost(self) -> bool {
+        match self {
+            CastingVariant::Warp
+            | CastingVariant::Escape
+            | CastingVariant::Harmonize
+            | CastingVariant::Flashback
+            | CastingVariant::HandPermission { .. }
+            | CastingVariant::Sneak { .. }
+            | CastingVariant::WebSlinging { .. }
+            | CastingVariant::Miracle
+            | CastingVariant::Madness
+            | CastingVariant::Evoke
+            | CastingVariant::Suspend
+            | CastingVariant::Plot
+            | CastingVariant::Foretell
+            | CastingVariant::Overload
+            | CastingVariant::Bestow
+            | CastingVariant::Awaken
+            | CastingVariant::Cleave
+            | CastingVariant::MoreThanMeetsTheEye
+            | CastingVariant::Disturb
+            | CastingVariant::Impending
+            | CastingVariant::Prototype => true,
+            CastingVariant::Normal
+            | CastingVariant::Adventure
+            | CastingVariant::Omen
+            | CastingVariant::Retrace
+            | CastingVariant::Aftermath
+            | CastingVariant::GraveyardPermission { .. }
+            | CastingVariant::ExilePermission { .. } => false,
+        }
     }
 
     pub fn exiles_when_leaving_stack_for_any_reason(self) -> bool {
@@ -3755,7 +3840,10 @@ impl CastingVariant {
     pub fn restores_front_face_after_stack_exit(self) -> bool {
         matches!(
             self,
-            CastingVariant::Adventure | CastingVariant::Omen | CastingVariant::MoreThanMeetsTheEye
+            CastingVariant::Adventure
+                | CastingVariant::Omen
+                | CastingVariant::MoreThanMeetsTheEye
+                | CastingVariant::Disturb
         )
     }
 }
@@ -4966,6 +5054,12 @@ pub struct GameState {
     #[serde(skip)]
     pub cost_payment_failed_flag: bool,
 
+    /// CR 601.2h + CR 616.1: Resume state when `handle_discard_for_cost` pauses mid-loop
+    /// for a replacement choice. The card at `paused_at_index` is completed by
+    /// `handle_replacement_choice`; resume continues at `paused_at_index + 1`.
+    #[serde(skip)]
+    pub pending_discard_for_cost: Option<PendingDiscardForCostResume>,
+
     /// Pending cast info saved when entering ManaPayment state (X-cost or convoke).
     /// Consumed by the (ManaPayment, PassPriority) handler to finalize the cast.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5358,6 +5452,7 @@ impl GameState {
             stack_trigger_event_batches: HashMap::new(),
             lki_cache: HashMap::new(),
             cost_payment_failed_flag: false,
+            pending_discard_for_cost: None,
             pending_cast: None,
             ring_level: HashMap::new(),
             ring_bearer: HashMap::new(),
@@ -5838,6 +5933,7 @@ mod tests {
                     PlayerId(0),
                 ),
                 cost: ManaCost::NoCost,
+                base_cost: None,
                 activation_cost: None,
                 activation_ability_index: None,
                 target_constraints: vec![],
@@ -6162,6 +6258,7 @@ mod tests {
                 PlayerId(0),
             ),
             cost: ManaCost::NoCost,
+            base_cost: None,
             activation_cost: None,
             activation_ability_index: None,
             target_constraints: vec![],

@@ -5914,9 +5914,6 @@ pub enum Effect {
     /// opponent other than the defending player for the source creature, then
     /// exiles those tokens at end of combat.
     Myriad,
-    /// CR 702.178a: Double team creates one tapped attacking token copy when the
-    /// creature attacks.
-    DoubleTeam,
     /// CR 509.1g + CR 506.3e + CR 707.2: For each attacking creature matched by
     /// `source_filter`, create a token that's a copy of it and put that token
     /// onto the battlefield blocking the attacker it copies. Mirror Match is the
@@ -7898,7 +7895,6 @@ impl Effect {
             // These use filters, zone-level operations, or have no targeting at all.
             Effect::StartYourEngines { .. }
             | Effect::Myriad
-            | Effect::DoubleTeam
             // CR 508.1: copies are chosen by the effect, not declared as targets.
             | Effect::CopyTokenBlockingAttacker { .. }
             | Effect::ChangeSpeed { .. }
@@ -8078,7 +8074,6 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::CastCopyOfCard { .. } => "CastCopyOfCard",
         Effect::CopyTokenOf { .. } => "CopyTokenOf",
         Effect::Myriad => "Myriad",
-        Effect::DoubleTeam => "DoubleTeam",
         Effect::CopyTokenBlockingAttacker { .. } => "CopyTokenBlockingAttacker",
         Effect::BecomeCopy { .. } => "BecomeCopy",
         Effect::ChooseCard { .. } => "ChooseCard",
@@ -8268,7 +8263,6 @@ pub enum EffectKind {
     CastCopyOfCard,
     CopyTokenOf,
     Myriad,
-    DoubleTeam,
     BecomeCopy,
     ChooseCard,
     PutCounter,
@@ -8455,7 +8449,6 @@ impl From<&Effect> for EffectKind {
             Effect::CastCopyOfCard { .. } => EffectKind::CastCopyOfCard,
             Effect::CopyTokenOf { .. } => EffectKind::CopyTokenOf,
             Effect::Myriad => EffectKind::Myriad,
-            Effect::DoubleTeam => EffectKind::DoubleTeam,
             // CR 707.2: classified as a copy-token effect — the block placement
             // is bookkeeping layered on top of the same token-copy creation.
             Effect::CopyTokenBlockingAttacker { .. } => EffectKind::CopyTokenOf,

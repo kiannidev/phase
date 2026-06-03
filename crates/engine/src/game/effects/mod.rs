@@ -64,7 +64,6 @@ pub mod dig;
 pub mod discard;
 pub mod discover;
 pub mod double;
-pub mod double_team;
 pub mod draw;
 pub mod drawn_this_turn_choice;
 pub mod effect;
@@ -1697,7 +1696,6 @@ pub fn resolve_effect(
         Effect::CastCopyOfCard { .. } => cast_copy_of_card::resolve(state, ability, events),
         Effect::CopyTokenOf { .. } => token_copy::resolve(state, ability, events),
         Effect::Myriad => myriad::resolve(state, ability, events),
-        Effect::DoubleTeam => double_team::resolve(state, ability, events),
         Effect::CopyTokenBlockingAttacker { .. } => {
             copy_token_blocking::resolve(state, ability, events)
         }

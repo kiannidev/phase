@@ -2599,10 +2599,8 @@ pub fn synthesize_myriad(face: &mut CardFace) {
     KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Myriad));
 }
 
-/// CR 702.178a: Double team is an attack trigger that creates one tapped attacking
-/// token copy of the attacking creature.
-///
-/// CR 702.178b: Multiple double team instances trigger separately.
+/// Double team is an Arena/Alchemy keyword that triggers on attack and creates
+/// one tapped attacking token copy of the attacking creature.
 pub fn synthesize_double_team(face: &mut CardFace) {
     KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::DoubleTeam));
 }
@@ -2820,20 +2818,49 @@ fn build_myriad_trigger() -> TriggerDefinition {
 fn is_double_team_attack_trigger(t: &TriggerDefinition) -> bool {
     matches!(t.mode, TriggerMode::Attacks)
         && matches!(t.valid_card, Some(TargetFilter::SelfRef))
-        && t.execute.as_deref().is_some_and(|ability| {
-            !ability.optional && matches!(ability.effect.as_ref(), Effect::DoubleTeam)
-        })
+        && t.execute
+            .as_deref()
+            .is_some_and(|ability| match &*ability.effect {
+                Effect::CopyTokenOf {
+                    target,
+                    owner,
+                    enters_attacking,
+                    tapped,
+                    count,
+                    ..
+                } => {
+                    !ability.optional
+                        && matches!(target, TargetFilter::SelfRef)
+                        && matches!(owner, TargetFilter::Controller)
+                        && *enters_attacking
+                        && *tapped
+                        && matches!(count, QuantityExpr::Fixed { value: 1 })
+                }
+                _ => false,
+            })
 }
 
 fn build_double_team_trigger() -> TriggerDefinition {
-    let execute = AbilityDefinition::new(AbilityKind::Spell, Effect::DoubleTeam)
-        .description("Create a tapped attacking token copy of this creature".to_string());
+    let execute = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::CopyTokenOf {
+            target: TargetFilter::SelfRef,
+            owner: TargetFilter::Controller,
+            source_filter: None,
+            enters_attacking: true,
+            tapped: true,
+            count: QuantityExpr::Fixed { value: 1 },
+            extra_keywords: vec![],
+            additional_modifications: vec![],
+        },
+    )
+    .description("Create a tapped attacking token copy of this creature".to_string());
 
     TriggerDefinition::new(TriggerMode::Attacks)
         .valid_card(TargetFilter::SelfRef)
         .execute(execute)
         .description(
-            "CR 702.178a: Double team — whenever this creature attacks, create a tapped and attacking token that's a copy of it.".to_string(),
+            "Double team — whenever this creature attacks, create a tapped and attacking token that's a copy of it.".to_string(),
         )
 }
 
@@ -4899,8 +4926,8 @@ pub fn synthesize_all(face: &mut CardFace) {
     // player, exiled at end of combat. CR 702.116b: each instance triggers
     // separately.
     synthesize_myriad(face);
-    // CR 702.178a: Double team — attack trigger creating one tapped attacking copy.
-    // CR 702.178b: each instance triggers separately.
+    // Double team is an Arena/Alchemy attack trigger creating one tapped
+    // attacking copy. Each instance triggers separately.
     synthesize_double_team(face);
     // CR 702.95a: Soulbond — two optional ETB triggers that create pair
     // relationships under the resolution checks in CR 702.95c-d.
@@ -8657,6 +8684,19 @@ mod myriad_runtime_tests {
         face
     }
 
+    fn double_team_creature_face(name: &str, instances: usize) -> CardFace {
+        let mut face = CardFace {
+            name: name.to_string(),
+            power: Some(PtValue::Fixed(2)),
+            toughness: Some(PtValue::Fixed(2)),
+            keywords: vec![Keyword::DoubleTeam; instances],
+            ..CardFace::default()
+        };
+        face.card_type.core_types.push(CoreType::Creature);
+        synthesize_all(&mut face);
+        face
+    }
+
     fn setup_attack_state(player_count: u8, face: &CardFace) -> (GameState, ObjectId) {
         let mut state = GameState::new(FormatConfig::standard(), player_count, 42);
         state.turn_number = 2;
@@ -8692,8 +8732,8 @@ mod myriad_runtime_tests {
                 attacks: vec![(attacker_id, AttackTarget::Player(defender))],
             },
         )
-        .expect("declare Myriad attacker");
-        // CR 603.3b (#531): multiple Myriad triggers from same controller
+        .expect("declare attacker");
+        // CR 603.3b (#531): multiple triggers from the same controller
         // surface an OrderTriggers prompt; drain with identity for legacy
         // stack-assertion tests.
         crate::game::triggers::drain_order_triggers_with_identity(state);
@@ -8722,6 +8762,65 @@ mod myriad_runtime_tests {
                     .then_some(*id)
             })
             .collect()
+    }
+
+    #[test]
+    fn double_team_attack_creates_tapped_attacking_copy() {
+        let face = double_team_creature_face("Double Team Bear", 1);
+        let (mut state, attacker_id) = setup_attack_state(2, &face);
+
+        declare_attack(&mut state, attacker_id, PlayerId(1));
+        assert_eq!(
+            state.stack.len(),
+            1,
+            "Double Team attack trigger goes on stack"
+        );
+
+        let mut events = Vec::new();
+        crate::game::stack::resolve_top(&mut state, &mut events);
+
+        let tokens = myriad_tokens(&state, &face.name);
+        assert_eq!(tokens.len(), 1, "one tapped attacking copy");
+        let token_id = tokens[0];
+        assert!(state.objects.get(&token_id).unwrap().tapped);
+
+        let token_attacker = state
+            .combat
+            .as_ref()
+            .unwrap()
+            .attackers
+            .iter()
+            .find(|attacker| attacker.object_id == token_id)
+            .expect("Double Team token is attacking");
+        assert_eq!(token_attacker.defending_player, PlayerId(1));
+        assert_eq!(
+            token_attacker.attack_target,
+            AttackTarget::Player(PlayerId(1))
+        );
+        assert!(
+            state
+                .combat
+                .as_ref()
+                .unwrap()
+                .attackers
+                .iter()
+                .any(|attacker| attacker.object_id == attacker_id),
+            "original attacker remains in combat"
+        );
+    }
+
+    #[test]
+    fn double_team_multiple_instances_stack_separately() {
+        let face = double_team_creature_face("Double Double Team Bear", 2);
+        let (mut state, attacker_id) = setup_attack_state(2, &face);
+
+        declare_attack(&mut state, attacker_id, PlayerId(1));
+
+        assert_eq!(
+            state.stack.len(),
+            2,
+            "each Double Team instance should synthesize an independent attack trigger"
+        );
     }
 
     #[test]

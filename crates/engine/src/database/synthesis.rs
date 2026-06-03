@@ -2987,41 +2987,51 @@ fn is_extort_trigger(t: &TriggerDefinition) -> bool {
             .is_some_and(|a| a.optional && a.cost.is_some())
 }
 
+/// CR 702.191a: Intervening-if — this permanent is a creature and mana spent to
+/// cast the spell exceeds its power or toughness.
 fn increment_mana_spent_exceeds_self_pt_condition() -> TriggerCondition {
-    TriggerCondition::Or {
+    TriggerCondition::And {
         conditions: vec![
-            TriggerCondition::QuantityComparison {
-                lhs: QuantityExpr::Ref {
-                    qty: QuantityRef::ManaSpentToCast {
-                        scope: CastManaObjectScope::TriggeringSpell,
-                        metric: CastManaSpentMetric::Total,
-                    },
-                },
-                comparator: Comparator::GT,
-                rhs: QuantityExpr::Ref {
-                    qty: QuantityRef::Power {
-                        scope: ObjectScope::Source,
-                    },
-                },
+            TriggerCondition::SourceMatchesFilter {
+                filter: TargetFilter::Typed(TypedFilter::creature()),
             },
-            TriggerCondition::QuantityComparison {
-                lhs: QuantityExpr::Ref {
-                    qty: QuantityRef::ManaSpentToCast {
-                        scope: CastManaObjectScope::TriggeringSpell,
-                        metric: CastManaSpentMetric::Total,
+            TriggerCondition::Or {
+                conditions: vec![
+                    TriggerCondition::QuantityComparison {
+                        lhs: QuantityExpr::Ref {
+                            qty: QuantityRef::ManaSpentToCast {
+                                scope: CastManaObjectScope::TriggeringSpell,
+                                metric: CastManaSpentMetric::Total,
+                            },
+                        },
+                        comparator: Comparator::GT,
+                        rhs: QuantityExpr::Ref {
+                            qty: QuantityRef::Power {
+                                scope: ObjectScope::Source,
+                            },
+                        },
                     },
-                },
-                comparator: Comparator::GT,
-                rhs: QuantityExpr::Ref {
-                    qty: QuantityRef::Toughness {
-                        scope: ObjectScope::Source,
+                    TriggerCondition::QuantityComparison {
+                        lhs: QuantityExpr::Ref {
+                            qty: QuantityRef::ManaSpentToCast {
+                                scope: CastManaObjectScope::TriggeringSpell,
+                                metric: CastManaSpentMetric::Total,
+                            },
+                        },
+                        comparator: Comparator::GT,
+                        rhs: QuantityExpr::Ref {
+                            qty: QuantityRef::Toughness {
+                                scope: ObjectScope::Source,
+                            },
+                        },
                     },
-                },
+                ],
             },
         ],
     }
 }
 
+/// CR 702.191a: Synthesized Increment spell-cast trigger identity.
 fn is_increment_trigger(t: &TriggerDefinition) -> bool {
     matches!(t.mode, TriggerMode::SpellCast)
         && matches!(t.valid_target, Some(TargetFilter::Controller))
@@ -7867,8 +7877,8 @@ mod increment_synthesis_tests {
             Some(TargetFilter::Controller)
         ));
         assert!(
-            matches!(trigger.condition, Some(TriggerCondition::Or { .. })),
-            "increment must gate on mana spent vs source P/T"
+            matches!(trigger.condition, Some(TriggerCondition::And { .. })),
+            "increment must gate on creature check and mana spent vs source P/T"
         );
 
         let Some(execute) = trigger.execute.as_deref() else {

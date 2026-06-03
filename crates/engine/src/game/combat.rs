@@ -1639,9 +1639,8 @@ pub fn validate_attack_band_declarations(
     attacks: &[(ObjectId, AttackTarget)],
     bands: &[Vec<ObjectId>],
 ) -> Result<(), String> {
-    let attack_targets: std::collections::HashMap<ObjectId, AttackTarget> =
-        attacks.iter().copied().collect();
-    let mut assigned = std::collections::HashSet::new();
+    let attack_targets: HashMap<ObjectId, AttackTarget> = attacks.iter().copied().collect();
+    let mut assigned = HashSet::new();
 
     for (band_index, members) in bands.iter().enumerate() {
         if members.is_empty() {
@@ -1705,21 +1704,22 @@ fn apply_attack_band_ids(attackers: &mut [AttackerInfo], bands: &[Vec<ObjectId>]
 
 /// CR 702.22h/i: Once any member of a band is blocked, the whole band is blocked
 /// and each member is considered blocked by the union of blockers on any member.
+/// Also keeps `blocker_to_attacker` in sync (inverse of `blocker_assignments`).
 pub fn propagate_banding_block_state(combat: &mut CombatState) {
-    let band_ids: Vec<u32> = combat
+    if !combat.attackers.iter().any(|a| a.band_id.is_some()) {
+        return;
+    }
+
+    let band_ids: HashSet<u32> = combat
         .attackers
         .iter()
-        .filter(|a| a.blocked && a.band_id.is_some())
+        .filter(|a| a.blocked)
         .filter_map(|a| a.band_id)
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
         .collect();
 
     for band_id in band_ids {
-        let member_ids: Vec<ObjectId> = combat
-            .attackers
-            .iter()
-            .filter(|a| a.band_id == Some(band_id))
+        let member_ids: Vec<ObjectId> = band_members(combat, band_id)
+            .into_iter()
             .map(|a| a.object_id)
             .collect();
 
@@ -1737,12 +1737,22 @@ pub fn propagate_banding_block_state(combat: &mut CombatState) {
             continue;
         }
 
-        for attacker in combat.attackers.iter_mut() {
-            if attacker.band_id == Some(band_id) {
+        for member_id in member_ids {
+            if let Some(attacker) = combat
+                .attackers
+                .iter_mut()
+                .find(|a| a.object_id == member_id)
+            {
                 attacker.blocked = true;
-                combat
-                    .blocker_assignments
-                    .insert(attacker.object_id, union_blockers.clone());
+            }
+            combat
+                .blocker_assignments
+                .insert(member_id, union_blockers.clone());
+            for &blocker_id in &union_blockers {
+                let attackers = combat.blocker_to_attacker.entry(blocker_id).or_default();
+                if !attackers.contains(&member_id) {
+                    attackers.push(member_id);
+                }
             }
         }
     }
@@ -3447,6 +3457,13 @@ mod tests {
             combat.blocker_assignments.get(&pegasus),
             combat.blocker_assignments.get(&hero),
             "blockers on one band member must propagate to the band"
+        );
+        assert!(
+            combat
+                .blocker_to_attacker
+                .get(&blocker)
+                .is_some_and(|attackers| attackers.contains(&hero) && attackers.contains(&pegasus)),
+            "blocker_to_attacker must list every propagated band member"
         );
     }
 

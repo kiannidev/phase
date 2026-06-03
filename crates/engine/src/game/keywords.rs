@@ -65,9 +65,23 @@ pub fn effective_flashback_cost(state: &GameState, object_id: ObjectId) -> Optio
     }
 }
 
-/// CR 702.140a: Effective Disturb alt-cost for an object in the graveyard.
+/// CR 702.146a: Effective Disturb alt-cost for an object in the graveyard.
 pub fn effective_disturb_cost(state: &GameState, object_id: ObjectId) -> Option<ManaCost> {
-    let keyword = effective_keyword_for_object(state, object_id, KeywordKind::Disturb)?;
+    let keyword =
+        effective_keyword_for_object(state, object_id, KeywordKind::Disturb).or_else(|| {
+            let obj = state.objects.get(&object_id)?;
+            // `snapshot_object_face` clears layout_kind; a still-unswapped DFC
+            // back face retains its layout kind and must not grant Disturb.
+            let stored_front_face = obj
+                .back_face
+                .as_ref()
+                .filter(|face| face.layout_kind.is_none())?;
+            stored_front_face
+                .keywords
+                .iter()
+                .find(|keyword| keyword.kind() == KeywordKind::Disturb)
+                .cloned()
+        })?;
     match keyword {
         Keyword::Disturb(cost) => Some(resolve_keyword_mana_cost(state, object_id, &cost)),
         _ => None,

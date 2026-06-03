@@ -458,16 +458,6 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                     *enter_tapped = crate::types::proposed_event::EtbTapState::Tapped;
                 }
             }
-            // CR 702.140a: Disturb resolves to the back face on the battlefield.
-            if casting_variant == CastingVariant::Disturb {
-                if let crate::types::proposed_event::ProposedEvent::ZoneChange {
-                    enter_transformed,
-                    ..
-                } = &mut proposed
-                {
-                    *enter_transformed = true;
-                }
-            }
             // CR 712.14a + CR 310.11b: If this spell was cast via an
             // ExileWithAltCost permission with `cast_transformed`, the
             // permanent enters the battlefield transformed (resolving to its
@@ -643,14 +633,16 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                                     }
                                 }
                             }
-                            // CR 702.162a + CR 712.11a + CR 712.13: MTMTE
-                            // puts the converted spell on the stack with its
-                            // back face up. A resolving DFC spell becomes a
-                            // permanent with the same face up; mark the
-                            // battlefield object transformed without swapping
-                            // faces again.
-                            if casting_variant == CastingVariant::MoreThanMeetsTheEye
-                                && to == Zone::Battlefield
+                            // CR 702.146b / CR 702.162a + CR 712.11a + CR
+                            // 712.13: Disturb and MTMTE put the spell on the
+                            // stack with its back face up. A resolving DFC
+                            // spell becomes a permanent with the same face up;
+                            // mark the battlefield object transformed without
+                            // swapping faces again.
+                            if matches!(
+                                casting_variant,
+                                CastingVariant::MoreThanMeetsTheEye | CastingVariant::Disturb
+                            ) && to == Zone::Battlefield
                             {
                                 let mut marked = false;
                                 if let Some(obj) = state.objects.get_mut(&object_id) {

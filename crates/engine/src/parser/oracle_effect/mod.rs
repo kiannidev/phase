@@ -5727,6 +5727,19 @@ fn try_parse_play_from_exile(tp: TextPair) -> Option<ParsedEffectClause> {
         }
     }
 
+    // CR 601.2a + CR 608.2c: Targeted "cast/play that card this turn" grants
+    // (Emry, Lurker in the Loch) bind to the ability's chosen target, not to a
+    // prior exile tracked set. Defer to `try_parse_cast_effect` →
+    // `CastFromZone { target: ParentTarget, duration: UntilEndOfTurn }`.
+    let is_targeted_this_turn_grant = scan_contains_phrase(tp.lower, "this turn")
+        && !scan_contains_phrase(tp.lower, "until end of turn")
+        && !scan_contains_phrase(tp.lower, "until the end of turn")
+        && (scan_contains_phrase(tp.lower, "that card")
+            || scan_contains_phrase(tp.lower, "that spell"));
+    if is_targeted_this_turn_grant {
+        return None;
+    }
+
     // Duration: extract from trailing text, defaulting to UntilEndOfTurn for impulse draw
     let (_, dur) = strip_trailing_duration(tp.original);
     let duration = dur.unwrap_or(Duration::UntilEndOfTurn);
@@ -10791,6 +10804,16 @@ fn try_parse_cast_as_though_flash_permission(tp: TextPair<'_>) -> Option<ParsedE
 fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
     type E<'a> = OracleError<'a>;
 
+    // CR 117.3a: Optional "you may " is peeled by `clause_shell` for generic
+    // imperatives but left attached for specialized cast/play grants (Emry,
+    // impulse-draw siblings). Strip here so "you may cast that card this
+    // turn" reaches the anaphoric `CastFromZone` arms.
+    let lower = opt(tag::<_, _, E>("you may "))
+        .parse(lower)
+        .ok()
+        .map(|(rest, _)| rest)
+        .unwrap_or(lower);
+
     // CR 305.1: "play" means cast if spell, play as land if land.
     let (rest, mode) = alt((
         value(CardPlayMode::Cast, tag::<_, _, E>("cast ")),
@@ -10833,6 +10856,10 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
     .parse(rest)
     .is_ok()
     {
+        let (_, dur) = strip_trailing_duration(lower);
+        let duration = dur.or_else(|| {
+            scan_contains_phrase(lower, "this turn").then_some(Duration::UntilEndOfTurn)
+        });
         return Some(Effect::CastFromZone {
             target: TargetFilter::ParentTarget,
             without_paying_mana_cost: without_paying,
@@ -10840,7 +10867,7 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
             cast_transformed: false,
             alt_ability_cost: None,
             constraint,
-            duration: None,
+            duration,
         });
     }
 
@@ -27063,14 +27090,26 @@ mod tests {
         let def = parse_effect_chain("You may play that card this turn.", AbilityKind::Spell);
         assert!(matches!(
             &*def.effect,
-            Effect::GrantCastingPermission {
-                permission: CastingPermission::PlayFromExile {
-                    duration: Duration::UntilEndOfTurn,
-                    ..
-                },
+            Effect::CastFromZone {
+                target: TargetFilter::ParentTarget,
+                mode: CardPlayMode::Play,
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parse_emry_cast_that_card_this_turn_is_cast_from_zone() {
+        let effect = parse_effect("You may cast that card this turn.");
+        match effect {
+            Effect::CastFromZone {
+                target: TargetFilter::ParentTarget,
+                without_paying_mana_cost: false,
+                mode: CardPlayMode::Cast,
+                ..
+            } => {}
+            other => panic!("expected CastFromZone ParentTarget, got {other:?}"),
+        }
     }
 
     #[test]

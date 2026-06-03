@@ -218,6 +218,7 @@ impl KeywordTriggerInstaller {
             // instance triggers separately, so one trigger is emitted per
             // `Keyword::Afterlife(_)` on the face.
             Keyword::Afterlife(n) => vec![build_afterlife_trigger(*n)],
+            Keyword::Soulshift(n) => vec![build_soulshift_trigger(*n)],
             Keyword::Annihilator(n) => vec![build_annihilator_trigger(*n)],
             Keyword::Renown(n) => vec![build_renown_trigger(*n)],
             Keyword::Mentor => vec![build_mentor_trigger()],
@@ -263,6 +264,7 @@ impl KeywordTriggerInstaller {
                 is_dies_return_with_counter_trigger(trigger, &CounterType::Minus1Minus1)
             }
             Keyword::Afterlife(n) => is_afterlife_trigger_for_count(trigger, *n),
+            Keyword::Soulshift(n) => is_soulshift_trigger_for_n(trigger, *n),
             Keyword::Annihilator(_) => is_annihilator_attack_trigger(trigger),
             Keyword::Renown(_) => is_renown_trigger(trigger),
             Keyword::Mentor => is_mentor_trigger(trigger),
@@ -2403,6 +2405,119 @@ pub fn synthesize_persist(face: &mut CardFace) {
 /// face.
 pub fn synthesize_afterlife(face: &mut CardFace) {
     KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Afterlife(_)));
+}
+
+/// CR 702.46a: Soulshift N — when this creature dies, you may return target
+/// Spirit card with mana value N or less from your graveyard to your hand.
+/// CR 702.46b: each instance triggers separately.
+pub fn synthesize_soulshift(face: &mut CardFace) {
+    KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Soulshift(_)));
+}
+
+/// CR 702.46a: Dies trigger returning a Spirit from the controller's graveyard.
+fn build_soulshift_trigger(n: u32) -> TriggerDefinition {
+    let spirit_target = soulshift_spirit_target_filter(n);
+    let execute = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::ChangeZone {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Hand,
+            target: spirit_target,
+            owner_library: false,
+            enter_transformed: false,
+            enters_under: None,
+            enter_tapped: false,
+            enters_attacking: false,
+            up_to: false,
+            enter_with_counters: vec![],
+        },
+    )
+    .description(format!(
+        "Return target Spirit card with mana value {n} or less from your graveyard to your hand"
+    ))
+    // CR 603.5: "you may" — optional triggered ability.
+    .optional();
+
+    TriggerDefinition::new(TriggerMode::ChangesZone)
+        .origin(Zone::Battlefield)
+        .destination(Zone::Graveyard)
+        .valid_card(TargetFilter::SelfRef)
+        .execute(execute)
+        .description(format!(
+            "CR 702.46a: Soulshift {n} — when this creature dies, you may return target Spirit card with mana value {n} or less from your graveyard to your hand."
+        ))
+}
+
+fn soulshift_spirit_target_filter(n: u32) -> TargetFilter {
+    TargetFilter::Typed(
+        TypedFilter::card()
+            .controller(ControllerRef::You)
+            .subtype("Spirit".to_string())
+            .properties(vec![
+                FilterProp::InZone {
+                    zone: Zone::Graveyard,
+                },
+                FilterProp::Cmc {
+                    comparator: Comparator::LE,
+                    value: QuantityExpr::Fixed { value: n as i32 },
+                },
+            ]),
+    )
+}
+
+fn is_soulshift_trigger_for_n(t: &TriggerDefinition, n: u32) -> bool {
+    soulshift_trigger_n(t) == Some(n)
+}
+
+fn soulshift_trigger_n(t: &TriggerDefinition) -> Option<u32> {
+    if !matches!(t.mode, TriggerMode::ChangesZone)
+        || t.origin != Some(Zone::Battlefield)
+        || t.destination != Some(Zone::Graveyard)
+        || !matches!(t.valid_card, Some(TargetFilter::SelfRef))
+    {
+        return None;
+    }
+    let execute = t.execute.as_deref()?;
+    if !execute.optional {
+        return None;
+    }
+    let Effect::ChangeZone {
+        origin,
+        destination,
+        target,
+        ..
+    } = &*execute.effect
+    else {
+        return None;
+    };
+    if *origin != Some(Zone::Graveyard) || *destination != Zone::Hand {
+        return None;
+    }
+    let TargetFilter::Typed(tf) = target else {
+        return None;
+    };
+    if tf.get_subtype() != Some("Spirit") || tf.controller != Some(ControllerRef::You) {
+        return None;
+    }
+    let mut cmc_le = None;
+    let mut in_graveyard = false;
+    for prop in &tf.properties {
+        match prop {
+            FilterProp::InZone {
+                zone: Zone::Graveyard,
+            } => in_graveyard = true,
+            FilterProp::Cmc {
+                comparator: Comparator::LE,
+                value: QuantityExpr::Fixed { value },
+            } => cmc_le = u32::try_from(*value).ok(),
+            _ => {}
+        }
+    }
+    if in_graveyard {
+        cmc_le
+    } else {
+        None
+    }
 }
 
 /// Builds the CR 702.135a Afterlife dies trigger for `count` Spirit tokens.
@@ -4897,6 +5012,8 @@ pub fn synthesize_all(face: &mut CardFace) {
     // Spirit creature tokens with flying. Self-referential dies trigger shape
     // shared with Undying/Persist.
     synthesize_afterlife(face);
+    // CR 702.46a: Soulshift N — dies trigger returning a Spirit from graveyard.
+    synthesize_soulshift(face);
     // CR 702.112a: Renown N — combat damage to player trigger with
     // designation-setting resolution. CR 702.112c: each instance triggers
     // separately; the resolution-time designation guard suppresses later ones.
@@ -7203,6 +7320,101 @@ mod undying_persist_synthesis_tests {
             .collect();
         counts.sort_unstable();
         assert_eq!(counts, vec![1, 2]);
+    }
+
+    /// CR 702.46a: Soulshift N synthesizes an optional dies trigger that returns
+    /// a Spirit from the controller's graveyard.
+    #[test]
+    fn synthesize_soulshift_adds_optional_dies_return_trigger() {
+        let mut face = face_with_keyword(Keyword::Soulshift(4));
+        synthesize_soulshift(&mut face);
+
+        let trigger = face
+            .triggers
+            .iter()
+            .find(|t| is_soulshift_trigger_for_n(t, 4))
+            .expect("soulshift should synthesize a dies trigger");
+
+        assert!(matches!(trigger.mode, TriggerMode::ChangesZone));
+        assert_eq!(trigger.origin, Some(Zone::Battlefield));
+        assert_eq!(trigger.destination, Some(Zone::Graveyard));
+        assert!(matches!(trigger.valid_card, Some(TargetFilter::SelfRef)));
+
+        let execute = trigger.execute.as_deref().expect("execute body required");
+        assert!(execute.optional);
+        let Effect::ChangeZone {
+            origin,
+            destination,
+            target,
+            ..
+        } = &*execute.effect
+        else {
+            panic!("soulshift execute should be Effect::ChangeZone");
+        };
+        assert_eq!(*origin, Some(Zone::Graveyard));
+        assert_eq!(*destination, Zone::Hand);
+        let TargetFilter::Typed(tf) = target else {
+            panic!("soulshift target should be TypedFilter");
+        };
+        assert_eq!(tf.get_subtype(), Some("Spirit"));
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+        assert!(
+            tf.properties.iter().any(|p| {
+                matches!(
+                    p,
+                    FilterProp::Cmc {
+                        comparator: Comparator::LE,
+                        value: QuantityExpr::Fixed { value: 4 },
+                    }
+                )
+            }),
+            "expected CMC <= 4 filter, got {:?}",
+            tf.properties
+        );
+    }
+
+    #[test]
+    fn synthesize_soulshift_is_idempotent() {
+        let mut face = face_with_keyword(Keyword::Soulshift(3));
+        synthesize_soulshift(&mut face);
+        synthesize_soulshift(&mut face);
+        let count = face
+            .triggers
+            .iter()
+            .filter(|t| is_soulshift_trigger_for_n(t, 3))
+            .count();
+        assert_eq!(count, 1, "soulshift trigger should be deduped");
+    }
+
+    /// CR 702.46b: multiple Soulshift instances trigger separately.
+    #[test]
+    fn synthesize_soulshift_emits_one_trigger_per_instance() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Soulshift(2));
+        face.keywords.push(Keyword::Soulshift(2));
+        synthesize_soulshift(&mut face);
+        let count = face
+            .triggers
+            .iter()
+            .filter(|t| is_soulshift_trigger_for_n(t, 2))
+            .count();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn synthesize_soulshift_keeps_distinct_n_values() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Soulshift(2));
+        face.keywords.push(Keyword::Soulshift(5));
+        synthesize_soulshift(&mut face);
+
+        let mut values: Vec<u32> = face
+            .triggers
+            .iter()
+            .filter_map(soulshift_trigger_n)
+            .collect();
+        values.sort_unstable();
+        assert_eq!(values, vec![2, 5]);
     }
 
     /// The Afterlife matcher (Spirit-token effect) must not collide with the

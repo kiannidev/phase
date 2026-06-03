@@ -7112,7 +7112,10 @@ fn can_cast_prepared_now(
     // emblem), which `prepare_spell_cast` recognizes via the same predicate and
     // zeroes the cost. `OncePerTurn` sources (Zaffai) opt in via the dedicated
     // `CastSpellForFree` action instead. Block the normal hand cast otherwise.
-    if matches!(obj.mana_cost, ManaCost::NoCost)
+    // Exile-zone copies (Prepare, Suspend, Discover, etc.) carry their own
+    // `ExileWithAltCost` permission and must not hit this hand/command guard.
+    if matches!(obj.zone, Zone::Hand | Zone::Command)
+        && matches!(obj.mana_cost, ManaCost::NoCost)
         && !unlimited_hand_cast_free_applies(state, player, obj, prepared.casting_variant)
     {
         return false;

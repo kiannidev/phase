@@ -105,20 +105,10 @@ impl TacticalPolicy for SpellskitePriorityPolicy {
     fn verdict(&self, ctx: &PolicyContext<'_>) -> PolicyVerdict {
         let na = || score(0.0, "spellskite_priority_na");
 
-        let GameAction::ActivateAbility {
-            source_id,
-            ability_index,
-        } = &ctx.candidate.action
-        else {
+        let GameAction::ActivateAbility { source_id, .. } = &ctx.candidate.action else {
             return na();
         };
 
-        let Some(source) = ctx.state.objects.get(source_id) else {
-            return na();
-        };
-        if !source.abilities.get(*ability_index).is_some() {
-            return na();
-        };
         if !ctx.effects().iter().any(|e| is_forced_self_retarget(e)) {
             return na();
         }

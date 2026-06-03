@@ -410,7 +410,7 @@ pub(super) fn handle_replacement_choice(
                 }
             }
 
-            // CR 118.3: Resume cast/activation cost payment paused for a
+            // CR 601.2h + CR 602.2b + CR 616.1: Resume cast/activation cost payment paused for a
             // replacement choice during discard or sacrifice cost payment.
             if matches!(waiting_for, WaitingFor::Priority { .. })
                 && (state.pending_cast.is_some() || state.pending_discard_for_cost.is_some())

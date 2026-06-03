@@ -7842,17 +7842,34 @@ fn apply_mana_spell_grants(
     }
 }
 
-/// CR 118.3: Pause cost payment for a competing replacement effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AbilityCostPaymentOutcome {
+    Complete,
+    Paused { remaining_cost: Option<AbilityCost> },
+}
+
+fn combine_remaining_costs(
+    paused_remaining: Option<AbilityCost>,
+    following_costs: &[AbilityCost],
+) -> Option<AbilityCost> {
+    let mut costs = Vec::new();
+    if let Some(cost) = paused_remaining {
+        costs.push(cost);
+    }
+    costs.extend(following_costs.iter().cloned());
+    match costs.len() {
+        0 => None,
+        1 => costs.into_iter().next(),
+        _ => Some(AbilityCost::Composite { costs }),
+    }
+}
+
+/// CR 601.2h + CR 616.1: Pause cost payment for a competing replacement effect.
 pub(crate) fn pause_cost_payment_for_replacement_choice(
     state: &mut GameState,
     choice_player: PlayerId,
 ) {
     state.waiting_for = super::replacement::replacement_choice_waiting_for(choice_player, state);
-}
-
-/// True when `pay_ability_cost` paused for `WaitingFor::ReplacementChoice`.
-pub(crate) fn cost_payment_paused_for_replacement_choice(state: &GameState) -> bool {
-    matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. })
 }
 
 /// Pay an activated ability's cost. Handles auto-payable cost components
@@ -7865,6 +7882,16 @@ pub fn pay_ability_cost(
     cost: &AbilityCost,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EngineError> {
+    pay_ability_cost_for_activation(state, player, source_id, cost, events).map(|_| ())
+}
+
+pub(crate) fn pay_ability_cost_for_activation(
+    state: &mut GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    cost: &AbilityCost,
+    events: &mut Vec<GameEvent>,
+) -> Result<AbilityCostPaymentOutcome, EngineError> {
     let excluded_sources = ability_mana_payment_excluded_sources(cost, source_id);
     pay_ability_cost_inner(state, player, source_id, cost, events, &excluded_sources)
 }
@@ -7876,7 +7903,7 @@ fn pay_ability_cost_inner(
     cost: &AbilityCost,
     events: &mut Vec<GameEvent>,
     excluded_sources: &HashSet<ObjectId>,
-) -> Result<(), EngineError> {
+) -> Result<AbilityCostPaymentOutcome, EngineError> {
     match cost {
         AbilityCost::Tap => {
             let obj = state
@@ -7918,8 +7945,8 @@ fn pay_ability_cost_inner(
             }
         }
         AbilityCost::Composite { costs } => {
-            for sub_cost in costs {
-                pay_ability_cost_inner(
+            for (index, sub_cost) in costs.iter().enumerate() {
+                let outcome = pay_ability_cost_inner(
                     state,
                     player,
                     source_id,
@@ -7927,8 +7954,13 @@ fn pay_ability_cost_inner(
                     events,
                     excluded_sources,
                 )?;
-                if cost_payment_paused_for_replacement_choice(state) {
-                    return Ok(());
+                if let AbilityCostPaymentOutcome::Paused { remaining_cost } = outcome {
+                    return Ok(AbilityCostPaymentOutcome::Paused {
+                        remaining_cost: combine_remaining_costs(
+                            remaining_cost,
+                            &costs[index + 1..],
+                        ),
+                    });
                 }
             }
         }
@@ -7959,9 +7991,10 @@ fn pay_ability_cost_inner(
                 match super::sacrifice::sacrifice_permanent(state, source_id, player, events)? {
                     super::sacrifice::SacrificeOutcome::Complete => {}
                     super::sacrifice::SacrificeOutcome::NeedsReplacementChoice(choice_player) => {
-                        state.activation_cost_payment_paused = true;
                         pause_cost_payment_for_replacement_choice(state, choice_player);
-                        return Ok(());
+                        return Ok(AbilityCostPaymentOutcome::Paused {
+                            remaining_cost: None,
+                        });
                     }
                 }
             } else {
@@ -7975,9 +8008,10 @@ fn pay_ability_cost_inner(
             match super::effects::discard::discard_as_cost(state, source_id, player, events) {
                 super::effects::discard::DiscardOutcome::Complete => {}
                 super::effects::discard::DiscardOutcome::NeedsReplacementChoice(choice_player) => {
-                    state.activation_cost_payment_paused = true;
                     pause_cost_payment_for_replacement_choice(state, choice_player);
-                    return Ok(());
+                    return Ok(AbilityCostPaymentOutcome::Paused {
+                        remaining_cost: None,
+                    });
                 }
             }
         }
@@ -8253,7 +8287,19 @@ fn pay_ability_cost_inner(
             ));
         }
     }
-    Ok(())
+    Ok(AbilityCostPaymentOutcome::Complete)
+}
+
+fn pending_activation_after_cost_pause(
+    source_id: ObjectId,
+    resolved: ResolvedAbility,
+    ability_index: usize,
+    remaining_cost: Option<AbilityCost>,
+) -> PendingCast {
+    let mut pending = PendingCast::new(source_id, CardId(0), resolved, ManaCost::NoCost);
+    pending.activation_cost = remaining_cost;
+    pending.activation_ability_index = Some(ability_index);
+    pending
 }
 
 /// CR 118.12: Pay an "unless pays" or other non-spell/non-activation mana
@@ -9355,13 +9401,15 @@ pub fn handle_activate_ability(
                         ability_index,
                     ));
                 }
-                pay_ability_cost(state, player, source_id, cost, events)?;
-                if cost_payment_paused_for_replacement_choice(state) {
-                    let mut pending =
-                        PendingCast::new(source_id, CardId(0), resolved.clone(), ManaCost::NoCost);
-                    pending.activation_cost = ability_def.cost.clone();
-                    pending.activation_ability_index = Some(ability_index);
-                    state.pending_cast = Some(Box::new(pending));
+                if let AbilityCostPaymentOutcome::Paused { remaining_cost } =
+                    pay_ability_cost_for_activation(state, player, source_id, cost, events)?
+                {
+                    state.pending_cast = Some(Box::new(pending_activation_after_cost_pause(
+                        source_id,
+                        resolved.clone(),
+                        ability_index,
+                        remaining_cost,
+                    )));
                     return Ok(state.waiting_for.clone());
                 }
             }
@@ -9442,13 +9490,15 @@ pub fn handle_activate_ability(
                 ability_index,
             ));
         }
-        pay_ability_cost(state, player, source_id, cost, events)?;
-        if cost_payment_paused_for_replacement_choice(state) {
-            let mut pending =
-                PendingCast::new(source_id, CardId(0), resolved.clone(), ManaCost::NoCost);
-            pending.activation_cost = ability_def.cost.clone();
-            pending.activation_ability_index = Some(ability_index);
-            state.pending_cast = Some(Box::new(pending));
+        if let AbilityCostPaymentOutcome::Paused { remaining_cost } =
+            pay_ability_cost_for_activation(state, player, source_id, cost, events)?
+        {
+            state.pending_cast = Some(Box::new(pending_activation_after_cost_pause(
+                source_id,
+                resolved.clone(),
+                ability_index,
+                remaining_cost,
+            )));
             return Ok(state.waiting_for.clone());
         }
     }
@@ -10136,9 +10186,9 @@ mod tests {
         CostCategory, FilterProp, GameRestriction, KickerVariant, ManaContribution, ManaProduction,
         ManaSpendPermission, ManaSpendRestriction, ModalSelectionCondition,
         ModalSelectionConstraint, MultiTargetSpec, ObjectProperty, ProhibitedActivity, PtValue,
-        QuantityExpr, QuantityRef, RestrictionExpiry, RestrictionPlayerScope,
-        SearchSelectionConstraint, StaticCondition, StaticDefinition, TargetFilter, TypeFilter,
-        TypedFilter,
+        QuantityExpr, QuantityRef, ReplacementDefinition, ReplacementMode, RestrictionExpiry,
+        RestrictionPlayerScope, SearchSelectionConstraint, StaticCondition, StaticDefinition,
+        TargetFilter, TargetRef, TypeFilter, TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::{CoreType, Supertype};
@@ -10148,6 +10198,7 @@ mod tests {
         ManaColor, ManaCost, ManaCostShard, ManaRestriction, ManaSpellGrant, ManaType, ManaUnit,
     };
     use crate::types::phase::Phase;
+    use crate::types::replacements::ReplacementEvent;
     use std::sync::Arc;
 
     fn setup_game_at_main_phase() -> GameState {
@@ -10175,6 +10226,27 @@ mod tests {
                 expiry: None,
             });
         }
+    }
+
+    fn install_optional_discard_replacement(state: &mut GameState) -> ObjectId {
+        let replacement_source = create_object(
+            state,
+            CardId(9_001),
+            PlayerId(0),
+            "Discard Replacement".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&replacement_source)
+            .unwrap()
+            .replacement_definitions
+            .push(
+                ReplacementDefinition::new(ReplacementEvent::Discard)
+                    .mode(ReplacementMode::Optional { decline: None })
+                    .description("Apply discard replacement".to_string()),
+            );
+        replacement_source
     }
 
     fn add_restricted_mana(
@@ -13190,6 +13262,175 @@ mod tests {
                 "activation_cost must be None after cost was already paid (issue #897)"
             );
         }
+    }
+
+    #[test]
+    fn activation_discard_replacement_resumes_and_pays_remaining_composite_cost() {
+        let mut state = setup_game_at_main_phase();
+        install_optional_discard_replacement(&mut state);
+        let source = create_object(
+            &mut state,
+            CardId(953),
+            PlayerId(0),
+            "Cycling Stand-In".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&source).unwrap();
+            let mut ability = AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+            )
+            .cost(AbilityCost::Composite {
+                costs: vec![
+                    AbilityCost::Discard {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        filter: None,
+                        random: false,
+                        self_ref: true,
+                    },
+                    AbilityCost::Mana {
+                        cost: ManaCost::Cost {
+                            shards: vec![],
+                            generic: 1,
+                        },
+                    },
+                ],
+            });
+            ability.activation_zone = Some(Zone::Hand);
+            Arc::make_mut(&mut obj.abilities).push(ability);
+        }
+        add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
+
+        apply_as_current(
+            &mut state,
+            GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            },
+        )
+        .expect("activation should pause for discard replacement");
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ));
+        assert_eq!(
+            state.players[0].mana_pool.total(),
+            1,
+            "later mana sub-cost must not be paid before the replacement choice resolves"
+        );
+
+        apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 })
+            .expect("replacement choice should resume activation");
+
+        assert_eq!(
+            state.players[0].mana_pool.total(),
+            0,
+            "the unpaid composite tail must be paid when activation resumes"
+        );
+        assert_eq!(state.objects[&source].zone, Zone::Graveyard);
+        assert_eq!(state.stack.len(), 1, "activation should reach the stack");
+    }
+
+    #[test]
+    fn targeted_activation_replacement_pause_preserves_selected_targets() {
+        let mut state = setup_game_at_main_phase();
+        install_optional_discard_replacement(&mut state);
+        let target_a = create_object(
+            &mut state,
+            CardId(954),
+            PlayerId(1),
+            "First Target".to_string(),
+            Zone::Battlefield,
+        );
+        let target_b = create_object(
+            &mut state,
+            CardId(955),
+            PlayerId(1),
+            "Second Target".to_string(),
+            Zone::Battlefield,
+        );
+        for target in [target_a, target_b] {
+            state
+                .objects
+                .get_mut(&target)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+        }
+        let source = create_object(
+            &mut state,
+            CardId(956),
+            PlayerId(0),
+            "Targeted Channel".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&source).unwrap();
+            let mut ability = AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::DealDamage {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Typed(TypedFilter::creature()),
+                    damage_source: None,
+                },
+            )
+            .cost(AbilityCost::Discard {
+                count: QuantityExpr::Fixed { value: 1 },
+                filter: None,
+                random: false,
+                self_ref: true,
+            });
+            ability.activation_zone = Some(Zone::Hand);
+            Arc::make_mut(&mut obj.abilities).push(ability);
+        }
+
+        apply_as_current(
+            &mut state,
+            GameAction::ActivateAbility {
+                source_id: source,
+                ability_index: 0,
+            },
+        )
+        .expect("activation should ask for a target before costs");
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::TargetSelection { .. }
+        ));
+
+        apply_as_current(
+            &mut state,
+            GameAction::SelectTargets {
+                targets: vec![TargetRef::Object(target_a)],
+            },
+        )
+        .expect("target selection should surface replacement choice, not error");
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ));
+
+        apply_as_current(&mut state, GameAction::ChooseReplacement { index: 0 })
+            .expect("replacement choice should resume targeted activation");
+
+        let Some(stack_entry) = state.stack.back() else {
+            panic!("targeted activation should reach the stack");
+        };
+        let StackEntryKind::ActivatedAbility { ability, .. } = &stack_entry.kind else {
+            panic!(
+                "expected activated ability on stack, got {:?}",
+                stack_entry.kind
+            );
+        };
+        assert_eq!(
+            ability.targets,
+            vec![TargetRef::Object(target_a)],
+            "resumed activation must keep the target chosen before the replacement pause"
+        );
     }
 
     #[test]

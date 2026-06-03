@@ -1876,7 +1876,7 @@ fn incubator_phyrexian_back_face() -> BackFaceData {
         defense: None,
         card_types: CardType {
             supertypes: vec![],
-            core_types: vec![CoreType::Creature],
+            core_types: vec![CoreType::Artifact, CoreType::Creature],
             subtypes: vec!["Phyrexian".to_string()],
         },
         mana_cost: ManaCost::default(),
@@ -2975,6 +2975,28 @@ mod tests {
     }
 
     #[test]
+    fn predefined_incubator_back_face_is_artifact_creature() {
+        let back_face = incubator_phyrexian_back_face();
+        assert_eq!(back_face.name, "Phyrexian Token");
+        assert_eq!(back_face.power, Some(0));
+        assert_eq!(back_face.toughness, Some(0));
+        assert!(back_face.color.is_empty());
+        assert!(back_face
+            .card_types
+            .core_types
+            .contains(&CoreType::Artifact));
+        assert!(back_face
+            .card_types
+            .core_types
+            .contains(&CoreType::Creature));
+        assert!(back_face
+            .card_types
+            .subtypes
+            .iter()
+            .any(|subtype| subtype == "Phyrexian"));
+    }
+
+    #[test]
     fn junk_token_injection_attaches_ability_and_rules_text() {
         let mut state = GameState::new_two_player(42);
         let obj_id = create_object(
@@ -2997,6 +3019,53 @@ mod tests {
             .token_rules_text
             .as_ref()
             .is_some_and(|t| t.contains("Exile")));
+    }
+
+    #[test]
+    fn junk_ability_runtime_exiles_top_card_and_grants_play_permission() {
+        let mut state = GameState::new_two_player(42);
+        let junk = create_object(
+            &mut state,
+            crate::types::identifiers::CardId(1),
+            PlayerId(0),
+            "Junk".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&junk).unwrap();
+            obj.card_types.core_types = vec![CoreType::Artifact];
+            obj.card_types.subtypes.push("Junk".to_string());
+            obj.is_token = true;
+        }
+        inject_predefined_token_abilities(&mut state, junk);
+
+        let top = create_object(
+            &mut state,
+            crate::types::identifiers::CardId(2),
+            PlayerId(0),
+            "Top Card".to_string(),
+            Zone::Library,
+        );
+        let ability_def = state.objects[&junk].abilities[0].clone();
+        let resolved = build_resolved_from_def(&ability_def, junk, PlayerId(0));
+        let mut events = Vec::new();
+
+        super::super::resolve_ability_chain(&mut state, &resolved, &mut events, 0)
+            .expect("Junk ability chain should resolve");
+
+        let top_obj = &state.objects[&top];
+        assert_eq!(top_obj.zone, Zone::Exile);
+        assert!(top_obj
+            .casting_permissions
+            .iter()
+            .any(|permission| matches!(
+                permission,
+                CastingPermission::PlayFromExile {
+                    duration: Duration::UntilEndOfTurn,
+                    granted_to,
+                    ..
+                } if *granted_to == PlayerId(0)
+            )));
     }
 
     /// CR 111.10u: the Lander rules-text arm must be present and describe the

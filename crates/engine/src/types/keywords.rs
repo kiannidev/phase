@@ -3037,14 +3037,8 @@ mod tests {
     /// CR 702.191: MTGJSON keyword ingestion must parse Increment, not Unknown.
     #[test]
     fn increment_from_str_and_keyword_from_tagged() {
-        assert_eq!(
-            Keyword::from_str("Increment").unwrap(),
-            Keyword::Increment
-        );
-        assert_eq!(
-            Keyword::from_str("increment").unwrap(),
-            Keyword::Increment
-        );
+        assert_eq!(Keyword::from_str("Increment").unwrap(), Keyword::Increment);
+        assert_eq!(Keyword::from_str("increment").unwrap(), Keyword::Increment);
         let kw = keyword_from_tagged("Increment", &serde_json::Value::Null).unwrap();
         assert_eq!(kw, Keyword::Increment);
     }

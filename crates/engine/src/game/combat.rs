@@ -90,6 +90,10 @@ pub struct AttackerInfo {
     /// never cleared — `unblocked_attackers` checks this flag, not the current blocker list.
     #[serde(default)]
     pub blocked: bool,
+    /// CR 702.46: Band identifier when this attacker was declared in a band.
+    /// `None` = not in a band (attacks and assigns damage individually).
+    #[serde(default)]
+    pub band_id: Option<u32>,
 }
 
 impl AttackerInfo {
@@ -103,6 +107,7 @@ impl AttackerInfo {
             defending_player,
             attack_target,
             blocked: false,
+            band_id: None,
         }
     }
 
@@ -1578,6 +1583,73 @@ pub fn creature_must_attack(state: &GameState, obj_id: ObjectId) -> bool {
     true
 }
 
+/// CR 702.46: Whether a creature has the banding keyword.
+pub fn has_banding(state: &GameState, object_id: ObjectId) -> bool {
+    state
+        .objects
+        .get(&object_id)
+        .is_some_and(|obj| obj.has_keyword(&Keyword::Banding))
+}
+
+/// CR 702.46: Attackers sharing a `band_id` (declaration order preserved).
+pub fn band_members(combat: &CombatState, band_id: u32) -> Vec<&AttackerInfo> {
+    combat
+        .attackers
+        .iter()
+        .filter(|a| a.band_id == Some(band_id))
+        .collect()
+}
+
+/// CR 702.46: A band is blocked if any member is blocked.
+pub fn band_is_blocked(combat: &CombatState, band_id: u32) -> bool {
+    band_members(combat, band_id).iter().any(|a| a.blocked)
+}
+
+/// CR 702.46: Union of blockers assigned to any member of the band.
+pub fn band_blocker_ids(combat: &CombatState, band_id: u32) -> Vec<ObjectId> {
+    let mut blockers = Vec::new();
+    for attacker in band_members(combat, band_id) {
+        if let Some(ids) = combat.blocker_assignments.get(&attacker.object_id) {
+            for &id in ids {
+                if !blockers.contains(&id) {
+                    blockers.push(id);
+                }
+            }
+        }
+    }
+    blockers
+}
+
+/// CR 702.46c: When at least one banding creature attacks a target, all creatures
+/// attacking that target may be declared in one band (simplified single-band-per-target
+/// assignment until explicit band UI exists).
+fn assign_attack_bands(state: &GameState, attackers: &mut [AttackerInfo]) {
+    use std::collections::HashMap;
+
+    let mut by_target: HashMap<AttackTarget, Vec<usize>> = HashMap::new();
+    for (idx, attacker) in attackers.iter().enumerate() {
+        by_target
+            .entry(attacker.attack_target)
+            .or_default()
+            .push(idx);
+    }
+
+    let mut next_band_id = 1u32;
+    for indices in by_target.values() {
+        let has_banding_attacker = indices
+            .iter()
+            .any(|&i| has_banding(state, attackers[i].object_id));
+        if !has_banding_attacker {
+            continue;
+        }
+        let band_id = next_band_id;
+        next_band_id += 1;
+        for &i in indices {
+            attackers[i].band_id = Some(band_id);
+        }
+    }
+}
+
 /// Declare attackers: validate, tap (unless vigilance), populate CombatState, emit event.
 /// Accepts per-creature attack targets as (attacker_id, target) pairs.
 pub fn declare_attackers(
@@ -1728,8 +1800,7 @@ pub fn declare_attackers(
     }
 
     // Populate CombatState with per-creature defending players and attack targets
-    let combat = state.combat.get_or_insert_with(CombatState::default);
-    combat.attackers = attacks
+    let mut attackers: Vec<AttackerInfo> = attacks
         .iter()
         .map(|(object_id, target)| {
             // CR 508.5 + CR 310.8d: Defending player for a battle = its protector,
@@ -1750,6 +1821,9 @@ pub fn declare_attackers(
             AttackerInfo::new(*object_id, *target, defending_player)
         })
         .collect();
+    assign_attack_bands(state, &mut attackers);
+    let combat = state.combat.get_or_insert_with(CombatState::default);
+    combat.attackers = attackers;
     state.players_attacked_this_step = combat
         .attackers
         .iter()
@@ -3109,6 +3183,36 @@ mod tests {
             obj.card_types.supertypes.push(*sp);
         }
         id
+    }
+
+    /// CR 702.46: Banding creatures attacking the same target share a band id.
+    #[test]
+    fn banding_attackers_share_band_id_per_target() {
+        let mut state = setup();
+        let hero = create_creature(&mut state, PlayerId(0), "Hero", 1, 1);
+        let pegasus = create_creature(&mut state, PlayerId(0), "Pegasus", 1, 1);
+        for id in [hero, pegasus] {
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .keywords
+                .push(Keyword::Banding);
+        }
+        let target = AttackTarget::Player(PlayerId(1));
+        declare_attackers(
+            &mut state,
+            &[(hero, target), (pegasus, target)],
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let combat = state.combat.as_ref().unwrap();
+        assert_eq!(combat.attackers.len(), 2);
+        assert_eq!(
+            combat.attackers[0].band_id, combat.attackers[1].band_id,
+            "banding attackers to the same player must share a band"
+        );
+        assert!(combat.attackers[0].band_id.is_some());
     }
 
     /// CR 702.14c: Plainswalk makes an attacker unblockable when defender controls a Plains.

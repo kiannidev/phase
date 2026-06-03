@@ -823,14 +823,8 @@ pub enum Keyword {
     /// (combat-damage-this-turn predicate) is not yet wired.
     Freerunning(ManaCost),
 
-    /// RUNTIME: TODO — converter accepts this keyword but engine has no
-    /// behavioral handler (spell-cast trigger not wired).
-    /// CR 702.191a: Increment — triggered ability. "Whenever you cast a
-    /// spell, if this permanent is a creature and the amount of mana
-    /// spent to cast that spell is greater than this creature's power
-    /// or this creature's toughness, put a +1/+1 counter on this
-    /// creature." Bare keyword; ETB / spell-cast trigger is not yet
-    /// wired.
+    /// CR 702.191a: Increment — spell-cast trigger synthesized in
+    /// `database::synthesis::synthesize_increment`.
     Increment,
 
     /// RUNTIME: TODO — converter accepts this keyword but engine has no

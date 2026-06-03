@@ -306,6 +306,10 @@ impl FromStr for CastFrequency {
     }
 }
 
+fn default_cast_from_hand_free_from_hand_only() -> bool {
+    true
+}
+
 /// CR 118.9 + CR 601.2a: The cost axis for `StaticMode::ExileCastPermission`.
 ///
 /// Sibling to `CastFrequency` and `CardPlayMode` — each axis of the exile-cast
@@ -687,6 +691,12 @@ pub enum StaticMode {
     CastFromHandFree {
         /// CR 601.2b: Per-turn cast frequency.
         frequency: CastFrequency,
+        /// When `true`, only cards in hand qualify (Omniscience's explicit "from
+        /// your hand"). When `false`, CR 601.2's implicit hand zone also admits
+        /// command-zone commanders (Dracogenesis — "you may cast Dragon spells
+        /// without paying their mana costs").
+        #[serde(default = "default_cast_from_hand_free_from_hand_only")]
+        from_hand_only: bool,
     },
     /// CR 601.2a + CR 113.6b + CR 118.9: Static ability granting permission to
     /// cast cards exiled with this source — restricted to cards exiled *this
@@ -1116,8 +1126,12 @@ impl Hash for StaticMode {
                 // alt_cost contains AbilityCost which lacks Hash; discriminant + play_mode only.
                 play_mode.hash(state);
             }
-            StaticMode::CastFromHandFree { frequency } => {
+            StaticMode::CastFromHandFree {
+                frequency,
+                from_hand_only,
+            } => {
                 frequency.hash(state);
+                from_hand_only.hash(state);
             }
             StaticMode::ExileCastPermission {
                 frequency,
@@ -1250,8 +1264,15 @@ impl fmt::Display for StaticMode {
                     write!(f, "TopOfLibraryCastPermission({play_mode})")
                 }
             }
-            StaticMode::CastFromHandFree { frequency } => {
-                write!(f, "CastFromHandFree({frequency})")
+            StaticMode::CastFromHandFree {
+                frequency,
+                from_hand_only,
+            } => {
+                if *from_hand_only {
+                    write!(f, "CastFromHandFree({frequency})")
+                } else {
+                    write!(f, "CastFromHandFree({frequency},implicit_cast_zone)")
+                }
             }
             StaticMode::ExileCastPermission {
                 frequency,
@@ -1574,14 +1595,19 @@ impl FromStr for StaticMode {
             }
             "CastFromHandFree" => StaticMode::CastFromHandFree {
                 frequency: CastFrequency::Unlimited,
+                from_hand_only: true,
             },
             s if s.starts_with("CastFromHandFree(") => {
-                let freq = s
+                let inner = s
                     .strip_prefix("CastFromHandFree(")
                     .and_then(|s| s.strip_suffix(')'))
                     .unwrap_or("unlimited");
+                let mut parts = inner.split(',');
+                let freq = parts.next().unwrap_or("unlimited");
+                let from_hand_only = !matches!(parts.next(), Some("implicit_cast_zone"));
                 StaticMode::CastFromHandFree {
                     frequency: freq.parse().unwrap_or(CastFrequency::Unlimited),
+                    from_hand_only,
                 }
             }
             "ExileCastPermission" => StaticMode::ExileCastPermission {
@@ -2081,9 +2107,11 @@ mod tests {
             // Cast-from-hand-free permissions (Omniscience; Zaffai).
             StaticMode::CastFromHandFree {
                 frequency: CastFrequency::Unlimited,
+                from_hand_only: true,
             },
             StaticMode::CastFromHandFree {
                 frequency: CastFrequency::OncePerTurn,
+                from_hand_only: true,
             },
             // Exile-cast permission (Maralen, Fae Ascendant).
             StaticMode::ExileCastPermission {

@@ -5073,6 +5073,7 @@ fn hand_cast_free_omniscience() {
         def.mode,
         StaticMode::CastFromHandFree {
             frequency: CastFrequency::Unlimited,
+            from_hand_only: true,
         }
     );
     assert_eq!(def.affected, Some(TargetFilter::Any));
@@ -5096,6 +5097,7 @@ fn hand_cast_free_zaffai_once_per_turn() {
             def.mode,
             StaticMode::CastFromHandFree {
                 frequency: CastFrequency::OncePerTurn,
+                from_hand_only: true,
             }
         ),
         "expected CastFromHandFree {{ OncePerTurn }}, got: {:?}",
@@ -5135,6 +5137,7 @@ fn cast_free_dracogenesis_no_zone_qualifier() {
         def.mode,
         StaticMode::CastFromHandFree {
             frequency: CastFrequency::Unlimited,
+            from_hand_only: false,
         }
     );
     // Dragon subtype filter must survive.

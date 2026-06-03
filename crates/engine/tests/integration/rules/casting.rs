@@ -1422,6 +1422,7 @@ fn zaffai_once_per_turn_hand_free_casts_with_no_mana() {
         .with_static_definition(
             StaticDefinition::new(StaticMode::CastFromHandFree {
                 frequency: CastFrequency::OncePerTurn,
+                from_hand_only: true,
             })
             .affected(TargetFilter::Typed(
                 engine::types::ability::TypedFilter::new(TypeFilter::Instant),
@@ -1515,6 +1516,7 @@ fn zaffai_second_cast_is_suppressed_same_turn() {
         .with_static_definition(
             StaticDefinition::new(StaticMode::CastFromHandFree {
                 frequency: CastFrequency::OncePerTurn,
+                from_hand_only: true,
             })
             .affected(TargetFilter::Typed(
                 engine::types::ability::TypedFilter::new(TypeFilter::Instant),

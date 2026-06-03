@@ -1577,9 +1577,12 @@ pub(crate) fn try_parse_cast_free_permission(text: &str, lower: &str) -> Option<
     // Intentional: "spells" with no qualifier → Any filter (Omniscience) — no warning needed.
     if filter_text == "spells" {
         return Some(
-            StaticDefinition::new(StaticMode::CastFromHandFree { frequency })
-                .affected(TargetFilter::Any)
-                .description(text.to_string()),
+            StaticDefinition::new(StaticMode::CastFromHandFree {
+                frequency,
+                from_hand_only: zone_qualified,
+            })
+            .affected(TargetFilter::Any)
+            .description(text.to_string()),
         );
     }
 
@@ -1606,8 +1609,11 @@ pub(crate) fn try_parse_cast_free_permission(text: &str, lower: &str) -> Option<
     }
 
     Some(
-        StaticDefinition::new(StaticMode::CastFromHandFree { frequency })
-            .affected(filter)
-            .description(text.to_string()),
+        StaticDefinition::new(StaticMode::CastFromHandFree {
+            frequency,
+            from_hand_only: zone_qualified,
+        })
+        .affected(filter)
+        .description(text.to_string()),
     )
 }

@@ -1631,9 +1631,10 @@ pub fn band_members(combat: &CombatState, band_id: u32) -> Vec<&AttackerInfo> {
         .collect()
 }
 
-/// CR 702.22c: Validate explicit band declarations at declare attackers.
-/// Each band must contain only declared attackers, share one attack target,
-/// include at least one banding creature, and at most one non-banding creature.
+/// CR 702.22c/d: Validate explicit band declarations at declare attackers.
+/// Each band must contain only declared attackers (702.22c), share one attack
+/// target (702.22d), include at least one banding creature, and at most one
+/// non-banding creature (702.22c).
 pub fn validate_attack_band_declarations(
     state: &GameState,
     attacks: &[(ObjectId, AttackTarget)],
@@ -1661,6 +1662,8 @@ pub fn validate_attack_band_declarations(
                     "{member_id:?} is in band {band_index} but was not declared as an attacker"
                 ));
             };
+            // CR 702.22d: All creatures in an attacking band must attack the
+            // same player, planeswalker, or battle.
             match band_target {
                 None => band_target = Some(target),
                 Some(existing) if existing != target => {

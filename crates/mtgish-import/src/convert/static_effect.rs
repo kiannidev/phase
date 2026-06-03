@@ -354,6 +354,14 @@ pub fn convert_permanent_rule(
             source_filter: affected.clone(),
             exemption: engine::types::statics::ActivationExemption::None,
         },
+        // CR 602.5 + CR 605.1a: Filtered prohibition ("non-mana abilities",
+        // etc.) on the host permanent. `source_filter` is the affected object;
+        // the `ActivatedAbilities` payload selects the exemption only.
+        P::AbilitiesOfTypeCantBeActivated(abilities) => StaticMode::CantBeActivated {
+            who: engine::types::statics::ProhibitionScope::AllPlayers,
+            source_filter: affected.clone(),
+            exemption: super::activated_abilities_exemption(abilities)?,
+        },
 
         _ => {
             return Err(ConversionGap::UnknownVariant {
@@ -986,8 +994,34 @@ fn check_hasable_to_keyword(c: &CheckHasable) -> ConvResult<engine::types::keywo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::types::{LandType, PermanentRule, Permanents, Player};
+    use crate::schema::types::{ActivatedAbilities, LandType, PermanentRule, Permanents, Player};
     use engine::types::ability::{TargetFilter, TypeFilter, TypedFilter};
+    use engine::types::statics::{ActivationExemption, ProhibitionScope};
+
+    #[test]
+    fn abilities_of_type_cant_be_activated_non_mana_lowers_to_cant_be_activated() {
+        let converted = convert_permanent_rule(
+            &PermanentRule::AbilitiesOfTypeCantBeActivated(Box::new(
+                ActivatedAbilities::NonManaAbility,
+            )),
+            TargetFilter::SelfRef,
+        )
+        .unwrap();
+
+        match converted.mode {
+            StaticMode::CantBeActivated {
+                who,
+                source_filter,
+                exemption,
+            } => {
+                assert_eq!(who, ProhibitionScope::AllPlayers);
+                assert_eq!(source_filter, TargetFilter::SelfRef);
+                assert_eq!(exemption, ActivationExemption::ManaAbilities);
+            }
+            other => panic!("expected CantBeActivated, got {other:?}"),
+        }
+        assert_eq!(converted.affected, Some(TargetFilter::SelfRef));
+    }
 
     #[test]
     fn can_block_only_creatures_with_flying_lowers_to_block_restriction() {

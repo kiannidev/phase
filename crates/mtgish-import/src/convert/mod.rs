@@ -1975,6 +1975,26 @@ fn activated_ability_effect_to_static(
     Ok(StaticDefinition::new(mode))
 }
 
+/// CR 602.5 + CR 605.1a: Exemption axis for `AbilitiesOfTypeCantBeActivated`
+/// on a host permanent (`Bound in Gold`, `Faith's Fetters`). The affected
+/// permanent is supplied separately as `CantBeActivated::source_filter`.
+pub(crate) fn activated_abilities_exemption(
+    abilities: &crate::schema::types::ActivatedAbilities,
+) -> ConvResult<engine::types::statics::ActivationExemption> {
+    use crate::schema::types::ActivatedAbilities as A;
+    use engine::types::statics::ActivationExemption;
+    Ok(match abilities {
+        A::NonManaAbility => ActivationExemption::ManaAbilities,
+        A::AnyAbility => ActivationExemption::None,
+        other => {
+            return Err(ConversionGap::EnginePrerequisiteMissing {
+                engine_type: "StaticMode::CantBeActivated",
+                needed_variant: format!("AbilitiesOfTypeCantBeActivated({other:?})"),
+            });
+        }
+    })
+}
+
 /// CR 602.5: Decompose an `ActivatedAbilities` filter into the
 /// `(source_filter, exemption)` pair that engine `CantBeActivated`
 /// expects. `AbilityOfAPermanent`/`AbilityOfPermanent` carry the source

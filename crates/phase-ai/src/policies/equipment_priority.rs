@@ -62,11 +62,7 @@ fn is_upgrade_host(state: &GameState, current_host: ObjectId, creature_id: Objec
 }
 
 /// Best base power among other creatures you control (excluding `current_host`).
-fn best_other_creature_base(
-    state: &GameState,
-    ai_player: PlayerId,
-    current_host: ObjectId,
-) -> i32 {
+fn best_other_creature_base(state: &GameState, ai_player: PlayerId, current_host: ObjectId) -> i32 {
     state
         .battlefield
         .iter()

@@ -231,6 +231,7 @@ impl KeywordTriggerInstaller {
             Keyword::Exalted => vec![build_exalted_trigger()],
             Keyword::Extort => vec![build_extort_trigger()],
             Keyword::Myriad => vec![build_myriad_trigger()],
+            Keyword::DoubleTeam => vec![build_double_team_trigger()],
             Keyword::Soulbond => build_soulbond_triggers(),
             // CR 702.62a + CR 604.1: granted Suspend carries the same two
             // triggered abilities printed Suspend synthesizes. The
@@ -268,6 +269,7 @@ impl KeywordTriggerInstaller {
             Keyword::Exalted => is_exalted_trigger(trigger),
             Keyword::Extort => is_extort_trigger(trigger),
             Keyword::Myriad => is_myriad_attack_trigger(trigger),
+            Keyword::DoubleTeam => is_double_team_attack_trigger(trigger),
             Keyword::Soulbond => is_soulbond_trigger(trigger),
             // CR 702.62a + CR 604.1: symmetric removal — `RemoveKeyword` strips
             // both suspend triggers when the granted keyword is removed.
@@ -2463,6 +2465,14 @@ pub fn synthesize_myriad(face: &mut CardFace) {
     KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Myriad));
 }
 
+/// CR 702.178a: Double team is an attack trigger that creates one tapped attacking
+/// token copy of the attacking creature.
+///
+/// CR 702.178b: Multiple double team instances trigger separately.
+pub fn synthesize_double_team(face: &mut CardFace) {
+    KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::DoubleTeam));
+}
+
 /// CR 702.95a + CR 115.10a: Soulbond represents two optional triggered
 /// abilities. One fires when the soulbond creature enters and can pair it with
 /// another unpaired creature you control; the other fires when another unpaired
@@ -2670,6 +2680,26 @@ fn build_myriad_trigger() -> TriggerDefinition {
         .execute(execute)
         .description(
             "CR 702.116a: Myriad — whenever this creature attacks, you may create tapped attacking copy tokens for each opponent other than defending player, then exile them at end of combat.".to_string(),
+        )
+}
+
+fn is_double_team_attack_trigger(t: &TriggerDefinition) -> bool {
+    matches!(t.mode, TriggerMode::Attacks)
+        && matches!(t.valid_card, Some(TargetFilter::SelfRef))
+        && t.execute.as_deref().is_some_and(|ability| {
+            !ability.optional && matches!(ability.effect.as_ref(), Effect::DoubleTeam)
+        })
+}
+
+fn build_double_team_trigger() -> TriggerDefinition {
+    let execute = AbilityDefinition::new(AbilityKind::Spell, Effect::DoubleTeam)
+        .description("Create a tapped attacking token copy of this creature".to_string());
+
+    TriggerDefinition::new(TriggerMode::Attacks)
+        .valid_card(TargetFilter::SelfRef)
+        .execute(execute)
+        .description(
+            "CR 702.178a: Double team — whenever this creature attacks, create a tapped and attacking token that's a copy of it.".to_string(),
         )
 }
 
@@ -4731,6 +4761,9 @@ pub fn synthesize_all(face: &mut CardFace) {
     // player, exiled at end of combat. CR 702.116b: each instance triggers
     // separately.
     synthesize_myriad(face);
+    // CR 702.178a: Double team — attack trigger creating one tapped attacking copy.
+    // CR 702.178b: each instance triggers separately.
+    synthesize_double_team(face);
     // CR 702.95a: Soulbond — two optional ETB triggers that create pair
     // relationships under the resolution checks in CR 702.95c-d.
     synthesize_soulbond(face);

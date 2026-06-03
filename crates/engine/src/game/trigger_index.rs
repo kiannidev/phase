@@ -682,6 +682,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::CopySpell
         | EffectKind::CopyTokenOf
         | EffectKind::Myriad
+        | EffectKind::DoubleTeam
         | EffectKind::BecomeCopy
         | EffectKind::ChooseCard
         | EffectKind::PutCounter

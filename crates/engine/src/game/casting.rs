@@ -440,6 +440,7 @@ pub fn spell_objects_available_to_cast(state: &GameState, player: PlayerId) -> V
                 && (has_harmonize_keyword(obj)
                     || has_flashback_keyword(state, obj_id)
                     || has_aftermath_keyword(state, obj_id)
+                    || has_disturb_keyword(state, obj_id)
                     || retrace_has_discardable_land(state, player, obj_id)
                     || graveyard_has_enough_for_escape(state, player, obj_id))
         })
@@ -557,6 +558,11 @@ fn has_aftermath_keyword(state: &GameState, object_id: ObjectId) -> bool {
     super::keywords::object_has_effective_keyword_kind(state, object_id, KeywordKind::Aftermath)
 }
 
+/// CR 702.140: Check if an object has the Disturb keyword.
+fn has_disturb_keyword(state: &GameState, object_id: ObjectId) -> bool {
+    super::keywords::object_has_effective_keyword_kind(state, object_id, KeywordKind::Disturb)
+}
+
 fn foretell_cost(obj: &crate::game::game_object::GameObject) -> Option<ManaCost> {
     obj.keywords.iter().find_map(|keyword| match keyword {
         Keyword::Foretell(cost) => Some(cost.clone()),
@@ -642,7 +648,7 @@ pub fn handle_foretell(
 }
 
 // CR 702.34 (Flashback) / CR 702.81 (Retrace) / CR 702.127 (Aftermath) /
-// CR 702.138 (Escape) / CR 702.180 (Harmonize): graveyard-cast alternative
+// CR 702.138 (Escape) / CR 702.140 (Disturb) / CR 702.180 (Harmonize): graveyard-cast alternative
 // permissions. Sneak (CR 702.190a) is a HAND-cast alt-cost and is deliberately
 // NOT listed here — including it would misclassify graveyard objects with a
 // granted Sneak as castable from the graveyard, which the rules do not permit.
@@ -659,6 +665,7 @@ fn has_effective_graveyard_cast_keyword(
             .any(|k| matches!(k, crate::types::keywords::Keyword::Harmonize(_)))
         || has_flashback_keyword(state, object_id)
         || has_aftermath_keyword(state, object_id)
+        || has_disturb_keyword(state, object_id)
 }
 
 fn upsert_keyword_by_kind(keywords: &mut Vec<Keyword>, keyword: Keyword) {
@@ -2041,6 +2048,9 @@ fn casting_variant_candidates(
         if has_aftermath_keyword(state, object_id) {
             candidates.push(CastingVariant::Aftermath);
         }
+        if super::keywords::effective_disturb_cost(state, object_id).is_some() {
+            candidates.push(CastingVariant::Disturb);
+        }
         if let Some(source) = graveyard_permission_source(state, player, object_id) {
             let slot_type = if source.frequency == CastFrequency::OncePerTurnPerPermanentType {
                 let slots = available_permanent_type_slots(state, source.source_id, object_id);
@@ -2339,6 +2349,13 @@ fn prepare_spell_cast_with_variant_override_inner(
         None
     };
 
+    // CR 702.140a: Disturb — use disturb cost when casting from graveyard.
+    let disturb_cost = if obj.zone == Zone::Graveyard {
+        super::keywords::effective_disturb_cost(state, object_id)
+    } else {
+        None
+    };
+
     // CR 702.190a: Sneak alt-cost when casting from HAND. The
     // `effective_sneak_cost` lookup goes through `effective_keyword_for_object`
     // so off-zone keyword grants (e.g., statics that grant Sneak to cards in
@@ -2369,7 +2386,8 @@ fn prepare_spell_cast_with_variant_override_inner(
     let (flashback_mana_cost, flashback_non_mana_cost) =
         split_flashback_cost_components(flashback_cost.as_ref());
 
-    // Precedence: Escape > Retrace > Harmonize > Flashback > Aftermath > GraveyardPermission > Warp > Normal.
+    // Precedence: Escape > Retrace > Harmonize > Flashback > Aftermath > Disturb >
+    // GraveyardPermission > Warp > Normal.
     // No standard card has multiple graveyard-cast keywords; if one did, the card's own
     // keyword overrides an external source's grant (GraveyardPermission).
     //
@@ -2436,6 +2454,8 @@ fn prepare_spell_cast_with_variant_override_inner(
             )
         {
             CastingVariant::Aftermath
+        } else if disturb_cost.is_some() {
+            CastingVariant::Disturb
         } else if let Some(source) = graveyard_permission_src {
             // CR 110.4: For OncePerTurnPerPermanentType permissions, auto-pick
             // the slot when only one is available. When multiple slots are
@@ -2679,6 +2699,11 @@ fn prepare_spell_cast_with_variant_override_inner(
     } else {
         None
     };
+    let effective_disturb_cost_for_path = if casting_variant == CastingVariant::Disturb {
+        disturb_cost
+    } else {
+        None
+    };
     let mut mana_cost = if energy_cost_from_exile
         || hand_cast_free
         || is_hand_permission_variant
@@ -2701,6 +2726,7 @@ fn prepare_spell_cast_with_variant_override_inner(
             .or(effective_escape_cost_for_path)
             .or(effective_harmonize_cost_for_path)
             .or(effective_flashback_mana_cost_for_path)
+            .or(effective_disturb_cost_for_path)
             .or(effective_sneak_cost_for_path)
             .or(effective_web_slinging_cost_for_path)
             .or(alt_cost_from_exile)
@@ -25146,6 +25172,61 @@ mod tests {
         assert_eq!(
             prepared.mana_cost, flashback_cost,
             "Should use flashback cost, not card mana cost"
+        );
+    }
+
+    fn add_disturb_creature_to_graveyard(
+        state: &mut GameState,
+        player: PlayerId,
+        disturb_cost: ManaCost,
+        mana_cost: ManaCost,
+    ) -> ObjectId {
+        let card_id = CardId(state.next_object_id);
+        let obj_id = create_object(
+            state,
+            card_id,
+            player,
+            "Lunarch Veteran".to_string(),
+            Zone::Graveyard,
+        );
+        let obj = state.objects.get_mut(&obj_id).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.base_card_types = obj.card_types.clone();
+        obj.mana_cost = mana_cost.clone();
+        obj.base_mana_cost = mana_cost;
+        obj.base_keywords
+            .push(Keyword::Disturb(disturb_cost.clone()));
+        obj.keywords = obj.base_keywords.clone();
+        obj_id
+    }
+
+    #[test]
+    fn disturb_uses_disturb_cost_from_graveyard() {
+        let mut state = setup_game_at_main_phase();
+        let disturb_cost = ManaCost::Cost {
+            generic: 2,
+            shards: vec![ManaCostShard::White],
+        };
+        let card_cost = ManaCost::Cost {
+            generic: 1,
+            shards: vec![ManaCostShard::White],
+        };
+        let obj_id = add_disturb_creature_to_graveyard(
+            &mut state,
+            PlayerId(0),
+            disturb_cost.clone(),
+            card_cost,
+        );
+
+        let prepared = prepare_spell_cast(&state, PlayerId(0), obj_id).unwrap();
+        assert_eq!(
+            prepared.casting_variant,
+            CastingVariant::Disturb,
+            "graveyard Disturb must use CastingVariant::Disturb"
+        );
+        assert_eq!(
+            prepared.mana_cost, disturb_cost,
+            "should use disturb cost, not card mana cost"
         );
     }
 

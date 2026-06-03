@@ -458,6 +458,16 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                     *enter_tapped = crate::types::proposed_event::EtbTapState::Tapped;
                 }
             }
+            // CR 702.140a: Disturb resolves to the back face on the battlefield.
+            if casting_variant == CastingVariant::Disturb {
+                if let crate::types::proposed_event::ProposedEvent::ZoneChange {
+                    enter_transformed,
+                    ..
+                } = &mut proposed
+                {
+                    *enter_transformed = true;
+                }
+            }
             // CR 712.14a + CR 310.11b: If this spell was cast via an
             // ExileWithAltCost permission with `cast_transformed`, the
             // permanent enters the battlefield transformed (resolving to its

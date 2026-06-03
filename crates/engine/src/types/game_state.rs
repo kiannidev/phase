@@ -3585,6 +3585,9 @@ pub enum CastingVariant {
     /// CR 702.127a: Cast an aftermath half of a split card from a graveyard.
     /// If it was cast from a graveyard, exile it any time it leaves the stack.
     Aftermath,
+    /// CR 702.140a: Cast from graveyard for disturb cost. The permanent enters
+    /// the battlefield transformed (back face) on resolution.
+    Disturb,
     /// CR 601.2a: Cast from graveyard via a static permission source (e.g. Lurrus).
     /// Stores the granting permanent's ObjectId for per-turn tracking.
     /// CR 400.7: Zone change creates new ObjectId, naturally resetting permission.

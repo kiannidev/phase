@@ -1809,6 +1809,7 @@ impl FromStr for Keyword {
             "totemarmor" => Ok(Keyword::TotemArmor),
             "evolve" => Ok(Keyword::Evolve),
             "extort" => Ok(Keyword::Extort),
+            "increment" => Ok(Keyword::Increment),
             "exploit" => Ok(Keyword::Exploit),
             "explore" => Ok(Keyword::Explore),
             "ascend" => Ok(Keyword::Ascend),
@@ -2090,6 +2091,7 @@ fn keyword_from_tagged(variant: &str, data: &serde_json::Value) -> Result<Keywor
         "Flanking" => Ok(Keyword::Flanking),
         "Evolve" => Ok(Keyword::Evolve),
         "Extort" => Ok(Keyword::Extort),
+        "Increment" => Ok(Keyword::Increment),
         "Exploit" => Ok(Keyword::Exploit),
         "Explore" => Ok(Keyword::Explore),
         "Ascend" => Ok(Keyword::Ascend),
@@ -3032,6 +3034,21 @@ mod tests {
         ));
     }
 
+    /// CR 702.191: MTGJSON keyword ingestion must parse Increment, not Unknown.
+    #[test]
+    fn increment_from_str_and_keyword_from_tagged() {
+        assert_eq!(
+            Keyword::from_str("Increment").unwrap(),
+            Keyword::Increment
+        );
+        assert_eq!(
+            Keyword::from_str("increment").unwrap(),
+            Keyword::Increment
+        );
+        let kw = keyword_from_tagged("Increment", &serde_json::Value::Null).unwrap();
+        assert_eq!(kw, Keyword::Increment);
+    }
+
     #[test]
     fn parse_hexproof_from_keywords() {
         // CR 702.11d: "hexproof from [quality]" variants
@@ -3179,6 +3196,7 @@ mod tests {
             "Totem Armor",
             "Evolve",
             "Extort",
+            "Increment",
             "Exploit",
             "Explore",
             "Ascend",

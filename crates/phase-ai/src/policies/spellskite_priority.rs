@@ -136,9 +136,7 @@ mod tests {
     use super::*;
     use engine::ai_support::{ActionMetadata, AiDecisionContext, CandidateAction, TacticalClass};
     use engine::game::zones::create_object;
-    use engine::types::ability::{
-        AbilityDefinition, AbilityKind, ResolvedAbility, TargetFilter,
-    };
+    use engine::types::ability::{AbilityDefinition, AbilityKind, ResolvedAbility, TargetFilter};
     use engine::types::card_type::CoreType;
     use engine::types::game_state::{GameState, StackEntry, StackEntryKind};
     use engine::types::identifiers::{CardId, ObjectId};

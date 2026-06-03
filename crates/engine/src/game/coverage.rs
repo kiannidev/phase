@@ -2366,6 +2366,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         | Effect::BecomeMonarch
         | Effect::Proliferate
         | Effect::EndTheTurn
+        | Effect::EndCombatPhase
         | Effect::SolveCase
         | Effect::Cleanup { .. }
         | Effect::AddRestriction { .. }
@@ -2403,7 +2404,8 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         | Effect::AddPendingETBCounters { .. }
         | Effect::ChooseAndSacrificeRest { .. }
         | Effect::ChooseOneOf { .. }
-        | Effect::ReturnAsAura { .. } => {}
+        | Effect::ReturnAsAura { .. }
+        | Effect::Specialize => {}
     }
     d
 }
@@ -8399,6 +8401,7 @@ mod tests {
             parse_warnings: vec![],
             brawl_commander: false,
             is_commander: false,
+            is_oathbreaker: false,
             deck_copy_limit: None,
             metadata: Default::default(),
             rarities: Default::default(),

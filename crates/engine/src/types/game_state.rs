@@ -950,6 +950,15 @@ pub struct PendingCast {
     pub card_id: CardId,
     pub ability: ResolvedAbility,
     pub cost: ManaCost,
+    /// CR 601.2f: The tax-inclusive base mana cost captured at announcement,
+    /// BEFORE any cost reductions/increases or {X} concretization. Lets the
+    /// full concrete cost be recomputed from scratch for any chosen X with
+    /// floors applied LAST (`concrete_cost_for_x`). `None` for activated /
+    /// mana-ability casts and for legacy/in-flight saved games — those paths
+    /// fall back to flooring the already-reduced `cost`. `NoCost` is a real
+    /// base, so `Option` is the only safe sentinel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_cost: Option<ManaCost>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_cost: Option<AbilityCost>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1040,6 +1049,7 @@ impl PendingCast {
             card_id,
             ability,
             cost,
+            base_cost: None,
             activation_cost: None,
             activation_ability_index: None,
             target_constraints: Vec::new(),
@@ -1437,6 +1447,13 @@ pub struct PlayerDeckPool {
     pub registered_commander: std::sync::Arc<Vec<DeckEntry>>,
     #[serde(default)]
     pub current_commander: std::sync::Arc<Vec<DeckEntry>>,
+    /// Oathbreaker RC: registered and current signature spell entries.
+    /// Empty for all non-Oathbreaker formats. Mirrors the commander Arc pair
+    /// so between-games persistence works correctly.
+    #[serde(default)]
+    pub registered_signature_spell: std::sync::Arc<Vec<DeckEntry>>,
+    #[serde(default)]
+    pub current_signature_spell: std::sync::Arc<Vec<DeckEntry>>,
     /// The declared bracket tier for this player's deck. Used by the AI to
     /// determine whether cEDH-specific policies apply (Phase 5 `ComboLinePolicy`,
     /// Phase 6 `CedhKeepablesMulligan`). Defaults to `Core` for backward
@@ -2606,6 +2623,12 @@ pub enum WaitingFor {
         options: Vec<u8>,
         option_names: Vec<String>,
     },
+    /// Digital-only Specialize: choose which color specialization to apply.
+    SpecializeColor {
+        player: PlayerId,
+        object_id: crate::types::identifiers::ObjectId,
+        options: Vec<crate::types::mana::ManaColor>,
+    },
     /// CR 118.3 + CR 601.2b + CR 605.3b: Player must select `count` objects
     /// from `choices` to pay a cost, then the engine resumes via `resume`.
     /// Replaces: DiscardForCost, SacrificeForCost, ReturnToHandForCost,
@@ -3217,6 +3240,7 @@ impl WaitingFor {
             | WaitingFor::ChooseRingBearer { player, .. }
             | WaitingFor::ChooseDungeon { player, .. }
             | WaitingFor::ChooseDungeonRoom { player, .. }
+            | WaitingFor::SpecializeColor { player, .. }
             | WaitingFor::PayCost { player, .. }
             | WaitingFor::ActivationCostOneOfChoice { player, .. }
             | WaitingFor::BlightChoice { player, .. }
@@ -5838,6 +5862,7 @@ mod tests {
                     PlayerId(0),
                 ),
                 cost: ManaCost::NoCost,
+                base_cost: None,
                 activation_cost: None,
                 activation_ability_index: None,
                 target_constraints: vec![],
@@ -6162,6 +6187,7 @@ mod tests {
                 PlayerId(0),
             ),
             cost: ManaCost::NoCost,
+            base_cost: None,
             activation_cost: None,
             activation_ability_index: None,
             target_constraints: vec![],

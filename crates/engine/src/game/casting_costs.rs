@@ -619,6 +619,7 @@ fn finish_pending_cost_or_cast(
         return pay_additional_cost(state, player, req_cost, pending, events);
     }
 
+    let base_cost = pending.base_cost.clone();
     pay_and_push(
         state,
         player,
@@ -626,6 +627,7 @@ fn finish_pending_cost_or_cast(
         pending.card_id,
         pending.ability,
         &pending.cost,
+        base_cost,
         pending.casting_variant,
         pending.cast_timing_permission,
         pending.distribute,
@@ -1537,6 +1539,7 @@ pub(super) fn check_additional_cost_or_pay(
     card_id: CardId,
     ability: ResolvedAbility,
     cost: &crate::types::mana::ManaCost,
+    base_cost: Option<ManaCost>,
     casting_variant: CastingVariant,
     cast_timing_permission: Option<CastTimingPermission>,
     origin_zone: Zone,
@@ -1550,6 +1553,7 @@ pub(super) fn check_additional_cost_or_pay(
         card_id,
         ability,
         cost,
+        base_cost,
         casting_variant,
         cast_timing_permission,
         None,
@@ -1583,6 +1587,7 @@ pub(super) fn finish_pending_cast_cost_or_pay(
     let distribute = pending.distribute;
     let origin_zone = pending.origin_zone;
     let payment_mode = pending.payment_mode;
+    let base_cost = pending.base_cost;
     let cost = pending.cost;
     let ability = pending.ability;
     check_additional_cost_or_pay_with_distribute(
@@ -1592,6 +1597,7 @@ pub(super) fn finish_pending_cast_cost_or_pay(
         card_id,
         ability,
         &cost,
+        base_cost,
         casting_variant,
         cast_timing_permission,
         distribute,
@@ -1609,6 +1615,7 @@ pub(super) fn begin_modal_additional_cost_declaration(
     card_id: CardId,
     ability: ResolvedAbility,
     cost: ManaCost,
+    base_cost: Option<ManaCost>,
     casting_variant: CastingVariant,
     cast_timing_permission: Option<CastTimingPermission>,
     modal: crate::types::ability::ModalChoice,
@@ -1626,6 +1633,7 @@ pub(super) fn begin_modal_additional_cost_declaration(
             modal_choice_for_player(state, player, object_id, &modal, &ability.context);
         capped.max_choices = capped.max_choices.min(capped.mode_count);
         let mut pending = PendingCast::new(object_id, card_id, ability, cost);
+        pending.base_cost = base_cost;
         pending.casting_variant = casting_variant;
         pending.cast_timing_permission = cast_timing_permission;
         pending.distribute = distribute;
@@ -1640,6 +1648,7 @@ pub(super) fn begin_modal_additional_cost_declaration(
     };
 
     let mut pending = PendingCast::new(object_id, card_id, ability, cost);
+    pending.base_cost = base_cost;
     pending.casting_variant = casting_variant;
     pending.cast_timing_permission = cast_timing_permission;
     pending.distribute = distribute;
@@ -1658,6 +1667,7 @@ pub(super) fn begin_target_dependent_additional_cost_declaration(
     card_id: CardId,
     ability: ResolvedAbility,
     cost: ManaCost,
+    base_cost: Option<ManaCost>,
     casting_variant: CastingVariant,
     cast_timing_permission: Option<CastTimingPermission>,
     distribute: Option<DistributionUnit>,
@@ -1677,6 +1687,7 @@ pub(super) fn begin_target_dependent_additional_cost_declaration(
             card_id,
             ability,
             &cost,
+            base_cost,
             casting_variant,
             cast_timing_permission,
             distribute,
@@ -1687,6 +1698,7 @@ pub(super) fn begin_target_dependent_additional_cost_declaration(
     };
 
     let mut pending = PendingCast::new(object_id, card_id, ability, cost);
+    pending.base_cost = base_cost;
     pending.casting_variant = casting_variant;
     pending.cast_timing_permission = cast_timing_permission;
     pending.distribute = distribute;
@@ -1708,6 +1720,7 @@ pub(super) fn begin_optional_cost_before_targets(
     card_id: CardId,
     ability: ResolvedAbility,
     cost: ManaCost,
+    base_cost: Option<ManaCost>,
     optional_cost: AdditionalCost,
     casting_variant: CastingVariant,
     cast_timing_permission: Option<CastTimingPermission>,
@@ -1717,6 +1730,7 @@ pub(super) fn begin_optional_cost_before_targets(
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     let mut pending = PendingCast::new(object_id, card_id, ability, cost);
+    pending.base_cost = base_cost;
     pending.casting_variant = casting_variant;
     pending.cast_timing_permission = cast_timing_permission;
     pending.distribute = distribute;
@@ -1756,6 +1770,7 @@ pub(super) fn begin_required_cost_before_targets(
     card_id: CardId,
     ability: ResolvedAbility,
     cost: ManaCost,
+    base_cost: Option<ManaCost>,
     required_cost: AbilityCost,
     casting_variant: CastingVariant,
     cast_timing_permission: Option<CastTimingPermission>,
@@ -1765,6 +1780,7 @@ pub(super) fn begin_required_cost_before_targets(
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     let mut pending = PendingCast::new(object_id, card_id, ability, cost);
+    pending.base_cost = base_cost;
     pending.casting_variant = casting_variant;
     pending.cast_timing_permission = cast_timing_permission;
     pending.distribute = distribute;
@@ -1786,6 +1802,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
     card_id: CardId,
     ability: ResolvedAbility,
     cost: &crate::types::mana::ManaCost,
+    base_cost: Option<ManaCost>,
     casting_variant: CastingVariant,
     cast_timing_permission: Option<CastTimingPermission>,
     distribute: Option<DistributionUnit>,
@@ -1815,37 +1832,12 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
         ));
     }
 
-    // CR 207.2c + CR 601.2f: Strive per-target cost increase.
-    // Targets are chosen in CR 601.2c; costs are determined in CR 601.2f.
-    // Add strive_cost * (num_targets - 1) to the total casting cost.
-    let strive_adjusted_cost;
-    let cost = if let Some(strive_cost) = state
-        .objects
-        .get(&object_id)
-        .and_then(|obj| obj.strive_cost.clone())
-    {
-        let target_count = super::ability_utils::flatten_targets_in_chain(&ability).len();
-        if target_count > 1 {
-            strive_adjusted_cost = (1..target_count).fold(cost.clone(), |acc, _| {
-                super::restrictions::add_mana_cost(&acc, &strive_cost)
-            });
-            &strive_adjusted_cost
-        } else {
-            cost
-        }
-    } else {
-        cost
-    };
-
+    // CR 601.2f: Strive cost increase + target-dependent self/battlefield cost
+    // modifiers, applied once targets are chosen (CR 601.2c) and costs are
+    // determined (CR 601.2f). Floors are excluded from the helper so they can
+    // run LAST below.
     let mut target_adjusted_cost = cost.clone();
-    super::casting::apply_self_spell_cost_modifiers_with_selected_targets(
-        state,
-        player,
-        object_id,
-        &ability,
-        &mut target_adjusted_cost,
-    );
-    super::casting::apply_battlefield_cost_modifiers_with_selected_targets(
+    super::casting::apply_target_dependent_cost_modifiers(
         state,
         player,
         object_id,
@@ -1855,7 +1847,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
     // CR 601.2b + CR 601.2f: Cost-floor statics (Trinisphere) apply last, after
     // all additive/subtractive modifiers including target-dependent ones. For
     // `{X}` costs the floor is deferred until X is concretized (mana value 0
-    // while symbolic would over-count) — see `apply_post_x_cost_floor`.
+    // while symbolic would over-count) — see `apply_post_x_cost_modifiers`.
     if !cost_has_x(&target_adjusted_cost) {
         super::casting::apply_cost_floor_with_selected_targets(
             state,
@@ -1907,6 +1899,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
     if casting_variant == CastingVariant::Normal {
         if let Some(alt_cost) = payable_spell_alternative_cost(state, player, object_id) {
             let mut pending = PendingCast::new(object_id, card_id, ability, ManaCost::NoCost);
+            pending.base_cost = base_cost.clone();
             pending.casting_variant = casting_variant;
             pending.cast_timing_permission = cast_timing_permission;
             pending.distribute = distribute.clone();
@@ -1933,6 +1926,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
                 }
                 // Required additional costs bypass the choice prompt — pay directly.
                 let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
+                pending.base_cost = base_cost.clone();
                 pending.casting_variant = casting_variant;
                 pending.cast_timing_permission = cast_timing_permission;
                 pending.origin_zone = origin_zone;
@@ -1941,6 +1935,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
             }
             AdditionalCost::Kicker { costs, repeatable } => {
                 let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
+                pending.base_cost = base_cost.clone();
                 pending.casting_variant = casting_variant;
                 pending.cast_timing_permission = cast_timing_permission;
                 pending.distribute = distribute.clone();
@@ -1970,6 +1965,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
                 repeatable: true,
             } => {
                 let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
+                pending.base_cost = base_cost.clone();
                 pending.casting_variant = casting_variant;
                 pending.cast_timing_permission = cast_timing_permission;
                 pending.distribute = distribute.clone();
@@ -1986,6 +1982,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
                 repeatable: false,
             } => {
                 let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
+                pending.base_cost = base_cost.clone();
                 pending.casting_variant = casting_variant;
                 pending.cast_timing_permission = cast_timing_permission;
                 pending.distribute = distribute.clone();
@@ -2010,6 +2007,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
             }
             AdditionalCost::Choice(preferred, fallback) => {
                 let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
+                pending.base_cost = base_cost.clone();
                 pending.casting_variant = casting_variant;
                 pending.cast_timing_permission = cast_timing_permission;
                 pending.distribute = distribute;
@@ -2053,6 +2051,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
     });
     if let Some(energy_mv) = energy_cost {
         let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
+        pending.base_cost = base_cost.clone();
         pending.casting_variant = casting_variant;
         pending.cast_timing_permission = cast_timing_permission;
         pending.origin_zone = origin_zone;
@@ -2102,6 +2101,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
     });
     if let Some(alt_cost) = alt_ability_cost {
         let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
+        pending.base_cost = base_cost.clone();
         pending.casting_variant = casting_variant;
         pending.cast_timing_permission = cast_timing_permission;
         pending.distribute = distribute;
@@ -2114,6 +2114,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
     if casting_variant == CastingVariant::Escape {
         if let Some((_, exile_count)) = super::keywords::effective_escape_data(state, object_id) {
             let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
+            pending.base_cost = base_cost.clone();
             pending.casting_variant = casting_variant;
             pending.cast_timing_permission = cast_timing_permission;
             pending.origin_zone = origin_zone;
@@ -2136,6 +2137,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
     // cost, then paying the card's normal mana cost.
     if casting_variant == CastingVariant::Retrace {
         let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
+        pending.base_cost = base_cost.clone();
         pending.casting_variant = casting_variant;
         pending.cast_timing_permission = cast_timing_permission;
         pending.distribute = distribute;
@@ -2156,6 +2158,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
             super::casting::split_flashback_cost_components(flashback_cost.as_ref());
         if let Some(non_mana_cost) = residual {
             let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
+            pending.base_cost = base_cost.clone();
             pending.casting_variant = casting_variant;
             pending.cast_timing_permission = cast_timing_permission;
             pending.distribute = distribute;
@@ -2181,6 +2184,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
         });
         if let Some((_mana, Some(non_mana_cost))) = evoke_split {
             let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
+            pending.base_cost = base_cost.clone();
             pending.casting_variant = casting_variant;
             pending.cast_timing_permission = cast_timing_permission;
             pending.distribute = distribute;
@@ -2194,6 +2198,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
     // reduction on matching-color permanent spells.
     if let Some((life_cost, mana_reduction)) = find_defiler_reduction(state, player, object_id) {
         let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
+        pending.base_cost = base_cost.clone();
         pending.casting_variant = casting_variant;
         pending.cast_timing_permission = cast_timing_permission;
         pending.distribute = distribute;
@@ -2214,6 +2219,7 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
         card_id,
         ability,
         cost,
+        base_cost,
         casting_variant,
         cast_timing_permission,
         distribute,
@@ -2347,6 +2353,7 @@ pub(crate) fn handle_defiler_payment(
             }
         }
         if !reduction_applied {
+            let base_cost = pending.base_cost.clone();
             return pay_and_push(
                 state,
                 player,
@@ -2354,6 +2361,7 @@ pub(crate) fn handle_defiler_payment(
                 pending.card_id,
                 pending.ability,
                 &cost,
+                base_cost,
                 pending.casting_variant,
                 pending.cast_timing_permission,
                 pending.distribute,
@@ -2392,6 +2400,7 @@ pub(crate) fn handle_defiler_payment(
         }
     }
 
+    let base_cost = pending.base_cost.clone();
     pay_and_push(
         state,
         player,
@@ -2399,6 +2408,7 @@ pub(crate) fn handle_defiler_payment(
         pending.card_id,
         pending.ability,
         &cost,
+        base_cost,
         pending.casting_variant,
         pending.cast_timing_permission,
         pending.distribute,
@@ -2817,7 +2827,7 @@ fn additional_cost_x_max(
     cost: &AbilityCost,
 ) -> Option<u32> {
     match cost {
-        AbilityCost::PayLife { amount } if quantity_expr_contains_x(amount) => {
+        AbilityCost::PayLife { amount } if amount.contains_x() => {
             Some(max_pay_life_x(state, player))
         }
         AbilityCost::Sacrifice { target, count } if *count == u32::MAX => {
@@ -2850,26 +2860,6 @@ fn max_pay_life_x(state: &GameState, player: PlayerId) -> u32 {
         .find(|p| p.id == player)
         .map(|p| u32::try_from(p.life.max(0)).unwrap_or(0))
         .unwrap_or(0)
-}
-
-fn quantity_expr_contains_x(expr: &QuantityExpr) -> bool {
-    match expr {
-        QuantityExpr::Ref {
-            qty: QuantityRef::Variable { name },
-        } => name == "X",
-        QuantityExpr::Offset { inner, .. }
-        | QuantityExpr::Multiply { inner, .. }
-        | QuantityExpr::DivideRounded { inner, .. }
-        | QuantityExpr::UpTo { max: inner }
-        | QuantityExpr::Power {
-            exponent: inner, ..
-        } => quantity_expr_contains_x(inner),
-        QuantityExpr::Sum { exprs } => exprs.iter().any(quantity_expr_contains_x),
-        QuantityExpr::Difference { left, right } => {
-            quantity_expr_contains_x(left) || quantity_expr_contains_x(right)
-        }
-        QuantityExpr::Fixed { .. } | QuantityExpr::Ref { .. } => false,
-    }
 }
 
 pub(super) fn effective_casualty_additional_cost(
@@ -2928,6 +2918,7 @@ pub(super) fn pay_and_push(
     card_id: CardId,
     ability: ResolvedAbility,
     cost: &crate::types::mana::ManaCost,
+    base_cost: Option<ManaCost>,
     casting_variant: CastingVariant,
     cast_timing_permission: Option<CastTimingPermission>,
     distribute: Option<DistributionUnit>,
@@ -2958,6 +2949,7 @@ pub(super) fn pay_and_push(
                 .collect();
             if !eligible.is_empty() {
                 let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
+                pending.base_cost = base_cost.clone();
                 pending.casting_variant = casting_variant;
                 pending.cast_timing_permission = cast_timing_permission;
                 pending.origin_zone = origin_zone;
@@ -2978,6 +2970,7 @@ pub(super) fn pay_and_push(
         card_id,
         ability,
         cost,
+        base_cost,
         casting_variant,
         cast_timing_permission,
         distribute,
@@ -2995,6 +2988,7 @@ pub(super) fn pay_and_push_adventure(
     card_id: CardId,
     ability: ResolvedAbility,
     cost: &crate::types::mana::ManaCost,
+    base_cost: Option<ManaCost>,
     casting_variant: CastingVariant,
     cast_timing_permission: Option<CastTimingPermission>,
     distribute: Option<DistributionUnit>,
@@ -3022,6 +3016,7 @@ pub(super) fn pay_and_push_adventure(
     let manual_payment = payment_mode == CastPaymentMode::Manual && cost.mana_value() > 0;
     if has_x || convoke_mode.is_some() || manual_payment {
         let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
+        pending.base_cost = base_cost.clone();
         pending.casting_variant = casting_variant;
         pending.cast_timing_permission = cast_timing_permission;
         pending.distribute = distribute;
@@ -3044,6 +3039,7 @@ pub(super) fn pay_and_push_adventure(
         &HashSet::new(),
     ) {
         let mut pending = PendingCast::new(object_id, card_id, ability, cost.clone());
+        pending.base_cost = base_cost.clone();
         pending.casting_variant = casting_variant;
         pending.cast_timing_permission = cast_timing_permission;
         pending.distribute = distribute;
@@ -4407,8 +4403,6 @@ pub(super) fn max_x_value_excluding(
     object_id: Option<ObjectId>,
     excluded_sources: &HashSet<ObjectId>,
 ) -> u32 {
-    use crate::types::statics::{CostModifyMode, StaticMode};
-
     let ManaCost::Cost { shards, generic } = cost else {
         return 0;
     };
@@ -4486,62 +4480,57 @@ pub(super) fn max_x_value_excluding(
     let available = pool + capacity;
     let formula_max = available.saturating_sub(fixed_portion) / x_count;
 
-    // CR 601.2f: A Trinisphere-class cost floor ("this spell costs at least {N}")
-    // is an effect that "directly affect[s] the total cost" and is locked in
-    // after X is chosen (CR 601.2b announces X first; CR 107.3g means symbolic X
-    // has mana value 0, so the floor is deferred until X is concrete). The
-    // arithmetic `formula_max` ignores the floor entirely, so it can offer an X
-    // whose floored, locked-in total is unpayable. CR 601.2h: unpayable costs
-    // can't be paid, so such an X must never be offered. The floor only ever
-    // *increases* a cost (it tops generic mana up to the floor, never reduces),
-    // so `formula_max` is an upper bound on any payable X — the probe never needs
-    // to search above it.
-    //
     // An object-less X cost (the `max_x_value` public path used by the
     // resolution-time probe in `effects/pay.rs`) is never a cast-time spell, so
-    // no cast-time floor can apply: return the unfloored bound unchanged.
+    // no cast-time cost modifier or floor can apply: return the unfloored
+    // arithmetic bound unchanged.
     let Some(spell_id) = object_id else {
         return formula_max;
     };
 
-    // Fast path: only floor-affected casts pay for the probe. This is an
-    // *existence* check ("could any cost floor apply at all"), not the authoritative
-    // CR 604.1 condition gate — `battlefield_functioning_statics` deliberately does
-    // NOT evaluate `def.condition`, so a tapped/non-functional Trinisphere still
-    // passes this `.any()`. That is correct by design: `apply_cost_floor` (called
-    // inside the probe) re-evaluates each static's condition per CR 601.2f, so a
-    // non-functional floor is correctly skipped there, yielding `formula_max` for
-    // that candidate. The vast majority of games have zero `MinimumCost` statics,
-    // so the hot X-announce / legal-actions path pays only one short-circuiting scan.
-    let floor_active =
-        super::functioning_abilities::battlefield_functioning_statics(state).any(|(_, def)| {
-            matches!(
-                def.mode,
-                StaticMode::ModifyCost {
-                    mode: CostModifyMode::Minimum,
-                    ..
-                }
-            )
-        });
-    if !floor_active {
+    // CR 601.2f: When this object is the pending spell being announced, the
+    // arithmetic `formula_max` (which uses the symbolic, mana-value-0 cost,
+    // CR 107.3g) understates the X cap whenever cost reductions exceed the fixed
+    // non-X generic — reduction capacity is clamped at generic=0 while X is
+    // symbolic and the surplus is lost. It can also overstate the cap when a
+    // floor (Trinisphere) applies. Recompute the FULL concrete cost for each X
+    // via the single orchestrator (`concrete_cost_for_x`) — reductions →
+    // target-dependent modifiers + Strive → floors LAST — so the cap reflects
+    // the real locked-in total (CR 601.2f).
+    //
+    // We only have the captured tax-inclusive base for the pending spell; for
+    // any other object (e.g. a separate trial cost) fall back to the arithmetic
+    // bound, preserving prior behavior.
+    let Some(pending) = state
+        .pending_cast
+        .as_ref()
+        .filter(|p| p.object_id == spell_id)
+    else {
         return formula_max;
-    }
+    };
+    let Some(base) = pending.base_cost.clone() else {
+        return formula_max;
+    };
+    let ability = pending.ability.clone();
 
-    // CR 601.2b + CR 601.2f + CR 601.2h: descend from the arithmetic upper bound to
-    // the largest X whose floored, locked-in total is payable. Mirrors the
-    // resolution-time descending probe in `effects/pay.rs` (`max_resolution_mana_x_value`).
-    // The probe consults the single floor authority (`casting::apply_cost_floor`)
-    // rather than re-deriving floor logic; it runs the untargeted channel only,
-    // which is exact for the target-independent `MinimumCost` filters in use today.
-    (0..=formula_max)
-        .rev()
-        .find(|&x| {
-            let mut probe = cost.clone();
-            probe.concretize_x(x);
-            super::casting::apply_cost_floor(state, player, spell_id, &mut probe);
-            probe.mana_value() <= available
-        })
-        .unwrap_or(0)
+    // CR 601.2b / CR 601.2f: The concrete total is monotonic non-decreasing in X.
+    // `concretize_x` adds `x * x_count` generic; non-floor and target-dependent
+    // reductions subtract an X-independent amount capped via `saturating_sub`
+    // (never below {0}, CR 601.2f); floors are `max(., N)`. The composition of
+    // these monotonic non-decreasing maps is monotonic non-decreasing, so we may
+    // ascend from X=0 to the first X whose total overshoots `available` and
+    // return the prior X. Termination: `mana_value(x) >= x * x_count - C` for the
+    // fixed total reduction cap C, which grows without bound, so the overshoot is
+    // always reached.
+    let mut x = 0u32;
+    loop {
+        let probe =
+            super::casting::concrete_cost_for_x(state, player, spell_id, &ability, &base, x);
+        if probe.mana_value() > available {
+            return x.saturating_sub(1);
+        }
+        x += 1;
+    }
 }
 
 /// Single authority for transitioning into the payment step of a cast.
@@ -4565,6 +4554,15 @@ pub fn enter_payment_step(
 ) -> Result<WaitingFor, EngineError> {
     if let Some(pending) = state.pending_cast.as_ref() {
         if pending.ability.chosen_x.is_none() && cost_has_x(&pending.cost) {
+            // CR 601.2f: Every spell-cast path that reaches X announcement must
+            // carry the captured tax-inclusive base so the X cap and the locked-in
+            // cost can be recomputed from scratch (`concrete_cost_for_x`). Activated
+            // / mana-ability casts (no spell announcement) legitimately have no
+            // base; gate the miss-detector to spell casts.
+            debug_assert!(
+                pending.activation_ability_index.is_some() || pending.base_cost.is_some(),
+                "spell-cast PendingCast reached X announcement without a captured base_cost",
+            );
             let min = pending.ability.min_x_value;
             let excluded_sources = pending
                 .activation_cost
@@ -5203,6 +5201,7 @@ mod tests {
                 PlayerId(0),
             ),
             cost: ManaCost::NoCost,
+            base_cost: None,
             activation_cost: None,
             activation_ability_index: Some(0),
             target_constraints: Vec::new(),
@@ -5745,6 +5744,7 @@ mod tests {
             CardId(100),
             ability,
             &cost,
+            None,
             CastingVariant::Normal,
             None,
             None,
@@ -5923,6 +5923,7 @@ mod tests {
                 caster,
             ),
             &ManaCost::NoCost,
+            None,
             CastingVariant::Normal,
             None,
             None,
@@ -7341,7 +7342,7 @@ mod tests {
 
     #[test]
     fn strive_surcharge_with_three_targets() {
-        // CR 207.2c + CR 601.2f: Strive adds per-target surcharge.
+        // CR 601.2f: Strive cost increase — adds per-target surcharge.
         // Base cost {2}{R}, strive cost {1}{R}, 3 targets -> {2}{R} + 2*{1}{R} = {4}{R}{R}{R}
         use crate::types::mana::ManaCostShard;
         let base = ManaCost::Cost {
@@ -7400,7 +7401,7 @@ mod tests {
 
     #[test]
     fn strive_surcharge_with_two_targets() {
-        // CR 207.2c + CR 601.2f: With 2 targets, add strive cost once.
+        // CR 601.2f: Strive cost increase — with 2 targets, add strive cost once.
         use crate::types::mana::ManaCostShard;
         let base = ManaCost::Cost {
             shards: vec![ManaCostShard::Blue],
@@ -8551,6 +8552,7 @@ mod tests {
                 caster,
             ),
             cost: crate::types::mana::ManaCost::NoCost,
+            base_cost: None,
             activation_cost: None,
             activation_ability_index: None,
             target_constraints: Vec::new(),
@@ -8670,6 +8672,7 @@ mod tests {
                 caster,
             ),
             cost: crate::types::mana::ManaCost::NoCost,
+            base_cost: None,
             activation_cost: None,
             activation_ability_index: None,
             target_constraints: Vec::new(),
@@ -8758,6 +8761,7 @@ mod tests {
                 caster,
             ),
             cost: crate::types::mana::ManaCost::NoCost,
+            base_cost: None,
             activation_cost: None,
             activation_ability_index: None,
             target_constraints: Vec::new(),
@@ -8835,6 +8839,7 @@ mod tests {
                 caster,
             ),
             cost: crate::types::mana::ManaCost::NoCost,
+            base_cost: None,
             activation_cost: None,
             activation_ability_index: None,
             target_constraints: Vec::new(),
@@ -8945,6 +8950,7 @@ mod tests {
                 caster,
             ),
             cost: crate::types::mana::ManaCost::NoCost,
+            base_cost: None,
             activation_cost: None,
             activation_ability_index: None,
             target_constraints: Vec::new(),

@@ -1880,7 +1880,73 @@ pub(crate) fn strip_rule_static_subject<'a>(
     None
 }
 
+/// CR 303.4 + CR 301.5: Strip "that is/are enchanted/equipped by a/an <kind> you control"
+/// from a subject phrase and return the corresponding `FilterProp`.
+pub(crate) fn strip_attachment_relative_clause(subject: &str) -> (&str, Option<FilterProp>) {
+    let lower = subject.to_lowercase();
+    let alts: &[(&str, FilterProp)] = &[
+        (
+            " that are enchanted by an aura you control",
+            FilterProp::HasAttachment {
+                kind: AttachmentKind::Aura,
+                controller: Some(ControllerRef::You),
+                exclude_source: false,
+            },
+        ),
+        (
+            " that's enchanted by an aura you control",
+            FilterProp::HasAttachment {
+                kind: AttachmentKind::Aura,
+                controller: Some(ControllerRef::You),
+                exclude_source: false,
+            },
+        ),
+        (
+            " that is enchanted by an aura you control",
+            FilterProp::HasAttachment {
+                kind: AttachmentKind::Aura,
+                controller: Some(ControllerRef::You),
+                exclude_source: false,
+            },
+        ),
+        (
+            " that are equipped by an equipment you control",
+            FilterProp::HasAttachment {
+                kind: AttachmentKind::Equipment,
+                controller: Some(ControllerRef::You),
+                exclude_source: false,
+            },
+        ),
+        (
+            " that is equipped by an equipment you control",
+            FilterProp::HasAttachment {
+                kind: AttachmentKind::Equipment,
+                controller: Some(ControllerRef::You),
+                exclude_source: false,
+            },
+        ),
+    ];
+    for (suffix, prop) in alts {
+        if lower.strip_suffix(suffix).is_some() {
+            let byte_len = subject.len() - suffix.len();
+            return (&subject[..byte_len], Some(prop.clone()));
+        }
+    }
+    (subject, None)
+}
+
+fn merge_filter_prop(filter: TargetFilter, prop: FilterProp) -> TargetFilter {
+    match filter {
+        TargetFilter::Typed(mut tf) => {
+            tf.properties.push(prop);
+            TargetFilter::Typed(tf)
+        }
+        other => other,
+    }
+}
+
 pub(crate) fn parse_rule_static_subject_filter(subject: &str) -> Option<TargetFilter> {
+    let (subject, attachment_prop) = strip_attachment_relative_clause(subject);
     let lower = subject.to_lowercase();
     let tp = TextPair::new(subject, &lower);
 
@@ -1910,7 +1976,10 @@ pub(crate) fn parse_rule_static_subject_filter(subject: &str) -> Option<TargetFi
     if let Some(rest_tp) = nom_tag_tp(&tp, "all ").or_else(|| nom_tag_tp(&tp, "each ")) {
         let (filter, rest) = parse_type_phrase(rest_tp.original);
         if rest.trim().is_empty() {
-            return Some(filter);
+            return Some(match attachment_prop {
+                Some(prop) => merge_filter_prop(filter, prop),
+                None => filter,
+            });
         }
     }
 
@@ -1934,7 +2003,10 @@ pub(crate) fn parse_rule_static_subject_filter(subject: &str) -> Option<TargetFi
 
     let (filter, rest) = parse_type_phrase(subject);
     if rest.trim().is_empty() {
-        return Some(filter);
+        return Some(match attachment_prop {
+            Some(prop) => merge_filter_prop(filter, prop),
+            None => filter,
+        });
     }
 
     None
@@ -2081,7 +2153,7 @@ pub(crate) fn parse_combat_rule_static_predicate_nom(
             RuleStaticPredicate::CantAttackOrBlock,
             tag("can't attack or block"),
         ),
-        parse_cant_attack_rule_static_predicate_nom,
+        parse_cant_attack_combat_predicate_nom,
         value(RuleStaticPredicate::CantBlock, tag("can't block")),
         value(
             RuleStaticPredicate::CantCrew,
@@ -2162,10 +2234,33 @@ pub(crate) fn parse_rule_static_tail_predicates(rest: &str) -> Option<Vec<RuleSt
     }
 }
 
+/// Optional attack-target scope after "can't attack" (CR 508.1d).
+pub(crate) fn parse_cant_attack_defended_scope_nom(
+    input: &str,
+) -> OracleResult<'_, Option<crate::types::triggers::AttackTargetFilter>> {
+    use crate::types::triggers::AttackTargetFilter;
+    opt(alt((
+        value(
+            AttackTargetFilter::PlayerOrPlaneswalker,
+            tag(" you or planeswalkers you control"),
+        ),
+        value(AttackTargetFilter::Player, tag(" you")),
+    )))
+    .parse(input)
+}
+
 pub(crate) fn parse_cant_attack_rule_static_predicate_nom(
     input: &str,
-) -> OracleResult<'_, RuleStaticPredicate> {
+) -> OracleResult<'_, Option<crate::types::triggers::AttackTargetFilter>> {
     let (rest, _) = tag("can't attack").parse(input)?;
     let (rest, _) = opt(preceded(space1, tag("its owner"))).parse(rest)?;
+    let (rest, defended) = parse_cant_attack_defended_scope_nom(rest)?;
+    Ok((rest, defended))
+}
+
+fn parse_cant_attack_combat_predicate_nom(
+    input: &str,
+) -> OracleResult<'_, RuleStaticPredicate> {
+    let (rest, _) = parse_cant_attack_rule_static_predicate_nom(input)?;
     Ok((rest, RuleStaticPredicate::CantAttack))
 }

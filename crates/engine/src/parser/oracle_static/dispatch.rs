@@ -1179,6 +1179,19 @@ pub(crate) fn parse_static_line_inner(
 
     // --- "~ can't attack" ---
     if nom_primitives::scan_contains(tp.lower, "can't attack") {
+        // CR 508.1d: Subject-led lines ("Each creature ... can't attack you") must not
+        // collapse to SelfRef — `parse_subject_combat_rule_static` handles them above.
+        if let Some(marker_idx) = tp.lower.find("can't attack") {
+            let subject = tp.original[..marker_idx].trim();
+            if !subject.is_empty()
+                && subject != "~"
+                && subject != "this"
+                && subject != "it"
+                && !SELF_REF_PARSE_ONLY_PHRASES.contains(&subject.to_lowercase().as_str())
+            {
+                return None;
+            }
+        }
         let mode = if nom_primitives::scan_contains(tp.lower, "can't attack or block") {
             StaticMode::CantAttackOrBlock
         } else {

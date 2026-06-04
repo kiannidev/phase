@@ -423,7 +423,7 @@ pub fn validate_attackers(state: &GameState, attacker_ids: &[ObjectId]) -> Resul
             matches!(
                 sd.mode,
                 StaticMode::CantAttack | StaticMode::CantAttackOrBlock
-            )
+            ) && sd.attack_defended.is_none()
         }) || crate::game::static_abilities::check_static_ability(
             state,
             StaticMode::CantAttack,
@@ -1240,7 +1240,7 @@ pub fn compute_combat_tax(
                     continue;
                 }
                 if let Some(filter) = defended {
-                    if !attack_target_matches_defended_scope(
+                    if !super::restrictions::attack_target_matches_defended_scope(
                         state,
                         attack_target.as_ref(),
                         filter,
@@ -1477,39 +1477,6 @@ fn extract_combat_tax_payload<'a>(
 /// - The `AttackTarget` is a player who is NOT the source controller.
 /// - The `AttackTarget` is a planeswalker / battle whose controller is NOT
 ///   the source controller (planeswalker scope only).
-/// - The filter is `Player` and the target is a planeswalker / battle (or vice versa).
-fn attack_target_matches_defended_scope(
-    state: &GameState,
-    attack_target: Option<&AttackTarget>,
-    filter: &crate::types::triggers::AttackTargetFilter,
-    source_controller: PlayerId,
-) -> bool {
-    use crate::types::triggers::AttackTargetFilter;
-    let Some(target) = attack_target else {
-        // Block-side: defender filter is meaningless; treat as no-match.
-        return false;
-    };
-    let permanent_controller =
-        |id: ObjectId| -> Option<PlayerId> { state.objects.get(&id).map(|obj| obj.controller) };
-    match (filter, target) {
-        (AttackTargetFilter::Player, AttackTarget::Player(p)) => *p == source_controller,
-        (AttackTargetFilter::Planeswalker, AttackTarget::Planeswalker(pw_id)) => {
-            permanent_controller(*pw_id) == Some(source_controller)
-        }
-        (AttackTargetFilter::PlayerOrPlaneswalker, AttackTarget::Player(p)) => {
-            *p == source_controller
-        }
-        (AttackTargetFilter::PlayerOrPlaneswalker, AttackTarget::Planeswalker(pw_id)) => {
-            permanent_controller(*pw_id) == Some(source_controller)
-        }
-        (AttackTargetFilter::Battle, AttackTarget::Battle(b_id)) => {
-            permanent_controller(*b_id) == Some(source_controller)
-        }
-        // Cross-type mismatches: filter requires Player, target is Planeswalker, etc.
-        _ => false,
-    }
-}
-
 /// CR 508.1d / CR 701.15b: True if `obj_id` is a creature controlled by the
 /// *active player* that carries a must-attack requirement it can currently
 /// satisfy, and therefore must be declared as an attacker or the declaration
@@ -1864,6 +1831,32 @@ pub fn declare_attackers_with_bands(
         }
     }
 
+    // CR 508.1d: Scoped remote CantAttack (Eriette — enchanted creatures can't
+    // attack you or planeswalkers you control).
+    for (attacker_id, target) in attacks {
+        if crate::game::static_abilities::check_static_ability(
+            state,
+            StaticMode::CantAttack,
+            &crate::game::static_abilities::StaticCheckContext {
+                target_id: Some(*attacker_id),
+                attack_target: Some(target.clone()),
+                ..Default::default()
+            },
+        ) || crate::game::static_abilities::check_static_ability(
+            state,
+            StaticMode::CantAttackOrBlock,
+            &crate::game::static_abilities::StaticCheckContext {
+                target_id: Some(*attacker_id),
+                attack_target: Some(target.clone()),
+                ..Default::default()
+            },
+        ) {
+            return Err(format!(
+                "{attacker_id:?} can't attack {target:?} (CR 508.1d attack restriction)"
+            ));
+        }
+    }
+
     // CR 701.15b: a goaded creature must attack a player other than the goading
     // player *if able*. "Able" is measured against the players this creature
     // could legally be declared attacking: `get_valid_attack_targets` already
@@ -2184,7 +2177,7 @@ pub fn get_valid_attacker_ids(state: &GameState) -> Vec<ObjectId> {
                     matches!(
                         sd.mode,
                         StaticMode::CantAttack | StaticMode::CantAttackOrBlock
-                    )
+                    ) && sd.attack_defended.is_none()
                 })
                 // CR 508.1 + CR 101.2 + CR 109.5: remote CantAttack statics
                 // (Angelic Arbiter restricting opponents' creatures) resolved via
@@ -2831,7 +2824,7 @@ pub fn has_potential_attackers(state: &GameState) -> bool {
                             matches!(
                                 sd.mode,
                                 StaticMode::CantAttack | StaticMode::CantAttackOrBlock
-                            )
+                            ) && sd.attack_defended.is_none()
                         },
                     )
                     // CR 508.1 + CR 101.2 + CR 109.5: remote CantAttack statics
@@ -4309,6 +4302,103 @@ mod tests {
         assert!(!can_block_pair(&state, ground_blocker, attacker));
         assert!(validate_blockers(&state, &[(flying_blocker, attacker)]).is_err());
         assert!(!can_block_pair(&state, flying_blocker, attacker));
+    }
+
+    /// CR 508.1d: Eriette of the Charmed Apple — enchanted creatures may attack
+    /// other players but not Eriette's player or planeswalkers.
+    #[test]
+    fn eriette_scoped_cant_attack_blocks_only_defender_scope() {
+        use crate::types::card_type::CoreType;
+
+        let mut state = setup();
+        state.active_player = PlayerId(1);
+        state.turn_number = 2;
+
+        let eriette = create_creature(&mut state, PlayerId(0), "Eriette of the Charmed Apple", 2, 4);
+        let static_line = "Each creature that's enchanted by an Aura you control can't attack you or planeswalkers you control.";
+        let def = parse_static_line(static_line).expect(static_line);
+        assert_eq!(def.mode, StaticMode::CantAttack);
+        assert_eq!(
+            def.attack_defended.as_ref(),
+            Some(&crate::types::triggers::AttackTargetFilter::PlayerOrPlaneswalker)
+        );
+        state
+            .objects
+            .get_mut(&eriette)
+            .unwrap()
+            .static_definitions
+            .push(def);
+
+        let attacker = create_creature(&mut state, PlayerId(1), "Enchanted Goblin", 2, 1);
+        let aura = create_creature(&mut state, PlayerId(0), "Pacifism", 0, 0);
+        {
+            let aura_obj = state.objects.get_mut(&aura).unwrap();
+            aura_obj.card_types.core_types.push(CoreType::Enchantment);
+            aura_obj.card_types.subtypes.push("Aura".into());
+            aura_obj.attached_to = Some(attacker.into());
+        }
+        state
+            .objects
+            .get_mut(&attacker)
+            .unwrap()
+            .attachments
+            .push(aura);
+
+        let pw_card = CardId(state.next_object_id);
+        let pw = create_object(
+            &mut state,
+            pw_card,
+            PlayerId(0),
+            "Jace".to_string(),
+            crate::types::zones::Zone::Battlefield,
+        );
+        let pw_obj = state.objects.get_mut(&pw).unwrap();
+        pw_obj
+            .card_types
+            .core_types
+            .push(CoreType::Planeswalker);
+
+        assert!(
+            get_valid_attacker_ids(&state).contains(&attacker),
+            "scoped restriction must not remove attacker from eligibility"
+        );
+
+        let mut events = Vec::new();
+        assert!(
+            declare_attackers(
+                &mut state,
+                &[(attacker, AttackTarget::Player(PlayerId(0)))],
+                &mut events
+            )
+            .is_err(),
+            "must not attack Eriette's controller"
+        );
+        events.clear();
+        assert!(
+            declare_attackers(
+                &mut state,
+                &[(attacker, AttackTarget::Planeswalker(pw))],
+                &mut events
+            )
+            .is_err(),
+            "must not attack Eriette's planeswalker"
+        );
+
+        {
+            let attacker_obj = state.objects.get_mut(&attacker).unwrap();
+            attacker_obj.attachments.retain(|&id| id != aura);
+        }
+        state.objects.get_mut(&aura).unwrap().attached_to = None;
+        events.clear();
+        assert!(
+            declare_attackers(
+                &mut state,
+                &[(attacker, AttackTarget::Player(PlayerId(0)))],
+                &mut events
+            )
+            .is_ok(),
+            "without qualifying aura attachment, attack is legal"
+        );
     }
 
     #[test]

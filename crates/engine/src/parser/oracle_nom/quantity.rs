@@ -419,6 +419,7 @@ pub fn parse_quantity_ref(input: &str) -> OracleResult<'_, QuantityRef> {
         parse_cards_in_zone_ref,
         parse_self_power_ref,
         parse_self_toughness_ref,
+        parse_damage_dealt_this_turn_ref,
         parse_life_lost_ref,
         parse_life_gained_ref,
         parse_starting_life_ref,
@@ -1277,6 +1278,32 @@ fn parse_self_toughness_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     .parse(input)
 }
 
+/// Parse damage-history references such as Chandra's Incinerator's
+/// "total amount of noncombat damage dealt to your opponents this turn".
+fn parse_damage_dealt_this_turn_ref(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (input, _) = opt(tag("the ")).parse(input)?;
+    let (input, _) =
+        tag("total amount of noncombat damage dealt to your opponents this turn").parse(input)?;
+
+    Ok((
+        input,
+        QuantityRef::DamageDealtThisTurn {
+            source: Box::new(TargetFilter::Any),
+            target: Box::new(TargetFilter::And {
+                filters: vec![
+                    TargetFilter::Player,
+                    TargetFilter::Typed(
+                        TypedFilter::default().controller(ControllerRef::Opponent),
+                    ),
+                ],
+            }),
+            aggregate: AggregateFunction::Sum,
+            group_by: None,
+            damage_kind: DamageKindFilter::NoncombatOnly,
+        },
+    ))
+}
+
 /// Parse life-lost references: "the life you've lost this turn", "life you've lost", etc.
 /// Includes duration-stripped forms (without "this turn") for post-duration-stripping contexts.
 /// Accepts an optional "(the) amount of " prefix so phrases like
@@ -1288,40 +1315,6 @@ fn parse_life_lost_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     let (input, _) =
         nom::combinator::opt(alt((tag("the amount of "), tag("amount of ")))).parse(input)?;
     alt((
-        value(
-            QuantityRef::DamageDealtThisTurn {
-                source: Box::new(TargetFilter::Any),
-                target: Box::new(TargetFilter::And {
-                    filters: vec![
-                        TargetFilter::Player,
-                        TargetFilter::Typed(
-                            TypedFilter::default().controller(ControllerRef::Opponent),
-                        ),
-                    ],
-                }),
-                aggregate: AggregateFunction::Sum,
-                group_by: None,
-                damage_kind: DamageKindFilter::NoncombatOnly,
-            },
-            tag("the total amount of noncombat damage dealt to your opponents this turn"),
-        ),
-        value(
-            QuantityRef::DamageDealtThisTurn {
-                source: Box::new(TargetFilter::Any),
-                target: Box::new(TargetFilter::And {
-                    filters: vec![
-                        TargetFilter::Player,
-                        TargetFilter::Typed(
-                            TypedFilter::default().controller(ControllerRef::Opponent),
-                        ),
-                    ],
-                }),
-                aggregate: AggregateFunction::Sum,
-                group_by: None,
-                damage_kind: DamageKindFilter::NoncombatOnly,
-            },
-            tag("total amount of noncombat damage dealt to your opponents this turn"),
-        ),
         value(
             QuantityRef::LifeLostThisTurn {
                 player: PlayerScope::Opponent {

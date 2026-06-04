@@ -55,9 +55,9 @@ mod prelude {
     pub(super) use crate::types::mana::{ManaColor, ManaCost, ManaType};
     pub(super) use crate::types::phase::Phase;
     pub(super) use crate::types::statics::{
-        ActivationExemption, BlockExceptionKind, CastFrequency, CastingProhibitionCondition,
-        CostModifyMode, CostPaymentProhibition, ExileCastCost, HandSizeModification,
-        ProhibitionScope, StaticMode, TriggerCause,
+        ActivationExemption, BlockExceptionKind, CastFreeOrigin, CastFrequency,
+        CastingProhibitionCondition, CostModifyMode, CostPaymentProhibition, ExileCastCost,
+        HandSizeModification, ProhibitionScope, StaticMode, TriggerCause,
     };
     pub(super) use crate::types::zones::Zone;
 }

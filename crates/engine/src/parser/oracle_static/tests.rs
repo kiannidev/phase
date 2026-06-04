@@ -5073,7 +5073,7 @@ fn hand_cast_free_omniscience() {
         def.mode,
         StaticMode::CastFromHandFree {
             frequency: CastFrequency::Unlimited,
-            from_hand_only: true,
+            origin: CastFreeOrigin::Hand,
         }
     );
     assert_eq!(def.affected, Some(TargetFilter::Any));
@@ -5097,7 +5097,7 @@ fn hand_cast_free_zaffai_once_per_turn() {
             def.mode,
             StaticMode::CastFromHandFree {
                 frequency: CastFrequency::OncePerTurn,
-                from_hand_only: true,
+                origin: CastFreeOrigin::Hand,
             }
         ),
         "expected CastFromHandFree {{ OncePerTurn }}, got: {:?}",
@@ -5128,7 +5128,8 @@ fn hand_cast_free_zaffai_not_intercepted_by_graveyard_branch() {
 
 // CR 601.2 + CR 118.9a: B10 Dracogenesis — Omniscience-class static with
 // the zone qualifier omitted ("you may cast Dragon spells without paying
-// their mana costs"). Implicit cast zone defaults to hand per CR 601.2.
+// their mana costs"). The mana-cost replacement applies from built-in cast
+// zones already authorized for that spell, including CR 903.8 command zone casts.
 #[test]
 fn cast_free_dracogenesis_no_zone_qualifier() {
     let text = "You may cast Dragon spells without paying their mana costs.";
@@ -5137,7 +5138,7 @@ fn cast_free_dracogenesis_no_zone_qualifier() {
         def.mode,
         StaticMode::CastFromHandFree {
             frequency: CastFrequency::Unlimited,
-            from_hand_only: false,
+            origin: CastFreeOrigin::DefaultCastPermission,
         }
     );
     // Dragon subtype filter must survive.

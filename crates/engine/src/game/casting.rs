@@ -20,8 +20,8 @@ use crate::types::mana::{
 };
 use crate::types::player::PlayerId;
 use crate::types::statics::{
-    ActivationExemption, CastFrequency, CastingProhibitionCondition, CostModifyMode, ExileCastCost,
-    ProhibitionScope, StaticMode,
+    ActivationExemption, CastFreeOrigin, CastFrequency, CastingProhibitionCondition,
+    CostModifyMode, ExileCastCost, ProhibitionScope, StaticMode,
 };
 use crate::types::zones::{ExileCostSourceZone, Zone};
 
@@ -1859,64 +1859,80 @@ pub fn exile_lands_playable_by_permission(
         .collect()
 }
 
-/// CR 601.2 + CR 903.8: Origin zone eligible for a `CastFromHandFree` permission.
-fn cast_from_hand_free_zone_ok(
-    state: &GameState,
-    obj: &crate::game::game_object::GameObject,
-    from_hand_only: bool,
-) -> bool {
-    match obj.zone {
-        Zone::Hand => true,
-        Zone::Command
-            if !from_hand_only && state.format_config.command_zone && obj.is_commander =>
-        {
-            true
-        }
-        _ => false,
-    }
-}
-
 /// CR 601.2b + CR 118.9a: Find the first `CastFromHandFree` static permission
 /// source on the controller's battlefield whose filter admits the given spell.
-/// Returns `(source_id, frequency, from_hand_only)` so callers can track
-/// per-turn usage and zone eligibility.
+/// Returns `(source_id, frequency)` so callers can track per-turn usage.
 ///
 /// For `OncePerTurn` sources, the already-used set is consulted; exhausted sources
 /// do not qualify. `Unlimited` sources always qualify if their filter matches.
-pub(crate) fn hand_cast_free_permission_source(
+fn cast_free_origin_admits_object(
     state: &GameState,
     player: PlayerId,
     obj: &crate::game::game_object::GameObject,
-) -> Option<(ObjectId, CastFrequency, bool)> {
-    state.battlefield.iter().find_map(|&src_id| {
-        let src_obj = state.objects.get(&src_id)?;
-        if src_obj.controller != player {
+    origin: CastFreeOrigin,
+) -> bool {
+    if obj.owner != player {
+        return false;
+    }
+    match origin {
+        CastFreeOrigin::Hand => obj.zone == Zone::Hand,
+        CastFreeOrigin::DefaultCastPermission => match obj.zone {
+            Zone::Hand => true,
+            Zone::Command => {
+                state.format_config.command_zone
+                    && (obj.is_commander
+                        || (obj.is_signature_spell() && oathbreaker_on_battlefield(state, player)))
+            }
+            _ => false,
+        },
+    }
+}
+
+fn cast_free_permission_from_source(
+    state: &GameState,
+    player: PlayerId,
+    obj: &crate::game::game_object::GameObject,
+    source_id: ObjectId,
+) -> Option<CastFrequency> {
+    let src_obj = state.objects.get(&source_id)?;
+    if src_obj.controller != player {
+        return None;
+    }
+    active_static_definitions(state, src_obj).find_map(|s| {
+        let StaticMode::CastFromHandFree { frequency, origin } = s.mode else {
             return None;
-        }
-        let (filter, frequency, from_hand_only) = active_static_definitions(state, src_obj)
-            .find_map(|s| match s.mode {
-                StaticMode::CastFromHandFree {
-                    frequency,
-                    from_hand_only,
-                } => s.affected.as_ref().map(|f| (f, frequency, from_hand_only)),
-                _ => None,
-            })?;
+        };
         // CR 601.2b: Skip if this source's once-per-turn slot was already used.
         if frequency == CastFrequency::OncePerTurn
-            && state.hand_cast_free_permissions_used.contains(&src_id)
+            && state.hand_cast_free_permissions_used.contains(&source_id)
         {
             return None;
         }
+        if !cast_free_origin_admits_object(state, player, obj, origin) {
+            return None;
+        }
+        let filter = s.affected.as_ref()?;
         if super::filter::matches_target_filter(
             state,
             obj.id,
             filter,
-            &super::filter::FilterContext::from_source_with_controller(src_id, player),
+            &super::filter::FilterContext::from_source_with_controller(source_id, player),
         ) {
-            Some((src_id, frequency, from_hand_only))
+            Some(frequency)
         } else {
             None
         }
+    })
+}
+
+pub(crate) fn hand_cast_free_permission_source(
+    state: &GameState,
+    player: PlayerId,
+    obj: &crate::game::game_object::GameObject,
+) -> Option<(ObjectId, CastFrequency)> {
+    state.battlefield.iter().find_map(|&src_id| {
+        cast_free_permission_from_source(state, player, obj, src_id)
+            .map(|frequency| (src_id, frequency))
     })
 }
 
@@ -1930,12 +1946,8 @@ fn unlimited_hand_cast_free_applies(
     casting_variant: CastingVariant,
 ) -> bool {
     !matches!(casting_variant, CastingVariant::HandPermission { .. })
-        && hand_cast_free_permission_source(state, player, obj).is_some_and(
-            |(_, frequency, from_hand_only)| {
-                frequency == CastFrequency::Unlimited
-                    && cast_from_hand_free_zone_ok(state, obj, from_hand_only)
-            },
-        )
+        && hand_cast_free_permission_source(state, player, obj)
+            .is_some_and(|(_, frequency)| frequency == CastFrequency::Unlimited)
 }
 
 /// CR 601.2f: Whether `spell_id` matches a pending next-spell modifier's optional filter.
@@ -2759,9 +2771,10 @@ fn prepare_spell_cast_with_variant_override_inner(
         .is_some();
 
     // CR 601.2b + CR 118.9a: CastFromHandFree — static permission grants free
-    // casting from hand. Auto-application is restricted to `Unlimited` sources
-    // (Omniscience, Tamiyo emblem); `OncePerTurn` sources (Zaffai) must be opted
-    // into explicitly via a dedicated action to preserve the player's "may cast"
+    // casting from the origin scope carried by the static. Auto-application is
+    // restricted to `Unlimited` sources (Omniscience, Tamiyo emblem,
+    // Dracogenesis); `OncePerTurn` sources (Zaffai) must be opted into
+    // explicitly via a dedicated action to preserve the player's "may cast"
     // choice and make per-turn slot consumption visible at the action layer.
     let hand_cast_free = unlimited_hand_cast_free_applies(state, player, obj, casting_variant);
 
@@ -5393,20 +5406,16 @@ pub fn handle_cast_spell_for_free_with_payment_mode(
             "CastSpellForFree requires a hand card owned by the caster".to_string(),
         ));
     }
-    // CR 601.2b + CR 400.7: The granting source's permission must be active and
-    // filter-matched. `hand_cast_free_permission_source` also enforces that any
-    // `OncePerTurn` slot has not already been consumed this turn.
-    let (matched_source, frequency, _from_hand_only) =
-        hand_cast_free_permission_source(state, player, obj).ok_or_else(|| {
+    // CR 601.2b + CR 400.7: The named granting source's permission must be
+    // active and filter-matched. Source-specific validation avoids accepting a
+    // stale legal action for one source only because an earlier battlefield
+    // source also matches the spell.
+    let frequency =
+        cast_free_permission_from_source(state, player, obj, source_id).ok_or_else(|| {
             EngineError::ActionNotAllowed(
-                "No CastFromHandFree permission source admits this spell".to_string(),
+                "Named CastFromHandFree permission source does not admit this spell".to_string(),
             )
         })?;
-    if matched_source != source_id {
-        return Err(EngineError::ActionNotAllowed(
-            "Named source is not the permission grantor for this spell".to_string(),
-        ));
-    }
     let variant = CastingVariant::HandPermission {
         source: source_id,
         frequency,
@@ -6962,7 +6971,7 @@ pub fn hand_cast_free_candidates(
 ) -> Vec<(ObjectId, ObjectId, CastFrequency)> {
     // CR 601.2b + CR 400.7: Collect active (source_id, frequency, filter)
     // triples for OncePerTurn permissions that haven't been consumed this turn.
-    let sources: Vec<(ObjectId, TargetFilter, CastFrequency)> = state
+    let sources: Vec<(ObjectId, TargetFilter, CastFrequency, CastFreeOrigin)> = state
         .battlefield
         .iter()
         .filter_map(|&src_id| {
@@ -6971,16 +6980,15 @@ pub fn hand_cast_free_candidates(
                 return None;
             }
             active_static_definitions(state, src_obj).find_map(|s| match s.mode {
-                StaticMode::CastFromHandFree {
-                    frequency,
-                    from_hand_only: _,
-                } => {
+                StaticMode::CastFromHandFree { frequency, origin } => {
                     if frequency == CastFrequency::OncePerTurn
                         && state.hand_cast_free_permissions_used.contains(&src_id)
                     {
                         None
                     } else if frequency == CastFrequency::OncePerTurn {
-                        s.affected.as_ref().map(|f| (src_id, f.clone(), frequency))
+                        s.affected
+                            .as_ref()
+                            .map(|f| (src_id, f.clone(), frequency, origin))
                     } else {
                         None
                     }
@@ -6999,7 +7007,13 @@ pub fn hand_cast_free_candidates(
         return out;
     };
     for &hand_id in &player_data.hand {
-        for (src_id, filter, frequency) in &sources {
+        for (src_id, filter, frequency, origin) in &sources {
+            let Some(obj) = state.objects.get(&hand_id) else {
+                continue;
+            };
+            if !cast_free_origin_admits_object(state, player, obj, *origin) {
+                continue;
+            }
             let ctx = super::filter::FilterContext::from_source_with_controller(*src_id, player);
             if !super::filter::matches_target_filter(state, hand_id, filter, &ctx) {
                 continue;

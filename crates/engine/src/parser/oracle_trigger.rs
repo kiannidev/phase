@@ -4429,19 +4429,36 @@ fn split_trigger(tp: TextPair<'_>) -> (String, String) {
     }
 }
 
+fn spell_quality_equal_to_chosen_number_tail<'a>(
+    input: &'a str,
+) -> nom::IResult<&'a str, (), OracleError<'a>> {
+    let (rest, _) = alt((
+        tag::<_, _, OracleError<'_>>("equal to the chosen number"),
+        tag("equal to that number"),
+    ))
+    .parse(input)?;
+    Ok((rest, ()))
+}
+
 /// CR 202.3 + CR 208.1: Commas inside a spell-quality disjunction
 /// ("mana value, power, or toughness equal to …") are not the condition/effect
 /// boundary. Talion, the Kindly Lord is the motivating card.
 fn continues_spell_quality_disjunction(after_comma: &str) -> bool {
     let trimmed = after_comma.trim_start();
-    // Talion disjunction only: "mana value, power, or toughness equal to [the]
-    // chosen/that number". Do not treat unrelated ", power, or …" phrases as
-    // condition continuations — that skips the real effect boundary and surfaces
-    // swallowed-clause diagnostics on unrelated cards.
-    trimmed.starts_with("power, or toughness")
-        || (trimmed.starts_with("or toughness")
-            && (trimmed.contains("equal to the chosen number")
-                || trimmed.contains("equal to that number")))
+
+    alt((
+        preceded(
+            tag::<_, _, OracleError<'_>>("power, or toughness "),
+            spell_quality_equal_to_chosen_number_tail,
+        ),
+        preceded(
+            tag::<_, _, OracleError<'_>>("or toughness "),
+            spell_quality_equal_to_chosen_number_tail,
+        ),
+    ))
+    .parse(trimmed)
+    .map(|(rest, _)| rest.is_empty() || tag::<_, _, OracleError<'_>>(", ").parse(rest).is_ok())
+    .unwrap_or(false)
 }
 
 fn find_effect_boundary(lower: &str) -> Option<usize> {
@@ -17346,14 +17363,27 @@ mod tests {
     }
 
     #[test]
+    fn continues_spell_quality_disjunction_talion_segments() {
+        assert!(continues_spell_quality_disjunction(
+            "power, or toughness equal to the chosen number, that player loses 2 life",
+        ));
+        assert!(continues_spell_quality_disjunction(
+            "or toughness equal to the chosen number, that player loses 2 life",
+        ));
+        assert!(!continues_spell_quality_disjunction("you draw a card"));
+    }
+
+    #[test]
     fn find_effect_boundary_does_not_skip_unrelated_power_or_comma() {
         let line = "Whenever an opponent casts a red spell, you draw a card";
         let lower = line.to_lowercase();
         let boundary = find_effect_boundary(&lower).expect("effect boundary");
-        assert!(
-            lower[boundary..].starts_with(", you draw"),
-            "comma after spell type should split condition/effect, got {:?}",
-            &lower[boundary..]
+        let suffix = &lower[boundary..];
+        let expected = ", you draw";
+        assert_eq!(
+            &suffix[..expected.len()],
+            expected,
+            "comma after spell type should split condition/effect, got {suffix:?}"
         );
     }
 
@@ -17362,10 +17392,12 @@ mod tests {
         let line = "Whenever an opponent casts a spell with mana value, power, or toughness equal to the chosen number, that player loses 2 life";
         let lower = line.to_lowercase();
         let boundary = find_effect_boundary(&lower).expect("effect boundary");
-        assert!(
-            lower[boundary..].starts_with(", that player"),
-            "boundary should follow the spell-quality clause, got {:?}",
-            &lower[boundary..]
+        let suffix = &lower[boundary..];
+        let expected = ", that player";
+        assert_eq!(
+            &suffix[..expected.len()],
+            expected,
+            "boundary should follow the spell-quality clause, got {suffix:?}"
         );
     }
 

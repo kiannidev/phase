@@ -2641,7 +2641,24 @@ pub fn synthesize_extort(face: &mut CardFace) {
 /// creature when mana spent to cast the spell exceeds its power or toughness.
 /// CR 702.191b: each instance triggers separately.
 pub fn synthesize_increment(face: &mut CardFace) {
-    KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Increment));
+    // `install_matching` dedupes exact synthesized trigger values. Increment can
+    // also arrive from parsed reminder text, whose trigger is semantically the
+    // same but not necessarily structurally identical, so count by Increment
+    // identity instead.
+    let desired = face
+        .keywords
+        .iter()
+        .filter(|kw| matches!(kw, Keyword::Increment))
+        .count();
+    let existing = face
+        .triggers
+        .iter()
+        .filter(|t| is_increment_trigger(t))
+        .count();
+
+    for _ in existing..desired {
+        face.triggers.push(build_increment_trigger());
+    }
 }
 
 /// CR 702.105a: Dethrone — an attack trigger that fires whenever this creature
@@ -3293,8 +3310,8 @@ fn is_increment_trigger(t: &TriggerDefinition) -> bool {
             t.execute.as_deref().map(|a| &*a.effect),
             Some(Effect::PutCounter {
                 counter_type: CounterType::Plus1Plus1,
+                count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::SelfRef,
-                ..
             })
         )
 }
@@ -8440,6 +8457,63 @@ mod increment_synthesis_tests {
             .filter(|t| is_increment_trigger(t))
             .count();
         assert_eq!(count, 2, "CR 702.191b: each instance triggers separately");
+    }
+
+    #[test]
+    fn build_oracle_face_dedupes_increment_keyword_and_reminder_body() {
+        let mtgjson = AtomicCard {
+            name: "Topiary Lecturer".to_string(),
+            mana_cost: Some("{2}{G}".to_string()),
+            colors: vec!["G".to_string()],
+            color_identity: vec!["G".to_string()],
+            text: Some(
+                "Increment (Whenever you cast a spell, if the amount of mana you spent is greater than this creature's power or toughness, put a +1/+1 counter on this creature.)"
+                    .to_string(),
+            ),
+            power: Some("2".to_string()),
+            toughness: Some("3".to_string()),
+            loyalty: None,
+            defense: None,
+            layout: "normal".to_string(),
+            type_line: Some("Creature — Plant Employee".to_string()),
+            types: vec!["Creature".to_string()],
+            subtypes: vec!["Plant".to_string(), "Employee".to_string()],
+            supertypes: Vec::new(),
+            keywords: Some(vec!["Increment".to_string()]),
+            side: None,
+            face_name: None,
+            mana_value: 3.0,
+            legalities: Default::default(),
+            leadership_skills: None,
+            printings: Vec::new(),
+            rulings: Vec::new(),
+            is_game_changer: false,
+            identifiers: crate::database::mtgjson::AtomicIdentifiers {
+                scryfall_oracle_id: Some("increment-dedupe-test".to_string()),
+                scryfall_id: Some("increment-dedupe-test-face".to_string()),
+            },
+            foreign_data: Vec::new(),
+        };
+
+        let face = build_oracle_face(&mtgjson, None);
+
+        assert!(face
+            .keywords
+            .iter()
+            .any(|keyword| matches!(keyword, Keyword::Increment)));
+        assert_eq!(
+            face.triggers
+                .iter()
+                .filter(|trigger| is_increment_trigger(trigger))
+                .count(),
+            1,
+            "Increment keyword synthesis should recognize the parsed reminder trigger"
+        );
+        assert_eq!(
+            face.triggers.len(),
+            1,
+            "Increment reminder parsing and keyword synthesis should not create duplicate triggers"
+        );
     }
 }
 

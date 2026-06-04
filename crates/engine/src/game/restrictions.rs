@@ -1681,9 +1681,8 @@ pub(crate) fn attack_target_matches_defended_scope(
     let Some(target) = attack_target else {
         return false;
     };
-    let permanent_controller = |id: ObjectId| -> Option<PlayerId> {
-        state.objects.get(&id).map(|obj| obj.controller)
-    };
+    let permanent_controller =
+        |id: ObjectId| -> Option<PlayerId> { state.objects.get(&id).map(|obj| obj.controller) };
     match (filter, target) {
         (AttackTargetFilter::Player, AttackTarget::Player(p)) => *p == source_controller,
         (AttackTargetFilter::Planeswalker, AttackTarget::Planeswalker(pw_id)) => {

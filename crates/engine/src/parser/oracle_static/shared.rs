@@ -2258,9 +2258,7 @@ pub(crate) fn parse_cant_attack_rule_static_predicate_nom(
     Ok((rest, defended))
 }
 
-fn parse_cant_attack_combat_predicate_nom(
-    input: &str,
-) -> OracleResult<'_, RuleStaticPredicate> {
+fn parse_cant_attack_combat_predicate_nom(input: &str) -> OracleResult<'_, RuleStaticPredicate> {
     let (rest, _) = parse_cant_attack_rule_static_predicate_nom(input)?;
     Ok((rest, RuleStaticPredicate::CantAttack))
 }

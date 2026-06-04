@@ -993,19 +993,17 @@ pub(crate) fn parse_subject_combat_rule_static(text: &str) -> Option<StaticDefin
     // typed subject (Eriette of the Charmed Apple). `parse_cant_attack_rule_static_
     // predicate_nom` captures the defended scope; the generic combat predicate
     // parser drops it.
-    if !lower.contains("can't attack or block") {
-        if let Some(marker_idx) = lower.find("can't attack") {
-            let subject = text[..marker_idx].trim();
-            let predicate = &text[marker_idx..];
-            let (rest, defended) = parse_cant_attack_rule_static_predicate_nom(predicate).ok()?;
-            let (rest, _) = opt(tag::<_, _, OracleError<'_>>(".")).parse(rest).ok()?;
-            if rest.trim().is_empty() {
-                let affected = parse_rule_static_subject_filter(subject)?;
-                return Some(
-                    lower_rule_static(RuleStaticPredicate::CantAttack, affected, text)
-                        .attack_defended(defended),
-                );
-            }
+    if let Some((subject_lower, defended, rest)) =
+        nom_primitives::scan_preceded(&lower, parse_cant_attack_rule_static_predicate_nom)
+    {
+        let (rest, _) = opt(tag::<_, _, OracleError<'_>>(".")).parse(rest).ok()?;
+        if rest.trim().is_empty() {
+            let subject = text[..subject_lower.len()].trim();
+            let affected = parse_rule_static_subject_filter(subject)?;
+            return Some(
+                lower_rule_static(RuleStaticPredicate::CantAttack, affected, text)
+                    .attack_defended(defended),
+            );
         }
     }
 

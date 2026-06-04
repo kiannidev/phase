@@ -4314,7 +4314,13 @@ mod tests {
         state.active_player = PlayerId(1);
         state.turn_number = 2;
 
-        let eriette = create_creature(&mut state, PlayerId(0), "Eriette of the Charmed Apple", 2, 4);
+        let eriette = create_creature(
+            &mut state,
+            PlayerId(0),
+            "Eriette of the Charmed Apple",
+            2,
+            4,
+        );
         let static_line = "Each creature that's enchanted by an Aura you control can't attack you or planeswalkers you control.";
         let def = parse_static_line(static_line).expect(static_line);
         assert_eq!(def.mode, StaticMode::CantAttack);
@@ -4353,10 +4359,7 @@ mod tests {
             crate::types::zones::Zone::Battlefield,
         );
         let pw_obj = state.objects.get_mut(&pw).unwrap();
-        pw_obj
-            .card_types
-            .core_types
-            .push(CoreType::Planeswalker);
+        pw_obj.card_types.core_types.push(CoreType::Planeswalker);
 
         assert!(
             get_valid_attacker_ids(&state).contains(&attacker),

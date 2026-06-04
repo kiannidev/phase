@@ -13315,13 +13315,13 @@ fn eriette_charmed_apple_static_and_trigger_parse() {
     assert_eq!(static_def.mode, StaticMode::CantAttack);
     assert_eq!(
         static_def.affected,
-        Some(TargetFilter::Typed(
-            TypedFilter::creature().properties(vec![FilterProp::HasAttachment {
+        Some(TargetFilter::Typed(TypedFilter::creature().properties(
+            vec![FilterProp::HasAttachment {
                 kind: AttachmentKind::Aura,
                 controller: Some(ControllerRef::You),
                 exclude_source: false,
-            }])
-        )),
+            }]
+        ))),
         "affected must be creatures enchanted by an Aura you control, got {:?}",
         static_def.affected
     );

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+use crate::game::combat::AttackTarget;
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::functioning_abilities::{battlefield_active_statics, game_functioning_statics};
 use crate::game::layers::{evaluate_condition, evaluate_condition_with_recipient};
@@ -8,7 +9,6 @@ use crate::types::ability::{ContinuousModification, Duration, TargetFilter, Type
 use crate::types::game_state::GameState;
 use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
-use crate::game::combat::AttackTarget;
 use crate::types::statics::{CostPaymentProhibition, ProhibitionScope, StaticMode};
 
 /// Handler function type for static ability modes.

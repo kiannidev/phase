@@ -297,6 +297,28 @@ fn register_transient_effect(
                 );
             }
         }
+        // CR 603.2 + CR 608.2c: Subject-based cast triggers (Judith, Carnage
+        // Connoisseur: "that spell gains deathtouch and lifelink") carry
+        // `target: TriggeringSource` with no chosen targets. The spell is on the
+        // stack, so the battlefield broadcast arm cannot reach it.
+        Some(TargetFilter::TriggeringSource) if ability.targets.is_empty() => {
+            if let Some(TargetRef::Object(obj_id)) =
+                crate::game::targeting::resolve_event_context_target(
+                    state,
+                    &TargetFilter::TriggeringSource,
+                    ability.source_id,
+                )
+            {
+                state.add_transient_continuous_effect(
+                    ability.source_id,
+                    ability.controller,
+                    duration.clone(),
+                    TargetFilter::SpecificObject { id: obj_id },
+                    modifications.clone(),
+                    static_def.condition.clone(),
+                );
+            }
+        }
         Some(TargetFilter::ParentTarget) if ability.targets.is_empty() => {
             let tracked = state
                 .chain_tracked_set_id
@@ -494,9 +516,10 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::types::ability::{
         ContinuousModification, ControllerRef, Duration, QuantityExpr, QuantityRef,
-        StaticDefinition, TypedFilter,
+        StaticDefinition, TargetFilter, TypedFilter,
     };
     use crate::types::card_type::CoreType;
+    use crate::types::events::GameEvent;
     use crate::types::identifiers::{CardId, TrackedSetId};
     use crate::types::keywords::Keyword;
     use crate::types::player::PlayerId;
@@ -831,6 +854,77 @@ mod tests {
                 id: target_creature
             }
         );
+    }
+
+    /// Issue #2013: Judith's modal mode binds `target: TriggeringSource` with no
+    /// chosen targets; the grant must reach the cast instant/sorcery on the stack.
+    #[test]
+    fn triggering_source_grant_binds_cast_spell_without_targets() {
+        let mut state = GameState::new_two_player(42);
+        let judith = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Judith, Carnage Connoisseur".to_string(),
+            Zone::Battlefield,
+        );
+        let cast_spell = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Lightning Bolt".to_string(),
+            Zone::Stack,
+        );
+        state
+            .objects
+            .get_mut(&cast_spell)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Instant);
+        state.current_trigger_event = Some(GameEvent::SpellCast {
+            card_id: CardId(2),
+            controller: PlayerId(0),
+            object_id: cast_spell,
+        });
+
+        let static_def = StaticDefinition::continuous()
+            .affected(TargetFilter::ParentTarget)
+            .modifications(vec![
+                ContinuousModification::AddKeyword {
+                    keyword: Keyword::Deathtouch,
+                },
+                ContinuousModification::AddKeyword {
+                    keyword: Keyword::Lifelink,
+                },
+            ]);
+        let ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![static_def],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: Some(TargetFilter::TriggeringSource),
+            },
+            vec![],
+            judith,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilEndOfTurn);
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.transient_continuous_effects.len(), 1);
+        let tce = &state.transient_continuous_effects[0];
+        assert_eq!(
+            tce.affected,
+            TargetFilter::SpecificObject { id: cast_spell }
+        );
+        assert!(tce.modifications.contains(&ContinuousModification::AddKeyword {
+            keyword: Keyword::Deathtouch,
+        }));
+        assert!(tce.modifications.contains(&ContinuousModification::AddKeyword {
+            keyword: Keyword::Lifelink,
+        }));
     }
 
     #[test]

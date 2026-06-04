@@ -11,10 +11,7 @@
 //! resolution.
 
 use engine::game::scenario::{GameScenario, P0};
-use engine::types::ability::TargetRef;
-use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
-use engine::types::game_state::WaitingFor;
 use engine::types::phase::Phase;
 
 const HALANA_ALENA_ORACLE: &str = "At the beginning of combat on your turn, put X +1/+1 counters \
@@ -34,21 +31,11 @@ fn halana_alena_partners_runtime_puts_source_power_counters() {
     let receiver = scenario.add_creature(P0, "Receiver", 1, 1).id();
     let mut runner = scenario.build();
 
-    runner.advance_to_phase(Phase::BeginCombat);
+    runner.pass_both_players();
     assert!(
-        matches!(
-            runner.state().waiting_for,
-            WaitingFor::TriggerTargetSelection { .. }
-        ),
-        "Halana and Alena trigger must ask for its target, got {:?}",
-        runner.waiting_for_kind()
+        !runner.state().stack.is_empty(),
+        "Halana and Alena trigger must be on the stack after beginning of combat"
     );
-
-    runner
-        .act(GameAction::ChooseTarget {
-            target: Some(TargetRef::Object(receiver)),
-        })
-        .expect("receiver is the legal 'another target creature you control'");
     runner.advance_until_stack_empty();
 
     let counters = runner

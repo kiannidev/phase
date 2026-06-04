@@ -13392,7 +13392,11 @@ mod tests {
             "PayCost with no W/B must set cost_payment_failed_flag"
         );
         assert_eq!(
-            (state.players[0].life, state.players[1].life, state.players[2].life),
+            (
+                state.players[0].life,
+                state.players[1].life,
+                state.players[2].life
+            ),
             (20, 20, 20),
             "accepting without payable mana must not drain opponents or grant life"
         );

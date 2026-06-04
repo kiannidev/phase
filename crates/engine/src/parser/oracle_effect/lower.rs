@@ -4167,12 +4167,19 @@ pub(super) fn compute_sentence_where_x(chunks: &[ClauseChunk]) -> Vec<Option<Str
 pub(crate) fn strip_trailing_where_x<'a>(tp: TextPair<'a>) -> (TextPair<'a>, Option<String>) {
     for needle in [", where x is ", " where x is "] {
         if let Some((before, after)) = tp.split_around(needle) {
-            let expression = after
+            let mut expression = after
                 .original
                 .trim()
                 .trim_end_matches('.')
                 .trim()
                 .to_string();
+            // CR 608.2c: A where-X binding can precede further instructions in the
+            // same sentence ("..., where X is N. Put that card ..."). Keep only
+            // the defining expression, not the continuation clause.
+            if let Some(idx) = expression.find(". ") {
+                expression.truncate(idx);
+                expression = expression.trim().to_string();
+            }
             if expression.is_empty() {
                 return (tp, None);
             }
@@ -4466,21 +4473,19 @@ pub(super) fn apply_where_x_effect_expression(
         | Effect::PutCounterAll { count: amount, .. }
         | Effect::Token { count: amount, .. }
         | Effect::Dig { count: amount, .. }
-        // CR 107.3i + CR 109.4 + CR 109.5: "search/seek for up to X …, where X
-        // is …" binds the search count to the defining clause (Oreskos
-        // Explorer: "search your library for up to X Plains cards, where X is
-        // the number of players who control more lands than you"). The count is
-        // an `UpTo` wrapper whose inner `Variable("X")` is rewritten by the
-        // recursion arm; the where-clause population is a control comparison
-        // (CR 109.4) relative to "you" (CR 109.5).
-        | Effect::SearchLibrary { count: amount, .. }
-        | Effect::Seek { count: amount, .. }
         | Effect::ExileTop { count: amount, .. }
         | Effect::Discover {
             mana_value_limit: amount,
         }
         | Effect::Incubate { count: amount } => {
             *amount = apply_where_x_quantity_expression(amount.clone(), where_x_expression);
+        }
+        // CR 107.3i + CR 109.4 + CR 109.5: "search/seek for up to X …, where X
+        // is …" binds the search count (Oreskos Explorer). Eldritch Evolution
+        // binds the filter's `Cmc` bound when X appears in the card filter.
+        Effect::SearchLibrary { filter, count, .. } | Effect::Seek { filter, count, .. } => {
+            *filter = apply_where_x_to_filter(filter.clone(), where_x_expression);
+            *count = apply_where_x_quantity_expression(count.clone(), where_x_expression);
         }
         Effect::Scry { count, .. } => {
             *count = apply_where_x_quantity_expression(count.clone(), where_x_expression);
@@ -5001,6 +5006,18 @@ mod where_x_tests {
                 comparator: Comparator::LE,
                 value: QuantityExpr::Fixed { value: 6 },
             })
+        );
+    }
+
+    #[test]
+    fn strip_trailing_where_x_stops_at_following_sentence() {
+        let (_, expr) = super::strip_trailing_where_x(crate::parser::oracle_util::TextPair::new(
+            "creature card with mana value X or less, where X is 2 plus the sacrificed creature's mana value. Put that card onto the battlefield",
+            "creature card with mana value x or less, where x is 2 plus the sacrificed creature's mana value. put that card onto the battlefield",
+        ));
+        assert_eq!(
+            expr.as_deref(),
+            Some("2 plus the sacrificed creature's mana value")
         );
     }
 

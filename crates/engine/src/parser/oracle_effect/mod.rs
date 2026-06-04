@@ -88,11 +88,11 @@ use crate::types::ability::{
     ContinuousModification, ControllerRef, DamageModification, DamageSource,
     DelayedTriggerCondition, DoubleTarget, Duration, Effect, FilterProp, GameRestriction,
     IterationKindBinding, ManaProduction, ManaSpendPermission, MultiTargetSpec, ObjectProperty,
-    ObjectScope, PaymentCost, PlayerFilter, PlayerScope, PreventionAmount, PreventionScope,
-    ProhibitedActivity, QuantityExpr, QuantityRef, ReplacementDefinition, RestrictionExpiry,
-    RestrictionPlayerScope, RoundingMode, StaticCondition, StaticDefinition, StepSkipTarget,
-    SubAbilityLink, TargetFilter, TargetSelectionMode, TriggerCondition, TriggerDefinition,
-    TypeFilter, TypedFilter, UnlessPayModifier, UntilCondition, ZoneOwner,
+    ObjectScope, PaymentCost, PlayerFilter, PlayerRelation, PlayerScope, PreventionAmount,
+    PreventionScope, ProhibitedActivity, QuantityExpr, QuantityRef, ReplacementDefinition,
+    RestrictionExpiry, RestrictionPlayerScope, RoundingMode, StaticCondition, StaticDefinition,
+    StepSkipTarget, SubAbilityLink, TargetFilter, TargetSelectionMode, TriggerCondition,
+    TriggerDefinition, TypeFilter, TypedFilter, UnlessPayModifier, UntilCondition, ZoneOwner,
 };
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::CounterType;
@@ -734,6 +734,7 @@ fn try_parse_die_exile_rider(lower: &str, kind: AbilityKind) -> Option<AbilityDe
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         },
     );
     let mut repl = ReplacementDefinition::new(ReplacementEvent::Moved)
@@ -811,6 +812,7 @@ fn try_parse_leave_battlefield_exile_replacement(lower: &str) -> Option<Effect> 
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             },
         ));
 
@@ -1831,6 +1833,7 @@ fn try_parse_self_name_exile(
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         }));
     }
     None
@@ -1884,6 +1887,7 @@ fn try_parse_airbend_clause(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
             target: mass_target,
             enters_under: None,
             enter_tapped: false,
+            face_down_profile: None,
         }
     } else {
         Effect::ChangeZone {
@@ -1897,6 +1901,7 @@ fn try_parse_airbend_clause(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         }
     };
 
@@ -1971,6 +1976,7 @@ fn try_parse_earthbend_clause(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         },
     );
 
@@ -2645,24 +2651,11 @@ fn try_parse_choose_one_of_inline(
     let mut chooser = PlayerFilter::Controller;
     let mut scoped_choice_player = false;
     let mut tp = tp;
-    if let Some((prefix_chooser, rest_original)) = nom_on_lower(tp.original, tp.lower, |i| {
-        alt((
-            value(
-                PlayerFilter::DefendingPlayer,
-                tag("defending player faces a villainous choice — "),
-            ),
-            value(
-                PlayerFilter::Opponent,
-                tag("target opponent faces a villainous choice — "),
-            ),
-            value(PlayerFilter::Controller, tag("face a villainous choice — ")),
-            value(
-                PlayerFilter::Controller,
-                tag("faces a villainous choice — "),
-            ),
-        ))
-        .parse(i)
-    }) {
+    if let Some((prefix_chooser, rest_original)) = nom_on_lower(
+        tp.original,
+        tp.lower,
+        parse_villainous_choice_chooser_prefix,
+    ) {
         let consumed = tp.original.len() - rest_original.len();
         tp = TextPair::new(rest_original, &tp.lower[consumed..]);
         chooser = prefix_chooser;
@@ -2820,6 +2813,51 @@ fn try_parse_choose_one_of_inline(
         chooser,
         branches: vec![left_def, right_def],
     }))
+}
+
+fn parse_villainous_choice_chooser_prefix(input: &str) -> OracleResult<'_, PlayerFilter> {
+    alt((
+        value(
+            PlayerFilter::DefendingPlayer,
+            tag("defending player faces a villainous choice — "),
+        ),
+        value(
+            PlayerFilter::Opponent,
+            tag("target opponent faces a villainous choice — "),
+        ),
+        parse_life_lost_villainous_choice_chooser,
+        value(PlayerFilter::Controller, tag("face a villainous choice — ")),
+        value(
+            PlayerFilter::Controller,
+            tag("faces a villainous choice — "),
+        ),
+    ))
+    .parse(input)
+}
+
+fn parse_life_lost_villainous_choice_chooser(input: &str) -> OracleResult<'_, PlayerFilter> {
+    let (input, relation) = alt((
+        value(PlayerRelation::Opponent, tag("each other player who lost ")),
+        value(PlayerRelation::Opponent, tag("each opponent who lost ")),
+        value(PlayerRelation::All, tag("each player who lost ")),
+        value(PlayerRelation::Opponent, tag("who lost ")),
+    ))
+    .parse(input)?;
+    let (input, threshold) = nom_primitives::parse_number(input)?;
+    let (input, _) = tag(" or more life this turn faces a villainous choice — ").parse(input)?;
+    let threshold = i32::try_from(threshold).unwrap_or(i32::MAX);
+
+    Ok((
+        input,
+        PlayerFilter::PlayerAttribute {
+            relation,
+            attr: Box::new(QuantityRef::LifeLostThisTurn {
+                player: PlayerScope::ScopedPlayer,
+            }),
+            comparator: Comparator::GE,
+            value: Box::new(QuantityExpr::Fixed { value: threshold }),
+        },
+    ))
 }
 
 fn ability_definition_from_clause(
@@ -3098,6 +3136,7 @@ fn try_parse_distinct_card_types_from_revealed(tp: TextPair<'_>) -> Option<Parse
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             },
         ))),
         distribute: None,
@@ -5053,6 +5092,7 @@ fn try_parse_owner_of_target_shuffle(
         enters_attacking: false,
         up_to: false,
         enter_with_counters: vec![],
+        face_down_profile: None,
     }))
 }
 
@@ -7086,6 +7126,7 @@ fn try_parse_return_opponent_choice_from_graveyard(text: &str) -> Option<ParsedE
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         },
     )));
     Some(clause)
@@ -8679,6 +8720,7 @@ fn try_parse_compound_shuffle(text: &str) -> Option<ParsedEffectClause> {
         enters_attacking: false,
         up_to: false,
         enter_with_counters: vec![],
+        face_down_profile: None,
     };
     let mut sub_def = AbilityDefinition::new(AbilityKind::Spell, sub_effect);
     sub_def.sub_ability = Some(Box::new(shuffle_def));
@@ -8695,6 +8737,7 @@ fn try_parse_compound_shuffle(text: &str) -> Option<ParsedEffectClause> {
         enters_attacking: false,
         up_to: false,
         enter_with_counters: vec![],
+        face_down_profile: None,
     };
 
     Some(ParsedEffectClause {
@@ -10206,6 +10249,23 @@ fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
         Effect::ExtraTurn { target } if *target == TargetFilter::Controller => {
             *target = subject_filter;
         }
+        // CR 104.3e + CR 603.7c: "that player loses the game" / "target player
+        // loses the game" — bind the named player into the effect's
+        // optional target field. The subject parser ("subject.rs") maps "that
+        // player" → `TargetFilter::TriggeringPlayer` (a context ref resolved
+        // at effect-resolution time against `state.current_trigger_event`)
+        // and "target player" → `TargetFilter::Player` (declared at cast/
+        // stack-push time). Guard on `is_none()` so an already-parsed target
+        // (no current call site, kept defensively) is preserved. Canonical
+        // cards: Ezio Auditore da Firenze's reflexive "that player loses the
+        // game" sub-ability (CR 104.3e); the WinTheGame arm is the symmetric
+        // CR 104.2b counterpart for any future "that player wins the game"
+        // wording.
+        Effect::LoseTheGame { ref mut target } | Effect::WinTheGame { ref mut target }
+            if target.is_none() =>
+        {
+            *target = Some(subject_filter);
+        }
         // CR 122.1: "target player gets a poison counter" — inject subject target
         Effect::GivePlayerCounter { target, .. } if *target == TargetFilter::Controller => {
             *target = subject_filter;
@@ -10570,6 +10630,17 @@ fn cast_filter_has_typed_leaf(filter: &TargetFilter) -> bool {
     }
 }
 
+fn cast_filter_has_meaningful_typed_leaf(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(tf) => tf.has_meaningful_type_constraint(),
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            filters.iter().any(cast_filter_has_meaningful_typed_leaf)
+        }
+        TargetFilter::Not { filter } => cast_filter_has_meaningful_typed_leaf(filter),
+        _ => false,
+    }
+}
+
 fn add_cast_target_props(
     filter: &mut TargetFilter,
     props: &[FilterProp],
@@ -10662,17 +10733,17 @@ fn parse_from_among_exiled_this_way(rest: &str) -> Option<TargetFilter> {
     // `cast_filter_has_typed_leaf` would treat `[Card]` as non-empty;
     // `TypedFilter::has_meaningful_type_constraint` is the canonical
     // accessor that excludes Card/Any noise.
-    let meaningful = match &typed_filter {
-        TargetFilter::Typed(tf) => tf.has_meaningful_type_constraint(),
-        _ => cast_filter_has_typed_leaf(&typed_filter),
-    };
+    let meaningful = cast_filter_has_meaningful_typed_leaf(&typed_filter);
 
-    Some(if meaningful {
+    Some(if !meaningful {
+        TargetFilter::ExiledBySource
+    } else if typed_filter.references_exiled_by_source() {
+        typed_filter.normalized()
+    } else {
         TargetFilter::And {
             filters: vec![TargetFilter::ExiledBySource, typed_filter],
         }
-    } else {
-        TargetFilter::ExiledBySource
+        .normalized()
     })
 }
 
@@ -10868,6 +10939,7 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
             alt_ability_cost: None,
             constraint,
             duration,
+            driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
         });
     }
 
@@ -10902,6 +10974,7 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
             alt_ability_cost: None,
             constraint,
             duration: None,
+            driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
         });
     }
     // CR 610.3 + CR 118.9 + CR 608.2c + CR 701.13a: "Cast [quantifier] [filter]
@@ -10923,6 +10996,7 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
             alt_ability_cost: None,
             constraint,
             duration: None,
+            driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
         });
     }
     if scan_contains_phrase(rest, "from among them")
@@ -10938,6 +11012,7 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
             alt_ability_cost: None,
             constraint,
             duration: None,
+            driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
         });
     }
 
@@ -10990,6 +11065,7 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
             alt_ability_cost: None,
             constraint,
             duration: None,
+            driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
         });
     }
 
@@ -11016,6 +11092,7 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
             alt_ability_cost: None,
             constraint,
             duration: None,
+            driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
         });
     }
 
@@ -11028,6 +11105,7 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
         alt_ability_cost: None,
         constraint,
         duration: None,
+        driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
     })
 }
 
@@ -13258,6 +13336,7 @@ fn try_parse_for_each_attacker_copy_blocker(
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             },
         );
         def.sub_ability = Some(Box::new(AbilityDefinition::new(
@@ -13313,6 +13392,7 @@ fn try_parse_return_target_and_same_name_from_your_graveyard(
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         },
     );
     def.sub_ability = Some(Box::new(AbilityDefinition::new(
@@ -13331,6 +13411,7 @@ fn try_parse_return_target_and_same_name_from_your_graveyard(
             ])),
             enters_under: None,
             enter_tapped,
+            face_down_profile: None,
         },
     )));
     Some(def)
@@ -15757,6 +15838,7 @@ fn try_parse_put_zone_change_parts(
                     enters_attacking,
                     up_to,
                     enter_with_counters,
+                    face_down_profile: None,
                 },
                 choice_count,
             ));
@@ -16435,11 +16517,12 @@ fn constrain_filter_to_stack(filter: TargetFilter) -> TargetFilter {
     }
 }
 
-/// CR 115.7: Parse "change the target of [spell]" and "you may choose new targets for [spell]".
+/// CR 115.7: Parse "change the/a target of [spell]" and "you may choose new targets for [spell]".
 ///
-/// Covers two Oracle text patterns:
-/// - "change the target of [spell phrase]" → scope: `Single`
-/// - "you may choose new targets for [spell phrase]" → scope: `All`
+/// Covers Oracle text patterns:
+/// - "change the target of [spell phrase]" → scope: `Single` (CR 115.7a)
+/// - "change a target of [spell phrase]" → scope: `Single` (CR 115.7b — Spellskite, Phyresis)
+/// - "you may choose new targets for [spell phrase]" → scope: `All` (CR 115.7d)
 ///
 /// An optional trailing "to [target phrase]" sets `forced_to`.
 fn try_parse_change_targets(lower: &str) -> Option<Effect> {
@@ -16450,6 +16533,7 @@ fn try_parse_change_targets(lower: &str) -> Option<Effect> {
             RetargetScope::Single,
             tag::<_, _, E>("change the target of "),
         ),
+        value(RetargetScope::Single, tag("change a target of ")),
         value(RetargetScope::All, tag("you may choose new targets for ")),
     ))
     .parse(lower)
@@ -17382,7 +17466,7 @@ mod tests {
         );
 
         assert!(
-            matches!(*def.effect, Effect::WinTheGame),
+            matches!(*def.effect, Effect::WinTheGame { .. }),
             "top-level effect must be WinTheGame, got: {:?}",
             def.effect
         );
@@ -20172,6 +20256,7 @@ mod tests {
                     target: TargetFilter::Player,
                     enters_under: None,
                     enter_tapped: false,
+                    face_down_profile: None,
                 }
             ),
             "exile target player's graveyard should be ChangeZoneAll with origin=Graveyard, target=Player, got {e:?}"
@@ -20233,6 +20318,7 @@ mod tests {
                     target: TargetFilter::ExiledBySource,
                     enters_under: None,
                     enter_tapped: false,
+                    face_down_profile: None,
                 }
             ),
             "should produce ChangeZoneAll from Exile to Graveyard with ExiledBySource, got {e:?}"
@@ -22450,6 +22536,7 @@ mod tests {
                 target: TargetFilter::Controller,
                 enters_under: None,
                 enter_tapped: false,
+                face_down_profile: None,
             }
         ));
 
@@ -22465,6 +22552,7 @@ mod tests {
                 target: TargetFilter::Controller,
                 enters_under: None,
                 enter_tapped: false,
+                face_down_profile: None,
             }
         ));
 
@@ -23909,6 +23997,63 @@ mod tests {
             clause.multi_target,
             Some(MultiTargetSpec::bounded_expr(
                 QuantityExpr::Fixed { value: 0 },
+                QuantityExpr::Fixed { value: 2 },
+            ))
+        );
+        assert_eq!(
+            clause.distribute,
+            Some(DistributionUnit::Counters("P1P1".to_string()))
+        );
+    }
+
+    #[test]
+    fn distribute_x_counters_among_any_number_allows_zero_targets() {
+        let clause = parse_effect_clause(
+            "distribute X +1/+1 counters among any number of target creatures you control",
+            &mut ParseContext::default(),
+        );
+        let x = QuantityExpr::Ref {
+            qty: QuantityRef::Variable {
+                name: "X".to_string(),
+            },
+        };
+
+        assert_eq!(
+            clause.multi_target,
+            Some(MultiTargetSpec::bounded_expr(
+                QuantityExpr::Fixed { value: 0 },
+                x.clone(),
+            ))
+        );
+        assert_eq!(
+            clause.distribute,
+            Some(DistributionUnit::Counters("P1P1".to_string()))
+        );
+        assert!(
+            matches!(
+                clause.effect,
+                Effect::PutCounter {
+                    counter_type: CounterType::Plus1Plus1,
+                    ref count,
+                    target: TargetFilter::Typed(_),
+                } if *count == x
+            ),
+            "Expected X-count targeted PutCounter with multi_target, got {:?}",
+            clause.effect
+        );
+    }
+
+    #[test]
+    fn distribute_fixed_counters_among_any_number_requires_one_target() {
+        let clause = parse_effect_clause(
+            "distribute two +1/+1 counters among any number of target creatures you control",
+            &mut ParseContext::default(),
+        );
+
+        assert_eq!(
+            clause.multi_target,
+            Some(MultiTargetSpec::bounded_expr(
+                QuantityExpr::Fixed { value: 1 },
                 QuantityExpr::Fixed { value: 2 },
             ))
         );
@@ -29155,6 +29300,19 @@ mod tests {
             }
             other => panic!("Expected Token effect in else_ability, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn change_targets_change_a_target_of_forced_to_self() {
+        let e = parse_effect("change a target of target spell or ability to ~");
+        let Effect::ChangeTargets {
+            scope, forced_to, ..
+        } = e
+        else {
+            panic!("Expected ChangeTargets, got {e:?}");
+        };
+        assert!(matches!(scope, RetargetScope::Single));
+        assert_eq!(forced_to, Some(TargetFilter::SelfRef));
     }
 
     #[test]
@@ -37210,6 +37368,112 @@ mod tests {
         }
     }
 
+    fn assert_life_lost_villainous_chooser(
+        chooser: &PlayerFilter,
+        expected_relation: PlayerRelation,
+    ) {
+        match chooser {
+            PlayerFilter::PlayerAttribute {
+                relation,
+                attr,
+                comparator,
+                value,
+            } => {
+                assert_eq!(*relation, expected_relation);
+                assert_eq!(*comparator, Comparator::GE);
+                assert!(matches!(
+                    attr.as_ref(),
+                    QuantityRef::LifeLostThisTurn {
+                        player: PlayerScope::ScopedPlayer
+                    }
+                ));
+                assert_eq!(value.as_ref(), &QuantityExpr::Fixed { value: 3 });
+            }
+            other => panic!("expected life-lost PlayerAttribute chooser, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn villainous_choice_supports_life_lost_restricted_chooser() {
+        let ability = parse_effect_chain(
+            "Each opponent who lost 3 or more life this turn faces a villainous choice — You draw a card, or that player discards a card.",
+            AbilityKind::Spell,
+        );
+
+        match &*ability.effect {
+            Effect::ChooseOneOf { chooser, branches } => {
+                assert_eq!(
+                    ability.player_scope, None,
+                    "restricted villainous choice must use chooser, not player_scope fan-out"
+                );
+                assert_life_lost_villainous_chooser(chooser, PlayerRelation::Opponent);
+                assert_eq!(branches.len(), 2);
+                assert!(matches!(&*branches[0].effect, Effect::Draw { .. }));
+                assert!(matches!(
+                    &*branches[1].effect,
+                    Effect::Discard {
+                        target: TargetFilter::ScopedPlayer,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected ChooseOneOf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn villainous_choice_supports_life_lost_continuation_remainder() {
+        let ability = parse_effect_chain(
+            "Who lost 3 or more life this turn faces a villainous choice — You draw a card, or that player discards a card.",
+            AbilityKind::Spell,
+        );
+
+        match &*ability.effect {
+            Effect::ChooseOneOf { chooser, branches } => {
+                assert_life_lost_villainous_chooser(chooser, PlayerRelation::Opponent);
+                assert_eq!(branches.len(), 2);
+            }
+            other => panic!("expected ChooseOneOf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn villainous_choice_supports_life_lost_restricted_all_players() {
+        let ability = parse_effect_chain(
+            "Each player who lost 3 or more life this turn faces a villainous choice — You draw a card, or that player discards a card.",
+            AbilityKind::Spell,
+        );
+
+        match &*ability.effect {
+            Effect::ChooseOneOf { chooser, branches } => {
+                assert_life_lost_villainous_chooser(chooser, PlayerRelation::All);
+                assert_eq!(branches.len(), 2);
+            }
+            other => panic!("expected ChooseOneOf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn davros_token_then_restricted_villainous_choice_chain() {
+        let ability = parse_effect_chain(
+            "Create a 3/3 black Dalek artifact creature token with menace. Then each opponent who lost 3 or more life this turn faces a villainous choice — You draw a card, or that player discards a card.",
+            AbilityKind::Spell,
+        );
+
+        assert!(matches!(&*ability.effect, Effect::Token { .. }));
+        let choice = ability
+            .sub_ability
+            .as_ref()
+            .expect("expected Davros villainous choice as sub-ability");
+        match &*choice.effect {
+            Effect::ChooseOneOf { chooser, branches } => {
+                assert_life_lost_villainous_chooser(chooser, PlayerRelation::Opponent);
+                assert_eq!(branches.len(), 2);
+            }
+            other => panic!("expected ChooseOneOf sub-ability, got {other:?}"),
+        }
+    }
+
     #[test]
     fn villainous_choice_supports_defending_player_chooser() {
         let ability = parse_effect_chain(
@@ -38963,6 +39227,56 @@ mod tests {
             .any(|prop| matches!(prop, FilterProp::InZone { zone: Zone::Hand })));
     }
 
+    /// CR 400.1 + CR 108.3 — Aether Vial class: "put a creature card ... from
+    /// your hand onto the battlefield" must scope the candidate set to the
+    /// controller's hand (`controller == Some(ControllerRef::You)`), not to
+    /// every player's hand. Without the controller scope the resolver collects
+    /// hand cards from both players, letting you put an opponent's creatures
+    /// onto the battlefield and revealing their hand (issue #1980).
+    ///
+    /// This is a building-block assertion on the produced `ChangeZone` target
+    /// filter, not a single-card check: every "<filter> from your hand onto the
+    /// battlefield" effect shares this code path. The dynamic interior clause
+    /// ("with mana value equal to the number of charge counters on this
+    /// artifact") is what previously displaced the "from your hand" zone suffix
+    /// past the contiguous type-phrase parse, dropping the controller scope.
+    #[test]
+    fn put_zone_change_from_your_hand_scopes_to_controller() {
+        // Self-references ("this artifact") are normalized to `~` before the
+        // effect parser runs, so the dynamic mana-value clause reaches this
+        // path as "the number of charge counters on ~ from your hand".
+        let text = "put a creature card with mana value equal to the number of charge counters on ~ from your hand onto the battlefield";
+        let lower = text.to_lowercase();
+        let effect = try_parse_put_zone_change(&lower, text)
+            .expect("expected ChangeZone for Aether Vial put-from-hand");
+        let Effect::ChangeZone {
+            destination,
+            target,
+            ..
+        } = effect
+        else {
+            panic!("expected ChangeZone, got {effect:?}");
+        };
+        assert_eq!(destination, Zone::Battlefield);
+        let TargetFilter::Typed(typed) = target else {
+            panic!("expected typed hand filter, got {target:?}");
+        };
+        assert!(
+            typed
+                .properties
+                .iter()
+                .any(|prop| matches!(prop, FilterProp::InZone { zone: Zone::Hand })),
+            "filter must restrict to the hand zone, got {:?}",
+            typed.properties
+        );
+        assert_eq!(
+            typed.controller,
+            Some(ControllerRef::You),
+            "\"from your hand\" must scope candidates to the controller's hand, got {:?}",
+            typed.controller
+        );
+    }
+
     /// CR 508.4 + CR 614.1 — Kaalia of the Vast: "put X from your hand onto
     /// the battlefield tapped and attacking that opponent." The inline-tail
     /// patcher in `try_parse_put_zone_change` must set both `enter_tapped`
@@ -40647,6 +40961,7 @@ mod snapshot_tests {
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         };
         // Non-delayed top-level ParentTarget return.
         stamp_delayed_returns(&mut prev, Zone::Exile);
@@ -40699,6 +41014,7 @@ mod snapshot_tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             },
         );
         let mut delayed = Effect::CreateDelayedTrigger {
@@ -40801,6 +41117,7 @@ mod snapshot_tests {
             target,
             enters_under,
             enter_tapped,
+            face_down_profile: None,
         } = &*same_name.effect
         else {
             panic!("expected ChangeZoneAll tail, got {:?}", same_name.effect);

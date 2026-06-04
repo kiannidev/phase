@@ -1812,7 +1812,11 @@ fn parse_investigated_arm(input: &str) -> nom::IResult<&str, PlayerActionKind, O
 
 /// Parse the clause after "for each" into a QuantityRef.
 pub(crate) fn parse_for_each_clause(clause: &str) -> Option<QuantityRef> {
-    parse_for_each_clause_with_they_controller(clause, ControllerRef::ScopedPlayer)
+    parse_for_each_clause_with_they_controller(
+        clause,
+        ControllerRef::ScopedPlayer,
+        &ParseContext::default(),
+    )
 }
 
 pub(crate) fn parse_for_each_clause_with_context(
@@ -1822,12 +1826,13 @@ pub(crate) fn parse_for_each_clause_with_context(
     let they_controller = ctx
         .third_person_player_controller_ref()
         .unwrap_or(ControllerRef::ScopedPlayer);
-    parse_for_each_clause_with_they_controller(clause, they_controller)
+    parse_for_each_clause_with_they_controller(clause, they_controller, ctx)
 }
 
 fn parse_for_each_clause_with_they_controller(
     clause: &str,
     they_controller: ControllerRef,
+    ctx: &ParseContext,
 ) -> Option<QuantityRef> {
     let clause = clause.trim().trim_end_matches('.');
 
@@ -1839,6 +1844,10 @@ fn parse_for_each_clause_with_they_controller(
         clause,
         &ParseContext {
             relative_player_scope: Some(they_controller.clone()),
+            subject: ctx.subject.clone(),
+            card_name: ctx.card_name.clone(),
+            host_self_reference: ctx.host_self_reference.clone(),
+            current_trigger_index: ctx.current_trigger_index,
             ..Default::default()
         },
     ) {
@@ -2126,6 +2135,10 @@ fn parse_for_each_clause_with_they_controller(
     // iterating player.
     let mut tp_ctx = ParseContext {
         relative_player_scope: Some(they_controller.clone()),
+        subject: ctx.subject.clone(),
+        card_name: ctx.card_name.clone(),
+        host_self_reference: ctx.host_self_reference.clone(),
+        current_trigger_index: ctx.current_trigger_index,
         ..Default::default()
     };
     let (filter, remainder) = parse_type_phrase_with_ctx(clause, &mut tp_ctx);

@@ -6203,7 +6203,7 @@ fn try_parse_for_each_effect(text: &str, ctx: &mut ParseContext) -> Option<Parse
     // thread subject through for effects that carry a target.
     if let Some(ast) = imperative::parse_numeric_imperative_ast(numeric_base, &numeric_base_lower) {
         let effect = imperative::lower_numeric_imperative_ast(ast.with_for_each_quantity(quantity));
-        let effect = thread_for_each_subject(effect, base_no_duration);
+        let effect = thread_for_each_subject(effect, base_no_duration, ctx);
         return Some(parsed_for_each_quantity_effect(
             effect,
             duration,
@@ -6225,7 +6225,7 @@ fn try_parse_for_each_effect(text: &str, ctx: &mut ParseContext) -> Option<Parse
         ) {
             let effect =
                 imperative::lower_targeted_action_ast(ast.with_for_each_quantity(quantity.clone()));
-            let effect = thread_for_each_subject(effect, base_no_duration);
+            let effect = thread_for_each_subject(effect, base_no_duration, ctx);
             return Some(ParsedEffectClause {
                 effect,
                 duration,
@@ -6627,7 +6627,10 @@ fn parse_energy_gain_continuation(rest: &str) -> Option<&str> {
 /// Thread subject through for-each effects that carry a `target` field.
 /// Locates the predicate verb, extracts subject text before it, and replaces
 /// default targets (Any/Controller) with the parsed subject filter.
-fn for_each_subject_application(original: &str) -> Option<SubjectApplication> {
+fn for_each_subject_application(
+    original: &str,
+    ctx: &mut ParseContext,
+) -> Option<SubjectApplication> {
     let lower = original.to_lowercase();
     // Predicate verbs that the for-each base parsers recognize — find the earliest one.
     // Note: uses str::find (not nom) because this is positional splitting on already-dispatched
@@ -6666,13 +6669,14 @@ fn for_each_subject_application(original: &str) -> Option<SubjectApplication> {
         return None;
     }
 
-    parse_subject_application(subject_text, &mut ParseContext::default())
+    parse_subject_application(subject_text, ctx)
 }
 
 fn for_each_quantity_context(original: &str, ctx: &ParseContext) -> ParseContext {
     let mut quantity_ctx = ctx.clone();
+    let mut subject_ctx = ctx.clone();
     if quantity_ctx.third_person_player_controller_ref().is_none()
-        && for_each_subject_application(original)
+        && for_each_subject_application(original, &mut subject_ctx)
             .is_some_and(|app| app.target.is_some() && is_player_filter(&app.affected))
     {
         quantity_ctx.relative_player_scope = Some(ControllerRef::TargetPlayer);
@@ -6692,8 +6696,12 @@ fn is_player_filter(filter: &TargetFilter) -> bool {
         )
 }
 
-fn thread_for_each_subject(effect: Effect, original: &str) -> Effect {
-    let application = match for_each_subject_application(original) {
+fn thread_for_each_subject(
+    effect: Effect,
+    original: &str,
+    ctx: &mut ParseContext,
+) -> Effect {
+    let application = match for_each_subject_application(original, ctx) {
         Some(application) => application,
         None => return effect,
     };

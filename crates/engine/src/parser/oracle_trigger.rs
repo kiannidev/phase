@@ -10851,7 +10851,8 @@ mod tests {
         CastingPermission, Comparator, ContinuousModification, ControllerRef, CountScope,
         DamageModification, DamageSource, DelayedTriggerCondition, Duration, Effect, FilterProp,
         ManaSpendPermission, ObjectScope, PlayerFilter, PlayerScope, PtStat, PtValue, PtValueScope,
-        QuantityExpr, QuantityRef, SharedQuality, TargetFilter, TypeFilter, TypedFilter,
+        QuantityExpr, QuantityRef, SharedQuality, TargetFilter,
+        TypeFilter, TypedFilter,
     };
     use crate::types::counter::{CounterMatch, CounterType};
     use crate::types::replacements::ReplacementEvent;
@@ -14035,6 +14036,69 @@ mod tests {
             def.condition
         );
         assert!(def.execute.is_some());
+    }
+
+    #[test]
+    fn shared_animosity_attack_pump_for_each_other_attacker_sharing_type() {
+        let def = parse_trigger_line(
+            "Whenever a creature you control attacks, it gets +1/+0 until end of turn for each other attacking creature that shares a creature type with it.",
+            "Shared Animosity",
+        );
+        assert_eq!(def.mode, TriggerMode::Attacks);
+        assert_eq!(
+            def.valid_card,
+            Some(TargetFilter::Typed(
+                TypedFilter::creature().controller(ControllerRef::You)
+            ))
+        );
+        let exec = def.execute.as_ref().expect("execute");
+        match &*exec.effect {
+            Effect::Pump {
+                power,
+                toughness,
+                target,
+                ..
+            } => {
+                assert_eq!(
+                    *target,
+                    TargetFilter::TriggeringSource,
+                    "attacker anaphor should be TriggeringSource"
+                );
+                assert_eq!(*toughness, PtValue::Fixed(0));
+                let PtValue::Quantity(QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount { filter },
+                }) = power
+                else {
+                    panic!("power should be for-each count, got {power:?}");
+                };
+                let TargetFilter::Typed(tf) = filter else {
+                    panic!("filter should be typed, got {filter:?}");
+                };
+                assert!(tf.properties.contains(&FilterProp::Another));
+                assert!(tf.properties.contains(&FilterProp::Attacking));
+                let shares = tf.properties.iter().find(|p| {
+                    matches!(
+                        p,
+                        FilterProp::SharesQuality {
+                            quality: SharedQuality::CreatureType,
+                            ..
+                        }
+                    )
+                });
+                let Some(FilterProp::SharesQuality { reference, .. }) = shares else {
+                    panic!(
+                        "for-each filter must include SharesQuality, properties: {:?}",
+                        tf.properties
+                    );
+                };
+                assert_eq!(
+                    reference.as_deref(),
+                    Some(&TargetFilter::TriggeringSource),
+                    "shares-type reference should bind to the attacking creature"
+                );
+            }
+            other => panic!("expected Pump, got {other:?}"),
+        }
     }
 
     #[test]

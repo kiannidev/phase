@@ -2614,8 +2614,9 @@ pub fn synthesize_afterlife(face: &mut CardFace) {
     KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Afterlife(_)));
 }
 
-/// CR 702.46a: Soulshift N — when this creature dies, you may return target
-/// Spirit card with mana value N or less from your graveyard to your hand.
+/// CR 702.46a: Soulshift N — when this permanent is put into a graveyard from
+/// the battlefield, you may return target Spirit card with mana value N or less
+/// from your graveyard to your hand.
 /// CR 702.46b: each instance triggers separately.
 pub fn synthesize_soulshift(face: &mut CardFace) {
     KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Soulshift(_)));
@@ -2637,6 +2638,7 @@ fn build_soulshift_trigger(n: u32) -> TriggerDefinition {
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         },
     )
     .description(format!(
@@ -2651,7 +2653,7 @@ fn build_soulshift_trigger(n: u32) -> TriggerDefinition {
         .valid_card(TargetFilter::SelfRef)
         .execute(execute)
         .description(format!(
-            "CR 702.46a: Soulshift {n} — when this creature dies, you may return target Spirit card with mana value {n} or less from your graveyard to your hand."
+            "CR 702.46a: Soulshift {n} — when this permanent is put into a graveyard from the battlefield, you may return target Spirit card with mana value {n} or less from your graveyard to your hand."
         ))
 }
 
@@ -8122,6 +8124,8 @@ mod undying_persist_runtime_tests {
     use crate::game::printed_cards::apply_card_face_to_object;
     use crate::game::triggers::process_triggers;
     use crate::game::zones::{create_object, move_to_zone};
+    use crate::types::ability::TargetRef;
+    use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
     use crate::types::counter::CounterType;
     use crate::types::events::GameEvent;
@@ -8142,6 +8146,43 @@ mod undying_persist_runtime_tests {
         face.card_type.core_types.push(CoreType::Creature);
         synthesize_all(&mut face);
         face
+    }
+
+    fn spirit_card_face(name: &str, mana_value: u32) -> CardFace {
+        let mut face = CardFace {
+            name: name.to_string(),
+            mana_cost: ManaCost::generic(mana_value),
+            power: Some(PtValue::Fixed(1)),
+            toughness: Some(PtValue::Fixed(1)),
+            ..CardFace::default()
+        };
+        face.card_type.core_types.push(CoreType::Creature);
+        face.card_type.subtypes.push("Spirit".to_string());
+        face
+    }
+
+    fn creature_card_face(name: &str, mana_value: u32) -> CardFace {
+        let mut face = CardFace {
+            name: name.to_string(),
+            mana_cost: ManaCost::generic(mana_value),
+            power: Some(PtValue::Fixed(1)),
+            toughness: Some(PtValue::Fixed(1)),
+            ..CardFace::default()
+        };
+        face.card_type.core_types.push(CoreType::Creature);
+        face
+    }
+
+    fn create_face_object(
+        state: &mut GameState,
+        face: &CardFace,
+        owner: PlayerId,
+        zone: Zone,
+    ) -> ObjectId {
+        let card_id = CardId(state.next_object_id);
+        let id = create_object(state, card_id, owner, face.name.clone(), zone);
+        apply_card_face_to_object(state.objects.get_mut(&id).unwrap(), face);
+        id
     }
 
     /// Stand up a two-player state with `face` on the battlefield under
@@ -8339,6 +8380,82 @@ mod undying_persist_runtime_tests {
                 "Spirit token must have flying"
             );
         }
+    }
+
+    /// CR 702.46a runtime path: accepting Soulshift N returns target Spirit card
+    /// with mana value N or less from the controller's graveyard to their hand.
+    #[test]
+    fn soulshift_returns_eligible_spirit_card_from_graveyard() {
+        let face = creature_face_with_keyword("Kami of the Honored Dead", Keyword::Soulshift(4));
+        let (mut state, obj_id) = setup_with_creature(&face, PlayerId(0));
+        let legal_spirit = create_face_object(
+            &mut state,
+            &spirit_card_face("Petalmane Baku", 3),
+            PlayerId(0),
+            Zone::Graveyard,
+        );
+        let too_expensive_spirit = create_face_object(
+            &mut state,
+            &spirit_card_face("High-Cost Spirit", 5),
+            PlayerId(0),
+            Zone::Graveyard,
+        );
+        let non_spirit = create_face_object(
+            &mut state,
+            &creature_card_face("Ordinary Bear", 2),
+            PlayerId(0),
+            Zone::Graveyard,
+        );
+
+        let mut events = Vec::new();
+        move_to_zone(&mut state, obj_id, Zone::Graveyard, &mut events);
+        process_triggers(&mut state, &events);
+        if matches!(state.waiting_for, WaitingFor::TriggerTargetSelection { .. }) {
+            crate::game::engine::apply_as_current(
+                &mut state,
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(legal_spirit)),
+                },
+            )
+            .expect("choose the only legal Soulshift target");
+        }
+
+        let mut resolve_events = Vec::new();
+        crate::game::stack::resolve_top(&mut state, &mut resolve_events);
+        assert!(
+            matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }),
+            "Soulshift is optional and must ask before returning the Spirit"
+        );
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::DecideOptionalEffect { accept: true },
+        )
+        .expect("accept Soulshift");
+        if matches!(state.waiting_for, WaitingFor::TriggerTargetSelection { .. }) {
+            crate::game::engine::apply_as_current(
+                &mut state,
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(legal_spirit)),
+                },
+            )
+            .expect("choose the legal Soulshift target after accepting");
+        }
+
+        assert_eq!(
+            state.objects[&legal_spirit].zone,
+            Zone::Hand,
+            "Soulshift must return the eligible Spirit card to hand"
+        );
+        assert_eq!(
+            state.objects[&too_expensive_spirit].zone,
+            Zone::Graveyard,
+            "Soulshift 4 must not return a Spirit card with mana value 5"
+        );
+        assert_eq!(
+            state.objects[&non_spirit].zone,
+            Zone::Graveyard,
+            "Soulshift must not return a non-Spirit card"
+        );
     }
 
     /// CR 603 multi-trigger semantics: a permanent that carries BOTH Undying

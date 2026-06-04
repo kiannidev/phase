@@ -606,6 +606,21 @@ pub(crate) fn parse_static_line_multi_inner(text: &str) -> Vec<StaticDefinition>
         return defs;
     }
 
+    // CR 509.1b: "<predicate> and can't be blocked[ by/except by … | by more
+    // than N creatures]" pairs a keyword/continuous grant with an evasion grant
+    // under one subject (Madcap Skills). Split so the evasion clause is not
+    // dropped.
+    if let Some(defs) = try_split_and_cant_be_blocked(&stripped) {
+        return defs;
+    }
+
+    // CR 509.1b: "<grant> and can't block" pairs a P/T (or keyword) grant with a
+    // blocking restriction under one subject (Copper Carapace, Maniacal Rage,
+    // Threshold downside creatures). Split so the CantBlock clause is not dropped.
+    if let Some(defs) = try_split_and_cant_block(&stripped) {
+        return defs;
+    }
+
     // CR 509.1b + CR 604.1 + CR 611.3a + CR 613.1f: Attached-subject grant lines
     // ("enchanted creature ...", "equipped creature ...") may decompose into more
     // than one StaticDefinition (e.g. CantBeBlocked + Continuous{AddKeyword}).
@@ -629,7 +644,63 @@ pub(crate) fn parse_static_line_multi_inner(text: &str) -> Vec<StaticDefinition>
     }
 
     // Fall back to the single-return parser.
-    parse_static_line(text).into_iter().collect()
+    let mut defs: Vec<StaticDefinition> = parse_static_line(text).into_iter().collect();
+    append_cant_have_keyword_denials(text, &mut defs);
+    defs
+}
+
+/// CR 613.1f / CR 702: "... can't have or gain [keyword]" (Theros Archetype cycle,
+/// Arcane Lighthouse) both strips the keyword now — a `RemoveKeyword` continuous
+/// modification on the base `Continuous` static — AND denies it going forward, so a
+/// concurrent anthem can't grant it back. The forward denial is a Layer 6
+/// `StaticMode::CantHaveKeyword` static (enforced by `apply_cant_have_keyword_denials`
+/// in `layers.rs`). Emit it as a sibling of the continuous static, reusing that
+/// static's `affected`/`condition` so it covers exactly the same objects.
+fn append_cant_have_keyword_denials(text: &str, defs: &mut Vec<StaticDefinition>) {
+    // Identify the SPECIFIC keyword the line denies, parsed from the clause
+    // "... can't have or gain [keyword]" / "... can't have [keyword]". Keying the
+    // emission off any `RemoveKeyword` alone would mis-target a line that removes
+    // one keyword but denies a different one ("lose flying ... can't have or gain
+    // trample"); the denied keyword must come from the can't-have clause itself.
+    let Some(denied) = parse_cant_have_or_gain_keyword(&text.to_lowercase()) else {
+        return;
+    };
+    let mut siblings: Vec<StaticDefinition> = Vec::new();
+    for def in defs.iter() {
+        if !matches!(def.mode, StaticMode::Continuous) {
+            continue;
+        }
+        // Reuse the affected/condition scope of the continuous static that strips
+        // the denied keyword now, so the forward denial covers identical objects.
+        let strips_denied = def.modifications.iter().any(|m| {
+            matches!(m, ContinuousModification::RemoveKeyword { keyword } if *keyword == denied)
+        });
+        if strips_denied {
+            siblings.push(StaticDefinition {
+                mode: StaticMode::CantHaveKeyword {
+                    keyword: denied.clone(),
+                },
+                modifications: Vec::new(),
+                ..def.clone()
+            });
+        }
+    }
+    defs.extend(siblings);
+}
+
+/// Extract the keyword denied by a "... can't have or gain [keyword]" /
+/// "... can't have [keyword]" clause from the already-lowercased line, using the
+/// canonical keyword combinator rather than coincidentally matching a removal.
+fn parse_cant_have_or_gain_keyword(lower: &str) -> Option<Keyword> {
+    let tail =
+        if let Ok((_, (_, after))) = nom_primitives::split_once_on(lower, "can't have or gain ") {
+            after
+        } else if let Ok((_, (_, after))) = nom_primitives::split_once_on(lower, "can't have ") {
+            after
+        } else {
+            return None;
+        };
+    crate::parser::oracle_keyword::parse_keyword_from_oracle(tail.trim().trim_end_matches('.'))
 }
 
 pub(crate) fn push_or_filter_branch(filters: &mut Vec<TargetFilter>, filter: TargetFilter) {
@@ -2130,7 +2201,10 @@ pub(crate) fn parse_rule_static_predicate_nom(
     input: &str,
 ) -> OracleResult<'_, RuleStaticPredicate> {
     let (rest, predicate) = alt((
-        parse_combat_rule_static_predicate_nom,
+        map(
+            parse_combat_rule_static_predicate_with_defended_nom,
+            |(predicate, _)| predicate,
+        ),
         value(
             RuleStaticPredicate::CantBeSacrificed,
             tag("can't be sacrificed"),
@@ -2145,22 +2219,35 @@ pub(crate) fn parse_rule_static_predicate_nom(
     Ok((rest, predicate))
 }
 
-pub(crate) fn parse_combat_rule_static_predicate_nom(
+/// Combat-rule predicate plus optional CR 508.1d defended scope (`CantAttack` only).
+pub(crate) fn parse_combat_rule_static_predicate_with_defended_nom(
     input: &str,
-) -> OracleResult<'_, RuleStaticPredicate> {
+) -> OracleResult<
+    '_,
+    (
+        RuleStaticPredicate,
+        Option<crate::types::triggers::AttackTargetFilter>,
+    ),
+> {
     alt((
         value(
-            RuleStaticPredicate::CantAttackOrBlock,
+            (RuleStaticPredicate::CantAttackOrBlock, None),
             tag("can't attack or block"),
         ),
-        parse_cant_attack_combat_predicate_nom,
-        value(RuleStaticPredicate::CantBlock, tag("can't block")),
+        map(
+            parse_cant_attack_rule_static_predicate_nom,
+            |defended| (RuleStaticPredicate::CantAttack, defended),
+        ),
         value(
-            RuleStaticPredicate::CantCrew,
+            (RuleStaticPredicate::CantBlock, None),
+            tag("can't block"),
+        ),
+        value(
+            (RuleStaticPredicate::CantCrew, None),
             (tag("can't crew"), opt(preceded(space1, tag("vehicles")))),
         ),
         value(
-            RuleStaticPredicate::MustAttack,
+            (RuleStaticPredicate::MustAttack, None),
             alt((
                 tag("attacks each combat if able"),
                 tag("attack each combat if able"),
@@ -2171,7 +2258,7 @@ pub(crate) fn parse_combat_rule_static_predicate_nom(
             )),
         ),
         value(
-            RuleStaticPredicate::MustBlock,
+            (RuleStaticPredicate::MustBlock, None),
             alt((
                 tag("blocks each combat if able"),
                 tag("block each combat if able"),
@@ -2182,14 +2269,14 @@ pub(crate) fn parse_combat_rule_static_predicate_nom(
             )),
         ),
         value(
-            RuleStaticPredicate::MustBeBlocked,
+            (RuleStaticPredicate::MustBeBlocked, None),
             alt((
                 tag("must be blocked each combat if able"),
                 tag("must be blocked if able"),
             )),
         ),
         value(
-            RuleStaticPredicate::Goaded,
+            (RuleStaticPredicate::Goaded, None),
             alt((tag("is goaded"), tag("are goaded"))),
         ),
     ))
@@ -2258,7 +2345,3 @@ pub(crate) fn parse_cant_attack_rule_static_predicate_nom(
     Ok((rest, defended))
 }
 
-fn parse_cant_attack_combat_predicate_nom(input: &str) -> OracleResult<'_, RuleStaticPredicate> {
-    let (rest, _) = parse_cant_attack_rule_static_predicate_nom(input)?;
-    Ok((rest, RuleStaticPredicate::CantAttack))
-}

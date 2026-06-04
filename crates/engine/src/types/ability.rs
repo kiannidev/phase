@@ -3264,6 +3264,12 @@ pub enum QuantityRef {
         aggregate: AggregateFunction,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group_by: Option<DamageGroupKey>,
+        /// CR 120.2a/120.2b: Restrict to combat or noncombat damage records.
+        #[serde(
+            default = "default_damage_kind",
+            skip_serializing_if = "is_default_damage_kind"
+        )]
+        damage_kind: DamageKindFilter,
     },
     /// A number chosen as the source entered the battlefield (e.g., Talion, the Kindly Lord).
     /// Resolved from the source object's `ChosenAttribute::Number`.
@@ -7468,6 +7474,14 @@ fn default_most_prevalent_scope() -> ControllerRef {
 
 fn is_default_damage_aggregate(a: &AggregateFunction) -> bool {
     matches!(a, AggregateFunction::Sum)
+}
+
+fn default_damage_kind() -> DamageKindFilter {
+    DamageKindFilter::Any
+}
+
+fn is_default_damage_kind(k: &DamageKindFilter) -> bool {
+    matches!(k, DamageKindFilter::Any)
 }
 
 fn is_default_search_selection_constraint(c: &SearchSelectionConstraint) -> bool {

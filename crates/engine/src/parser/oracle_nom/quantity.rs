@@ -21,8 +21,9 @@ use crate::parser::oracle_target::{
 use crate::parser::oracle_util::parse_subtype;
 use crate::types::ability::{
     AggregateFunction, CardTypeSetSource, CastManaObjectScope, CastManaSpentMetric, ControllerRef,
-    CountScope, DevotionColors, FilterProp, ObjectProperty, ObjectScope, PlayerScope, QuantityExpr,
-    QuantityRef, RoundingMode, SharedQuality, TargetFilter, TypeFilter, TypedFilter, ZoneRef,
+    CountScope, DamageKindFilter, DevotionColors, FilterProp, ObjectProperty, ObjectScope,
+    PlayerScope, QuantityExpr, QuantityRef, RoundingMode, SharedQuality, TargetFilter, TypeFilter,
+    TypedFilter, ZoneRef,
 };
 use crate::types::counter::CounterMatch;
 use crate::types::player::PlayerCounterKind;
@@ -1287,6 +1288,40 @@ fn parse_life_lost_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     let (input, _) =
         nom::combinator::opt(alt((tag("the amount of "), tag("amount of ")))).parse(input)?;
     alt((
+        value(
+            QuantityRef::DamageDealtThisTurn {
+                source: Box::new(TargetFilter::Any),
+                target: Box::new(TargetFilter::And {
+                    filters: vec![
+                        TargetFilter::Player,
+                        TargetFilter::Typed(
+                            TypedFilter::default().controller(ControllerRef::Opponent),
+                        ),
+                    ],
+                }),
+                aggregate: AggregateFunction::Sum,
+                group_by: None,
+                damage_kind: DamageKindFilter::NoncombatOnly,
+            },
+            tag("the total amount of noncombat damage dealt to your opponents this turn"),
+        ),
+        value(
+            QuantityRef::DamageDealtThisTurn {
+                source: Box::new(TargetFilter::Any),
+                target: Box::new(TargetFilter::And {
+                    filters: vec![
+                        TargetFilter::Player,
+                        TargetFilter::Typed(
+                            TypedFilter::default().controller(ControllerRef::Opponent),
+                        ),
+                    ],
+                }),
+                aggregate: AggregateFunction::Sum,
+                group_by: None,
+                damage_kind: DamageKindFilter::NoncombatOnly,
+            },
+            tag("total amount of noncombat damage dealt to your opponents this turn"),
+        ),
         value(
             QuantityRef::LifeLostThisTurn {
                 player: PlayerScope::Opponent {

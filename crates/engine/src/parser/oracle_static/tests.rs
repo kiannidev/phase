@@ -5,9 +5,9 @@ use super::restriction::*;
 use super::support::*;
 use super::*;
 use crate::types::ability::{
-    ActivationRestriction, AggregateFunction, CardTypeSetSource, CountScope, Duration, Effect,
-    ObjectProperty, PlayerScope, PtStat, PtValueScope, SharedQuality, SharedQualityRelation,
-    TypeFilter, ZoneRef,
+    ActivationRestriction, AggregateFunction, CardTypeSetSource, CountScope, DamageKindFilter,
+    Duration, Effect, ObjectProperty, PlayerScope, PtStat, PtValueScope, SharedQuality,
+    SharedQualityRelation, TypeFilter, ZoneRef,
 };
 use crate::types::counter::CounterType;
 use crate::types::keywords::Keyword;
@@ -1192,6 +1192,39 @@ fn static_this_spell_cost_less_self_scoped_in_castable_zones() {
             ..
         }
     ));
+    assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
+    assert_eq!(
+        def.active_zones,
+        vec![Zone::Hand, Zone::Stack, Zone::Command]
+    );
+}
+
+#[test]
+fn chandras_incinerator_self_cost_reduction_uses_noncombat_damage_to_opponents() {
+    let def = parse_static_line(
+        "This spell costs {X} less to cast, where X is the total amount of noncombat damage dealt to your opponents this turn.",
+    )
+    .unwrap();
+
+    let StaticMode::ModifyCost {
+        mode: CostModifyMode::Reduce,
+        dynamic_count:
+            Some(QuantityRef::DamageDealtThisTurn {
+                damage_kind: DamageKindFilter::NoncombatOnly,
+                target,
+                ..
+            }),
+        ..
+    } = def.mode
+    else {
+        panic!("expected dynamic self-spell ReduceCost, got {:?}", def.mode);
+    };
+    let TargetFilter::And { filters } = target.as_ref() else {
+        panic!("expected opponent player target filter, got {target:?}");
+    };
+    assert_eq!(filters.len(), 2);
+    assert!(matches!(filters[0], TargetFilter::Player));
+    assert!(matches!(filters[1], TargetFilter::Typed(_)));
     assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
     assert_eq!(
         def.active_zones,

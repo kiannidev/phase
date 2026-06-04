@@ -1121,14 +1121,21 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             target,
             aggregate,
             group_by,
+            damage_kind,
         } => {
             let group = match group_by {
                 None => "ungrouped".to_string(),
                 Some(crate::types::ability::DamageGroupKey::SourceId) => "by-source".to_string(),
             };
+            let kind = match damage_kind {
+                crate::types::ability::DamageKindFilter::Any => "",
+                crate::types::ability::DamageKindFilter::CombatOnly => " combat",
+                crate::types::ability::DamageKindFilter::NoncombatOnly => " noncombat",
+            };
             format!(
-                "{} damage dealt this turn ({} -> {}) [{group}]",
+                "{}{} damage dealt this turn ({} -> {}) [{group}]",
                 fmt_aggregate_function(*aggregate),
+                kind,
                 fmt_target(source),
                 fmt_target(target)
             )

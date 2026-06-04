@@ -5269,6 +5269,7 @@ fn bloodthirst_counter_quantity(value: &BloodthirstValue) -> QuantityExpr {
                 target: Box::new(bloodthirst_opponent_player_filter()),
                 aggregate: AggregateFunction::Sum,
                 group_by: None,
+                damage_kind: DamageKindFilter::Any,
             },
         },
     }

@@ -1951,59 +1951,41 @@ pub(crate) fn strip_rule_static_subject<'a>(
     None
 }
 
-/// CR 303.4 + CR 301.5: Strip "that is/are enchanted/equipped by a/an <kind> you control"
+/// CR 303.4 + CR 301.5: Strip "that is/are/'s enchanted/equipped by <kind> you control"
 /// from a subject phrase and return the corresponding `FilterProp`.
+fn parse_attachment_relative_clause_nom(input: &str) -> OracleResult<'_, (&str, AttachmentKind)> {
+    let (input, before) = take_until(" that").parse(input)?;
+    let (input, _) = tag(" that").parse(input)?;
+    let (input, _) = opt(alt((tag("'s"), tag(" is"), tag(" are")))).parse(input)?;
+    let (input, kind) = alt((
+        value(AttachmentKind::Aura, tag(" enchanted by an aura")),
+        value(AttachmentKind::Equipment, tag(" equipped by an equipment")),
+    ))
+    .parse(input)?;
+    let (input, _) = tag(" you control").parse(input)?;
+    if !input.is_empty() {
+        return Err(nom::Err::Error(OracleError::new(
+            input,
+            nom::error::ErrorKind::Verify,
+        )));
+    }
+    Ok((input, (before.trim_end(), kind)))
+}
+
 pub(crate) fn strip_attachment_relative_clause(subject: &str) -> (&str, Option<FilterProp>) {
     let lower = subject.to_lowercase();
-    let alts: &[(&str, FilterProp)] = &[
-        (
-            " that are enchanted by an aura you control",
-            FilterProp::HasAttachment {
-                kind: AttachmentKind::Aura,
-                controller: Some(ControllerRef::You),
-                exclude_source: false,
-            },
-        ),
-        (
-            " that's enchanted by an aura you control",
-            FilterProp::HasAttachment {
-                kind: AttachmentKind::Aura,
-                controller: Some(ControllerRef::You),
-                exclude_source: false,
-            },
-        ),
-        (
-            " that is enchanted by an aura you control",
-            FilterProp::HasAttachment {
-                kind: AttachmentKind::Aura,
-                controller: Some(ControllerRef::You),
-                exclude_source: false,
-            },
-        ),
-        (
-            " that are equipped by an equipment you control",
-            FilterProp::HasAttachment {
-                kind: AttachmentKind::Equipment,
-                controller: Some(ControllerRef::You),
-                exclude_source: false,
-            },
-        ),
-        (
-            " that is equipped by an equipment you control",
-            FilterProp::HasAttachment {
-                kind: AttachmentKind::Equipment,
-                controller: Some(ControllerRef::You),
-                exclude_source: false,
-            },
-        ),
-    ];
-    for (suffix, prop) in alts {
-        if lower.strip_suffix(suffix).is_some() {
-            let byte_len = subject.len() - suffix.len();
-            return (&subject[..byte_len], Some(prop.clone()));
-        }
+    let Ok((rest, (before, kind))) = parse_attachment_relative_clause_nom(&lower) else {
+        return (subject, None);
+    };
+    if !rest.is_empty() {
+        return (subject, None);
     }
-    (subject, None)
+    let prop = FilterProp::HasAttachment {
+        kind,
+        controller: Some(ControllerRef::You),
+        exclude_source: false,
+    };
+    (&subject[..before.len()], Some(prop))
 }
 
 fn merge_filter_prop(filter: TargetFilter, prop: FilterProp) -> TargetFilter {

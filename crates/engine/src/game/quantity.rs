@@ -7344,6 +7344,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn resolve_object_color_count_source_target_and_recipient() {
         let mut state = GameState::new_two_player(42);
         let source = create_object(

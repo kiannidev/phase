@@ -1,7 +1,7 @@
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till1, take_until};
 use nom::character::complete::{multispace0, multispace1};
-use nom::combinator::{eof, opt, rest, value};
+use nom::combinator::{all_consuming, eof, map, not, opt, rest, value, verify};
 use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
@@ -4168,18 +4168,20 @@ pub(super) fn compute_sentence_where_x(chunks: &[ClauseChunk]) -> Vec<Option<Str
 pub(crate) fn strip_trailing_where_x<'a>(tp: TextPair<'a>) -> (TextPair<'a>, Option<String>) {
     for needle in [", where x is ", " where x is "] {
         if let Some((before, after)) = tp.split_around(needle) {
-            let mut expression = after
+            // CR 608.2c: A where-X binding can precede further instructions in the
+            // same sentence ("..., where X is N. Put that card ..."). Truncate on
+            // the TextPair before materializing a String (Halana and Alena, Partners:
+            // "... where X is ~'s power. That creature gains haste ...").
+            let mut after_clause = after;
+            if let Some((clause, _)) = after.split_around(". ") {
+                after_clause = clause;
+            }
+            let expression = after_clause
                 .original
                 .trim()
                 .trim_end_matches('.')
                 .trim()
                 .to_string();
-            // CR 107.3i: Stop at the next sentence when the where-X clause is not
-            // the final sentence (Halana and Alena, Partners: "... where X is
-            // ~'s power. That creature gains haste ...").
-            if let Some((clause, _)) = expression.split_once(". ") {
-                expression = clause.trim().to_string();
-            }
             if expression.is_empty() {
                 return (tp, None);
             }
@@ -4325,9 +4327,10 @@ pub(crate) fn parse_where_x_quantity_expression(where_x_expression: &str) -> Opt
     if let Some(expr) = parse_where_x_number_of_for_each_clause(expression_lower.as_str()) {
         return Some(expr);
     }
-    // CR 107.3i: "where X is [printed card name]'s power" refers to the ability
-    // source (Halana and Alena, Partners). Must precede `parse_event_context_quantity`,
-    // which only recognizes anaphoric/participle possessives.
+    // CR 107.3f + CR 113.7: "where X is [printed card name]'s power" refers to the
+    // ability source (Halana and Alena, Partners). Must precede
+    // `parse_event_context_quantity`, which only recognizes anaphoric/participle
+    // possessives.
     if let Some(expr) = parse_where_x_printed_name_possessive_stat(expression_lower.as_str()) {
         return Some(expr);
     }
@@ -4342,50 +4345,57 @@ pub(crate) fn parse_where_x_quantity_expression(where_x_expression: &str) -> Opt
     crate::parser::oracle_quantity::parse_event_context_quantity(where_x_expression)
 }
 
-/// CR 107.3i: Printed-name possessive in a where-X binding ("Halana and Alena's power").
+/// CR 107.3f + CR 113.7: Printed-name possessive in a where-X binding
+/// ("Halana and Alena's power" → `Power { scope: Source }`). Determiner-led
+/// forms ("the sacrificed creature's power", "~'s power") are rejected here and
+/// handled by `parse_cda_quantity` / `parse_event_context_quantity` upstream.
 fn parse_where_x_printed_name_possessive_stat(expression_lower: &str) -> Option<QuantityExpr> {
-    const BLOCKED_PREFIXES: &[&str] = &[
-        "that ",
-        "the ",
-        "target ",
-        "its ",
-        "this ",
-        "sacrificed ",
-        "discarded ",
-        "destroyed ",
-        "exiled ",
-        "milled ",
-        "revealed ",
-        "targeted ",
-        "entered ",
-    ];
-    if BLOCKED_PREFIXES
-        .iter()
-        .any(|prefix| expression_lower.starts_with(prefix))
-        || expression_lower.starts_with('~')
-    {
-        return None;
-    }
-    let (subject, qty) = if let Some(subject) = expression_lower.strip_suffix("'s power") {
-        (
-            subject,
-            QuantityRef::Power {
+    let blocked_prefix = alt((
+        tag::<_, _, OracleError<'_>>("that "),
+        tag("the "),
+        tag("target "),
+        tag("its "),
+        tag("this "),
+        tag("sacrificed "),
+        tag("discarded "),
+        tag("destroyed "),
+        tag("exiled "),
+        tag("milled "),
+        tag("revealed "),
+        tag("targeted "),
+        tag("entered "),
+        tag("~"),
+    ));
+    let non_empty = |subject: &str| subject.chars().any(|c| !c.is_whitespace());
+    let possessive_stat = alt((
+        map(
+            (
+                verify(
+                    take_until::<_, _, OracleError<'_>>("'s power"),
+                    non_empty,
+                ),
+                tag("'s power"),
+            ),
+            |(_, _)| QuantityRef::Power {
                 scope: ObjectScope::Source,
             },
-        )
-    } else if let Some(subject) = expression_lower.strip_suffix("'s toughness") {
-        (
-            subject,
-            QuantityRef::Toughness {
+        ),
+        map(
+            (
+                verify(
+                    take_until::<_, _, OracleError<'_>>("'s toughness"),
+                    non_empty,
+                ),
+                tag("'s toughness"),
+            ),
+            |(_, _)| QuantityRef::Toughness {
                 scope: ObjectScope::Source,
             },
-        )
-    } else {
-        return None;
-    };
-    if subject.trim().is_empty() {
-        return None;
-    }
+        ),
+    ));
+    let (_, qty) = all_consuming(preceded(not(blocked_prefix), possessive_stat))
+        .parse(expression_lower)
+        .ok()?;
     Some(QuantityExpr::Ref { qty })
 }
 
@@ -4930,7 +4940,6 @@ mod tests {
         }
     }
 
-    #[test]
     #[test]
     fn strip_trailing_where_x_stops_at_next_sentence() {
         let text = "put x +1/+1 counters on another target creature you control, where x is halana and alena's power. that creature gains haste until end of turn.";

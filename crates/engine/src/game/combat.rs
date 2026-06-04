@@ -573,27 +573,15 @@ fn must_be_blocked_statics_for_attacker<'a>(
 }
 
 fn attacker_has_must_be_blocked(state: &GameState, attacker_id: ObjectId) -> bool {
-    state
-        .objects
-        .get(&attacker_id)
-        .is_some_and(|attacker| {
-            super::functioning_abilities::active_static_definitions(state, attacker)
-                .any(|sd| sd.mode == StaticMode::MustBeBlocked)
-        })
-        || must_be_blocked_statics_for_attacker(state, attacker_id)
-            .any(|(_, def)| def.mode == StaticMode::MustBeBlocked)
+    // CR 509.1c: Check if any active static forces blockers on this attacker.
+    must_be_blocked_statics_for_attacker(state, attacker_id)
+        .any(|(_, def)| def.mode == StaticMode::MustBeBlocked)
 }
 
 fn attacker_has_must_be_blocked_by_all(state: &GameState, attacker_id: ObjectId) -> bool {
-    state
-        .objects
-        .get(&attacker_id)
-        .is_some_and(|attacker| {
-            super::functioning_abilities::active_static_definitions(state, attacker)
-                .any(|sd| sd.mode == StaticMode::MustBeBlockedByAll)
-        })
-        || must_be_blocked_statics_for_attacker(state, attacker_id)
-            .any(|(_, def)| def.mode == StaticMode::MustBeBlockedByAll)
+    // CR 509.1c: Check if any active static forces all able creatures to block this attacker.
+    must_be_blocked_statics_for_attacker(state, attacker_id)
+        .any(|(_, def)| def.mode == StaticMode::MustBeBlockedByAll)
 }
 
 /// Validate blocker declarations per CR 509.1.

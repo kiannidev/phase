@@ -4167,19 +4167,20 @@ pub(super) fn compute_sentence_where_x(chunks: &[ClauseChunk]) -> Vec<Option<Str
 pub(crate) fn strip_trailing_where_x<'a>(tp: TextPair<'a>) -> (TextPair<'a>, Option<String>) {
     for needle in [", where x is ", " where x is "] {
         if let Some((before, after)) = tp.split_around(needle) {
-            let mut expression = after
+            // CR 608.2c: A where-X binding can precede further instructions in the
+            // same sentence ("..., where X is N. Put that card ..."). Truncate on
+            // the TextPair before materializing a String (Eldritch Evolution:
+            // "... where X is 2 plus the sacrificed creature's mana value. Put ...").
+            let mut after_clause = after;
+            if let Some((clause, _)) = after.split_around(". ") {
+                after_clause = clause;
+            }
+            let expression = after_clause
                 .original
                 .trim()
                 .trim_end_matches('.')
                 .trim()
                 .to_string();
-            // CR 608.2c: A where-X binding can precede further instructions in the
-            // same sentence ("..., where X is N. Put that card ..."). Keep only
-            // the defining expression, not the continuation clause.
-            if let Some(idx) = expression.find(". ") {
-                expression.truncate(idx);
-                expression = expression.trim().to_string();
-            }
             if expression.is_empty() {
                 return (tp, None);
             }

@@ -10973,16 +10973,21 @@ fn parse_control_none_filter(text: &str) -> Option<TargetFilter> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::scenario::{GameScenario, P0, P1};
+    use crate::parser::oracle::parse_oracle_text;
     use crate::parser::oracle_ir::context::ParseContext;
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
     use crate::types::ability::{
         AbilityCondition, AbilityCost, AbilityKind, AggregateFunction, BounceSelection,
-        CastingPermission, Comparator, ContinuousModification, ControllerRef, CountScope,
-        DamageModification, DamageSource, DelayedTriggerCondition, Duration, Effect, FilterProp,
-        ManaSpendPermission, ObjectScope, PlayerFilter, PlayerScope, PtStat, PtValue, PtValueScope,
-        QuantityExpr, QuantityRef, SharedQuality, TargetFilter, TypeFilter, TypedFilter,
+        CastingPermission, ChosenAttribute, Comparator, ContinuousModification, ControllerRef,
+        CountScope, DamageModification, DamageSource, DelayedTriggerCondition, Duration, Effect,
+        FilterProp, ManaSpendPermission, ObjectScope, PlayerFilter, PlayerScope, PtStat, PtValue,
+        PtValueScope, QuantityExpr, QuantityRef, SharedQuality, TargetFilter, TypeFilter,
+        TypedFilter,
     };
     use crate::types::counter::{CounterMatch, CounterType};
+    use crate::types::game_state::WaitingFor;
+    use crate::types::mana::{ManaCost, ManaType, ManaUnit};
     use crate::types::replacements::ReplacementEvent;
     use crate::types::statics::CastFrequency;
 
@@ -17632,7 +17637,6 @@ mod tests {
 
     #[test]
     fn talion_kindly_lord_full_oracle_no_swallowed_clause() {
-        use crate::parser::oracle::parse_oracle_text;
         let text = "Flying\nAs Talion, the Kindly Lord enters the battlefield, choose a number between 1 and 10.\nWhenever an opponent casts a spell with mana value, power, or toughness equal to the chosen number, that player loses 2 life and you draw a card.";
         let parsed = parse_oracle_text(
             text,
@@ -17650,6 +17654,62 @@ mod tests {
             swallowed.is_empty(),
             "Talion should parse without swallowed-clause warnings: {swallowed:?}"
         );
+    }
+
+    #[test]
+    fn talion_runtime_triggers_only_for_matching_spell_quality() {
+        let run = |name: &str, creature_pt: Option<(i32, i32)>, mana_value: u32| {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PreCombatMain);
+            scenario.with_library_top(P0, &["Drawn Card"]);
+            let talion = scenario
+                .add_creature_from_oracle(
+                    P0,
+                    "Talion, the Kindly Lord",
+                    3,
+                    4,
+                    "Flying\nAs Talion, the Kindly Lord enters the battlefield, choose a number between 1 and 10.\nWhenever an opponent casts a spell with mana value, power, or toughness equal to the chosen number, that player loses 2 life and you draw a card.",
+                )
+                .id();
+            let spell = if let Some((power, toughness)) = creature_pt {
+                scenario
+                    .add_creature_to_hand_from_oracle(P1, name, power, toughness, "")
+                    .with_mana_cost(ManaCost::generic(mana_value))
+                    .id()
+            } else {
+                scenario
+                    .add_spell_to_hand_from_oracle(P1, name, true, "")
+                    .with_mana_cost(ManaCost::generic(mana_value))
+                    .id()
+            };
+            scenario.with_mana_pool(
+                P1,
+                (0..mana_value)
+                    .map(|_| ManaUnit::new(ManaType::Colorless, talion, false, Vec::new()))
+                    .collect(),
+            );
+            let mut runner = scenario.build();
+            {
+                let state = runner.state_mut();
+                state
+                    .objects
+                    .get_mut(&talion)
+                    .expect("Talion source exists")
+                    .chosen_attributes
+                    .push(ChosenAttribute::Number(3));
+                state.active_player = P1;
+                state.priority_player = P1;
+                state.waiting_for = WaitingFor::Priority { player: P1 };
+            }
+
+            let outcome = runner.cast(spell).resolve();
+            (outcome.life_delta(P1), outcome.hand_drawn(P0))
+        };
+
+        assert_eq!(run("Three-Mana Instant", None, 3), (-2, 1));
+        assert_eq!(run("Three-Power Creature", Some((3, 1)), 1), (-2, 1));
+        assert_eq!(run("Three-Toughness Creature", Some((1, 3)), 1), (-2, 1));
+        assert_eq!(run("One-One Creature", Some((1, 1)), 1), (0, 0));
     }
 
     #[test]

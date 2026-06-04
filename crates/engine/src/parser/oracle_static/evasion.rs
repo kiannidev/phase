@@ -1204,9 +1204,7 @@ pub(crate) fn parse_subject_combat_rule_static(text: &str) -> Option<StaticDefin
     }
     let subject = text[..subject_lower.len()].trim();
     let affected = parse_rule_static_subject_filter(subject)?;
-    Some(
-        lower_rule_static(predicate, affected, text).attack_defended(defended),
-    )
+    Some(lower_rule_static(predicate, affected, text).attack_defended(defended))
 }
 
 /// Nom 8.0 parser for the combat-tax body.

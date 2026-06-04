@@ -2234,14 +2234,10 @@ pub(crate) fn parse_combat_rule_static_predicate_with_defended_nom(
             (RuleStaticPredicate::CantAttackOrBlock, None),
             tag("can't attack or block"),
         ),
-        map(
-            parse_cant_attack_rule_static_predicate_nom,
-            |defended| (RuleStaticPredicate::CantAttack, defended),
-        ),
-        value(
-            (RuleStaticPredicate::CantBlock, None),
-            tag("can't block"),
-        ),
+        map(parse_cant_attack_rule_static_predicate_nom, |defended| {
+            (RuleStaticPredicate::CantAttack, defended)
+        }),
+        value((RuleStaticPredicate::CantBlock, None), tag("can't block")),
         value(
             (RuleStaticPredicate::CantCrew, None),
             (tag("can't crew"), opt(preceded(space1, tag("vehicles")))),
@@ -2344,4 +2340,3 @@ pub(crate) fn parse_cant_attack_rule_static_predicate_nom(
     let (rest, defended) = parse_cant_attack_defended_scope_nom(rest)?;
     Ok((rest, defended))
 }
-

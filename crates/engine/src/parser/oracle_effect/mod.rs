@@ -24545,10 +24545,6 @@ mod tests {
     /// `Variable("X")` (which resolves to 0 and skips the search).
     #[test]
     fn eldritch_evolution_search_binds_sacrificed_creature_mana_value_plus_two() {
-        use crate::types::ability::{
-            Comparator, FilterProp, ObjectScope, QuantityExpr, QuantityRef, TargetFilter,
-            TypeFilter,
-        };
         let def = parse_effect_chain_with_context(
             "Search your library for a creature card with mana value X or less, where X is 2 plus the sacrificed creature's mana value. Put that card onto the battlefield, then shuffle. Exile Eldritch Evolution.",
             AbilityKind::Spell,

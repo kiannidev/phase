@@ -4371,11 +4371,11 @@ mod tests {
     use crate::parser::oracle_effect::parse_effect_chain;
     use crate::types::ability::{
         AbilityCondition, AggregateFunction, Comparator, ContinuousModification, ControllerRef,
-        Duration, FilterProp, ManaProduction, ManaSpendRestriction, ModalSelectionConstraint,
-        MultiTargetSpec, ObjectScope, ParsedCondition, PlayerFilter, PlayerScope, PreventionAmount,
-        PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef, ReplacementCondition,
-        RoundingMode, SharedQuality, SharedQualityRelation, ShieldKind, StaticCondition,
-        TargetFilter, TriggerCondition, TypeFilter, TypedFilter,
+        Duration, Effect, FilterProp, ManaProduction, ManaSpendRestriction,
+        ModalSelectionConstraint, MultiTargetSpec, ObjectScope, ParsedCondition, PlayerFilter,
+        PlayerScope, PreventionAmount, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
+        ReplacementCondition, RoundingMode, SharedQuality, SharedQualityRelation, ShieldKind,
+        StaticCondition, TargetFilter, TriggerCondition, TypeFilter, TypedFilter,
     };
     use crate::types::keywords::{FlashbackCost, KeywordKind, WardCost};
     use crate::types::mana::{ManaColor, ManaCost, ManaCostShard};
@@ -4928,9 +4928,6 @@ mod tests {
     /// search whose mana-value cap tracks the sacrificed creature (+2).
     #[test]
     fn eldritch_evolution_parses_sacrifice_cost_and_dynamic_search_filter() {
-        use crate::types::ability::{
-            Comparator, Effect, FilterProp, ObjectScope, QuantityExpr, QuantityRef,
-        };
         let r = parse(
             "As an additional cost to cast this spell, sacrifice a creature.\n\
              Search your library for a creature card with mana value X or less, where X is 2 plus the sacrificed creature's mana value. \

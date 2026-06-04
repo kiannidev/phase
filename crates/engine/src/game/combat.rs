@@ -4364,7 +4364,7 @@ mod tests {
     fn eriette_scoped_cant_attack_blocks_only_defender_scope() {
         use crate::types::card_type::CoreType;
 
-        let mut state = setup();
+        let mut state = GameState::new(FormatConfig::standard(), 3, 42);
         state.active_player = PlayerId(1);
         state.turn_number = 2;
 
@@ -4420,7 +4420,18 @@ mod tests {
             "scoped restriction must not remove attacker from eligibility"
         );
 
+        let mut other_player_state = state.clone();
         let mut events = Vec::new();
+        assert!(
+            declare_attackers(
+                &mut other_player_state,
+                &[(attacker, AttackTarget::Player(PlayerId(2)))],
+                &mut events
+            )
+            .is_ok(),
+            "enchanted creature must still be able to attack another player"
+        );
+        events.clear();
         assert!(
             declare_attackers(
                 &mut state,

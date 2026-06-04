@@ -610,6 +610,26 @@ fn trigger_source_ids_for_zone(state: &GameState, zone: Zone) -> Vec<ObjectId> {
     }
 }
 
+fn source_was_not_co_departed_into_zone(
+    event: &GameEvent,
+    source_id: ObjectId,
+    zone: Zone,
+) -> bool {
+    match event {
+        // CR 603.2 + CR 702.59a: Off-zone triggers fire only if their source was
+        // already functioning in the scanned zone when the trigger event
+        // occurred. A source that co-departed into that zone as the triggering
+        // object moved there was not there yet for this event, so Recover-style
+        // graveyard triggers must not see it. The event object itself is not
+        // suppressed here: self-referential LTB triggers (Rancor class) still use
+        // the destination-zone scan plus CR 603.10a last-known information.
+        GameEvent::ZoneChanged { to, record, .. } if *to == zone => {
+            !record.co_departed.contains(&source_id)
+        }
+        _ => true,
+    }
+}
+
 fn storm_copy_count_before_cast(state: &GameState) -> i32 {
     state
         .spells_cast_this_turn_by_player
@@ -939,7 +959,13 @@ fn collect_pending_triggers(
             for matched in matched_triggers {
                 #[cfg(debug_assertions)]
                 production_matched.insert((obj_id, matched.trig_idx));
-                record_trigger_fired(state, matched.constraint.as_ref(), obj_id, matched.trig_idx);
+                record_trigger_fired(
+                    state,
+                    matched.constraint.as_ref(),
+                    obj_id,
+                    matched.trig_idx,
+                    event,
+                );
                 if matched.batched {
                     batched_this_pass.insert((obj_id, matched.trig_idx));
                 }
@@ -1326,6 +1352,7 @@ fn collect_pending_triggers(
                         matched.constraint.as_ref(),
                         *moved_id,
                         matched.trig_idx,
+                        event,
                     );
                     if matched.batched {
                         batched_this_pass.insert((*moved_id, matched.trig_idx));
@@ -1393,6 +1420,7 @@ fn collect_pending_triggers(
                         matched.constraint.as_ref(),
                         observer_id,
                         matched.trig_idx,
+                        event,
                     );
                     if matched.batched {
                         batched_this_pass.insert((observer_id, matched.trig_idx));
@@ -1414,6 +1442,9 @@ fn collect_pending_triggers(
         // firebending / exploit) deliberately do NOT run in this loop.
         for zone in [Zone::Graveyard, Zone::Exile, Zone::Stack, Zone::Command] {
             for obj_id in trigger_source_ids_for_zone(state, zone) {
+                if !source_was_not_co_departed_into_zone(event, obj_id, zone) {
+                    continue;
+                }
                 let matched_triggers = {
                     let obj = match state.objects.get(&obj_id) {
                         Some(o) => o,
@@ -1437,6 +1468,7 @@ fn collect_pending_triggers(
                         matched.constraint.as_ref(),
                         obj_id,
                         matched.trig_idx,
+                        event,
                     );
                     if matched.batched {
                         batched_this_pass.insert((obj_id, matched.trig_idx));
@@ -3730,6 +3762,21 @@ fn check_trigger_constraint(
         TriggerConstraint::OncePerGame => !state.triggers_fired_this_game.contains(&key),
         TriggerConstraint::OnlyDuringYourTurn => state.active_player == controller,
         TriggerConstraint::OnlyDuringOpponentsTurn => state.active_player != controller,
+        TriggerConstraint::OncePerOpponentPerTurn => {
+            // CR 603.2: The trigger event only matches the first life-loss event
+            // during that opponent's own turn.
+            let opponent_id = match event {
+                GameEvent::LifeChanged { player_id, .. } => *player_id,
+                _ => return false,
+            };
+            if opponent_id == controller || state.active_player != opponent_id {
+                return false;
+            }
+            let per_opponent_key = (obj_id, trig_idx, opponent_id);
+            !state
+                .triggers_fired_this_turn_per_opponent
+                .contains(&per_opponent_key)
+        }
         // CR 505.1: Main phases are precombat and postcombat.
         TriggerConstraint::OnlyDuringYourMainPhase => {
             state.active_player == controller
@@ -4130,8 +4177,7 @@ pub(crate) fn check_trigger_condition(
             | PlayerFilter::OpponentDealtCombatDamage { .. }
             // CR 508.6: a set-valued attacked-this-turn predicate has no
             // single-player "whose turn" semantic.
-            | PlayerFilter::OpponentAttackedThisTurn
-            | PlayerFilter::OpponentAttackedBySourceThisTurn
+            | PlayerFilter::OpponentAttacked { .. }
             | PlayerFilter::All
             | PlayerFilter::HighestSpeed
             | PlayerFilter::ZoneChangedThisWay
@@ -4590,6 +4636,7 @@ fn record_trigger_fired(
     constraint: Option<&crate::types::ability::TriggerConstraint>,
     obj_id: ObjectId,
     trig_idx: usize,
+    event: &GameEvent,
 ) {
     use crate::types::ability::TriggerConstraint;
 
@@ -4606,6 +4653,25 @@ fn record_trigger_fired(
         }
         TriggerConstraint::OncePerGame => {
             state.triggers_fired_this_game.insert(key);
+        }
+        TriggerConstraint::OncePerOpponentPerTurn => {
+            // CR 603.2: The trigger event only matches the first life-loss event
+            // during that opponent's own turn.
+            let opponent_id = match event {
+                GameEvent::LifeChanged { player_id, .. } => *player_id,
+                _ => return,
+            };
+            let Some(controller) = state.objects.get(&obj_id).map(|object| object.controller)
+            else {
+                return;
+            };
+            if opponent_id == controller || state.active_player != opponent_id {
+                return;
+            }
+            let per_opponent_key = (obj_id, trig_idx, opponent_id);
+            state
+                .triggers_fired_this_turn_per_opponent
+                .insert(per_opponent_key);
         }
         TriggerConstraint::OnlyDuringYourTurn
         | TriggerConstraint::OnlyDuringOpponentsTurn
@@ -8503,6 +8569,90 @@ pub mod tests {
         assert_eq!(state.stack.len(), 0);
     }
 
+    fn add_recover_style_graveyard_trigger(state: &mut GameState, obj_id: ObjectId) {
+        let mut trigger = TriggerDefinition::new(TriggerMode::ChangesZone)
+            .origin(Zone::Battlefield)
+            .destination(Zone::Graveyard)
+            .valid_card(TargetFilter::Typed(TypedFilter::creature().properties(
+                vec![
+                    FilterProp::Another,
+                    FilterProp::Owned {
+                        controller: ControllerRef::You,
+                    },
+                ],
+            )))
+            .execute(AbilityDefinition::new(
+                AbilityKind::Database,
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    player: TargetFilter::Controller,
+                },
+            ));
+        trigger.trigger_zones = vec![Zone::Graveyard];
+        state
+            .objects
+            .get_mut(&obj_id)
+            .unwrap()
+            .trigger_definitions
+            .push(trigger);
+    }
+
+    /// CR 702.59a: Recover functions only while the source card is already in a
+    /// graveyard. A pre-existing graveyard source must observe a later creature
+    /// going to that player's graveyard from the battlefield.
+    #[test]
+    fn graveyard_source_trigger_fires_when_source_was_already_in_graveyard() {
+        let mut state = setup();
+        let recover = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Recover Source".to_string(),
+            Zone::Graveyard,
+        );
+        add_recover_style_graveyard_trigger(&mut state, recover);
+        let creature = make_creature(&mut state, PlayerId(0), "Dying Creature", 2, 2);
+
+        let mut events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, creature, Zone::Graveyard, &mut events);
+
+        let pending = collect_pending_triggers(&mut state, &events);
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|ctx| ctx.pending.source_id == recover)
+                .count(),
+            1,
+            "Recover-style source already in the graveyard must observe the later death"
+        );
+    }
+
+    /// CR 702.59a: A Recover source that enters the graveyard in the same
+    /// simultaneous event was not functioning in that graveyard before the
+    /// trigger event, so it must not observe a co-dying creature.
+    #[test]
+    fn graveyard_source_trigger_does_not_fire_when_source_arrived_simultaneously() {
+        let mut state = setup();
+        let recover = make_creature(&mut state, PlayerId(0), "Recover Source", 2, 2);
+        add_recover_style_graveyard_trigger(&mut state, recover);
+        let creature = make_creature(&mut state, PlayerId(0), "Co-Dying Creature", 2, 2);
+
+        let mut events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, recover, Zone::Graveyard, &mut events);
+        crate::game::zones::move_to_zone(&mut state, creature, Zone::Graveyard, &mut events);
+        crate::game::zones::mark_simultaneous_departures(&mut events, &[recover, creature]);
+
+        let pending = collect_pending_triggers(&mut state, &events);
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|ctx| ctx.pending.source_id == recover)
+                .count(),
+            0,
+            "Recover-style source that arrived in the graveyard simultaneously must not fire"
+        );
+    }
+
     #[test]
     fn sneaky_snacker_returns_tapped_from_graveyard_on_third_draw_in_turn() {
         let mut state = setup();
@@ -11339,6 +11489,70 @@ pub mod tests {
     }
 
     #[test]
+    fn once_per_opponent_per_turn_requires_that_opponents_turn() {
+        let mut state = setup();
+        let trigger_index = 0;
+        let controller = PlayerId(0);
+        let opponent = PlayerId(1);
+        let source = make_creature(&mut state, controller, "Valgavoth", 4, 4);
+        let mut trig_def = make_trigger(TriggerMode::LifeLost);
+        trig_def.constraint = Some(TriggerConstraint::OncePerOpponentPerTurn);
+
+        let opponent_life_loss = GameEvent::LifeChanged {
+            player_id: opponent,
+            amount: -3,
+        };
+        state.active_player = controller;
+        assert!(!check_trigger_constraint(
+            &state,
+            &trig_def,
+            source,
+            trigger_index,
+            controller,
+            &opponent_life_loss,
+        ));
+
+        state.active_player = opponent;
+        assert!(check_trigger_constraint(
+            &state,
+            &trig_def,
+            source,
+            trigger_index,
+            controller,
+            &opponent_life_loss,
+        ));
+        record_trigger_fired(
+            &mut state,
+            trig_def.constraint.as_ref(),
+            source,
+            trigger_index,
+            &opponent_life_loss,
+        );
+        assert!(!check_trigger_constraint(
+            &state,
+            &trig_def,
+            source,
+            trigger_index,
+            controller,
+            &opponent_life_loss,
+        ));
+
+        let controller_life_loss = GameEvent::LifeChanged {
+            player_id: controller,
+            amount: -3,
+        };
+        state.active_player = controller;
+        assert!(!check_trigger_constraint(
+            &state,
+            &trig_def,
+            source,
+            trigger_index,
+            controller,
+            &controller_life_loss,
+        ));
+    }
+
+    #[test]
     fn parsed_each_of_your_main_phases_fires_only_on_controller_main_phases() {
         fn run(active_player: PlayerId, phase: Phase) -> usize {
             let mut state = setup();
@@ -13904,6 +14118,7 @@ pub mod tests {
                     (prankster_a, AttackTarget::Player(PlayerId(1))),
                     (prankster_b, AttackTarget::Player(PlayerId(1))),
                 ],
+                bands: vec![],
             },
         )
         .expect("declare attackers");
@@ -14189,6 +14404,7 @@ pub mod tests {
                 &mut state,
                 GameAction::DeclareAttackers {
                     attacks: vec![(attacker, AttackTarget::Player(PlayerId(1)))],
+                    bands: vec![],
                 },
             )
             .expect("declare attackers");
@@ -14271,6 +14487,7 @@ pub mod tests {
                 &mut state,
                 GameAction::DeclareAttackers {
                     attacks: vec![(attacker, AttackTarget::Player(PlayerId(1)))],
+                    bands: vec![],
                 },
             )
             .expect("declare attackers");
@@ -14585,6 +14802,7 @@ pub mod tests {
             &mut state,
             GameAction::DeclareAttackers {
                 attacks: vec![(doctor, AttackTarget::Player(PlayerId(1)))],
+                bands: vec![],
             },
         )
         .expect("declare attackers");
@@ -14711,7 +14929,10 @@ pub mod tests {
                 WaitingFor::DeclareAttackers { .. } => {
                     crate::game::engine::apply_as_current(
                         &mut state,
-                        GameAction::DeclareAttackers { attacks: vec![] },
+                        GameAction::DeclareAttackers {
+                            attacks: vec![],
+                            bands: vec![],
+                        },
                     )
                     .expect("declare no attackers");
                 }
@@ -14830,6 +15051,7 @@ pub mod tests {
             &mut state,
             GameAction::DeclareAttackers {
                 attacks: vec![(raph, AttackTarget::Player(PlayerId(1)))],
+                bands: vec![],
             },
         )
         .expect("declare attackers");
@@ -15030,7 +15252,10 @@ pub mod tests {
                 WaitingFor::DeclareAttackers { .. } => {
                     crate::game::engine::apply_as_current(
                         &mut state,
-                        GameAction::DeclareAttackers { attacks: vec![] },
+                        GameAction::DeclareAttackers {
+                            attacks: vec![],
+                            bands: vec![],
+                        },
                     )
                     .expect("declare no attackers");
                 }

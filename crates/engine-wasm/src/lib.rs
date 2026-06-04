@@ -321,6 +321,7 @@ pub fn is_card_commander_eligible_for_format(name: &str, format: JsValue) -> boo
             GameFormat::Commander | GameFormat::DuelCommander => is_commander_eligible(face),
             GameFormat::PauperCommander => is_commander_eligible(face),
             GameFormat::TinyLeaders => is_tiny_leader_eligible(face),
+            GameFormat::Oathbreaker => face.is_oathbreaker,
             GameFormat::Brawl | GameFormat::HistoricBrawl => is_brawl_commander_eligible(face),
             _ => false,
         }
@@ -760,9 +761,10 @@ pub fn submit_action(actor: u8, action: JsValue) -> JsValue {
         owner,
         zone,
         attach_to,
+        run_etb,
     }) = action
     {
-        return handle_debug_create_card(card_name, owner, zone, attach_to);
+        return handle_debug_create_card(card_name, owner, zone, attach_to, run_etb);
     }
 
     match with_state_mut(|state| match apply(state, actor, action) {
@@ -782,6 +784,7 @@ fn handle_debug_create_card(
     owner: PlayerId,
     zone: engine::types::zones::Zone,
     attach_to: Option<engine::game::game_object::AttachTarget>,
+    run_etb: bool,
 ) -> JsValue {
     let face = CARD_DB.with(|cell| {
         let db = cell.borrow();
@@ -879,7 +882,7 @@ fn handle_debug_create_card(
         }
 
         let result = if zone == engine::types::zones::Zone::Battlefield {
-            engine::game::route_debug_create_to_battlefield(state, obj_id)
+            engine::game::route_debug_create_to_battlefield(state, obj_id, run_etb)
         } else {
             engine::types::game_state::ActionResult {
                 events: vec![],
@@ -1408,6 +1411,7 @@ pub fn apply_seat_mutation(state_json: &str, mutation_json: &str) -> Result<JsVa
                 sideboard: deck_data.sideboard,
                 commander: deck_data.commander,
                 attraction_deck: deck_data.attraction_deck,
+                signature_spell: deck_data.signature_spell,
                 bracket_tier: deck_data.bracket_tier,
             })
         }

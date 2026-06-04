@@ -115,7 +115,9 @@ pub(super) fn handles(waiting_for: &WaitingFor) -> bool {
             | WaitingFor::ChooseRingBearer { .. }
             | WaitingFor::ChooseDungeon { .. }
             | WaitingFor::ChooseDungeonRoom { .. }
+            | WaitingFor::SpecializeColor { .. }
             | WaitingFor::ChooseLegend { .. }
+            | WaitingFor::MutateMergeChoice { .. }
             | WaitingFor::CommanderZoneChoice { .. }
             | WaitingFor::BattleProtectorChoice { .. }
             | WaitingFor::CategoryChoice { .. }
@@ -253,6 +255,7 @@ fn apply_search_partition(
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: Vec::new(),
+                face_down_profile: None,
             },
             primary_targets,
             source_id,
@@ -410,6 +413,7 @@ pub(super) fn handle_resolution_choice(
                             value: discover_value as i32,
                         },
                     }),
+                    false,
                     cleanup,
                     events,
                 )?;
@@ -542,6 +546,7 @@ pub(super) fn handle_resolution_choice(
                             value: source_mv as i32,
                         },
                     }),
+                    false,
                     cleanup,
                     events,
                 )?;
@@ -2317,6 +2322,12 @@ pub(super) fn handle_resolution_choice(
                                 | ChoiceType::BasicLandType
                                 | ChoiceType::Color { .. }
                                 | ChoiceType::Keyword { .. }
+                                // CR 613.1: a persisted "choose a player" gates
+                                // CDA P/T that count the chosen player's objects
+                                // or zones (Sewer Nemesis, Skyshroud War Beast) —
+                                // recompute layers immediately.
+                                | ChoiceType::Player
+                                | ChoiceType::Opponent
                         ) {
                             crate::game::layers::mark_layers_full(state);
                         }
@@ -2438,6 +2449,24 @@ pub(super) fn handle_resolution_choice(
             effects::venture::handle_choose_room(state, player, dungeon, room_index, events);
             ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
         }
+        (
+            WaitingFor::SpecializeColor {
+                player,
+                object_id,
+                options,
+            },
+            GameAction::ChooseSpecializeColor { color },
+        ) => {
+            if !options.contains(&color) {
+                return Err(EngineError::InvalidAction(
+                    "Invalid specialize color choice".to_string(),
+                ));
+            }
+            effects::specialize::handle_choose_specialize_color(
+                state, player, object_id, &options, color, events,
+            )?;
+            ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
+        }
         (WaitingFor::ChooseLegend { candidates, .. }, GameAction::ChooseLegend { keep }) => {
             if !candidates.contains(&keep) {
                 return Err(EngineError::InvalidAction(
@@ -2455,6 +2484,18 @@ pub(super) fn handle_resolution_choice(
             ResolutionChoiceOutcome::WaitingFor(WaitingFor::Priority {
                 player: state.active_player,
             })
+        }
+        // CR 702.140c + CR 730.2a: The mutate spell's controller chose whether the
+        // spell merges on top of or under the target creature. `merge::handle_mutate_
+        // merge_choice` validates the actor, performs the merge (CR 730.2), and
+        // returns to priority so the `Mutated` event's triggers/SBAs are processed.
+        (
+            WaitingFor::MutateMergeChoice { player, .. },
+            GameAction::ChooseMutateMergeSide { side },
+        ) => {
+            let waiting =
+                crate::game::merge::handle_mutate_merge_choice(state, player, side, events)?;
+            ResolutionChoiceOutcome::WaitingFor(waiting)
         }
         // CR 903.9a: Owner decides whether to return their commander to the command zone.
         // Accept = move to command zone; Decline = leave in current zone (marked as

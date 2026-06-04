@@ -3,7 +3,7 @@ use thiserror::Error;
 
 use crate::types::ability::{EffectKind, KeywordAction, TargetRef};
 use crate::types::actions::GameAction;
-use crate::types::events::{BendingType, GameEvent, ManaTapState, PlayerActionKind};
+use crate::types::events::{BendingType, ContestRound, GameEvent, ManaTapState, PlayerActionKind};
 use crate::types::game_state::{
     ActionResult, AutoPassMode, AutoPassRequest, CastOfferKind, ConvokeMode, CostResume, GameState,
     PayCostKind, RetargetScope, StackEntry, StackEntryKind, WaitingFor,
@@ -1634,6 +1634,18 @@ fn apply_action(
                         &mut events,
                     )?
                 }
+                AlternativeCastKeyword::Mutate => {
+                    // CR 702.140a: Handle the mutate alternative cost choice.
+                    casting::handle_mutate_cost_choice_with_payment_mode(
+                        state,
+                        *player,
+                        *object_id,
+                        *card_id,
+                        choice,
+                        *payment_mode,
+                        &mut events,
+                    )?
+                }
                 AlternativeCastKeyword::Cleave => {
                     casting::handle_cleave_cost_choice_with_payment_mode(
                         state,
@@ -1659,6 +1671,18 @@ fn apply_action(
                 AlternativeCastKeyword::Impending => {
                     // CR 702.176a: Handle the impending alternative cost choice during casting.
                     casting::handle_impending_cost_choice_with_payment_mode(
+                        state,
+                        *player,
+                        *object_id,
+                        *card_id,
+                        choice,
+                        *payment_mode,
+                        &mut events,
+                    )?
+                }
+                AlternativeCastKeyword::Prototype => {
+                    // CR 702.160a: Handle the prototype alternative cost choice during casting.
+                    casting::handle_prototype_cost_choice_with_payment_mode(
                         state,
                         *player,
                         *object_id,
@@ -1825,7 +1849,21 @@ fn apply_action(
         ) => match resume {
             CostResume::Spell {
                 spell: pending_cast,
-            } => match kind {
+            }
+            | CostResume::SpellCost {
+                spell: pending_cast,
+                ..
+            } => {
+                let paid_cost = match resume {
+                    CostResume::SpellCost { cost, source, .. } => {
+                        Some(casting_costs::SpellCostPayment {
+                            cost: cost.as_ref(),
+                            source: *source,
+                        })
+                    }
+                    _ => None,
+                };
+                match kind {
                 PayCostKind::Discard => engine_casting::handle_discard_for_cost(
                     state,
                     *player,
@@ -1835,15 +1873,19 @@ fn apply_action(
                     &chosen,
                     &mut events,
                 )?,
-                PayCostKind::Sacrifice => engine_casting::handle_sacrifice_for_cost(
-                    state,
-                    *player,
-                    *pending_cast.clone(),
-                    (*min_count, *count),
-                    choices,
-                    &chosen,
-                    &mut events,
-                )?,
+	                PayCostKind::Sacrifice => engine_casting::handle_sacrifice_for_cost(
+	                    state,
+	                    *player,
+	                    *pending_cast.clone(),
+	                    paid_cost,
+	                    casting_costs::CostSelection {
+	                        min_count: *min_count,
+	                        count: *count,
+	                        legal_permanents: choices,
+	                        chosen: &chosen,
+	                    },
+	                    &mut events,
+	                )?,
                 PayCostKind::ReturnToHand => engine_casting::handle_return_to_hand_for_cost(
                     state,
                     *player,
@@ -1863,6 +1905,20 @@ fn apply_action(
                     &chosen,
                     &mut events,
                 )?,
+                // CR 702.167a/b: Craft materials exile across the
+                // battlefield/graveyard union.
+                PayCostKind::ExileMaterials { materials } => {
+                    engine_casting::handle_exile_materials_for_cost(
+                        state,
+                        *player,
+                        materials.clone(),
+                        *pending_cast.clone(),
+                        (*min_count, *count),
+                        choices,
+                        &chosen,
+                        &mut events,
+                    )?
+                }
                 PayCostKind::RemoveCounter { counter_type } => {
                     casting_costs::handle_remove_counter_for_cost(
                         state,
@@ -1901,7 +1957,8 @@ fn apply_action(
                         "ExileFromManaZone cost cannot resume a spell cast".into(),
                     ));
                 }
-            },
+                }
+            }
             CostResume::ManaAbility {
                 mana_ability: pending_mana_ability,
             } => match kind {
@@ -1946,6 +2003,7 @@ fn apply_action(
                 // through the spell pipeline.
                 PayCostKind::ReturnToHand
                 | PayCostKind::ExileFromZone { .. }
+                | PayCostKind::ExileMaterials { .. }
                 | PayCostKind::RemoveCounter { .. }
                 | PayCostKind::Behold { .. } => {
                     return Err(EngineError::InvalidAction(
@@ -1962,6 +2020,10 @@ fn apply_action(
                 resume:
                     CostResume::Spell {
                         spell: pending_cast,
+                    }
+                    | CostResume::SpellCost {
+                        spell: pending_cast,
+                        ..
                     },
                 ..
             },
@@ -2427,10 +2489,13 @@ fn apply_action(
                 object_id,
                 value,
             });
-            // CR 601.2b + CR 601.2f: X is now locked in. Apply the cost floor
-            // (Trinisphere class) that was deferred while X was symbolic, against
-            // the now-concrete total, before payment is determined.
-            casting::apply_post_x_cost_floor(state, player, object_id);
+            // CR 601.2b + CR 601.2f: X is now locked in. Re-derive the full
+            // concrete cost from the captured base — all reductions, target-
+            // dependent modifiers, and Strive re-applied, with floors (Trinisphere
+            // class) run LAST — against the now-concrete total, before payment is
+            // determined. (Legacy/in-flight pending casts without a captured base
+            // fall back to flooring the already-concretized cost.)
+            casting::apply_post_x_cost_modifiers(state, player, object_id);
             casting_costs::enter_payment_step(state, player, convoke_mode, &mut events)?
         }
         // CR 601.2h: Player has confirmed payment — delegate to the shared finalizer
@@ -2806,9 +2871,12 @@ fn apply_action(
             mulligan::handle_opening_hand_bottom(state, actor, cards, &mut events)
                 .map_err(EngineError::InvalidAction)?
         }
-        (WaitingFor::DeclareAttackers { player, .. }, GameAction::DeclareAttackers { attacks }) => {
+        (
+            WaitingFor::DeclareAttackers { player, .. },
+            GameAction::DeclareAttackers { attacks, bands },
+        ) => {
             triggers_processed_inline = true;
-            engine_combat::handle_declare_attackers(state, *player, &attacks, &mut events)?
+            engine_combat::handle_declare_attackers(state, *player, &attacks, &bands, &mut events)?
         }
         (
             WaitingFor::DeclareBlockers { player, .. },
@@ -3923,6 +3991,28 @@ fn apply_action(
                 &assignments,
                 trample_damage,
                 controller_damage,
+                &mut events,
+            )?
+        }
+        // CR 510.1d + CR 702.22k: A banded blocker's combat damage is divided by
+        // the active player among the attackers it blocks.
+        (
+            WaitingFor::AssignBlockerDamage {
+                player,
+                blocker_id,
+                total_damage,
+                attackers,
+            },
+            GameAction::AssignBlockerDamage { assignments },
+        ) => {
+            triggers_processed_inline = true;
+            engine_combat::handle_assign_blocker_damage(
+                state,
+                *player,
+                *blocker_id,
+                *total_damage,
+                attackers,
+                &assignments,
                 &mut events,
             )?
         }
@@ -5082,8 +5172,7 @@ fn handle_crew_activation(
         ));
     }
 
-    // Find eligible creatures: untapped creatures controlled by player, excluding the Vehicle
-    // TODO: CR 702.122c — filter out creatures with "can't crew Vehicles" restriction when implemented
+    // CR 702.122c: Exclude creatures with "can't crew Vehicles".
     let eligible_creatures: Vec<ObjectId> = state
         .battlefield
         .iter()
@@ -5099,6 +5188,7 @@ fn handle_crew_activation(
                             && o.card_types
                                 .core_types
                                 .contains(&crate::types::card_type::CoreType::Creature)
+                            && !super::static_abilities::object_has_cant_crew(state, id)
                     })
                     .unwrap_or(false)
         })
@@ -5205,6 +5295,11 @@ fn handle_crew_announcement(
         if obj.zone != Zone::Battlefield || obj.tapped {
             return Err(EngineError::InvalidAction(
                 "Creature is no longer eligible for crewing".to_string(),
+            ));
+        }
+        if super::static_abilities::object_has_cant_crew(state, cid) {
+            return Err(EngineError::InvalidAction(
+                "Creature can't crew Vehicles".to_string(),
             ));
         }
         total_power += obj.power.unwrap_or(0).max(0);
@@ -5587,56 +5682,28 @@ pub fn new_game(seed: u64) -> GameState {
 /// broken deterministically by lowest seat index (see `start_game`).
 const FIRST_PLAYER_CONTEST_MAX_ROUNDS: usize = 16;
 
-/// Start game with mulligan flow. If no cards in libraries, skips mulligan.
+/// CR 103.1: run the starting-player roll-off and capture its round structure.
 ///
-/// CR 103.1: At the start of game 1 of a match the players determine who takes
-/// the first turn "using any mutually agreeable method (flipping a coin,
-/// rolling dice, etc.)". This engine models that determination as an
-/// authoritative d20 high-roll contest — one d20 per seat using the game's
-/// seeded RNG (CR 706, rolling a die) — with ties rerolled among the tied top
-/// group. NOTE ON FIDELITY: the literal CR 103.1 sequence is "contest winner
-/// *chooses* who takes the first turn"; this engine collapses that to "contest
-/// winner *becomes* the starting player" (it does not present a play/draw
-/// choice here), an existing, accepted simplification — the annotation does not
-/// claim the choose-step is implemented. Subsequent games in a multi-game match
-/// route through `match_flow::start_next_game`, which uses `next_game_chooser`
-/// instead, so this function is always the game-1 path.
+/// `roll_round` is called once per round with the current contender set (in
+/// seat order) and returns each contender's d20 result. Round 1 = all seats;
+/// each later round = the prior round's tied-max group (CR 103.1 reroll).
+/// Returns the per-round structure and the winner: the unique max of the final
+/// round, or the lowest seat index when still tied at
+/// `FIRST_PLAYER_CONTEST_MAX_ROUNDS`.
 ///
-/// DETERMINISM: the contest draws only from `state.rng` (the seeded
-/// `ChaCha20Rng`), never thread/global RNG, so replays and AI search stay
-/// deterministic. This consumes a different number of RNG draws than the
-/// previous single `random_range(0..len)` pick, so a given seed now produces a
-/// different downstream sequence — an intentional, accepted determinism shift
-/// (verified: no in-repo test or replay fixture pins exact post-start RNG
-/// state).
-///
-/// Callers that need a deterministic starter (tests, fixed scenarios) must use
-/// `start_game_with_starting_player` directly — that path runs no contest and
-/// emits no `DieRolled` events.
-pub fn start_game(state: &mut GameState) -> ActionResult {
-    if state.seat_order.is_empty() {
-        return start_game_with_starting_player(state, PlayerId(0));
-    }
-
-    // CR 103.1 / CR 706: roll one d20 per seat; the high roller becomes the
-    // starting player. Emit a DieRolled event for every roll (including reroll
-    // rounds) so the contest can be surfaced/animated downstream.
-    let mut dice_events: Vec<GameEvent> = Vec::new();
-
-    let roll_for =
-        |state: &mut GameState, dice_events: &mut Vec<GameEvent>, seat: PlayerId| -> u8 {
-            let result = state.rng.random_range(1..=20u8);
-            dice_events.push(GameEvent::DieRolled {
-                player_id: seat,
-                sides: 20,
-                result,
-            });
-            result
-        };
+/// The selection logic (contenders narrowing, max/top filtering, bounded cap,
+/// lowest-seat fallback) is identical to the prior inline loop; the only change
+/// is that each round's rolls are captured into a `ContestRound` instead of
+/// pushed as flat `DieRolled` events.
+fn build_contest_rounds(
+    seat_order: &[PlayerId],
+    mut roll_round: impl FnMut(&[PlayerId]) -> Vec<(PlayerId, u8)>,
+) -> (Vec<ContestRound>, PlayerId) {
+    let mut rounds: Vec<ContestRound> = Vec::new();
 
     // `contenders` is the set of seats still in the running. It starts as every
     // seat and, after each tie, narrows to the tied top group only.
-    let mut contenders: Vec<PlayerId> = state.seat_order.clone();
+    let mut contenders: Vec<PlayerId> = seat_order.to_vec();
     let mut starting_player: Option<PlayerId> = None;
 
     // BOUNDED tie loop. Each iteration rolls every contender; a unique high
@@ -5647,16 +5714,14 @@ pub fn start_game(state: &mut GameState) -> ActionResult {
     // shrinking. If the cap is reached while still tied, the tie is broken
     // deterministically by lowest seat index below — the engine can never hang.
     for _round in 0..FIRST_PLAYER_CONTEST_MAX_ROUNDS {
-        let rolls: Vec<(PlayerId, u8)> = contenders
-            .iter()
-            .map(|&seat| (seat, roll_for(state, &mut dice_events, seat)))
-            .collect();
+        let rolls: Vec<(PlayerId, u8)> = roll_round(&contenders);
         let max_roll = rolls.iter().map(|&(_, r)| r).max().expect("non-empty");
         let top: Vec<PlayerId> = rolls
             .iter()
             .filter(|&&(_, r)| r == max_roll)
             .map(|&(seat, _)| seat)
             .collect();
+        rounds.push(ContestRound { rolls });
         if top.len() == 1 {
             starting_player = Some(top[0]);
             break;
@@ -5674,10 +5739,70 @@ pub fn start_game(state: &mut GameState) -> ActionResult {
             .expect("contenders is always non-empty")
     });
 
+    (rounds, starting_player)
+}
+
+/// Start game with mulligan flow. If no cards in libraries, skips mulligan.
+///
+/// CR 103.1: At the start of game 1 of a match the players determine who takes
+/// the first turn "using any mutually agreeable method (flipping a coin,
+/// rolling dice, etc.)". This engine models that determination as an
+/// authoritative d20 high-roll contest — one d20 per seat using the game's
+/// seeded RNG (CR 706, rolling a die) — with ties rerolled among the tied top
+/// group. NOTE ON FIDELITY: the literal CR 103.1 sequence is "contest winner
+/// *chooses* who takes the first turn"; this engine collapses that to "contest
+/// winner *becomes* the starting player" (it does not present a play/draw
+/// choice here), an existing, accepted simplification — the annotation does not
+/// claim the choose-step is implemented. Subsequent games in a multi-game match
+/// route through `match_flow::start_next_game`, which uses `next_game_chooser`
+/// instead, so this function is always the game-1 path.
+///
+/// The contest is surfaced as a single authoritative
+/// `GameEvent::StartingPlayerContest` carrying the full round structure (round
+/// 1 = all seats, each later round = the prior round's tied-max reroll group)
+/// plus the engine's authoritative `winner`, so downstream consumers render the
+/// contest round by round without re-deriving anything. It is inserted at the
+/// front of the result, ahead of `GameStarted` → `TurnStarted`. This replaces
+/// the prior flat per-roll `DieRolled` batch; in-game die rolls still emit
+/// `DieRolled`.
+///
+/// DETERMINISM: the contest draws only from `state.rng` (the seeded
+/// `ChaCha20Rng`), never thread/global RNG, so replays and AI search stay
+/// deterministic. The RNG draw count and order are EXACTLY as before — one
+/// `random_range(1..=20)` per contender per round, in seat order — so this
+/// representation change introduces ZERO determinism shift relative to the
+/// prior `DieRolled`-batch implementation. (It still differs from the original
+/// single `random_range(0..len)` pick that predated the contest, an earlier,
+/// accepted shift.)
+///
+/// Callers that need a deterministic starter (tests, fixed scenarios) must use
+/// `start_game_with_starting_player` directly — that path runs no contest and
+/// emits no `StartingPlayerContest` event.
+pub fn start_game(state: &mut GameState) -> ActionResult {
+    if state.seat_order.is_empty() {
+        return start_game_with_starting_player(state, PlayerId(0));
+    }
+
+    // CR 103.1 / CR 706: roll one d20 per seat; the high roller becomes the
+    // starting player. Draw order/count is identical to the prior
+    // implementation — one `random_range(1..=20)` per contender, in seat order.
+    let seat_order = state.seat_order.clone();
+    let (rounds, starting_player) = build_contest_rounds(&seat_order, |contenders| {
+        contenders
+            .iter()
+            .map(|&seat| (seat, state.rng.random_range(1..=20u8)))
+            .collect()
+    });
+
     let mut result = start_game_with_starting_player(state, starting_player);
-    // Sequence: all DieRolled (every round) → GameStarted → TurnStarted.
-    dice_events.append(&mut result.events);
-    result.events = dice_events;
+    // CR 103.1: StartingPlayerContest → GameStarted → TurnStarted.
+    result.events.insert(
+        0,
+        GameEvent::StartingPlayerContest {
+            rounds,
+            winner: starting_player,
+        },
+    );
     result
 }
 
@@ -6892,6 +7017,7 @@ mod tests {
             &mut state,
             GameAction::DeclareAttackers {
                 attacks: vec![(bombardiers, AttackTarget::Player(PlayerId(1)))],
+                bands: vec![],
             },
         )
         .unwrap();
@@ -9692,6 +9818,7 @@ mod tests {
             &mut state,
             GameAction::DeclareAttackers {
                 attacks: vec![(attacker, AttackTarget::Player(PlayerId(1)))],
+                bands: vec![],
             },
         )
         .unwrap();
@@ -10493,6 +10620,7 @@ mod tests {
                 PlayerId(0),
             ),
             cost: crate::types::mana::ManaCost::NoCost,
+            base_cost: None,
             activation_cost: None,
             activation_ability_index: None,
             target_constraints: vec![],
@@ -10501,6 +10629,7 @@ mod tests {
             distribute: None,
             origin_zone: crate::types::zones::Zone::Hand,
             additional_cost_flow: None,
+            additional_cost_source: crate::types::game_state::SpellCostSource::Other,
             deferred_modal_choice: None,
             deferred_target_selection: false,
             chosen_modes: Vec::new(),
@@ -10873,6 +11002,7 @@ mod tests {
                 PlayerId(0),
             ),
             cost: crate::types::mana::ManaCost::NoCost,
+            base_cost: None,
             activation_cost: None,
             activation_ability_index: None,
             target_constraints: vec![],
@@ -10881,6 +11011,7 @@ mod tests {
             distribute: None,
             origin_zone: crate::types::zones::Zone::Hand,
             additional_cost_flow: None,
+            additional_cost_source: crate::types::game_state::SpellCostSource::Other,
             deferred_modal_choice: None,
             deferred_target_selection: false,
             chosen_modes: Vec::new(),
@@ -12354,6 +12485,7 @@ mod trigger_target_tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             },
             Vec::new(),
             trigger_creature,
@@ -12468,6 +12600,7 @@ mod trigger_target_tests {
                     enters_attacking: false,
                     up_to: false,
                     enter_with_counters: vec![],
+                    face_down_profile: None,
                 },
                 vec![],
                 ObjectId(1),
@@ -13426,6 +13559,7 @@ mod exile_return_tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             },
             vec![TargetRef::Object(victim_id)],
             source_id,
@@ -14248,15 +14382,18 @@ mod phase_trigger_regression_tests {
     use super::*;
     use crate::game::combat::AttackTarget;
     use crate::game::zones::create_object;
+    use crate::parser::oracle::parse_oracle_text;
     use crate::types::ability::{
         AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, Effect,
         FilterProp, ObjectScope, PlayerFilter, QuantityExpr, QuantityRef, ResolvedAbility,
         TargetFilter, TargetRef, TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter,
         UnlessPayModifier,
     };
+    use crate::types::card::CardFace;
     use crate::types::card_type::CoreType;
     use crate::types::format::FormatConfig;
     use crate::types::identifiers::{CardId, ObjectId};
+    use crate::types::keywords::Keyword;
     use crate::types::mana::{ManaColor, ManaCost, ManaType, ManaUnit};
     use crate::types::player::PlayerId;
     use crate::types::triggers::TriggerMode;
@@ -14314,6 +14451,7 @@ mod phase_trigger_regression_tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             },
             vec![],
             source_id,
@@ -15045,6 +15183,114 @@ mod phase_trigger_regression_tests {
     }
 
     #[test]
+    fn issue_1981_echo_decline_sacrifice_fires_dies_trigger() {
+        let mut state = new_game(42);
+        state.turn_number = 2;
+        state.phase = Phase::Untap;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+
+        let mogg = create_object(
+            &mut state,
+            CardId(1981),
+            PlayerId(0),
+            "Mogg War Marshal".to_string(),
+            Zone::Battlefield,
+        );
+
+        let oracle = "Echo {1}{R} (At the beginning of your upkeep, if this came under your control since the beginning of your last upkeep, sacrifice it unless you pay its echo cost.)\n\
+When this creature enters or dies, create a 1/1 red Goblin creature token.";
+        let parsed = parse_oracle_text(
+            oracle,
+            "Mogg War Marshal",
+            &[],
+            &["Creature".to_string()],
+            &["Goblin".to_string(), "Warrior".to_string()],
+        );
+        assert!(
+            parsed
+                .extracted_keywords
+                .iter()
+                .any(|kw| matches!(kw, Keyword::Echo(_))),
+            "Mogg's echo keyword must parse before synthesis"
+        );
+
+        let mut face = CardFace {
+            keywords: parsed.extracted_keywords.clone(),
+            triggers: parsed.triggers.clone(),
+            ..CardFace::default()
+        };
+        crate::database::synthesis::synthesize_echo(&mut face);
+
+        {
+            let obj = state.objects.get_mut(&mogg).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.card_types.subtypes.push("Goblin".to_string());
+            obj.card_types.subtypes.push("Warrior".to_string());
+            obj.power = Some(1);
+            obj.toughness = Some(1);
+            obj.base_power = Some(1);
+            obj.base_toughness = Some(1);
+            obj.keywords = face.keywords.clone();
+            obj.base_keywords = obj.keywords.clone();
+            for trigger in face.triggers.clone() {
+                obj.trigger_definitions.push(trigger);
+            }
+            obj.base_trigger_definitions =
+                Arc::new(obj.trigger_definitions.iter_all().cloned().collect());
+            // CR 702.30a: the next controller-upkeep echo payment is due.
+            obj.echo_due = true;
+        }
+
+        let mut events = Vec::new();
+        crate::game::turns::auto_advance(&mut state, &mut events);
+        assert_eq!(state.phase, Phase::Upkeep);
+        assert!(
+            !state.stack.is_empty(),
+            "echo trigger must be on the stack at the beginning of upkeep"
+        );
+
+        events.clear();
+        crate::game::stack::resolve_top(&mut state, &mut events);
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::UnlessPayment {
+                player: PlayerId(0),
+                ..
+            }
+        ));
+
+        apply_as_current(&mut state, GameAction::PayUnlessCost { pay: false }).unwrap();
+
+        assert_eq!(
+            state.objects[&mogg].zone,
+            Zone::Graveyard,
+            "declining echo must sacrifice Mogg War Marshal"
+        );
+        assert!(
+            !state.stack.is_empty(),
+            "Mogg War Marshal's dies trigger must be put on the stack after the echo sacrifice"
+        );
+
+        apply_as_current(&mut state, GameAction::PassPriority).unwrap();
+        apply_as_current(&mut state, GameAction::PassPriority).unwrap();
+
+        let goblin_tokens = state
+            .battlefield
+            .iter()
+            .filter_map(|id| state.objects.get(id))
+            .filter(|obj| obj.is_token && obj.name == "Goblin")
+            .count();
+        assert_eq!(
+            goblin_tokens, 1,
+            "the dies trigger should resolve to one 1/1 red Goblin token"
+        );
+    }
+
+    #[test]
     fn attack_trigger_resolves_before_combat_damage_and_only_once() {
         let mut state = new_game(42);
         state.turn_number = 5;
@@ -15129,6 +15375,7 @@ mod phase_trigger_regression_tests {
             &mut state,
             GameAction::DeclareAttackers {
                 attacks: vec![(ajani, AttackTarget::Player(PlayerId(1)))],
+                bands: vec![],
             },
         )
         .unwrap();
@@ -15322,6 +15569,7 @@ mod phase_trigger_regression_tests {
             &mut state,
             GameAction::DeclareAttackers {
                 attacks: vec![(bat, AttackTarget::Player(PlayerId(1)))],
+                bands: vec![],
             },
         )
         .unwrap();
@@ -15725,6 +15973,214 @@ mod phase_trigger_regression_tests {
         assert_eq!(state.players[1].energy, 0);
         // Primary suppressed (no +4 life), alternative ran (+2 life from sub_ability).
         assert_eq!(state.players[0].life, starting_life + 2);
+    }
+
+    /// CR 603.2 + CR 118.12a: the paid IfAPlayerDoes branch resolves on the
+    /// unless-payment resume path, so events produced by that branch must be
+    /// scanned for normal triggers before priority resumes.
+    #[test]
+    fn unless_pay_success_sub_ability_fires_triggers_from_events() {
+        let mut state = setup_game_at_main_phase();
+        let source_id = create_object(
+            &mut state,
+            CardId(914),
+            PlayerId(0),
+            "Divert Disaster Stand-In".to_string(),
+            Zone::Battlefield,
+        );
+        let doomed = create_object(
+            &mut state,
+            CardId(915),
+            PlayerId(0),
+            "Doomed Witness Stand-In".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&doomed).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.trigger_definitions.push(
+                TriggerDefinition::new(TriggerMode::ChangesZone)
+                    .valid_card(TargetFilter::SelfRef)
+                    .origin(Zone::Battlefield)
+                    .destination(Zone::Graveyard)
+                    .trigger_zones(vec![Zone::Battlefield])
+                    .execute(AbilityDefinition::new(
+                        AbilityKind::Database,
+                        Effect::GainLife {
+                            amount: QuantityExpr::Fixed { value: 3 },
+                            player: TargetFilter::Controller,
+                        },
+                    )),
+            );
+            obj.base_trigger_definitions =
+                Arc::new(obj.trigger_definitions.iter_all().cloned().collect());
+        }
+
+        let mut primary = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 4 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        let mut alternative = ResolvedAbility::new(
+            Effect::Sacrifice {
+                target: TargetFilter::Any,
+                count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
+            },
+            vec![TargetRef::Object(doomed)],
+            source_id,
+            PlayerId(0),
+        );
+        alternative.condition = Some(AbilityCondition::effect_performed());
+        primary.sub_ability = Some(Box::new(alternative));
+
+        state.players[1].energy = 2;
+        state.waiting_for = WaitingFor::UnlessPayment {
+            player: PlayerId(1),
+            cost: AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed { value: 2 },
+            },
+            pending_effect: Box::new(primary),
+            trigger_event: None,
+            effect_description: None,
+            remaining: Vec::new(),
+        };
+
+        let starting_life = state.players[0].life;
+        let result = apply_as_current(&mut state, GameAction::PayUnlessCost { pay: true }).unwrap();
+
+        assert!(matches!(result.waiting_for, WaitingFor::Priority { .. }));
+        assert_eq!(state.objects[&doomed].zone, Zone::Graveyard);
+        assert!(
+            !state.stack.is_empty(),
+            "the paid IfAPlayerDoes sacrifice must put the dies trigger on the stack"
+        );
+
+        apply_as_current(&mut state, GameAction::PassPriority).unwrap();
+        apply_as_current(&mut state, GameAction::PassPriority).unwrap();
+
+        assert_eq!(
+            state.players[0].life,
+            starting_life + 3,
+            "the dies trigger from the paid sub-ability should resolve"
+        );
+    }
+
+    /// CR 603.3b + CR 701.22a: if an unless-payment branch pauses on a
+    /// resolution choice, triggers produced by that branch wait until the choice
+    /// finishes instead of clobbering the choice prompt.
+    #[test]
+    fn unless_pay_resolution_choice_defers_branch_triggers() {
+        let mut state = setup_game_at_main_phase();
+        let source_id = create_object(
+            &mut state,
+            CardId(916),
+            PlayerId(0),
+            "Unless Scry Stand-In".to_string(),
+            Zone::Battlefield,
+        );
+        for (card_id, name, effect) in [
+            (
+                CardId(917),
+                "Scry Watcher Draw",
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+            ),
+            (
+                CardId(918),
+                "Scry Watcher Life",
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    player: TargetFilter::Controller,
+                },
+            ),
+        ] {
+            let watcher = create_object(
+                &mut state,
+                card_id,
+                PlayerId(0),
+                name.to_string(),
+                Zone::Battlefield,
+            );
+            let obj = state.objects.get_mut(&watcher).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.trigger_definitions.push(
+                TriggerDefinition::new(TriggerMode::Scry)
+                    .execute(AbilityDefinition::new(AbilityKind::Database, effect)),
+            );
+            obj.base_trigger_definitions =
+                Arc::new(obj.trigger_definitions.iter_all().cloned().collect());
+        }
+        for (card_id, name) in [
+            (CardId(919), "Library One"),
+            (CardId(920), "Library Two"),
+            (CardId(921), "Library Three"),
+        ] {
+            create_object(
+                &mut state,
+                card_id,
+                PlayerId(0),
+                name.to_string(),
+                Zone::Library,
+            );
+        }
+
+        state.waiting_for = WaitingFor::UnlessPayment {
+            player: PlayerId(1),
+            cost: AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed { value: 2 },
+            },
+            pending_effect: Box::new(ResolvedAbility::new(
+                Effect::Scry {
+                    count: QuantityExpr::Fixed { value: 2 },
+                    target: TargetFilter::Controller,
+                },
+                vec![],
+                source_id,
+                PlayerId(0),
+            )),
+            trigger_event: None,
+            effect_description: None,
+            remaining: Vec::new(),
+        };
+
+        let result =
+            apply_as_current(&mut state, GameAction::PayUnlessCost { pay: false }).unwrap();
+        let WaitingFor::ScryChoice { player, cards } = result.waiting_for.clone() else {
+            panic!(
+                "unless branch must preserve ScryChoice before watcher triggers, got {:?}",
+                result.waiting_for
+            );
+        };
+        assert_eq!(player, PlayerId(0));
+        assert_eq!(cards.len(), 2);
+        assert_eq!(
+            state.deferred_triggers.len(),
+            2,
+            "the two scry watcher triggers should be parked until ScryChoice resolves"
+        );
+
+        let hand_after_scry_prompt = state.players[0].hand.len();
+        let life_after_scry_prompt = state.players[0].life;
+        apply_as_current(&mut state, GameAction::SelectCards { cards }).unwrap();
+        for _ in 0..8 {
+            if matches!(state.waiting_for, WaitingFor::OrderTriggers { .. }) {
+                crate::game::triggers::drain_order_triggers_with_identity(&mut state);
+            }
+            if state.stack.is_empty() && matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                break;
+            }
+            apply_as_current(&mut state, GameAction::PassPriority).unwrap();
+        }
+
+        assert_eq!(state.players[0].hand.len(), hand_after_scry_prompt + 1);
+        assert_eq!(state.players[0].life, life_after_scry_prompt + 1);
     }
 
     /// CR 118.12: When the unless cost is declined, the primary effect runs
@@ -17387,6 +17843,7 @@ mod phase_trigger_regression_tests {
                     enters_attacking: false,
                     up_to: false,
                     enter_with_counters: vec![],
+                    face_down_profile: None,
                 },
             );
             let reflexive = crate::types::ability::AbilityDefinition {
@@ -17577,6 +18034,7 @@ mod phase_trigger_regression_tests {
                         enters_attacking: false,
                         up_to: false,
                         enter_with_counters: vec![],
+                        face_down_profile: None,
                     },
                 )
             };
@@ -17733,6 +18191,7 @@ mod phase_trigger_regression_tests {
             &mut state,
             GameAction::DeclareAttackers {
                 attacks: vec![(attacker, AttackTarget::Player(PlayerId(1)))],
+                bands: vec![],
             },
         )
         .unwrap();
@@ -19011,7 +19470,9 @@ mod crew_tests {
     use crate::types::card_type::CoreType;
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::player::PlayerId;
+    use crate::types::statics::StaticMode;
     use crate::types::zones::Zone;
+    use crate::types::StaticDefinition;
 
     fn setup_game_at_main_phase() -> GameState {
         let mut state = new_game(42);
@@ -19200,6 +19661,52 @@ mod crew_tests {
         assert!(matches!(result.waiting_for, WaitingFor::Priority { .. }));
         assert!(state.objects.get(&creature_a).unwrap().tapped);
         assert!(state.objects.get(&creature_b).unwrap().tapped);
+    }
+
+    #[test]
+    fn test_crew_excludes_creature_with_cant_crew() {
+        let (mut state, vehicle_id, creature_a, creature_b) = setup_crew_scenario();
+        state
+            .objects
+            .get_mut(&creature_b)
+            .unwrap()
+            .static_definitions
+            .push(StaticDefinition::new(StaticMode::CantCrew));
+        assert!(!crate::game::static_abilities::object_has_cant_crew(
+            &state, creature_a
+        ));
+        assert!(crate::game::static_abilities::object_has_cant_crew(
+            &state, creature_b
+        ));
+
+        let result = apply_as_current(
+            &mut state,
+            GameAction::CrewVehicle {
+                vehicle_id,
+                creature_ids: vec![],
+            },
+        )
+        .unwrap();
+
+        match result.waiting_for {
+            WaitingFor::CrewVehicle {
+                eligible_creatures, ..
+            } => {
+                assert!(eligible_creatures.contains(&creature_a));
+                assert!(!eligible_creatures.contains(&creature_b));
+            }
+            other => panic!("Expected CrewVehicle, got {:?}", other),
+        }
+
+        let err = apply_as_current(
+            &mut state,
+            GameAction::CrewVehicle {
+                vehicle_id,
+                creature_ids: vec![creature_b],
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, EngineError::InvalidAction(_)));
     }
 
     #[test]
@@ -21283,37 +21790,39 @@ mod mdfc_land_tests {
 
     // --- First-player d20 contest (start_game) -------------------------------
 
-    /// Collect the d20 contest rolls (seat → result) from an ActionResult's
-    /// leading `DieRolled` batch, preserving emission order.
-    fn contest_rolls(result: &ActionResult) -> Vec<(PlayerId, u8)> {
-        result
-            .events
-            .iter()
-            .filter_map(|e| match e {
-                GameEvent::DieRolled {
-                    player_id,
-                    sides: 20,
-                    result,
-                } => Some((*player_id, *result)),
-                _ => None,
-            })
-            .collect()
+    /// Extract the single `StartingPlayerContest` event's (rounds, winner) from
+    /// an ActionResult. Panics if absent or duplicated — the contest path emits
+    /// exactly one such event.
+    fn contest_event(result: &ActionResult) -> (Vec<ContestRound>, PlayerId) {
+        let mut found = result.events.iter().filter_map(|e| match e {
+            GameEvent::StartingPlayerContest { rounds, winner } => Some((rounds.clone(), *winner)),
+            _ => None,
+        });
+        let event = found.next().expect("a StartingPlayerContest event");
+        assert!(
+            found.next().is_none(),
+            "exactly one StartingPlayerContest event"
+        );
+        event
     }
 
-    /// CR 103.1 / CR 706: a seeded contest emits one d20 `DieRolled` per seat
-    /// (when there is no tie) and the high roller becomes the starting player.
+    /// CR 103.1 / CR 706: a seeded contest with no tie emits a single round
+    /// with one d20 per seat and the high roller becomes the starting player.
     #[test]
     fn start_game_contest_emits_d20_per_seat_and_picks_high_roller() {
         let mut state = GameState::new(FormatConfig::standard(), 2, 7);
         let result = start_game(&mut state);
-        let rolls = contest_rolls(&result);
+        let (rounds, winner) = contest_event(&result);
 
-        // No tie at this seed → exactly one roll per seat.
-        assert_eq!(rolls.len(), 2, "no tie → one roll per seat");
+        // No tie at this seed → exactly one round, one roll per seat.
+        assert_eq!(rounds.len(), 1, "no tie → single round");
+        let rolls = &rounds[0].rolls;
+        assert_eq!(rolls.len(), 2, "one roll per seat");
         assert_ne!(rolls[0].1, rolls[1].1, "seed 7 should not tie");
         let max_roll = rolls.iter().map(|&(_, r)| r).max().unwrap();
         // The winner is the seat that rolled the max.
-        let winner = rolls.iter().find(|&&(_, r)| r == max_roll).unwrap().0;
+        let argmax = rolls.iter().find(|&&(_, r)| r == max_roll).unwrap().0;
+        assert_eq!(winner, argmax, "winner == argmax of the round");
         assert_eq!(
             state.current_starting_player, winner,
             "high roller becomes the starting player"
@@ -21322,12 +21831,17 @@ mod mdfc_land_tests {
         assert!(rolls.iter().all(|&(_, r)| (1..=20).contains(&r)));
     }
 
-    /// Event sequencing: all `DieRolled` precede `GameStarted`, which precedes
-    /// `TurnStarted`.
+    /// Event sequencing: the single `StartingPlayerContest` precedes
+    /// `GameStarted`, which precedes `TurnStarted`.
     #[test]
     fn start_game_contest_sequences_dice_before_game_started() {
         let mut state = GameState::new(FormatConfig::standard(), 2, 7);
         let result = start_game(&mut state);
+        let contest = result
+            .events
+            .iter()
+            .position(|e| matches!(e, GameEvent::StartingPlayerContest { .. }))
+            .expect("StartingPlayerContest present");
         let first_game_started = result
             .events
             .iter()
@@ -21338,14 +21852,9 @@ mod mdfc_land_tests {
             .iter()
             .position(|e| matches!(e, GameEvent::TurnStarted { .. }))
             .expect("TurnStarted present");
-        let last_die = result
-            .events
-            .iter()
-            .rposition(|e| matches!(e, GameEvent::DieRolled { .. }))
-            .expect("DieRolled present");
         assert!(
-            last_die < first_game_started,
-            "all DieRolled must precede GameStarted"
+            contest < first_game_started,
+            "StartingPlayerContest must precede GameStarted"
         );
         assert!(
             first_game_started < first_turn_started,
@@ -21353,20 +21862,18 @@ mod mdfc_land_tests {
         );
     }
 
-    /// Tie path: when the first round ties, a reroll occurs (more rolls than
-    /// seats) and the contest still resolves to a unique starting player.
+    /// Tie path: when the first round ties, a reroll round occurs and each
+    /// later round's seat set is a subset of the prior round's tied-max group.
     #[test]
     fn start_game_contest_tie_triggers_reroll_and_resolves() {
-        // Scan seeds for one whose first round of two d20s ties, forcing a
-        // reroll. This proves the reroll branch is exercised end-to-end.
+        // Scan seeds for one whose contest needs more than one round (a tie at
+        // the round's max forces a reroll). Proves the reroll branch end-to-end.
         let mut tie_seed = None;
         for seed in 0..2000u64 {
             let mut probe = GameState::new(FormatConfig::standard(), 2, seed);
             let result = start_game(&mut probe);
-            let rolls = contest_rolls(&result);
-            // A tie on the first round means seat 0 and seat 1 rolled equal,
-            // producing a third (reroll) DieRolled event.
-            if rolls.len() > 2 {
+            let (rounds, _) = contest_event(&result);
+            if rounds.len() > 1 {
                 tie_seed = Some(seed);
                 break;
             }
@@ -21374,80 +21881,196 @@ mod mdfc_land_tests {
         let seed = tie_seed.expect("a tie within 2000 seeds (P(tie) = 1/20)");
         let mut state = GameState::new(FormatConfig::standard(), 2, seed);
         let result = start_game(&mut state);
-        let rolls = contest_rolls(&result);
-        assert!(
-            rolls.len() > 2,
-            "tie seed must produce reroll events beyond the two initial rolls"
-        );
+        let (rounds, winner) = contest_event(&result);
+        assert!(rounds.len() > 1, "tie seed must produce a reroll round");
+        // CR 103.1: each later round rerolls exactly the prior round's tied-max
+        // group, so its seat set ⊆ that group.
+        for window in rounds.windows(2) {
+            let (prev, next) = (&window[0], &window[1]);
+            let prev_max = prev.rolls.iter().map(|&(_, r)| r).max().unwrap();
+            let prev_top: Vec<PlayerId> = prev
+                .rolls
+                .iter()
+                .filter(|&&(_, r)| r == prev_max)
+                .map(|&(s, _)| s)
+                .collect();
+            for &(seat, _) in &next.rolls {
+                assert!(
+                    prev_top.contains(&seat),
+                    "reroll round seats must be a subset of the prior tied-max group"
+                );
+            }
+        }
         // Resolves to exactly one starting player that is a valid seat.
+        assert_eq!(state.current_starting_player, winner);
         assert!(
-            state.seat_order.contains(&state.current_starting_player),
+            state.seat_order.contains(&winner),
             "starting player is a valid seat after a reroll"
         );
         exactly_one_game_started(&result);
     }
 
-    /// N-seat (3–4 player) contest picks the global max roller.
+    /// CR 103.1: high roller wins — for 3- and 4-player contests across many
+    /// seeds, the winner is the unique-max roller of the FINAL round's rolls.
     #[test]
-    fn start_game_contest_three_and_four_seats_pick_global_max() {
+    fn start_game_contest_high_roller_wins_three_and_four_seats() {
         for player_count in [3u8, 4] {
-            let mut state = GameState::new(FormatConfig::commander(), player_count, 11);
-            let result = start_game(&mut state);
-            let rolls = contest_rolls(&result);
-            assert!(
-                rolls.len() >= player_count as usize,
-                "at least one roll per seat"
-            );
-            // The first `player_count` rolls are the opening round (one per seat).
-            let opening = &rolls[..player_count as usize];
-            let max_roll = opening.iter().map(|&(_, r)| r).max().unwrap();
-            // Count how many seats tied at the opening max.
-            let top: Vec<PlayerId> = opening
-                .iter()
-                .filter(|&&(_, r)| r == max_roll)
-                .map(|&(s, _)| s)
-                .collect();
-            if top.len() == 1 {
-                // Clean win: starting player is the unique opening max roller.
+            for seed in 0..500u64 {
+                let mut state = GameState::new(FormatConfig::commander(), player_count, seed);
+                let result = start_game(&mut state);
+                let (rounds, winner) = contest_event(&result);
+                let final_round = rounds.last().expect("at least one round");
+                let max_roll = final_round.rolls.iter().map(|&(_, r)| r).max().unwrap();
+                let top: Vec<PlayerId> = final_round
+                    .rolls
+                    .iter()
+                    .filter(|&&(_, r)| r == max_roll)
+                    .map(|&(s, _)| s)
+                    .collect();
+                // ChaCha20 never reaches the all-tie cap within these seeds, so
+                // the final round always has a unique max == winner.
                 assert_eq!(
-                    state.current_starting_player, top[0],
-                    "global max roller wins when there is no opening tie"
+                    top.len(),
+                    1,
+                    "final round has a unique max (no cap fallback) at seed {seed}"
                 );
-            } else {
-                // Opening tie → reroll happened; winner is still a valid seat.
-                assert!(rolls.len() > player_count as usize, "tie forced a reroll");
-                assert!(state.seat_order.contains(&state.current_starting_player));
+                assert_eq!(
+                    winner, top[0],
+                    "winner is the unique-max roller of the final round"
+                );
+                assert_eq!(state.current_starting_player, winner);
             }
         }
     }
 
-    /// The tie loop is BOUNDED: it can roll at most one initial round plus
-    /// FIRST_PLAYER_CONTEST_MAX_ROUNDS reroll rounds before falling back to the
-    /// lowest seat index. With at most `seats` rolls per round, the total
-    /// `DieRolled` count can never exceed `seats * (MAX_ROUNDS + 1)` — so the
-    /// engine can never hang at game start. (Forcing a *true* all-tie out of
-    /// ChaCha20 is impractical, so this asserts the structural bound that makes
-    /// the lowest-seat fallback reachable rather than the fallback firing.)
+    /// CR 103.1: round-structure invariants across player counts and seeds —
+    /// round 1 covers exactly the seat order, each later round's seat set equals
+    /// the prior round's tied-max group, and the winner is the final round's
+    /// unique max.
+    #[test]
+    fn start_game_contest_round_structure_invariants() {
+        for player_count in [2u8, 3, 4] {
+            for seed in 0..300u64 {
+                let format = if player_count == 2 {
+                    FormatConfig::standard()
+                } else {
+                    FormatConfig::commander()
+                };
+                let mut state = GameState::new(format, player_count, seed);
+                let seat_order = state.seat_order.clone();
+                let result = start_game(&mut state);
+                let (rounds, winner) = contest_event(&result);
+                assert!(!rounds.is_empty(), "at least one round");
+
+                // Round 1 covers exactly the seat order, in seat order.
+                let round1_seats: Vec<PlayerId> = rounds[0].rolls.iter().map(|&(s, _)| s).collect();
+                assert_eq!(
+                    round1_seats, seat_order,
+                    "round 1 rolls cover exactly the seat order"
+                );
+
+                // Each later round == set of seats tied at max of the prior round.
+                for window in rounds.windows(2) {
+                    let (prev, next) = (&window[0], &window[1]);
+                    let prev_max = prev.rolls.iter().map(|&(_, r)| r).max().unwrap();
+                    let mut prev_top: Vec<PlayerId> = prev
+                        .rolls
+                        .iter()
+                        .filter(|&&(_, r)| r == prev_max)
+                        .map(|&(s, _)| s)
+                        .collect();
+                    let mut next_seats: Vec<PlayerId> =
+                        next.rolls.iter().map(|&(s, _)| s).collect();
+                    prev_top.sort();
+                    next_seats.sort();
+                    assert_eq!(
+                        next_seats, prev_top,
+                        "reroll round seat set == prior round's tied-max group"
+                    );
+                }
+
+                // Winner == unique max of the final round (no all-tie cap hit
+                // within these seeds).
+                let final_round = rounds.last().unwrap();
+                let max_roll = final_round.rolls.iter().map(|&(_, r)| r).max().unwrap();
+                let top: Vec<PlayerId> = final_round
+                    .rolls
+                    .iter()
+                    .filter(|&&(_, r)| r == max_roll)
+                    .map(|&(s, _)| s)
+                    .collect();
+                assert_eq!(top.len(), 1, "final round has a unique max");
+                assert_eq!(winner, top[0]);
+                assert_eq!(state.current_starting_player, winner);
+            }
+        }
+    }
+
+    /// The tie loop is BOUNDED: at most FIRST_PLAYER_CONTEST_MAX_ROUNDS rounds
+    /// before the lowest-seat fallback. (Forcing a *true* all-tie out of
+    /// ChaCha20 is impractical, so this asserts the structural round bound that
+    /// makes the fallback reachable rather than the fallback firing.)
     #[test]
     fn start_game_contest_is_bounded_no_hang() {
         for seed in 0..200u64 {
             for player_count in [2u8, 3, 4] {
                 let mut state = GameState::new(FormatConfig::commander(), player_count, seed);
                 let result = start_game(&mut state);
-                let rolls = contest_rolls(&result);
-                let upper = player_count as usize * (FIRST_PLAYER_CONTEST_MAX_ROUNDS + 1);
+                let (rounds, winner) = contest_event(&result);
                 assert!(
-                    rolls.len() <= upper,
-                    "contest must terminate within the bounded reroll cap (got {} rolls, cap {upper})",
-                    rolls.len()
+                    rounds.len() <= FIRST_PLAYER_CONTEST_MAX_ROUNDS,
+                    "contest must terminate within the bounded reroll cap (got {} rounds, cap {FIRST_PLAYER_CONTEST_MAX_ROUNDS})",
+                    rounds.len()
                 );
-                assert!(state.seat_order.contains(&state.current_starting_player));
+                assert!(state.seat_order.contains(&winner));
+                assert_eq!(state.current_starting_player, winner);
             }
         }
     }
 
+    /// `build_contest_rounds` with SCRIPTED rolls (no RNG): a unique max in a
+    /// later round breaks an earlier tie, and an all-tie path falls back to the
+    /// lowest seat index. The one allowed hand-constructed contest test.
+    #[test]
+    fn build_contest_rounds_scripted_paths() {
+        let seats = [PlayerId(0), PlayerId(1), PlayerId(2)];
+
+        // Round 1: seats 0,1,2 roll 20,20,5 → tie among 0,1.
+        // Round 2: seats 0,1 roll 20,3 → seat 0 wins.
+        let scripted = [
+            vec![(PlayerId(0), 20u8), (PlayerId(1), 20), (PlayerId(2), 5)],
+            vec![(PlayerId(0), 20u8), (PlayerId(1), 3)],
+        ];
+        let mut idx = 0;
+        let (rounds, winner) = build_contest_rounds(&seats, |contenders| {
+            let round = scripted[idx].clone();
+            // The closure receives exactly the contenders we scripted for.
+            let seats_in: Vec<PlayerId> = round.iter().map(|&(s, _)| s).collect();
+            assert_eq!(contenders.to_vec(), seats_in);
+            idx += 1;
+            round
+        });
+        assert_eq!(rounds.len(), 2, "tie forces exactly one reroll round");
+        assert_eq!(rounds[0].rolls.len(), 3);
+        assert_eq!(rounds[1].rolls.len(), 2, "reroll only the tied group");
+        assert_eq!(winner, PlayerId(0));
+
+        // All-tie path: every round ties the full group → cap reached → lowest
+        // seat index (seat 1 here) wins.
+        let tie_seats = [PlayerId(2), PlayerId(1)];
+        let (rounds, winner) = build_contest_rounds(&tie_seats, |contenders| {
+            contenders.iter().map(|&s| (s, 7u8)).collect()
+        });
+        assert_eq!(
+            rounds.len(),
+            FIRST_PLAYER_CONTEST_MAX_ROUNDS,
+            "all-tie runs to the cap"
+        );
+        assert_eq!(winner, PlayerId(1), "lowest seat index wins on cap");
+    }
+
     /// Explicit `start_game_with_starting_player` runs no contest and emits NO
-    /// `DieRolled` events.
+    /// `StartingPlayerContest` event.
     #[test]
     fn start_game_with_explicit_player_emits_no_dice() {
         let mut state = GameState::new(FormatConfig::standard(), 2, 7);
@@ -21456,13 +22079,13 @@ mod mdfc_land_tests {
             !result
                 .events
                 .iter()
-                .any(|e| matches!(e, GameEvent::DieRolled { .. })),
-            "explicit starting player path must emit no contest dice"
+                .any(|e| matches!(e, GameEvent::StartingPlayerContest { .. })),
+            "explicit starting player path must emit no contest event"
         );
         assert_eq!(state.current_starting_player, PlayerId(1));
     }
 
-    /// Empty seat order keeps the PlayerId(0) fast path and emits no dice.
+    /// Empty seat order keeps the PlayerId(0) fast path and emits no contest.
     #[test]
     fn start_game_empty_seat_order_no_contest() {
         let mut state = GameState::new(FormatConfig::standard(), 2, 7);
@@ -21472,8 +22095,8 @@ mod mdfc_land_tests {
             !result
                 .events
                 .iter()
-                .any(|e| matches!(e, GameEvent::DieRolled { .. })),
-            "empty seat order must not roll any dice"
+                .any(|e| matches!(e, GameEvent::StartingPlayerContest { .. })),
+            "empty seat order must emit no contest event"
         );
         assert_eq!(state.current_starting_player, PlayerId(0));
     }

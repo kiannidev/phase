@@ -103,6 +103,7 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
         | WaitingFor::ChooseRingBearer { .. }
         | WaitingFor::ChooseDungeon { .. }
         | WaitingFor::ChooseDungeonRoom { .. }
+        | WaitingFor::SpecializeColor { .. }
         | WaitingFor::PayCost { .. }
         | WaitingFor::BlightChoice { .. }
         | WaitingFor::ChooseManaColor { .. }
@@ -120,6 +121,9 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
         | WaitingFor::RevealUntilKeptChoice { .. }
         | WaitingFor::RepeatDecision { .. }
         | WaitingFor::TopOrBottomChoice { .. }
+        // CR 702.140c + CR 730.2a: mutate top/bottom merge side — a forced
+        // mid-resolution choice; route to the ability catch-all.
+        | WaitingFor::MutateMergeChoice { .. }
         | WaitingFor::PopulateChoice { .. }
         | WaitingFor::ClashChooseOpponent { .. }
         | WaitingFor::ClashCardPlacement { .. }
@@ -134,6 +138,9 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
         | WaitingFor::ChooseObjectsSelection { .. }
         | WaitingFor::CategoryChoice { .. }
         | WaitingFor::AssignCombatDamage { .. }
+        // CR 510.1d + CR 702.22k: active player divides a banded blocker's
+        // damage — a forced mid-combat choice, routed to the ability catch-all.
+        | WaitingFor::AssignBlockerDamage { .. }
         // CR 107.1c + CR 107.14: "Pay any amount of X" prompts are forced
         // mid-resolution choices; route to ActivateAbility as a catch-all.
         | WaitingFor::PayAmountChoice { .. }

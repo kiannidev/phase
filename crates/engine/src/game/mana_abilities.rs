@@ -3030,6 +3030,7 @@ mod tests {
             keyword_kinds: vec![],
             cast_from_zone: None,
             mana_value: None,
+            color_count: None,
         };
         let goblin_ctx = PaymentContext::Spell(&goblin_spell);
         let mut pool_clone = pool.clone();
@@ -3046,6 +3047,7 @@ mod tests {
             keyword_kinds: vec![],
             cast_from_zone: None,
             mana_value: None,
+            color_count: None,
         };
         let elemental_ctx = PaymentContext::Spell(&elemental_spell);
         assert!(
@@ -4487,6 +4489,7 @@ mod tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             },
             vec![TargetRef::Object(lions)],
             pit,

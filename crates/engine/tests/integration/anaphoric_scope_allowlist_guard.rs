@@ -12,7 +12,7 @@
 //!
 //! After the #495 fix and the bare-anaphoric-possessive classifier fix (Yuriko,
 //! the Tiger's Shadow / Dark Confidant class — `classify_possessive_referent`
-//! in `parser/oracle_quantity.rs`), exactly **244** cards in the exported card
+//! in `parser/oracle_quantity.rs`), exactly **252** cards in the exported card
 //! data retain a runtime `ObjectScope::Anaphoric` in a `DealDamage` /
 //! `GainLife` / `LoseLife` (or similar) amount. This test holds that set as a
 //! sorted constant and fails if a card leaks in or out of it — a tripwire,
@@ -119,7 +119,7 @@
 //! or a count change) fails this test; a human then decides whether it is a
 //! legitimate new category-1/2/3/4 case (add it here) or a real regression
 //! (fix the parser). The curation lives at the *category* level — the
-//! correct granularity — not as 244 per-card annotations.
+//! correct granularity — not as 252 per-card annotations.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -142,8 +142,10 @@ const ANAPHORIC_SCOPE_CARDS: &[&str] = &[
     "angelic chorus",
     "archdruid's charm",
     "archon of redemption",
+    "artifact mutation",
     "assert perfection",
     "augury adept",
+    "aura mutation",
     "avatar destiny",
     "backlash",
     "baneful omen",
@@ -191,6 +193,7 @@ const ANAPHORIC_SCOPE_CARDS: &[&str] = &[
     "divine offering",
     "domri's ambush",
     "doomgape",
+    "dovescape",
     "durkwood tracker",
     "duskmantle seer",
     "electrosiphon",
@@ -225,6 +228,7 @@ const ANAPHORIC_SCOPE_CARDS: &[&str] = &[
     "hellhole rats",
     "hidetsugu and kairi",
     "hit",
+    "hoard-smelter dragon",
     "horrid shadowspinner",
     "hotel of fears",
     "huatli's final strike",
@@ -235,6 +239,7 @@ const ANAPHORIC_SCOPE_CARDS: &[&str] = &[
     "ikra shidiqi, the usurper",
     "immersturm",
     "imp's mischief",
+    "induce paranoia",
     "infernal reckoning",
     "interpret the signs",
     "jenova, ancient calamity",
@@ -425,7 +430,7 @@ fn anaphoric_scope_set_is_frozen() {
         leaked.is_empty(),
         "New card(s) leaked a runtime ObjectScope::Anaphoric and are not in the \
          frozen allowlist: {leaked:?}. Classify each: a legitimate new \
-         category-1/2/3 case (see module doc) should be added to \
+         category-1/2/3/4 case (see module doc) should be added to \
          ANAPHORIC_SCOPE_CARDS; a real regression must be fixed in the parser. \
          Categories 2 & 3 are tracked in #512, Dark Confidant's reveal-referent \
          in #511."
@@ -441,22 +446,25 @@ fn anaphoric_scope_set_is_frozen() {
     // both this and ANAPHORIC_SCOPE_CARDS shrink together.
     assert_eq!(
         observed.len(),
-        247,
-        "Expected exactly 247 cards retaining ObjectScope::Anaphoric. PR #1451 \
+        252,
+        "Expected exactly 252 cards retaining ObjectScope::Anaphoric. PR #1451 \
          re-scoped 8 dynamic-quantity 'its power' anaphora off the Anaphoric \
          arm onto typed quantity refs; PR #1522 re-scoped Dead Before Sunrise \
          through the recipient/subject rewrite. The category-2 'it deals damage \
          equal to its power' trigger-subject class (#512) then moved 10 more \
          cards (Warstorm Surge, Stalking Vengeance, Mage Slayer, et al.) onto \
-         `Power {{ scope: EventSource }}`; Sly Spy remains a legitimate \
-         reveal-referent case. Count moved to \
-         {}.",
+         `Power {{ scope: EventSource }}`. The parser later began extracting the \
+         'where X is that <type>'s mana value' tail for five more cards in the \
+         existing category-3 (target-destroy anaphora: Artifact Mutation, Aura \
+         Mutation, Hoard-Smelter Dragon) and category-4 (counter-then-act: \
+         Dovescape, Induce Paranoia) classes, moving the count 247 -> 252. Count \
+         moved to {}.",
         observed.len()
     );
     assert_eq!(
         ANAPHORIC_SCOPE_CARDS.len(),
-        247,
-        "ANAPHORIC_SCOPE_CARDS must list exactly 247 cards."
+        252,
+        "ANAPHORIC_SCOPE_CARDS must list exactly 252 cards."
     );
 }
 

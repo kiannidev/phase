@@ -1117,7 +1117,9 @@ impl Keyword {
     ///   triggered abilities whose instance count is consumed by `for _ in 0..count`
     ///   loops in `game/triggers.rs`.
     /// - Myriad (CR 702.116a: a triggered ability; CR 702.116b: each instance
-    ///   triggers separately) / Exalted (CR 702.83a: a triggered ability;
+    ///   triggers separately) / Increment (CR 702.191a: a triggered ability;
+    ///   CR 702.191b: each instance triggers separately) / Exalted (CR 702.83a:
+    ///   a triggered ability;
     ///   per-instance multiplicity grounded in the general CR 113.2c rule, since
     ///   CR 702.83 has no card-specific multiplicity clause) — one trigger is
     ///   installed per face `Keyword` instance by
@@ -1135,6 +1137,7 @@ impl Keyword {
             Keyword::Cascade
                 | Keyword::Storm
                 | Keyword::Myriad
+                | Keyword::Increment
                 | Keyword::Exalted
                 | Keyword::DoubleTeam
         )

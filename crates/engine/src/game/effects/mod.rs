@@ -13041,6 +13041,69 @@ mod tests {
         );
     }
 
+    /// Issue #1972: Extort must prompt before draining, then pay {W/B}, drain each
+    /// opponent, and gain life equal to the total life lost.
+    #[test]
+    fn issue_1972_extort_optional_accept_drains_all_opponents_and_gains() {
+        use crate::database::synthesis::synthesize_extort;
+        use crate::game::ability_utils::build_resolved_from_def;
+        use crate::types::card::CardFace;
+        use crate::types::format::FormatConfig;
+        use crate::types::game_state::{GameState, WaitingFor};
+        use crate::types::identifiers::ObjectId;
+        use crate::types::keywords::Keyword;
+        use crate::types::mana::{ManaType, ManaUnit};
+        use crate::types::player::PlayerId;
+        use crate::types::triggers::TriggerMode;
+
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Extort);
+        synthesize_extort(&mut face);
+        let execute = face
+            .triggers
+            .iter()
+            .find(|t| {
+                matches!(t.mode, TriggerMode::SpellCast)
+                    && matches!(
+                        t.execute.as_deref().map(|e| e.optional),
+                        Some(true)
+                    )
+            })
+            .and_then(|t| t.execute.as_deref())
+            .expect("synthesized extort trigger");
+
+        let mut state = GameState::new(FormatConfig::standard(), 3, 42);
+        let source_id = ObjectId(100);
+        state.players[0].mana_pool.add(ManaUnit::new(
+            ManaType::White,
+            ObjectId(200),
+            false,
+            Vec::new(),
+        ));
+        let resolved = build_resolved_from_def(execute, source_id, PlayerId(0));
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &resolved, &mut events, 0).unwrap();
+        assert!(
+            matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }),
+            "extort must prompt before draining, got {:?}",
+            state.waiting_for
+        );
+        assert_eq!(
+            (state.players[1].life, state.players[2].life),
+            (20, 20),
+            "opponents must not lose life before the may-pay decision"
+        );
+
+        crate::game::engine_payment_choices::handle_optional_effect_choice(
+            &mut state, true, &mut events,
+        )
+        .unwrap();
+        assert_eq!(state.players[0].life, 22);
+        assert_eq!(state.players[1].life, 19);
+        assert_eq!(state.players[2].life, 19);
+        assert_eq!(state.players[0].mana_pool.mana.len(), 0);
+    }
+
     #[test]
     fn optional_resolution_pay_ability_cost_if_you_do_draws_after_composite_payment() {
         let mut state = GameState::new_two_player(42);

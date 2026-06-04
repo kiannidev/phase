@@ -13,7 +13,7 @@ use crate::types::ability::{
     CardPlayMode, CastVariantPaid, ChoiceType, Comparator, ContinuousModification, ControllerRef,
     CopyRetargetPermission, CounterTriggerFilter, DamageKindFilter, Duration, Effect, FilterProp,
     KickerVariant, ManaContribution, ManaProduction, ModalSelectionCondition,
-    ModalSelectionConstraint, NinjutsuVariant, ObjectScope, ParsedCondition, PlayerFilter,
+    ModalSelectionConstraint,     NinjutsuVariant, ObjectScope, ParsedCondition, PaymentCost, PlayerFilter,
     PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef, ReplacementCondition,
     ReplacementDefinition, RuntimeHandler, SearchSelectionConstraint, StaticCondition,
     StaticDefinition, TargetChoiceTiming, TargetFilter, TriggerCondition, TriggerDefinition,
@@ -2888,18 +2888,32 @@ fn build_mentor_trigger() -> TriggerDefinition {
 fn is_extort_trigger(t: &TriggerDefinition) -> bool {
     matches!(t.mode, TriggerMode::SpellCast)
         && matches!(t.valid_target, Some(TargetFilter::Controller))
-        && t.execute
-            .as_deref()
-            .is_some_and(|a| a.optional && a.cost.is_some())
+        && t.execute.as_deref().is_some_and(|a| {
+            a.optional
+                && matches!(
+                    &*a.effect,
+                    Effect::PayCost {
+                        cost: PaymentCost::AbilityCost {
+                            cost: AbilityCost::Mana { .. },
+                        },
+                        ..
+                    }
+                )
+                && a.sub_ability.as_deref().is_some_and(|drain| {
+                    matches!(drain.player_scope, Some(PlayerFilter::Opponent))
+                        && matches!(&*drain.effect, Effect::LoseLife { .. })
+                })
+        })
 }
 
 fn build_extort_trigger() -> TriggerDefinition {
-    // The drain effect: each opponent loses 1 life, you gain that much.
-    // Use player_scope to iterate over opponents for the LoseLife,
-    // then sub_ability for the controller's GainLife.
-    let drain_effect = Effect::LoseLife {
-        amount: QuantityExpr::Fixed { value: 1 },
-        target: None,
+    // CR 702.101a: Optional {W/B} payment must resolve before the opponent drain.
+    // `AbilityDefinition::cost` is not carried into `ResolvedAbility`, so the
+    // payment is modeled as an optional `PayCost` parent (mirroring parsed
+    // "you may pay {cost}. If you do, …" chains) with the drain on the sub.
+    let wb_mana = ManaCost::Cost {
+        shards: vec![ManaCostShard::WhiteBlack],
+        generic: 0,
     };
     let gain_life = AbilityDefinition::new(
         AbilityKind::Spell,
@@ -2910,20 +2924,32 @@ fn build_extort_trigger() -> TriggerDefinition {
             player: TargetFilter::Controller,
         },
     );
-    let execute = AbilityDefinition::new(AbilityKind::Spell, drain_effect)
-        .player_scope(PlayerFilter::Opponent)
-        .sub_ability(gain_life)
-        .optional()
-        .cost(AbilityCost::Mana {
-            cost: ManaCost::Cost {
-                shards: vec![ManaCostShard::WhiteBlack],
-                generic: 0,
+    let drain = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::LoseLife {
+            amount: QuantityExpr::Fixed { value: 1 },
+            target: None,
+        },
+    )
+    .player_scope(PlayerFilter::Opponent)
+    .sub_ability(gain_life);
+    let execute = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::PayCost {
+            cost: PaymentCost::AbilityCost {
+                cost: AbilityCost::Mana {
+                    cost: wb_mana.clone(),
+                },
             },
-        })
-        .description(
-            "CR 702.101a: Extort — pay {W/B}, each opponent loses 1 life, you gain that much life"
-                .to_string(),
-        );
+            payer: TargetFilter::Controller,
+        },
+    )
+    .optional()
+    .sub_ability(drain)
+    .description(
+        "CR 702.101a: Extort — pay {W/B}, each opponent loses 1 life, you gain that much life"
+            .to_string(),
+    );
     TriggerDefinition::new(TriggerMode::SpellCast)
         .valid_target(TargetFilter::Controller)
         .execute(execute)
@@ -7540,17 +7566,37 @@ mod extort_synthesis_tests {
             panic!("execute body required");
         };
         assert!(execute.optional, "extort must be optional (may pay)");
-        assert!(execute.cost.is_some(), "extort must have a mana cost");
+        let Effect::PayCost {
+            cost: PaymentCost::AbilityCost {
+                cost: AbilityCost::Mana { cost },
+            },
+            payer,
+        } = &*execute.effect
+        else {
+            panic!("extort must pay W/B via PayCost before draining");
+        };
+        assert_eq!(
+            cost,
+            &ManaCost::Cost {
+                shards: vec![ManaCostShard::WhiteBlack],
+                generic: 0,
+            }
+        );
+        assert!(matches!(payer, TargetFilter::Controller));
+
+        let Some(drain) = execute.sub_ability.as_deref() else {
+            panic!("extort must chain drain after payment");
+        };
         assert!(
-            matches!(execute.player_scope, Some(PlayerFilter::Opponent)),
+            matches!(drain.player_scope, Some(PlayerFilter::Opponent)),
             "drain must scope to opponents"
         );
         assert!(
-            matches!(&*execute.effect, Effect::LoseLife { .. }),
-            "primary effect must be LoseLife"
+            matches!(&*drain.effect, Effect::LoseLife { .. }),
+            "drain effect must be LoseLife"
         );
 
-        let Some(gain) = execute.sub_ability.as_deref() else {
+        let Some(gain) = drain.sub_ability.as_deref() else {
             panic!("extort must chain a gain-life rider");
         };
         let Effect::GainLife { amount, player } = &*gain.effect else {

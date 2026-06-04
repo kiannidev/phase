@@ -8,7 +8,7 @@
 //! The AI reaches equip via `GameAction::ActivateAbility` on the equipment's
 //! equip ability (effect `Effect::Attach`), then `GameAction::Equip` while
 //! `WaitingFor::EquipTarget`. Both route to `DecisionKind::ActivateAbility`.
-//! This policy rejects pointless activations and re-targets (including paying
+//! This policy rejects same-host activations and re-targets (including paying
 //! {1} to re-equip Skullclamp to the creature it is already on — #1986).
 //!
 //! It never *rewards* equipping (the reported problem is over-equipping); fresh
@@ -62,7 +62,11 @@ fn is_upgrade_host(state: &GameState, current_host: ObjectId, creature_id: Objec
 }
 
 /// Best base power among other creatures you control (excluding `current_host`).
-fn best_other_creature_base(state: &GameState, ai_player: PlayerId, current_host: ObjectId) -> i32 {
+fn best_other_creature_base(
+    state: &GameState,
+    ai_player: PlayerId,
+    current_host: ObjectId,
+) -> Option<i32> {
     state
         .battlefield
         .iter()
@@ -75,7 +79,6 @@ fn best_other_creature_base(state: &GameState, ai_player: PlayerId, current_host
             o.base_power
         })
         .max()
-        .unwrap_or(i32::MIN)
 }
 
 pub struct EquipmentPriorityPolicy;
@@ -111,9 +114,6 @@ impl TacticalPolicy for EquipmentPriorityPolicy {
                 let Some(equip) = ctx.state.objects.get(source_id) else {
                     return na();
                 };
-                if !equip.card_types.subtypes.iter().any(|s| s == "Equipment") {
-                    return na();
-                }
                 let Some(ability) = equip.abilities.get(*ability_index) else {
                     return na();
                 };
@@ -132,6 +132,9 @@ impl TacticalPolicy for EquipmentPriorityPolicy {
         let Some(equip) = ctx.state.objects.get(&equipment_id) else {
             return na();
         };
+        if !equip.card_types.subtypes.iter().any(|s| s == "Equipment") {
+            return na();
+        }
 
         let Some(host_id) = equip.attached_to.as_ref().and_then(|a| a.as_object()) else {
             return score(0.0, "equipment_equip_fresh");
@@ -153,10 +156,12 @@ impl TacticalPolicy for EquipmentPriorityPolicy {
             .get(&host_id)
             .and_then(|o| o.base_power)
             .unwrap_or(0);
-        if best_other_creature_base(ctx.state, ctx.ai_player, host_id) > host_base {
-            score(0.0, "equipment_upgrade_available")
-        } else {
-            reject("equipment_no_better_home")
+        match best_other_creature_base(ctx.state, ctx.ai_player, host_id) {
+            Some(best_other_base) if best_other_base > host_base => {
+                score(0.0, "equipment_upgrade_available")
+            }
+            Some(_) => score(-DOWNGRADE_TARGET_PENALTY, "equipment_no_better_home"),
+            None => reject("equipment_no_other_home"),
         }
     }
 }
@@ -276,13 +281,26 @@ mod tests {
     }
 
     #[test]
-    fn reequip_no_better_home_rejected() {
+    fn reequip_no_other_home_rejected() {
+        let mut state = GameState::new_two_player(42);
+        let equip = equipment(&mut state);
+        let host = creature(&mut state, 3);
+        attach(&mut state, equip, host, 2);
+        assert_reject(activate_equip(&state, equip), "equipment_no_other_home");
+    }
+
+    #[test]
+    fn reequip_no_better_home_penalized_when_another_target_exists() {
         let mut state = GameState::new_two_player(42);
         let equip = equipment(&mut state);
         let host = creature(&mut state, 3);
         creature(&mut state, 2); // smaller alternative
         attach(&mut state, equip, host, 2);
-        assert_reject(activate_equip(&state, equip), "equipment_no_better_home");
+        assert_score(
+            activate_equip(&state, equip),
+            "equipment_no_better_home",
+            -DOWNGRADE_TARGET_PENALTY,
+        );
     }
 
     /// #1986: Skullclamp-style loop — paying equip cost to re-attach to the same host.

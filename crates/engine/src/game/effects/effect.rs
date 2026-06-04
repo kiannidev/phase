@@ -113,6 +113,30 @@ fn register_transient_effect(
         );
         return;
     }
+    // CR 603.2 + CR 608.2c: Subject-based cast triggers (Judith, Carnage
+    // Connoisseur: "that spell gains deathtouch and lifelink") carry
+    // `target: TriggeringSource`. Short-circuit before the chosen-targets
+    // branch (issue #323 class) so propagated `ability.targets` cannot bind
+    // the grant to the wrong object.
+    if matches!(resolved_filter, Some(TargetFilter::TriggeringSource)) {
+        if let Some(TargetRef::Object(obj_id)) =
+            crate::game::targeting::resolve_event_context_target(
+                state,
+                &TargetFilter::TriggeringSource,
+                ability.source_id,
+            )
+        {
+            state.add_transient_continuous_effect(
+                ability.source_id,
+                ability.controller,
+                duration.clone(),
+                TargetFilter::SpecificObject { id: obj_id },
+                modifications,
+                static_def.condition.clone(),
+            );
+        }
+        return;
+    }
     let static_affected_references_target_player = target_filter.is_none()
         && static_def
             .affected
@@ -297,28 +321,7 @@ fn register_transient_effect(
                 );
             }
         }
-        // CR 603.2 + CR 608.2c: Subject-based cast triggers (Judith, Carnage
-        // Connoisseur: "that spell gains deathtouch and lifelink") carry
-        // `target: TriggeringSource` with no chosen targets. The spell is on the
-        // stack, so the battlefield broadcast arm cannot reach it.
-        Some(TargetFilter::TriggeringSource) if ability.targets.is_empty() => {
-            if let Some(TargetRef::Object(obj_id)) =
-                crate::game::targeting::resolve_event_context_target(
-                    state,
-                    &TargetFilter::TriggeringSource,
-                    ability.source_id,
-                )
-            {
-                state.add_transient_continuous_effect(
-                    ability.source_id,
-                    ability.controller,
-                    duration.clone(),
-                    TargetFilter::SpecificObject { id: obj_id },
-                    modifications.clone(),
-                    static_def.condition.clone(),
-                );
-            }
-        }
+        // TriggeringSource is handled via early short-circuit to avoid target propagation bugs.
         Some(TargetFilter::ParentTarget) if ability.targets.is_empty() => {
             let tracked = state
                 .chain_tracked_set_id
@@ -919,12 +922,82 @@ mod tests {
             tce.affected,
             TargetFilter::SpecificObject { id: cast_spell }
         );
-        assert!(tce.modifications.contains(&ContinuousModification::AddKeyword {
-            keyword: Keyword::Deathtouch,
-        }));
-        assert!(tce.modifications.contains(&ContinuousModification::AddKeyword {
-            keyword: Keyword::Lifelink,
-        }));
+        assert!(tce
+            .modifications
+            .contains(&ContinuousModification::AddKeyword {
+                keyword: Keyword::Deathtouch,
+            }));
+        assert!(tce
+            .modifications
+            .contains(&ContinuousModification::AddKeyword {
+                keyword: Keyword::Lifelink,
+            }));
+    }
+
+    /// Issue #323 class: propagated `ability.targets` must not override TriggeringSource.
+    #[test]
+    fn triggering_source_short_circuits_when_targets_propagated() {
+        let mut state = GameState::new_two_player(42);
+        let judith = create_object(
+            &mut state,
+            CardId(10),
+            PlayerId(0),
+            "Judith, Carnage Connoisseur".to_string(),
+            Zone::Battlefield,
+        );
+        let cast_spell = create_object(
+            &mut state,
+            CardId(11),
+            PlayerId(0),
+            "Shock".to_string(),
+            Zone::Stack,
+        );
+        let wrong_target = create_object(
+            &mut state,
+            CardId(12),
+            PlayerId(0),
+            "Wrong".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&cast_spell)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Instant);
+        state.current_trigger_event = Some(GameEvent::SpellCast {
+            card_id: CardId(11),
+            controller: PlayerId(0),
+            object_id: cast_spell,
+        });
+
+        let static_def = StaticDefinition::continuous()
+            .affected(TargetFilter::ParentTarget)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Lifelink,
+            }]);
+        let ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![static_def],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: Some(TargetFilter::TriggeringSource),
+            },
+            vec![TargetRef::Object(wrong_target)],
+            judith,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilEndOfTurn);
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.transient_continuous_effects.len(), 1);
+        assert_eq!(
+            state.transient_continuous_effects[0].affected,
+            TargetFilter::SpecificObject { id: cast_spell },
+            "TriggeringSource must bind to the cast spell, not propagated targets"
+        );
     }
 
     #[test]

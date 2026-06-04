@@ -1292,9 +1292,7 @@ fn parse_damage_dealt_this_turn_ref(input: &str) -> OracleResult<'_, QuantityRef
             target: Box::new(TargetFilter::And {
                 filters: vec![
                     TargetFilter::Player,
-                    TargetFilter::Typed(
-                        TypedFilter::default().controller(ControllerRef::Opponent),
-                    ),
+                    TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent)),
                 ],
             }),
             aggregate: AggregateFunction::Sum,

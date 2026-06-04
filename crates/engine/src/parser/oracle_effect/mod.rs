@@ -18,14 +18,14 @@ pub(crate) use lower::{
 // pub(super) re-exports used by sibling submodules via `super::fn_name()`.
 pub(super) use lower::{
     apply_where_x_to_filter, extract_exact_target_multi_target, parse_dynamic_counter_suffix_body,
-    parse_multi_target_count_expr, parse_pump_clause, parse_where_x_quantity_expression,
-    strip_exact_target_prefix, strip_optional_target_prefix, try_parse_pump,
+    parse_multi_target_count_expr, parse_where_x_quantity_expression, strip_exact_target_prefix,
+    strip_optional_target_prefix, try_parse_pump,
 };
 // Test-only re-exports from lower module.
 #[cfg(test)]
 pub(super) use lower::{
-    parse_damage_each_player_scope, rewrite_token_created_this_way_unimplemented,
-    target_filter_is_single_object_target,
+    parse_damage_each_player_scope, parse_pump_clause,
+    rewrite_token_created_this_way_unimplemented, target_filter_is_single_object_target,
 };
 // Shared utilities from the lowering module used by the parse phase above.
 // Using local `use` bindings avoids updating call sites in this file.
@@ -6696,11 +6696,7 @@ fn is_player_filter(filter: &TargetFilter) -> bool {
         )
 }
 
-fn thread_for_each_subject(
-    effect: Effect,
-    original: &str,
-    ctx: &mut ParseContext,
-) -> Effect {
+fn thread_for_each_subject(effect: Effect, original: &str, ctx: &mut ParseContext) -> Effect {
     let application = match for_each_subject_application(original, ctx) {
         Some(application) => application,
         None => return effect,

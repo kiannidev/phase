@@ -10851,8 +10851,7 @@ mod tests {
         CastingPermission, Comparator, ContinuousModification, ControllerRef, CountScope,
         DamageModification, DamageSource, DelayedTriggerCondition, Duration, Effect, FilterProp,
         ManaSpendPermission, ObjectScope, PlayerFilter, PlayerScope, PtStat, PtValue, PtValueScope,
-        QuantityExpr, QuantityRef, SharedQuality, TargetFilter,
-        TypeFilter, TypedFilter,
+        QuantityExpr, QuantityRef, SharedQuality, TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::counter::{CounterMatch, CounterType};
     use crate::types::replacements::ReplacementEvent;

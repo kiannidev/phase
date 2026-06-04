@@ -2504,8 +2504,7 @@ fn parse_for_each_recipient_shared_quality(input: &str) -> OracleResult<'_, Quan
         opt(alt((value((), tag("other ")), value((), tag("another "))))).parse(input)?;
     let (rest, type_filter) = parse_type_filter_word(rest)?;
     let (rest, _) = tag(" on the battlefield ").parse(rest)?;
-    let (rest, shared_quality) =
-        parse_shared_quality_clause(rest, &ParseContext::default())?;
+    let (rest, shared_quality) = parse_shared_quality_clause(rest, &ParseContext::default())?;
 
     let mut properties = Vec::new();
     if has_other.is_some() {
@@ -2919,10 +2918,8 @@ mod tests {
 
     #[test]
     fn parse_for_each_other_attacking_goblin_via_type_phrase_fallback() {
-        let qty = crate::parser::oracle_quantity::parse_for_each_clause(
-            "other attacking Goblin",
-        )
-        .expect("oracle_quantity fallback should parse other attacking Goblin");
+        let qty = crate::parser::oracle_quantity::parse_for_each_clause("other attacking Goblin")
+            .expect("oracle_quantity fallback should parse other attacking Goblin");
         assert!(matches!(
             qty,
             QuantityRef::ObjectCount {

@@ -4042,6 +4042,7 @@ pub(crate) fn try_parse_pump(lower: &str, _text: &str) -> Option<Effect> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn parse_pump_clause(predicate: &str) -> Option<(PtValue, PtValue, Option<Duration>)> {
     parse_pump_clause_with_context(predicate, &ParseContext::default())
 }

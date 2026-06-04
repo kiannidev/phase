@@ -3938,10 +3938,9 @@ pub(crate) fn parse_shared_quality_clause<'a>(
     .parse(rest)?;
     let (rest, _) = opt(alt((tag::<_, _, Vbe>("a "), tag("at least one ")))).parse(rest)?;
     let (rest, quality) = parse_shared_quality(rest)?;
-    let (rest, reference) = opt(nom::sequence::preceded(
-        tag::<_, _, Vbe>(" with "),
-        |i| parse_shared_quality_reference(i, ctx),
-    ))
+    let (rest, reference) = opt(nom::sequence::preceded(tag::<_, _, Vbe>(" with "), |i| {
+        parse_shared_quality_reference(i, ctx)
+    }))
     .parse(rest)?;
 
     Ok((
@@ -9377,7 +9376,8 @@ mod tests {
 
     #[test]
     fn that_targets_only_single_creature_you_control() {
-        let result = parse_that_clause_suffix(" that targets only a single creature you control,", None);
+        let result =
+            parse_that_clause_suffix(" that targets only a single creature you control,", None);
         let (props, consumed) = result.expect("should parse");
         // Should produce TargetsOnly + HasSingleTarget
         assert_eq!(props.len(), 2);
@@ -9399,7 +9399,8 @@ mod tests {
 
     #[test]
     fn that_targets_only_single_permanent_or_player() {
-        let result = parse_that_clause_suffix(" that targets only a single permanent or player", None);
+        let result =
+            parse_that_clause_suffix(" that targets only a single permanent or player", None);
         let (props, _consumed) = result.expect("should parse");
         assert_eq!(props.len(), 2);
         assert!(matches!(&props[0], FilterProp::TargetsOnly { .. }));
@@ -9518,7 +9519,8 @@ mod tests {
     #[test]
     fn that_targets_one_or_more_creatures() {
         // "one or more" prefix is stripped (redundant with .any() semantics)
-        let result = parse_that_clause_suffix(" that targets one or more creatures you control,", None);
+        let result =
+            parse_that_clause_suffix(" that targets one or more creatures you control,", None);
         let (props, consumed) = result.expect("should parse");
         assert_eq!(props.len(), 1);
         if let FilterProp::Targets { filter } = &props[0] {

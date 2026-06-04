@@ -38,9 +38,8 @@ use crate::types::ability::{
     CoinFlipResult, Comparator, ControllerRef, CounterTriggerFilter, DamageKindFilter,
     DestinationConstraint, Effect, FilterProp, ObjectScope, OriginConstraint, PlayerFilter,
     PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, StaticCondition, TargetFilter,
-    TriggerCondition,
-    TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter, UnlessPayModifier,
-    ZoneChangeClause,
+    TriggerCondition, TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter,
+    UnlessPayModifier, ZoneChangeClause,
 };
 use crate::types::card_type::{is_land_subtype, CoreType};
 use crate::types::counter::CounterType;
@@ -4435,9 +4434,12 @@ fn split_trigger(tp: TextPair<'_>) -> (String, String) {
 /// boundary. Talion, the Kindly Lord is the motivating card.
 fn continues_spell_quality_disjunction(after_comma: &str) -> bool {
     let trimmed = after_comma.trim_start();
-    trimmed.starts_with("power, or ")
-        || trimmed.starts_with("toughness, or ")
-        || (trimmed.starts_with("or ")
+    // Talion disjunction only: "mana value, power, or toughness equal to [the]
+    // chosen/that number". Do not treat unrelated ", power, or …" phrases as
+    // condition continuations — that skips the real effect boundary and surfaces
+    // swallowed-clause diagnostics on unrelated cards.
+    trimmed.starts_with("power, or toughness")
+        || (trimmed.starts_with("or toughness")
             && (trimmed.contains("equal to the chosen number")
                 || trimmed.contains("equal to that number")))
 }
@@ -17344,6 +17346,18 @@ mod tests {
     }
 
     #[test]
+    fn find_effect_boundary_does_not_skip_unrelated_power_or_comma() {
+        let line = "Whenever an opponent casts a red spell, you draw a card";
+        let lower = line.to_lowercase();
+        let boundary = find_effect_boundary(&lower).expect("effect boundary");
+        assert!(
+            lower[boundary..].starts_with(", you draw"),
+            "comma after spell type should split condition/effect, got {:?}",
+            &lower[boundary..]
+        );
+    }
+
+    #[test]
     fn find_effect_boundary_skips_spell_quality_comma() {
         let line = "Whenever an opponent casts a spell with mana value, power, or toughness equal to the chosen number, that player loses 2 life";
         let lower = line.to_lowercase();
@@ -17361,11 +17375,10 @@ mod tests {
             "spell with mana value, power, or toughness equal to the chosen number",
         )
         .expect("suffix should parse");
-        assert!(
-            tf.properties
-                .iter()
-                .any(|p| matches!(p, FilterProp::AnyOf { .. }))
-        );
+        assert!(tf
+            .properties
+            .iter()
+            .any(|p| matches!(p, FilterProp::AnyOf { .. })));
     }
 
     #[test]
@@ -17448,6 +17461,28 @@ mod tests {
             .as_ref()
             .expect("draw chained after life loss");
         assert!(matches!(draw.effect.as_ref(), Effect::Draw { .. }));
+    }
+
+    #[test]
+    fn talion_kindly_lord_full_oracle_no_swallowed_clause() {
+        use crate::parser::oracle::parse_oracle_text;
+        let text = "Flying\nAs Talion, the Kindly Lord enters the battlefield, choose a number between 1 and 10.\nWhenever an opponent casts a spell with mana value, power, or toughness equal to the chosen number, that player loses 2 life and you draw a card.";
+        let parsed = parse_oracle_text(
+            text,
+            "Talion, the Kindly Lord",
+            &["Flying".to_string()],
+            &["Creature".to_string()],
+            &["Faerie".to_string(), "Noble".to_string()],
+        );
+        let swallowed: Vec<_> = parsed
+            .parse_warnings
+            .iter()
+            .filter(|w| w.category_name() == "swallowed-clause")
+            .collect();
+        assert!(
+            swallowed.is_empty(),
+            "Talion should parse without swallowed-clause warnings: {swallowed:?}"
+        );
     }
 
     #[test]

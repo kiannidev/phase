@@ -101,9 +101,7 @@ fn issue_1974_attack_discard_reaches_all_opponents_after_pause() {
         apply(
             &mut state,
             player,
-            GameAction::SelectCards {
-                cards: vec![pick],
-            },
+            GameAction::SelectCards { cards: vec![pick] },
         )
         .expect("discard choice should succeed");
     }

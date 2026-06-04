@@ -78,9 +78,11 @@ impl DamageContext {
             source_id,
             controller: obj.controller,
             source_is_creature: obj.card_types.core_types.contains(&CoreType::Creature),
-            // CR 613.1f + CR 702.2 + CR 702.15: Off-battlefield keyword grants (e.g. Judith's
-            // "that spell gains deathtouch and lifelink") live in transient continuous effects
-            // and are visible via `object_has_effective_keyword_kind`, not printed `obj.keywords`.
+            // CR 613.1f + CR 702.2 + CR 702.15 + CR 702.80 + CR 702.90:
+            // Off-battlefield keyword grants (e.g. Judith's "that spell gains
+            // deathtouch and lifelink") live in transient continuous effects and
+            // are visible via `object_has_effective_keyword_kind`, not printed
+            // `obj.keywords`.
             has_deathtouch: keywords::object_has_effective_keyword_kind(
                 state,
                 source_id,

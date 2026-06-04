@@ -995,7 +995,9 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::CostPaidObject => "cost-paid object's colors".into(),
         },
         QuantityRef::ObjectTypelineComponentCount { scope } => match scope {
-            ObjectScope::Source | ObjectScope::Anaphoric => "typeline components on self".into(),
+            ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
+                "typeline components on self".into()
+            }
             ObjectScope::Target => "typeline components on target".into(),
             ObjectScope::Recipient => "typeline components on recipient".into(),
             ObjectScope::EventSource => "typeline components on event source".into(),
@@ -5341,7 +5343,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::CostPaidObject => ("CostPaidObjectNameWordCount", Handled),
         },
         QuantityRef::ObjectTypelineComponentCount { scope } => match scope {
-            ObjectScope::Source | ObjectScope::Anaphoric => {
+            ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
                 ("SourceObjectTypelineComponentCount", Handled)
             }
             ObjectScope::Target => ("TargetObjectTypelineComponentCount", Handled),

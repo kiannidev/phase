@@ -9995,6 +9995,7 @@ fn quantity_expr_is_board_state_relative(expr: &QuantityExpr) -> bool {
         QuantityExpr::Ref { qty } => quantity_ref_is_board_state_relative(qty),
         QuantityExpr::DivideRounded { inner, .. }
         | QuantityExpr::Offset { inner, .. }
+        | QuantityExpr::ClampMin { inner, .. }
         | QuantityExpr::Multiply { inner, .. } => quantity_expr_is_board_state_relative(inner),
         QuantityExpr::Sum { exprs } => exprs.iter().all(quantity_expr_is_board_state_relative),
         _ => false,
@@ -12128,6 +12129,7 @@ mod tests {
                 active_zones: vec![],
                 characteristic_defining: false,
                 description: Some("Assassin spells you cast have freerunning {B}{B}.".to_string()),
+                attack_defended: None,
             };
             obj.static_definitions = vec![def].into();
         }
@@ -15991,8 +15993,14 @@ mod tests {
                         .expect("priority pass to advance the turn");
                 }
                 WaitingFor::DeclareAttackers { .. } => {
-                    apply_as_current(&mut state, GameAction::DeclareAttackers { attacks: vec![] })
-                        .expect("declare no attackers");
+                    apply_as_current(
+                        &mut state,
+                        GameAction::DeclareAttackers {
+                            attacks: vec![],
+                            bands: vec![],
+                        },
+                    )
+                    .expect("declare no attackers");
                 }
                 WaitingFor::DeclareBlockers { .. } => {
                     apply_as_current(
@@ -16160,8 +16168,14 @@ mod tests {
                         .expect("priority pass to advance the turn");
                 }
                 WaitingFor::DeclareAttackers { .. } => {
-                    apply_as_current(&mut state, GameAction::DeclareAttackers { attacks: vec![] })
-                        .expect("declare no attackers");
+                    apply_as_current(
+                        &mut state,
+                        GameAction::DeclareAttackers {
+                            attacks: vec![],
+                            bands: vec![],
+                        },
+                    )
+                    .expect("declare no attackers");
                 }
                 WaitingFor::DeclareBlockers { .. } => {
                     apply_as_current(
@@ -17311,6 +17325,7 @@ mod tests {
                     active_zones: vec![],
                     characteristic_defining: false,
                     description: None,
+                    attack_defended: None,
                 }]
                 .into();
             }
@@ -19376,6 +19391,7 @@ mod tests {
                 description: Some(
                     "Instant and sorcery spells you cast have affinity for creatures.".to_string(),
                 ),
+                attack_defended: None,
             };
             obj.static_definitions = vec![def].into();
         }

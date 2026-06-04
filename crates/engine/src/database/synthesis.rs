@@ -14,11 +14,11 @@ use crate::types::ability::{
     ChoiceType, Comparator, ContinuousModification, ControllerRef, CopyRetargetPermission,
     CounterTriggerFilter, DamageKindFilter, Duration, Effect, FilterProp, KickerVariant,
     ManaContribution, ManaProduction, ModalSelectionCondition, ModalSelectionConstraint,
-    NinjutsuVariant, ObjectScope, ParsedCondition, PaymentCost, PlayerFilter, PlayerScope,
-    PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef, ReplacementCondition,
-    ReplacementDefinition, RuntimeHandler, SearchSelectionConstraint, StaticCondition,
-    StaticDefinition, TargetChoiceTiming, TargetFilter, TriggerCondition, TriggerDefinition,
-    TypeFilter, TypedFilter, UnlessPayModifier,
+    NinjutsuVariant, ObjectScope, ParsedCondition, PaymentCost, PlayerFilter, PlayerScope, PtStat,
+    PtValue, PtValueScope, QuantityExpr, QuantityRef, ReplacementCondition, ReplacementDefinition,
+    RuntimeHandler, SearchSelectionConstraint, StaticCondition, StaticDefinition,
+    TargetChoiceTiming, TargetFilter, TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter,
+    UnlessPayModifier,
 };
 use crate::types::card::{CardFace, CardLayout, CleaveVariant};
 use crate::types::card_type::{CardType, CoreType, Supertype};
@@ -10477,9 +10477,10 @@ mod extort_synthesis_tests {
         };
         assert!(execute.optional, "extort must be optional (may pay)");
         let Effect::PayCost {
-            cost: PaymentCost::AbilityCost {
-                cost: AbilityCost::Mana { cost },
-            },
+            cost:
+                PaymentCost::AbilityCost {
+                    cost: AbilityCost::Mana { cost },
+                },
             payer,
         } = &*execute.effect
         else {

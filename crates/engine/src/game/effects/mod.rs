@@ -13291,10 +13291,7 @@ mod tests {
             .iter()
             .find(|t| {
                 matches!(t.mode, TriggerMode::SpellCast)
-                    && matches!(
-                        t.execute.as_deref().map(|e| e.optional),
-                        Some(true)
-                    )
+                    && matches!(t.execute.as_deref().map(|e| e.optional), Some(true))
             })
             .and_then(|t| t.execute.as_deref())
             .expect("synthesized extort trigger");
@@ -13322,7 +13319,9 @@ mod tests {
         );
 
         crate::game::engine_payment_choices::handle_optional_effect_choice(
-            &mut state, true, &mut events,
+            &mut state,
+            true,
+            &mut events,
         )
         .unwrap();
         assert_eq!(state.players[0].life, 22);

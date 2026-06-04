@@ -19134,8 +19134,6 @@ mod tests {
     /// to source power, not an unresolved Variable name.
     #[test]
     fn halana_alena_partners_combat_trigger_puts_source_power_counters() {
-        use crate::types::ability::ObjectScope;
-
         let def = parse_trigger_line(
             "At the beginning of combat on your turn, put X +1/+1 counters on another target creature you control, where X is Halana and Alena's power. That creature gains haste until end of turn.",
             "Halana and Alena, Partners",

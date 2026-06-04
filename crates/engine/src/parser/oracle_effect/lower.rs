@@ -4167,7 +4167,7 @@ pub(crate) fn strip_trailing_where_x<'a>(tp: TextPair<'a>) -> (TextPair<'a>, Opt
     for needle in [", where x is ", " where x is "] {
         if let Some((before, after)) = tp.split_around(needle) {
             // CR 608.2c: A where-X binding can precede further instructions in the
-            // same sentence ("..., where X is N. Put that card ..."). Truncate on
+            // same resolution ("..., where X is N. Put that card ..."). Truncate on
             // the TextPair before materializing a String (Halana and Alena, Partners:
             // "... where X is ~'s power. That creature gains haste ...").
             let mut after_clause = after;

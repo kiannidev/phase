@@ -4370,10 +4370,7 @@ fn parse_where_x_printed_name_possessive_stat(expression_lower: &str) -> Option<
     let possessive_stat = alt((
         map(
             (
-                verify(
-                    take_until::<_, _, OracleError<'_>>("'s power"),
-                    non_empty,
-                ),
+                verify(take_until::<_, _, OracleError<'_>>("'s power"), non_empty),
                 tag("'s power"),
             ),
             |(_, _)| QuantityRef::Power {

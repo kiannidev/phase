@@ -8,6 +8,7 @@
 //! Mirrors `equipment_priority`: hard-reject pointless activations; leave real
 //! redirects neutral for other policies to score.
 
+use engine::game::effects::change_targets::legal_new_targets_for_stack_entry;
 use engine::types::ability::{Effect, TargetFilter, TargetRef};
 use engine::types::actions::GameAction;
 use engine::types::game_state::GameState;
@@ -50,7 +51,8 @@ fn stack_has_redirectable_threat(
     ai_player: PlayerId,
     spellskite_id: ObjectId,
 ) -> bool {
-    state.stack.iter().any(|entry| {
+    let spellskite_target = TargetRef::Object(spellskite_id);
+    state.stack.iter().enumerate().any(|(entry_index, entry)| {
         if entry.controller == ai_player {
             return false;
         }
@@ -71,6 +73,9 @@ fn stack_has_redirectable_threat(
                 .is_some_and(|o| o.controller == ai_player),
         });
         if !targets_ai {
+            return false;
+        }
+        if !legal_new_targets_for_stack_entry(state, entry_index).contains(&spellskite_target) {
             return false;
         }
         let already_on_spellskite = ability
@@ -126,7 +131,10 @@ mod tests {
     use super::*;
     use engine::ai_support::{ActionMetadata, AiDecisionContext, CandidateAction, TacticalClass};
     use engine::game::zones::create_object;
-    use engine::types::ability::{AbilityDefinition, AbilityKind, ResolvedAbility, TargetFilter};
+    use engine::types::ability::{
+        AbilityDefinition, AbilityKind, QuantityExpr, ResolvedAbility, TargetFilter, TypeFilter,
+        TypedFilter,
+    };
     use engine::types::card_type::CoreType;
     use engine::types::game_state::{GameState, StackEntry, StackEntryKind};
     use engine::types::identifiers::{CardId, ObjectId};
@@ -177,6 +185,41 @@ mod tests {
         };
         let ability =
             ResolvedAbility::new(effect, vec![TargetRef::Object(target)], ObjectId(900), OPP);
+        let entry_id = ObjectId(state.next_object_id);
+        state.next_object_id += 1;
+        state.stack.push_back(StackEntry {
+            id: entry_id,
+            source_id: ObjectId(900),
+            controller: OPP,
+            kind: StackEntryKind::Spell {
+                ability: Some(ability),
+                card_id: CardId(900),
+                casting_variant: Default::default(),
+                actual_mana_spent: 0,
+            },
+        });
+    }
+
+    fn push_opp_nonartifact_creature_spell(state: &mut GameState, target: ObjectId) {
+        let effect = Effect::Destroy {
+            target: TargetFilter::Typed(
+                TypedFilter::creature().with_type(TypeFilter::Non(Box::new(TypeFilter::Artifact))),
+            ),
+            cant_regenerate: false,
+        };
+        push_opp_stack_entry(state, effect, vec![TargetRef::Object(target)]);
+    }
+
+    fn push_opp_player_life_loss(state: &mut GameState) {
+        let effect = Effect::LoseLife {
+            amount: QuantityExpr::Fixed { value: 3 },
+            target: Some(TargetFilter::Player),
+        };
+        push_opp_stack_entry(state, effect, vec![TargetRef::Player(AI)]);
+    }
+
+    fn push_opp_stack_entry(state: &mut GameState, effect: Effect, targets: Vec<TargetRef>) {
+        let ability = ResolvedAbility::new(effect, targets, ObjectId(900), OPP);
         let entry_id = ObjectId(state.next_object_id);
         state.next_object_id += 1;
         state.stack.push_back(StackEntry {
@@ -266,5 +309,28 @@ mod tests {
         let bear = ai_creature(&mut state);
         push_opp_destroy_spell(&mut state, bear);
         assert_score(policy_verdict(&state, sk), "spellskite_redirect_available");
+    }
+
+    #[test]
+    fn reject_when_harmful_player_spell_cannot_target_spellskite() {
+        let mut state = GameState::new_two_player(42);
+        let sk = spellskite(&mut state);
+        push_opp_player_life_loss(&mut state);
+        assert_reject(
+            policy_verdict(&state, sk),
+            "spellskite_no_redirectable_threat",
+        );
+    }
+
+    #[test]
+    fn reject_when_harmful_spell_cannot_legally_target_spellskite() {
+        let mut state = GameState::new_two_player(42);
+        let sk = spellskite(&mut state);
+        let bear = ai_creature(&mut state);
+        push_opp_nonartifact_creature_spell(&mut state, bear);
+        assert_reject(
+            policy_verdict(&state, sk),
+            "spellskite_no_redirectable_threat",
+        );
     }
 }

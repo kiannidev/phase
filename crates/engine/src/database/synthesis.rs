@@ -4148,7 +4148,8 @@ fn build_extort_trigger() -> TriggerDefinition {
         },
     )
     .player_scope(PlayerFilter::Opponent)
-    .sub_ability(gain_life);
+    .sub_ability(gain_life)
+    .condition(AbilityCondition::effect_performed());
     let execute = AbilityDefinition::new(
         AbilityKind::Spell,
         Effect::PayCost {
@@ -10805,6 +10806,11 @@ mod extort_synthesis_tests {
         assert!(
             matches!(drain.player_scope, Some(PlayerFilter::Opponent)),
             "drain must scope to opponents"
+        );
+        assert_eq!(
+            drain.condition,
+            Some(AbilityCondition::effect_performed()),
+            "drain must be gated on successful W/B payment (If you do)"
         );
         assert!(
             matches!(&*drain.effect, Effect::LoseLife { .. }),

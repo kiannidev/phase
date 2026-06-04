@@ -13339,6 +13339,65 @@ mod tests {
         assert_eq!(state.players[0].mana_pool.mana.len(), 0);
     }
 
+    /// Accept extort with no {W/B} available — drain must not run (CR 702.101a).
+    #[test]
+    fn issue_1972_extort_accept_without_payable_mana_does_not_drain() {
+        use crate::database::synthesis::synthesize_extort;
+        use crate::game::ability_utils::build_resolved_from_def;
+        use crate::types::card::CardFace;
+        use crate::types::format::FormatConfig;
+        use crate::types::game_state::{GameState, WaitingFor};
+        use crate::types::identifiers::ObjectId;
+        use crate::types::keywords::Keyword;
+        use crate::types::player::PlayerId;
+        use crate::types::triggers::TriggerMode;
+
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Extort);
+        synthesize_extort(&mut face);
+        let execute = face
+            .triggers
+            .iter()
+            .find(|t| {
+                matches!(t.mode, TriggerMode::SpellCast)
+                    && matches!(t.execute.as_deref().map(|e| e.optional), Some(true))
+            })
+            .and_then(|t| t.execute.as_deref())
+            .expect("synthesized extort trigger");
+
+        let mut state = GameState::new(FormatConfig::standard(), 3, 42);
+        let source_id = ObjectId(100);
+        assert!(
+            state.players[0].mana_pool.mana.is_empty(),
+            "controller must have no mana to pay W/B"
+        );
+        let resolved = build_resolved_from_def(execute, source_id, PlayerId(0));
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &resolved, &mut events, 0).unwrap();
+        assert!(
+            matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }),
+            "extort must prompt before draining, got {:?}",
+            state.waiting_for
+        );
+
+        crate::game::engine_payment_choices::handle_optional_effect_choice(
+            &mut state,
+            true,
+            &mut events,
+        )
+        .unwrap();
+
+        assert!(
+            state.cost_payment_failed_flag,
+            "PayCost with no W/B must set cost_payment_failed_flag"
+        );
+        assert_eq!(
+            (state.players[0].life, state.players[1].life, state.players[2].life),
+            (20, 20, 20),
+            "accepting without payable mana must not drain opponents or grant life"
+        );
+    }
+
     #[test]
     fn optional_resolution_pay_ability_cost_if_you_do_draws_after_composite_payment() {
         let mut state = GameState::new_two_player(42);

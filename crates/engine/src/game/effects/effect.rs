@@ -113,12 +113,12 @@ fn register_transient_effect(
         );
         return;
     }
-    // CR 603.2 + CR 608.2c: Subject-based cast triggers (Judith, Carnage
-    // Connoisseur: "that spell gains deathtouch and lifelink") carry
-    // `target: TriggeringSource`. Short-circuit before the chosen-targets
-    // branch (issue #323 class) so propagated `ability.targets` cannot bind
-    // the grant to the wrong object.
-    if matches!(resolved_filter, Some(TargetFilter::TriggeringSource)) {
+    // CR 603.2 + CR 608.2c: Judith modal sub-abilities set `target:
+    // TriggeringSource` (the GenericEffect `target` parameter), not
+    // `static_def.affected`. Short-circuit only on that parameter — when
+    // `affected: TriggeringSource` with chosen targets, the inherited-target
+    // branch below must still run (Earthbender Ascension).
+    if matches!(target_filter, Some(TargetFilter::TriggeringSource)) {
         if let Some(TargetRef::Object(obj_id)) =
             crate::game::targeting::resolve_event_context_target(
                 state,

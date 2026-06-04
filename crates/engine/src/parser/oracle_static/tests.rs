@@ -1304,7 +1304,10 @@ fn chandras_incinerator_self_cost_reduction_uses_noncombat_damage_to_opponents()
     };
     assert_eq!(filters.len(), 2);
     assert!(matches!(filters[0], TargetFilter::Player));
-    assert!(matches!(filters[1], TargetFilter::Typed(_)));
+    let TargetFilter::Typed(typed) = &filters[1] else {
+        panic!("expected opponent typed filter, got {:?}", filters[1]);
+    };
+    assert_eq!(typed.controller, Some(ControllerRef::Opponent));
     assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
     assert_eq!(
         def.active_zones,

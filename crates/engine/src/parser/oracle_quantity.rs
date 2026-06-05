@@ -1856,14 +1856,7 @@ fn parse_for_each_clause_with_they_controller(
 
     if let Ok((rest, qty)) = nom_quantity::parse_for_each_clause_ref_with_context(
         clause,
-        &ParseContext {
-            relative_player_scope: Some(they_controller.clone()),
-            subject: ctx.subject.clone(),
-            card_name: ctx.card_name.clone(),
-            host_self_reference: ctx.host_self_reference.clone(),
-            current_trigger_index: ctx.current_trigger_index,
-            ..Default::default()
-        },
+        &for_each_anaphor_context(ctx, &they_controller),
     ) {
         if rest.is_empty() {
             return Some(qty);
@@ -2150,20 +2143,24 @@ fn parse_for_each_clause_with_they_controller(
     // God and other caster-relative counts are unchanged. CR 608.2c: the controller
     // follows instructions in order, so a per-player-scoped count reads the
     // iterating player.
-    let mut tp_ctx = ParseContext {
-        relative_player_scope: Some(they_controller.clone()),
-        subject: ctx.subject.clone(),
-        card_name: ctx.card_name.clone(),
-        host_self_reference: ctx.host_self_reference.clone(),
-        current_trigger_index: ctx.current_trigger_index,
-        ..Default::default()
-    };
+    let mut tp_ctx = for_each_anaphor_context(ctx, &they_controller);
     let (filter, remainder) = parse_type_phrase_with_ctx(clause, &mut tp_ctx);
     if !matches!(filter, TargetFilter::Any) && remainder.trim().is_empty() {
         return Some(QuantityRef::ObjectCount { filter });
     }
 
     None
+}
+
+fn for_each_anaphor_context(ctx: &ParseContext, they_controller: &ControllerRef) -> ParseContext {
+    ParseContext {
+        relative_player_scope: Some(they_controller.clone()),
+        subject: ctx.subject.clone(),
+        card_name: ctx.card_name.clone(),
+        host_self_reference: ctx.host_self_reference.clone(),
+        current_trigger_index: ctx.current_trigger_index,
+        ..Default::default()
+    }
 }
 
 /// CR 608.2c: Parse the object set named by a "for each [object]"

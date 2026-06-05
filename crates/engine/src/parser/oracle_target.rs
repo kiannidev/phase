@@ -3788,10 +3788,9 @@ fn parse_shared_quality_reference<'a>(
     input: &'a str,
     ctx: &ParseContext,
 ) -> nom::IResult<&'a str, TargetFilter, OracleError<'a>> {
-    // Shared-quality clauses ("creatures that share a type with the sacrificed
-    // creature") only ever back-reference a *sacrificed* cost object; the
-    // context-gated "exiled" participle is irrelevant here, so a default
-    // `ParseContext` (no exile cost) is correct — "exiled" stays a fall-through.
+    // Shared-quality clauses can back-reference the current ability's
+    // cost-paid object ("the sacrificed creature"; "the exiled card" for
+    // exile-cost abilities), so preserve the caller's cost context.
     if let Ok((rest, filter)) = parse_cost_paid_object_reference(input, ctx) {
         return Ok((rest, filter));
     }

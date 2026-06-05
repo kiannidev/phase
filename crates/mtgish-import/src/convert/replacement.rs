@@ -2771,37 +2771,59 @@ fn damage_recipients_list_to_prevent_target(
     use DamageRecipientsList as R;
     Ok(match recipients {
         R::APermanent(perms) => convert_permanents(perms)?,
-        R::APlayer(players) => {
-            let ctrl = players_to_controller(players)?;
-            TargetFilter::Typed(TypedFilter::default().controller(ctrl))
+        R::APlayer(players) => players_to_prevent_target(players)?,
+        R::APlayerOrAPermanent(_, _) => {
+            return Err(ConversionGap::EnginePrerequisiteMissing {
+                engine_type: "Effect::PreventDamage::target",
+                needed_variant: "combined player-plus-permanent damage recipient".into(),
+            });
         }
-        R::APlayerOrAPermanent(players, perms) => TargetFilter::Or {
-            filters: vec![
-                TargetFilter::Typed(
-                    TypedFilter::default().controller(players_to_controller(players)?),
-                ),
-                convert_permanents(perms)?,
-            ],
-        },
     })
 }
 
+fn players_to_prevent_target(players: &Players) -> ConvResult<TargetFilter> {
+    match players {
+        Players::SinglePlayer(player) => player_to_prevent_target(player),
+        // CR 614.1a: "a player" is a damage-recipient class, not an object
+        // controller filter. `prevent_damage::resolve` maps `TargetFilter::Player`
+        // to `DamageTargetPlayerScope::Any` when no target slot is present.
+        Players::AnyPlayer => Ok(TargetFilter::Player),
+        other => Err(ConversionGap::EnginePrerequisiteMissing {
+            engine_type: "Effect::PreventDamage::target",
+            needed_variant: format!("player damage recipient {other:?}"),
+        }),
+    }
+}
+
+fn player_to_prevent_target(player: &Player) -> ConvResult<TargetFilter> {
+    match player {
+        Player::You | Player::HostPlayer | Player::HostController | Player::SelfPlayer => {
+            Ok(TargetFilter::Controller)
+        }
+        Player::Ref_TargetPlayer
+        | Player::Ref_TargetPlayer1
+        | Player::Ref_TargetPlayer2
+        | Player::Ref_TargetPlayer3 => Ok(TargetFilter::Player),
+        other => Err(ConversionGap::EnginePrerequisiteMissing {
+            engine_type: "Effect::PreventDamage::target",
+            needed_variant: format!("player damage recipient {other:?}"),
+        }),
+    }
+}
+
 /// CR 614.2: Map a `SingleDamageRecipient` onto the `Effect::PreventDamage`
-/// recipient axis. Unrecognised shapes leave `Any` so the shield still
-/// prevents broadly rather than strict-failing the whole card.
+/// recipient axis.
 fn single_damage_recipient_to_prevent_target(
     recipient: &SingleDamageRecipient,
 ) -> ConvResult<TargetFilter> {
-    Ok(match recipient {
-        SingleDamageRecipient::Permanent(p) => convert_permanent(p)?,
-        SingleDamageRecipient::Player(p) => match &**p {
-            Player::You => TargetFilter::Controller,
-            other => {
-                TargetFilter::Typed(TypedFilter::default().controller(player_to_controller(other)?))
-            }
-        },
-        _ => TargetFilter::Any,
-    })
+    match recipient {
+        SingleDamageRecipient::Permanent(p) => convert_permanent(p),
+        SingleDamageRecipient::Player(p) => player_to_prevent_target(p),
+        other => Err(ConversionGap::EnginePrerequisiteMissing {
+            engine_type: "Effect::PreventDamage::target",
+            needed_variant: format!("SingleDamageRecipient::{other:?}"),
+        }),
+    }
 }
 
 /// CR 615 + CR 614.1a: Decompose a `ReplacableEventWouldDealDamage` into
@@ -3155,6 +3177,61 @@ mod tests {
                     .controller(ControllerRef::You)
             )
         );
+    }
+
+    #[test]
+    fn player_damage_recipient_maps_to_player_target_filter() {
+        use crate::schema::types::DamageRecipientsList;
+
+        assert_eq!(
+            damage_recipients_list_to_prevent_target(&DamageRecipientsList::APlayer(Box::new(
+                Players::AnyPlayer
+            )))
+            .unwrap(),
+            TargetFilter::Player
+        );
+        assert_eq!(
+            damage_recipients_list_to_prevent_target(&DamageRecipientsList::APlayer(Box::new(
+                Players::SinglePlayer(Box::new(Player::You))
+            )))
+            .unwrap(),
+            TargetFilter::Controller
+        );
+    }
+
+    #[test]
+    fn mixed_player_or_permanent_damage_recipient_strict_fails() {
+        use crate::schema::types::DamageRecipientsList;
+
+        let err =
+            damage_recipients_list_to_prevent_target(&DamageRecipientsList::APlayerOrAPermanent(
+                Box::new(Players::AnyPlayer),
+                Box::new(Permanents::AnyPermanent),
+            ))
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ConversionGap::EnginePrerequisiteMissing {
+                engine_type: "Effect::PreventDamage::target",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unrecognized_single_damage_recipient_strict_fails() {
+        let err =
+            single_damage_recipient_to_prevent_target(&SingleDamageRecipient::DistributedAnyTarget)
+                .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ConversionGap::EnginePrerequisiteMissing {
+                engine_type: "Effect::PreventDamage::target",
+                ..
+            }
+        ));
     }
 
     #[test]

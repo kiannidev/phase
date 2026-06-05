@@ -96,6 +96,12 @@ fn player_damage_filter(player: PlayerId) -> DamageTargetFilter {
     }
 }
 
+fn any_player_damage_filter() -> DamageTargetFilter {
+    DamageTargetFilter::Player {
+        player: DamageTargetPlayerScope::Any,
+    }
+}
+
 fn untargeted_damage_filter(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -103,6 +109,8 @@ fn untargeted_damage_filter(
 ) -> Option<DamageTargetFilter> {
     match target {
         TargetFilter::Any => None,
+        TargetFilter::Player => Some(any_player_damage_filter()),
+        TargetFilter::SpecificPlayer { id } => Some(player_damage_filter(*id)),
         filter if filter.is_context_ref() => Some(player_damage_filter(
             super::resolve_player_for_context_ref(state, ability, filter),
         )),
@@ -676,6 +684,88 @@ mod tests {
             deal_damage::DamageResult::Applied(0)
         ));
         assert_eq!(state.players[0].life, 20);
+    }
+
+    #[test]
+    fn player_recipient_prevention_uses_damage_target_filter() {
+        let mut state = GameState::new_two_player(42);
+        let shield_source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Player Shield".to_string(),
+            Zone::Stack,
+        );
+        let damage_source = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Attacker".to_string(),
+            Zone::Battlefield,
+        );
+        let creature = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Creature".to_string(),
+            Zone::Battlefield,
+        );
+
+        let ability = ResolvedAbility::new(
+            Effect::PreventDamage {
+                amount: PreventionAmount::All,
+                amount_dynamic: None,
+                target: TargetFilter::Player,
+                scope: PreventionScope::AllDamage,
+                damage_source_filter: None,
+            },
+            vec![],
+            shield_source,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.pending_damage_replacements.len(), 1);
+        let shield = &state.pending_damage_replacements[0];
+        assert_eq!(
+            shield.damage_target_filter,
+            Some(DamageTargetFilter::Player {
+                player: DamageTargetPlayerScope::Any,
+            })
+        );
+        assert_eq!(shield.valid_card, None);
+
+        let ctx = deal_damage::DamageContext::from_source(&state, damage_source).unwrap();
+        let player_result = deal_damage::apply_damage_to_target(
+            &mut state,
+            &ctx,
+            TargetRef::Player(PlayerId(1)),
+            3,
+            false,
+            &mut events,
+        )
+        .unwrap();
+        assert!(matches!(
+            player_result,
+            deal_damage::DamageResult::Applied(0)
+        ));
+        assert_eq!(state.players[1].life, 20);
+
+        let creature_result = deal_damage::apply_damage_to_target(
+            &mut state,
+            &ctx,
+            TargetRef::Object(creature),
+            2,
+            false,
+            &mut events,
+        )
+        .unwrap();
+        assert!(matches!(
+            creature_result,
+            deal_damage::DamageResult::Applied(2)
+        ));
+        assert_eq!(state.objects.get(&creature).unwrap().damage_marked, 2);
     }
 
     #[test]

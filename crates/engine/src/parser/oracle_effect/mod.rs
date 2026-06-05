@@ -18,14 +18,14 @@ pub(crate) use lower::{
 // pub(super) re-exports used by sibling submodules via `super::fn_name()`.
 pub(super) use lower::{
     apply_where_x_to_filter, extract_exact_target_multi_target, parse_dynamic_counter_suffix_body,
-    parse_multi_target_count_expr, parse_pump_clause, parse_where_x_quantity_expression,
-    strip_exact_target_prefix, strip_optional_target_prefix, try_parse_pump,
+    parse_multi_target_count_expr, parse_where_x_quantity_expression, strip_exact_target_prefix,
+    strip_optional_target_prefix, try_parse_pump,
 };
 // Test-only re-exports from lower module.
 #[cfg(test)]
 pub(super) use lower::{
-    parse_damage_each_player_scope, rewrite_token_created_this_way_unimplemented,
-    target_filter_is_single_object_target,
+    parse_damage_each_player_scope, parse_pump_clause,
+    rewrite_token_created_this_way_unimplemented, target_filter_is_single_object_target,
 };
 // Shared utilities from the lowering module used by the parse phase above.
 // Using local `use` bindings avoids updating call sites in this file.
@@ -6205,7 +6205,7 @@ fn try_parse_for_each_effect(text: &str, ctx: &mut ParseContext) -> Option<Parse
     // thread subject through for effects that carry a target.
     if let Some(ast) = imperative::parse_numeric_imperative_ast(numeric_base, &numeric_base_lower) {
         let effect = imperative::lower_numeric_imperative_ast(ast.with_for_each_quantity(quantity));
-        let effect = thread_for_each_subject(effect, base_no_duration);
+        let effect = thread_for_each_subject(effect, base_no_duration, ctx);
         return Some(parsed_for_each_quantity_effect(
             effect,
             duration,
@@ -6227,7 +6227,7 @@ fn try_parse_for_each_effect(text: &str, ctx: &mut ParseContext) -> Option<Parse
         ) {
             let effect =
                 imperative::lower_targeted_action_ast(ast.with_for_each_quantity(quantity.clone()));
-            let effect = thread_for_each_subject(effect, base_no_duration);
+            let effect = thread_for_each_subject(effect, base_no_duration, ctx);
             return Some(ParsedEffectClause {
                 effect,
                 duration,
@@ -6629,7 +6629,10 @@ fn parse_energy_gain_continuation(rest: &str) -> Option<&str> {
 /// Thread subject through for-each effects that carry a `target` field.
 /// Locates the predicate verb, extracts subject text before it, and replaces
 /// default targets (Any/Controller) with the parsed subject filter.
-fn for_each_subject_application(original: &str) -> Option<SubjectApplication> {
+fn for_each_subject_application(
+    original: &str,
+    ctx: &mut ParseContext,
+) -> Option<SubjectApplication> {
     let lower = original.to_lowercase();
     // Predicate verbs that the for-each base parsers recognize — find the earliest one.
     // Note: uses str::find (not nom) because this is positional splitting on already-dispatched
@@ -6668,13 +6671,14 @@ fn for_each_subject_application(original: &str) -> Option<SubjectApplication> {
         return None;
     }
 
-    parse_subject_application(subject_text, &mut ParseContext::default())
+    parse_subject_application(subject_text, ctx)
 }
 
 fn for_each_quantity_context(original: &str, ctx: &ParseContext) -> ParseContext {
     let mut quantity_ctx = ctx.clone();
+    let mut subject_ctx = ctx.clone();
     if quantity_ctx.third_person_player_controller_ref().is_none()
-        && for_each_subject_application(original)
+        && for_each_subject_application(original, &mut subject_ctx)
             .is_some_and(|app| app.target.is_some() && is_player_filter(&app.affected))
     {
         quantity_ctx.relative_player_scope = Some(ControllerRef::TargetPlayer);
@@ -6694,8 +6698,8 @@ fn is_player_filter(filter: &TargetFilter) -> bool {
         )
 }
 
-fn thread_for_each_subject(effect: Effect, original: &str) -> Effect {
-    let application = match for_each_subject_application(original) {
+fn thread_for_each_subject(effect: Effect, original: &str, ctx: &mut ParseContext) -> Effect {
+    let application = match for_each_subject_application(original, ctx) {
         Some(application) => application,
         None => return effect,
     };
@@ -10044,24 +10048,23 @@ fn rewrite_quantity_controller(expr: &mut QuantityExpr, from: ControllerRef, to:
     }
 }
 
-/// Recoerce an anaphoric "its power" reference (parsed as
-/// `Power { scope: Anaphoric }` per CR 608.2k) to a concrete `ObjectScope`
-/// when surrounding context establishes the binding — e.g. a damage clause
-/// whose subject is the source or first target object. An explicit
-/// participle-possessive ("the sacrificed creature's power",
-/// `CostPaidObject` per CR 608.2k) is deliberately NOT matched here — its
-/// referent is fixed by the Oracle text and must not be clobbered.
-fn rewrite_event_source_power_to_object_power(expr: &mut QuantityExpr, scope: ObjectScope) {
+/// Rebind a deferred anaphoric **pronoun** referent ("its power", "its
+/// toughness", "its mana value", …) — parsed as `ObjectScope::Anaphoric` per
+/// CR 608.2k — to a concrete `ObjectScope` once the surrounding clause
+/// establishes the antecedent (a damage clause whose subject is the source,
+/// the first target object, or the triggering object).
+///
+/// CR 113.6 + CR 208/209/202: the pronoun names *one* object; this rewrite
+/// retargets *which* object (the `scope` field), never *which* characteristic
+/// (the `QuantityRef` variant), so it stays within each property's CR section
+/// and applies uniformly across power, toughness, mana value, color/word/
+/// mana-symbol counts, and counters. An explicit participle-possessive ("the
+/// sacrificed creature's power", `CostPaidObject`) and a demonstrative ("that
+/// creature's toughness", `Demonstrative`) are deliberately NOT matched — both
+/// have antecedents fixed by the Oracle text and must not be clobbered.
+fn rebind_anaphoric_object_scope(expr: &mut QuantityExpr, scope: ObjectScope) {
     match expr {
-        QuantityExpr::Ref {
-            qty: QuantityRef::Power {
-                scope: ObjectScope::Anaphoric,
-            },
-        } => {
-            *expr = QuantityExpr::Ref {
-                qty: QuantityRef::Power { scope },
-            };
-        }
+        QuantityExpr::Ref { qty } => rebind_anaphoric_ref(qty, scope),
         QuantityExpr::DivideRounded { inner, .. }
         | QuantityExpr::Multiply { inner, .. }
         | QuantityExpr::ClampMin { inner, .. }
@@ -10070,18 +10073,39 @@ fn rewrite_event_source_power_to_object_power(expr: &mut QuantityExpr, scope: Ob
         | QuantityExpr::Power {
             exponent: inner, ..
         } => {
-            rewrite_event_source_power_to_object_power(inner, scope);
+            rebind_anaphoric_object_scope(inner, scope);
         }
         QuantityExpr::Sum { exprs } => {
             for inner in exprs {
-                rewrite_event_source_power_to_object_power(inner, scope);
+                rebind_anaphoric_object_scope(inner, scope);
             }
         }
         QuantityExpr::Difference { left, right } => {
-            rewrite_event_source_power_to_object_power(left, scope);
-            rewrite_event_source_power_to_object_power(right, scope);
+            rebind_anaphoric_object_scope(left, scope);
+            rebind_anaphoric_object_scope(right, scope);
         }
-        QuantityExpr::Fixed { .. } | QuantityExpr::Ref { .. } => {}
+        QuantityExpr::Fixed { .. } => {}
+    }
+}
+
+/// Retarget a single per-object `QuantityRef` whose scope is the deferred
+/// pronoun `ObjectScope::Anaphoric` to `target`. Leaves every other scope
+/// (including the fixed `Demonstrative` / `CostPaidObject` referents) and every
+/// non-per-object `QuantityRef` untouched.
+fn rebind_anaphoric_ref(qty: &mut QuantityRef, target: ObjectScope) {
+    let scope = match qty {
+        QuantityRef::Power { scope }
+        | QuantityRef::Toughness { scope }
+        | QuantityRef::ObjectManaValue { scope }
+        | QuantityRef::ObjectColorCount { scope }
+        | QuantityRef::ObjectNameWordCount { scope }
+        | QuantityRef::ObjectTypelineComponentCount { scope }
+        | QuantityRef::ManaSymbolsInManaCost { scope, .. }
+        | QuantityRef::CountersOn { scope, .. } => scope,
+        _ => return,
+    };
+    if *scope == ObjectScope::Anaphoric {
+        *scope = target;
     }
 }
 
@@ -10101,7 +10125,7 @@ fn bind_damage_clause_source(
             damage_source,
             ..
         } => {
-            rewrite_event_source_power_to_object_power(amount, power_scope);
+            rebind_anaphoric_object_scope(amount, power_scope);
             *damage_source = Some(damage_source_ref);
             true
         }
@@ -10486,16 +10510,19 @@ fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
         Effect::LoseLife { ref mut target, .. } if target.is_none() => {
             *target = Some(subject_filter);
         }
-        // CR 608.2c + CR 120.3: When the stripped subject is the source object
-        // ("~ deals damage equal to its power..."), an anaphoric "its power" is
-        // the ability source's current power, not a triggering event's source
-        // power. Only `ObjectScope::Anaphoric` is rewritten — an explicit
-        // possessive ("the sacrificed creature's power", `CostPaidObject` per
-        // CR 608.2k) keeps its parser-fixed referent and is left untouched.
+        // CR 608.2c + CR 113.7a + CR 120.3: When the stripped subject is the
+        // source object ("~ deals damage equal to its toughness/power/mana
+        // value..."), an anaphoric "its <characteristic>" reads the ability
+        // source's current value — via LKI (CR 113.7a) if the source has since
+        // left the battlefield (Steadfast Armasaur destroyed in response to its
+        // own activated ability). Only the pronoun `ObjectScope::Anaphoric` is
+        // rebound; an explicit possessive ("the sacrificed creature's power",
+        // `CostPaidObject`) or a demonstrative ("that creature's toughness",
+        // `Demonstrative`) keeps its parser-fixed referent.
         Effect::DealDamage { amount, .. } | Effect::DamageEachPlayer { amount, .. }
             if subject_filter == TargetFilter::SelfRef =>
         {
-            rewrite_event_source_power_to_object_power(amount, ObjectScope::Source);
+            rebind_anaphoric_object_scope(amount, ObjectScope::Source);
         }
         // CR 701.23a: "Its controller may search their library..." — the subject
         // names the library owner (and, when the subject is a context-ref, the
@@ -13615,7 +13642,7 @@ pub(crate) fn parse_effect_chain_ir(
     // chain; the anchor is reset at each top-level call.
     let mut anchor_subject: Option<TargetFilter> = None;
     let mut chunk_diagnostics: Vec<OracleDiagnostic> = Vec::new();
-    // CR 609.3: "Repeat the following process N times." appears as its own
+    // CR 608.2c: "Repeat the following process N times." appears as its own
     // sentence before the body clause. The count is stashed here and applied
     // to the immediately-following clause so the body executes N times.
     let mut pending_repeat_for: Option<QuantityExpr> = None;
@@ -13624,6 +13651,11 @@ pub(crate) fn parse_effect_chain_ir(
     // when that chunk is consumed standalone, so the next chunk (which holds
     // the actual `player_scope: All` payload) can stamp `starting_with`.
     let mut pending_starting_with: Option<ControllerRef> = None;
+    // CR 101.4 + CR 608.2c + CR 608.2f: "Repeat the following process for
+    // each {opponent,player} [in turn order]." — forward-carry the
+    // per-player iteration scope to the next clause. Sibling of
+    // `pending_repeat_for` / `pending_starting_with`; identical lifecycle.
+    let mut pending_player_scope: Option<PlayerFilter> = None;
     // CR 608.2c + CR 107.1c: Chain-level "repeat this process" loop predicate.
     // A back-reference recognized as its own trailing sentence; applied to the
     // root `AbilityDefinition` during lowering.
@@ -14009,18 +14041,42 @@ pub(crate) fn parse_effect_chain_ir(
             continue;
         }
 
-        // CR 609.3: "Repeat the following process N times." — forward-carry
-        // repeat directive. Unlike "repeat this process" (back-reference),
-        // this announces that the NEXT clause executes N times. The count is
-        // stashed in `pending_repeat_for` and applied to the next clause's
-        // `repeat_for` field; the directive itself produces no clause.
-        if nom_on_lower(normalized_text, &lower_check, |i| {
-            value((), tag("repeat the following process")).parse(i)
-        })
-        .is_some()
-        {
-            let (count, _) = strip_repeat_count_suffix(normalized_text);
-            pending_repeat_for = count;
+        // CR 608.2f + CR 101.4 + CR 608.2c: "Repeat the following process …" —
+        // forward-carry repeat directive. Unlike "repeat this process"
+        // (back-reference), this announces that the NEXT clause executes
+        // some number of times or once per matching player.
+        //   - "… N times" → numeric repeat into `pending_repeat_for`.
+        //   - "… for each {opponent,player} [in turn order]" → per-player
+        //     iteration into `pending_player_scope` (CR 101.4 APNAP from
+        //     the active player when no explicit "starting with <player>"
+        //     prefix is present). The directive itself produces no clause.
+        if let Some((player_scope_opt, _)) = nom_on_lower(normalized_text, &lower_check, |i| {
+            let (i, _) = tag("repeat the following process").parse(i)?;
+            let (i, player_scope) = opt(|i| {
+                let (i, _) = tag(" for each ").parse(i)?;
+                let (i, scope) = alt((
+                    value(PlayerFilter::Opponent, tag("opponents")),
+                    value(PlayerFilter::Opponent, tag("opponent")),
+                    value(PlayerFilter::All, tag("players")),
+                    value(PlayerFilter::All, tag("player")),
+                ))
+                .parse(i)?;
+                // CR 101.4: optional "in turn order" — with no explicit
+                // "starting with <player>" prefix, this is APNAP from the
+                // active player.
+                let (i, _) = opt(tag(" in turn order")).parse(i)?;
+                Ok((i, scope))
+            })
+            .parse(i)?;
+            let (i, _) = opt(tag(".")).parse(i)?;
+            Ok((i, player_scope))
+        }) {
+            if let Some(scope) = player_scope_opt {
+                pending_player_scope = Some(scope);
+            } else {
+                let (count, _) = strip_repeat_count_suffix(normalized_text);
+                pending_repeat_for = count;
+            }
             continue;
         }
 
@@ -14299,7 +14355,7 @@ pub(crate) fn parse_effect_chain_ir(
             (None, text)
         };
         let condition = condition.or(leading_cond);
-        // CR 609.3: "[effect] a number of times equal to the difference" — when
+        // CR 608.2c: "[effect] a number of times equal to the difference" — when
         // a leading comparison condition was just stripped, a trailing
         // difference-repeat suffix repeats the effect by the unsigned magnitude
         // gap between the condition's operands (Expand the Sphere's "If you put
@@ -14542,7 +14598,7 @@ pub(crate) fn parse_effect_chain_ir(
                 strip_trailing_where_x(TextPair::new(&text, &text_where_x_lower));
             (without_where_x.original.to_string(), where_x_expression)
         };
-        // CR 609.3: "twice" / "N times" suffix — same mechanism as "for each" prefix.
+        // CR 608.2c: "twice" / "N times" suffix — same mechanism as "for each" prefix.
         let (repeat_count, text) = if repeat_for.is_none() {
             let (repeat_count, stripped_text) = strip_repeat_count_suffix(&text_without_where_x);
             if repeat_count.is_some() {
@@ -14555,11 +14611,12 @@ pub(crate) fn parse_effect_chain_ir(
         };
         let repeat_for = repeat_for
             .or(repeat_count)
-            // CR 609.3: difference-repeat count detected after the leading
+            // CR 608.2c: difference-repeat count detected after the leading
             // conditional strip ("a number of times equal to the difference").
             .or(difference_repeat)
             .or_else(|| pending_repeat_for.take());
         let (player_scope, text) = strip_player_scope_subject(&text);
+        let pending_player_scope_for_clause = pending_player_scope.take();
         let carried_player_scope = if player_scope.is_none()
             && !sequence::starts_clause_text(&text)
             && sequence::starts_clause_text_or_conjugated(&text)
@@ -14577,7 +14634,10 @@ pub(crate) fn parse_effect_chain_ir(
         // OptionalEffectChoice is emitted once per matching player.
         let mut player_scope = player_scope
             .or(implicit_player_scope)
-            .or(carried_player_scope);
+            .or(carried_player_scope)
+            // CR 101.4 + CR 608.2f: forward-carry from a preceding
+            // "Repeat the following process for each <scope> [in turn order]."
+            .or(pending_player_scope_for_clause);
 
         // CR 608.2e + CR 608.2c + CR 101.3: A decline-tail strips one of four
         // shapes (prepositional vs subject-only × optional `doesn't` vs
@@ -25401,18 +25461,19 @@ mod tests {
             "expected AtNextPhaseForPlayer(PreCombatMain), got {delayed_cond:?}"
         );
 
-        // Inner delayed effect: Mana(Colorless, Ref(ObjectManaValue{Anaphoric})).
+        // Inner delayed effect: Mana(Colorless, Ref(ObjectManaValue{Demonstrative})).
         //
         // CR 608.2c — "that spell" in the delayed-trigger clause is a bare
-        // anaphoric pronoun: it points at the spell introduced by the
+        // demonstrative possessive: it points at the spell introduced by the
         // earlier-instruction `Counter target spell`. `classify_possessive_referent`
-        // emits `ObjectScope::Anaphoric` whose runtime resolver (in
-        // `game/quantity.rs`) consults `effect_context_object` (the
-        // captured-on-counter spell snapshot stamped by the parent chain)
-        // before falling back to the trigger-event source / cost_paid_object.
+        // emits `ObjectScope::Demonstrative` (the noun-phrase referent, distinct
+        // from the pronoun "its") whose runtime resolver (in `game/quantity.rs`)
+        // consults `effect_context_object` (the captured-on-counter spell
+        // snapshot stamped by the parent chain) before falling back to the
+        // trigger-event source / cost_paid_object. The dedicated variant keeps
+        // the subject-injection rewrite from rebinding this fixed antecedent.
         // The integration test `mana_drain_refund.rs` exercises the runtime
-        // end-to-end; this parser assertion just freezes the parse-time
-        // scope.
+        // end-to-end; this parser assertion just freezes the parse-time scope.
         let Effect::Mana { produced, .. } = &*delayed_effect_def.effect else {
             panic!(
                 "expected Mana effect on delayed trigger, got {:?}",
@@ -25425,11 +25486,11 @@ mod tests {
                     *count,
                     QuantityExpr::Ref {
                         qty: QuantityRef::ObjectManaValue {
-                            scope: crate::types::ability::ObjectScope::Anaphoric,
+                            scope: crate::types::ability::ObjectScope::Demonstrative,
                         }
                     },
                     "Colorless count must reference the counter-target spell's \
-                     mana value via ObjectManaValue{{Anaphoric}} (CR 608.2c \
+                     mana value via ObjectManaValue{{Demonstrative}} (CR 608.2c \
                      instruction-order referent)"
                 );
             }
@@ -40658,6 +40719,100 @@ mod tests {
             sub.effect
         );
         assert_eq!(sub.player_scope, Some(PlayerFilter::All));
+    }
+
+    /// CR 101.4 + CR 608.2f: "Repeat the following process for each opponent
+    /// in turn order. <body>" stamps `player_scope = Opponent` on the
+    /// produced clause and leaves `starting_with` unset (APNAP from active
+    /// player is the default iteration order). Protection Racket [NCC] is
+    /// the prototype; the parser must handle the class, not the card.
+    #[test]
+    fn parse_repeat_for_each_opponent_in_turn_order_emits_player_scope_opponent() {
+        let def = parse_effect_chain(
+            "Repeat the following process for each opponent in turn order. Reveal the top card of your library.",
+            AbilityKind::Spell,
+        );
+        assert_eq!(def.player_scope, Some(PlayerFilter::Opponent));
+        assert_eq!(def.starting_with, None);
+    }
+
+    /// CR 101.4 + CR 608.2f: "for each player" variant stamps
+    /// `player_scope = All` so every player iterates in APNAP order. The body
+    /// deliberately has no explicit player subject ("Reveal …" not "Each
+    /// player reveals …") so the scope can only arrive via the new
+    /// `pending_player_scope` carry-forward, not the explicit-subject path.
+    #[test]
+    fn parse_repeat_for_each_player_in_turn_order_emits_player_scope_all() {
+        let def = parse_effect_chain(
+            "Repeat the following process for each player in turn order. Reveal the top card of their library.",
+            AbilityKind::Spell,
+        );
+        assert_eq!(def.player_scope, Some(PlayerFilter::All));
+    }
+
+    /// CR 608.2f: an explicit player subject on the body clause outranks the
+    /// carried directive scope. "Repeat the following process for each player.
+    /// Each opponent draws a card." must resolve to `Opponent` (the explicit
+    /// subject), not the carried `All` — pinning the `.or()` precedence of
+    /// explicit > implicit > carried > `pending_player_scope`.
+    #[test]
+    fn parse_repeat_for_each_explicit_body_subject_outranks_carried_scope() {
+        let def = parse_effect_chain(
+            "Repeat the following process for each player. Each opponent draws a card.",
+            AbilityKind::Spell,
+        );
+        assert_eq!(def.player_scope, Some(PlayerFilter::Opponent));
+    }
+
+    /// CR 608.2f: the carried directive scope is consumed by the next body
+    /// clause even when that body has its own explicit player subject. A later
+    /// independent sentence must not inherit stale pending scope.
+    #[test]
+    fn parse_repeat_for_each_explicit_body_subject_does_not_leak_to_later_clause() {
+        let def = parse_effect_chain(
+            "Repeat the following process for each player. Each opponent draws a card. Draw a card.",
+            AbilityKind::Spell,
+        );
+        assert_eq!(def.player_scope, Some(PlayerFilter::Opponent));
+
+        let tail = def
+            .sub_ability
+            .as_ref()
+            .expect("expected trailing Draw clause");
+        assert_eq!(tail.player_scope, None);
+        assert!(matches!(
+            &*tail.effect,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                ..
+            }
+        ));
+    }
+
+    /// CR 608.2f: the "in turn order" suffix is optional — bare
+    /// "for each opponent" still maps to `player_scope = Opponent`.
+    /// Iteration order falls back to APNAP from the active player per
+    /// CR 101.4 default when no explicit "starting with" is given.
+    #[test]
+    fn parse_repeat_for_each_opponent_without_turn_order_emits_player_scope_opponent() {
+        let def = parse_effect_chain(
+            "Repeat the following process for each opponent. Reveal the top card of your library.",
+            AbilityKind::Spell,
+        );
+        assert_eq!(def.player_scope, Some(PlayerFilter::Opponent));
+    }
+
+    /// CR 608.2f regression: the numeric "N times" branch must keep working
+    /// after the per-player extension. `pending_player_scope` must remain
+    /// `None` and `repeat_for` must carry the fixed count.
+    #[test]
+    fn parse_repeat_the_following_process_twice_still_emits_numeric_repeat_for() {
+        let def = parse_effect_chain(
+            "Repeat the following process twice. Draw a card.",
+            AbilityKind::Spell,
+        );
+        assert_eq!(def.repeat_for, Some(QuantityExpr::Fixed { value: 2 }));
+        assert_eq!(def.player_scope, None);
     }
 
     /// Alliance of Arms — same preamble, token body. `player_scope = All` on

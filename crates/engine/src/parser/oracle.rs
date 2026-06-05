@@ -1822,9 +1822,7 @@ pub(crate) fn parse_oracle_ir(
         // "This spell costs {N} less..." tails on combined lines (Rottenmouth
         // Viper class). Defiler cycle lines share the prefix but route at
         // Priority 6c-defiler instead.
-        if lower_starts_with(&lower, "as an additional cost")
-            && !is_defiler_cost_pattern(&lower)
-        {
+        if lower_starts_with(&lower, "as an additional cost") && !is_defiler_cost_pattern(&lower) {
             let (cost_line, trailing_reduction) =
                 split_additional_cost_trailing_spell_reduction(&line, &lower);
             let cost_lower = cost_line.to_lowercase();
@@ -1833,7 +1831,12 @@ pub(crate) fn parse_oracle_ir(
                 if let Some(mut def) = parse_static_line(reduction_text) {
                     // CR 702.166a analogue: reduction only applies when the optional
                     // additional cost is declared, not when the player declines it.
-                    def.condition = Some(StaticCondition::AdditionalCostPaid);
+                    def.condition = Some(match def.condition {
+                        Some(existing) => StaticCondition::And {
+                            conditions: vec![existing, StaticCondition::AdditionalCostPaid],
+                        },
+                        None => StaticCondition::AdditionalCostPaid,
+                    });
                     result.statics.push(def);
                 }
             }

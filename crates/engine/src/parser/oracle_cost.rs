@@ -244,9 +244,9 @@ fn parse_remove_counter_quantity_and_kind(
     {
         return Some((u32::MAX, counter_type));
     }
-    // CR 107.2: "any number of" — variable removal; the player chooses how
-    // many counters to remove (including zero). u32::MAX lets the runtime
-    // clamp to the actual count via saturating subtraction.
+    // CR 601.2b / CR 602.2b: "any number of" is a casting/activation-time
+    // variable choice. u32::MAX lets the runtime clamp to the actual count via
+    // saturating subtraction.
     if let Ok((_, counter_type)) = all_consuming(preceded(
         tag::<_, _, E<'_>>("any number of "),
         parse_remove_counter_kind,

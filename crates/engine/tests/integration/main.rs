@@ -80,7 +80,11 @@ mod integration_bending;
 mod integration_landfall;
 mod issue_1509_sorcery_main_phase_cast;
 mod issue_2011_eldrazi_temple_kozilek_cast;
+<<<<<<< fix/2374-fblthp-library-origin
 mod issue_2374_fblthp_library_origin;
+=======
+mod issue_2417_satoru_intervening_if;
+>>>>>>> main
 mod issue_2439_wayta_trigger_doubling;
 mod issue_709_regression;
 mod jace_wielder_empty_library_win;

@@ -13,7 +13,7 @@ use super::super::oracle_nom::condition::inject_controller_you;
 use super::super::oracle_nom::primitives as nom_primitives;
 use super::super::oracle_nom::quantity as nom_quantity;
 use super::super::oracle_quantity::{canonicalize_quantity_ref, parse_cda_quantity};
-use super::super::oracle_target::parse_type_phrase;
+use super::super::oracle_target::{parse_type_phrase, parse_zone_word};
 use super::super::oracle_util::{parse_comparison_suffix, parse_subtype, TextPair};
 use super::{parse_effect_chain, scan_contains_phrase, ParseContext};
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
@@ -3080,28 +3080,29 @@ fn parse_die_result_condition(lower: &str) -> Option<AbilityCondition> {
 }
 
 /// CR 603.4 + CR 601.2a + CR 603.6c: Origin-zone phrase for "entered from
-/// <zone>" / "was cast from <zone>" ability gates. Reuses the cast-origin
-/// possessive vocabulary ("your library", "a graveyard", "exile", etc.).
+/// <zone>" / "was cast from <zone>" ability gates. Zone tokens are delegated to
+/// the canonical zone-word parser so the accepted zone vocabulary stays
+/// centralized.
 fn parse_entered_or_cast_origin_zone_phrase(
     input: &str,
 ) -> nom::IResult<&str, Zone, OracleError<'_>> {
     type E<'a> = OracleError<'a>;
-    alt((
-        value(Zone::Hand, tag::<_, _, E>("your hand")),
-        value(Zone::Hand, tag::<_, _, E>("their hand")),
-        value(Zone::Hand, tag::<_, _, E>("a hand")),
-        value(Zone::Graveyard, tag::<_, _, E>("your graveyard")),
-        value(Zone::Graveyard, tag::<_, _, E>("their graveyard")),
-        value(Zone::Graveyard, tag::<_, _, E>("a graveyard")),
-        value(Zone::Library, tag::<_, _, E>("your library")),
-        value(Zone::Library, tag::<_, _, E>("their library")),
-        value(Zone::Library, tag::<_, _, E>("a library")),
-        value(Zone::Exile, tag::<_, _, E>("exile")),
-    ))
-    .parse(input)
+    let (input, _) = opt(alt((
+        tag::<_, _, E>("an opponent's "),
+        tag("each opponent's "),
+        tag("your "),
+        tag("their "),
+        tag("a "),
+        tag("the "),
+    )))
+    .parse(input)?;
+    parse_zone_word(input)
 }
 
 fn entered_or_cast_from_zone_condition(zone: Zone) -> AbilityCondition {
+    // CR 603.4 + CR 601.2a + CR 603.6c: Model the source-origin gate as the
+    // disjunction of entering the battlefield from that zone or being cast
+    // from that zone.
     AbilityCondition::Or {
         conditions: vec![
             AbilityCondition::ZoneChangeObjectMatchesFilter {

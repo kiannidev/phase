@@ -9451,9 +9451,7 @@ pub(crate) fn parse_post_spell_modifier(modifier: &str) -> Option<TargetFilter> 
     // CR 608.2b: "that has the same name as a card in your graveyard"
     // (Pyromancer's Ascension). Reuse the search-filter name-reference suffix
     // combinator so graveyard SharesQuality semantics stay aligned.
-    if let Ok((rest, prop)) =
-        super::oracle_effect::parse_search_name_reference_suffix(modifier)
-    {
+    if let Ok((rest, prop)) = super::oracle_effect::parse_search_name_reference_suffix(modifier) {
         if rest.trim().is_empty() {
             return Some(TargetFilter::Typed(
                 TypedFilter::default().properties(vec![prop]),

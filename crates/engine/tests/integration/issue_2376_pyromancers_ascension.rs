@@ -44,7 +44,11 @@ fn install_ascension(state: &mut GameState, quest_counters: u32) -> ObjectId {
         &[],
     );
     let triggers: Vec<TriggerDefinition> = parsed.triggers;
-    assert_eq!(triggers.len(), 2, "Ascension oracle must parse to two triggers");
+    assert_eq!(
+        triggers.len(),
+        2,
+        "Ascension oracle must parse to two triggers"
+    );
     assert_eq!(triggers[0].mode, TriggerMode::SpellCast);
     assert_eq!(triggers[1].mode, TriggerMode::SpellCast);
     assert!(
@@ -59,10 +63,8 @@ fn install_ascension(state: &mut GameState, quest_counters: u32) -> ObjectId {
     let obj = state.objects.get_mut(&ascension).unwrap();
     obj.card_types.core_types.push(CoreType::Enchantment);
     if quest_counters > 0 {
-        obj.counters.insert(
-            CounterType::Generic("quest".to_string()),
-            quest_counters,
-        );
+        obj.counters
+            .insert(CounterType::Generic("quest".to_string()), quest_counters);
     }
     obj.trigger_definitions = triggers.into();
     ascension
@@ -120,11 +122,7 @@ fn spell_cast_matcher_accepts(
     trigger_idx: usize,
     spell_id: ObjectId,
 ) -> bool {
-    let trigger = &state
-        .objects
-        .get(&ascension)
-        .unwrap()
-        .trigger_definitions[trigger_idx];
+    let trigger = &state.objects.get(&ascension).unwrap().trigger_definitions[trigger_idx];
     let matcher = trigger_matcher(trigger.mode.clone()).expect("SpellCast matcher");
     matcher(&spell_cast_event(spell_id), trigger, ascension, state)
 }

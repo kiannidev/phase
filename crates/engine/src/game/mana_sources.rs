@@ -1005,6 +1005,23 @@ fn emit_source_rows(
                 })
             })
             .collect(),
+        // CR 106.1b: `{C}{C}` from one activation (Eldrazi Temple, Sol Ring, …)
+        // must surface as a single atomic combination so auto-tap does not plan
+        // two taps of the same source (issue #2011).
+        ManaProduction::Colorless { .. } | ManaProduction::Mixed { .. } => {
+            let resolved =
+                super::ability_utils::build_resolved_from_def(ability, object_id, controller);
+            let types =
+                super::effects::mana::resolve_mana_types_for_ability(produced, state, &resolved);
+            if types.is_empty() {
+                return Vec::new();
+            }
+            vec![SourceRow {
+                mana_type: types[0],
+                atomic_combination: (types.len() > 1).then_some(types),
+                restrictions: concrete_restrictions.clone(),
+            }]
+        }
         _ => mana_options_from_production(state, controller, object_id, produced)
             .into_iter()
             .map(|mana_type| SourceRow {

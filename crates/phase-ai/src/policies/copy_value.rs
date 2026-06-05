@@ -3,7 +3,8 @@ use engine::ai_support::{
     project_copy_mana_spent_for_x,
 };
 use engine::game::filter::{matches_target_filter, FilterContext};
-use engine::types::ability::{AbilityDefinition, TargetRef};
+use engine::game::game_object::GameObject;
+use engine::types::ability::{AbilityDefinition, Effect, TargetRef};
 use engine::types::actions::GameAction;
 use engine::types::card_type::Supertype;
 use engine::types::game_state::{GameState, PendingCast, WaitingFor};
@@ -43,9 +44,88 @@ impl CopyValuePolicy {
             ) if valid_targets.contains(target_id) => {
                 score_target_choice(ctx.state, ctx.ai_player, *source_id, *target_id)
             }
+            (
+                WaitingFor::TargetSelection { .. }
+                | WaitingFor::TriggerTargetSelection { .. },
+                GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(target_id)),
+                },
+            ) if ctx.effects().iter().any(|e| matches!(e, Effect::CopyTokenOf { .. })) => {
+                let source_id = ctx
+                    .source_object()
+                    .map(|source| source.id)
+                    .unwrap_or(*target_id);
+                score_copy_token_target(ctx.state, ctx.ai_player, source_id, *target_id)
+            }
             _ => 0.0,
         }
     }
+}
+
+/// CR 704.5j: Prefer keeping commanders and non-token originals over ephemeral
+/// copy tokens when the legend rule fires.
+pub(crate) fn score_legend_rule_keep(state: &GameState, keep: ObjectId) -> f64 {
+    let Some(object) = state.objects.get(&keep) else {
+        return -100.0;
+    };
+    let mut score = evaluate_creature(state, keep);
+    if object.is_commander {
+        score += 80.0;
+    }
+    if object.is_token {
+        score -= 60.0;
+    }
+    score
+}
+
+/// Penalties for copy effects that would trigger a wasteful legend-rule loop
+/// (issue #2438 — Saheeli copying her own commander).
+pub(crate) fn copy_target_penalties(
+    state: &GameState,
+    ai_player: PlayerId,
+    source_id: ObjectId,
+    target: &GameObject,
+) -> f64 {
+    let mut penalty = 0.0;
+
+    if target.id == source_id {
+        penalty += 50.0;
+    }
+
+    if target.is_commander && target.controller == ai_player {
+        penalty += 40.0;
+    }
+
+    if target.controller == ai_player
+        && target.card_types.supertypes.contains(&Supertype::Legendary)
+        && state.battlefield.iter().any(|&id| {
+            id != target.id
+                && state.objects.get(&id).is_some_and(|other| {
+                    other.controller == ai_player
+                        && other.card_types.supertypes.contains(&Supertype::Legendary)
+                        && other.name == target.name
+                })
+                && !engine::game::sba::legend_rule_exempt(state, id)
+        })
+    {
+        penalty += 35.0;
+    }
+
+    penalty
+}
+
+fn score_copy_token_target(
+    state: &GameState,
+    ai_player: PlayerId,
+    source_id: ObjectId,
+    target_id: ObjectId,
+) -> f64 {
+    let Some(target) = state.objects.get(&target_id) else {
+        return -10.0;
+    };
+    let base = evaluate_creature(state, target_id);
+    let penalty = copy_target_penalties(state, ai_player, source_id, target);
+    base - penalty
 }
 
 impl TacticalPolicy for CopyValuePolicy {
@@ -175,11 +255,7 @@ fn score_target_choice(
         copy_bonus += 0.06;
     }
 
-    if target.controller == source.controller
-        && target.card_types.supertypes.contains(&Supertype::Legendary)
-    {
-        copy_penalty += 0.20;
-    }
+    copy_penalty += copy_target_penalties(state, ai_player, source_id, target);
 
     if base_creature_value < 3.0 {
         copy_penalty += 0.08;
@@ -531,5 +607,54 @@ mod tests {
         });
 
         assert!(score_large > score_small);
+    }
+
+    #[test]
+    fn copy_token_target_heavily_penalises_self_commander() {
+        let mut state = make_state();
+        let saheeli = add_creature(&mut state, 1, PlayerId(0), "Saheeli, Radiant Creator", 2, 3, 4);
+        {
+            let obj = state.objects.get_mut(&saheeli).unwrap();
+            obj.card_types.supertypes.push(Supertype::Legendary);
+            obj.is_commander = true;
+        }
+
+        let score = score_copy_token_target(&state, PlayerId(0), saheeli, saheeli);
+        assert!(
+            score < -50.0,
+            "self-commander copy must be strongly penalised, got {score}"
+        );
+    }
+
+    #[test]
+    fn legend_rule_keep_prefers_commander_over_copy_token() {
+        let mut state = make_state();
+        let commander = add_creature(&mut state, 1, PlayerId(0), "Saheeli, Radiant Creator", 2, 3, 4);
+        {
+            let obj = state.objects.get_mut(&commander).unwrap();
+            obj.card_types.supertypes.push(Supertype::Legendary);
+            obj.is_commander = true;
+        }
+        let copy_token = add_creature(
+            &mut state,
+            2,
+            PlayerId(0),
+            "Saheeli, Radiant Creator",
+            5,
+            5,
+            4,
+        );
+        {
+            let obj = state.objects.get_mut(&copy_token).unwrap();
+            obj.card_types.supertypes.push(Supertype::Legendary);
+            obj.is_token = true;
+        }
+
+        let commander_score = score_legend_rule_keep(&state, commander);
+        let token_score = score_legend_rule_keep(&state, copy_token);
+        assert!(
+            commander_score > token_score,
+            "commander ({commander_score}) must beat copy token ({token_score})"
+        );
     }
 }

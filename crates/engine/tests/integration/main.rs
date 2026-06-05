@@ -81,6 +81,7 @@ mod integration_landfall;
 mod issue_1509_sorcery_main_phase_cast;
 mod issue_2011_eldrazi_temple_kozilek_cast;
 mod issue_2361_unless_pay_choice;
+mod issue_2374_fblthp_library_origin;
 mod issue_2417_satoru_intervening_if;
 mod issue_2439_wayta_trigger_doubling;
 mod issue_709_regression;

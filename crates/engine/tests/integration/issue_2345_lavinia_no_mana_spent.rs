@@ -7,7 +7,8 @@ use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::TriggerCondition;
 use engine::types::triggers::TriggerMode;
 
-const LAVINIA_TRIGGER: &str = "Whenever an opponent casts a spell, if no mana was spent to cast it, counter that spell.";
+const LAVINIA_TRIGGER: &str =
+    "Whenever an opponent casts a spell, if no mana was spent to cast it, counter that spell.";
 
 #[test]
 fn lavinia_spell_cast_trigger_parses_no_mana_spent_intervening_if() {

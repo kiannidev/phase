@@ -1063,11 +1063,12 @@ pub(crate) fn parse_keyword_from_oracle(text: &str) -> Option<Keyword> {
     // forward-compatible compound shape (mana + non-mana). Pure-mana evoke
     // ("Evoke {3}{U}", original Lorwyn cycle) arrives via MTGJSON's keywords
     // array and is handled by the `FromStr` path above.
-    if let Some(rest) = text
-        .strip_prefix("evoke\u{2014}")
-        .or_else(|| text.strip_prefix("evoke—"))
-        .or_else(|| text.strip_prefix("evoke--"))
-        .or_else(|| text.strip_prefix("evoke-"))
+    if let Ok((rest, _)) = alt((
+        tag::<_, _, OracleError<'_>>("evoke\u{2014}"),
+        tag("evoke--"),
+        tag("evoke-"),
+    ))
+    .parse(text)
     {
         if let Some(ev_cost) = parse_evoke_cost(rest) {
             return Some(Keyword::Evoke(ev_cost));

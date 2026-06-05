@@ -277,16 +277,12 @@ fn dalkovan_encampment_warriors_sacrificed_at_next_end_step() {
         "Warrior tokens must be sacrificed at the beginning of the next end step"
     );
     assert!(
-        !runner
-            .state()
-            .delayed_triggers
-            .iter()
-            .any(|dt| {
-                matches!(
-                    dt.condition,
-                    DelayedTriggerCondition::AtNextPhase { phase: Phase::End }
-                ) && matches!(&dt.ability.effect, Effect::Sacrifice { .. })
-            }),
+        !runner.state().delayed_triggers.iter().any(|dt| {
+            matches!(
+                dt.condition,
+                DelayedTriggerCondition::AtNextPhase { phase: Phase::End }
+            ) && matches!(&dt.ability.effect, Effect::Sacrifice { .. })
+        }),
         "the end-step sacrifice delayed trigger must be consumed after firing"
     );
 }

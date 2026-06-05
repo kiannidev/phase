@@ -2777,9 +2777,9 @@ fn damage_recipients_list_to_prevent_target(
         }
         R::APlayerOrAPermanent(players, perms) => TargetFilter::Or {
             filters: vec![
-                TargetFilter::Typed(TypedFilter::default().controller(players_to_controller(
-                    players,
-                )?)),
+                TargetFilter::Typed(
+                    TypedFilter::default().controller(players_to_controller(players)?),
+                ),
                 convert_permanents(perms)?,
             ],
         },
@@ -2796,9 +2796,9 @@ fn single_damage_recipient_to_prevent_target(
         SingleDamageRecipient::Permanent(p) => convert_permanent(p)?,
         SingleDamageRecipient::Player(p) => match &**p {
             Player::You => TargetFilter::Controller,
-            other => TargetFilter::Typed(
-                TypedFilter::default().controller(player_to_controller(other)?),
-            ),
+            other => {
+                TargetFilter::Typed(TypedFilter::default().controller(player_to_controller(other)?))
+            }
         },
         _ => TargetFilter::Any,
     })
@@ -3113,9 +3113,11 @@ mod tests {
 
     #[test]
     fn pack_leader_prevent_damage_scopes_to_dogs_you_control() {
-        use engine::types::ability::{ControllerRef, PreventionAmount, PreventionScope, TypeFilter};
         use crate::schema::types::{
             CreatureType, DamageRecipientsList, ReplacableEventWouldDealDamage,
+        };
+        use engine::types::ability::{
+            ControllerRef, PreventionAmount, PreventionScope, TypeFilter,
         };
 
         let effect = convert_create_replace_would_deal_damage_until(

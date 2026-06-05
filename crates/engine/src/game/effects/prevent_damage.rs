@@ -771,7 +771,11 @@ mod tests {
         let mut events = Vec::new();
         resolve(&mut state, &ability, &mut events).unwrap();
 
-        let shield = &state.objects.get(&pack_leader).unwrap().replacement_definitions[0];
+        let shield = &state
+            .objects
+            .get(&pack_leader)
+            .unwrap()
+            .replacement_definitions[0];
         assert_eq!(
             shield.valid_card,
             Some(TargetFilter::Typed(

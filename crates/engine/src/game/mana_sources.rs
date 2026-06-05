@@ -1008,7 +1008,9 @@ fn emit_source_rows(
         // CR 106.1b: `{C}{C}` from one activation (Eldrazi Temple, Sol Ring, …)
         // must surface as a single atomic combination so auto-tap does not plan
         // two taps of the same source (issue #2011).
-        ManaProduction::Fixed { .. } | ManaProduction::Colorless { .. } | ManaProduction::Mixed { .. } => {
+        ManaProduction::Fixed { .. }
+        | ManaProduction::Colorless { .. }
+        | ManaProduction::Mixed { .. } => {
             let resolved =
                 super::ability_utils::build_resolved_from_def(ability, object_id, controller);
             let types =

@@ -133,6 +133,8 @@ describe("DialogHost", () => {
       </DialogHost>,
     );
     const wrapper = container.firstElementChild as HTMLElement | null;
+    expect(wrapper?.className ?? "").toMatch(/fixed/);
+    expect(wrapper?.className ?? "").toMatch(/z-40/);
     expect(wrapper?.style.pointerEvents).not.toBe("none");
   });
 

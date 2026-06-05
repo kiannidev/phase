@@ -110,6 +110,19 @@ fn untargeted_damage_filter(
     }
 }
 
+/// CR 614.1a: Typed permanent recipient filters ("Dogs you control",
+/// "attacking artifact creatures you control") route through the shield's
+/// `valid_card` slot — the runtime matches the damage recipient object
+/// against this filter. Player/context refs are handled by
+/// `untargeted_damage_filter` instead.
+fn typed_recipient_valid_card_filter(target: &TargetFilter) -> Option<TargetFilter> {
+    match target {
+        TargetFilter::Any | TargetFilter::ParentTarget => None,
+        filter if filter.is_context_ref() => None,
+        filter => Some(filter.clone()),
+    }
+}
+
 /// CR 615: Prevent damage — creates a prevention shield on the source object.
 ///
 /// The shield is stored as a `ReplacementDefinition` with `ShieldKind::Prevention`
@@ -189,6 +202,8 @@ pub fn resolve(
     if !host_on_parent_target_object {
         if let Some(filter) = untargeted_damage_filter(state, ability, &target) {
             shield = shield.damage_target_filter(filter);
+        } else if let Some(recipient_filter) = typed_recipient_valid_card_filter(&target) {
+            shield = shield.valid_card(recipient_filter);
         }
     }
 
@@ -690,6 +705,105 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    #[test]
+    fn typed_recipient_prevention_only_blocks_matching_creatures() {
+        use crate::types::ability::{ControllerRef, TypeFilter};
+        use crate::types::card_type::CoreType;
+
+        let mut state = GameState::new_two_player(42);
+        let pack_leader = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Pack Leader".to_string(),
+            Zone::Battlefield,
+        );
+        let dog = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Dog".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&dog).unwrap().card_types = crate::types::card_type::CardType {
+            supertypes: vec![],
+            core_types: vec![CoreType::Creature],
+            subtypes: vec!["Dog".to_string()],
+        };
+        let bear = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Bear".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&bear).unwrap().card_types = crate::types::card_type::CardType {
+            supertypes: vec![],
+            core_types: vec![CoreType::Creature],
+            subtypes: vec!["Bear".to_string()],
+        };
+        let attacker = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(1),
+            "Attacker".to_string(),
+            Zone::Battlefield,
+        );
+
+        let ability = ResolvedAbility::new(
+            Effect::PreventDamage {
+                amount: PreventionAmount::All,
+                amount_dynamic: None,
+                target: TargetFilter::Typed(
+                    TypedFilter::creature()
+                        .with_type(TypeFilter::Subtype("Dog".into()))
+                        .controller(ControllerRef::You),
+                ),
+                scope: PreventionScope::CombatDamage,
+                damage_source_filter: None,
+            },
+            vec![],
+            pack_leader,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let shield = &state.objects.get(&pack_leader).unwrap().replacement_definitions[0];
+        assert_eq!(
+            shield.valid_card,
+            Some(TargetFilter::Typed(
+                TypedFilter::creature()
+                    .with_type(TypeFilter::Subtype("Dog".into()))
+                    .controller(ControllerRef::You)
+            ))
+        );
+
+        let ctx = deal_damage::DamageContext::from_source(&state, attacker).unwrap();
+        let dog_result = deal_damage::apply_damage_to_target(
+            &mut state,
+            &ctx,
+            TargetRef::Object(dog),
+            3,
+            true,
+            &mut events,
+        )
+        .unwrap();
+        assert!(matches!(dog_result, deal_damage::DamageResult::Applied(0)));
+
+        let bear_result = deal_damage::apply_damage_to_target(
+            &mut state,
+            &ctx,
+            TargetRef::Object(bear),
+            2,
+            true,
+            &mut events,
+        )
+        .unwrap();
+        assert!(matches!(bear_result, deal_damage::DamageResult::Applied(2)));
+        assert_eq!(state.objects.get(&bear).unwrap().damage_marked, 2);
     }
 
     /// CR 615.1a: A `Prevention { All }` shield is not depletion-based — it

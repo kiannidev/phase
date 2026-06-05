@@ -3437,6 +3437,7 @@ fn trigger_cause_matches(
             record.core_types.contains(&CoreType::Creature)
         }
         TriggerCause::ControlledCreatureDealtDamage => {
+            // CR 603.2d: Wayta doubles triggers caused by a creature you control being dealt damage.
             let Some(GameEvent::DamageDealt { target, .. }) = event else {
                 return false;
             };

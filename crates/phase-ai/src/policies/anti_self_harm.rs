@@ -492,7 +492,7 @@ fn score_target_object(ctx: &PolicyContext<'_>, object_id: ObjectId, beneficial:
         .any(|effect| matches!(effect, Effect::CopyTokenOf { .. }))
     {
         if let Some(source) = ctx.source_object() {
-            score -= copy_target_penalties(ctx.state, ctx.ai_player, source.id, object);
+            score -= copy_target_penalties(ctx.state, ctx.ai_player, Some(source.id), object);
         }
     }
 

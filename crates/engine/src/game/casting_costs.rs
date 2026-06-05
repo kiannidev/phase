@@ -3,14 +3,14 @@ use std::collections::HashSet;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AdditionalCost, BeholdCostAction, CastTimingPermission,
     CostPaidObjectSnapshot, Effect, KickerVariant, QuantityExpr, QuantityRef, ResolvedAbility,
-    SpellCastingOptionKind, TargetFilter, TypedFilter,
+    SpellCastingOptionKind, StaticCondition, TargetFilter, TypedFilter,
 };
 use crate::types::events::{GameEvent, ManaTapState};
 use crate::types::game_state::{
     CastPaymentMode, CastingVariant, ConvokeMode, CostResume, DistributionUnit, GameState,
     PayCostKind, PendingCast, StackEntry, StackEntryKind, StackPaidSnapshot, WaitingFor,
 };
-use crate::types::identifiers::{CardId, ObjectId};
+use crate::types::identifiers::{CardId, ObjectId, TrackedSetId};
 use crate::types::keywords::Keyword;
 use crate::types::mana::{ManaCost, ManaCostShard, ManaType, PaymentContext};
 use crate::types::player::PlayerId;
@@ -941,6 +941,54 @@ pub(crate) fn handle_sacrifice_for_cost(
         pending
             .ability
             .set_chosen_x_recursive(chosen.len().try_into().unwrap_or(u32::MAX));
+    }
+
+    // CR 601.2f + CR 608.2c: Spell casts that sacrifice as an additional cost
+    // may reduce the spell's total mana cost per object sacrificed ("for each
+    // permanent sacrificed this way"). Apply the reduction from the payment
+    // selection count — FilteredTrackedSetSize cannot re-check `Permanent`
+    // on objects already in the graveyard (CR 403.3).
+    if pending.activation_ability_index.is_none() && !chosen.is_empty() {
+        let tracked_id = TrackedSetId(state.next_tracked_set_id);
+        state.next_tracked_set_id += 1;
+        state
+            .tracked_object_sets
+            .insert(tracked_id, chosen.to_vec());
+
+        if pending.ability.context.additional_cost_paid {
+            if let Some(spell_obj) = state.objects.get(&pending.object_id) {
+                use crate::types::statics::{CostModifyMode, StaticMode};
+                let sacrifice_count = chosen.len() as u32;
+                for def in spell_obj.static_definitions.iter_all() {
+                    let StaticMode::ModifyCost {
+                        mode: CostModifyMode::Reduce,
+                        amount,
+                        dynamic_count: Some(_),
+                        ..
+                    } = &def.mode
+                    else {
+                        continue;
+                    };
+                    if !matches!(def.affected, Some(TargetFilter::SelfRef)) {
+                        continue;
+                    }
+                    if def.condition != Some(StaticCondition::AdditionalCostPaid) {
+                        continue;
+                    }
+                    let ManaCost::Cost { generic: per, .. } = amount else {
+                        continue;
+                    };
+                    if let ManaCost::Cost {
+                        generic: ref mut spell_generic,
+                        ..
+                    } = pending.cost
+                    {
+                        *spell_generic =
+                            spell_generic.saturating_sub(per.saturating_mul(sacrifice_count));
+                    }
+                }
+            }
+        }
     }
 
     finish_pending_cost_or_cast(state, player, pending, events)

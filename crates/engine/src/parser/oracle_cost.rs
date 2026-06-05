@@ -329,6 +329,21 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
                 count: 1,
             };
         }
+        // CR 107.2: "sacrifice any number of [filter]" — player chooses 0..=all
+        // eligible permanents (Rottenmouth Viper, Scapeshift-class additional costs).
+        if let Some(((), rest_after_any)) = nom_on_lower(rest, &rest_lower, |i| {
+            value((), tag("any number of ")).parse(i)
+        }) {
+            let filter_text = rest_after_any.trim().trim_end_matches('.');
+            let target_phrase = format!("target {filter_text}");
+            let (filter, remainder) = parse_target(&target_phrase);
+            if remainder.trim().is_empty() {
+                return AbilityCost::Sacrifice {
+                    target: filter,
+                    count: u32::MAX,
+                };
+            }
+        }
         // Try to extract a numeric count: "sacrifice two creatures", "sacrifice three lands"
         // CR 107.3a: `X` in an activation or additional cost is chosen as part
         // of activating or casting, so preserve it as a variable cost marker.
@@ -1294,6 +1309,21 @@ mod tests {
                 ));
             }
             other => panic!("Expected Sacrifice, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cost_sacrifice_any_number_nonland_permanents() {
+        match parse_oracle_cost("Sacrifice any number of nonland permanents") {
+            AbilityCost::Sacrifice { target, count } => {
+                assert_eq!(count, u32::MAX);
+                assert!(matches!(
+                    target,
+                    TargetFilter::Typed(ref tf)
+                        if tf.type_filters.iter().any(|f| matches!(f, TypeFilter::Non(_)))
+                ));
+            }
+            other => panic!("Expected Sacrifice any number nonland, got {:?}", other),
         }
     }
 

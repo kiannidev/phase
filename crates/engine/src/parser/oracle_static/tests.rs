@@ -495,7 +495,12 @@ fn alt_cost_rooftop_storm_zombie_creature_zero() {
     .expect("Rooftop Storm must parse to a CastWithAlternativeCost static");
     match &def.mode {
         StaticMode::CastWithAlternativeCost { cost } => {
-            assert_eq!(*cost, crate::types::mana::ManaCost::zero());
+            assert_eq!(
+                *cost,
+                AbilityCost::Mana {
+                    cost: crate::types::mana::ManaCost::zero()
+                }
+            );
         }
         other => panic!("expected CastWithAlternativeCost, got {other:?}"),
     }
@@ -533,15 +538,17 @@ fn alt_cost_fist_of_suns_any_spell_wubrg() {
             use crate::types::mana::{ManaCost, ManaCostShard};
             assert_eq!(
                 *cost,
-                ManaCost::Cost {
-                    shards: vec![
-                        ManaCostShard::White,
-                        ManaCostShard::Blue,
-                        ManaCostShard::Black,
-                        ManaCostShard::Red,
-                        ManaCostShard::Green,
-                    ],
-                    generic: 0,
+                AbilityCost::Mana {
+                    cost: ManaCost::Cost {
+                        shards: vec![
+                            ManaCostShard::White,
+                            ManaCostShard::Blue,
+                            ManaCostShard::Black,
+                            ManaCostShard::Red,
+                            ManaCostShard::Green,
+                        ],
+                        generic: 0,
+                    }
                 }
             );
         }
@@ -553,6 +560,66 @@ fn alt_cost_fist_of_suns_any_spell_wubrg() {
         }
         other => panic!("expected Typed(any spell you cast), got {other:?}"),
     }
+}
+
+/// CR 118.9 + CR 107.14: Primal Prayers grants {E} as an alternative cost for
+/// creature spells with MV ≤ 3, plus flash on the same line.
+#[test]
+fn alt_cost_primal_prayers_energy_creature_mv_leq_3() {
+    use crate::parser::oracle_static::cost_mod::parse_cast_spells_alternative_cost_multi;
+    use crate::types::ability::{Comparator, QuantityExpr};
+
+    let text = "You may cast creature spells with mana value 3 or less by paying {E} \
+                rather than paying their mana costs. If you cast a spell this way, \
+                you may cast it as though it had flash.";
+    let defs = parse_cast_spells_alternative_cost_multi(text);
+    assert_eq!(
+        defs.len(),
+        2,
+        "expected alt-cost + flash statics, got {defs:?}"
+    );
+
+    match &defs[0].mode {
+        StaticMode::CastWithAlternativeCost { cost } => {
+            assert_eq!(
+                *cost,
+                AbilityCost::PayEnergy {
+                    amount: QuantityExpr::Fixed { value: 1 }
+                }
+            );
+        }
+        other => panic!("expected CastWithAlternativeCost, got {other:?}"),
+    }
+    match &defs[0].affected {
+        Some(TargetFilter::Typed(tf)) => {
+            assert_eq!(tf.controller, Some(ControllerRef::You));
+            assert!(
+                tf.type_filters.contains(&TypeFilter::Creature),
+                "expected Creature filter, got {:?}",
+                tf.type_filters
+            );
+            assert!(
+                tf.properties.iter().any(|p| matches!(
+                    p,
+                    FilterProp::Cmc {
+                        comparator: Comparator::LE,
+                        value: QuantityExpr::Fixed { value: 3 }
+                    }
+                )),
+                "expected Cmc LE 3, got {:?}",
+                tf.properties
+            );
+        }
+        other => panic!("expected Typed(creature MV<=3 you cast), got {other:?}"),
+    }
+
+    match &defs[1].mode {
+        StaticMode::CastWithKeyword { keyword } => {
+            assert_eq!(*keyword, Keyword::Flash);
+        }
+        other => panic!("expected CastWithKeyword(Flash), got {other:?}"),
+    }
+    assert_eq!(defs[1].affected, defs[0].affected);
 }
 
 /// CR 118.9: a Jodah-style MV qualifier — "spells you cast with mana value 5

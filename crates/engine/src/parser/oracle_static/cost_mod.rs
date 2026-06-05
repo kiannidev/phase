@@ -122,17 +122,115 @@ pub(crate) fn parse_pay_life_as_colored_mana(text: &str) -> Option<StaticDefinit
     )
 }
 
+/// CR 118.9 + CR 601.2f: Parse alternative-cost grant statics that may also
+/// carry a flash rider — "You may cast [filter] by paying {X} rather than
+/// paying their mana costs. If you cast a spell this way, you may cast it as
+/// though it had flash." (Primal Prayers). Returns one or two statics.
+pub(crate) fn parse_cast_spells_alternative_cost_multi(text: &str) -> Vec<StaticDefinition> {
+    let Some((alt_cost_def, flash_suffix)) = parse_cast_spells_alternative_cost(text) else {
+        return Vec::new();
+    };
+    let mut defs = vec![alt_cost_def];
+    if flash_suffix {
+        if let Some(flash_def) = alt_cost_flash_grant_from_cast_cost(text) {
+            defs.push(flash_def);
+        }
+    }
+    defs
+}
+
+/// CR 118.9 + CR 601.2f: "You may cast [filter] by paying {cost} rather than
+/// paying [their mana costs | its mana cost]." Primal Prayers ({E}, creature
+/// MV ≤ 3). The trailing flash rider is stripped; callers that need the flash
+/// grant use `parse_cast_spells_alternative_cost_multi`.
+fn parse_cast_spells_alternative_cost(text: &str) -> Option<(StaticDefinition, bool)> {
+    type VE<'a> = OracleError<'a>;
+
+    let lower = text.to_lowercase();
+    let tp = TextPair::new(text, &lower);
+    let tp = nom_tag_tp(&tp, "you may cast ")?.trim_start();
+
+    let (after_filter_lower, filter_lower) = take_until::<_, _, VE<'_>>(" by paying ")
+        .parse(tp.lower)
+        .ok()?;
+    let filter_len = filter_lower.len();
+    let filter_original = tp.original[..filter_len].trim();
+    let after_filter = TextPair::new(&tp.original[filter_len..], after_filter_lower);
+    let after_filter = nom_tag_tp(&after_filter, " by paying ")?;
+
+    let (after_cost_lower, cost_lower) = take_until::<_, _, VE<'_>>(" rather than paying ")
+        .parse(after_filter.lower)
+        .ok()?;
+    let cost_len = cost_lower.len();
+    let cost_slice = after_filter.original[..cost_len].trim();
+    let after_cost = TextPair::new(&after_filter.original[cost_len..], after_cost_lower);
+    let after_cost = nom_tag_tp(&after_cost, " rather than paying ")?;
+
+    let (remainder_lower, _) = alt((
+        tag::<_, _, VE<'_>>("their mana costs"),
+        tag("its mana cost"),
+    ))
+    .parse(after_cost.lower)
+    .ok()?;
+    let consumed = after_cost.lower.len() - remainder_lower.len();
+    let remainder = after_cost.original[consumed..]
+        .trim()
+        .trim_start_matches('.')
+        .trim();
+
+    let flash_suffix = remainder
+        .to_lowercase()
+        .starts_with("if you cast a spell this way");
+
+    let base_filter = parse_type_phrase(filter_original).0;
+    let affected = apply_spell_keyword_subject_constraints(base_filter, None, None, Vec::new());
+
+    let cost = parse_oracle_cost(cost_slice);
+    if !supported_alternative_cast_cost(&cost) {
+        return None;
+    }
+
+    let def = StaticDefinition::new(StaticMode::CastWithAlternativeCost { cost })
+        .affected(affected)
+        .description(text.to_string())
+        .active_zones(vec![Zone::Battlefield]);
+    Some((def, flash_suffix))
+}
+
+/// CR 118.9: Alternative costs the `CastWithAlternativeCost` static supports
+/// today. Mana ({0}, {WUBRG}) and energy ({E}) are in; life/discard/free shapes
+/// that belong to other cast-permission classes stay deferred.
+fn supported_alternative_cast_cost(cost: &AbilityCost) -> bool {
+    matches!(
+        cost,
+        AbilityCost::Mana { .. } | AbilityCost::PayEnergy { .. }
+    )
+}
+
+/// CR 702.8a: Re-parse a `parse_cast_spells_alternative_cost` match to emit the
+/// paired flash grant static, sharing the spell filter of the alt-cost static.
+fn alt_cost_flash_grant_from_cast_cost(text: &str) -> Option<StaticDefinition> {
+    let (alt_cost_def, _) = parse_cast_spells_alternative_cost(text)?;
+    Some(
+        StaticDefinition::new(StaticMode::CastWithKeyword {
+            keyword: Keyword::Flash,
+        })
+        .affected(alt_cost_def.affected.clone()?)
+        .description(text.to_string())
+        .active_zones(vec![Zone::Battlefield]),
+    )
+}
+
 /// CR 118.9 + CR 601.2f: Parse a mana-cost-alternative-grant static —
 /// "You may [pay] X rather than pay [the/its/this object's] mana cost for
 /// [filter] spells you cast." The permanent's controller may pay the
-/// alternative MANA cost `X` instead of a matching spell's printed mana cost.
+/// alternative cost `X` instead of a matching spell's printed mana cost.
 ///
 /// Class members: Rooftop Storm ({0}, Zombie creature spells), Fist of Suns
 /// ({WUBRG}, any spell), Jodah ({WUBRG}, MV 5+ when the qualifier parses).
 ///
-/// Strict-fails to `None` (never misparses) when the payment is non-mana
-/// (Dream Halls discard, Bolas's Citadel life, As Foretold free), deferring
-/// those classes rather than producing a wrong static.
+/// Strict-fails to `None` (never misparses) when the payment cannot be parsed
+/// as an `AbilityCost` (Dream Halls discard, Bolas's Citadel life-as-MV).
 pub(crate) fn parse_spells_alternative_cost(text: &str) -> Option<StaticDefinition> {
     type VE<'a> = OracleError<'a>;
 
@@ -215,12 +313,10 @@ pub(crate) fn parse_spells_alternative_cost(text: &str) -> Option<StaticDefiniti
     let affected =
         apply_spell_keyword_subject_constraints(base_filter, None, mv_filter, Vec::new());
 
-    // Cost gate: only a pure MANA cost grants this static. {0} and {WUBRG} parse
-    // to AbilityCost::Mana; non-mana payments (life, discard, free) return a
-    // different AbilityCost variant and strict-fail here.
-    let AbilityCost::Mana { cost } = parse_oracle_cost(cost_slice) else {
+    let cost = parse_oracle_cost(cost_slice);
+    if !supported_alternative_cast_cost(&cost) {
         return None;
-    };
+    }
 
     Some(
         StaticDefinition::new(StaticMode::CastWithAlternativeCost { cost })

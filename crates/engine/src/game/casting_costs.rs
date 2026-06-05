@@ -6480,7 +6480,9 @@ mod tests {
             Zone::Battlefield,
         );
         let grant = StaticDefinition::new(StaticMode::CastWithAlternativeCost {
-            cost: ManaCost::zero(),
+            cost: AbilityCost::Mana {
+                cost: ManaCost::zero(),
+            },
         })
         .affected(TargetFilter::Typed(
             TypedFilter::creature()
@@ -6551,6 +6553,82 @@ mod tests {
             payable_spell_alternative_cost(&state, PlayerId(1), opp_zombie),
             None,
             "opponent's Zombie must not receive the controller-You grant"
+        );
+    }
+
+    /// CR 118.9 + CR 107.14: Primal Prayers grants {E} as an alternative cost
+    /// for creature spells with MV ≤ 3 that the controller casts.
+    #[test]
+    fn granted_alternative_energy_cost_matches_creature_mv_filter() {
+        use crate::types::ability::{Comparator, QuantityExpr, StaticDefinition};
+
+        let mut state = GameState::new_two_player(42);
+        let caster = PlayerId(0);
+        state.players[caster.0 as usize].energy = 2;
+
+        let source = create_object(
+            &mut state,
+            CardId(10),
+            caster,
+            "Primal Prayers".to_string(),
+            Zone::Battlefield,
+        );
+        let grant = StaticDefinition::new(StaticMode::CastWithAlternativeCost {
+            cost: AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed { value: 1 },
+            },
+        })
+        .affected(TargetFilter::Typed(
+            TypedFilter::creature()
+                .controller(ControllerRef::You)
+                .properties(vec![FilterProp::Cmc {
+                    comparator: Comparator::LE,
+                    value: QuantityExpr::Fixed { value: 3 },
+                }]),
+        ));
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .static_definitions
+            .push(grant);
+
+        let rampager = create_object(
+            &mut state,
+            CardId(11),
+            caster,
+            "Greenbelt Rampager".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&rampager).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.mana_cost = ManaCost::generic(1);
+        }
+        assert_eq!(
+            payable_spell_alternative_cost(&state, caster, rampager),
+            Some(AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed { value: 1 }
+            }),
+            "MV 1 creature must receive the {{E}} alternative cost"
+        );
+
+        let expensive = create_object(
+            &mut state,
+            CardId(12),
+            caster,
+            "Big Creature".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&expensive).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.mana_cost = ManaCost::generic(4);
+        }
+        assert_eq!(
+            payable_spell_alternative_cost(&state, caster, expensive),
+            None,
+            "MV 4 creature must not receive the MV≤3 grant"
         );
     }
 

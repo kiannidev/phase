@@ -4729,14 +4729,14 @@ fn and_trigger_conditions(
 /// parsed unchanged.
 ///
 /// Delegates condition recognition to `parse_inner_condition` (the shared
-/// combinator authority, which already handles `"~ is attacking"` via
-/// `parse_combat_state_predicate`). Only the attacking gate is representable as
-/// a `TriggerCondition` (`SourceIsAttacking` is the sole combat-state variant of
-/// that enum — CR 508.1), so a recognized-but-unrepresentable state ("while ~ is
-/// blocking") returns `None`, leaving the clause intact rather than dropping the
-/// gate silently. Returns the event clause with the `"while ..."` suffix removed
-/// plus the extracted condition, or `None` when no representable `"while ..."`
-/// gate is present.
+/// combinator authority). The combat-state special case handles attacking
+/// directly (`SourceIsAttacking` is the sole combat-state variant of
+/// `TriggerCondition` — CR 508.1); other representable states are bridged
+/// through `static_condition_to_trigger_condition`. Recognized but
+/// unrepresentable states ("while ~ is blocking") return `None`, leaving the
+/// clause intact rather than dropping the gate silently. Returns the event
+/// clause with the `"while ..."` suffix removed plus the extracted condition, or
+/// `None` when no representable `"while ..."` gate is present.
 fn strip_while_state_clause(condition: &str) -> Option<(String, TriggerCondition)> {
     let lower = condition.to_lowercase();
     // The gate is introduced by " while " and runs to the end of the event
@@ -4775,11 +4775,11 @@ pub(crate) fn parse_trigger_condition(
     condition: &str,
     ctx: &mut ParseContext,
 ) -> (TriggerMode, TriggerDefinition) {
-    // CR 603.4 + CR 508.1: A trailing "while [self-ref] is attacking" gate on
-    // the trigger event ("Whenever you cast a spell while ~ is attacking")
-    // restricts the trigger to that combat state. Strip it before mode dispatch
-    // and AND it onto the parsed trigger's condition so the rest of the event
-    // clause parses exactly as it would unqualified.
+    // CR 603.4 + CR 508.1: A trailing "while [state]" gate on the trigger event
+    // ("Whenever you cast a spell while ~ is attacking") restricts the trigger to
+    // that state. Strip it before mode dispatch and AND it onto the parsed
+    // trigger's condition so the rest of the event clause parses exactly as it
+    // would unqualified.
     if let Some((stripped, while_cond)) = strip_while_state_clause(condition) {
         let (mode, mut def) = parse_trigger_condition(&stripped, ctx);
         def.condition = Some(and_trigger_conditions(def.condition.take(), while_cond));

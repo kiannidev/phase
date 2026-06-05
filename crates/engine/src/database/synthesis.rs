@@ -4536,6 +4536,16 @@ pub fn synthesize_ingest(face: &mut CardFace) {
 ///
 /// Each instance of Extort triggers separately (CR 702.101b), so one trigger
 /// is synthesized per `Keyword::Extort` instance.
+fn is_extort_mana_cost(cost: &ManaCost) -> bool {
+    matches!(
+        cost,
+        ManaCost::Cost {
+            shards,
+            generic: 0,
+        } if shards.as_slice() == [ManaCostShard::WhiteBlack]
+    )
+}
+
 fn is_extort_trigger(t: &TriggerDefinition) -> bool {
     matches!(t.mode, TriggerMode::SpellCast)
         && matches!(t.valid_target, Some(TargetFilter::Controller))
@@ -4545,14 +4555,32 @@ fn is_extort_trigger(t: &TriggerDefinition) -> bool {
                     &*a.effect,
                     Effect::PayCost {
                         cost: PaymentCost::AbilityCost {
-                            cost: AbilityCost::Mana { .. },
+                            cost: AbilityCost::Mana { cost },
                         },
-                        ..
-                    }
+                        payer: TargetFilter::Controller,
+                    } if is_extort_mana_cost(cost)
                 )
                 && a.sub_ability.as_deref().is_some_and(|drain| {
                     matches!(drain.player_scope, Some(PlayerFilter::Opponent))
-                        && matches!(&*drain.effect, Effect::LoseLife { .. })
+                        && drain.condition == Some(AbilityCondition::effect_performed())
+                        && matches!(
+                            &*drain.effect,
+                            Effect::LoseLife {
+                                amount: QuantityExpr::Fixed { value: 1 },
+                                target: None,
+                            }
+                        )
+                        && drain.sub_ability.as_deref().is_some_and(|gain| {
+                            matches!(
+                                &*gain.effect,
+                                Effect::GainLife {
+                                    amount: QuantityExpr::Ref {
+                                        qty: QuantityRef::PreviousEffectAmount,
+                                    },
+                                    player: TargetFilter::Controller,
+                                }
+                            )
+                        })
                 })
         })
 }
@@ -11762,6 +11790,65 @@ mod extort_synthesis_tests {
             .filter(|t| is_extort_trigger(t))
             .count();
         assert_eq!(count, 2);
+    }
+
+    /// CR 604.1: the runtime-granted path (`triggers_for`) yields the same shape
+    /// as the printed path, and `trigger_matches_keyword_kind` recognizes exactly
+    /// that shape for symmetric removal.
+    #[test]
+    fn triggers_for_extort_matches_keyword_kind() {
+        let triggers = KeywordTriggerInstaller::triggers_for(&Keyword::Extort);
+        assert_eq!(triggers.len(), 1);
+        assert!(is_extort_trigger(&triggers[0]));
+        assert!(KeywordTriggerInstaller::trigger_matches_keyword_kind(
+            &triggers[0],
+            &Keyword::Extort
+        ));
+        assert!(!KeywordTriggerInstaller::trigger_matches_keyword_kind(
+            &build_dethrone_trigger(),
+            &Keyword::Extort
+        ));
+    }
+
+    /// The Extort matcher feeds runtime `RemoveKeyword`, so it must not strip a
+    /// coincidental spell-cast trigger with a different payment/drain shape.
+    #[test]
+    fn extort_matcher_rejects_non_extort_pay_and_drain_trigger() {
+        let gain = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+        );
+        let drain = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::LoseLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                target: None,
+            },
+        )
+        .player_scope(PlayerFilter::Opponent)
+        .sub_ability(gain)
+        .condition(AbilityCondition::effect_performed());
+        let execute = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::PayCost {
+                cost: PaymentCost::AbilityCost {
+                    cost: AbilityCost::Mana {
+                        cost: ManaCost::generic(1),
+                    },
+                },
+                payer: TargetFilter::Controller,
+            },
+        )
+        .optional()
+        .sub_ability(drain);
+        let trigger = TriggerDefinition::new(TriggerMode::SpellCast)
+            .valid_target(TargetFilter::Controller)
+            .execute(execute);
+
+        assert!(!is_extort_trigger(&trigger));
     }
 
     /// CR 702.101a: "you gain that much life" means the total life actually

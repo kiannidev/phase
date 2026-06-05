@@ -18,7 +18,7 @@ use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{DamageRecord, GameState};
 use crate::types::identifiers::ObjectId;
-use crate::types::keywords::Keyword;
+use crate::types::keywords::{Keyword, KeywordKind};
 use crate::types::player::PlayerId;
 use crate::types::proposed_event::ProposedEvent;
 
@@ -43,7 +43,8 @@ fn player_context_target(
     if matches!(target_filter, TargetFilter::SourceChosenPlayer) {
         // CR 607.2d + CR 608.2c: Resolve "the chosen player" from the
         // source's linked persisted choice.
-        return super::source_chosen_player(state, ability.source_id).map(TargetRef::Player);
+        return crate::game::game_object::source_chosen_player(state, ability.source_id)
+            .map(TargetRef::Player);
     }
 
     if matches!(
@@ -77,10 +78,31 @@ impl DamageContext {
             source_id,
             controller: obj.controller,
             source_is_creature: obj.card_types.core_types.contains(&CoreType::Creature),
-            has_deathtouch: obj.has_keyword(&Keyword::Deathtouch),
-            has_lifelink: obj.has_keyword(&Keyword::Lifelink),
-            has_wither: obj.has_keyword(&Keyword::Wither),
-            has_infect: obj.has_keyword(&Keyword::Infect),
+            // CR 613.1f + CR 702.2 + CR 702.15 + CR 702.80 + CR 702.90:
+            // Off-battlefield keyword grants (e.g. Judith's "that spell gains
+            // deathtouch and lifelink") live in transient continuous effects and
+            // are visible via `object_has_effective_keyword_kind`, not printed
+            // `obj.keywords`.
+            has_deathtouch: keywords::object_has_effective_keyword_kind(
+                state,
+                source_id,
+                KeywordKind::Deathtouch,
+            ),
+            has_lifelink: keywords::object_has_effective_keyword_kind(
+                state,
+                source_id,
+                KeywordKind::Lifelink,
+            ),
+            has_wither: keywords::object_has_effective_keyword_kind(
+                state,
+                source_id,
+                KeywordKind::Wither,
+            ),
+            has_infect: keywords::object_has_effective_keyword_kind(
+                state,
+                source_id,
+                KeywordKind::Infect,
+            ),
             combat_damage_poison: obj
                 .keywords
                 .iter()
@@ -508,7 +530,8 @@ pub(crate) fn apply_damage_after_replacement(
             record.source_power = obj.power;
             record.source_toughness = obj.toughness;
             record.source_colors = obj.color.clone();
-            record.source_mana_value = obj.mana_cost.mana_value();
+            // CR 202.3e: include cost_x_paid for on-stack spells.
+            record.source_mana_value = obj.mana_cost.mana_value_with_x(obj.zone, obj.cost_x_paid);
             record.source_controller_snapshot = obj.controller;
             record.source_owner = obj.owner;
             // CR 608.2i: snapshot the source's zone (Stack for a spell,
@@ -605,7 +628,7 @@ pub fn resolve(
                 damage_source,
                 target,
             } => (
-                resolve_quantity_with_targets(state, amount, ability) as u32,
+                resolve_quantity_with_targets(state, amount, ability).max(0) as u32,
                 *damage_source,
                 target,
             ),
@@ -903,14 +926,16 @@ fn collect_matching_players(
                             source_id,
                         )
                     }
-                    // CR 508.6: opponent this player attacked this turn.
-                    PlayerFilter::OpponentAttackedThisTurn => {
-                        p.id != source_controller && state.has_attacked(source_controller, p.id)
-                    }
-                    // CR 508.6: opponent this source creature attacked this turn.
-                    PlayerFilter::OpponentAttackedBySourceThisTurn => {
+                    // CR 508.6: opponent the subject attacked within scope.
+                    PlayerFilter::OpponentAttacked { subject, scope } => {
                         p.id != source_controller
-                            && state.creature_attacked_player_this_turn(source_id, p.id)
+                            && state.opponent_attacked(
+                                subject,
+                                scope,
+                                source_controller,
+                                source_id,
+                                p.id,
+                            )
                     }
                     PlayerFilter::HighestSpeed => {
                         let highest_speed = state
@@ -927,8 +952,12 @@ fn collect_matching_players(
                         .iter()
                         .any(|id| state.objects.get(id).is_some_and(|obj| obj.owner == p.id)),
                     PlayerFilter::PerformedActionThisWay { relation, action } => {
-                        crate::game::players::matches_relation(p.id, source_controller, relation)
-                            && crate::game::players::performed_action_this_way(state, p.id, action)
+                        crate::game::players::matches_relation(
+                            state,
+                            p.id,
+                            source_controller,
+                            relation,
+                        ) && crate::game::players::performed_action_this_way(state, p.id, action)
                     }
                     PlayerFilter::OwnersOfCardsExiledBySource => {
                         crate::game::players::owns_card_exiled_by_source(state, p.id, source_id)
@@ -941,7 +970,7 @@ fn collect_matching_players(
                     // CR 120.3 + CR 603.2c: Each opponent other than the triggering opponent.
                     // Falls back to plain Opponent semantics when no trigger event is in scope.
                     PlayerFilter::OpponentOtherThanTriggering => {
-                        if p.id == source_controller {
+                        if !crate::game::players::is_opponent(state, source_controller, p.id) {
                             return false;
                         }
                         let triggering = state.current_trigger_event.as_ref().and_then(|e| {
@@ -976,15 +1005,19 @@ fn collect_matching_players(
                             source_controller,
                             source_id,
                         );
-                        crate::game::players::matches_relation(p.id, source_controller, *relation)
-                            && crate::game::effects::player_control_count_compares(
-                                state,
-                                p.id,
-                                filter,
-                                *comparator,
-                                threshold,
-                                source_id,
-                            )
+                        crate::game::players::matches_relation(
+                            state,
+                            p.id,
+                            source_controller,
+                            *relation,
+                        ) && crate::game::effects::player_control_count_compares(
+                            state,
+                            p.id,
+                            filter,
+                            *comparator,
+                            threshold,
+                            source_id,
+                        )
                     }
                     // CR 402.1 / 119.1 / 122.1f / 404.1: "each [player class]
                     // whose [scalar attr] [comparator] [value]" — candidate
@@ -1003,9 +1036,13 @@ fn collect_matching_players(
                             source_controller,
                             source_id,
                         );
-                        crate::game::players::matches_relation(p.id, source_controller, *relation)
-                            && crate::game::effects::candidate_player_scalar(p, attr)
-                                .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
+                        crate::game::players::matches_relation(
+                            state,
+                            p.id,
+                            source_controller,
+                            *relation,
+                        ) && crate::game::effects::candidate_player_scalar(p, attr)
+                            .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
                     }
                 }
         })
@@ -1075,14 +1112,16 @@ pub fn resolve_each_player(
                             ability.source_id,
                         )
                     }
-                    // CR 508.6: opponent this player attacked this turn.
-                    PlayerFilter::OpponentAttackedThisTurn => {
-                        p.id != ability.controller && state.has_attacked(ability.controller, p.id)
-                    }
-                    // CR 508.6: opponent this source creature attacked this turn.
-                    PlayerFilter::OpponentAttackedBySourceThisTurn => {
+                    // CR 508.6: opponent the subject attacked within scope.
+                    PlayerFilter::OpponentAttacked { subject, scope } => {
                         p.id != ability.controller
-                            && state.creature_attacked_player_this_turn(ability.source_id, p.id)
+                            && state.opponent_attacked(
+                                *subject,
+                                *scope,
+                                ability.controller,
+                                ability.source_id,
+                                p.id,
+                            )
                     }
                     PlayerFilter::HighestSpeed => {
                         let highest_speed = state
@@ -1099,8 +1138,12 @@ pub fn resolve_each_player(
                         .iter()
                         .any(|id| state.objects.get(id).is_some_and(|obj| obj.owner == p.id)),
                     PlayerFilter::PerformedActionThisWay { relation, action } => {
-                        crate::game::players::matches_relation(p.id, ability.controller, *relation)
-                            && crate::game::players::performed_action_this_way(state, p.id, *action)
+                        crate::game::players::matches_relation(
+                            state,
+                            p.id,
+                            ability.controller,
+                            *relation,
+                        ) && crate::game::players::performed_action_this_way(state, p.id, *action)
                     }
                     PlayerFilter::OwnersOfCardsExiledBySource => {
                         crate::game::players::owns_card_exiled_by_source(
@@ -1117,7 +1160,7 @@ pub fn resolve_each_player(
                     // CR 120.3 + CR 603.2c: Each opponent other than the triggering opponent.
                     // Falls back to plain Opponent semantics when no trigger event is in scope.
                     PlayerFilter::OpponentOtherThanTriggering => {
-                        if p.id == ability.controller {
+                        if !crate::game::players::is_opponent(state, ability.controller, p.id) {
                             return false;
                         }
                         let triggering = state.current_trigger_event.as_ref().and_then(|e| {
@@ -1150,15 +1193,19 @@ pub fn resolve_each_player(
                             ability.controller,
                             ability.source_id,
                         );
-                        crate::game::players::matches_relation(p.id, ability.controller, *relation)
-                            && crate::game::effects::player_control_count_compares(
-                                state,
-                                p.id,
-                                filter,
-                                *comparator,
-                                threshold,
-                                ability.source_id,
-                            )
+                        crate::game::players::matches_relation(
+                            state,
+                            p.id,
+                            ability.controller,
+                            *relation,
+                        ) && crate::game::effects::player_control_count_compares(
+                            state,
+                            p.id,
+                            filter,
+                            *comparator,
+                            threshold,
+                            ability.source_id,
+                        )
                     }
                     // CR 402.1 / 119.1 / 122.1f / 404.1: "each [player class]
                     // whose [scalar attr] [comparator] [value]" — candidate
@@ -1177,9 +1224,13 @@ pub fn resolve_each_player(
                             ability.controller,
                             ability.source_id,
                         );
-                        crate::game::players::matches_relation(p.id, ability.controller, *relation)
-                            && crate::game::effects::candidate_player_scalar(p, attr)
-                                .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
+                        crate::game::players::matches_relation(
+                            state,
+                            p.id,
+                            ability.controller,
+                            *relation,
+                        ) && crate::game::effects::candidate_player_scalar(p, attr)
+                            .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
                     }
                 }
         })
@@ -1239,7 +1290,8 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        FilterProp, ObjectScope, QuantityExpr, QuantityRef, TargetFilter, TypeFilter, TypedFilter,
+        ContinuousModification, Duration, FilterProp, ObjectScope, QuantityExpr, QuantityRef,
+        TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::CoreType;
     use crate::types::events::GameEvent;
@@ -1261,6 +1313,47 @@ mod tests {
             ObjectId(100),
             PlayerId(0),
         )
+    }
+
+    /// CR 122.1c: damage to a permanent with a shield counter is prevented and
+    /// one shield counter is removed (non-combat / single-source path).
+    #[test]
+    fn shield_counter_prevents_noncombat_damage_and_is_consumed() {
+        use crate::types::counter::CounterType;
+        let mut state = GameState::new_two_player(42);
+        let obj_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Shielded Bear".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&obj_id)
+            .unwrap()
+            .counters
+            .insert(CounterType::Shield, 1);
+
+        let ability = make_ability(3, vec![TargetRef::Object(obj_id)]);
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.objects[&obj_id].damage_marked, 0,
+            "shield counter prevents the damage"
+        );
+        assert_eq!(
+            state.objects[&obj_id].counters.get(&CounterType::Shield),
+            None,
+            "the shield counter is consumed"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GameEvent::DamagePrevented { .. })),
+            "a DamagePrevented event is emitted"
+        );
     }
 
     #[test]
@@ -1957,12 +2050,11 @@ mod tests {
         resolve(&mut state, &ability, &mut events).unwrap();
 
         assert_eq!(state.objects[&battle_id].defense, Some(0));
-        assert_eq!(
-            state.objects[&battle_id]
+        assert!(
+            !state.objects[&battle_id]
                 .counters
-                .get(&CounterType::Defense)
-                .copied(),
-            Some(0)
+                .contains_key(&CounterType::Defense),
+            "zero-count defense entry should be pruned after damage removes the last counter"
         );
     }
 
@@ -2080,6 +2172,44 @@ mod tests {
         assert_eq!(state.objects[&target_id].damage_marked, 3);
         // CR 702.15b: Lifelink triggers on creature damage too.
         assert_eq!(state.players[0].life, 23); // 20 + 3
+    }
+
+    /// Issue #2013: Judith grants deathtouch/lifelink to the cast instant/sorcery via a
+    /// `SpecificObject` transient effect; damage must read effective keywords, not printed.
+    #[test]
+    fn transient_spell_keyword_grants_apply_to_damage() {
+        let mut state = GameState::new_two_player(42);
+        let spell_id = create_object(
+            &mut state,
+            CardId(60),
+            PlayerId(0),
+            "Shock".to_string(),
+            Zone::Stack,
+        );
+        {
+            let obj = state.objects.get_mut(&spell_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Instant);
+        }
+        state.add_transient_continuous_effect(
+            spell_id,
+            PlayerId(0),
+            Duration::UntilEndOfTurn,
+            TargetFilter::SpecificObject { id: spell_id },
+            vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Lifelink,
+            }],
+            None,
+        );
+        let ability = make_ability_with_source(2, vec![TargetRef::Player(PlayerId(1))], spell_id);
+        let mut events = Vec::new();
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.players[1].life, 18);
+        assert_eq!(
+            state.players[0].life, 22,
+            "lifelink from a transient spell grant must apply when the spell deals damage"
+        );
     }
 
     #[test]

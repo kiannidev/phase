@@ -698,6 +698,7 @@ pub fn convert_replace_would_put_into_graveyard(
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: Vec::new(),
+                face_down_profile: None,
             },
         );
         out.push(ReplacementDefinition {
@@ -942,6 +943,7 @@ pub fn convert_as_put_into_graveyard_from_anywhere(
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: Vec::new(),
+                face_down_profile: None,
             },
         );
         out.push(ReplacementDefinition {
@@ -2575,7 +2577,7 @@ fn variant_tag(a: &ReplacementActionWouldEnter) -> String {
 /// permanent's own `cost_x_paid` field — populated by `finalize_cast` and
 /// preserved across the stack → battlefield zone change. Walks the
 /// expression tree so wrapped forms (`Multiply`, `DivideRounded`, `Offset`,
-/// `Sum`, `UpTo`) all rewrite correctly.
+/// `ClampMin`, `Sum`, `UpTo`) all rewrite correctly.
 ///
 /// Mirrors `engine::parser::oracle_replacement::rewrite_variable_x_to_cost_x_paid`
 /// (which is `pub(crate)` to the engine crate). Replicated here so the
@@ -2590,6 +2592,7 @@ fn rewrite_variable_x_to_cost_x_paid(expr: &mut QuantityExpr) {
         }
         QuantityExpr::Fixed { .. } => {}
         QuantityExpr::DivideRounded { inner, .. }
+        | QuantityExpr::ClampMin { inner, .. }
         | QuantityExpr::Offset { inner, .. }
         | QuantityExpr::Multiply { inner, .. } => rewrite_variable_x_to_cost_x_paid(inner),
         QuantityExpr::Sum { exprs } => {

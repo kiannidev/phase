@@ -37,12 +37,14 @@ pub fn check_spell_timing(
         return Ok(());
     }
 
-    // CR 608.2g + CR 702.85a / CR 701.57a: A cascade/discover hit is cast DURING
-    // the resolution of its source ability, following the 601.2a-i cast steps but
-    // bypassing normal timing — sorcery-speed, empty-stack, and active-player
-    // gates do not apply (the stack is necessarily non-empty mid-resolution). Such
-    // a cast is driven by `initiate_cast_during_resolution`, which marks the
-    // exiled hit with an `ExileWithAltCost` permission carrying `resolution_cleanup`.
+    // CR 608.2g + CR 702.85a / CR 701.57a + CR 702.62a/d: A spell cast DURING
+    // the resolution of its source ability — a Cascade/Discover hit, or
+    // Suspend's last-time-counter free cast — follows the 601.2a-i cast steps
+    // but bypasses normal timing: sorcery-speed, empty-stack, and active-player
+    // gates do not apply (Treasure Cruise is a sorcery cast at upkeep with the
+    // trigger still on the stack). Such a cast is driven by
+    // `initiate_cast_during_resolution`, which marks the card with an
+    // `ExileWithAltCost` permission carrying `resolution_cleanup`.
     if obj.casting_permissions.iter().any(|p| {
         matches!(
             p,
@@ -194,7 +196,8 @@ pub fn record_spell_cast_from_zone(
         subtypes: obj.card_types.subtypes.clone(),
         keywords: obj.keywords.clone(),
         colors: obj.color.clone(),
-        mana_value: obj.mana_cost.mana_value(),
+        // CR 202.3e: While on the stack, X equals the announced value, not 0.
+        mana_value: obj.mana_cost.mana_value_with_x(obj.zone, obj.cost_x_paid),
         // CR 107.3 + CR 601.2b: Capture X-in-cost at record time so later
         // trigger-filter evaluation (e.g. "your first spell with {X} in its
         // mana cost each turn") does not need to re-examine the spell object.
@@ -684,7 +687,7 @@ fn activation_restriction_applies(
             state.active_player == player && state.phase == Phase::Upkeep
         }
         // CR 508.1c / CR 509.1b: Combat-phase restrictions on activation timing.
-        ActivationRestriction::DuringCombat => is_combat_phase(state.phase),
+        ActivationRestriction::DuringCombat => state.phase.is_combat(),
         ActivationRestriction::BeforeAttackersDeclared => is_before_attackers_declared(state),
         ActivationRestriction::BeforeCombatDamage => is_before_combat_damage(state.phase),
         // CR 602.5b: Per-turn activation limit tracked via ability activation counter.
@@ -777,7 +780,7 @@ fn casting_restriction_applies(
     match restriction {
         // CR 307.1: A player may cast a sorcery during a main phase of their turn when the stack is empty.
         CastingRestriction::AsSorcery => is_sorcery_speed_window(state, player),
-        CastingRestriction::DuringCombat => is_combat_phase(state.phase),
+        CastingRestriction::DuringCombat => state.phase.is_combat(),
         CastingRestriction::DuringOpponentsTurn => state.active_player != player,
         CastingRestriction::DuringYourTurn => state.active_player == player,
         CastingRestriction::DuringYourUpkeep => {
@@ -1438,19 +1441,6 @@ fn is_before_attackers_declared(state: &crate::types::game_state::GameState) -> 
         && matches!(state.phase, Phase::PreCombatMain | Phase::BeginCombat)
 }
 
-/// CR 506.1: The combat phase has five steps: beginning of combat, declare attackers,
-/// declare blockers, combat damage, and end of combat.
-fn is_combat_phase(phase: Phase) -> bool {
-    matches!(
-        phase,
-        Phase::BeginCombat
-            | Phase::DeclareAttackers
-            | Phase::DeclareBlockers
-            | Phase::CombatDamage
-            | Phase::EndCombat
-    )
-}
-
 fn is_before_combat_damage(phase: Phase) -> bool {
     matches!(
         phase,
@@ -1677,6 +1667,39 @@ fn is_source_blocked(state: &crate::types::game_state::GameState, source_id: Obj
         .as_ref()
         .and_then(|combat| combat.blocker_assignments.get(&source_id))
         .is_some_and(|blockers| !blockers.is_empty())
+}
+
+/// CR 508.1d + CR 508.1h: Whether a declared `AttackTarget` falls within a
+/// combat restriction's defended scope relative to the static's controller.
+pub(crate) fn attack_target_matches_defended_scope(
+    state: &crate::types::game_state::GameState,
+    attack_target: Option<&crate::game::combat::AttackTarget>,
+    filter: &crate::types::triggers::AttackTargetFilter,
+    source_controller: PlayerId,
+) -> bool {
+    use crate::game::combat::AttackTarget;
+    use crate::types::triggers::AttackTargetFilter;
+    let Some(target) = attack_target else {
+        return false;
+    };
+    let permanent_controller =
+        |id: ObjectId| -> Option<PlayerId> { state.objects.get(&id).map(|obj| obj.controller) };
+    match (filter, target) {
+        (AttackTargetFilter::Player, AttackTarget::Player(p)) => *p == source_controller,
+        (AttackTargetFilter::Planeswalker, AttackTarget::Planeswalker(pw_id)) => {
+            permanent_controller(*pw_id) == Some(source_controller)
+        }
+        (AttackTargetFilter::PlayerOrPlaneswalker, AttackTarget::Player(p)) => {
+            *p == source_controller
+        }
+        (AttackTargetFilter::PlayerOrPlaneswalker, AttackTarget::Planeswalker(pw_id)) => {
+            permanent_controller(*pw_id) == Some(source_controller)
+        }
+        (AttackTargetFilter::Battle, AttackTarget::Battle(b_id)) => {
+            permanent_controller(*b_id) == Some(source_controller)
+        }
+        _ => false,
+    }
 }
 
 #[cfg(test)]

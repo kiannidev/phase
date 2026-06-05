@@ -140,10 +140,11 @@ fn find_legal_targets_with_context(
                 ) {
                     continue;
                 }
-                let is_opponent = player.id != source_controller;
                 let include = match controller {
-                    Some(ControllerRef::Opponent) => is_opponent,
-                    Some(ControllerRef::You) => !is_opponent,
+                    Some(ControllerRef::Opponent) => {
+                        super::players::is_opponent(state, source_controller, player.id)
+                    }
+                    Some(ControllerRef::You) => player.id == source_controller,
                     // CR 109.4: TargetPlayer is nonsensical when enumerating target
                     // candidates (the "target player" is what's being chosen here).
                     // Fail closed.
@@ -151,6 +152,9 @@ fn find_legal_targets_with_context(
                     Some(ControllerRef::TargetPlayer) => false,
                     Some(ControllerRef::ParentTargetController) => false,
                     Some(ControllerRef::DefendingPlayer) => false,
+                    // CR 613.1: a persisted chosen player isn't a target
+                    // candidate here. Fail closed.
+                    Some(ControllerRef::SourceChosenPlayer) => false,
                     // CR 109.4: A chosen player is fixed during resolution, not
                     // enumerated as a target candidate. Fail closed.
                     Some(ControllerRef::ChosenPlayer { .. }) => false,
@@ -1123,7 +1127,8 @@ fn stack_spell_entry_matches_filter(
                 TargetRef::Object(id) => {
                     super::filter::matches_target_filter(state, *id, constraint, &bare_ctx)
                 }
-                TargetRef::Player(pid) => super::filter::player_matches_target_filter(
+                TargetRef::Player(pid) => super::filter::player_matches_target_filter_in_state(
+                    state,
                     constraint,
                     *pid,
                     source_controller_opt,
@@ -1141,7 +1146,8 @@ fn stack_spell_entry_matches_filter(
                 TargetRef::Object(id) => {
                     super::filter::matches_target_filter(state, *id, constraint, &bare_ctx)
                 }
-                TargetRef::Player(pid) => super::filter::player_matches_target_filter(
+                TargetRef::Player(pid) => super::filter::player_matches_target_filter_in_state(
+                    state,
                     constraint,
                     *pid,
                     source_controller_opt,
@@ -1330,13 +1336,21 @@ fn can_target(
     if obj.has_keyword(&Keyword::Shroud) {
         return false;
     }
+    // CR 702.11e: An "ignore hexproof" effect (Detection Tower) lets the targeting
+    // source's controller target a permanent "as though it didn't have hexproof".
+    // It bypasses Hexproof / Hexproof from [quality] only — never Shroud.
+    let ignores_hexproof =
+        crate::game::static_abilities::player_ignores_hexproof(state, source_controller);
     // CR 702.11a: Hexproof prevents targeting by opponents.
-    if obj.has_keyword(&Keyword::Hexproof) && obj.controller != source_controller {
+    if !ignores_hexproof
+        && obj.has_keyword(&Keyword::Hexproof)
+        && obj.controller != source_controller
+    {
         return false;
     }
     // CR 702.11d: "Hexproof from [quality]" prevents targeting by opponents' sources
     // with the matching quality. CR 702.11e: IgnoreHexproof bypasses this.
-    if obj.controller != source_controller {
+    if !ignores_hexproof && obj.controller != source_controller {
         for kw in &obj.keywords {
             if let Keyword::HexproofFrom(ref filter) = kw {
                 if hexproof_filter_matches(filter, source_id, state) {
@@ -1346,6 +1360,19 @@ fn can_target(
         }
     }
     if is_protected_from(obj, source_id, state) {
+        return false;
+    }
+    // CR 702.18a: A static "can't be the target of spells or abilities" is the
+    // descriptive (non-keyworded) form of Shroud — the permanent can't be the
+    // target of any spell or ability, regardless of controller. It is modeled as
+    // `StaticMode::CantBeTargeted`, living on the object's own static definitions
+    // (a self-referential static, or propagated onto a subject via `AddStaticMode`
+    // — see `static_mode_needs_grant_propagation`). The opponent-scoped variant
+    // ("... your opponents control") is parsed as `Keyword::Hexproof` instead, so
+    // it is handled by the Hexproof branch above rather than here.
+    if super::functioning_abilities::active_static_definitions(state, obj)
+        .any(|def| matches!(def.mode, crate::types::statics::StaticMode::CantBeTargeted))
+    {
         return false;
     }
     // CR 702.21a: Ward is a triggered ability, not a targeting restriction.
@@ -1393,16 +1420,20 @@ pub(crate) fn zone_object_ids(state: &GameState, zone: Zone) -> Vec<ObjectId> {
     }
 }
 
-/// Extract all explicit `InZone` zones from a target filter, recursing through combinators.
+/// Extract all explicit zone restrictions from a target filter, recursing through combinators.
 fn extract_explicit_zones(filter: &TargetFilter) -> Vec<Zone> {
     match filter {
-        TargetFilter::Typed(TypedFilter { properties, .. }) => properties
-            .iter()
-            .filter_map(|p| match p {
-                FilterProp::InZone { zone } => Some(*zone),
-                _ => None,
-            })
-            .collect(),
+        TargetFilter::Typed(TypedFilter { properties, .. }) => {
+            let mut explicit_zones = Vec::new();
+            for property in properties {
+                match property {
+                    FilterProp::InZone { zone } => explicit_zones.push(*zone),
+                    FilterProp::InAnyZone { zones } => explicit_zones.extend(zones.iter().copied()),
+                    _ => {}
+                }
+            }
+            explicit_zones
+        }
         TargetFilter::Or { filters } | TargetFilter::And { filters } => {
             filters.iter().flat_map(extract_explicit_zones).collect()
         }
@@ -1514,11 +1545,13 @@ mod tests {
     use super::*;
     use crate::game::game_object::AttachTarget;
     use crate::game::zones::create_object;
-    use crate::types::ability::{Comparator, QuantityExpr};
+    use crate::types::ability::{Comparator, ContinuousModification, Duration, QuantityExpr};
     use crate::types::card_type::CoreType;
     use crate::types::game_state::CastingVariant;
     use crate::types::identifiers::CardId;
-    use crate::types::keywords::ProtectionTarget;
+    use crate::types::keywords::{HexproofFilter, ProtectionTarget};
+    use crate::types::mana::ManaColor;
+    use crate::types::statics::StaticMode;
     use crate::types::zones::Zone;
 
     #[test]
@@ -1678,6 +1711,121 @@ mod tests {
     }
 
     #[test]
+    fn ignore_hexproof_lets_controller_target_opponents_hexproof_creature() {
+        // CR 702.11e: Detection Tower — while the targeting player has an active
+        // "ignore hexproof" effect, opponents' hexproof permanents are legal targets.
+        let (mut state, _c0, c1) = setup_with_creatures();
+        state
+            .objects
+            .get_mut(&c1)
+            .unwrap()
+            .keywords
+            .push(Keyword::Hexproof);
+
+        // Baseline: P0 can't target P1's hexproof creature.
+        assert!(
+            !find_legal_targets(&state, &creature_filter(), PlayerId(0), ObjectId(99))
+                .contains(&TargetRef::Object(c1))
+        );
+
+        // Grant P0 IgnoreHexproof (the player-scoped transient a bypass effect creates).
+        state.add_transient_continuous_effect(
+            ObjectId(99),
+            PlayerId(0),
+            Duration::UntilEndOfTurn,
+            TargetFilter::SpecificPlayer { id: PlayerId(0) },
+            vec![ContinuousModification::AddStaticMode {
+                mode: StaticMode::IgnoreHexproof,
+            }],
+            None,
+        );
+
+        // Now P0 may target it; the grant is player-scoped to P0.
+        assert!(
+            find_legal_targets(&state, &creature_filter(), PlayerId(0), ObjectId(99))
+                .contains(&TargetRef::Object(c1))
+        );
+    }
+
+    #[test]
+    fn ignore_hexproof_bypasses_hexproof_from_quality() {
+        // CR 702.11e: "as though it didn't have hexproof" also bypasses
+        // hexproof from [quality].
+        let (mut state, _c0, c1) = setup_with_creatures();
+        state
+            .objects
+            .get_mut(&c1)
+            .unwrap()
+            .keywords
+            .push(Keyword::HexproofFrom(HexproofFilter::Color(ManaColor::Red)));
+        let source_id = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Lightning Bolt".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&source_id)
+            .unwrap()
+            .color
+            .push(ManaColor::Red);
+
+        assert!(!can_target(
+            state.objects.get(&c1).unwrap(),
+            PlayerId(0),
+            source_id,
+            &state
+        ));
+
+        state.add_transient_continuous_effect(
+            source_id,
+            PlayerId(0),
+            Duration::UntilEndOfTurn,
+            TargetFilter::SpecificPlayer { id: PlayerId(0) },
+            vec![ContinuousModification::AddStaticMode {
+                mode: StaticMode::IgnoreHexproof,
+            }],
+            None,
+        );
+
+        assert!(can_target(
+            state.objects.get(&c1).unwrap(),
+            PlayerId(0),
+            source_id,
+            &state
+        ));
+    }
+
+    #[test]
+    fn ignore_hexproof_does_not_bypass_shroud() {
+        // CR 702.18a: IgnoreHexproof bypasses hexproof only — never shroud.
+        let (mut state, _c0, c1) = setup_with_creatures();
+        state
+            .objects
+            .get_mut(&c1)
+            .unwrap()
+            .keywords
+            .push(Keyword::Shroud);
+        state.add_transient_continuous_effect(
+            ObjectId(99),
+            PlayerId(0),
+            Duration::UntilEndOfTurn,
+            TargetFilter::SpecificPlayer { id: PlayerId(0) },
+            vec![ContinuousModification::AddStaticMode {
+                mode: StaticMode::IgnoreHexproof,
+            }],
+            None,
+        );
+
+        assert!(
+            !find_legal_targets(&state, &creature_filter(), PlayerId(0), ObjectId(99))
+                .contains(&TargetRef::Object(c1))
+        );
+    }
+
+    #[test]
     fn shroud_creature_not_targetable_by_anyone() {
         let (mut state, _c0, c1) = setup_with_creatures();
         state
@@ -1691,6 +1839,34 @@ mod tests {
         let targets_p1 = find_legal_targets(&state, &creature_filter(), PlayerId(1), ObjectId(99));
         assert!(!targets_p0.contains(&TargetRef::Object(c1)));
         assert!(!targets_p1.contains(&TargetRef::Object(c1)));
+    }
+
+    /// CR 702.18a: A `StaticMode::CantBeTargeted` static (the descriptive Shroud
+    /// form, "~ can't be the target of spells or abilities") makes the permanent
+    /// untargetable by EVERY player, including its own controller — distinguishing
+    /// it from Hexproof, which only blocks opponents.
+    #[test]
+    fn cant_be_targeted_static_blocks_all_players() {
+        let (mut state, _c0, c1) = setup_with_creatures();
+        // c1 is controlled by P1. Grant it the blanket static directly, mirroring
+        // a self-referential static / the `AddStaticMode` propagation onto a subject.
+        state.objects.get_mut(&c1).unwrap().static_definitions.push(
+            crate::types::ability::StaticDefinition::new(
+                crate::types::statics::StaticMode::CantBeTargeted,
+            )
+            .affected(crate::types::ability::TargetFilter::SelfRef),
+        );
+
+        let targets_p0 = find_legal_targets(&state, &creature_filter(), PlayerId(0), ObjectId(99));
+        let targets_p1 = find_legal_targets(&state, &creature_filter(), PlayerId(1), ObjectId(99));
+        assert!(
+            !targets_p0.contains(&TargetRef::Object(c1)),
+            "opponent cannot target a CantBeTargeted permanent"
+        );
+        assert!(
+            !targets_p1.contains(&TargetRef::Object(c1)),
+            "the controller cannot target it either (Shroud semantics, not Hexproof)"
+        );
     }
 
     #[test]
@@ -1969,6 +2145,66 @@ mod tests {
         let targets = find_legal_targets(&state, &filter, PlayerId(0), ObjectId(99));
         assert!(targets.contains(&TargetRef::Object(c1)));
         assert_eq!(targets.len(), 1);
+    }
+
+    #[test]
+    fn find_legal_targets_honors_in_any_zone() {
+        let mut state = GameState::new_two_player(42);
+        let hand_card = create_object(
+            &mut state,
+            CardId(10),
+            PlayerId(1),
+            "Hand Creature".to_string(),
+            Zone::Hand,
+        );
+        state
+            .objects
+            .get_mut(&hand_card)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        let graveyard_card = create_object(
+            &mut state,
+            CardId(11),
+            PlayerId(1),
+            "Graveyard Creature".to_string(),
+            Zone::Graveyard,
+        );
+        state
+            .objects
+            .get_mut(&graveyard_card)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        let battlefield_card = create_object(
+            &mut state,
+            CardId(12),
+            PlayerId(1),
+            "Battlefield Creature".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&battlefield_card)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+
+        let filter = TargetFilter::Typed(
+            TypedFilter::creature()
+                .controller(ControllerRef::Opponent)
+                .properties(vec![FilterProp::InAnyZone {
+                    zones: vec![Zone::Hand, Zone::Graveyard],
+                }]),
+        );
+        let targets = find_legal_targets(&state, &filter, PlayerId(0), ObjectId(99));
+        assert!(targets.contains(&TargetRef::Object(hand_card)));
+        assert!(targets.contains(&TargetRef::Object(graveyard_card)));
+        assert!(!targets.contains(&TargetRef::Object(battlefield_card)));
+        assert_eq!(targets.len(), 2);
     }
 
     #[test]
@@ -2989,6 +3225,34 @@ mod tests {
             "protected opponent must not be a legal target, got {:?}",
             targets
         );
+    }
+
+    /// CR 102.3 + CR 115.9c: In team multiplayer, "target opponent" excludes
+    /// teammates and includes opposing-team players.
+    #[test]
+    fn find_legal_targets_typed_opponent_excludes_two_headed_giant_teammate() {
+        use crate::types::ability::{ControllerRef, TypedFilter};
+        use crate::types::format::FormatConfig;
+
+        let mut state = GameState::new(FormatConfig::two_headed_giant(), 4, 42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source Spell".to_string(),
+            Zone::Battlefield,
+        );
+        let filter =
+            TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent));
+
+        let targets = find_legal_targets(&state, &filter, PlayerId(0), source);
+        assert!(
+            !targets.contains(&TargetRef::Player(PlayerId(1))),
+            "teammate must not be a legal target opponent, got {:?}",
+            targets
+        );
+        assert!(targets.contains(&TargetRef::Player(PlayerId(2))));
+        assert!(targets.contains(&TargetRef::Player(PlayerId(3))));
     }
 
     fn make_resolved_with_targets(

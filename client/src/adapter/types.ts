@@ -39,6 +39,7 @@ export type GameFormat =
   | "PauperCommander"
   | "DuelCommander"
   | "TinyLeaders"
+  | "Oathbreaker"
   | "Brawl"
   | "HistoricBrawl"
   | "FreeForAll"
@@ -130,8 +131,6 @@ export interface LobbyGame {
    * joiners to confirm before entering.
    */
   is_sandbox?: boolean;
-  /** `true` when the room uses competitive ranked rating updates. */
-  is_ranked?: boolean;
   /** Draft-specific metadata. Present when the room is a draft pod. */
   draft_metadata?: DraftLobbyMetadata | null;
 }
@@ -295,6 +294,10 @@ export type PayCostKind =
   | { type: "Sacrifice" }
   | { type: "ReturnToHand" }
   | { type: "ExileFromZone"; zone: ExileCostSourceZone }
+  // CR 702.167a/b: Craft materials exile across the battlefield/graveyard union.
+  // `materials` is the engine-side `TargetFilter` the choices were drawn from;
+  // the modal only renders `choices`, so it is opaque pass-through here.
+  | { type: "ExileMaterials"; materials: unknown }
   | { type: "ExileFromManaZone"; zone: Zone }
   | { type: "RemoveCounter"; counter_type: CounterMatch }
   | { type: "TapCreatures" }
@@ -718,6 +721,12 @@ export interface GameObject {
    */
   is_token?: boolean;
   /**
+   * CR 707.10 / CR 707.12a: Whether this object is a copy of a card/spell and so
+   * is not "represented by a card" (mirrors the engine's `is_copy`). Present
+   * only when true; the frontend does not read it (display only).
+   */
+  is_copy?: boolean;
+  /**
    * Image-lookup routing hint from the engine. "Card" → look up the image
    * in the real-card database (default; also covers token-copies of real
    * cards like Twinflame/Helm of the Host). "Token" → look up the image
@@ -1068,7 +1077,7 @@ export type WaitingFor =
   | { type: "OrderTriggers"; data: { player: PlayerId; triggers: PendingTriggerSummary[] } }
   | { type: "CopyTargetChoice"; data: { player: PlayerId; source_id: ObjectId; valid_targets: ObjectId[]; max_mana_value?: number | null } }
   | { type: "ExploreChoice"; data: { player: PlayerId; source_id: ObjectId; choosable: ObjectId[]; remaining: ObjectId[]; pending_effect: unknown } }
-  | { type: "ReturnAsAuraTarget"; data: { player: PlayerId; source_id: ObjectId; returned_id: ObjectId; legal_targets: ObjectId[]; pending_effect: unknown } }
+  | { type: "ReturnAsAuraTarget"; data: { player: PlayerId; source_id: ObjectId; returned_id: ObjectId; legal_targets: TargetRef[]; pending_effect: unknown } }
   | { type: "EquipTarget"; data: { player: PlayerId; equipment_id: ObjectId; valid_targets: ObjectId[] } }
   | { type: "CrewVehicle"; data: { player: PlayerId; vehicle_id: ObjectId; crew_power: number; eligible_creatures: ObjectId[] } }
   | { type: "StationTarget"; data: { player: PlayerId; spacecraft_id: ObjectId; eligible_creatures: ObjectId[] } }
@@ -1094,7 +1103,13 @@ export type WaitingFor =
   | { type: "DefilerPayment"; data: { player: PlayerId; life_cost: number; mana_reduction: ManaCost; pending_cast: PendingCast } }
   | { type: "CastOffer"; data: { player: PlayerId; kind: CastOfferKind } }
   | { type: "ModalFaceChoice"; data: { player: PlayerId; object_id: ObjectId; card_id: CardId } }
-  | { type: "AlternativeCastChoice"; data: { player: PlayerId; object_id: ObjectId; card_id: CardId; payment_mode?: CastPaymentMode; keyword: { type: "Warp" } | { type: "Evoke" } | { type: "Overload" } | { type: "Bestow" } | { type: "Awaken" } | { type: "Cleave" } | { type: "MoreThanMeetsTheEye" }; normal_cost: ManaCost; alternative_cost: ManaCost | null; alternative_additional_cost: SerializedAbilityCost | null } }
+  | { type: "AlternativeCastChoice"; data: { player: PlayerId; object_id: ObjectId; card_id: CardId; payment_mode?: CastPaymentMode; keyword: { type: "Warp" } | { type: "Evoke" } | { type: "Overload" } | { type: "Bestow" } | { type: "Awaken" } | { type: "Cleave" } | { type: "MoreThanMeetsTheEye" } | { type: "Mutate" }; normal_cost: ManaCost; alternative_cost: ManaCost | null; alternative_additional_cost: SerializedAbilityCost | null } }
+  // CR 702.140c + CR 730.2a: mutating creature spell resolving with a legal
+  // target — controller chooses to put it on top of or under the target creature.
+  | { type: "MutateMergeChoice"; data: { player: PlayerId; merging_id: ObjectId; target_id: ObjectId } }
+  // CR 702.99a: resolving Cipher spell — controller may exile this card encoded
+  // on a creature they control (or decline, sending it to the graveyard).
+  | { type: "CipherEncodeChoice"; data: { player: PlayerId; card_id: ObjectId; creatures: ObjectId[] } }
   | { type: "CastingVariantChoice"; data: { player: PlayerId; object_id: ObjectId; card_id: CardId; payment_mode?: CastPaymentMode; options: CastingVariantChoiceOption[] } }
   | { type: "ChoosePermanentTypeSlot"; data: { player: PlayerId; object_id: ObjectId; card_id: CardId; source: ObjectId; payment_mode?: CastPaymentMode; available_slots: CoreType[] } }
   | { type: "MultiTargetSelection"; data: { player: PlayerId; legal_targets: ObjectId[]; min_targets: number; max_targets: number; pending_ability: unknown } }
@@ -1157,6 +1172,10 @@ export type WaitingFor =
   | { type: "ExertChoice"; data: { player: PlayerId; attacker: ObjectId; remaining?: ObjectId[] } }
   | { type: "PhyrexianPayment"; data: { player: PlayerId; spell_object: ObjectId; shards: PhyrexianShard[] } }
   | { type: "AssignCombatDamage"; data: { player: PlayerId; attacker_id: ObjectId; total_damage: number; blockers: { blocker_id: ObjectId; lethal_minimum: number }[]; trample: TrampleKind | null; defending_player: PlayerId; attack_target: AttackTarget; pw_loyalty?: number; pw_controller?: PlayerId } }
+  // CR 510.1d + CR 702.22k: a blocking creature blocking a banded attacker —
+  // the active player divides that blocker's combat damage among the attackers
+  // it's blocking (free division, no lethal ordering).
+  | { type: "AssignBlockerDamage"; data: { player: PlayerId; blocker_id: ObjectId; total_damage: number; attackers: ObjectId[] } }
   | { type: "DistributeAmong"; data: { player: PlayerId; total: number; targets: TargetRef[]; unit: DistributionUnit } }
   | { type: "MoveCountersDistribution"; data: { player: PlayerId; source_id: ObjectId; counter_type?: CounterType | null; available: [CounterType, number][]; destinations: ObjectId[]; pending_effect: unknown } }
   | { type: "ChooseFromZoneChoice"; data: { player: PlayerId; cards: ObjectId[]; count: number; up_to?: boolean; constraint?: ChooseFromZoneConstraint | null; source_id: ObjectId } }
@@ -1214,6 +1233,7 @@ export type WaitingFor =
     } }
   | { type: "ChooseDungeon"; data: { player: PlayerId; options: DungeonId[] } }
   | { type: "ChooseDungeonRoom"; data: { player: PlayerId; dungeon: DungeonId; options: number[]; option_names: string[] } }
+  | { type: "SpecializeColor"; data: { player: PlayerId; object_id: ObjectId; options: ManaColor[] } }
   | { type: "CategoryChoice"; data: {
       player: PlayerId;
       target_player: PlayerId;
@@ -1301,10 +1321,23 @@ export type RetargetScope =
 
 // ── Log Types ────────────────────────────────────────────────────────────
 
-export type LogCategory =
-  | "Game" | "Turn" | "Stack" | "Combat" | "Zone" | "Life"
-  | "Mana" | "State" | "Token" | "Trigger" | "Special" | "Destroy"
-  | "Debug";
+export const LOG_CATEGORIES = [
+  "Game",
+  "Turn",
+  "Stack",
+  "Combat",
+  "Zone",
+  "Life",
+  "Mana",
+  "State",
+  "Token",
+  "Trigger",
+  "Special",
+  "Destroy",
+  "Debug",
+] as const;
+
+export type LogCategory = (typeof LOG_CATEGORIES)[number];
 
 export type LogSegment =
   | { type: "Text"; value: string }
@@ -1368,11 +1401,14 @@ export type DebugAction =
         owner: PlayerId;
         zone: Zone;
         attach_to?: AttachTarget;
+        run_etb: boolean;
       };
     }
   | { type: "RemoveObject"; data: { object_id: ObjectId } }
+  | { type: "Sacrifice"; data: { object_id: ObjectId } }
   | { type: "DrawCards"; data: { player_id: PlayerId; count: number } }
   | { type: "Mill"; data: { player_id: PlayerId; count: number } }
+  | { type: "Reveal"; data: { player_id: PlayerId; count: number } }
   | { type: "ShuffleLibrary"; data: { player_id: PlayerId } }
   | { type: "Proliferate"; data: { player_id: PlayerId } }
   | { type: "SetBasePowerToughness"; data: { object_id: ObjectId; power: number | null; toughness: number | null } }
@@ -1390,12 +1426,14 @@ export type DebugAction =
   | { type: "ModifyPlayerCounters"; data: { player_id: PlayerId; counter_kind: PlayerCounterKind; delta: number } }
   | { type: "ModifyEnergy"; data: { player_id: PlayerId; delta: number } }
   | { type: "AddMana"; data: { player_id: PlayerId; mana: ManaType[] } }
+  | { type: "SetInfiniteMana"; data: { player_id: PlayerId; enabled: boolean } }
   | { type: "SetPhase"; data: { phase: Phase; active_player: PlayerId } }
   | { type: "RunStateBasedActions" }
   | {
       type: "CreateToken";
       data: {
         request: DebugTokenRequest;
+        run_etb: boolean;
       };
     }
   | { type: "CreateTokenCopy"; data: { source_id: ObjectId; owner: PlayerId } };
@@ -1408,7 +1446,7 @@ export type GameAction =
   | { type: "CastSpellWithPaymentMode"; data: { object_id: ObjectId; card_id: CardId; targets: ObjectId[]; payment_mode: CastPaymentMode } }
   | { type: "Foretell"; data: { object_id: ObjectId; card_id: CardId } }
   | { type: "ActivateAbility"; data: { source_id: ObjectId; ability_index: number } }
-  | { type: "DeclareAttackers"; data: { attacks: [ObjectId, AttackTarget][] } }
+  | { type: "DeclareAttackers"; data: { attacks: [ObjectId, AttackTarget][]; bands?: ObjectId[][] } }
   | { type: "DeclareBlockers"; data: { assignments: [ObjectId, ObjectId][] } }
   | { type: "MulliganDecision"; data: { choice: MulliganChoice } }
   | { type: "ReorderHand"; data: { order: ObjectId[] } }
@@ -1480,17 +1518,24 @@ export type GameAction =
   | { type: "DiscoverChoice"; data: { choice: CastChoice } }
   | { type: "CascadeChoice"; data: { choice: CastChoice } }
   | { type: "ChooseTopOrBottom"; data: { top: boolean } }
+  // CR 702.140c + CR 730.2a: answer to MutateMergeChoice — top or bottom.
+  | { type: "ChooseMutateMergeSide"; data: { side: "Top" | "Bottom" } }
+  // CR 702.99a: answer to CipherEncodeChoice — a creature to encode on, or null to decline.
+  | { type: "CipherEncode"; data: { creature: ObjectId | null } }
   | { type: "ChooseClashOpponent"; data: { opponent: PlayerId } }
   | { type: "SetAutoPass"; data: { mode: { type: "UntilStackEmpty" } | { type: "UntilEndOfTurn" } } }
   | { type: "CancelAutoPass" }
   | { type: "SetPhaseStops"; data: { stops: Phase[] } }
   | { type: "AssignCombatDamage"; data: { assignments: [ObjectId, number][]; trample_damage: number; controller_damage: number } }
+  // CR 510.1d + CR 702.22k: blocker's combat-damage division among the attackers it blocks.
+  | { type: "AssignBlockerDamage"; data: { assignments: [ObjectId, number][] } }
   | { type: "DistributeAmong"; data: { distribution: [TargetRef, number][] } }
   | { type: "ChooseCounterMoveDistribution"; data: { selections: CounterMoveChoice[] } }
   | { type: "RetargetSpell"; data: { new_targets: TargetRef[] } }
   | { type: "LearnDecision"; data: { choice: LearnOption } }
   | { type: "ChooseDungeon"; data: { dungeon: DungeonId } }
   | { type: "ChooseDungeonRoom"; data: { room_index: number } }
+  | { type: "ChooseSpecializeColor"; data: { color: ManaColor } }
   | { type: "UnlockRoomDoor"; data: { object_id: ObjectId; door: RoomDoor } }
   | { type: "TapForConvoke"; data: { object_id: ObjectId; mana_type: ManaType } }
   | { type: "SelectCategoryPermanents"; data: { choices: (ObjectId | null)[] } }
@@ -1603,6 +1648,16 @@ export type GameEvent =
   // CR 706: a die was rolled. Animated by DiceRollOverlay. `sides`/`result` are
   // the engine's authoritative roll (1..=sides after modifiers).
   | { type: "DieRolled"; data: { player_id: PlayerId; sides: number; result: number } }
+  // CR 103.1: the starting-player d20 roll-off as one structured event. `rounds`
+  // preserves the round boundaries (round 1 = every seat; each later round = the
+  // previous round's tied-max group that rerolled); `winner` is the engine's
+  // authoritative starting player. Each round's `rolls` are [playerId, result]
+  // pairs in seat order. Replaces the flat per-roll DieRolled batch for the
+  // contest; in-game die rolls still emit DieRolled.
+  | {
+      type: "StartingPlayerContest";
+      data: { rounds: { rolls: [PlayerId, number][] }[]; winner: PlayerId };
+    }
   // CR 705: a coin was flipped. `won` is whether the flipping player won the flip
   // (relative to that player) — there is no engine-named face; the heads/tails
   // depiction is a presentation choice.
@@ -1917,6 +1972,17 @@ export interface SubmitResult {
 }
 
 /** Bundles legal actions with the engine's auto-pass recommendation. */
+/**
+ * Engine-owned non-fatal diagnostic (an engine-level progress wedge, not a
+ * rules outcome): an owed decision has no legal action for any authorized
+ * submitter, i.e. a wedged game. Display-only — the frontend surfaces it as a
+ * toast so a hung game informs the user.
+ */
+export interface StuckDecisionDiagnostic {
+  waitingForKind: string;
+  stuckPlayers: number[];
+}
+
 export interface LegalActionsResult {
   actions: GameAction[];
   autoPassRecommended: boolean;
@@ -1929,6 +1995,8 @@ export interface LegalActionsResult {
    * availability from objects.
    */
   legalActionsByObject?: Record<string, GameAction[]>;
+  /** Engine progress-wedge diagnostic: present only when the current decision is wedged. */
+  stuckDiagnostic?: StuckDecisionDiagnostic;
 }
 
 /**
@@ -1945,6 +2013,14 @@ export interface ViewerSnapshot {
   autoPassRecommended: boolean;
   spellCosts?: Record<string, ManaCost>;
   legalActionsByObject?: Record<string, GameAction[]>;
+  /**
+   * Engine progress-wedge diagnostic, mirrored from `LegalActionsResult` for
+   * shape parity. Currently inert on this path: the store's `stuckDiagnostic`
+   * slice is fed exclusively via `legalResultState` (the `LegalActionsResult`
+   * path), and the P2P broadcast wire format (`LegalActionsWire`) does not
+   * carry this field, so the snapshot copy is a deliberate parity placeholder.
+   */
+  stuckDiagnostic?: StuckDecisionDiagnostic;
 }
 
 export interface BatchResolveResult {

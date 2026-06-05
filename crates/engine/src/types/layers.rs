@@ -112,13 +112,23 @@ impl ContinuousModification {
             | ContinuousModification::AddAllBasicLandTypes
             | ContinuousModification::AddAllLandTypes
             | ContinuousModification::AddChosenSubtype { .. }
-            | ContinuousModification::SetBasicLandType { .. } => Layer::Type, // CR 613.1d + CR 205.4b
+            | ContinuousModification::SetBasicLandType { .. }
+            | ContinuousModification::SetChosenBasicLandType => Layer::Type, // CR 613.1d + CR 205.4b
             // CR 122.1 + CR 614.1c: One-shot counter placement at copy
             // resolution. Consumed by the BecomeCopy / CopyTokenOf resolvers
             // before any continuous-effect machinery is reached. Reaching this
             // arm via `apply_continuous_effect` indicates a wiring bug.
             ContinuousModification::AddCounterOnEnter { .. } => unreachable!(
                 "AddCounterOnEnter is consumed at resolution; never layered. \
+                 Verify resolver dispatch in token_copy.rs / become_copy.rs."
+            ),
+            // CR 707.9 + CR 202.1b: The "has no mana cost" copy exception is
+            // consumed at copy resolution (token_copy.rs bakes it into the token;
+            // become_copy.rs strips it from the copied values), exactly like
+            // AddCounterOnEnter — it never flows through the layer system.
+            // Reaching this arm indicates a wiring bug.
+            ContinuousModification::RemoveManaCost => unreachable!(
+                "RemoveManaCost is consumed at copy resolution; never layered. \
                  Verify resolver dispatch in token_copy.rs / become_copy.rs."
             ),
             ContinuousModification::SetColor { .. }

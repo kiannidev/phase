@@ -505,10 +505,12 @@ fn walk_continuous_mod(modification: &ContinuousModification, out: &mut Vec<Stri
         | ContinuousModification::AssignNoCombatDamage
         | ContinuousModification::ChangeController
         | ContinuousModification::SetBasicLandType { .. }
+        | ContinuousModification::SetChosenBasicLandType
         | ContinuousModification::RetainPrintedTriggerFromSource { .. }
         | ContinuousModification::AddSupertype { .. }
         | ContinuousModification::RemoveSupertype { .. }
-        | ContinuousModification::AddCounterOnEnter { .. } => {}
+        | ContinuousModification::AddCounterOnEnter { .. }
+        | ContinuousModification::RemoveManaCost => {}
     }
 }
 
@@ -546,6 +548,7 @@ fn walk_cost(cost: &AbilityCost, out: &mut Vec<String>) {
         | AbilityCost::PayLife { .. }
         | AbilityCost::Discard { .. }
         | AbilityCost::Exile { .. }
+        | AbilityCost::ExileMaterials { .. }
         | AbilityCost::CollectEvidence { .. }
         | AbilityCost::TapCreatures { .. }
         | AbilityCost::RemoveCounter { .. }
@@ -706,7 +709,9 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::TimeTravel
         | Effect::BecomeMonarch
         | Effect::Proliferate
+        | Effect::ProliferateTarget { .. }
         | Effect::EndTheTurn
+        | Effect::EndCombatPhase
         | Effect::Populate
         | Effect::Clash
         | Effect::SwitchPT { .. }
@@ -744,6 +749,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::PhaseOut { .. }
         | Effect::PhaseIn { .. }
         | Effect::ForceBlock { .. }
+        | Effect::ForceAttack { .. }
         | Effect::SolveCase
         | Effect::BecomePrepared { .. }
         | Effect::BecomeUnprepared { .. }
@@ -755,8 +761,8 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::PayCost { .. }
         | Effect::CastFromZone { .. }
         | Effect::PreventDamage { .. }
-        | Effect::LoseTheGame
-        | Effect::WinTheGame
+        | Effect::LoseTheGame { .. }
+        | Effect::WinTheGame { .. }
         | Effect::RingTemptsYou
         | Effect::VentureIntoDungeon
         | Effect::VentureInto { .. }
@@ -816,6 +822,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         // CR 614.12 + CR 303.4: ReturnAsAura.grants carry typed
         // ContinuousModifications, never conjured card names.
         | Effect::ReturnAsAura { .. }
+        | Effect::Specialize
         | Effect::Unimplemented { .. } => {}
     }
 }
@@ -992,10 +999,29 @@ pub fn rehydrate_game_from_card_db(state: &mut GameState, db: &CardDatabase) {
             }
 
             if is_face_down_battlefield {
-                apply_face_down_creature_characteristics(obj);
+                // CR 708.2a: This reload path only runs while `printed_ref` is
+                // still set (see the `obj.printed_ref.clone()` guard above);
+                // effect-driven face-down entries (Cyber-Controller) clear
+                // `printed_ref` and carry their `FaceDownProfile` characteristics
+                // directly, so they never reach here. The vanilla 2/2 default
+                // reproduces the morph/manifest reload behavior.
+                apply_face_down_creature_characteristics(
+                    obj,
+                    &crate::types::ability::FaceDownProfile::vanilla_2_2(),
+                );
                 changed_any = true;
                 changed_battlefield = true;
                 continue;
+            }
+
+            // Digital-only Specialize: load all specialized faces for runtime choice.
+            if obj.specialize_faces.is_none() {
+                if let Some(rules) = db.get_by_name(&card_face.name) {
+                    if let CardLayout::Specialize(_, variants) = &rules.layout {
+                        obj.specialize_faces =
+                            Some(super::specialize::specialize_faces_from_variants(variants));
+                    }
+                }
             }
 
             // Populate back_face for dual-faced layouts so the other face's
@@ -1230,6 +1256,7 @@ mod tests {
             parse_warnings: vec![],
             brawl_commander: false,
             is_commander: false,
+            is_oathbreaker: false,
             deck_copy_limit: None,
             metadata: Default::default(),
             rarities: Default::default(),
@@ -1861,6 +1888,7 @@ mod tests {
         walk_effect(&until_lose, &mut names);
 
         let roll = Effect::RollDie {
+            count: QuantityExpr::Fixed { value: 1 },
             sides: 6,
             results: vec![DieResultBranch {
                 min: 1,

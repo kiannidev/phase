@@ -1,7 +1,7 @@
 use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till, take_until};
-use nom::combinator::{all_consuming, map, opt, value, verify};
+use nom::combinator::{all_consuming, map, opt, rest, value, verify};
 use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
@@ -11,9 +11,9 @@ use super::animation::{
 use super::{resolve_it_pronoun, ParseContext};
 use crate::parser::oracle_ir::ast::*;
 use crate::types::ability::{
-    AbilityDefinition, AbilityKind, ContinuousModification, ControllerRef, Duration, Effect,
-    FilterProp, MultiTargetSpec, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef,
-    StaticDefinition, TargetFilter, TypedFilter,
+    AbilityDefinition, AbilityKind, ChosenSubtypeKind, ContinuousModification, ControllerRef,
+    Duration, Effect, FilterProp, MultiTargetSpec, PlayerFilter, PlayerScope, PtValue,
+    QuantityExpr, QuantityRef, StaticDefinition, TargetFilter, TypedFilter,
 };
 use crate::types::game_state::DayNight;
 use crate::types::keywords::Keyword;
@@ -264,7 +264,7 @@ fn try_parse_subject_continuous_clause(
         return Some(clause);
     }
     let application = parse_subject_application(subject, ctx)?;
-    build_continuous_clause(application, predicate)
+    build_continuous_clause(application, predicate, ctx)
 }
 
 fn additive_type_subject_application(
@@ -650,6 +650,40 @@ pub(super) fn is_can_attack_despite_defender_predicate(lower: &str) -> bool {
     .is_ok()
 }
 
+/// CR 509.1b: predicate-only "can't be blocked [this turn] [except by … | by …]"
+/// conjunct left after the sequence splitter peels a trailing evasion restriction
+/// off a keyword/P/T grant ("gain haste until end of turn and can't be blocked
+/// this turn except by creatures with haste"). Used by
+/// `combat_requirement_conjunct_prepend` to re-attach the subject.
+pub(super) fn is_cant_be_blocked_restriction_predicate(lower: &str) -> bool {
+    let trimmed = lower.trim().trim_end_matches('.').trim();
+    parse_cant_be_blocked_restriction_predicate(trimmed).is_ok()
+        || parse_restriction_modes(trimmed).is_some_and(|modes| {
+            modes.iter().any(|mode| {
+                matches!(
+                    mode,
+                    StaticMode::CantBeBlocked
+                        | StaticMode::CantBeBlockedBy { .. }
+                        | StaticMode::CantBeBlockedExceptBy { .. }
+                )
+            })
+        })
+}
+
+fn parse_cant_be_blocked_restriction_predicate(input: &str) -> OracleResult<'_, ()> {
+    let (input, _) = alt((
+        tag::<_, _, OracleError<'_>>("can't be blocked"),
+        tag("cannot be blocked"),
+    ))
+    .parse(input)?;
+    let (input, _) = opt(alt((tag(" this turn"), tag(" this combat")))).parse(input)?;
+    if input.is_empty() {
+        return Ok((input, ()));
+    }
+    let (input, _) = (tag(" "), alt((tag("except by "), tag("by "))), rest).parse(input)?;
+    Ok((input, ()))
+}
+
 fn parse_extra_blockers_count(input: &str) -> OracleResult<'_, Option<u32>> {
     alt((
         map(
@@ -990,6 +1024,11 @@ pub(super) fn parse_subject_application(
                 })
             } else if matches!(ctx.relative_player_scope, Some(ControllerRef::ScopedPlayer)) {
                 TargetFilter::ScopedPlayer
+            } else if matches!(
+                ctx.relative_player_scope,
+                Some(ControllerRef::SourceChosenPlayer)
+            ) {
+                TargetFilter::SourceChosenPlayer
             } else if matches!(
                 ctx.relative_player_scope,
                 Some(ControllerRef::ParentTargetController)
@@ -1506,6 +1545,7 @@ pub(super) fn is_single_object_ref(filter: &TargetFilter) -> bool {
 fn try_split_pump_compound(
     normalized: &str,
     application: &SubjectApplication,
+    ctx: &ParseContext,
 ) -> Option<ParsedEffectClause> {
     let lower = normalized.to_lowercase();
     // Find " and " that separates two independent clauses after a pump+duration.
@@ -1515,7 +1555,8 @@ fn try_split_pump_compound(
     let remainder = remainder_tp.original.trim();
 
     // Parse the pump clause first to check whether it carries its own duration.
-    let (power, toughness, duration) = super::parse_pump_clause(pump_part)?;
+    let (power, toughness, duration) =
+        super::lower::parse_pump_clause_with_context(pump_part, ctx)?;
 
     // Guard: when the pump part has NO duration (e.g., "get +2/+2 and gain flying
     // until end of turn"), the trailing duration is shared across both clauses.
@@ -1626,6 +1667,7 @@ fn build_keyword_choice_clause(
 fn build_continuous_clause(
     application: SubjectApplication,
     predicate: &str,
+    ctx: &ParseContext,
 ) -> Option<ParsedEffectClause> {
     let normalized = deconjugate_verb(predicate);
 
@@ -1646,7 +1688,9 @@ fn build_continuous_clause(
     }
 
     // Try the full predicate first (simple pump with no compound).
-    if let Some((power, toughness, duration)) = super::parse_pump_clause(&normalized) {
+    if let Some((power, toughness, duration)) =
+        super::lower::parse_pump_clause_with_context(&normalized, ctx)
+    {
         let effect = build_pump_effect(&application, power, toughness);
         return Some(ParsedEffectClause {
             effect,
@@ -1663,7 +1707,7 @@ fn build_continuous_clause(
     // Compound: "get +1/+1 until end of turn and you gain 1 life"
     // Split on " and " that follows a duration marker, producing a pump
     // with a chained sub_ability for the remainder.
-    if let Some(clause) = try_split_pump_compound(&normalized, &application) {
+    if let Some(clause) = try_split_pump_compound(&normalized, &application, ctx) {
         return Some(clause);
     }
 
@@ -1890,6 +1934,37 @@ fn build_become_clause(
     // Must intercept before parse_animation_spec which rejects "of your choice" patterns.
     if let Some(clause) = try_parse_become_choice(become_text, &application, duration.clone()) {
         return Some(clause);
+    }
+
+    // CR 205.3e + CR 607.2d: "becomes that type" applies the creature type chosen
+    // by the preceding "Choose a creature type" instruction in the same ability
+    // (Imagecrafter, Unnatural Selection, Mistform Mutant, Standardize). Unlike
+    // the "of your choice" arm above, the choice is already made upstream, so this
+    // emits only the apply half — a continuous `AddChosenSubtype` that reads the
+    // source's chosen creature type at resolution. Must intercept before
+    // parse_animation_spec, which would mis-tokenize "that"/"type" as subtypes.
+    if become_text.eq_ignore_ascii_case("that type") {
+        let affected = static_affected_for_application(&application);
+        let effect = Effect::GenericEffect {
+            static_abilities: vec![StaticDefinition::continuous()
+                .affected(affected)
+                .modifications(vec![ContinuousModification::AddChosenSubtype {
+                    kind: ChosenSubtypeKind::CreatureType,
+                }])
+                .description(become_text.to_string())],
+            duration: duration.clone(),
+            target: application.target.clone(),
+        };
+        return Some(ParsedEffectClause {
+            effect,
+            duration,
+            sub_ability: None,
+            distribute: None,
+            multi_target: None,
+            condition: None,
+            optional: false,
+            unless_pay: None,
+        });
     }
 
     // CR 702.xxx: Prepare (Strixhaven) — "becomes prepared" / "becomes
@@ -2132,16 +2207,26 @@ fn try_parse_set_life_total(
     become_text: &str,
     application: &SubjectApplication,
 ) -> Option<ParsedEffectClause> {
-    let lower = become_text.to_lowercase();
+    let full_lower = become_text.to_lowercase();
+    // CR 119.5: "life total becomes equal to <quantity>" — strip the optional
+    // "equal to" connector via a nom combinator so the quantity parser below
+    // sees the bare quantity ("equal to your starting life total" → "your
+    // starting life total"; Oketra's Last Mercy, Resolute Archangel). Forms
+    // without the connector ("becomes half ...", "becomes 10") pass through
+    // unchanged because `opt` never fails.
+    let lower = opt(tag::<_, _, OracleError<'_>>("equal to "))
+        .parse(full_lower.as_str())
+        .map_or(full_lower.as_str(), |(rest, _)| rest)
+        .trim();
 
-    let amount = if nom_primitives::scan_contains(&lower, "starting life total") {
+    let amount = if nom_primitives::scan_contains(lower, "starting life total") {
         let amount_text = lower.trim().trim_end_matches('.');
         let (rest, amount) = nom_quantity::parse_quantity(amount_text).ok()?;
         if !rest.trim().is_empty() {
             return None;
         }
         amount
-    } else if let Some((n, rest)) = parse_number(&lower) {
+    } else if let Some((n, rest)) = parse_number(lower) {
         // Guard: reject if substantial text remains after the number.
         // "a 3/3 red goblin creature" matches "a" as 1 but the rest
         // "3/3 red goblin creature" indicates this is an animation, not
@@ -2159,7 +2244,7 @@ fn try_parse_set_life_total(
         // "life total becomes <quantity>" card composes. `parse_cda_quantity`
         // returns `Some` only when it fully consumes the phrase, so an
         // unrecognized trailer yields `None` here — no false positives.
-        oracle_quantity::parse_cda_quantity(&lower)?
+        oracle_quantity::parse_cda_quantity(lower)?
     };
 
     // CR 119.5: Use the parsed target if targeted ("target player's life total"),
@@ -2325,6 +2410,41 @@ fn build_restriction_clause(
     let (predicate, duration) = super::strip_trailing_duration(&normalized);
     let lower = predicate.to_lowercase();
 
+    // CR 702.18a / 702.11a: a duration-scoped "can't be the target [of ...]" grant
+    // on a subject/target (Vines of Vastwood: "target creature can't be the target
+    // of spells or abilities your opponents control this turn") is Shroud / Hexproof.
+    // Emit the keyword grant so the targeting check applies the correct controller
+    // scope (Hexproof leaves the controller able to target), reusing the enforced
+    // keyword path rather than a scope-less rule static.
+    if let Some(scope) = crate::parser::oracle_keyword::classify_cant_be_targeted(&lower) {
+        let keyword = match scope {
+            crate::parser::oracle_keyword::CantBeTargetedScope::AnyPlayer => {
+                crate::types::keywords::Keyword::Shroud
+            }
+            crate::parser::oracle_keyword::CantBeTargetedScope::OpponentsOnly => {
+                crate::types::keywords::Keyword::Hexproof
+            }
+        };
+        let static_def = StaticDefinition::continuous()
+            .affected(static_affected_for_application(&application))
+            .modifications(vec![ContinuousModification::AddKeyword { keyword }])
+            .description(predicate.to_string());
+        return Some(ParsedEffectClause {
+            effect: Effect::GenericEffect {
+                static_abilities: vec![static_def],
+                duration: duration.clone(),
+                target: application.target,
+            },
+            duration,
+            sub_ability: None,
+            distribute: None,
+            multi_target: None,
+            condition: None,
+            optional: false,
+            unless_pay: None,
+        });
+    }
+
     // CR 508.1d / CR 509.1a: Restriction predicates for attack/block/target.
     // Compound restrictions ("can't attack or block") produce multiple StaticDefinition entries.
     let modes = parse_restriction_modes(&lower)?;
@@ -2451,6 +2571,7 @@ pub(crate) fn static_mode_needs_grant_propagation(mode: &StaticMode) -> bool {
         StaticMode::CantBlock
             | StaticMode::CantAttack
             | StaticMode::CantAttackOrBlock
+            | StaticMode::CantCrew
             | StaticMode::CantBeBlocked
             | StaticMode::CantBeBlockedBy { .. }
             | StaticMode::CantBeBlockedExceptBy { .. }
@@ -2464,6 +2585,11 @@ pub(crate) fn static_mode_needs_grant_propagation(mode: &StaticMode) -> bool {
             // bypass in replacement.rs::destroy_applier observes it via
             // active_static_definitions.
             | StaticMode::CantBeRegenerated
+            // CR 702.18a: CantBeTargeted (the descriptive Shroud form) is granted to
+            // a subject/target creature and must propagate onto its
+            // `static_definitions` so the targeting check in `targeting.rs::can_target`
+            // observes it via active_static_definitions.
+            | StaticMode::CantBeTargeted
     )
 }
 
@@ -2542,6 +2668,26 @@ pub(crate) fn parse_restriction_modes(lower: &str) -> Option<Vec<StaticMode>> {
     if lower == "can't attack or block" || lower == "cannot attack or block" {
         return Some(vec![StaticMode::CantAttack, StaticMode::CantBlock]);
     }
+    // CR 702.122c: "~ can't crew [Vehicles]"
+    if lower == "can't crew"
+        || lower == "cannot crew"
+        || lower == "can't crew vehicles"
+        || lower == "cannot crew vehicles"
+    {
+        return Some(vec![StaticMode::CantCrew]);
+    }
+    // CR 508.1d + CR 509.1a + CR 702.122c: Bound in Gold / Intercessor's Arrest
+    if lower == "can't attack, block, or crew vehicles"
+        || lower == "cannot attack, block, or crew vehicles"
+        || lower == "can't attack, block, or crew"
+        || lower == "cannot attack, block, or crew"
+    {
+        return Some(vec![
+            StaticMode::CantAttack,
+            StaticMode::CantBlock,
+            StaticMode::CantCrew,
+        ]);
+    }
     // CR 509.1a + "can't be blocked": Compound "can't block or be blocked"
     if lower == "can't block or be blocked" || lower == "cannot block or be blocked" {
         return Some(vec![StaticMode::CantBlock, StaticMode::CantBeBlocked]);
@@ -2550,6 +2696,8 @@ pub(crate) fn parse_restriction_modes(lower: &str) -> Option<Vec<StaticMode>> {
     if let Ok((except_text, _)) = alt((
         tag::<_, _, OracleError<'_>>("can't be blocked except by "),
         tag("cannot be blocked except by "),
+        tag("can't be blocked this turn except by "),
+        tag("cannot be blocked this turn except by "),
     ))
     .parse(lower)
     {
@@ -2580,14 +2728,16 @@ pub(crate) fn parse_restriction_modes(lower: &str) -> Option<Vec<StaticMode>> {
             return Some(vec![StaticMode::CantBeBlockedBy { filter }]);
         }
     }
-    // CR 115.4: "can't be the target of ..." — hexproof variant
-    if alt((
-        tag::<_, _, OracleError<'_>>("can't be the target of "),
-        tag("cannot be the target of "),
-    ))
-    .parse(lower)
-    .is_ok()
-    {
+    // CR 702.18a: "can't be the target of spells or abilities" is blanket Shroud,
+    // modeled as `CantBeTargeted` (propagated onto the subject via `AddStaticMode`
+    // and enforced in `can_target`). CR 702.11a: the opponent-scoped variant is
+    // Hexproof — a keyword grant this rule-mode parser can't express, so it is
+    // handled by the keyword-grant path and deliberately not produced here, lest a
+    // bare `CantBeTargeted` over-block the controller.
+    if matches!(
+        crate::parser::oracle_keyword::classify_cant_be_targeted(lower),
+        Some(crate::parser::oracle_keyword::CantBeTargetedScope::AnyPlayer)
+    ) {
         return Some(vec![StaticMode::CantBeTargeted]);
     }
     // CR 119.7: "can't gain life" — a player can't make their life total increase.
@@ -3105,6 +3255,33 @@ mod tests {
             "expected TakeTheInitiative, got {:?}",
             ability.effect
         );
+    }
+
+    #[test]
+    fn set_life_total_becomes_equal_to_starting_life_total() {
+        for (text, expected) in [
+            (
+                // Oketra's Last Mercy, Resolute Archangel.
+                "Your life total becomes equal to your starting life total.",
+                QuantityExpr::Ref {
+                    qty: QuantityRef::StartingLifeTotal,
+                },
+            ),
+            (
+                "Your life total becomes equal to 10.",
+                QuantityExpr::Fixed { value: 10 },
+            ),
+        ] {
+            let ability =
+                crate::parser::oracle_effect::parse_effect_chain(text, AbilityKind::Spell);
+            let Effect::SetLifeTotal { amount, .. } = &*ability.effect else {
+                panic!(
+                    "expected SetLifeTotal for {text:?}, got {:?}",
+                    ability.effect
+                );
+            };
+            assert_eq!(amount, &expected, "wrong amount for {text:?}");
+        }
     }
 
     #[test]
@@ -3834,6 +4011,30 @@ mod tests {
         assert_eq!(
             parse_restriction_modes("can't transform"),
             Some(vec![StaticMode::Other("CantTransform".to_string())])
+        );
+    }
+
+    #[test]
+    fn parse_restriction_modes_cant_crew_variants() {
+        assert_eq!(
+            parse_restriction_modes("can't crew"),
+            Some(vec![StaticMode::CantCrew])
+        );
+        assert_eq!(
+            parse_restriction_modes("cannot crew vehicles"),
+            Some(vec![StaticMode::CantCrew])
+        );
+    }
+
+    #[test]
+    fn parse_restriction_modes_cant_attack_block_or_crew_vehicles_compound() {
+        assert_eq!(
+            parse_restriction_modes("can't attack, block, or crew vehicles"),
+            Some(vec![
+                StaticMode::CantAttack,
+                StaticMode::CantBlock,
+                StaticMode::CantCrew,
+            ])
         );
     }
 

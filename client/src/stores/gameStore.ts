@@ -11,6 +11,7 @@ import type {
   ManaCost,
   MatchConfig,
   PlayerId,
+  StuckDecisionDiagnostic,
   WaitingFor,
 } from "../adapter/types";
 import { MAX_UNDO_HISTORY, UNDOABLE_ACTIONS } from "../constants/game";
@@ -19,12 +20,13 @@ import { getPlayerId } from "../hooks/usePlayerId";
 import { loadCheckpoints, saveGame } from "../services/gamePersistence";
 
 /** Map a LegalActionsResult to the store fields it owns — single source of truth. */
-export function legalResultState(result: LegalActionsResult): Pick<GameStoreState, "legalActions" | "autoPassRecommended" | "spellCosts" | "legalActionsByObject"> {
+export function legalResultState(result: LegalActionsResult): Pick<GameStoreState, "legalActions" | "autoPassRecommended" | "spellCosts" | "legalActionsByObject" | "stuckDiagnostic"> {
   return {
     legalActions: result.actions,
     autoPassRecommended: result.autoPassRecommended,
     spellCosts: result.spellCosts ?? {},
     legalActionsByObject: result.legalActionsByObject ?? {},
+    stuckDiagnostic: result.stuckDiagnostic ?? null,
   };
 }
 
@@ -44,13 +46,26 @@ export {
   clearP2PHostSession,
 } from "../services/gamePersistence";
 
-export type GameMode = "ai" | "online" | "local" | "p2p-host" | "p2p-join" | "draft-match";
+export type GameMode =
+  | "ai"
+  | "online"
+  | "local"
+  | "p2p-host"
+  | "p2p-join"
+  | "draft-match"
+  | "spectate";
 
 /** True for modes where the engine state is shared across the wire —
  * undo/rewind would desync from the authoritative game, so the client
  * must not build a stateHistory or expose an Undo affordance. */
 export function isMultiplayerMode(mode: GameMode | null): boolean {
-  return mode === "online" || mode === "p2p-host" || mode === "p2p-join" || mode === "draft-match";
+  return (
+    mode === "online"
+    || mode === "p2p-host"
+    || mode === "p2p-join"
+    || mode === "draft-match"
+    || mode === "spectate"
+  );
 }
 
 interface GameStoreState {
@@ -74,6 +89,13 @@ interface GameStoreState {
    * through this map instead of inferring action availability from objects.
    */
   legalActionsByObject: Record<string, GameAction[]>;
+  /**
+   * Engine-owned non-fatal progress-wedge diagnostic (an engine anomaly, not a
+   * rules outcome) — present only when the current decision is wedged (no legal
+   * action for any authorized submitter). `null` in normal play. Display-only
+   * (drives `StuckDecisionToast`).
+   */
+  stuckDiagnostic: StuckDecisionDiagnostic | null;
   stateHistory: GameState[];
   turnCheckpoints: GameState[];
   /**
@@ -150,6 +172,7 @@ const initialState: GameStoreState = {
   autoPassRecommended: false,
   spellCosts: {},
   legalActionsByObject: {},
+  stuckDiagnostic: null,
   stateHistory: [],
   turnCheckpoints: [],
   lobbyProgress: null,
@@ -176,7 +199,10 @@ export const useGameStore = create<GameStore>()(
       // play/draw choice. `current_starting_player` is the engine's pick — never
       // recomputed from the rolls on the frontend.
       const initEvents = initResult.events ?? [];
-      const rolledStart = initEvents[0]?.type === "DieRolled";
+      // The engine emits a single StartingPlayerContest event (round structure +
+      // winner) at the head of the game-start batch when it ran a roll-off
+      // (random starter); absent for an explicit play/draw choice.
+      const rolledStart = initEvents[0]?.type === "StartingPlayerContest";
       const startingContest = rolledStart
         ? {
             events: initEvents,

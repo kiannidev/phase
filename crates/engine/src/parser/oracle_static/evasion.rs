@@ -212,7 +212,7 @@ pub(crate) fn parse_compound_subject_rule_static(
         nom_primitives::scan_preceded(lower, parse_rule_static_predicate_nom)?;
     let (rest, mut predicates) = many0(preceded(
         parse_rule_static_separator_nom,
-        parse_rule_static_predicate_nom,
+        parse_rule_static_tail_predicate_nom,
     ))
     .parse(after_first)
     .ok()?;
@@ -294,8 +294,10 @@ pub(crate) fn parse_rule_static_separator_nom(input: &str) -> OracleResult<'_, (
     value(
         (),
         alt((
+            tag::<_, _, OracleError<'_>>(", or "),
             tag::<_, _, OracleError<'_>>(", and "),
             tag(", "),
+            tag(" or "),
             tag(" and "),
         )),
     )
@@ -509,6 +511,404 @@ pub(crate) fn try_split_and_can_block_additional(text: &str) -> Option<Vec<Stati
     let affected = defs[0].affected.clone()?;
     let condition = defs[0].condition.clone();
     let mut companion = StaticDefinition::new(StaticMode::ExtraBlockers { count })
+        .affected(affected)
+        .description(text.to_string());
+    if let Some(condition) = condition {
+        companion = companion.condition(condition);
+    }
+    defs.push(companion);
+    Some(defs)
+}
+
+/// CR 509.1b: Decompose `"<continuous grant> and can't block"` into the first
+/// conjunct's static(s) plus a `CantBlock` static sharing the same `affected`
+/// (and any `condition`).
+///
+/// Without this split the trailing blocking restriction was dropped: downside
+/// pumps like Copper Carapace ("Equipped creature gets +2/+2 and can't block."),
+/// Maniacal Rage / Undying Rage, and Threshold creatures ("this creature gets
+/// +2/+2 and can't block.") parsed to only the P/T grant, so the equipped/
+/// enchanted creature could still block — the card's entire drawback vanished.
+/// Mirrors `try_split_and_can_block_additional`. A terminal-phrase guard keeps
+/// this disjoint from the already-handled "can't block alone", "can't block
+/// <filter>", and "can't block unless …" shapes.
+pub(crate) fn try_split_and_cant_block(text: &str) -> Option<Vec<StaticDefinition>> {
+    type VE<'a> = OracleError<'a>;
+    let lower = text.to_lowercase();
+
+    let (before, _matched, rest) = nom_primitives::scan_preceded(&lower, |i: &str| {
+        // Match both the ASCII and typographic U+2019 apostrophe.
+        let (i, _) = alt((
+            tag::<_, _, VE>("and can't block"),
+            tag::<_, _, VE>("and can\u{2019}t block"),
+        ))
+        .parse(i)?;
+        // Optional trailing duration phrase.
+        let (i, _) = opt(alt((
+            tag::<_, _, VE>(" each combat"),
+            tag::<_, _, VE>(" this combat"),
+            tag::<_, _, VE>(" this turn"),
+        )))
+        .parse(i)?;
+        Ok((i, ()))
+    })?;
+
+    // CR 509.1b: only the bare, terminal "can't block" is a plain CantBlock. A
+    // remaining tail ("alone", "<filter>", "unless …") is a different restriction
+    // owned by another branch — decline so we don't mis-split it.
+    if !rest.trim_start().trim_end_matches('.').trim().is_empty() {
+        return None;
+    }
+
+    let cut_end = before
+        .trim_end_matches(|ch: char| ch == ',' || ch.is_whitespace())
+        .len();
+    let line_a = format!("{}.", text[..cut_end].trim_end_matches('.'));
+    let mut defs = parse_static_line_multi(&line_a);
+    if defs.is_empty() {
+        return None;
+    }
+    for def in &mut defs {
+        def.description = Some(text.to_string());
+    }
+
+    let affected = defs[0].affected.clone()?;
+    let condition = defs[0].condition.clone();
+    let mut companion = StaticDefinition::new(StaticMode::CantBlock)
+        .affected(affected)
+        .description(text.to_string());
+    if let Some(condition) = condition {
+        companion = companion.condition(condition);
+    }
+    defs.push(companion);
+    Some(defs)
+}
+
+/// CR 502.3: Decompose `"<continuous grant> and doesn't untap during [its
+/// controller's] untap step"` into the first conjunct's static(s) plus a
+/// `CantUntap` static sharing the same `affected` (and any trailing "as long
+/// as …" condition).
+///
+/// Without this split the trailing untap restriction was dropped: Flood the
+/// Engine ("Enchanted permanent loses all abilities and doesn't untap during
+/// its controller's untap step.") parsed to only the loses-all-abilities def,
+/// so the enchanted permanent untapped normally — the lock vanished. Mirrors
+/// `try_split_and_cant_block`. Requiring a recognized untap-step phrase keeps
+/// this disjoint from the one-time "during their next untap step" effect, and
+/// the `defs.is_empty()` guard leaves the "enters tapped and doesn't untap"
+/// replacement+static compound (issue #292) to its own earlier carve-out.
+pub(crate) fn try_split_and_doesnt_untap(text: &str) -> Option<Vec<StaticDefinition>> {
+    type VE<'a> = OracleError<'a>;
+    let lower = text.to_lowercase();
+
+    let (before, _matched, rest) = nom_primitives::scan_preceded(&lower, |i: &str| {
+        // Match both the ASCII and typographic U+2019 apostrophe.
+        let (i, _) = alt((
+            tag::<_, _, VE>("and doesn't untap during"),
+            tag::<_, _, VE>("and doesn\u{2019}t untap during"),
+        ))
+        .parse(i)?;
+        // Require a recognized permanent-static untap-step phrase to follow, so
+        // we only split the standing form (not a one-time "during their next
+        // untap step", which is an effect, not a CantUntap static).
+        let (i, _) = preceded(
+            space0,
+            alt((
+                tag::<_, _, VE>("its controller's untap step"),
+                tag::<_, _, VE>("its controller\u{2019}s untap step"),
+                tag::<_, _, VE>("their controllers' untap steps"),
+                tag::<_, _, VE>("their controllers\u{2019} untap steps"),
+                tag::<_, _, VE>("your untap step"),
+            )),
+        )
+        .parse(i)?;
+        Ok((i, ()))
+    })?;
+
+    // CR 502.3: only split when the untap clause is terminal or carries a
+    // recognized "as long as …"/"if …" rider (routed to the companion below).
+    // Decline any other trailing clause ("… untap step, then …") rather than
+    // silently dropping it — parity with the sibling `try_split_and_cant_block`
+    // terminal guard.
+    let tail = rest.trim_start().trim_end_matches('.').trim();
+    let recognized_rider = tail.is_empty()
+        || alt((tag::<_, _, VE>("as long as "), tag::<_, _, VE>("if ")))
+            .parse(tail)
+            .is_ok();
+    if !recognized_rider {
+        return None;
+    }
+
+    let cut_end = before
+        .trim_end_matches(|ch: char| ch == ',' || ch.is_whitespace())
+        .len();
+    let line_a = format!("{}.", text[..cut_end].trim_end_matches('.'));
+    let mut defs = parse_static_line_multi(&line_a);
+    if defs.is_empty() {
+        return None;
+    }
+    for def in &mut defs {
+        def.description = Some(text.to_string());
+    }
+
+    let affected = defs[0].affected.clone()?;
+    // CR 502.3: a trailing "as long as …"/"if …" rider on the untap clause
+    // belongs on the CantUntap companion; otherwise inherit the grant's gate.
+    let condition = extract_cant_untap_condition(&lower).or_else(|| defs[0].condition.clone());
+    let mut companion = StaticDefinition::new(StaticMode::CantUntap)
+        .affected(affected)
+        .description(text.to_string());
+    if let Some(condition) = condition {
+        companion = companion.condition(condition);
+    }
+    defs.push(companion);
+    Some(defs)
+}
+
+/// CR 508.1c: Decompose `"<continuous grant> and can't attack"` into the first
+/// conjunct's static(s) plus a `CantAttack` static sharing the same `affected`
+/// (and any `condition`).
+///
+/// Without this split the trailing attacking restriction was dropped: Cagemail
+/// ("Enchanted creature gets +2/+2 and can't attack.") parsed to only the +2/+2
+/// grant, so the enchanted creature could still attack — the Aura's drawback
+/// vanished, making it a strictly-better-than-printed pure pump. Mirrors
+/// `try_split_and_cant_block`. A terminal-phrase guard keeps this disjoint from
+/// the already-handled "can't attack alone" shape and from the scoped
+/// "can't attack you / planeswalkers / its owner …" restrictions, which are a
+/// different `StaticMode`.
+pub(crate) fn try_split_and_cant_attack(text: &str) -> Option<Vec<StaticDefinition>> {
+    type VE<'a> = OracleError<'a>;
+
+    let (before, _matched, rest) = nom_primitives::scan_preceded(text, |i: &str| {
+        // Match both the ASCII and typographic U+2019 apostrophe.
+        let (i, _) = alt((
+            tag_no_case::<_, _, VE>("and can't attack"),
+            tag_no_case::<_, _, VE>("and can\u{2019}t attack"),
+        ))
+        .parse(i)?;
+        // Optional trailing duration phrase.
+        let (i, _) = opt(alt((
+            tag_no_case::<_, _, VE>(" each combat"),
+            tag_no_case::<_, _, VE>(" this combat"),
+            tag_no_case::<_, _, VE>(" this turn"),
+        )))
+        .parse(i)?;
+        Ok((i, ()))
+    })?;
+
+    // CR 508.1c: only the bare, terminal "can't attack" is a plain CantAttack. A
+    // remaining tail ("alone", "you or planeswalkers …", "its owner …", "unless
+    // …") is a different restriction owned by another branch — decline so we
+    // don't mis-split it.
+    if !rest.trim_start().trim_end_matches('.').trim().is_empty() {
+        return None;
+    }
+
+    let cut_end = before
+        .trim_end_matches(|ch: char| ch == ',' || ch.is_whitespace())
+        .len();
+    let line_a = format!("{}.", text[..cut_end].trim_end_matches('.'));
+    let mut defs = parse_static_line_multi(&line_a);
+    if defs.is_empty() {
+        return None;
+    }
+    for def in &mut defs {
+        def.description = Some(text.to_string());
+    }
+
+    let affected = defs[0].affected.clone()?;
+    let condition = defs[0].condition.clone();
+    let mut companion = StaticDefinition::new(StaticMode::CantAttack)
+        .affected(affected)
+        .description(text.to_string());
+    if let Some(condition) = condition {
+        companion = companion.condition(condition);
+    }
+    defs.push(companion);
+    Some(defs)
+}
+
+/// CR 702.5 / CR 702.6: Decompose `"<grant or restriction> and can't be
+/// enchanted [or equipped] [by other Auras]"` (and the "equipped" lead-in) into
+/// the first conjunct's static(s) plus the matching attach-prohibition
+/// static(s) — `Other("CantBeEquipped")` / `Other("CantBeEnchanted")` — sharing
+/// the same `affected` set.
+///
+/// Without this split the trailing attach prohibition was dropped: Anti-Magic
+/// Aura ("Enchanted creature can't be the target of spells and can't be
+/// enchanted by other Auras.") and Consecrate Land ("Enchanted land has
+/// indestructible and can't be enchanted by other Auras.") parsed to only the
+/// first clause, so other Auras could still be attached — half the card
+/// vanished. Mirrors `try_split_and_cant_block`; the classifier matches the
+/// standalone attach-prohibition dispatch (equipped-first ordering) so a
+/// compound "equipped or enchanted" yields both prohibitions.
+pub(crate) fn try_split_and_cant_be_attached(text: &str) -> Option<Vec<StaticDefinition>> {
+    type VE<'a> = OracleError<'a>;
+    let lower = text.to_lowercase();
+
+    let (before, _matched, _rest) = nom_primitives::scan_preceded(&lower, |i: &str| {
+        // Match both the ASCII and typographic U+2019 apostrophe.
+        let (i, _) = alt((
+            tag::<_, _, VE>("and can't be "),
+            tag::<_, _, VE>("and can\u{2019}t be "),
+        ))
+        .parse(i)?;
+        let (i, _) = alt((tag::<_, _, VE>("enchanted"), tag::<_, _, VE>("equipped"))).parse(i)?;
+        Ok((i, ()))
+    })?;
+
+    // Classify the attach prohibition(s) from the full second clause, mirroring
+    // the standalone dispatch (`dispatch.rs` / `shared.rs`): "equipped" → host
+    // can't be equipped (CR 702.6), "enchanted" → can't be enchanted (CR 702.5);
+    // a compound "equipped or enchanted" yields both, equipped-first.
+    let attach_clause = &lower[before.len()..];
+    let mut modes: Vec<StaticMode> = Vec::new();
+    if nom_primitives::scan_contains(attach_clause, "equipped") {
+        modes.push(StaticMode::Other("CantBeEquipped".to_string()));
+    }
+    if nom_primitives::scan_contains(attach_clause, "enchanted") {
+        modes.push(StaticMode::Other("CantBeEnchanted".to_string()));
+    }
+    if modes.is_empty() {
+        return None;
+    }
+
+    let cut_end = before
+        .trim_end_matches(|ch: char| ch == ',' || ch.is_whitespace())
+        .len();
+    let line_a = format!("{}.", text[..cut_end].trim_end_matches('.'));
+    let mut defs = parse_static_line_multi(&line_a);
+    if defs.is_empty() {
+        return None;
+    }
+    for def in &mut defs {
+        def.description = Some(text.to_string());
+    }
+
+    let affected = defs[0].affected.clone()?;
+    for mode in modes {
+        defs.push(
+            StaticDefinition::new(mode)
+                .affected(affected.clone())
+                .description(text.to_string()),
+        );
+    }
+    Some(defs)
+}
+
+/// CR 509.1b: Classify a "can't be blocked …" evasion predicate (lowercased,
+/// starting with "can't be blocked") into the corresponding `StaticMode` and
+/// optional evasion condition, composing the same building blocks the standalone
+/// branches use. Returns `None` when the tail is not a recognized evasion shape.
+fn cant_be_blocked_mode(clause: &str) -> Option<(StaticMode, Option<StaticCondition>)> {
+    type VE<'a> = OracleError<'a>;
+    let rest = nom_tag_lower(clause, clause, "can't be blocked")?;
+    let rest = rest.trim_end_matches('.').trim_end();
+    // "except by <filter>" → CantBeBlockedExceptBy (quality or min-blockers).
+    if let Some(filter) = nom_tag_lower(rest, rest, " except by ") {
+        return Some((
+            StaticMode::CantBeBlockedExceptBy {
+                kind: classify_block_exception(filter),
+            },
+            None,
+        ));
+    }
+    // "by more than N creature(s)" → per-creature blocker maximum. Must precede
+    // the generic "by <filter>" branch, which would read "more than …" as a
+    // quality filter.
+    if let Some(after) = nom_tag_lower(rest, rest, " by more than ") {
+        if let Ok((after, max)) = nom_primitives::parse_number(after) {
+            if let Ok((after, _)) =
+                alt((tag::<_, _, VE>(" creatures"), tag(" creature"))).parse(after)
+            {
+                if after.trim().is_empty() {
+                    return Some((StaticMode::CantBeBlockedByMoreThan { max }, None));
+                }
+            }
+        }
+        return None;
+    }
+    // "by <filter>" → CantBeBlockedBy.
+    if let Some(filter_text) = nom_tag_lower(rest, rest, " by ") {
+        let filter_tp = TextPair::new(filter_text, filter_text);
+        let (filter, remainder) = if let Some(filter) = parse_chosen_qualifier_subject(&filter_tp) {
+            (filter, "")
+        } else {
+            parse_type_phrase(filter_text)
+        };
+        if !matches!(filter, TargetFilter::Any) {
+            let condition = parse_compound_cant_be_blocked_condition(remainder);
+            return Some((StaticMode::CantBeBlockedBy { filter }, condition));
+        }
+        return None;
+    }
+    // Bare "can't be blocked".
+    if rest.is_empty() {
+        return Some((StaticMode::CantBeBlocked, None));
+    }
+    if let Some(condition) = parse_compound_cant_be_blocked_condition(rest) {
+        return Some((StaticMode::CantBeBlocked, Some(condition)));
+    }
+    None
+}
+
+/// CR 509.1b: Attach a trailing "as long as …" condition to the evasion
+/// restriction produced by the compound split.
+fn parse_compound_cant_be_blocked_condition(text: &str) -> Option<StaticCondition> {
+    let condition_text = text.trim().trim_end_matches('.');
+    if condition_text.is_empty() {
+        return None;
+    }
+    nom_condition::parse_condition(condition_text)
+        .ok()
+        .and_then(|(rest, condition)| rest.trim().is_empty().then_some(condition))
+}
+
+/// CR 509.1b: Decompose `"<predicate> and can't be blocked[ by/except by … | by
+/// more than N creatures]"` into the first conjunct's static(s) plus the
+/// matching `CantBeBlocked*` static, both sharing the same `affected` set.
+///
+/// Without this split the trailing evasion clause was dropped: Madcap Skills
+/// ("Enchanted creature gets +3/+0 and can't be blocked by more than one
+/// creature.") parsed to only the +3/+0 grant. Mirrors
+/// `try_split_and_can_block_additional`. Standalone "can't be blocked …" lines
+/// (no preceding "and") are handled by the existing branches, so this requires
+/// the conjunction.
+pub(crate) fn try_split_and_cant_be_blocked(text: &str) -> Option<Vec<StaticDefinition>> {
+    type VE<'a> = OracleError<'a>;
+    let lower = text.to_lowercase();
+
+    // Match both the ASCII apostrophe and the typographic U+2019 form, mirroring
+    // the standalone evasion branches (`shared.rs` / the dispatch path); the
+    // static parse path does not universally normalize apostrophes. The matched
+    // tail (`rest`) carries no apostrophe, so the clause is reconstructed with an
+    // ASCII "can't be blocked" and `cant_be_blocked_mode` needs no apostrophe arm.
+    let (before, _matched, rest) = nom_primitives::scan_preceded(&lower, |i: &str| {
+        alt((
+            tag::<_, _, VE>("and can't be blocked"),
+            tag::<_, _, VE>("and can\u{2019}t be blocked"),
+        ))
+        .parse(i)
+    })?;
+    let clause = format!("can't be blocked{rest}");
+    let (mode, evasion_condition) = cant_be_blocked_mode(&clause)?;
+
+    let cut_end = before
+        .trim_end_matches(|ch: char| ch == ',' || ch.is_whitespace())
+        .len();
+    let line_a = format!("{}.", text[..cut_end].trim_end_matches('.'));
+    let mut defs = parse_static_line_multi(&line_a);
+    if defs.is_empty() {
+        return None;
+    }
+    for def in &mut defs {
+        def.description = Some(text.to_string());
+    }
+
+    let affected = defs[0].affected.clone()?;
+    let condition = evasion_condition.or_else(|| defs[0].condition.clone());
+    let mut companion = StaticDefinition::new(mode)
         .affected(affected)
         .description(text.to_string());
     if let Some(condition) = condition {
@@ -862,6 +1262,56 @@ pub(crate) fn parse_subject_rule_static(text: &str) -> Option<StaticDefinition> 
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
     let (affected, predicate_text) = strip_rule_static_subject(tp.original, tp.lower)?;
+
+    // CR 509.1b: Evasion ability — "<self/typed subject> can't be blocked except by
+    // <filter>" is a static ability restricting blockers; must land as a top-level
+    // continuous static (CR 604.1), not a spell-resolution GenericEffect. Reuses
+    // classify_block_exception for the count-vs-quality BlockExceptionKind. Handled
+    // here before the generic predicate parse so it cannot fall through to
+    // dispatch_line_nom. The dispatch.rs CantBeBlockedExceptBy arm is guarded
+    // `!except by`, so the two paths are disjoint.
+    let pred_lower = predicate_text.to_lowercase();
+    if let Some(rest) = nom_tag_lower(predicate_text, &pred_lower, "can't be blocked except by ")
+        .or_else(|| {
+            nom_tag_lower(
+                predicate_text,
+                &pred_lower,
+                "can\u{2019}t be blocked except by ",
+            )
+        })
+    {
+        let def = StaticDefinition::new(StaticMode::CantBeBlockedExceptBy {
+            kind: classify_block_exception(rest),
+        })
+        .affected(affected.clone())
+        .description(text.to_string());
+        // A "can't be blocked except by <filter>" predicate never carries a
+        // trailing granted-keyword companion (the " has "/" gains " needles
+        // can't appear in it), so the evasion static is complete on its own.
+        return Some(def);
+    }
+
+    // CR 604.1 + CR 508.1d: a trailing "unless you control <X>" clause makes a
+    // rule-static (e.g. "attacks each combat if able") conditional — the
+    // requirement/restriction applies only while the controller does NOT control
+    // <X>. Class: Reckless Cohort ("…unless you control another Ally"), Marauding
+    // Maulhorn, and any rule-static with the same "unless you control" rider.
+    // Strip the clause, classify the base predicate, and attach the negated
+    // control presence via the shared `parse_control_conditions` building block.
+    let pred_tp = TextPair::new(predicate_text, &pred_lower);
+    if let Some((base, unless)) = pred_tp.split_around(" unless ") {
+        if let Ok(("", control)) = crate::parser::oracle_nom::condition::parse_control_conditions(
+            unless.lower.trim_end_matches('.'),
+        ) {
+            let predicate = parse_rule_static_predicate(base.original)?;
+            let mut def = lower_rule_static(predicate, affected, text);
+            def.condition = Some(StaticCondition::Not {
+                condition: Box::new(control),
+            });
+            return Some(def);
+        }
+    }
+
     let predicate = parse_rule_static_predicate(predicate_text)?;
     // CR 502.3: Extract trailing condition for CantUntap statics (e.g., "as long as [condition]")
     if matches!(predicate, RuleStaticPredicate::CantUntap) {
@@ -957,15 +1407,26 @@ pub(crate) fn parse_combat_tax_static(tp: &TextPair<'_>, text: &str) -> Option<S
 
 pub(crate) fn parse_subject_combat_rule_static(text: &str) -> Option<StaticDefinition> {
     let lower = text.to_lowercase();
-    let (subject_lower, predicate, rest) =
-        nom_primitives::scan_preceded(&lower, parse_combat_rule_static_predicate_nom)?;
+    let (subject_lower, (predicate, defended), rest) = nom_primitives::scan_preceded(
+        &lower,
+        parse_combat_rule_static_predicate_with_defended_nom,
+    )?;
     let (rest, _) = opt(tag::<_, _, OracleError<'_>>(".")).parse(rest).ok()?;
-    if !rest.trim().is_empty() {
-        return None;
-    }
     let subject = text[..subject_lower.len()].trim();
     let affected = parse_rule_static_subject_filter(subject)?;
-    Some(lower_rule_static(predicate, affected, text))
+    let mut def = lower_rule_static(predicate, affected, text).attack_defended(defended);
+    let trailing = rest.trim();
+    if trailing.is_empty() {
+        return Some(def);
+    }
+    if let Some(unless_cond) = {
+        let tp = TextPair::new(text, &lower);
+        super::shared::parse_unless_static_condition(&tp)
+    } {
+        def.condition = Some(unless_cond);
+        return Some(def);
+    }
+    None
 }
 
 /// Nom 8.0 parser for the combat-tax body.

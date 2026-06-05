@@ -304,6 +304,7 @@ fn snapshot_quantity_expr(expr: &mut QuantityExpr, state: &GameState, ability: &
             }
         }
         QuantityExpr::Offset { inner, .. }
+        | QuantityExpr::ClampMin { inner, .. }
         | QuantityExpr::Multiply { inner, .. }
         | QuantityExpr::DivideRounded { inner, .. } => {
             snapshot_quantity_expr(inner, state, ability);
@@ -342,16 +343,16 @@ fn snapshot_quantity_ref(
         _ => None,
     })?;
     match qty {
-        // CR 608.2c + CR 608.2k: All three target-bound object-scope variants
+        // CR 608.2c + CR 608.2k: All four target-bound object-scope variants
         // (`CostPaidObject` cost/trigger referent, `Target` first-target slot,
-        // `Anaphoric` instruction-order referent) bake to the parent's
-        // first object target at snapshot time. `Anaphoric` joined this list
-        // when `classify_possessive_referent` started routing bare-anaphoric
-        // possessives ("that spell's mana value", Mana Drain class) to
-        // `Anaphoric` instead of `CostPaidObject`; snapshot baking must
-        // preserve the prior behavior — read the parent target's mana value
-        // now and freeze it as `Fixed` — or the delayed trigger fires later
-        // with an empty context and produces 0.
+        // `Anaphoric` pronoun and `Demonstrative` noun-phrase
+        // instruction-order referents) bake to the parent's first object target
+        // at snapshot time. `Demonstrative` carries the bare-anaphoric
+        // possessives ("that spell's mana value", Mana Drain class) that
+        // `classify_possessive_referent` routes off `CostPaidObject`; snapshot
+        // baking must preserve the prior behavior — read the parent target's
+        // mana value now and freeze it as `Fixed` — or the delayed trigger
+        // fires later with an empty context and produces 0.
         QuantityRef::ObjectManaValue {
             scope: ObjectScope::CostPaidObject,
         }
@@ -360,12 +361,16 @@ fn snapshot_quantity_ref(
         }
         | QuantityRef::ObjectManaValue {
             scope: ObjectScope::Anaphoric,
+        }
+        | QuantityRef::ObjectManaValue {
+            scope: ObjectScope::Demonstrative,
         } => {
             // Read live state first, LKI as fallback, 0 if neither.
+            // CR 202.3e: include cost_x_paid for on-stack spells.
             let value = state
                 .objects
                 .get(&target_object_id)
-                .map(|obj| obj.mana_cost.mana_value() as i32)
+                .map(|obj| obj.mana_cost.mana_value_with_x(obj.zone, obj.cost_x_paid) as i32)
                 .or_else(|| {
                     state
                         .lki_cache
@@ -427,6 +432,7 @@ fn bind_tracked_set_to_effect(effect: &mut Effect, real_id: TrackedSetId) {
                 target: TargetFilter::TrackedSet { id: real_id },
                 enters_under: None,
                 enter_tapped: false,
+                face_down_profile: None,
             };
         }
         _ => {}
@@ -551,6 +557,7 @@ mod tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             },
         );
         let ability = ResolvedAbility::new(
@@ -641,6 +648,7 @@ mod tests {
                 target: TargetFilter::Any,
                 enters_under: None,
                 enter_tapped: false,
+                face_down_profile: None,
             },
         );
         let ability = ResolvedAbility::new(
@@ -699,6 +707,7 @@ mod tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             },
         );
         let ability = ResolvedAbility::new(

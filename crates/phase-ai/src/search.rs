@@ -547,6 +547,18 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
             Some(GameAction::ChooseTopOrBottom { top: true })
         }
 
+        // CR 702.140c + CR 730.2a: mutate merge side — default to placing the
+        // mutating spell on top (the candidate generator still explores bottom).
+        WaitingFor::MutateMergeChoice { .. } => Some(GameAction::ChooseMutateMergeSide {
+            side: engine::game::merge::MergeSide::Top,
+        }),
+
+        // CR 702.99a: cipher encode — default to encoding on the first legal host
+        // (the candidate generator still explores declining and other hosts).
+        WaitingFor::CipherEncodeChoice { creatures, .. } => Some(GameAction::CipherEncode {
+            creature: creatures.first().copied(),
+        }),
+
         // CR 701.30b: clash opponent choice — fall back to the first candidate.
         WaitingFor::ClashChooseOpponent { candidates, .. } => candidates
             .first()
@@ -624,6 +636,10 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
         WaitingFor::ChooseDungeonRoom { options, .. } => options
             .first()
             .map(|&room_index| GameAction::ChooseDungeonRoom { room_index }),
+        WaitingFor::SpecializeColor { options, .. } => options
+            .first()
+            .copied()
+            .map(|color| GameAction::ChooseSpecializeColor { color }),
 
         // Paradigm: pass.
         WaitingFor::CastOffer {
@@ -688,18 +704,27 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
             targets: Vec::new(),
         }),
 
-        // Copy retarget: keep current targets when present; freshly cast
-        // prepare/paradigm copies start empty, so choose the first legal target.
-        WaitingFor::CopyRetarget { target_slots, .. } => {
-            let targets: Option<Vec<_>> = target_slots
-                .iter()
-                .map(|slot| {
-                    slot.current
-                        .clone()
-                        .or_else(|| slot.legal_alternatives.first().cloned())
-                })
-                .collect();
-            targets.map(|new_targets| GameAction::RetargetSpell { new_targets })
+        // Copy retarget: keep copied targets when all slots already have a
+        // current value; freshly cast prepare/paradigm copies start empty, so
+        // choose the first legal target for the current slot.
+        WaitingFor::CopyRetarget {
+            target_slots,
+            current_slot,
+            ..
+        } => {
+            let slot = target_slots.get(*current_slot)?;
+            if target_slots.iter().all(|slot| slot.current.is_some()) {
+                Some(GameAction::KeepAllCopyTargets)
+            } else if slot.current.is_some() {
+                Some(GameAction::ChooseTarget { target: None })
+            } else {
+                slot.legal_alternatives
+                    .first()
+                    .cloned()
+                    .map(|target| GameAction::ChooseTarget {
+                        target: Some(target),
+                    })
+            }
         }
 
         // Assign combat damage: greedy lethal-to-each, mirroring the engine's
@@ -752,6 +777,21 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
                 controller_damage,
             })
         }
+
+        // CR 510.1d + CR 702.22k: a banded blocker's damage is divided by the
+        // ACTIVE player among the attackers it blocks. There is no lethal rule
+        // (CR 510.1d), so the simplest legal division dumps the blocker's full
+        // power onto the first blocked attacker — mirroring the engine's
+        // ai_support::candidates AssignBlockerDamage arm.
+        WaitingFor::AssignBlockerDamage {
+            total_damage,
+            attackers,
+            ..
+        } => attackers
+            .first()
+            .map(|first| GameAction::AssignBlockerDamage {
+                assignments: vec![(*first, *total_damage)],
+            }),
 
         // X value: pick max (CR 107.1c + CR 601.2f). The engine has already
         // capped `max` to the maximum legally-payable X for this cast (see
@@ -901,7 +941,7 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
         | WaitingFor::OptionalCostChoice { .. }
         | WaitingFor::DefilerPayment { .. }
         | WaitingFor::PayCost {
-            resume: CostResume::Spell { .. },
+            resume: CostResume::Spell { .. } | CostResume::SpellCost { .. },
             ..
         }
         | WaitingFor::BlightChoice { .. }
@@ -1738,7 +1778,10 @@ fn validated_declare_attackers(
         engine::game::combat::AttackTarget,
     )>,
 ) -> GameAction {
-    let candidate = GameAction::DeclareAttackers { attacks };
+    let candidate = GameAction::DeclareAttackers {
+        attacks,
+        bands: vec![],
+    };
     let mut sim = state.clone();
     if engine::game::engine::apply_as_current(&mut sim, candidate.clone()).is_ok() {
         return candidate;
@@ -1748,6 +1791,7 @@ fn validated_declare_attackers(
         .find(|action| matches!(action, GameAction::DeclareAttackers { .. }))
         .unwrap_or(GameAction::DeclareAttackers {
             attacks: Vec::new(),
+            bands: vec![],
         })
 }
 
@@ -2441,6 +2485,7 @@ mod tests {
                 defending_player: PlayerId(0),
                 attack_target: AttackTarget::Player(PlayerId(0)),
                 blocked: false,
+                band_id: None,
             }],
             blocker_assignments: HashMap::new(),
             blocker_to_attacker: HashMap::new(),
@@ -2530,7 +2575,7 @@ mod tests {
         let action = validated_declare_attackers(&state, vec![(creature, target)]);
 
         match action {
-            GameAction::DeclareAttackers { attacks } => assert!(
+            GameAction::DeclareAttackers { attacks, .. } => assert!(
                 !attacks.iter().any(|(id, _)| *id == creature),
                 "guard must drop the illegal (tapped) attacker, got {attacks:?}"
             ),
@@ -2539,13 +2584,21 @@ mod tests {
     }
 
     /// CR 608.2c + CR 701.23: Gifts Ungiven scaling regression — with a
-    /// large library (80 cards), a count-4 search must complete in well
-    /// under 100 ms via the BEAM_K-bounded path. The pre-fix Cartesian
-    /// enumerator (~C(80, 4) ≈ 1.5M combos × per-combo scoring) stalled
-    /// the AI; the beam reduces to C(BEAM_K, 4) candidates. The DistinctNames
-    /// constraint is honored by the engine candidate filter and re-checked
-    /// inside the AI beam, so the returned selection must contain only
-    /// uniquely-named cards.
+    /// large library (80 cards), a count-4 search must complete via the
+    /// BEAM_K-bounded path rather than the pre-fix Cartesian enumerator
+    /// (~C(80, 4) ≈ 1.5M combos × per-combo scoring) that stalled the AI.
+    /// The beam reduces this to C(BEAM_K, 4) ≈ 794 scored selections.
+    ///
+    /// The ceiling is a *blowup* guard, not a tight micro-benchmark: the
+    /// healthy beam path runs in ~60–130 ms (machine- and load-dependent —
+    /// this runs in CI and alongside concurrent Tilt rebuilds), while a
+    /// reversion to Cartesian enumeration costs *tens of seconds*. A 1 s
+    /// ceiling cleanly separates the two — ~8× headroom over the loaded
+    /// healthy path, ~1000× below a Cartesian regression — so it catches the
+    /// regression it exists to catch without flaking on contention. The
+    /// DistinctNames constraint is honored by the engine candidate filter and
+    /// re-checked inside the AI beam, so the returned selection must contain
+    /// only uniquely-named cards.
     #[test]
     fn gifts_ungiven_search_choice_returns_quickly_with_distinct_names() {
         use engine::types::ability::{SearchSelectionConstraint, SharedQuality};
@@ -2594,8 +2647,10 @@ mod tests {
         let action = choose_action(&state, PlayerId(0), &config, &mut rng);
         let elapsed = started.elapsed();
         assert!(
-            elapsed.as_millis() < 100,
-            "AI search-choice took {elapsed:?}; beam path must keep it under 100ms"
+            elapsed.as_millis() < 1000,
+            "AI search-choice took {elapsed:?}; a Cartesian-enumeration regression \
+             (C(80,4) ≈ 1.5M combos) costs tens of seconds — the BEAM_K path must \
+             stay well under the 1s blowup ceiling"
         );
 
         match action {
@@ -2673,6 +2728,83 @@ mod tests {
             matches!(action, GameAction::ChooseOption { ref choice } if choice == "foe"),
             "AI labeling opponent must pick foe, got {action:?}"
         );
+    }
+
+    #[test]
+    fn copy_retarget_fallback_keeps_existing_targets_with_legal_action() {
+        let mut state = make_state();
+        let original_target = TargetRef::Object(ObjectId(10));
+        state.waiting_for = WaitingFor::CopyRetarget {
+            player: PlayerId(0),
+            copy_id: ObjectId(20),
+            target_slots: vec![engine::types::game_state::CopyTargetSlot {
+                current: Some(original_target),
+                legal_alternatives: vec![TargetRef::Object(ObjectId(11))],
+            }],
+            current_slot: 0,
+        };
+
+        let action = fallback_action(&state).expect("fallback returns an action");
+        assert_eq!(action, GameAction::KeepAllCopyTargets);
+        assert!(engine::game::engine::apply_as_current(&mut state, action).is_ok());
+        assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+    }
+
+    #[test]
+    fn copy_retarget_fallback_keeps_current_slot_before_later_empty_slot() {
+        let mut state = make_state();
+        let current_target = TargetRef::Object(ObjectId(10));
+        state.waiting_for = WaitingFor::CopyRetarget {
+            player: PlayerId(0),
+            copy_id: ObjectId(20),
+            target_slots: vec![
+                engine::types::game_state::CopyTargetSlot {
+                    current: Some(current_target),
+                    legal_alternatives: vec![TargetRef::Object(ObjectId(11))],
+                },
+                engine::types::game_state::CopyTargetSlot {
+                    current: None,
+                    legal_alternatives: vec![TargetRef::Object(ObjectId(12))],
+                },
+            ],
+            current_slot: 0,
+        };
+
+        let action = fallback_action(&state).expect("fallback returns an action");
+        assert_eq!(action, GameAction::ChooseTarget { target: None });
+        assert!(engine::game::engine::apply_as_current(&mut state, action).is_ok());
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::CopyRetarget {
+                current_slot: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn copy_retarget_fallback_selects_first_target_for_fresh_copy_cast() {
+        let mut state = make_state();
+        let first_target = TargetRef::Object(ObjectId(10));
+        state.waiting_for = WaitingFor::CopyRetarget {
+            player: PlayerId(0),
+            copy_id: ObjectId(20),
+            target_slots: vec![engine::types::game_state::CopyTargetSlot {
+                current: None,
+                legal_alternatives: vec![first_target.clone(), TargetRef::Object(ObjectId(11))],
+            }],
+            current_slot: 0,
+        };
+
+        let action = fallback_action(&state).expect("fallback returns an action");
+        assert_eq!(
+            action,
+            GameAction::ChooseTarget {
+                target: Some(first_target),
+            }
+        );
+        assert!(engine::game::engine::apply_as_current(&mut state, action).is_ok());
+        assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
     }
 
     /// A classic vote (`actor == player`) keeps the pre-existing "first

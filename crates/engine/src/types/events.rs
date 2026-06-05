@@ -99,6 +99,15 @@ pub enum ClashResult {
     Tied,
 }
 
+/// CR 103.1 / CR 706: one round of the starting-player d20 roll-off.
+/// `rolls` are in seat order; round 1 contains every seat, and each later
+/// round contains exactly the previous round's tied-max group (CR 103.1
+/// reroll). The high roller of the final round becomes the starting player.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContestRound {
+    pub rolls: Vec<(PlayerId, u8)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum GameEvent {
@@ -117,6 +126,19 @@ pub enum GameEvent {
         card_id: CardId,
         controller: PlayerId,
         object_id: ObjectId, // CR 601.2a: The spell object on the stack
+    },
+    /// CR 702.140c + CR 730.2: A mutating creature spell merged with a target
+    /// creature, forming a mutated permanent. Emitted by
+    /// `merge::merge_object_onto`. `merged_id` is the surviving permanent's
+    /// `ObjectId` (the target creature's, kept per CR 730.2c); `merging_id` is the
+    /// component card/token that merged onto it; `controller` is the merging
+    /// spell's controller. "Whenever this creature mutates" triggers (CR 702.140d)
+    /// listen here — downstream condition handling is deferred (no Phase-1 card
+    /// needs it), but the event is observable now.
+    Mutated {
+        merged_id: ObjectId,
+        merging_id: ObjectId,
+        controller: PlayerId,
     },
     /// CR 707.10: A spell was copied onto the stack. A copy of a spell isn't
     /// cast, so this is a distinct event from `SpellCast` — copy-sensitive
@@ -231,6 +253,11 @@ pub enum GameEvent {
     CreatureExerted {
         object_id: ObjectId,
     },
+    /// CR 702.143a: A player foretold a card from their hand.
+    Foretold {
+        player_id: PlayerId,
+        object_id: ObjectId,
+    },
     PlayerLost {
         player_id: PlayerId,
     },
@@ -304,6 +331,17 @@ pub enum GameEvent {
     },
     GameOver {
         winner: Option<PlayerId>,
+    },
+    /// CR 732.2: A mandatory auto-resolution sequence hit the engine's resource
+    /// ceiling without settling — a net-progress loop the engine cannot
+    /// shortcut (CR 732.2 resolves these by a player-declared iteration count
+    /// the engine can't infer). Resolution is paused and priority returned to
+    /// the active player. NOT a draw: distinct from CR 104.4b, which requires a
+    /// *repeating* state (a true loop is detected separately and ends the game).
+    /// `involved` carries the in-flight cascade's distinct stack-source ids for
+    /// diagnostics only — never read by game logic.
+    ResolutionHalted {
+        involved: Vec<ObjectId>,
     },
     DamageDealt {
         source_id: ObjectId,
@@ -429,6 +467,11 @@ pub enum GameEvent {
     Transformed {
         object_id: ObjectId,
     },
+    /// Digital-only Specialize: a permanent became a color-specific specialized face.
+    Specialized {
+        object_id: ObjectId,
+        color: crate::types::mana::ManaColor,
+    },
     DayNightChanged {
         new_state: String,
     },
@@ -530,6 +573,18 @@ pub enum GameEvent {
         player_id: PlayerId,
         sides: u8,
         result: u8,
+    },
+    /// CR 103.1 / CR 706: The game-1 starting-player roll-off, emitted as one
+    /// authoritative structured event so the contest can be rendered round by
+    /// round (including tie rerolls) with no downstream re-derivation. `rounds`
+    /// preserves the round boundaries the engine computes; `winner` is the
+    /// engine's authoritative starting player (unique max of the final round, or
+    /// the lowest-seat fallback when tied at the reroll cap). Replaces the prior
+    /// flat per-roll `DieRolled` batch on the starting-player contest path; in-game
+    /// die rolls still emit `DieRolled`.
+    StartingPlayerContest {
+        rounds: Vec<ContestRound>,
+        winner: PlayerId,
     },
     /// CR 705: A coin was flipped.
     CoinFlipped {

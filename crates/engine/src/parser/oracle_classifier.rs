@@ -2,6 +2,7 @@ use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::combinator::verify;
+use nom::sequence::terminated;
 use nom::Parser;
 
 use super::oracle_nom::primitives as nom_primitives;
@@ -178,6 +179,11 @@ const STATIC_CONTAINS_PATTERNS: &[&str] = &[
     "have ",
     "has ",
     "can't be blocked",
+    // CR 301.5 + CR 303.4 + CR 701.3a: positive attachment restriction on an
+    // Aura/Equipment ("~ can be attached only to {filter}") — Strata Scythe,
+    // Brass Knuckles, Konda's Banner. Routes to parse_static_line so it lowers
+    // to StaticMode::AttachmentRestriction instead of an effect.
+    "can be attached only to",
     "can't attack",
     "can't block",
     "can't be countered",
@@ -247,6 +253,9 @@ const STATIC_CONTAINS_PATTERNS: &[&str] = &[
     "activated abilities of ",
     // CR 701.23 + CR 609.3: Ashiok-class search prohibition.
     "can't cause their controller to search their library",
+    // CR 603.2 + CR 609.3: The Master, Multiplied-class sacrifice/exile prohibition.
+    "triggered abilities ",
+    "can't cause you to sacrifice or exile",
     // CR 701.23 + CR 609.3: Mindlock Orb-class search prohibition.
     "can't search libraries",
     "cannot search libraries",
@@ -283,6 +292,17 @@ const STATIC_CONTAINS_PATTERNS: &[&str] = &[
     // false-positive into other pattern classes.
     "is every creature type",
     "are every creature type",
+    // CR 502.3 + CR 113.6: Seedborn-class untap permission — "untap <subject>
+    // during each other player's untap step" is always a continuous static, so
+    // route it to `parse_static_line` regardless of subject (covers the self-ref
+    // form "Untap this artifact …" on Bender's Waterskin, not just the "untap
+    // all <type> you control" subject that already matched other patterns).
+    // Lines that merely *trigger* at an untap step lead with "at the beginning
+    // of …" and are caught by the trigger-prefix check before this point, so
+    // this contains-scan stays specific to the static body. Both apostrophe
+    // forms are listed because the source text is not apostrophe-normalized.
+    "during each other player's untap step",
+    "during each other player\u{2019}s untap step",
 ];
 
 const STATIC_PREFIX_PATTERNS: &[&str] = &[
@@ -376,7 +396,36 @@ fn is_static_compound_pattern(lower: &str) -> bool {
             // Vivien on the Hunt static). Routes the line to `parse_static_line`
             // so it lowers to `StaticMode::TopOfLibraryCastPermission` instead
             // of falling through to `try_parse_cast_effect`'s impulse-draw flow.
-            || scan_contains(lower, "from the top of your library"))
+            || scan_contains(lower, "from the top of your library")
+            // CR 113.6b + CR 406.6: "you may play lands and cast spells from
+            // among cards exiled with ~" — persistent, name-anchored exile-play
+            // permission (The Matrix of Time). Routes to `parse_static_line` so
+            // it lowers to `StaticMode::ExileCastPermission { pool: Persistent }`
+            // instead of falling through to the imperative impulse-draw flow.
+            || scan_contains(lower, "from among cards exiled with"))
+    {
+        return true;
+    }
+    // CR 117.1c + CR 113.6b: The Matrix-of-Time form leads with the timing
+    // qualifier ("During your turn, you may play lands and cast spells from
+    // among cards exiled with ~."), so the "you may [play|cast]" prefix is not
+    // at the head of the line. The "play lands and cast spells from among cards
+    // exiled with" anchor is the diagnostic substring; route it to the static
+    // parser regardless of leading text.
+    if scan_contains(
+        lower,
+        "play lands and cast spells from among cards exiled with",
+    ) {
+        return true;
+    }
+    // CR 601.3f + CR 406.6: The "look-at" variant leads with "you may look at
+    // cards exiled with ~, and you may play lands and cast spells from among
+    // those cards." — the play/cast clause uses "those cards" (a back-reference
+    // to the exiled-with set) rather than repeating "cards exiled with". Require
+    // both the source-anchored exile anchor and the play/cast clause so this
+    // stays specific to the persistent exile-play permission.
+    if scan_contains(lower, "cards exiled with")
+        && scan_contains(lower, "play lands and cast spells from among those cards")
     {
         return true;
     }
@@ -518,6 +567,24 @@ fn is_as_enters_choose_pattern(lower: &str) -> bool {
     has_as && has_enters && has_choose
 }
 
+/// CR 603.2 vs CR 614.1c: "Whenever <subject> enters with a counter on it, <consequence>"
+/// is an ETB-with-counter triggered ability (it watches for ANY counter, hence the
+/// untyped "a counter"), NOT a CR 614.1c self/granted enters-with replacement (which
+/// always specifies a typed/counted counter: "a +1/+1 counter", "X +1/+1 counters",
+/// "an additional loyalty counter", ...). Recognizing the untyped form lets the
+/// Priority 5-pre replacement interceptor exclude Murderous Redcap Avatar and cousins
+/// while still capturing the typed/counted replacements.
+pub(crate) fn is_enters_with_counter_trigger(lower: &str) -> bool {
+    nom_primitives::scan_at_word_boundaries(lower, |i| {
+        terminated(
+            tag::<_, _, OracleError<'_>>("enters with a counter on it"),
+            tag(","),
+        )
+        .parse(i)
+    })
+    .is_some()
+}
+
 const EFFECT_IMPERATIVE_PREFIXES: &[&str] = &[
     "add ",
     "attach ",
@@ -569,6 +636,33 @@ pub(crate) fn is_effect_sentence_candidate(lower: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_enters_with_counter_trigger() {
+        // CR 603.2: untyped "enters with a counter on it," — ETB trigger.
+        assert!(is_enters_with_counter_trigger(
+            "whenever a creature you control enters with a counter on it, you may have it deal damage"
+        ));
+        assert!(is_enters_with_counter_trigger(
+            "when a permanent you control enters with a counter on it, draw a card"
+        ));
+        // CR 614.1c: typed/counted forms are replacements, NOT triggers.
+        assert!(!is_enters_with_counter_trigger(
+            "this creature enters with x +1/+1 counters on it"
+        ));
+        assert!(!is_enters_with_counter_trigger(
+            "that creature enters with a +1/+1 counter on it."
+        ));
+        assert!(!is_enters_with_counter_trigger(
+            "that planeswalker enters with an additional loyalty counter on it."
+        ));
+        assert!(!is_enters_with_counter_trigger(
+            "the token enters with x +1/+1 counters on it"
+        ));
+        assert!(!is_enters_with_counter_trigger(
+            "it enters with twice that many +1/+1 counters on it"
+        ));
+    }
 
     /// CR 118.9: the mana-cost-alternative-grant classifier must recognize the
     /// Rooftop Storm / Fist of Suns shape and reject flash-permission text.

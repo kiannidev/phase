@@ -19245,17 +19245,12 @@ mod tests {
                 "Omniscience".to_string(),
                 Zone::Battlefield,
             );
-            state
-                .objects
-                .get_mut(&id)
-                .unwrap()
-                .static_definitions
-                .push(
-                    parse_static_line(
-                        "You may cast spells from your hand without paying their mana costs.",
-                    )
-                    .expect("Omniscience static should parse"),
-                );
+            state.objects.get_mut(&id).unwrap().static_definitions.push(
+                parse_static_line(
+                    "You may cast spells from your hand without paying their mana costs.",
+                )
+                .expect("Omniscience static should parse"),
+            );
         }
 
         /// Quantum Riddler class: printed {3}{U}{U}, Warp {1}{U}.
@@ -19320,9 +19315,9 @@ mod tests {
                         })
                     );
                 }
-                other => panic!(
-                    "expected Warp choice with free normal under Omniscience, got {other:?}"
-                ),
+                other => {
+                    panic!("expected Warp choice with free normal under Omniscience, got {other:?}")
+                }
             }
         }
 

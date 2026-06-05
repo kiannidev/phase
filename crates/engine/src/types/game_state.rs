@@ -6,7 +6,7 @@ use rand_chacha::ChaCha20Rng;
 use serde::{Deserialize, Serialize};
 
 use super::ability::{
-    default_target_filter_permanent, AbilityCost, AbilityDefinition, AdditionalCost,
+    default_target_filter_permanent, AbilityCost, AbilityDefinition, AdditionalCost, AttackSubject,
     BeholdCostAction, CategoryChooserScope, ChoiceType, ChoiceValue, ChooseFromZoneConstraint,
     ChosenAttribute, Comparator, ContinuousModification, CostPaidObjectSnapshot,
     DelayedTriggerCondition, Duration, EffectKind, GameRestriction, KeywordAction, KickerVariant,
@@ -651,6 +651,15 @@ pub enum ExileLinkKind {
     /// copy on the stack (CR 707.10f), not a re-cast of the original. Assign
     /// when WotC publishes SOS CR update.
     ParadigmSource { player: PlayerId },
+    /// CR 702.99b: Cipher — the exiled card (`exiled_id`) is *encoded* on the
+    /// creature (`source_id`). While the card stays in exile and the creature
+    /// stays on the battlefield, the creature has "Whenever this creature deals
+    /// combat damage to a player, its controller may cast a copy of the encoded
+    /// card without paying its mana cost" (CR 702.99c). The link is pruned
+    /// automatically when the card leaves exile (`zones.rs` exile-exit) or the
+    /// creature leaves the battlefield (`zones.rs` battlefield-exit, since this
+    /// is not an `UntilSourceLeaves` link) — exactly CR 702.99c's lifetime.
+    Cipher,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2497,6 +2506,16 @@ pub enum WaitingFor {
         merging_id: ObjectId,
         target_id: ObjectId,
     },
+    /// CR 702.99a: A resolving Cipher spell offers "you may exile this card
+    /// encoded on a creature you control". `card_id` is the resolving spell
+    /// (held in limbo off the stack until the choice completes, mirroring
+    /// `MutateMergeChoice`); `creatures` are the legal hosts the controller may
+    /// pick from, or decline (sending the card to its graveyard).
+    CipherEncodeChoice {
+        player: PlayerId,
+        card_id: ObjectId,
+        creatures: Vec<ObjectId>,
+    },
     /// CR 601.2b: Player chooses which legal cast permission / variant to use
     /// when more than one applies to the same spell from the same zone.
     CastingVariantChoice {
@@ -3343,6 +3362,7 @@ impl WaitingFor {
             | WaitingFor::ModalFaceChoice { player, .. }
             | WaitingFor::AlternativeCastChoice { player, .. }
             | WaitingFor::MutateMergeChoice { player, .. }
+            | WaitingFor::CipherEncodeChoice { player, .. }
             | WaitingFor::CastingVariantChoice { player, .. }
             | WaitingFor::ChoosePermanentTypeSlot { player, .. }
             | WaitingFor::ChooseRingBearer { player, .. }
@@ -4802,8 +4822,8 @@ pub struct GameState {
     /// players they attacked this turn, accumulated across every combat's
     /// declare-attackers step (CR 508.5 "defending player": planeswalker/battle
     /// attacks resolve to controller/protector). Counted by
-    /// `PlayerFilter::OpponentAttackedThisTurn` for "opponents you attacked this
-    /// turn" (Militant Angel).
+    /// `PlayerFilter::OpponentAttacked { You, ThisTurn }` for "opponents you
+    /// attacked this turn" (Militant Angel).
     #[serde(default)]
     pub attacked_defenders_this_turn: HashMap<PlayerId, HashSet<PlayerId>>,
     /// CR 508.6 + CR 508.1b: For each creature declared as an attacker this
@@ -5459,6 +5479,82 @@ impl GameState {
         self.creature_attacked_defenders_this_turn
             .get(&attacker)
             .is_some_and(|defenders| defenders.contains(&defender))
+    }
+
+    /// CR 508.6: Did `subject` attack player `target` within `scope`? Centralizes
+    /// the turn- vs combat-scoped lookup behind `PlayerFilter::OpponentAttacked`.
+    pub fn opponent_attacked(
+        &self,
+        subject: AttackSubject,
+        scope: crate::types::ability::AttackScope,
+        controller: PlayerId,
+        source_id: ObjectId,
+        target: PlayerId,
+    ) -> bool {
+        use crate::types::ability::{AttackScope, AttackSubject};
+        match (subject, scope) {
+            (AttackSubject::You, AttackScope::ThisTurn) => self.has_attacked(controller, target),
+            (AttackSubject::Source, AttackScope::ThisTurn) => {
+                self.creature_attacked_player_this_turn(source_id, target)
+            }
+            (AttackSubject::You, AttackScope::ThisCombat) => {
+                self.player_attacked_player_this_combat(controller, target)
+            }
+            (AttackSubject::Source, AttackScope::ThisCombat) => {
+                self.creature_attacked_player_this_combat(source_id, target)
+            }
+        }
+    }
+
+    /// CR 508.6 + CR 506.1: Within the CURRENT combat, did `attacker_controller`
+    /// declare any creature attacking `defender`? Read from the combat's
+    /// declaration ledger, so it reflects only this combat while surviving
+    /// attackers leaving combat before a trigger resolves. `defending_player`
+    /// already resolves planeswalker/battle attacks to the defending player
+    /// (CR 508.5).
+    pub fn player_attacked_player_this_combat(
+        &self,
+        attacker_controller: PlayerId,
+        defender: PlayerId,
+    ) -> bool {
+        self.combat.as_ref().is_some_and(|combat| {
+            combat
+                .attacked_defenders_this_combat
+                .get(&attacker_controller)
+                .is_some_and(|defenders| defenders.contains(&defender))
+        })
+    }
+
+    /// CR 508.6: Within the CURRENT combat, did creature `source_id` attack
+    /// `defender`? Reads declaration history, not live combat membership.
+    pub fn creature_attacked_player_this_combat(
+        &self,
+        source_id: ObjectId,
+        defender: PlayerId,
+    ) -> bool {
+        self.combat.as_ref().is_some_and(|combat| {
+            combat
+                .creature_attacked_defenders_this_combat
+                .get(&source_id)
+                .is_some_and(|defenders| defenders.contains(&defender))
+        })
+    }
+
+    /// CR 508.6 + CR 702.121a: Defending players the subject attacked in the
+    /// current combat, read from declaration history for Melee-style counts.
+    pub fn attacked_defenders_this_combat_for(
+        &self,
+        subject: AttackSubject,
+        controller: PlayerId,
+        source_id: ObjectId,
+    ) -> Option<&HashSet<PlayerId>> {
+        let combat = self.combat.as_ref()?;
+        match subject {
+            AttackSubject::You => combat.attacked_defenders_this_combat.get(&controller),
+            AttackSubject::Source => combat
+                .creature_attacked_defenders_this_combat
+                .get(&source_id),
+        }
     }
 
     /// Create a new game with the given format configuration and player count.

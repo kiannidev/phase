@@ -10024,7 +10024,10 @@ fn quantity_ref_is_board_state_relative(qty: &QuantityRef) -> bool {
         | QuantityRef::Toughness { scope }
         | QuantityRef::ObjectManaValue { scope }
         | QuantityRef::ObjectColorCount { scope }
-        | QuantityRef::ObjectNameWordCount { scope } => matches!(scope, ObjectScope::Source),
+        | QuantityRef::ObjectNameWordCount { scope }
+        | QuantityRef::ObjectTypelineComponentCount { scope } => {
+            matches!(scope, ObjectScope::Source)
+        }
         // Conservative default: any ref not positively known to be
         // board/controller-relative (Variable/X, target-relative scopes,
         // cast/trigger-event context, etc.) makes the condition non-evaluable
@@ -12126,6 +12129,7 @@ mod tests {
                 active_zones: vec![],
                 characteristic_defining: false,
                 description: Some("Assassin spells you cast have freerunning {B}{B}.".to_string()),
+                attack_defended: None,
             };
             obj.static_definitions = vec![def].into();
         }
@@ -17321,6 +17325,7 @@ mod tests {
                     active_zones: vec![],
                     characteristic_defining: false,
                     description: None,
+                    attack_defended: None,
                 }]
                 .into();
             }
@@ -19386,6 +19391,7 @@ mod tests {
                 description: Some(
                     "Instant and sorcery spells you cast have affinity for creatures.".to_string(),
                 ),
+                attack_defended: None,
             };
             obj.static_definitions = vec![def].into();
         }

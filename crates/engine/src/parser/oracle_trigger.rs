@@ -1525,9 +1525,11 @@ fn condition_introduces_chosen_player_phase(cond_lower: &str) -> bool {
         tag::<_, _, OracleError<'_>>("at the beginning of "),
         alt((
             tag("the chosen player's "),
+            tag("the chosen player\u{2019}s "),
             tag("the chosen players "),
             tag("the chosen players\u{2019} "),
             tag("chosen player's "),
+            tag("chosen player\u{2019}s "),
             tag("chosen players "),
             tag("chosen players\u{2019} "),
         )),
@@ -8331,8 +8333,10 @@ fn try_parse_phase_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefinitio
         def.valid_target = Some(TargetFilter::AttachedTo);
     }
     if scan_contains(phase_text, "chosen player's")
+        || scan_contains(phase_text, "chosen player\u{2019}s ")
         || scan_contains(phase_text, "chosen players ")
         || scan_contains(phase_text, "the chosen player's")
+        || scan_contains(phase_text, "the chosen player\u{2019}s ")
         || scan_contains(phase_text, "the chosen players ")
     {
         def.valid_target = Some(TargetFilter::SourceChosenPlayer);
@@ -19756,6 +19760,26 @@ mod tests {
     fn phase_trigger_chosen_players_upkeep_scopes_to_source_chosen_player() {
         let def = parse_trigger_line(
             "At the beginning of the chosen player's upkeep, this artifact deals X damage to that player, where X is 3 minus the number of cards in their hand.",
+            "The Rack",
+        );
+        assert_eq!(def.mode, TriggerMode::Phase);
+        assert_eq!(def.phase, Some(Phase::Upkeep));
+        assert_eq!(def.valid_target, Some(TargetFilter::SourceChosenPlayer));
+        match def.execute.as_ref().map(|ability| ability.effect.as_ref()) {
+            Some(Effect::DealDamage { target, amount, .. }) => {
+                assert_eq!(target, &TargetFilter::SourceChosenPlayer);
+                assert!(matches!(amount, QuantityExpr::ClampMin { minimum: 0, .. }));
+            }
+            other => panic!("expected DealDamage, got {other:?}"),
+        }
+    }
+
+    /// CR 613.1 + CR 503.1a: Curly-apostrophe "chosen player's upkeep" must
+    /// scope the phase trigger to the source's chosen player.
+    #[test]
+    fn phase_trigger_chosen_player_curly_apostrophe_scopes_to_source_chosen_player() {
+        let def = parse_trigger_line(
+            "At the beginning of the chosen player\u{2019}s upkeep, this artifact deals X damage to that player, where X is 3 minus the number of cards in their hand.",
             "The Rack",
         );
         assert_eq!(def.mode, TriggerMode::Phase);

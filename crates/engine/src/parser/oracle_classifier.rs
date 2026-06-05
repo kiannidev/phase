@@ -72,7 +72,7 @@ pub(crate) fn is_spells_alternative_cost_pattern(lower: &str) -> bool {
 /// pre-filter; lowering is `parse_cast_spells_alternative_cost_multi`.
 pub(crate) fn is_cast_spells_alternative_cost_pattern(lower: &str) -> bool {
     lower_starts_with(lower, "you may cast ")
-        && scan_contains(lower, " by paying ")
+        && scan_contains(lower, "by paying ")
         && scan_contains(lower, "rather than paying")
         && (scan_contains(lower, "their mana costs") || scan_contains(lower, "its mana cost"))
 }

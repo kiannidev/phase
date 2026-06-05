@@ -178,9 +178,10 @@ fn parse_cast_spells_alternative_cost(text: &str) -> Option<(StaticDefinition, b
         .trim_start_matches('.')
         .trim();
 
-    let flash_suffix = remainder
-        .to_lowercase()
-        .starts_with("if you cast a spell this way");
+    let remainder_lower = remainder.to_lowercase();
+    let flash_suffix = tag::<_, _, VE<'_>>("if you cast a spell this way")
+        .parse(remainder_lower.as_str())
+        .is_ok();
 
     let base_filter = parse_type_phrase(filter_original).0;
     let affected = apply_spell_keyword_subject_constraints(base_filter, None, None, Vec::new());

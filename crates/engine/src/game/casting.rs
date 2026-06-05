@@ -19240,7 +19240,7 @@ mod tests {
         fn install_omniscience(state: &mut GameState) {
             let id = create_object(
                 state,
-                CardId(2432_001),
+                CardId(2_432_001),
                 PlayerId(0),
                 "Omniscience".to_string(),
                 Zone::Battlefield,
@@ -19257,7 +19257,7 @@ mod tests {
         fn create_quantum_riddler(state: &mut GameState) -> ObjectId {
             let obj_id = create_object(
                 state,
-                CardId(2432_002),
+                CardId(2_432_002),
                 PlayerId(0),
                 "Quantum Riddler".to_string(),
                 Zone::Hand,
@@ -19290,7 +19290,7 @@ mod tests {
                 &mut state,
                 PlayerId(0),
                 riddler,
-                CardId(2432_002),
+                CardId(2_432_002),
                 &mut events,
             )
             .unwrap();
@@ -19334,7 +19334,7 @@ mod tests {
                 &mut state,
                 PlayerId(0),
                 riddler,
-                CardId(2432_002),
+                CardId(2_432_002),
                 &mut events,
             )
             .unwrap();
@@ -19350,7 +19350,7 @@ mod tests {
                 &mut state,
                 PlayerId(0),
                 riddler,
-                CardId(2432_002),
+                CardId(2_432_002),
                 crate::types::actions::AlternativeCastDecision::Normal,
                 &mut events,
             )

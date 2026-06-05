@@ -6137,17 +6137,30 @@ pub fn handle_cast_spell_with_payment_mode(
                 crate::types::keywords::Keyword::Warp(cost) => Some(cost.clone()),
                 _ => None,
             }) {
+                // CR 601.2b + CR 118.9a: `Unlimited` `CastFromHandFree` (Omniscience)
+                // replaces the printed mana cost with nothing on the normal path.
+                // The Warp prompt must treat that path as always affordable and
+                // surface `NoCost` as the normal option — otherwise a spell whose
+                // printed cost is unpayable auto-routes to Warp and the free cast
+                // is never offered (issue #2432).
+                let omniscience_free =
+                    unlimited_hand_cast_free_applies(state, player, obj, CastingVariant::Normal);
                 // CR 601.2f + CR 118.9d: affordability and the displayed costs
                 // must reflect active cost modifiers — applied to BOTH the printed
                 // cost and the warp alternative cost (CR 118.9d).
-                let normal_cost =
+                let printed_normal_cost =
                     apply_cost_modifiers_to_base(state, player, object_id, obj.mana_cost.clone())
                         .unwrap_or_else(|| obj.mana_cost.clone());
+                let normal_cost = if omniscience_free {
+                    ManaCost::NoCost
+                } else {
+                    printed_normal_cost.clone()
+                };
                 let warp_cost_eff =
                     apply_cost_modifiers_to_base(state, player, object_id, warp_cost.clone())
                         .unwrap_or_else(|| warp_cost.clone());
-                let normal_affordable =
-                    can_pay_cost_after_auto_tap(state, player, object_id, &normal_cost);
+                let normal_affordable = omniscience_free
+                    || can_pay_cost_after_auto_tap(state, player, object_id, &printed_normal_cost);
                 let warp_affordable =
                     can_pay_cost_after_auto_tap(state, player, object_id, &warp_cost_eff);
                 if normal_affordable && warp_affordable {
@@ -19214,6 +19227,149 @@ mod tests {
             !matches!(cost, ManaCost::NoCost),
             "Omniscience must not apply to command-zone commanders, got {cost:?}"
         );
+    }
+
+    /// Issue #2432: Omniscience must offer a free normal cast for Warp spells
+    /// whose printed mana cost is unaffordable but whose warp cost is payable.
+    mod omniscience_warp_2432 {
+        use super::*;
+        use crate::types::game_state::AlternativeCastKeyword;
+        use crate::types::keywords::Keyword;
+        use crate::types::mana::{ManaCost, ManaCostShard};
+
+        fn install_omniscience(state: &mut GameState) {
+            let id = create_object(
+                state,
+                CardId(2432_001),
+                PlayerId(0),
+                "Omniscience".to_string(),
+                Zone::Battlefield,
+            );
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .static_definitions
+                .push(
+                    parse_static_line(
+                        "You may cast spells from your hand without paying their mana costs.",
+                    )
+                    .expect("Omniscience static should parse"),
+                );
+        }
+
+        /// Quantum Riddler class: printed {3}{U}{U}, Warp {1}{U}.
+        fn create_quantum_riddler(state: &mut GameState) -> ObjectId {
+            let obj_id = create_object(
+                state,
+                CardId(2432_002),
+                PlayerId(0),
+                "Quantum Riddler".to_string(),
+                Zone::Hand,
+            );
+            let obj = state.objects.get_mut(&obj_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.mana_cost = ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue, ManaCostShard::Blue],
+                generic: 3,
+            };
+            obj.base_mana_cost = obj.mana_cost.clone();
+            obj.keywords.push(Keyword::Warp(ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 1,
+            }));
+            obj_id
+        }
+
+        #[test]
+        fn omniscience_offers_free_normal_when_warp_affordable_but_printed_is_not() {
+            let mut state = setup_game_at_main_phase();
+            install_omniscience(&mut state);
+            let riddler = create_quantum_riddler(&mut state);
+            // Enough for Warp {1}{U}, not for {3}{U}{U}.
+            add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
+            add_mana(&mut state, PlayerId(0), ManaType::Blue, 1);
+
+            let mut events = Vec::new();
+            let wf = handle_cast_spell(
+                &mut state,
+                PlayerId(0),
+                riddler,
+                CardId(2432_002),
+                &mut events,
+            )
+            .unwrap();
+
+            match wf {
+                WaitingFor::AlternativeCastChoice {
+                    keyword: AlternativeCastKeyword::Warp,
+                    normal_cost,
+                    alternative_cost,
+                    ..
+                } => {
+                    assert_eq!(
+                        normal_cost,
+                        ManaCost::NoCost,
+                        "Omniscience must surface NoCost as the normal option"
+                    );
+                    assert_eq!(
+                        alternative_cost,
+                        Some(ManaCost::Cost {
+                            shards: vec![ManaCostShard::Blue],
+                            generic: 1,
+                        })
+                    );
+                }
+                other => panic!(
+                    "expected Warp choice with free normal under Omniscience, got {other:?}"
+                ),
+            }
+        }
+
+        #[test]
+        fn omniscience_warp_spell_normal_choice_proceeds_without_mana_payment() {
+            let mut state = setup_game_at_main_phase();
+            install_omniscience(&mut state);
+            let riddler = create_quantum_riddler(&mut state);
+            add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
+            add_mana(&mut state, PlayerId(0), ManaType::Blue, 1);
+
+            let mut events = Vec::new();
+            let wf = handle_cast_spell(
+                &mut state,
+                PlayerId(0),
+                riddler,
+                CardId(2432_002),
+                &mut events,
+            )
+            .unwrap();
+            assert!(matches!(
+                wf,
+                WaitingFor::AlternativeCastChoice {
+                    keyword: AlternativeCastKeyword::Warp,
+                    ..
+                }
+            ));
+
+            let wf = handle_warp_cost_choice(
+                &mut state,
+                PlayerId(0),
+                riddler,
+                CardId(2432_002),
+                crate::types::actions::AlternativeCastDecision::Normal,
+                &mut events,
+            )
+            .unwrap();
+
+            assert!(
+                !matches!(wf, WaitingFor::AlternativeCastChoice { .. }),
+                "normal choice under Omniscience must not re-prompt; got {wf:?}"
+            );
+            assert!(
+                !matches!(wf, WaitingFor::ManaPayment { .. }),
+                "Omniscience normal cast must skip mana payment; got {wf:?}"
+            );
+        }
     }
 
     // Witherbloom, the Balancer (cost {5}{B}{G}) has printed `Keyword::Affinity(Creature)`.

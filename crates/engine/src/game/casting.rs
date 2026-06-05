@@ -8196,23 +8196,15 @@ pub(super) fn can_feasibly_pay_mana_cost(
     source_id: Option<ObjectId>,
     cost: &crate::types::mana::ManaCost,
 ) -> bool {
-    // CR 601.2f + CR 107.1b: Affordability must consider some choosable X, not
+    // CR 601.2f + CR 107.1b: Affordability must check a concrete X value, not
     // the symbolic `{X}` shard left in the cost (issue #2011: Kozilek's Command
-    // `{X}{C}{C}` with only Eldrazi Temple was treated as uncastable).
+    // `{X}{C}{C}` with only Eldrazi Temple was treated as uncastable). X only
+    // adds generic mana, so X=0 is the cheapest concrete affordability probe.
     if let Some(sid) = source_id {
         if super::casting_costs::cost_has_x(cost) {
-            let max_x = super::casting_costs::max_x_value_excluding(
-                state,
-                player,
-                cost,
-                Some(sid),
-                &HashSet::new(),
-            );
-            return (0..=max_x).any(|x| {
-                let mut concrete = cost.clone();
-                concrete.concretize_x(x);
-                can_feasibly_pay_mana_cost_without_x(state, player, Some(sid), &concrete)
-            });
+            let mut concrete = cost.clone();
+            concrete.concretize_x(0);
+            return can_feasibly_pay_mana_cost_without_x(state, player, Some(sid), &concrete);
         }
     }
     can_feasibly_pay_mana_cost_without_x(state, player, source_id, cost)

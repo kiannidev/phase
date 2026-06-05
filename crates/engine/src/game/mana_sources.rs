@@ -211,12 +211,11 @@ pub struct ManaSourceOption {
     /// undoability. Constructed by `scan_mana_abilities` via
     /// `mana_ability_penalty`.
     pub penalty: ManaSourcePenalty,
-    /// CR 605.3b + CR 106.1a: Complete pre-chosen multi-mana sequence for
-    /// `ManaProduction::ChoiceAmongCombinations` sources (Shadowmoor/Eventide
-    /// filter lands). `None` for all other sources. When `Some`, a single
-    /// activation of this ability produces **every** mana type listed here,
-    /// atomically — the shard assigner must treat all combos sharing the same
-    /// `(object_id, ability_index)` as alternatives (pick at most one).
+    /// CR 605.3b + CR 106.1a/b: Complete pre-chosen multi-mana sequence for a
+    /// single activation. When `Some`, one activation of this ability produces
+    /// **every** mana type listed here atomically — the shard assigner must treat
+    /// all combos sharing the same `(object_id, ability_index)` as alternatives
+    /// (pick at most one).
     pub atomic_combination: Option<Vec<ManaType>>,
     /// CR 106.6: Resolved spend restrictions attached to the mana this option
     /// produces. Auto-tap filters with the same `PaymentContext` used by the
@@ -1005,9 +1004,9 @@ fn emit_source_rows(
                 })
             })
             .collect(),
-        // CR 106.1b: `{C}{C}` from one activation (Eldrazi Temple, Sol Ring, …)
-        // must surface as a single atomic combination so auto-tap does not plan
-        // two taps of the same source (issue #2011).
+        // CR 605.3b + CR 106.1a/b: Multi-mana from one activation must surface
+        // as a single atomic combination so auto-tap does not plan two taps of
+        // the same source (issue #2011).
         ManaProduction::Fixed { .. }
         | ManaProduction::Colorless { .. }
         | ManaProduction::Mixed { .. } => {

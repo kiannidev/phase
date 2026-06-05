@@ -508,7 +508,7 @@ pub enum TriggerCause {
     /// to `Graveyard` for an object whose snapshot included `Creature` in
     /// its core types.
     CreatureDying,
-    /// CR 603.2d + CR 119.2: Trigger was caused by a creature you control
+    /// CR 603.2d + CR 120.3: Trigger was caused by a creature you control
     /// being dealt damage (Wayta, Trainer Prodigy-class). Matches
     /// `GameEvent::DamageDealt` whose target is a creature controlled by the
     /// doubler's controller.

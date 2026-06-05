@@ -1063,7 +1063,12 @@ pub(crate) fn parse_keyword_from_oracle(text: &str) -> Option<Keyword> {
     // forward-compatible compound shape (mana + non-mana). Pure-mana evoke
     // ("Evoke {3}{U}", original Lorwyn cycle) arrives via MTGJSON's keywords
     // array and is handled by the `FromStr` path above.
-    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("evoke\u{2014}").parse(text) {
+    if let Some(rest) = text
+        .strip_prefix("evoke\u{2014}")
+        .or_else(|| text.strip_prefix("evoke—"))
+        .or_else(|| text.strip_prefix("evoke--"))
+        .or_else(|| text.strip_prefix("evoke-"))
+    {
         if let Some(ev_cost) = parse_evoke_cost(rest) {
             return Some(Keyword::Evoke(ev_cost));
         }
@@ -3132,6 +3137,18 @@ mod tests {
             "expected a HasColor(White) property on the exile filter, got {:?}",
             typed.properties,
         );
+    }
+
+    /// Issue #580: some exports use an ASCII hyphen instead of the Unicode em-dash.
+    #[test]
+    fn parse_keyword_from_oracle_evoke_ascii_dash_exile_white_card_from_hand() {
+        use crate::types::keywords::EvokeCost;
+
+        let kw = parse_keyword_from_oracle("evoke-exile a white card from your hand.").unwrap();
+        assert!(matches!(
+            kw,
+            Keyword::Evoke(EvokeCost::NonMana(AbilityCost::Exile { .. }))
+        ));
     }
 
     /// CR 702.74a regression: pure-mana Evoke ({2}{U} Mulldrifter-class) must

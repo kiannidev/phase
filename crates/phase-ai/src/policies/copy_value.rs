@@ -45,12 +45,15 @@ impl CopyValuePolicy {
                 score_target_choice(ctx.state, ctx.ai_player, *source_id, *target_id)
             }
             (
-                WaitingFor::TargetSelection { .. }
-                | WaitingFor::TriggerTargetSelection { .. },
+                WaitingFor::TargetSelection { .. } | WaitingFor::TriggerTargetSelection { .. },
                 GameAction::ChooseTarget {
                     target: Some(TargetRef::Object(target_id)),
                 },
-            ) if ctx.effects().iter().any(|e| matches!(e, Effect::CopyTokenOf { .. })) => {
+            ) if ctx
+                .effects()
+                .iter()
+                .any(|e| matches!(e, Effect::CopyTokenOf { .. })) =>
+            {
                 let source_id = ctx
                     .source_object()
                     .map(|source| source.id)
@@ -612,7 +615,15 @@ mod tests {
     #[test]
     fn copy_token_target_heavily_penalises_self_commander() {
         let mut state = make_state();
-        let saheeli = add_creature(&mut state, 1, PlayerId(0), "Saheeli, Radiant Creator", 2, 3, 4);
+        let saheeli = add_creature(
+            &mut state,
+            1,
+            PlayerId(0),
+            "Saheeli, Radiant Creator",
+            2,
+            3,
+            4,
+        );
         {
             let obj = state.objects.get_mut(&saheeli).unwrap();
             obj.card_types.supertypes.push(Supertype::Legendary);
@@ -629,7 +640,15 @@ mod tests {
     #[test]
     fn legend_rule_keep_prefers_commander_over_copy_token() {
         let mut state = make_state();
-        let commander = add_creature(&mut state, 1, PlayerId(0), "Saheeli, Radiant Creator", 2, 3, 4);
+        let commander = add_creature(
+            &mut state,
+            1,
+            PlayerId(0),
+            "Saheeli, Radiant Creator",
+            2,
+            3,
+            4,
+        );
         {
             let obj = state.objects.get_mut(&commander).unwrap();
             obj.card_types.supertypes.push(Supertype::Legendary);

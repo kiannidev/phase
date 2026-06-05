@@ -19733,7 +19733,7 @@ mod tests {
         }
     }
 
-    /// CR 603.4 + CR 104.3: Triskaidekaphile — "if you have exactly thirteen
+    /// CR 603.4 + CR 104.2b: Triskaidekaphile — "if you have exactly thirteen
     /// cards in your hand" must hoist as HandSize EQ 13, not fire WinTheGame
     /// unconditionally every upkeep (issue #2371).
     #[test]

@@ -939,7 +939,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             counter_type,
         } => {
             let scope_str = match scope {
-                ObjectScope::Source | ObjectScope::Anaphoric => "self",
+                ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => "self",
                 ObjectScope::Target => "target",
                 ObjectScope::Recipient => "recipient",
                 ObjectScope::EventSource => "event source",
@@ -959,35 +959,54 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
         },
         QuantityRef::Variable { name } => name.clone(),
         QuantityRef::Power { scope } => match scope {
-            ObjectScope::Source | ObjectScope::Anaphoric => "self power".into(),
+            ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
+                "self power".into()
+            }
             ObjectScope::Target => "target's power".into(),
             ObjectScope::Recipient => "recipient's power".into(),
             ObjectScope::EventSource => "event source's power".into(),
             ObjectScope::CostPaidObject => "referenced object's power".into(),
         },
         QuantityRef::Toughness { scope } => match scope {
-            ObjectScope::Source | ObjectScope::Anaphoric => "self toughness".into(),
+            ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
+                "self toughness".into()
+            }
             ObjectScope::Target => "target's toughness".into(),
             ObjectScope::Recipient => "recipient's toughness".into(),
             ObjectScope::EventSource => "event source's toughness".into(),
             ObjectScope::CostPaidObject => "referenced object's toughness".into(),
         },
         QuantityRef::ObjectManaValue { scope } => match scope {
-            ObjectScope::Source | ObjectScope::Anaphoric => "self mana value".into(),
+            ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
+                "self mana value".into()
+            }
             ObjectScope::Target => "target's mana value".into(),
             ObjectScope::Recipient => "recipient's mana value".into(),
             ObjectScope::EventSource => "event source's mana value".into(),
             ObjectScope::CostPaidObject => "referenced object's mana value".into(),
         },
         QuantityRef::ObjectColorCount { scope } => match scope {
-            ObjectScope::Source | ObjectScope::Anaphoric => "self colors".into(),
+            ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
+                "self colors".into()
+            }
             ObjectScope::Target => "target's colors".into(),
             ObjectScope::Recipient => "recipient's colors".into(),
             ObjectScope::EventSource => "event source's colors".into(),
             ObjectScope::CostPaidObject => "cost-paid object's colors".into(),
         },
+        QuantityRef::ObjectTypelineComponentCount { scope } => match scope {
+            ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
+                "typeline components on self".into()
+            }
+            ObjectScope::Target => "typeline components on target".into(),
+            ObjectScope::Recipient => "typeline components on recipient".into(),
+            ObjectScope::EventSource => "typeline components on event source".into(),
+            ObjectScope::CostPaidObject => "typeline components on cost-paid object".into(),
+        },
         QuantityRef::ObjectNameWordCount { scope } => match scope {
-            ObjectScope::Source | ObjectScope::Anaphoric => "words in self name".into(),
+            ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
+                "words in self name".into()
+            }
             ObjectScope::Target => "words in target's name".into(),
             ObjectScope::Recipient => "words in recipient's name".into(),
             ObjectScope::EventSource => "words in event source's name".into(),
@@ -995,7 +1014,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
         },
         QuantityRef::ManaSymbolsInManaCost { scope, color } => {
             let scope_str = match scope {
-                ObjectScope::Source | ObjectScope::Anaphoric => "self",
+                ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => "self",
                 ObjectScope::Target => "target",
                 ObjectScope::Recipient => "recipient",
                 ObjectScope::EventSource => "event source",
@@ -1124,14 +1143,21 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             target,
             aggregate,
             group_by,
+            damage_kind,
         } => {
             let group = match group_by {
                 None => "ungrouped".to_string(),
                 Some(crate::types::ability::DamageGroupKey::SourceId) => "by-source".to_string(),
             };
+            let kind = match damage_kind {
+                crate::types::ability::DamageKindFilter::Any => "",
+                crate::types::ability::DamageKindFilter::CombatOnly => " combat",
+                crate::types::ability::DamageKindFilter::NoncombatOnly => " noncombat",
+            };
             format!(
-                "{} damage dealt this turn ({} -> {}) [{group}]",
+                "{}{} damage dealt this turn ({} -> {}) [{group}]",
                 fmt_aggregate_function(*aggregate),
+                kind,
                 fmt_target(source),
                 fmt_target(target)
             )
@@ -2648,6 +2674,7 @@ fn fmt_modification(m: &crate::types::ability::ContinuousModification) -> String
                 None => format!("enter with {count_str} {} counter", counter_type.as_str()),
             }
         }
+        ContinuousModification::RemoveManaCost => "no mana cost".to_string(),
     }
 }
 
@@ -5278,42 +5305,61 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         QuantityRef::CountersOnObjects { .. } => ("CountersOnObjects", Handled),
         QuantityRef::Variable { .. } => ("Variable", Handled),
         QuantityRef::Power { scope } => match scope {
-            ObjectScope::Source | ObjectScope::Anaphoric => ("SelfPower", Handled),
+            ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
+                ("SelfPower", Handled)
+            }
             ObjectScope::Target => ("TargetPower", Handled),
             ObjectScope::Recipient => ("RecipientPower", Handled),
             ObjectScope::EventSource => ("EventSourcePower", Handled),
             ObjectScope::CostPaidObject => ("CostPaidObjectPower", Handled),
         },
         QuantityRef::Toughness { scope } => match scope {
-            ObjectScope::Source | ObjectScope::Anaphoric => ("SelfToughness", Handled),
+            ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
+                ("SelfToughness", Handled)
+            }
             ObjectScope::Target => ("TargetToughness", Handled),
             ObjectScope::Recipient => ("RecipientToughness", Handled),
             ObjectScope::EventSource => ("EventSourceToughness", Handled),
             ObjectScope::CostPaidObject => ("CostPaidObjectToughness", Handled),
         },
         QuantityRef::ObjectManaValue { scope } => match scope {
-            ObjectScope::Source | ObjectScope::Anaphoric => ("SelfManaValue", Handled),
+            ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
+                ("SelfManaValue", Handled)
+            }
             ObjectScope::Target => ("TargetManaValue", Handled),
             ObjectScope::Recipient => ("RecipientManaValue", Handled),
             ObjectScope::EventSource => ("EventSourceManaValue", Handled),
             ObjectScope::CostPaidObject => ("CostPaidObjectManaValue", Handled),
         },
         QuantityRef::ObjectColorCount { scope } => match scope {
-            ObjectScope::Source | ObjectScope::Anaphoric => ("SourceObjectColorCount", Handled),
+            ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
+                ("SourceObjectColorCount", Handled)
+            }
             ObjectScope::Target => ("TargetObjectColorCount", Handled),
             ObjectScope::Recipient => ("RecipientObjectColorCount", Handled),
             ObjectScope::EventSource => ("EventSourceObjectColorCount", Handled),
             ObjectScope::CostPaidObject => ("CostPaidObjectColorCount", Handled),
         },
         QuantityRef::ObjectNameWordCount { scope } => match scope {
-            ObjectScope::Source | ObjectScope::Anaphoric => ("SourceObjectNameWordCount", Handled),
+            ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
+                ("SourceObjectNameWordCount", Handled)
+            }
             ObjectScope::Target => ("TargetObjectNameWordCount", Handled),
             ObjectScope::Recipient => ("RecipientObjectNameWordCount", Handled),
             ObjectScope::EventSource => ("EventSourceObjectNameWordCount", Handled),
             ObjectScope::CostPaidObject => ("CostPaidObjectNameWordCount", Handled),
         },
+        QuantityRef::ObjectTypelineComponentCount { scope } => match scope {
+            ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
+                ("SourceObjectTypelineComponentCount", Handled)
+            }
+            ObjectScope::Target => ("TargetObjectTypelineComponentCount", Handled),
+            ObjectScope::Recipient => ("RecipientObjectTypelineComponentCount", Handled),
+            ObjectScope::EventSource => ("EventSourceObjectTypelineComponentCount", Handled),
+            ObjectScope::CostPaidObject => ("CostPaidObjectTypelineComponentCount", Handled),
+        },
         QuantityRef::ManaSymbolsInManaCost { scope, .. } => match scope {
-            ObjectScope::Source | ObjectScope::Anaphoric => {
+            ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
                 ("SourceManaSymbolsInManaCost", Handled)
             }
             ObjectScope::Target => ("TargetManaSymbolsInManaCost", Handled),
@@ -5611,6 +5657,7 @@ fn oracle_line_mentions_counter_type(lower: &str, counter_type: &CounterType) ->
         | CounterType::Stun
         | CounterType::Lore
         | CounterType::Time
+        | CounterType::Fade
         | CounterType::Age
         | CounterType::Shield
         | CounterType::Generic(_) => {
@@ -8346,6 +8393,19 @@ mod tests {
     }
 
     #[test]
+    fn apnap_swallowed_clause_warning_counts_as_coverage_gap() {
+        let warnings = vec![OracleDiagnostic::SwallowedClause {
+            detector: "APNAP".to_string(),
+            description: "Repeat the following process for each opponent in turn order."
+                .to_string(),
+            line_index: 0,
+        }];
+        let mut missing = Vec::new();
+        check_parse_warnings(&warnings, &mut missing);
+        assert_eq!(missing, vec!["Swallow:APNAP"]);
+    }
+
+    #[test]
     fn swallowed_clause_warning_counts_as_coverage_gap() {
         let warnings = vec![
             crate::parser::oracle_ir::diagnostic::OracleDiagnostic::SwallowedClause {
@@ -8483,6 +8543,22 @@ mod tests {
         let mut missing = Vec::new();
         check_parse_warnings(&warnings, &mut missing);
         assert_eq!(missing, vec!["Swallow:DynamicQty".to_string()]);
+    }
+
+    /// CR 608.2d: A swallowed `Optional_YouMay` clause must demote the card
+    /// from "supported" via a `Swallow:Optional_YouMay` gap label. This is
+    /// the regression contract for issue #2277 — dropped `you may` optional
+    /// sub-effects must not be counted as supported.
+    #[test]
+    fn check_parse_warnings_flags_optional_you_may() {
+        let warnings = vec![OracleDiagnostic::SwallowedClause {
+            detector: "Optional_YouMay".into(),
+            description: "you may reveal that card and put it into your hand".into(),
+            line_index: 0,
+        }];
+        let mut missing = Vec::new();
+        check_parse_warnings(&warnings, &mut missing);
+        assert_eq!(missing, vec!["Swallow:Optional_YouMay".to_string()]);
     }
 
     /// `CascadeLoss` means a cascade slot was parsed but did not land on the
@@ -9123,6 +9199,7 @@ mod tests {
                     active_zones: vec![],
                     characteristic_defining: false,
                     description: None,
+                    attack_defended: None,
                 }],
                 duration: Some(Duration::UntilEndOfTurn),
                 target: None,
@@ -9166,6 +9243,7 @@ mod tests {
                     active_zones: vec![],
                     characteristic_defining: false,
                     description: None,
+                    attack_defended: None,
                 }],
                 duration: Some(Duration::UntilEndOfTurn),
                 target: None,
@@ -10019,6 +10097,7 @@ mod tests {
             description: Some(
                 "As an additional cost to cast blue permanent spells, you may pay 2 life. Those spells cost less to cast.".to_string(),
             ),
+            attack_defended: None,
         });
 
         assert!(audit_card_lines(oracle, &face).is_empty());
@@ -10049,6 +10128,7 @@ mod tests {
             description: Some(
                 "As an additional cost to cast blue permanent spells, you may pay 2 life. Those spells cost less to cast.".to_string(),
             ),
+            attack_defended: None,
         });
 
         assert!(audit_card_lines(oracle, &face).is_empty());
@@ -10077,6 +10157,7 @@ mod tests {
             active_zones: vec![],
             characteristic_defining: false,
             description: None,
+            attack_defended: None,
         });
 
         let findings = audit_card_lines(oracle, &face);
@@ -10181,6 +10262,7 @@ mod tests {
             active_zones: vec![],
             characteristic_defining: false,
             description: Some("Skip your draw step.".to_string()),
+            attack_defended: None,
         });
 
         assert!(
@@ -10219,6 +10301,7 @@ mod tests {
             active_zones: vec![],
             characteristic_defining: false,
             description: Some("Players can't draw cards.".to_string()),
+            attack_defended: None,
         });
 
         let gaps = card_face_gaps(&face);
@@ -10248,6 +10331,7 @@ mod tests {
             active_zones: vec![],
             characteristic_defining: false,
             description: Some("You can't draw cards.".to_string()),
+            attack_defended: None,
         });
 
         let gaps = card_face_gaps(&face);
@@ -10285,6 +10369,7 @@ mod tests {
                 active_zones: vec![],
                 characteristic_defining: false,
                 description: Some(description.to_string()),
+                attack_defended: None,
             });
         }
 

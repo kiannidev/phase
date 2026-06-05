@@ -27,6 +27,7 @@ use crate::types::format::DeckCopyLimit;
 use crate::types::keywords::{BloodthirstValue, BuybackCost, CyclingCost, Keyword, PartnerType};
 use crate::types::mana::{ManaColor, ManaCost, ManaCostShard};
 use crate::types::phase::Phase;
+use crate::types::player::PlayerCounterKind;
 use crate::types::replacements::ReplacementEvent;
 use crate::types::statics::StaticMode;
 use crate::types::triggers::TriggerMode;
@@ -282,6 +283,35 @@ impl KeywordTriggerInstaller {
                 build_suspend_upkeep_removal_trigger(),
                 build_suspend_last_counter_cast_trigger(),
             ],
+            // CR 702.130a: Afflict N — a once-per-blocked-attacker trigger.
+            // CR 702.130b: each Afflict instance triggers separately (one trigger per instance).
+            Keyword::Afflict(n) => vec![build_afflict_trigger(*n)],
+            // CR 702.149a: Training — an attacks trigger.
+            // CR 702.149b: each Training instance triggers separately (one trigger per instance).
+            Keyword::Training => vec![build_training_trigger()],
+            // CR 702.70a: Poisonous N — a combat-damage-to-player trigger.
+            // CR 702.70b: each Poisonous instance triggers separately (one trigger per instance).
+            Keyword::Poisonous(n) => vec![build_poisonous_trigger(*n)],
+            // CR 702.115a: Ingest — a combat-damage-to-player trigger.
+            // CR 702.115b: each Ingest instance triggers separately (one trigger per instance).
+            Keyword::Ingest => vec![build_ingest_trigger()],
+            // CR 702.69a: Gravestorm — a stack-functioning spell-cast copy
+            // trigger. CR 702.69b: each Gravestorm instance triggers separately.
+            Keyword::Gravestorm => vec![build_gravestorm_trigger()],
+            // CR 702.32a + CR 604.1: granted Fading carries the upkeep
+            // counter-removal / "if you can't, sacrifice" trigger. The
+            // ETB-with-N-fade-counters replacement (CR 702.32a clause 1) is a
+            // static ability that functions only as the permanent enters; a
+            // runtime-granted keyword misses that window (the permanent is
+            // already on the battlefield), so the replacement is not installed.
+            Keyword::Fading(_) => vec![build_fading_upkeep_trigger()],
+            // CR 702.63a + CR 604.1: granted Vanishing carries the upkeep
+            // counter-removal and last-counter sacrifice triggers; the ETB
+            // replacement is not installed for the same reason as Fading.
+            Keyword::Vanishing(_) => vec![
+                build_battlefield_upkeep_counter_removal_trigger(CounterType::Time, "702.63a"),
+                build_vanishing_sacrifice_trigger(),
+            ],
             // CR 702.72a + CR 702.72b: Champion a[n] [type] — paired
             // ETB-exile-or-sacrifice and LTB-return-linked-card triggers. See
             // `build_champion_triggers` for the linkage rationale. Granted
@@ -336,6 +366,26 @@ impl KeywordTriggerInstaller {
             // both suspend triggers when the granted keyword is removed.
             Keyword::Suspend { .. } => {
                 is_suspend_upkeep_trigger(trigger) || is_suspend_last_counter_trigger(trigger)
+            }
+            // CR 702.130a + CR 604.1: symmetric removal — `RemoveKeyword` strips
+            // the Afflict blocked-attacker trigger when the granted keyword is removed.
+            Keyword::Afflict(n) => is_afflict_trigger(trigger, *n),
+            // CR 702.149a + CR 604.1: symmetric removal for granted Training.
+            Keyword::Training => is_training_trigger(trigger),
+            // CR 702.70a + CR 604.1: symmetric removal for granted Poisonous.
+            Keyword::Poisonous(n) => is_poisonous_trigger(trigger, *n),
+            // CR 702.115a + CR 604.1: symmetric removal for granted Ingest.
+            Keyword::Ingest => is_ingest_trigger(trigger),
+            // CR 702.69a + CR 604.1: symmetric removal for granted Gravestorm.
+            Keyword::Gravestorm => is_gravestorm_trigger(trigger),
+            // CR 702.32a + CR 604.1: symmetric removal — `RemoveKeyword` strips
+            // the granted Fading trigger when the granted keyword is removed.
+            Keyword::Fading(_) => is_fading_upkeep_trigger(trigger),
+            // CR 702.63a + CR 604.1: symmetric removal — `RemoveKeyword` strips
+            // both Vanishing triggers when the granted keyword is removed.
+            Keyword::Vanishing(_) => {
+                is_battlefield_upkeep_counter_removal_trigger(trigger, &CounterType::Time)
+                    || is_vanishing_sacrifice_trigger(trigger)
             }
             // CR 702.72a + CR 702.72b + CR 604.1: symmetric removal — both the
             // ETB exile-or-sacrifice trigger and the LTB return trigger are
@@ -1966,6 +2016,90 @@ pub fn synthesize_replicate(face: &mut CardFace) {
     );
 }
 
+/// CR 702.69a: The `AbilityDefinition` produced by a Gravestorm trigger — a
+/// self-referential `CopySpell` repeated once for each permanent put into a
+/// graveyard from the battlefield this turn. Mirrors
+/// `replicate_copy_ability_definition` but drives `repeat_for` off the
+/// battlefield-to-graveyard zone-change count (CR 702.69a) rather than the
+/// additional-cost payment count, and carries no intervening-if.
+pub fn gravestorm_copy_ability_definition() -> AbilityDefinition {
+    let mut def = AbilityDefinition::new(
+        AbilityKind::Spell,
+        // CR 702.69a + CR 707.10c: "If the spell has any targets, you may
+        // choose new targets for any of the copies."
+        Effect::CopySpell {
+            target: TargetFilter::SelfRef,
+            retarget: CopyRetargetPermission::MayChooseNewTargets,
+        },
+    );
+    // CR 702.69a: "copy it for each permanent that was put into a graveyard from
+    // the battlefield this turn." The count drives N `CopySpell` iterations.
+    def.repeat_for = Some(QuantityExpr::Ref {
+        qty: QuantityRef::ZoneChangeCountThisTurn {
+            from: Some(Zone::Battlefield),
+            to: Some(Zone::Graveyard),
+            filter: TargetFilter::Typed(TypedFilter::permanent()),
+        },
+    });
+    def
+}
+
+/// CR 702.69a: A Gravestorm trigger — a self-referential `SpellCast` copy
+/// trigger that functions on the stack and whose copy count is the
+/// battlefield-to-graveyard zone-change count this turn.
+fn is_gravestorm_trigger(t: &TriggerDefinition) -> bool {
+    matches!(t.mode, TriggerMode::SpellCast)
+        && matches!(t.valid_card, Some(TargetFilter::SelfRef))
+        && t.trigger_zones.contains(&Zone::Stack)
+        && t.execute.as_deref().is_some_and(|a| {
+            matches!(
+                &*a.effect,
+                Effect::CopySpell {
+                    target: TargetFilter::SelfRef,
+                    retarget: CopyRetargetPermission::MayChooseNewTargets,
+                }
+            ) && a.repeat_for.as_ref().is_some_and(|repeat_for| {
+                matches!(
+                    repeat_for,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::ZoneChangeCountThisTurn {
+                            from: Some(Zone::Battlefield),
+                            to: Some(Zone::Graveyard),
+                            filter,
+                        }
+                    } if *filter == TargetFilter::Typed(TypedFilter::permanent())
+                )
+            })
+        })
+}
+
+/// CR 702.69a: Build one Gravestorm trigger — "when you cast this spell, copy
+/// it for each permanent that was put into a graveyard from the battlefield
+/// this turn." CR 702.69b: multiple Gravestorm instances trigger separately.
+fn build_gravestorm_trigger() -> TriggerDefinition {
+    TriggerDefinition::new(TriggerMode::SpellCast)
+        .valid_card(TargetFilter::SelfRef)
+        .trigger_zones(vec![Zone::Stack])
+        .execute(gravestorm_copy_ability_definition())
+        .description(
+            "CR 702.69a: Gravestorm — when you cast this spell, copy it for each permanent \
+             put into a graveyard from the battlefield this turn."
+                .to_string(),
+        )
+}
+
+/// CR 702.69a: Synthesize Gravestorm into "when you cast this spell" copy
+/// triggers that function on the stack and copy the spell once for each
+/// permanent put into a graveyard from the battlefield this turn.
+///
+/// Build-for-the-class: keyed entirely on `Keyword::Gravestorm`, so every
+/// printed Gravestorm card flows through this one synthesizer. CR 702.69b says
+/// each Gravestorm instance triggers separately, which `install_matching`
+/// preserves while keeping repeated synthesis idempotent.
+pub fn synthesize_gravestorm(face: &mut CardFace) {
+    KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Gravestorm));
+}
+
 /// CR 702.42a: Synthesize Entwine cost onto modal spell's ModalChoice.
 ///
 /// Sets `entwine_cost` on the face's modal abilities and raises `max_choices`
@@ -2599,6 +2733,165 @@ fn static_grants_haste_to_self(static_def: &StaticDefinition) -> bool {
                 }
             )
         })
+}
+
+/// CR 702.98a: Unleash represents two static abilities — the permanent "may enter
+/// with an additional +1/+1 counter on it" and "can't block as long as it has a
+/// +1/+1 counter on it." The first mirrors `synthesize_riot`'s optional ETB +1/+1
+/// counter (here with no decline branch); the second is a `CantBlock` static gated
+/// on the creature carrying any +1/+1 counter (CR 702.98a keys on *any* such
+/// counter, not only the unleash one). Static grants of Unleash synthesize the
+/// same shape from the static's affected filter, mirroring `synthesize_riot`.
+pub fn synthesize_unleash(face: &mut CardFace) {
+    let printed_count = face
+        .keywords
+        .iter()
+        .filter(|kw| matches!(kw, Keyword::Unleash))
+        .count();
+    add_unleash_replacements(face, TargetFilter::SelfRef, printed_count);
+    if printed_count > 0 {
+        add_unleash_cant_block_static(
+            face,
+            TargetFilter::SelfRef,
+            StaticCondition::HasCounters {
+                counters: CounterMatch::OfType(CounterType::Plus1Plus1),
+                minimum: 1,
+                maximum: None,
+            },
+        );
+    }
+
+    let static_grants: Vec<TargetFilter> = face
+        .static_abilities
+        .iter()
+        .filter(|static_def| static_grants_unleash(static_def))
+        .map(|static_def| static_def.affected.clone().unwrap_or(TargetFilter::Any))
+        .collect();
+    for filter in static_grants {
+        add_unleash_replacements(face, filter.clone(), 1);
+        add_unleash_cant_block_static(
+            face,
+            filter,
+            StaticCondition::RecipientHasCounters {
+                counters: CounterMatch::OfType(CounterType::Plus1Plus1),
+                minimum: 1,
+                maximum: None,
+            },
+        );
+    }
+}
+
+fn static_grants_unleash(static_def: &StaticDefinition) -> bool {
+    static_def.mode == StaticMode::Continuous
+        && static_def.modifications.iter().any(|modification| {
+            matches!(
+                modification,
+                ContinuousModification::AddKeyword {
+                    keyword: Keyword::Unleash
+                }
+            )
+        })
+}
+
+fn add_unleash_replacements(face: &mut CardFace, valid_card: TargetFilter, needed: usize) {
+    let existing = face
+        .replacements
+        .iter()
+        .filter(|replacement| is_unleash_replacement(replacement, &valid_card))
+        .count();
+    for _ in existing..needed {
+        face.replacements
+            .push(build_unleash_replacement(valid_card.clone()));
+    }
+}
+
+fn build_unleash_replacement(valid_card: TargetFilter) -> ReplacementDefinition {
+    // CR 702.98a: "You may have this permanent enter with an additional +1/+1
+    // counter on it."
+    let counter_branch = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::PutCounter {
+            counter_type: CounterType::Plus1Plus1,
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::SelfRef,
+        },
+    )
+    .description("This permanent enters with an additional +1/+1 counter on it".to_string());
+
+    ReplacementDefinition {
+        event: ReplacementEvent::Moved,
+        execute: Some(Box::new(counter_branch)),
+        mode: crate::types::ability::ReplacementMode::Optional { decline: None },
+        valid_card: Some(valid_card),
+        destination_zone: Some(Zone::Battlefield),
+        description: Some(
+            "CR 702.98a: Unleash — this permanent may enter with an additional +1/+1 counter on it."
+                .to_string(),
+        ),
+        ..ReplacementDefinition::new(ReplacementEvent::Moved)
+    }
+}
+
+fn is_unleash_replacement(replacement: &ReplacementDefinition, valid_card: &TargetFilter) -> bool {
+    if !matches!(replacement.event, ReplacementEvent::Moved)
+        || replacement.valid_card.as_ref() != Some(valid_card)
+        || replacement.destination_zone != Some(Zone::Battlefield)
+        || !matches!(
+            replacement.mode,
+            crate::types::ability::ReplacementMode::Optional { decline: None }
+        )
+    {
+        return false;
+    }
+    let Some(execute) = replacement.execute.as_deref() else {
+        return false;
+    };
+    matches!(
+        &*execute.effect,
+        Effect::PutCounter {
+            counter_type: CounterType::Plus1Plus1,
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::SelfRef,
+        }
+    )
+}
+
+fn add_unleash_cant_block_static(
+    face: &mut CardFace,
+    affected: TargetFilter,
+    condition: StaticCondition,
+) {
+    if !face
+        .static_abilities
+        .iter()
+        .any(|static_def| is_unleash_cant_block_static(static_def, &affected, &condition))
+    {
+        face.static_abilities
+            .push(build_unleash_cant_block_static(affected, condition));
+    }
+}
+
+fn build_unleash_cant_block_static(
+    affected: TargetFilter,
+    condition: StaticCondition,
+) -> StaticDefinition {
+    // CR 702.98a: "This permanent can't block as long as it has a +1/+1 counter on
+    // it." The condition is source-relative for printed Unleash and
+    // recipient-relative for static grants.
+    StaticDefinition::new(StaticMode::CantBlock)
+        .affected(affected)
+        .condition(condition)
+        .description("can't block as long as it has a +1/+1 counter on it".to_string())
+}
+
+fn is_unleash_cant_block_static(
+    static_def: &StaticDefinition,
+    affected: &TargetFilter,
+    condition: &StaticCondition,
+) -> bool {
+    static_def.mode == StaticMode::CantBlock
+        && static_def.affected.as_ref() == Some(affected)
+        && static_def.condition.as_ref() == Some(condition)
 }
 
 /// CR 702.93a: Undying — "When this permanent is put into a graveyard from the
@@ -3936,7 +4229,10 @@ fn build_exalted_trigger() -> TriggerDefinition {
             TypedFilter::creature().controller(ControllerRef::You),
         ))
         .condition(TriggerCondition::Not {
-            condition: Box::new(TriggerCondition::MinCoAttackers { minimum: 1 }),
+            condition: Box::new(TriggerCondition::MinCoAttackers {
+                minimum: 1,
+                filter: None,
+            }),
         })
         .execute(execute)
         .description(
@@ -4012,6 +4308,227 @@ fn build_mentor_trigger() -> TriggerDefinition {
              this creature's power."
                 .to_string(),
         )
+}
+
+/// CR 702.130a: Afflict N — "Whenever this creature becomes blocked, defending
+/// player loses N life." Each instance triggers separately (CR 702.130b), so one
+/// trigger is synthesized per `Keyword::Afflict` instance. Self-scoped via
+/// `valid_card` (the field block matchers read) exactly like Bushido; the life
+/// loss is directed at `DefendingPlayer`, which routes through
+/// `combat::defending_player_for_attacker` for the source attacking creature.
+fn build_afflict_trigger(n: u32) -> TriggerDefinition {
+    // CR 702.130a: "defending player loses N life."
+    let lose_life = Effect::LoseLife {
+        amount: QuantityExpr::Fixed { value: n as i32 },
+        target: Some(TargetFilter::DefendingPlayer),
+    };
+    let execute = AbilityDefinition::new(AbilityKind::Spell, lose_life).description(format!(
+        "CR 702.130a: Afflict {n} — defending player loses {n} life"
+    ));
+    TriggerDefinition::new(TriggerMode::AttackerBlocked)
+        .valid_card(TargetFilter::SelfRef)
+        .execute(execute)
+        .description(format!(
+            "CR 702.130a: Afflict {n} — whenever this creature becomes blocked, \
+             the defending player loses {n} life."
+        ))
+}
+
+/// CR 702.130a: An Afflict `n` trigger — a self-scoped (`valid_card: SelfRef`)
+/// `AttackerBlocked` trigger whose effect makes the `DefendingPlayer` lose `n`
+/// life. Parameterized by `n` (and asserting `valid_card`) so `RemoveKeyword`
+/// symmetric removal strips exactly its own trigger without matching a different
+/// Afflict level or a coincidental printed becomes-blocked life-loss.
+fn is_afflict_trigger(t: &TriggerDefinition, n: u32) -> bool {
+    matches!(t.mode, TriggerMode::AttackerBlocked)
+        && matches!(t.valid_card, Some(TargetFilter::SelfRef))
+        && matches!(
+            t.execute.as_deref().map(|a| &*a.effect),
+            Some(Effect::LoseLife {
+                amount: QuantityExpr::Fixed { value },
+                target: Some(TargetFilter::DefendingPlayer),
+            }) if *value == n as i32
+        )
+}
+
+/// CR 702.149a + CR 208.1: Training's co-attacker gate — a creature whose current
+/// power is strictly greater than the source creature's current power. Reuses the
+/// same `PtComparison` building block Mentor uses (inverted comparator: `GT`
+/// instead of `LT`), resolved with the source creature as the filter's source so
+/// the comparison reads the Training creature's power.
+fn training_higher_power_coattacker_filter() -> TargetFilter {
+    TargetFilter::Typed(
+        TypedFilter::creature().properties(vec![FilterProp::PtComparison {
+            stat: PtStat::Power,
+            scope: PtValueScope::Current,
+            comparator: Comparator::GT,
+            value: QuantityExpr::Ref {
+                qty: QuantityRef::Power {
+                    scope: ObjectScope::Source,
+                },
+            },
+        }]),
+    )
+}
+
+/// CR 702.149a: Training — "Whenever this creature and at least one other
+/// creature with power greater than this creature's power attack, put a +1/+1
+/// counter on this creature." Each instance triggers separately (CR 702.149b),
+/// so one trigger is synthesized per `Keyword::Training` instance.
+///
+/// Mirrors the self-scoped `Attacks` shape of Exalted but pumps itself with a
+/// +1/+1 counter (not until-end-of-turn) and gates on a higher-power co-attacker
+/// via a `MinCoAttackers { minimum: 1, filter }` intervening condition — the
+/// existing co-attacker counter parameterized with the power filter, so no new
+/// condition variant is introduced.
+fn build_training_trigger() -> TriggerDefinition {
+    let execute = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::PutCounter {
+            counter_type: CounterType::Plus1Plus1,
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::SelfRef,
+        },
+    )
+    .description("CR 702.149a: Training — put a +1/+1 counter on this creature".to_string());
+
+    TriggerDefinition::new(TriggerMode::Attacks)
+        .valid_card(TargetFilter::SelfRef)
+        .condition(TriggerCondition::MinCoAttackers {
+            minimum: 1,
+            filter: Some(training_higher_power_coattacker_filter()),
+        })
+        .execute(execute)
+        .description(
+            "CR 702.149a: Training — whenever this creature and at least one other \
+             creature with power greater than this creature's power attack, put a \
+             +1/+1 counter on this creature."
+                .to_string(),
+        )
+}
+
+/// CR 702.149a: A Training trigger — a self-scoped (`valid_card: SelfRef`)
+/// `Attacks` trigger gated on a filtered `MinCoAttackers` higher-power co-attacker
+/// that puts a single +1/+1 counter on the source. Used by `RemoveKeyword`
+/// symmetric removal so a granted-then-removed Training strips exactly its own
+/// trigger.
+fn is_training_trigger(t: &TriggerDefinition) -> bool {
+    matches!(t.mode, TriggerMode::Attacks)
+        && matches!(t.valid_card, Some(TargetFilter::SelfRef))
+        && matches!(
+            t.condition.as_ref(),
+            Some(TriggerCondition::MinCoAttackers {
+                minimum: 1,
+                filter: Some(f),
+            }) if f == &training_higher_power_coattacker_filter()
+        )
+        && matches!(
+            t.execute.as_deref().map(|a| &*a.effect),
+            Some(Effect::PutCounter {
+                counter_type: CounterType::Plus1Plus1,
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::SelfRef,
+            })
+        )
+}
+
+/// CR 702.70a: Poisonous N — "Whenever this creature deals combat damage to a
+/// player, that player gets N poison counters." Each instance triggers separately
+/// (CR 702.70b), so one trigger is synthesized per `Keyword::Poisonous` instance.
+///
+/// Modeled as a source-led combat-damage trigger (`DamageDone` +
+/// `DamageKindFilter::CombatOnly`, `valid_source: SelfRef`, `valid_target:
+/// Player`), mirroring the parser's "deals combat damage to a player" shape. The
+/// poison routes to the damaged player (`TriggeringPlayer`) via
+/// `GivePlayerCounter`, which sends `PlayerCounterKind::Poison` to the dedicated
+/// poison field (CR 104.3d).
+fn build_poisonous_trigger(n: u32) -> TriggerDefinition {
+    let give_poison = Effect::GivePlayerCounter {
+        counter_kind: PlayerCounterKind::Poison,
+        count: QuantityExpr::Fixed { value: n as i32 },
+        target: TargetFilter::TriggeringPlayer,
+    };
+    let execute = AbilityDefinition::new(AbilityKind::Spell, give_poison).description(format!(
+        "CR 702.70a: Poisonous {n} — that player gets {n} poison counters"
+    ));
+    TriggerDefinition::new(TriggerMode::DamageDone)
+        .damage_kind(DamageKindFilter::CombatOnly)
+        .valid_source(TargetFilter::SelfRef)
+        .valid_target(TargetFilter::Player)
+        .execute(execute)
+        .description(format!(
+            "CR 702.70a: Poisonous {n} — whenever this creature deals combat \
+             damage to a player, that player gets {n} poison counters."
+        ))
+}
+
+/// CR 702.70a: A Poisonous `n` trigger — a source-scoped combat-damage-to-player
+/// trigger that gives the damaged player `n` poison counters. Parameterized by
+/// `n` so `RemoveKeyword` symmetric removal strips exactly its own trigger.
+fn is_poisonous_trigger(t: &TriggerDefinition, n: u32) -> bool {
+    matches!(t.mode, TriggerMode::DamageDone)
+        && matches!(t.damage_kind, DamageKindFilter::CombatOnly)
+        && matches!(t.valid_source, Some(TargetFilter::SelfRef))
+        && matches!(t.valid_target, Some(TargetFilter::Player))
+        && matches!(
+            t.execute.as_deref().map(|a| &*a.effect),
+            Some(Effect::GivePlayerCounter {
+                counter_kind: PlayerCounterKind::Poison,
+                count: QuantityExpr::Fixed { value },
+                target: TargetFilter::TriggeringPlayer,
+            }) if *value == n as i32
+        )
+}
+
+/// CR 702.115a: Ingest — "Whenever this creature deals combat damage to a
+/// player, that player exiles the top card of their library." Each instance
+/// triggers separately (CR 702.115b), so one trigger is synthesized per
+/// `Keyword::Ingest` instance.
+fn build_ingest_trigger() -> TriggerDefinition {
+    let exile = Effect::ExileTop {
+        player: TargetFilter::TriggeringPlayer,
+        count: QuantityExpr::Fixed { value: 1 },
+        face_down: false,
+    };
+    let execute = AbilityDefinition::new(AbilityKind::Spell, exile).description(
+        "CR 702.115a: Ingest — that player exiles the top card of their library".to_string(),
+    );
+    TriggerDefinition::new(TriggerMode::DamageDone)
+        .damage_kind(DamageKindFilter::CombatOnly)
+        .valid_source(TargetFilter::SelfRef)
+        .valid_target(TargetFilter::Player)
+        .execute(execute)
+        .description(
+            "CR 702.115a: Ingest — whenever this creature deals combat damage to a player, \
+             that player exiles the top card of their library."
+                .to_string(),
+        )
+}
+
+/// CR 702.115a: An Ingest trigger — a source-scoped combat-damage-to-player
+/// trigger that exiles the top card of the damaged player's library. Used by
+/// `RemoveKeyword` symmetric removal so a granted-then-removed Ingest strips
+/// exactly its own trigger.
+fn is_ingest_trigger(t: &TriggerDefinition) -> bool {
+    matches!(t.mode, TriggerMode::DamageDone)
+        && matches!(t.damage_kind, DamageKindFilter::CombatOnly)
+        && matches!(t.valid_source, Some(TargetFilter::SelfRef))
+        && matches!(t.valid_target, Some(TargetFilter::Player))
+        && matches!(
+            t.execute.as_deref().map(|a| &*a.effect),
+            Some(Effect::ExileTop {
+                player: TargetFilter::TriggeringPlayer,
+                count: QuantityExpr::Fixed { value: 1 },
+                face_down: false,
+            })
+        )
+}
+
+/// CR 702.115a: Synthesize Ingest into a combat-damage-to-player trigger that
+/// exiles the top card of the damaged player's library. CR 702.115b: multiple
+/// Ingest instances trigger separately.
+pub fn synthesize_ingest(face: &mut CardFace) {
+    KeywordTriggerInstaller::install_matching(face, |kw| matches!(kw, Keyword::Ingest));
 }
 
 /// CR 702.101a: Extort — "Whenever you cast a spell, you may pay {W/B}.
@@ -4667,6 +5184,364 @@ fn is_suspend_last_counter_trigger(t: &TriggerDefinition) -> bool {
         && t.counter_filter
             .as_ref()
             .is_some_and(|f| matches!(f.counter_type, CounterType::Time) && f.threshold == Some(0))
+}
+
+// ---------------------------------------------------------------------------
+// Fading (CR 702.32) and Vanishing (CR 702.63)
+//
+// Both keywords use upkeep counter-removal shapes — a `TriggerMode::Phase`
+// upkeep trigger gated `OnlyDuringYourTurn` whose execute body starts with
+// `Effect::RemoveCounter { count: 1, target: SelfRef }` — and differ in counter
+// type and sacrifice timing:
+//
+//   * Fading N (CR 702.32a) enters with N *fade* counters and is sacrificed at
+//     the upkeep where it *can't* remove one (the upkeep with 0 fade counters,
+//     one upkeep AFTER its last counter was removed) — so it gets N uses.
+//   * Vanishing N (CR 702.63a) enters with N *time* counters and is sacrificed
+//     *when its last time counter is removed* (the Nth upkeep, the removal that
+//     takes it to 0).
+//
+// Vanishing's removal trigger mirrors suspend (CR 702.62a) but in the
+// Battlefield zone. Fading needs a single remove-or-sacrifice trigger because
+// its "if you can't" branch is checked during resolution.
+
+/// CR 702.63a: Shared upkeep counter-removal trigger for Vanishing and other
+/// "remove one counter if one remains" battlefield keywords. Mirrors
+/// `build_suspend_upkeep_removal_trigger`, but on the battlefield
+/// (Vanishing permanents are on the battlefield, suspend cards are in exile).
+///
+/// The `HasCounters { minimum: 1 }` intervening-if (CR 603.4) ensures the
+/// removal only fires while a counter remains. This matches Vanishing's printed
+/// "if this permanent has a time counter on it" (CR 702.63a). Fading is not
+/// built through this helper because its "if you can't, sacrifice" branch must
+/// be decided during the single upkeep trigger's resolution.
+fn build_battlefield_upkeep_counter_removal_trigger(
+    counter_type: CounterType,
+    cr: &str,
+) -> TriggerDefinition {
+    let remove_one = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::RemoveCounter {
+            counter_type: Some(counter_type.clone()),
+            count: 1,
+            target: TargetFilter::SelfRef,
+        },
+    );
+    TriggerDefinition::new(TriggerMode::Phase)
+        .phase(Phase::Upkeep)
+        .valid_card(TargetFilter::SelfRef)
+        .condition(TriggerCondition::HasCounters {
+            counters: CounterMatch::OfType(counter_type.clone()),
+            minimum: 1,
+            maximum: None,
+        })
+        .constraint(crate::types::ability::TriggerConstraint::OnlyDuringYourTurn)
+        .execute(remove_one)
+        .description(format!(
+            "CR {cr}: At the beginning of your upkeep, remove a {} counter from this permanent.",
+            counter_type.as_str()
+        ))
+}
+
+/// CR 702.32a: Fading's single upkeep trigger. It attempts to remove one fade
+/// counter, then sacrifices the permanent if that removal did not happen during
+/// resolution. The sacrifice branch is a sub-ability gated by the existing
+/// `PreviousEffectAmount == 0` chain signal; `RemoveCounter` stamps the amount
+/// from emitted `CounterRemoved` events, so a counter removed in response makes
+/// this trigger sacrifice at resolution instead of silently doing nothing.
+fn build_fading_upkeep_trigger() -> TriggerDefinition {
+    let sacrifice_if_none_removed = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Sacrifice {
+            target: TargetFilter::SelfRef,
+            count: QuantityExpr::Fixed { value: 1 },
+            min_count: 0,
+        },
+    )
+    .condition(AbilityCondition::PreviousEffectAmount {
+        comparator: Comparator::EQ,
+        rhs: QuantityExpr::Fixed { value: 0 },
+    });
+    let remove_one = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::RemoveCounter {
+            counter_type: Some(CounterType::Fade),
+            count: 1,
+            target: TargetFilter::SelfRef,
+        },
+    )
+    .sub_ability(sacrifice_if_none_removed);
+    TriggerDefinition::new(TriggerMode::Phase)
+        .phase(Phase::Upkeep)
+        .valid_card(TargetFilter::SelfRef)
+        .constraint(crate::types::ability::TriggerConstraint::OnlyDuringYourTurn)
+        .execute(remove_one)
+        .description(
+            "CR 702.32a: At the beginning of your upkeep, if you can't remove a fade counter from this permanent, sacrifice it."
+                .to_string(),
+        )
+}
+
+/// CR 702.63a (3rd ability): Vanishing's sacrifice trigger. "When the last time
+/// counter is removed from this permanent, sacrifice it." Identical shape to the
+/// suspend last-counter trigger (`build_suspend_last_counter_cast_trigger`) —
+/// `TriggerMode::CounterRemoved` with `threshold: Some(0)` (fire only when the
+/// post-removal count is 0) — but on the battlefield and executing a sacrifice
+/// instead of a free cast. This fires on the very upkeep that removes the last
+/// counter (CR 702.63a), one upkeep earlier than Fading's sacrifice.
+fn build_vanishing_sacrifice_trigger() -> TriggerDefinition {
+    let sacrifice = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Sacrifice {
+            target: TargetFilter::SelfRef,
+            count: QuantityExpr::Fixed { value: 1 },
+            min_count: 0,
+        },
+    );
+    TriggerDefinition::new(TriggerMode::CounterRemoved)
+        .valid_card(TargetFilter::SelfRef)
+        .counter_filter(CounterTriggerFilter {
+            counter_type: CounterType::Time,
+            threshold: Some(0),
+        })
+        .execute(sacrifice)
+        .description(
+            "CR 702.63a: When the last time counter is removed from this permanent, sacrifice it."
+                .to_string(),
+        )
+}
+
+/// Structural predicate: true iff `trigger` is the battlefield upkeep
+/// counter-removal trigger for `counter_type`. Mirrors `is_suspend_upkeep_trigger`,
+/// but on the battlefield.
+fn is_battlefield_upkeep_counter_removal_trigger(
+    t: &TriggerDefinition,
+    counter_type: &CounterType,
+) -> bool {
+    // Default `trigger_zones` (empty) means battlefield-only, which is what the
+    // builder leaves — distinguishing this from the suspend upkeep trigger,
+    // which explicitly sets `trigger_zones = [Exile]`.
+    matches!(t.mode, TriggerMode::Phase)
+        && t.phase == Some(Phase::Upkeep)
+        && t.trigger_zones.is_empty()
+        && matches!(t.valid_card, Some(TargetFilter::SelfRef))
+        && matches!(
+            t.execute.as_deref().map(|a| &*a.effect),
+            Some(Effect::RemoveCounter { counter_type: Some(ct), target: TargetFilter::SelfRef, .. })
+                if ct == counter_type
+        )
+}
+
+/// Structural predicate: true iff `trigger` is the Fading upkeep trigger shape:
+/// upkeep, self fade-counter removal, then self-sacrifice if no counter was
+/// removed during resolution.
+fn is_fading_upkeep_trigger(t: &TriggerDefinition) -> bool {
+    matches!(t.mode, TriggerMode::Phase)
+        && t.phase == Some(Phase::Upkeep)
+        && matches!(t.valid_card, Some(TargetFilter::SelfRef))
+        && matches!(
+            t.execute.as_deref().map(|a| &*a.effect),
+            Some(Effect::RemoveCounter {
+                counter_type: Some(CounterType::Fade),
+                target: TargetFilter::SelfRef,
+                ..
+            })
+        )
+        && t.execute
+            .as_deref()
+            .and_then(|a| a.sub_ability.as_deref())
+            .is_some_and(|sub| {
+                matches!(
+                    &sub.condition,
+                    Some(AbilityCondition::PreviousEffectAmount {
+                        comparator: Comparator::EQ,
+                        rhs: QuantityExpr::Fixed { value: 0 },
+                    })
+                ) && matches!(
+                    &*sub.effect,
+                    Effect::Sacrifice {
+                        target: TargetFilter::SelfRef,
+                        ..
+                    }
+                )
+            })
+}
+
+/// Structural predicate: true iff `trigger` is the Vanishing last-counter
+/// sacrifice trigger shape. Mirrors `is_suspend_last_counter_trigger` but
+/// executes a self-sacrifice rather than a free cast.
+fn is_vanishing_sacrifice_trigger(t: &TriggerDefinition) -> bool {
+    matches!(t.mode, TriggerMode::CounterRemoved)
+        && matches!(t.valid_card, Some(TargetFilter::SelfRef))
+        && t.counter_filter
+            .as_ref()
+            .is_some_and(|f| matches!(f.counter_type, CounterType::Time) && f.threshold == Some(0))
+        && matches!(
+            t.execute.as_deref().map(|a| &*a.effect),
+            Some(Effect::Sacrifice {
+                target: TargetFilter::SelfRef,
+                ..
+            })
+        )
+}
+
+/// Build the shared "enters with N counters" ETB replacement for Fading /
+/// Vanishing. Mirrors the Modular ETB-with-N-P1P1 replacement
+/// (`synthesize_modular`): a `ReplacementEvent::Moved` replacement on `SelfRef`
+/// whose execute body is `Effect::PutCounter { count: Fixed(n), target: SelfRef }`.
+/// CR 702.32a / CR 702.63a: "This permanent enters with N [fade/time] counters
+/// on it."
+fn build_fade_vanish_etb_replacement(
+    counter_type: CounterType,
+    n: u32,
+    cr: &str,
+) -> ReplacementDefinition {
+    let etb_counters = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::PutCounter {
+            counter_type: counter_type.clone(),
+            count: QuantityExpr::Fixed { value: n as i32 },
+            target: TargetFilter::SelfRef,
+        },
+    )
+    .description(format!(
+        "This permanent enters with {n} {} counter{} on it",
+        counter_type.as_str(),
+        if n == 1 { "" } else { "s" }
+    ));
+    ReplacementDefinition {
+        event: ReplacementEvent::Moved,
+        execute: Some(Box::new(etb_counters)),
+        valid_card: Some(TargetFilter::SelfRef),
+        description: Some(format!(
+            "CR {cr}: this permanent enters with {n} {} counter{} on it.",
+            counter_type.as_str(),
+            if n == 1 { "" } else { "s" }
+        )),
+        ..ReplacementDefinition::new(ReplacementEvent::Moved)
+    }
+}
+
+/// Idempotency-shape predicate for the Fading/Vanishing ETB-with-counters
+/// replacement. True iff `replacement` is a `Moved` replacement on `SelfRef`
+/// whose execute body places exactly `expected_n` `counter_type` counters on
+/// `SelfRef` with a fixed count. The `expected_n` argument is load-bearing for
+/// the same reason as `is_modular_etb_replacement`: a card carrying both a
+/// printed "enters with K counters" replacement and the keyword with K ≠ N must
+/// not silently dedupe.
+fn is_fade_vanish_etb_replacement(
+    replacement: &ReplacementDefinition,
+    counter_type: &CounterType,
+    expected_n: u32,
+) -> bool {
+    if !matches!(replacement.event, ReplacementEvent::Moved)
+        || !matches!(replacement.valid_card, Some(TargetFilter::SelfRef))
+    {
+        return false;
+    }
+    matches!(
+        replacement.execute.as_deref().map(|a| &*a.effect),
+        Some(Effect::PutCounter {
+            counter_type: ct,
+            count: QuantityExpr::Fixed { value },
+            target: TargetFilter::SelfRef,
+        }) if ct == counter_type && *value == expected_n as i32
+    )
+}
+
+/// CR 702.32a: Fading N — synthesize the enters-with-N-fade-counters ETB
+/// replacement and the single upkeep "remove a fade counter; if you can't,
+/// sacrifice" trigger. Each Fading instance functions separately (CR 113.2c);
+/// the per-N idempotency mirrors `synthesize_modular`.
+pub fn synthesize_fading(face: &mut CardFace) {
+    let fading_values: Vec<u32> = face
+        .keywords
+        .iter()
+        .filter_map(|kw| match kw {
+            Keyword::Fading(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    if fading_values.is_empty() {
+        return;
+    }
+
+    // ETB-with-N-fade-counters replacement, per-N idempotent (mirrors Modular).
+    for &n in &fading_values {
+        let needed = fading_values.iter().filter(|m| **m == n).count();
+        let existing = face
+            .replacements
+            .iter()
+            .filter(|r| is_fade_vanish_etb_replacement(r, &CounterType::Fade, n))
+            .count();
+        if existing >= needed {
+            continue;
+        }
+        face.replacements.push(build_fade_vanish_etb_replacement(
+            CounterType::Fade,
+            n,
+            "702.32a",
+        ));
+    }
+
+    // Upkeep remove-or-sacrifice trigger (shape-only idempotency: no N dependence).
+    if !face.triggers.iter().any(is_fading_upkeep_trigger) {
+        face.triggers.push(build_fading_upkeep_trigger());
+    }
+}
+
+/// CR 702.63a: Vanishing N — synthesize the enters-with-N-time-counters ETB
+/// replacement, the upkeep time-counter-removal trigger, and the last-counter
+/// sacrifice trigger. Each Vanishing instance functions separately (CR 702.63c);
+/// the per-N idempotency mirrors `synthesize_modular`.
+pub fn synthesize_vanishing(face: &mut CardFace) {
+    let vanishing_values: Vec<u32> = face
+        .keywords
+        .iter()
+        .filter_map(|kw| match kw {
+            Keyword::Vanishing(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    if vanishing_values.is_empty() {
+        return;
+    }
+
+    // ETB-with-N-time-counters replacement, per-N idempotent (mirrors Modular).
+    for &n in &vanishing_values {
+        let needed = vanishing_values.iter().filter(|m| **m == n).count();
+        let existing = face
+            .replacements
+            .iter()
+            .filter(|r| is_fade_vanish_etb_replacement(r, &CounterType::Time, n))
+            .count();
+        if existing >= needed {
+            continue;
+        }
+        face.replacements.push(build_fade_vanish_etb_replacement(
+            CounterType::Time,
+            n,
+            "702.63a",
+        ));
+    }
+
+    // Upkeep time-counter-removal trigger (shape-only idempotency).
+    if !face
+        .triggers
+        .iter()
+        .any(|t| is_battlefield_upkeep_counter_removal_trigger(t, &CounterType::Time))
+    {
+        face.triggers
+            .push(build_battlefield_upkeep_counter_removal_trigger(
+                CounterType::Time,
+                "702.63a",
+            ));
+    }
+
+    // Last-counter sacrifice trigger (shape-only idempotency).
+    if !face.triggers.iter().any(is_vanishing_sacrifice_trigger) {
+        face.triggers.push(build_vanishing_sacrifice_trigger());
+    }
 }
 
 /// Idempotency-shape predicate for `synthesize_dies_return_with_counter`.
@@ -5862,6 +6737,7 @@ fn bloodthirst_counter_quantity(value: &BloodthirstValue) -> QuantityExpr {
                 target: Box::new(bloodthirst_opponent_player_filter()),
                 aggregate: AggregateFunction::Sum,
                 group_by: None,
+                damage_kind: DamageKindFilter::Any,
             },
         },
     }
@@ -6387,12 +7263,18 @@ pub fn synthesize_all(face: &mut CardFace) {
     synthesize_specialize(face);
     synthesize_cycling(face);
     synthesize_scavenge(face);
+    // CR 702.128a / CR 702.129a: Embalm / Eternalize graveyard-activated
+    // token-copy abilities (self-contained building block in its own module).
+    crate::database::embalm_eternalize::synthesize_embalm_eternalize(face);
     synthesize_outlast(face);
     synthesize_reinforce(face);
     synthesize_casualty(face);
     // CR 702.56a: Replicate — repeatable optional additional cost + SpellCast
     // copy trigger that makes one copy per replicate payment.
     synthesize_replicate(face);
+    // CR 702.69a: Gravestorm — copy this spell for each permanent put into a
+    // graveyard from the battlefield this turn.
+    synthesize_gravestorm(face);
     synthesize_entwine(face);
     synthesize_madness_intrinsics(face);
     synthesize_evoke(face);
@@ -6415,6 +7297,9 @@ pub fn synthesize_all(face: &mut CardFace) {
     // haste. Static grants of Riot synthesize matching ETB replacements from
     // their affected filters.
     synthesize_riot(face);
+    // CR 702.98a: Unleash — optional ETB +1/+1 counter plus a "can't block while
+    // it has a +1/+1 counter" static. Sibling of Riot's optional-counter shape.
+    synthesize_unleash(face);
     // CR 702.93a: Undying — dies trigger that returns the permanent with a
     // +1/+1 counter, gated on having had no +1/+1 counter at death (LKI).
     synthesize_undying(face);
@@ -6467,6 +7352,9 @@ pub fn synthesize_all(face: &mut CardFace) {
     // cost to return this card from your graveyard to your hand; otherwise
     // exile it.
     synthesize_recover(face);
+    // CR 702.115a: Ingest — combat-damage-to-player trigger that exiles the top
+    // card of the damaged player's library.
+    synthesize_ingest(face);
     // CR 702.100a: Evolve — ETB trigger that puts a +1/+1 counter on the
     // creature whenever another creature you control enters with greater power
     // or toughness. CR 702.100d: each instance triggers separately.
@@ -6526,6 +7414,14 @@ pub fn synthesize_all(face: &mut CardFace) {
     // last-counter free-cast. Runs after Evoke to keep alt-cost synthesizers
     // grouped; idempotent so order against Cycling/Madness is irrelevant.
     synthesize_suspend(face);
+    // CR 702.32a: Fading N — enters-with-N-fade-counters ETB replacement, upkeep
+    // fade-counter-removal trigger, and the "if you can't, sacrifice" upkeep
+    // trigger. Each instance functions separately; idempotent.
+    synthesize_fading(face);
+    // CR 702.63a: Vanishing N — enters-with-N-time-counters ETB replacement,
+    // upkeep time-counter-removal trigger, and the last-counter sacrifice
+    // trigger. Each instance functions separately; idempotent.
+    synthesize_vanishing(face);
     // CR 702.170 + CR 116.2k: Plot — hand-activated special-action-approximated
     // ability that exiles self and grants a Plotted casting permission for
     // free-cast on a later turn. Runs after Suspend; idempotent.
@@ -11125,6 +12021,131 @@ mod riot_synthesis_tests {
                 .any(|replacement| is_riot_replacement(replacement, &affected)),
             "static Riot grant should add ETB replacement for affected filter, got {:?}",
             face.replacements
+        );
+    }
+
+    #[test]
+    fn synthesize_unleash_adds_optional_etb_counter_and_cant_block_static() {
+        // CR 702.98a: both halves — the optional ETB +1/+1 counter and the
+        // "can't block while it has a +1/+1 counter" static.
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Unleash);
+        face.card_type.core_types.push(CoreType::Creature);
+        synthesize_unleash(&mut face);
+        assert!(
+            face.replacements
+                .iter()
+                .any(|replacement| is_unleash_replacement(replacement, &TargetFilter::SelfRef)),
+            "unleash should add an optional ETB +1/+1 counter replacement, got {:?}",
+            face.replacements
+        );
+        let condition = StaticCondition::HasCounters {
+            counters: CounterMatch::OfType(CounterType::Plus1Plus1),
+            minimum: 1,
+            maximum: None,
+        };
+        assert!(
+            face.static_abilities
+                .iter()
+                .any(|static_def| is_unleash_cant_block_static(
+                    static_def,
+                    &TargetFilter::SelfRef,
+                    &condition
+                )),
+            "unleash should add a counter-conditioned CantBlock static, got {:?}",
+            face.static_abilities
+        );
+    }
+
+    #[test]
+    fn synthesize_unleash_is_idempotent() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Unleash);
+        synthesize_unleash(&mut face);
+        synthesize_unleash(&mut face);
+        assert_eq!(
+            face.replacements
+                .iter()
+                .filter(|replacement| is_unleash_replacement(replacement, &TargetFilter::SelfRef))
+                .count(),
+            1
+        );
+        let condition = StaticCondition::HasCounters {
+            counters: CounterMatch::OfType(CounterType::Plus1Plus1),
+            minimum: 1,
+            maximum: None,
+        };
+        assert_eq!(
+            face.static_abilities
+                .iter()
+                .filter(|static_def| is_unleash_cant_block_static(
+                    static_def,
+                    &TargetFilter::SelfRef,
+                    &condition
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn synthesize_unleash_is_noop_without_keyword() {
+        let mut face = CardFace::default();
+        face.card_type.core_types.push(CoreType::Creature);
+        synthesize_unleash(&mut face);
+        assert!(face
+            .replacements
+            .iter()
+            .all(|r| !is_unleash_replacement(r, &TargetFilter::SelfRef)));
+        let condition = StaticCondition::HasCounters {
+            counters: CounterMatch::OfType(CounterType::Plus1Plus1),
+            minimum: 1,
+            maximum: None,
+        };
+        assert!(face
+            .static_abilities
+            .iter()
+            .all(|s| !is_unleash_cant_block_static(s, &TargetFilter::SelfRef, &condition)));
+    }
+
+    #[test]
+    fn synthesize_unleash_static_grant_adds_replacement_and_recipient_cant_block_static() {
+        let mut face = CardFace::default();
+        let affected = TargetFilter::Typed(
+            TypedFilter::creature()
+                .controller(ControllerRef::You)
+                .properties(vec![FilterProp::NonToken]),
+        );
+        face.static_abilities.push(
+            StaticDefinition::continuous()
+                .affected(affected.clone())
+                .modifications(vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Unleash,
+                }]),
+        );
+        synthesize_unleash(&mut face);
+        assert!(
+            face.replacements
+                .iter()
+                .any(|replacement| is_unleash_replacement(replacement, &affected)),
+            "static Unleash grant should add ETB replacement for affected filter, got {:?}",
+            face.replacements
+        );
+        let condition = StaticCondition::RecipientHasCounters {
+            counters: CounterMatch::OfType(CounterType::Plus1Plus1),
+            minimum: 1,
+            maximum: None,
+        };
+        assert!(
+            face.static_abilities
+                .iter()
+                .any(|static_def| is_unleash_cant_block_static(
+                    static_def,
+                    &affected,
+                    &condition
+                )),
+            "static Unleash grant should add recipient-gated CantBlock for affected filter, got {:?}",
+            face.static_abilities
         );
     }
 }
@@ -18219,6 +19240,452 @@ mod reinforce_synthesis_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fading (CR 702.32) and Vanishing (CR 702.63) tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod fading_vanishing_tests {
+    use super::*;
+    use crate::game::scenario::{GameScenario, P0};
+    use crate::types::actions::GameAction;
+    use crate::types::game_state::{GameState, WaitingFor};
+    use crate::types::identifiers::{CardId, ObjectId};
+    use crate::types::player::PlayerId;
+
+    // --- SHAPE tests: synthesized triggers/replacements on the CardFace ---
+
+    #[test]
+    fn synthesize_fading_adds_etb_replacement_and_single_remove_or_sacrifice_trigger() {
+        // CR 702.32a: Fading 2 enters with 2 fade counters; an upkeep trigger
+        // removes one, then sacrifices if no counter was removed.
+        let mut face = CardFace {
+            keywords: vec![Keyword::Fading(2)],
+            ..CardFace::default()
+        };
+        synthesize_fading(&mut face);
+
+        // ETB-with-2-fade-counters replacement.
+        let etb = face
+            .replacements
+            .iter()
+            .find(|r| is_fade_vanish_etb_replacement(r, &CounterType::Fade, 2))
+            .expect("Fading 2 must synthesize an enters-with-2-fade-counters replacement");
+        assert!(matches!(
+            etb.execute.as_deref().map(|a| &*a.effect),
+            Some(Effect::PutCounter {
+                counter_type: CounterType::Fade,
+                count: QuantityExpr::Fixed { value: 2 },
+                target: TargetFilter::SelfRef,
+            })
+        ));
+
+        // Upkeep trigger: remove a fade counter, then sacrifice if none was removed.
+        let removal = face
+            .triggers
+            .iter()
+            .find(|t| is_fading_upkeep_trigger(t))
+            .expect("Fading must synthesize a single upkeep remove-or-sacrifice trigger");
+        assert!(removal.condition.is_none());
+        assert!(matches!(
+            removal.execute.as_deref().map(|a| &*a.effect),
+            Some(Effect::RemoveCounter {
+                counter_type: Some(CounterType::Fade),
+                count: 1,
+                target: TargetFilter::SelfRef,
+            })
+        ));
+        let sacrifice = removal
+            .execute
+            .as_deref()
+            .and_then(|a| a.sub_ability.as_deref())
+            .expect("Fading removal must carry the conditional sacrifice branch");
+        assert!(matches!(
+            &sacrifice.condition,
+            Some(AbilityCondition::PreviousEffectAmount {
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Fixed { value: 0 },
+            })
+        ));
+        assert!(matches!(
+            &*sacrifice.effect,
+            Effect::Sacrifice {
+                target: TargetFilter::SelfRef,
+                count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
+            }
+        ));
+    }
+
+    #[test]
+    fn synthesize_vanishing_adds_etb_replacement_removal_and_last_counter_sacrifice() {
+        // CR 702.63a: Vanishing 2 enters with 2 time counters; an upkeep trigger
+        // removes one; a CounterRemoved trigger sacrifices when the last is gone.
+        let mut face = CardFace {
+            keywords: vec![Keyword::Vanishing(2)],
+            ..CardFace::default()
+        };
+        synthesize_vanishing(&mut face);
+
+        let etb = face
+            .replacements
+            .iter()
+            .find(|r| is_fade_vanish_etb_replacement(r, &CounterType::Time, 2))
+            .expect("Vanishing 2 must synthesize an enters-with-2-time-counters replacement");
+        assert!(matches!(
+            etb.execute.as_deref().map(|a| &*a.effect),
+            Some(Effect::PutCounter {
+                counter_type: CounterType::Time,
+                count: QuantityExpr::Fixed { value: 2 },
+                target: TargetFilter::SelfRef,
+            })
+        ));
+
+        let removal = face
+            .triggers
+            .iter()
+            .find(|t| is_battlefield_upkeep_counter_removal_trigger(t, &CounterType::Time))
+            .expect("Vanishing must synthesize an upkeep time-counter-removal trigger");
+        assert!(matches!(
+            removal.execute.as_deref().map(|a| &*a.effect),
+            Some(Effect::RemoveCounter {
+                counter_type: Some(CounterType::Time),
+                count: 1,
+                target: TargetFilter::SelfRef,
+            })
+        ));
+
+        // Last-counter sacrifice: CounterRemoved with threshold Some(0).
+        let sac = face
+            .triggers
+            .iter()
+            .find(|t| is_vanishing_sacrifice_trigger(t))
+            .expect("Vanishing must synthesize a last-counter sacrifice trigger");
+        assert!(matches!(sac.mode, TriggerMode::CounterRemoved));
+        assert!(sac
+            .counter_filter
+            .as_ref()
+            .is_some_and(|f| f.counter_type == CounterType::Time && f.threshold == Some(0)));
+    }
+
+    #[test]
+    fn synthesize_fading_and_vanishing_are_idempotent_and_noop_without_keyword() {
+        // Idempotency: re-running synthesis must not duplicate replacements/triggers.
+        let mut fading = CardFace {
+            keywords: vec![Keyword::Fading(3)],
+            ..CardFace::default()
+        };
+        synthesize_fading(&mut fading);
+        synthesize_fading(&mut fading);
+        assert_eq!(
+            fading
+                .replacements
+                .iter()
+                .filter(|r| is_fade_vanish_etb_replacement(r, &CounterType::Fade, 3))
+                .count(),
+            1
+        );
+        assert_eq!(
+            fading
+                .triggers
+                .iter()
+                .filter(|t| is_fading_upkeep_trigger(t))
+                .count(),
+            1
+        );
+
+        let mut vanishing = CardFace {
+            keywords: vec![Keyword::Vanishing(3)],
+            ..CardFace::default()
+        };
+        synthesize_vanishing(&mut vanishing);
+        synthesize_vanishing(&mut vanishing);
+        assert_eq!(
+            vanishing
+                .triggers
+                .iter()
+                .filter(|t| is_vanishing_sacrifice_trigger(t))
+                .count(),
+            1
+        );
+
+        // No-op without the keyword.
+        let mut other = CardFace {
+            keywords: vec![Keyword::Menace],
+            ..CardFace::default()
+        };
+        synthesize_fading(&mut other);
+        synthesize_vanishing(&mut other);
+        assert!(other.triggers.is_empty());
+        assert!(other.replacements.is_empty());
+    }
+
+    #[test]
+    fn fade_counter_round_trips_through_serialization() {
+        // CR 122.1: the fade counter is a distinct named type, serialized as "fade".
+        assert_eq!(CounterType::Fade.as_str().as_ref(), "fade");
+        let json = serde_json::to_string(&CounterType::Fade).unwrap();
+        assert_eq!(json, "\"fade\"");
+        let back: CounterType = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, CounterType::Fade);
+    }
+
+    // --- End-to-end runtime tests: drive real turns and observe behavior ---
+
+    /// Advance real turn progression (through `apply`, the clobber site) until
+    /// `PlayerId(0)` reaches an upkeep strictly later than `after_turn`,
+    /// draining any stack the auto-advance path places (so upkeep triggers
+    /// resolve). Returns the turn number reached.
+    fn run_to_p0_upkeep(state: &mut GameState, after_turn: u32) -> u32 {
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            assert!(guard < 400, "turn progression stalled before P0's upkeep");
+            if state.phase == Phase::Upkeep
+                && state.active_player == PlayerId(0)
+                && state.turn_number > after_turn
+                && state.stack.is_empty()
+                && matches!(state.waiting_for, WaitingFor::Priority { .. })
+            {
+                return state.turn_number;
+            }
+            if !state.stack.is_empty() && matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                crate::game::engine::apply_as_current(state, GameAction::PassPriority)
+                    .expect("priority pass to resolve stack");
+                continue;
+            }
+            match &state.waiting_for {
+                WaitingFor::Priority { .. } => {
+                    crate::game::engine::apply_as_current(state, GameAction::PassPriority)
+                        .expect("priority pass to advance the turn");
+                }
+                WaitingFor::DeclareAttackers { .. } => {
+                    crate::game::engine::apply_as_current(
+                        state,
+                        GameAction::DeclareAttackers {
+                            attacks: vec![],
+                            bands: vec![],
+                        },
+                    )
+                    .expect("declare no attackers");
+                }
+                WaitingFor::DeclareBlockers { .. } => {
+                    crate::game::engine::apply_as_current(
+                        state,
+                        GameAction::DeclareBlockers {
+                            assignments: vec![],
+                        },
+                    )
+                    .expect("declare no blockers");
+                }
+                other => panic!("unexpected waiting state during turn progression: {other:?}"),
+            }
+        }
+    }
+
+    fn run_until_p0_upkeep_trigger_on_stack(state: &mut GameState, after_turn: u32) -> u32 {
+        let mut guard = 0;
+        loop {
+            guard += 1;
+            assert!(
+                guard < 400,
+                "turn progression stalled before P0's upkeep trigger"
+            );
+            if state.phase == Phase::Upkeep
+                && state.active_player == PlayerId(0)
+                && state.turn_number > after_turn
+                && !state.stack.is_empty()
+                && matches!(state.waiting_for, WaitingFor::Priority { .. })
+            {
+                return state.turn_number;
+            }
+            match &state.waiting_for {
+                WaitingFor::Priority { .. } => {
+                    crate::game::engine::apply_as_current(state, GameAction::PassPriority)
+                        .expect("priority pass to advance to upkeep trigger");
+                }
+                WaitingFor::DeclareAttackers { .. } => {
+                    crate::game::engine::apply_as_current(
+                        state,
+                        GameAction::DeclareAttackers {
+                            attacks: vec![],
+                            bands: vec![],
+                        },
+                    )
+                    .expect("declare no attackers");
+                }
+                WaitingFor::DeclareBlockers { .. } => {
+                    crate::game::engine::apply_as_current(
+                        state,
+                        GameAction::DeclareBlockers {
+                            assignments: vec![],
+                        },
+                    )
+                    .expect("declare no blockers");
+                }
+                other => panic!("unexpected waiting state during turn progression: {other:?}"),
+            }
+        }
+    }
+
+    /// Build a 2-player state with a battlefield creature controlled by P0 that
+    /// carries `counters` of `counter_type` plus the supplied synthesized
+    /// triggers. Libraries are stocked so neither player decks out. Returns
+    /// `(state, creature_id)`. Starts on P0's turn at the post-upkeep main phase
+    /// so the FIRST upkeep observed by `run_to_p0_upkeep` is a real later turn.
+    fn battlefield_with_triggers(
+        counter_type: CounterType,
+        counters: u32,
+        triggers: Vec<TriggerDefinition>,
+    ) -> (GameState, ObjectId) {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PostCombatMain);
+        let creature = scenario.add_creature(P0, "Test Permanent", 2, 2).id();
+        let mut runner = scenario.build();
+        {
+            let obj = runner.state_mut().objects.get_mut(&creature).unwrap();
+            obj.counters.insert(counter_type, counters);
+            for t in &triggers {
+                obj.trigger_definitions.push(t.clone());
+                std::sync::Arc::make_mut(&mut obj.base_trigger_definitions).push(t.clone());
+            }
+        }
+        // Stock libraries to avoid decking out across several turns.
+        let state = runner.state_mut();
+        for player in [PlayerId(0), PlayerId(1)] {
+            for i in 0..20u64 {
+                crate::game::zones::create_object(
+                    state,
+                    CardId(9000 + u64::from(player.0) * 100 + i),
+                    player,
+                    format!("Filler {}-{i}", player.0),
+                    Zone::Library,
+                );
+            }
+        }
+        let state = std::mem::replace(runner.state_mut(), GameState::new_two_player(0));
+        (state, creature)
+    }
+
+    #[test]
+    fn fading_two_survives_two_upkeeps_then_sacrificed_on_third() {
+        // CR 702.32a: Fading 2 — enters with 2 fade counters, survives two of
+        // P0's upkeeps (removing one fade counter each), and is sacrificed on
+        // the THIRD upkeep, the one where it can't remove a counter (count 0).
+        let (mut state, creature) =
+            battlefield_with_triggers(CounterType::Fade, 2, vec![build_fading_upkeep_trigger()]);
+
+        let start = state.turn_number;
+
+        // First P0 upkeep after setup: 2 -> 1 fade counters, still on battlefield.
+        run_to_p0_upkeep(&mut state, start);
+        assert_eq!(
+            state.objects[&creature]
+                .counters
+                .get(&CounterType::Fade)
+                .copied(),
+            Some(1),
+            "after 1st upkeep, one fade counter removed (2 -> 1)"
+        );
+        assert_eq!(state.objects[&creature].zone, Zone::Battlefield);
+
+        // Second P0 upkeep: 1 -> 0 fade counters, still on battlefield (survives).
+        let t2 = state.turn_number;
+        run_to_p0_upkeep(&mut state, t2);
+        assert_eq!(
+            state.objects[&creature]
+                .counters
+                .get(&CounterType::Fade)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "after 2nd upkeep, last fade counter removed (1 -> 0)"
+        );
+        assert_eq!(
+            state.objects[&creature].zone,
+            Zone::Battlefield,
+            "CR 702.32a: Fading survives the upkeep that removes its LAST counter"
+        );
+
+        // Third P0 upkeep: cannot remove a fade counter (0 remain) -> sacrificed.
+        let t3 = state.turn_number;
+        run_to_p0_upkeep(&mut state, t3);
+        assert_eq!(
+            state.objects[&creature].zone,
+            Zone::Graveyard,
+            "CR 702.32a: Fading is sacrificed on the upkeep where it CAN'T remove a fade counter (the 3rd upkeep)"
+        );
+    }
+
+    #[test]
+    fn fading_sacrifices_if_last_counter_removed_before_upkeep_trigger_resolves() {
+        // CR 702.32a: Fading decides "if you can't" as the upkeep trigger
+        // resolves. If the last fade counter disappears after the trigger is
+        // put onto the stack but before it resolves, the permanent is
+        // sacrificed during that resolution.
+        let (mut state, creature) =
+            battlefield_with_triggers(CounterType::Fade, 1, vec![build_fading_upkeep_trigger()]);
+
+        let start = state.turn_number;
+        run_until_p0_upkeep_trigger_on_stack(&mut state, start);
+        state
+            .objects
+            .get_mut(&creature)
+            .expect("fading permanent exists")
+            .counters
+            .insert(CounterType::Fade, 0);
+
+        while !state.stack.is_empty() {
+            crate::game::engine::apply_as_current(&mut state, GameAction::PassPriority)
+                .expect("priority pass to resolve fading trigger");
+        }
+
+        assert_eq!(
+            state.objects[&creature].zone,
+            Zone::Graveyard,
+            "Fading must sacrifice when no fade counter can be removed at trigger resolution"
+        );
+    }
+
+    #[test]
+    fn vanishing_two_sacrificed_on_second_upkeep_when_last_counter_removed() {
+        // CR 702.63a: Vanishing 2 — enters with 2 time counters, removes one on
+        // the first P0 upkeep (2 -> 1, survives), and is sacrificed on the SECOND
+        // upkeep, the removal that takes it to 0 (one upkeep EARLIER than Fading 2).
+        let (mut state, creature) = battlefield_with_triggers(
+            CounterType::Time,
+            2,
+            vec![
+                build_battlefield_upkeep_counter_removal_trigger(CounterType::Time, "702.63a"),
+                build_vanishing_sacrifice_trigger(),
+            ],
+        );
+
+        let start = state.turn_number;
+
+        // First P0 upkeep: 2 -> 1 time counters, still on battlefield.
+        run_to_p0_upkeep(&mut state, start);
+        assert_eq!(
+            state.objects[&creature]
+                .counters
+                .get(&CounterType::Time)
+                .copied(),
+            Some(1),
+            "after 1st upkeep, one time counter removed (2 -> 1)"
+        );
+        assert_eq!(state.objects[&creature].zone, Zone::Battlefield);
+
+        // Second P0 upkeep: removal takes it 1 -> 0 and the last-counter
+        // trigger sacrifices it the SAME upkeep.
+        let t2 = state.turn_number;
+        run_to_p0_upkeep(&mut state, t2);
+        assert_eq!(
+            state.objects[&creature].zone,
+            Zone::Graveyard,
+            "CR 702.63a: Vanishing is sacrificed WHEN its last time counter is removed (the 2nd upkeep)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod sunburst_synthesis_tests {
     //! CR 702.44a + CR 702.44b + CR 702.44d: shape tests for the synthesized
@@ -18553,6 +20020,405 @@ mod sunburst_runtime_tests {
             0,
             "a noncreature Sunburst must not place +1/+1 counters (CR 702.44a)"
         );
+    }
+}
+
+#[cfg(test)]
+mod afflict_training_poisonous_synthesis_tests {
+    //! CR 702.130a (Afflict), CR 702.149a (Training), CR 702.70a (Poisonous)
+    //! shape + matcher-roundtrip tests. These three keywords were previously
+    //! parsed/typed but fell through `triggers_for` to `_ => Vec::new()` (silent
+    //! no-ops). Each is now synthesized into exactly one trigger per instance
+    //! (CR 702.130b / 702.149b / 702.70b) and recognized by
+    //! `trigger_matches_keyword_kind` for runtime grant + symmetric removal
+    //! (CR 604.1).
+    use super::*;
+
+    // ---- Afflict (CR 702.130a) ----
+
+    #[test]
+    fn afflict_synthesizes_becomes_blocked_life_loss() {
+        let triggers = KeywordTriggerInstaller::triggers_for(&Keyword::Afflict(3));
+        assert_eq!(triggers.len(), 1, "CR 702.130b: one trigger per Afflict");
+        let t = &triggers[0];
+        assert!(matches!(t.mode, TriggerMode::AttackerBlocked));
+        assert!(matches!(t.valid_card, Some(TargetFilter::SelfRef)));
+        let effect = &*t.execute.as_deref().expect("execute body").effect;
+        let Effect::LoseLife { amount, target } = effect else {
+            panic!("Afflict must lose life, got {effect:?}");
+        };
+        assert!(matches!(amount, QuantityExpr::Fixed { value: 3 }));
+        assert!(
+            matches!(target, Some(TargetFilter::DefendingPlayer)),
+            "CR 702.130a: the defending player loses the life"
+        );
+    }
+
+    #[test]
+    fn afflict_matcher_roundtrips_and_distinguishes_n() {
+        let triggers = KeywordTriggerInstaller::triggers_for(&Keyword::Afflict(2));
+        assert!(KeywordTriggerInstaller::trigger_matches_keyword_kind(
+            &triggers[0],
+            &Keyword::Afflict(2)
+        ));
+        // Different N must not match (symmetric removal correctness).
+        assert!(!KeywordTriggerInstaller::trigger_matches_keyword_kind(
+            &triggers[0],
+            &Keyword::Afflict(1)
+        ));
+        // Must not be mistaken for another becomes-blocked keyword.
+        assert!(!KeywordTriggerInstaller::trigger_matches_keyword_kind(
+            &triggers[0],
+            &Keyword::Flanking
+        ));
+    }
+
+    // ---- Training (CR 702.149a) ----
+
+    #[test]
+    fn training_synthesizes_gated_self_counter() {
+        let triggers = KeywordTriggerInstaller::triggers_for(&Keyword::Training);
+        assert_eq!(triggers.len(), 1, "CR 702.149b: one trigger per Training");
+        let t = &triggers[0];
+        assert!(matches!(t.mode, TriggerMode::Attacks));
+        assert!(matches!(t.valid_card, Some(TargetFilter::SelfRef)));
+
+        // CR 702.149a: gated on at least one higher-power co-attacker.
+        let Some(TriggerCondition::MinCoAttackers { minimum, filter }) = t.condition.as_ref()
+        else {
+            panic!(
+                "Training must gate on MinCoAttackers, got {:?}",
+                t.condition
+            );
+        };
+        assert_eq!(*minimum, 1);
+        let Some(TargetFilter::Typed(tf)) = filter.as_ref() else {
+            panic!("Training co-attacker filter must be a typed creature filter");
+        };
+        assert!(
+            tf.properties.iter().any(|p| matches!(
+                p,
+                FilterProp::PtComparison {
+                    stat: PtStat::Power,
+                    comparator: Comparator::GT,
+                    value: QuantityExpr::Ref {
+                        qty: QuantityRef::Power {
+                            scope: ObjectScope::Source
+                        }
+                    },
+                    ..
+                }
+            )),
+            "CR 702.149a: co-attacker power must be strictly greater than the source's power"
+        );
+
+        // CR 702.149a: puts a +1/+1 counter on this creature.
+        let effect = &*t.execute.as_deref().expect("execute body").effect;
+        assert!(matches!(
+            effect,
+            Effect::PutCounter {
+                counter_type: CounterType::Plus1Plus1,
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::SelfRef,
+            }
+        ));
+    }
+
+    #[test]
+    fn training_matcher_roundtrips_and_is_distinct_from_mentor() {
+        let training = KeywordTriggerInstaller::triggers_for(&Keyword::Training);
+        let mentor = KeywordTriggerInstaller::triggers_for(&Keyword::Mentor);
+
+        assert!(KeywordTriggerInstaller::trigger_matches_keyword_kind(
+            &training[0],
+            &Keyword::Training
+        ));
+        // Both are self-scoped Attacks/+1+1 triggers, but Mentor targets a
+        // lesser-power attacker (no co-attacker gate) — the matchers must not
+        // cross-match, or RemoveKeyword would strip the wrong trigger.
+        assert!(!KeywordTriggerInstaller::trigger_matches_keyword_kind(
+            &training[0],
+            &Keyword::Mentor
+        ));
+        assert!(!KeywordTriggerInstaller::trigger_matches_keyword_kind(
+            &mentor[0],
+            &Keyword::Training
+        ));
+    }
+
+    // ---- Poisonous (CR 702.70a) ----
+
+    #[test]
+    fn poisonous_synthesizes_combat_damage_poison() {
+        let triggers = KeywordTriggerInstaller::triggers_for(&Keyword::Poisonous(2));
+        assert_eq!(triggers.len(), 1, "CR 702.70b: one trigger per Poisonous");
+        let t = &triggers[0];
+        assert!(matches!(t.mode, TriggerMode::DamageDone));
+        assert!(
+            matches!(t.damage_kind, DamageKindFilter::CombatOnly),
+            "CR 702.70a: only combat damage triggers Poisonous"
+        );
+        assert!(matches!(t.valid_source, Some(TargetFilter::SelfRef)));
+        assert!(
+            matches!(t.valid_target, Some(TargetFilter::Player)),
+            "CR 702.70a: combat damage must be dealt to a player"
+        );
+        let effect = &*t.execute.as_deref().expect("execute body").effect;
+        let Effect::GivePlayerCounter {
+            counter_kind,
+            count,
+            target,
+        } = effect
+        else {
+            panic!("Poisonous must give player counters, got {effect:?}");
+        };
+        assert!(matches!(counter_kind, PlayerCounterKind::Poison));
+        assert!(matches!(count, QuantityExpr::Fixed { value: 2 }));
+        assert!(
+            matches!(target, TargetFilter::TriggeringPlayer),
+            "CR 702.70a: the player dealt damage gets the poison counters"
+        );
+    }
+
+    #[test]
+    fn poisonous_matcher_roundtrips_and_distinguishes_n() {
+        let triggers = KeywordTriggerInstaller::triggers_for(&Keyword::Poisonous(2));
+        assert!(KeywordTriggerInstaller::trigger_matches_keyword_kind(
+            &triggers[0],
+            &Keyword::Poisonous(2)
+        ));
+        assert!(!KeywordTriggerInstaller::trigger_matches_keyword_kind(
+            &triggers[0],
+            &Keyword::Poisonous(1)
+        ));
+    }
+
+    // ---- cross-keyword regression guard ----
+
+    #[test]
+    fn previously_dead_keywords_now_synthesize_triggers() {
+        // Regression: these three keywords used to fall through `triggers_for`
+        // to `_ => Vec::new()`. Each must now yield exactly one trigger.
+        for kw in [
+            Keyword::Afflict(1),
+            Keyword::Training,
+            Keyword::Poisonous(1),
+        ] {
+            assert_eq!(
+                KeywordTriggerInstaller::triggers_for(&kw).len(),
+                1,
+                "{kw:?} must synthesize one trigger (was a silent no-op)"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod ingest_gravestorm_synthesis_tests {
+    //! CR 702.115a/b (Ingest) and CR 702.69a/b (Gravestorm) shape tests for
+    //! printed keyword synthesis plus runtime-grant trigger installation.
+    use super::*;
+
+    #[test]
+    fn ingest_synthesizes_combat_damage_exile() {
+        let triggers = KeywordTriggerInstaller::triggers_for(&Keyword::Ingest);
+        assert_eq!(triggers.len(), 1, "CR 702.115b: one trigger per Ingest");
+        let t = &triggers[0];
+        assert!(matches!(t.mode, TriggerMode::DamageDone));
+        assert!(
+            matches!(t.damage_kind, DamageKindFilter::CombatOnly),
+            "CR 702.115a: only combat damage triggers Ingest"
+        );
+        assert!(matches!(t.valid_source, Some(TargetFilter::SelfRef)));
+        assert!(
+            matches!(t.valid_target, Some(TargetFilter::Player)),
+            "CR 702.115a: combat damage must be dealt to a player"
+        );
+
+        let effect = &*t.execute.as_deref().expect("execute body").effect;
+        let Effect::ExileTop {
+            player,
+            count,
+            face_down,
+        } = effect
+        else {
+            panic!("Ingest must exile the top card, got {effect:?}");
+        };
+        assert!(
+            matches!(player, TargetFilter::TriggeringPlayer),
+            "CR 702.115a: the damaged player exiles the card"
+        );
+        assert!(matches!(count, QuantityExpr::Fixed { value: 1 }));
+        assert!(!face_down, "CR 406.3: Ingest exiles face up by default");
+    }
+
+    #[test]
+    fn ingest_printed_keyword_synthesizes_trigger() {
+        let mut face = CardFace {
+            keywords: vec![Keyword::Ingest],
+            ..CardFace::default()
+        };
+        synthesize_ingest(&mut face);
+
+        assert_eq!(
+            face.triggers
+                .iter()
+                .filter(|trigger| is_ingest_trigger(trigger))
+                .count(),
+            1,
+            "printed Ingest must synthesize its combat-damage trigger"
+        );
+    }
+
+    #[test]
+    fn ingest_preserves_multiple_instances() {
+        let mut face = CardFace {
+            keywords: vec![Keyword::Ingest, Keyword::Ingest],
+            ..CardFace::default()
+        };
+        synthesize_ingest(&mut face);
+        synthesize_ingest(&mut face);
+
+        assert_eq!(
+            face.triggers
+                .iter()
+                .filter(|trigger| is_ingest_trigger(trigger))
+                .count(),
+            2,
+            "CR 702.115b: two Ingest instances trigger separately"
+        );
+    }
+
+    #[test]
+    fn ingest_matcher_roundtrips_and_is_distinct_from_renown() {
+        let ingest = KeywordTriggerInstaller::triggers_for(&Keyword::Ingest);
+        let renown = KeywordTriggerInstaller::triggers_for(&Keyword::Renown(1));
+
+        assert!(KeywordTriggerInstaller::trigger_matches_keyword_kind(
+            &ingest[0],
+            &Keyword::Ingest
+        ));
+        assert!(!KeywordTriggerInstaller::trigger_matches_keyword_kind(
+            &ingest[0],
+            &Keyword::Renown(1)
+        ));
+        assert!(!KeywordTriggerInstaller::trigger_matches_keyword_kind(
+            &renown[0],
+            &Keyword::Ingest
+        ));
+    }
+
+    #[test]
+    fn synthesize_all_wires_printed_ingest_and_gravestorm() {
+        let mut face = CardFace {
+            keywords: vec![Keyword::Ingest, Keyword::Gravestorm],
+            ..CardFace::default()
+        };
+        synthesize_all(&mut face);
+
+        assert_eq!(
+            face.triggers
+                .iter()
+                .filter(|trigger| is_ingest_trigger(trigger))
+                .count(),
+            1,
+            "synthesize_all must install printed Ingest triggers"
+        );
+        assert_eq!(
+            face.triggers
+                .iter()
+                .filter(|trigger| is_gravestorm_trigger(trigger))
+                .count(),
+            1,
+            "synthesize_all must install printed Gravestorm triggers"
+        );
+    }
+
+    #[test]
+    fn gravestorm_synthesizes_zone_counted_copy_trigger() {
+        let mut face = CardFace {
+            keywords: vec![Keyword::Gravestorm],
+            ..CardFace::default()
+        };
+        synthesize_gravestorm(&mut face);
+
+        let trigger = face
+            .triggers
+            .iter()
+            .find(|trigger| is_gravestorm_trigger(trigger))
+            .expect("printed Gravestorm must synthesize a copy trigger");
+        assert!(matches!(trigger.mode, TriggerMode::SpellCast));
+        assert!(matches!(trigger.valid_card, Some(TargetFilter::SelfRef)));
+        assert!(
+            trigger.trigger_zones.contains(&Zone::Stack),
+            "CR 702.69a: Gravestorm functions while the spell is on the stack"
+        );
+
+        let execute = trigger.execute.as_deref().expect("execute body");
+        assert!(matches!(
+            &*execute.effect,
+            Effect::CopySpell {
+                target: TargetFilter::SelfRef,
+                retarget: CopyRetargetPermission::MayChooseNewTargets,
+            }
+        ));
+        assert!(matches!(
+            execute.repeat_for.as_ref(),
+            Some(QuantityExpr::Ref {
+                qty: QuantityRef::ZoneChangeCountThisTurn {
+                    from: Some(Zone::Battlefield),
+                    to: Some(Zone::Graveyard),
+                    filter,
+                }
+            }) if *filter == TargetFilter::Typed(TypedFilter::permanent())
+        ));
+    }
+
+    #[test]
+    fn gravestorm_preserves_multiple_instances() {
+        let mut face = CardFace {
+            keywords: vec![Keyword::Gravestorm, Keyword::Gravestorm],
+            ..CardFace::default()
+        };
+        synthesize_gravestorm(&mut face);
+
+        assert_eq!(
+            face.triggers
+                .iter()
+                .filter(|trigger| is_gravestorm_trigger(trigger))
+                .count(),
+            2,
+            "CR 702.69b: two Gravestorm instances trigger separately"
+        );
+    }
+
+    #[test]
+    fn gravestorm_is_idempotent() {
+        let mut face = CardFace {
+            keywords: vec![Keyword::Gravestorm, Keyword::Gravestorm],
+            ..CardFace::default()
+        };
+        synthesize_gravestorm(&mut face);
+        synthesize_gravestorm(&mut face);
+
+        assert_eq!(
+            face.triggers
+                .iter()
+                .filter(|trigger| is_gravestorm_trigger(trigger))
+                .count(),
+            2,
+            "re-running synthesis must not duplicate Gravestorm triggers"
+        );
+    }
+
+    #[test]
+    fn gravestorm_noop_without_keyword() {
+        let mut face = CardFace {
+            keywords: vec![Keyword::Flying],
+            ..CardFace::default()
+        };
+        synthesize_gravestorm(&mut face);
+        assert!(face.triggers.is_empty());
     }
 }
 

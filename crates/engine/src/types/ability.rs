@@ -2861,20 +2861,39 @@ pub enum ObjectScope {
     /// trio (CR 117.1 + CR 400.7j cost referent and CR 603.2 trigger
     /// referent are the two enumerated members of CR 608.2k's single clause).
     CostPaidObject,
-    /// CR 608.2k: A deferred anaphoric pronoun ("it" / "its") whose object
-    /// referent is bound at parse time. The parser remaps this to a concrete
-    /// scope wherever it can — `Source` when the clause subject is the ability
-    /// source, `Target` when the recipient is "itself". For triggered abilities
-    /// no remap applies and `Anaphoric` survives to runtime, where it resolves
-    /// identically to `CostPaidObject` (behavior-preserving — these cards
-    /// parsed to `CostPaidObject` before this variant existed). General
-    /// rules-correct runtime resolution of triggered-ability anaphora (e.g.
-    /// "its mana value" after a reveal — see issue #511) is separate per-card
-    /// parser work. Distinguishing this from an explicit cost-paid possessive
-    /// ("the sacrificed creature's power", CR 608.2k -> `CostPaidObject`) is
-    /// what prevents the subject-injection rewrite from clobbering
-    /// correctly-scoped possessives.
+    /// CR 608.2k: A deferred anaphoric **pronoun** ("it" / "its") whose object
+    /// referent is bound at parse time. The parser rebinds this to a concrete
+    /// scope wherever the enclosing clause establishes the antecedent —
+    /// `Source` when the clause subject is the ability source, `Target` when
+    /// the recipient is "itself", `EventSource` when the subject is the
+    /// triggering object. The rebind ([`rebind_anaphoric_object_scope`] in
+    /// `parser/oracle_effect/mod.rs`) covers every per-object characteristic
+    /// (power, toughness, mana value, …) — not just power — because the
+    /// pronoun refers to one object and the rebind only retargets *which*
+    /// object, never *which* characteristic. When no clause subject applies
+    /// (triggered-ability anaphora) `Anaphoric` survives to runtime, where it
+    /// resolves identically to a demonstrative (effect-context referent first;
+    /// see [`ObjectScope::Demonstrative`]). General rules-correct runtime
+    /// resolution of triggered-ability anaphora (e.g. "its mana value" after a
+    /// reveal — see issue #511) is separate per-card parser work.
     Anaphoric,
+    /// CR 608.2c: A **demonstrative / definite** possessive back-reference
+    /// ("that creature's", "that card's", "that spell's", "the creature's")
+    /// whose antecedent is a full noun phrase naming an object introduced by an
+    /// earlier instruction in the same ability — *not* the grammatical subject
+    /// of the clause it appears in. Unlike [`ObjectScope::Anaphoric`] (the
+    /// pronoun "its"), the subject-injection rewrite MUST NOT rebind this — its
+    /// antecedent is fixed by the Oracle text. Steadfast Armasaur ("its
+    /// toughness", `Anaphoric` → rebound to `Source`) and Creature Bond ("that
+    /// creature's toughness", `Demonstrative` → never rebound) parse to the
+    /// same `QuantityRef` property and differ only by this scope: collapsing
+    /// them caused the LKI-toughness bug. At runtime `Demonstrative` resolves
+    /// identically to `Anaphoric` — `effect_context_object` (CR 608.2c
+    /// instruction-order referent) first, then the trigger source (CR 608.2k),
+    /// then the cost-paid object. This is the Yuriko / Dark Confidant / Mana
+    /// Drain class (issue #511): a reveal/counter/reanimate earlier in the same
+    /// ability binds "that <type>'s" to the referenced object.
+    Demonstrative,
 }
 
 /// Source set for counting distinct card types.
@@ -3052,6 +3071,10 @@ pub enum QuantityRef {
     /// "enchanted/equipped creature gets +N/+N for each word in its name" by
     /// binding to the affected object rather than the Aura or Equipment source.
     ObjectNameWordCount { scope: ObjectScope },
+    /// CR 205.4a + CR 205.2a + CR 205.3: Number of typeline components on an
+    /// object (supertypes + core card types + subtypes). Embiggen: "+1/+1 for
+    /// each supertype, card type, and subtype it has."
+    ObjectTypelineComponentCount { scope: ObjectScope },
     /// CR 107.4 + CR 202.1: Count colored mana symbols in an object's mana
     /// cost. Hybrid, monocolored hybrid, Phyrexian, hybrid Phyrexian, and
     /// colorless hybrid symbols count when they contain `color`, via
@@ -3264,6 +3287,12 @@ pub enum QuantityRef {
         aggregate: AggregateFunction,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         group_by: Option<DamageGroupKey>,
+        /// CR 120.2a/120.2b: Restrict to combat or noncombat damage records.
+        #[serde(
+            default = "default_damage_kind",
+            skip_serializing_if = "is_default_damage_kind"
+        )]
+        damage_kind: DamageKindFilter,
     },
     /// A number chosen as the source entered the battlefield (e.g., Talion, the Kindly Lord).
     /// Resolved from the source object's `ChosenAttribute::Number`.
@@ -7502,6 +7531,14 @@ fn is_default_damage_aggregate(a: &AggregateFunction) -> bool {
     matches!(a, AggregateFunction::Sum)
 }
 
+fn default_damage_kind() -> DamageKindFilter {
+    DamageKindFilter::Any
+}
+
+fn is_default_damage_kind(k: &DamageKindFilter) -> bool {
+    matches!(k, DamageKindFilter::Any)
+}
+
 fn is_default_search_selection_constraint(c: &SearchSelectionConstraint) -> bool {
     matches!(c, SearchSelectionConstraint::None)
 }
@@ -10241,7 +10278,20 @@ pub enum TriggerCondition {
     /// CR 508.1a: "Whenever ~ and at least N other creatures attack".
     /// True when combat is active and at least `minimum` other creatures
     /// controlled by the same player are also attacking.
-    MinCoAttackers { minimum: u32 },
+    ///
+    /// `filter` optionally narrows which co-attackers count toward `minimum`
+    /// (the source creature is always excluded). `None` counts every
+    /// same-controller co-attacker (Exalted's "attacks alone" check); `Some(f)`
+    /// counts only co-attackers matching `f`, resolved via
+    /// `target_filter_matches_object` with the source creature as the filter's
+    /// source object. CR 702.149a (Training) uses
+    /// `Some(creature with power > source power)` so only a higher-power
+    /// co-attacker satisfies the trigger.
+    MinCoAttackers {
+        minimum: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<TargetFilter>,
+    },
     /// CR 719.2: Intervening-if for Case auto-solve.
     /// True when the source Case is unsolved AND its solve condition is met.
     SolveConditionMet,
@@ -10909,6 +10959,17 @@ pub struct TriggerDefinition {
     /// `DamageDealtOnce`); ignored by other modes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub damage_amount: Option<(Comparator, u32)>,
+    /// CR 119.3: Per-event life-change-amount constraint for life triggers
+    /// ("Whenever [a player] loses exactly N life" / "…loses N or more life").
+    /// When `Some((cmp, n))`, the matcher requires the `LifeChanged` event's
+    /// magnitude (`|amount|`) to satisfy `magnitude cmp n`. `None` means no
+    /// amount restriction. Applies to the life-event trigger modes
+    /// (`LifeLost`, `LifeLostAll`, `LifeGained`, `LifeChanged`); ignored by
+    /// other modes. Mirrors `damage_amount` but is a separate field because
+    /// life (CR 119) and damage (CR 120) are distinct rule sections evaluated
+    /// against different event payloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub life_amount: Option<(Comparator, u32)>,
     /// CR 705.2: Coin-flip result filter for FlippedCoin trigger mode.
     /// When `Some(Won)`, fires only on wins; `Some(Lost)` only on losses; `None` fires on any flip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -10945,6 +11006,7 @@ impl TriggerDefinition {
             attack_target_filter: None,
             player_actions: None,
             damage_amount: None,
+            life_amount: None,
             coin_flip_result: None,
         }
     }
@@ -11105,6 +11167,12 @@ pub struct StaticDefinition {
     pub characteristic_defining: bool,
     #[serde(default)]
     pub description: Option<String>,
+    /// CR 506.3 + CR 508.1d: When set on `CantAttack` / `CantAttackOrBlock`, the
+    /// prohibition applies only to attacks whose `AttackTarget` matches this filter,
+    /// scoped to the static's source controller (Propaganda's `UnlessPay::defended`
+    /// uses the same axis). `None` means the creature cannot attack at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attack_defended: Option<crate::types::triggers::AttackTargetFilter>,
 }
 
 impl StaticDefinition {
@@ -11120,6 +11188,7 @@ impl StaticDefinition {
             active_zones: vec![],
             characteristic_defining: false,
             description: None,
+            attack_defended: None,
         }
     }
 
@@ -11147,6 +11216,14 @@ impl StaticDefinition {
     /// controller), not the source controller. Mirrors `.condition()`.
     pub fn per_player_condition(mut self, cond: ParsedCondition) -> Self {
         self.per_player_condition = Some(cond);
+        self
+    }
+
+    pub fn attack_defended(
+        mut self,
+        defended: Option<crate::types::triggers::AttackTargetFilter>,
+    ) -> Self {
+        self.attack_defended = defended;
         self
     }
 
@@ -11967,6 +12044,14 @@ pub enum ContinuousModification {
         /// characteristics").
         if_type: Option<CoreType>,
     },
+    /// CR 707.9 + CR 202.1b: Strip a copy's mana cost — the "has no mana cost"
+    /// copy exception used by Embalm (CR 702.128a) and Eternalize
+    /// (CR 702.129a). Like `AddCounterOnEnter`, this is consumed at copy
+    /// resolution, never evaluated through the layer system, so
+    /// `ContinuousModification::layer()` treats it as unreachable: `token_copy.rs`
+    /// bakes it into the new token's base mana cost, and `become_copy.rs` strips
+    /// it from the copied values so the continuous copy carries mana value 0.
+    RemoveManaCost,
 }
 
 // ---------------------------------------------------------------------------
@@ -13169,6 +13254,7 @@ mod tests {
             attack_target_filter: None,
             player_actions: None,
             damage_amount: None,
+            life_amount: None,
             coin_flip_result: None,
         };
         let json = serde_json::to_string(&trigger).unwrap();
@@ -13196,6 +13282,7 @@ mod tests {
             active_zones: vec![],
             characteristic_defining: false,
             description: Some("Other creatures you control get +1/+1.".to_string()),
+            attack_defended: None,
         };
         let json = serde_json::to_string(&static_def).unwrap();
         let deserialized: StaticDefinition = serde_json::from_str(&json).unwrap();
@@ -13483,6 +13570,7 @@ mod tests {
                 active_zones: vec![],
                 characteristic_defining: false,
                 description: None,
+                attack_defended: None,
             }],
             duration: Some(Duration::UntilEndOfTurn),
             target: None,

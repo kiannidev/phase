@@ -4,6 +4,7 @@
 use super::prelude::*;
 #[allow(unused_imports)]
 use super::support::*;
+use crate::types::ability::CastTimingPermission;
 
 pub(crate) fn parse_activated_cost_reduction_minimum_mana(lower: &str) -> Option<u32> {
     preceded(
@@ -125,25 +126,19 @@ pub(crate) fn parse_pay_life_as_colored_mana(text: &str) -> Option<StaticDefinit
 /// CR 118.9 + CR 601.2f: Parse alternative-cost grant statics that may also
 /// carry a flash rider — "You may cast [filter] by paying {X} rather than
 /// paying their mana costs. If you cast a spell this way, you may cast it as
-/// though it had flash." (Primal Prayers). Returns one or two statics.
+/// though it had flash." (Primal Prayers).
 pub(crate) fn parse_cast_spells_alternative_cost_multi(text: &str) -> Vec<StaticDefinition> {
-    let Some((alt_cost_def, flash_suffix)) = parse_cast_spells_alternative_cost(text) else {
+    let Some(alt_cost_def) = parse_cast_spells_alternative_cost(text) else {
         return Vec::new();
     };
-    let mut defs = vec![alt_cost_def];
-    if flash_suffix {
-        if let Some(flash_def) = alt_cost_flash_grant_from_cast_cost(text) {
-            defs.push(flash_def);
-        }
-    }
-    defs
+    vec![alt_cost_def]
 }
 
 /// CR 118.9 + CR 601.2f: "You may cast [filter] by paying {cost} rather than
 /// paying [their mana costs | its mana cost]." Primal Prayers ({E}, creature
-/// MV ≤ 3). The trailing flash rider is stripped; callers that need the flash
-/// grant use `parse_cast_spells_alternative_cost_multi`.
-fn parse_cast_spells_alternative_cost(text: &str) -> Option<(StaticDefinition, bool)> {
+/// MV ≤ 3). The trailing flash rider is carried by the alternative-cost static,
+/// not emitted as an unconditional keyword grant.
+fn parse_cast_spells_alternative_cost(text: &str) -> Option<StaticDefinition> {
     type VE<'a> = OracleError<'a>;
 
     let lower = text.to_lowercase();
@@ -191,11 +186,16 @@ fn parse_cast_spells_alternative_cost(text: &str) -> Option<(StaticDefinition, b
         return None;
     }
 
-    let def = StaticDefinition::new(StaticMode::CastWithAlternativeCost { cost })
-        .affected(affected)
-        .description(text.to_string())
-        .active_zones(vec![Zone::Battlefield]);
-    Some((def, flash_suffix))
+    let timing_permission = flash_suffix.then_some(CastTimingPermission::AsThoughHadFlash);
+
+    let def = StaticDefinition::new(StaticMode::CastWithAlternativeCost {
+        cost,
+        timing_permission,
+    })
+    .affected(affected)
+    .description(text.to_string())
+    .active_zones(vec![Zone::Battlefield]);
+    Some(def)
 }
 
 /// CR 118.9: Alternative costs the `CastWithAlternativeCost` static supports
@@ -205,20 +205,6 @@ fn supported_alternative_cast_cost(cost: &AbilityCost) -> bool {
     matches!(
         cost,
         AbilityCost::Mana { .. } | AbilityCost::PayEnergy { .. }
-    )
-}
-
-/// CR 702.8a: Re-parse a `parse_cast_spells_alternative_cost` match to emit the
-/// paired flash grant static, sharing the spell filter of the alt-cost static.
-fn alt_cost_flash_grant_from_cast_cost(text: &str) -> Option<StaticDefinition> {
-    let (alt_cost_def, _) = parse_cast_spells_alternative_cost(text)?;
-    Some(
-        StaticDefinition::new(StaticMode::CastWithKeyword {
-            keyword: Keyword::Flash,
-        })
-        .affected(alt_cost_def.affected.clone()?)
-        .description(text.to_string())
-        .active_zones(vec![Zone::Battlefield]),
     )
 }
 
@@ -320,9 +306,12 @@ pub(crate) fn parse_spells_alternative_cost(text: &str) -> Option<StaticDefiniti
     }
 
     Some(
-        StaticDefinition::new(StaticMode::CastWithAlternativeCost { cost })
-            .affected(affected)
-            .description(text.to_string())
-            .active_zones(vec![Zone::Battlefield]),
+        StaticDefinition::new(StaticMode::CastWithAlternativeCost {
+            cost,
+            timing_permission: None,
+        })
+        .affected(affected)
+        .description(text.to_string())
+        .active_zones(vec![Zone::Battlefield]),
     )
 }

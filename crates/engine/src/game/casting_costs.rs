@@ -254,6 +254,20 @@ pub(crate) fn payable_spell_alternative_cost(
     player: PlayerId,
     object_id: ObjectId,
 ) -> Option<AbilityCost> {
+    payable_spell_alternative_cost_details(state, player, object_id).map(|details| details.cost)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PayableSpellAlternativeCost {
+    pub(crate) cost: AbilityCost,
+    pub(crate) timing_permission: Option<CastTimingPermission>,
+}
+
+pub(crate) fn payable_spell_alternative_cost_details(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+) -> Option<PayableSpellAlternativeCost> {
     let obj = state.objects.get(&object_id)?;
     if obj.zone != Zone::Hand || obj.controller != player {
         return None;
@@ -289,7 +303,10 @@ pub(crate) fn payable_spell_alternative_cost(
             }
         };
         if spell_alternative_cost_is_payable(state, player, object_id, &cost) {
-            Some(cost)
+            Some(PayableSpellAlternativeCost {
+                cost,
+                timing_permission: None,
+            })
         } else {
             None
         }
@@ -301,7 +318,35 @@ pub(crate) fn payable_spell_alternative_cost(
     // CR 118.9 + CR 601.2f: A permanent-granted alternative MANA cost (Rooftop
     // Storm, Fist of Suns, Jodah) applies when no self-referential option does.
     let granted = super::casting::granted_spell_alternative_cost(state, player, object_id)?;
-    spell_alternative_cost_is_payable(state, player, object_id, &granted).then_some(granted)
+    spell_alternative_cost_is_payable(state, player, object_id, &granted.cost).then_some(
+        PayableSpellAlternativeCost {
+            cost: granted.cost,
+            timing_permission: granted.timing_permission,
+        },
+    )
+}
+
+pub(crate) fn payable_spell_alternative_cost_for_timing(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+    timing_permission: CastTimingPermission,
+) -> Option<PayableSpellAlternativeCost> {
+    let obj = state.objects.get(&object_id)?;
+    if obj.zone != Zone::Hand || obj.controller != player || obj.additional_cost.is_some() {
+        return None;
+    }
+
+    let granted = super::casting::granted_spell_alternative_cost(state, player, object_id)?;
+    if granted.timing_permission != Some(timing_permission) {
+        return None;
+    }
+    spell_alternative_cost_is_payable(state, player, object_id, &granted.cost).then_some(
+        PayableSpellAlternativeCost {
+            cost: granted.cost,
+            timing_permission: granted.timing_permission,
+        },
+    )
 }
 
 fn spell_alternative_cost_is_payable(
@@ -2112,7 +2157,12 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
     // the pending spell mana cost `NoCost`: accepting pays the alternative cost,
     // declining pays the printed mana cost as the fallback branch.
     if casting_variant == CastingVariant::Normal {
-        if let Some(alt_cost) = payable_spell_alternative_cost(state, player, object_id) {
+        let alt_cost = cast_timing_permission
+            .and_then(|permission| {
+                payable_spell_alternative_cost_for_timing(state, player, object_id, permission)
+            })
+            .or_else(|| payable_spell_alternative_cost_details(state, player, object_id));
+        if let Some(alt_cost) = alt_cost {
             let mut pending = PendingCast::new(object_id, card_id, ability, ManaCost::NoCost);
             pending.base_cost = base_cost.clone();
             pending.casting_variant = casting_variant;
@@ -2120,9 +2170,27 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
             pending.distribute = distribute.clone();
             pending.origin_zone = origin_zone;
             pending.payment_mode = payment_mode;
+            let alt_cost_required_for_timing = cast_timing_permission.is_some()
+                && alt_cost.timing_permission == cast_timing_permission;
+            if alt_cost_required_for_timing {
+                if matches!(alt_cost.cost, AbilityCost::Mana { .. }) {
+                    pending.ability.context.alternative_mana_cost_paid = true;
+                }
+                return pay_additional_cost_with_source(
+                    state,
+                    player,
+                    alt_cost.cost,
+                    SpellCostSource::Other,
+                    pending,
+                    events,
+                );
+            }
             return Ok(WaitingFor::OptionalCostChoice {
                 player,
-                cost: AdditionalCost::Choice(alt_cost, AbilityCost::Mana { cost: cost.clone() }),
+                cost: AdditionalCost::Choice(
+                    alt_cost.cost,
+                    AbilityCost::Mana { cost: cost.clone() },
+                ),
                 times_kicked: 0,
                 pending_cast: Box::new(pending),
             });
@@ -6483,6 +6551,7 @@ mod tests {
             cost: AbilityCost::Mana {
                 cost: ManaCost::zero(),
             },
+            timing_permission: None,
         })
         .affected(TargetFilter::Typed(
             TypedFilter::creature()
@@ -6577,6 +6646,7 @@ mod tests {
             cost: AbilityCost::PayEnergy {
                 amount: QuantityExpr::Fixed { value: 1 },
             },
+            timing_permission: None,
         })
         .affected(TargetFilter::Typed(
             TypedFilter::creature()

@@ -5,7 +5,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use super::ability::{
-    AbilityCost, CardPlayMode, CostCategory, QuantityExpr, QuantityRef, TargetFilter,
+    AbilityCost, CardPlayMode, CastTimingPermission, CostCategory, QuantityExpr, QuantityRef,
+    TargetFilter,
 };
 use super::identifiers::ObjectId;
 use super::keywords::Keyword;
@@ -662,9 +663,12 @@ pub enum StaticMode {
     /// REPLACES the mana cost wholesale (CR 118.9) and is mutually exclusive
     /// with other alternative costs (CR 118.9a). Rooftop Storm ({0}, Zombie
     /// creature spells), Fist of Suns ({WUBRG}, any spell), Jodah (MV 5+),
-    /// Primal Prayers ({E}, creature MV ≤ 3).
+    /// Primal Prayers ({E}, creature MV ≤ 3, with an alternative-cost timing
+    /// permission).
     CastWithAlternativeCost {
         cost: AbilityCost,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        timing_permission: Option<CastTimingPermission>,
     },
     /// CR 601.2f: Modifies the mana cost of spells matching `spell_filter`
     /// (or all spells when `None`) by `amount`, in the direction described by `mode`.
@@ -1391,7 +1395,7 @@ impl fmt::Display for StaticMode {
             StaticMode::CastWithKeyword { keyword } => {
                 write!(f, "CastWithKeyword({keyword:?})")
             }
-            StaticMode::CastWithAlternativeCost { cost } => {
+            StaticMode::CastWithAlternativeCost { cost, .. } => {
                 write!(f, "CastWithAlternativeCost({cost:?})")
             }
             StaticMode::ModifyCost { mode, .. } => match mode {
@@ -2446,6 +2450,7 @@ mod tests {
                 cost: AbilityCost::Mana {
                     cost: ManaCost::zero(),
                 },
+                timing_permission: None,
             },
             StaticMode::CastWithAlternativeCost {
                 cost: AbilityCost::Mana {
@@ -2460,6 +2465,7 @@ mod tests {
                         generic: 0,
                     },
                 },
+                timing_permission: None,
             },
             StaticMode::Other("Custom".to_string()),
         ];

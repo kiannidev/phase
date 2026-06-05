@@ -18720,14 +18720,8 @@ mod tests {
         state.objects.get_mut(&spell_id).unwrap().mana_cost = ManaCost::generic(1);
         add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
 
-        let err = handle_cast_spell(
-            &mut state,
-            PlayerId(0),
-            spell_id,
-            card_id,
-            &mut Vec::new(),
-        )
-        .expect_err("normal-cost creature cast must not inherit Primal Prayers flash");
+        let err = handle_cast_spell(&mut state, PlayerId(0), spell_id, card_id, &mut Vec::new())
+            .expect_err("normal-cost creature cast must not inherit Primal Prayers flash");
 
         assert!(
             matches!(err, EngineError::ActionNotAllowed(_)),
@@ -18752,14 +18746,9 @@ mod tests {
         let card_id = state.objects.get(&spell_id).unwrap().card_id;
         state.objects.get_mut(&spell_id).unwrap().mana_cost = ManaCost::generic(1);
 
-        let waiting = handle_cast_spell(
-            &mut state,
-            PlayerId(0),
-            spell_id,
-            card_id,
-            &mut Vec::new(),
-        )
-        .expect("payable Primal Prayers alternative cost should authorize the cast");
+        let waiting =
+            handle_cast_spell(&mut state, PlayerId(0), spell_id, card_id, &mut Vec::new())
+                .expect("payable Primal Prayers alternative cost should authorize the cast");
 
         assert!(
             matches!(waiting, WaitingFor::Priority { .. }),

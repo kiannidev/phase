@@ -1319,11 +1319,13 @@ pub(crate) fn target_dependent_flash_permission_satisfied(
     if flash_options.is_empty() {
         return true;
     }
-    flash_options.iter().any(|option| match option.condition.as_ref() {
-        None => true,
-        Some(ParsedCondition::SpellTargetsFilter { filter }) => evaluate_target_filter(filter),
-        Some(_other_non_target_condition) => true,
-    })
+    flash_options
+        .iter()
+        .any(|option| match option.condition.as_ref() {
+            None => true,
+            Some(ParsedCondition::SpellTargetsFilter { filter }) => evaluate_target_filter(filter),
+            Some(_other_non_target_condition) => true,
+        })
 }
 
 /// CR 601.3d: For a spell whose only instant-speed permission is a

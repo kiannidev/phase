@@ -1493,6 +1493,15 @@ fn finish_exile_selection_for_cost(
     // `TargetFilter::CostPaidObject` resolves during ability resolution.
     if let Some(&first) = chosen.first() {
         if let Some(obj) = state.objects.get(&first) {
+            // CR 107.3a + CR 118.9: Shoal-style alternative costs ("exile a
+            // [color] card with mana value X") define X from the pitched card's
+            // mana value rather than a prior announcement.
+            if pending.ability.chosen_x.is_none()
+                && pending.cost == crate::types::mana::ManaCost::NoCost
+                && pending.base_cost.as_ref().is_some_and(cost_has_x)
+            {
+                pending.ability.chosen_x = Some(obj.mana_cost.mana_value());
+            }
             pending
                 .ability
                 .set_cost_paid_object_recursive(CostPaidObjectSnapshot {

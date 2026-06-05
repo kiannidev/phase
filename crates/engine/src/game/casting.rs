@@ -9491,6 +9491,8 @@ fn find_eligible_hand_cost_targets(
     source: ObjectId,
     filter: Option<&TargetFilter>,
 ) -> Vec<ObjectId> {
+    let effective_filter = super::cost_payability::exile_cost_effective_filter(filter);
+    let filter_ref = effective_filter.as_ref();
     let ctx = super::filter::FilterContext::from_source(state, source);
     state
         .players
@@ -9502,7 +9504,7 @@ fn find_eligible_hand_cost_targets(
                 .copied()
                 .filter(|&id| {
                     id != source
-                        && filter.is_none_or(|f| {
+                        && filter_ref.is_none_or(|f| {
                             super::filter::matches_target_filter(state, id, f, &ctx)
                         })
                 })

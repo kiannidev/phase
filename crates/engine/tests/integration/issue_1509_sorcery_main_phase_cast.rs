@@ -32,7 +32,7 @@ fn floating_green(n: usize) -> Vec<ManaUnit> {
         .collect()
 }
 
-/// CR 307.1 + CR 116.1: sorcery in hand, active player's empty-stack main phase,
+/// CR 307.1 + CR 117.1a: sorcery in hand, active player's empty-stack main phase,
 /// enough untapped Forests — must be offered as a legal cast.
 #[test]
 fn sorcery_with_untapped_lands_appears_in_legal_actions() {

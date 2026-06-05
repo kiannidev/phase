@@ -18716,6 +18716,7 @@ mod tests {
         add_primal_prayers_grant(&mut state, PlayerId(0));
 
         let spell_id = create_creature_spell_in_hand(&mut state, PlayerId(0));
+        let card_id = state.objects.get(&spell_id).unwrap().card_id;
         state.objects.get_mut(&spell_id).unwrap().mana_cost = ManaCost::generic(1);
         add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
 
@@ -18723,7 +18724,7 @@ mod tests {
             &mut state,
             PlayerId(0),
             spell_id,
-            CardId(24029),
+            card_id,
             &mut Vec::new(),
         )
         .expect_err("normal-cost creature cast must not inherit Primal Prayers flash");
@@ -18748,13 +18749,14 @@ mod tests {
         add_primal_prayers_grant(&mut state, PlayerId(0));
 
         let spell_id = create_creature_spell_in_hand(&mut state, PlayerId(0));
+        let card_id = state.objects.get(&spell_id).unwrap().card_id;
         state.objects.get_mut(&spell_id).unwrap().mana_cost = ManaCost::generic(1);
 
         let waiting = handle_cast_spell(
             &mut state,
             PlayerId(0),
             spell_id,
-            CardId(24030),
+            card_id,
             &mut Vec::new(),
         )
         .expect("payable Primal Prayers alternative cost should authorize the cast");

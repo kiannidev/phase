@@ -137,6 +137,46 @@ fn write_sidecar(dir: &Path, code: &str, map: &BTreeMap<String, LocalizedFace>) 
         .unwrap_or_else(|e| panic!("Failed to promote {}: {e}", final_path.display()));
 }
 
+/// MTGJSON sometimes groups unrelated single-faced cards that share a printed
+/// name under one atomic key (homonyms). Example: MKM's *Pick Your Poison*
+/// and a Mystery Booster playtest card with the same name. These are not true
+/// multi-face cards — each face has `layout: normal` and a distinct oracle id.
+fn is_homonym_atomic_group(faces: &[AtomicCard]) -> bool {
+    if faces.len() < 2 {
+        return false;
+    }
+    if !faces
+        .iter()
+        .all(|face| map_layout(&face.layout) == LayoutKind::Single)
+    {
+        return false;
+    }
+    let oracle_ids: std::collections::HashSet<_> = faces
+        .iter()
+        .filter_map(|face| face.identifiers.scryfall_oracle_id.as_ref())
+        .collect();
+    oracle_ids.len() == faces.len()
+}
+
+fn legality_export_score(legalities: &BTreeMap<String, String>) -> u32 {
+    legalities
+        .values()
+        .filter(|status| status.as_str() == "legal")
+        .count() as u32
+}
+
+/// Within the same structural class (both standalone or both multi-face), pick
+/// the entry with more printings; on a tie, prefer the one legal in more
+/// formats so homonyms like *Pick Your Poison* resolve to the paper card.
+fn same_class_face_priority(existing: &CardExportEntry, new: &CardExportEntry) -> bool {
+    let new_printings = new.printings.len();
+    let existing_printings = existing.printings.len();
+    if new_printings != existing_printings {
+        return new_printings > existing_printings;
+    }
+    legality_export_score(&new.legalities) > legality_export_score(&existing.legalities)
+}
+
 fn hidden_multiface_key(key: &str, entry: &CardExportEntry) -> Option<String> {
     let oracle_id = entry.face.scryfall_oracle_id.as_ref()?;
     entry.layout.as_ref()?;
@@ -198,7 +238,7 @@ fn insert_face(
     let new_wins = match (existing_standalone, new_standalone) {
         (false, true) => true,
         (true, false) => false,
-        _ => entry.printings.len() > existing.printings.len(),
+        _ => same_class_face_priority(existing, &entry),
     };
 
     let existing_oracle = existing.face.scryfall_oracle_id.as_deref();
@@ -626,7 +666,45 @@ fn main() {
 
         let layout_kind = map_layout(&faces[0].layout);
 
-        if faces.len() >= 2 {
+        if is_homonym_atomic_group(faces) {
+            for source in faces.iter() {
+                let oracle_id = source.identifiers.scryfall_oracle_id.clone();
+                let mut face = build_oracle_face(source, oracle_id);
+                #[cfg(feature = "forge")]
+                if let Some(ref fi) = forge_index {
+                    engine::database::forge::apply_forge_fallback(&mut face, fi);
+                }
+                stamp_token_source_metadata(&mut face, &token_source_metadata);
+                let key = face.name.to_lowercase();
+                let legalities =
+                    legalities_to_export_map(&normalize_legalities(&source.legalities));
+
+                if stats && card_face_has_unimplemented_parts(&face) {
+                    cards_with_unimplemented += 1;
+                }
+
+                let rarities = rarity_map
+                    .get(&face.name.to_lowercase())
+                    .cloned()
+                    .unwrap_or_default();
+                let bracket_signals = bracket_signals_for_face(&bracket_lists, &face, source);
+                collect_localized(&mut sidecars, &key, source);
+                insert_face(
+                    &mut face_index,
+                    mtgjson_key.as_str(),
+                    key,
+                    CardExportEntry {
+                        face,
+                        legalities,
+                        layout: None,
+                        printings: source.printings.clone(),
+                        rulings: source.rulings.clone(),
+                        rarities,
+                        bracket_signals,
+                    },
+                );
+            }
+        } else if faces.len() >= 2 {
             let mut legalities_by_face = BTreeMap::new();
             let layout = build_export_layout(faces, oracle_id, layout_kind);
             for (face, source) in layout_faces(&layout).iter().zip(faces.iter()) {
@@ -1314,18 +1392,77 @@ mod tests {
     use super::*;
 
     fn make_entry(oracle_id: &str, printings: &[&str], layout: Option<&str>) -> CardExportEntry {
+        make_entry_with_legalities(oracle_id, printings, layout, &[])
+    }
+
+    fn make_entry_with_legalities(
+        oracle_id: &str,
+        printings: &[&str],
+        layout: Option<&str>,
+        legalities: &[(&str, &str)],
+    ) -> CardExportEntry {
         CardExportEntry {
             face: CardFace {
                 scryfall_oracle_id: Some(oracle_id.to_string()),
                 ..Default::default()
             },
-            legalities: BTreeMap::new(),
+            legalities: legalities
+                .iter()
+                .map(|(format, status)| (format.to_string(), status.to_string()))
+                .collect(),
             layout: layout.map(|s| s.to_string()),
             printings: printings.iter().map(|s| s.to_string()).collect(),
             rulings: Vec::new(),
             rarities: BTreeSet::new(),
             bracket_signals: BracketSignals::default(),
         }
+    }
+
+    #[test]
+    fn is_homonym_atomic_group_detects_distinct_single_faced_oracle_ids() {
+        let atomic = load_atomic_fixture();
+        let faces = atomic
+            .data
+            .get("Aang, Swift Savior // Aang and La, Ocean's Fury")
+            .expect("Aang faces should exist");
+        assert!(
+            !is_homonym_atomic_group(faces),
+            "true multi-face cards must not be treated as homonyms"
+        );
+    }
+
+    #[test]
+    fn insert_face_prefers_more_legalities_on_printings_tie() {
+        let mut map = BTreeMap::new();
+        insert_face(
+            &mut map,
+            "Pick Your Poison",
+            "pick your poison".to_string(),
+            make_entry_with_legalities("playtest-oracle", &["CMB1", "CMB2"], None, &[]),
+        );
+        insert_face(
+            &mut map,
+            "Pick Your Poison",
+            "pick your poison".to_string(),
+            make_entry_with_legalities(
+                "mkm-oracle",
+                &["MKM", "SOA"],
+                None,
+                &[("modern", "legal"), ("pioneer", "legal")],
+            ),
+        );
+        assert_eq!(
+            map["pick your poison"].face.scryfall_oracle_id.as_deref(),
+            Some("mkm-oracle"),
+            "paper card with format legalities must win over a playtest homonym"
+        );
+        assert_eq!(
+            map["pick your poison"]
+                .legalities
+                .get("modern")
+                .map(String::as_str),
+            Some("legal"),
+        );
     }
 
     #[test]

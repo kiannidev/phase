@@ -2295,6 +2295,10 @@ pub(super) fn try_nom_condition_as_ability_condition(
         return Some(condition);
     }
 
+    if let Some(condition) = parse_entered_or_cast_from_zone_ability_condition(lower.as_str()) {
+        return Some(condition);
+    }
+
     if let Some(condition) = parse_zone_change_object_matches_filter_condition(lower.as_str()) {
         return Some(condition);
     }
@@ -3073,6 +3077,108 @@ fn parse_die_result_condition(lower: &str) -> Option<AbilityCondition> {
         comparator,
         rhs: QuantityExpr::Fixed { value },
     })
+}
+
+/// CR 603.4 + CR 601.2a + CR 603.6c: Origin-zone phrase for "entered from
+/// <zone>" / "was cast from <zone>" ability gates. Reuses the cast-origin
+/// possessive vocabulary ("your library", "a graveyard", "exile", etc.).
+fn parse_entered_or_cast_origin_zone_phrase(
+    input: &str,
+) -> nom::IResult<&str, Zone, OracleError<'_>> {
+    type E<'a> = OracleError<'a>;
+    alt((
+        value(Zone::Hand, tag::<_, _, E>("your hand")),
+        value(Zone::Hand, tag::<_, _, E>("their hand")),
+        value(Zone::Hand, tag::<_, _, E>("a hand")),
+        value(Zone::Graveyard, tag::<_, _, E>("your graveyard")),
+        value(Zone::Graveyard, tag::<_, _, E>("their graveyard")),
+        value(Zone::Graveyard, tag::<_, _, E>("a graveyard")),
+        value(Zone::Library, tag::<_, _, E>("your library")),
+        value(Zone::Library, tag::<_, _, E>("their library")),
+        value(Zone::Library, tag::<_, _, E>("a library")),
+        value(Zone::Exile, tag::<_, _, E>("exile")),
+    ))
+    .parse(input)
+}
+
+fn entered_or_cast_from_zone_condition(zone: Zone) -> AbilityCondition {
+    AbilityCondition::Or {
+        conditions: vec![
+            AbilityCondition::ZoneChangeObjectMatchesFilter {
+                origin: Some(zone),
+                destination: Zone::Battlefield,
+                filter: TargetFilter::Any,
+            },
+            AbilityCondition::CastFromZone { zone },
+        ],
+    }
+}
+
+/// CR 603.4 + CR 601.2 + CR 603.6c: "if it entered from your library or was
+/// cast from your library" and the compact "if it entered or was cast from a
+/// graveyard" class — ability-level gates for ETB draw-rider "instead" clauses
+/// (Fblthp, the Lost). Composes zone-change origin with cast-origin checks.
+fn parse_entered_or_cast_from_zone_ability_condition(lower: &str) -> Option<AbilityCondition> {
+    let (rest, plural) = alt((
+        value(false, tag::<_, _, OracleError<'_>>("it ")),
+        value(true, tag::<_, _, OracleError<'_>>("they ")),
+    ))
+    .parse(lower)
+    .ok()?;
+
+    // Form B: "entered from <zone> or was/were cast from <zone>"
+    if let Ok((rest, zone1)) = preceded(
+        tag::<_, _, OracleError<'_>>("entered from "),
+        parse_entered_or_cast_origin_zone_phrase,
+    )
+    .parse(rest)
+    {
+        let (rest, _) = tag::<_, _, OracleError<'_>>(" or ").parse(rest).ok()?;
+        let zone2 = if plural {
+            preceded(
+                tag::<_, _, OracleError<'_>>("were cast from "),
+                parse_entered_or_cast_origin_zone_phrase,
+            )
+            .parse(rest)
+            .ok()
+        } else {
+            preceded(
+                tag::<_, _, OracleError<'_>>("was cast from "),
+                parse_entered_or_cast_origin_zone_phrase,
+            )
+            .parse(rest)
+            .ok()
+        };
+        if let Some((rest, zone2)) = zone2 {
+            if zone1 == zone2 && rest.trim().is_empty() {
+                return Some(entered_or_cast_from_zone_condition(zone1));
+            }
+        }
+    }
+
+    // Form A: "entered or was/were cast from <zone>"
+    let (rest, _) = tag::<_, _, OracleError<'_>>("entered or ")
+        .parse(rest)
+        .ok()?;
+    let (rest, zone) = if plural {
+        preceded(
+            tag::<_, _, OracleError<'_>>("were cast from "),
+            parse_entered_or_cast_origin_zone_phrase,
+        )
+        .parse(rest)
+        .ok()?
+    } else {
+        preceded(
+            tag::<_, _, OracleError<'_>>("was cast from "),
+            parse_entered_or_cast_origin_zone_phrase,
+        )
+        .parse(rest)
+        .ok()?
+    };
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    Some(entered_or_cast_from_zone_condition(zone))
 }
 
 fn parse_zone_change_object_matches_filter_condition(lower: &str) -> Option<AbilityCondition> {
@@ -4110,5 +4216,83 @@ mod tests {
             "CoreType chosen-type phrase must not be hijacked into a subtype \
              TargetMatchesFilter, got {cond:?}"
         );
+    }
+
+    /// CR 603.4 + CR 601.2 + CR 603.6c: Fblthp, the Lost (issue #2374) — library
+    /// origin gate for the "draw two cards instead" rider.
+    #[test]
+    fn entered_from_library_or_cast_from_library_condition() {
+        let cond = try_nom_condition_as_ability_condition(
+            "it entered from your library or was cast from your library",
+            &mut ParseContext::default(),
+        );
+        let Some(AbilityCondition::Or { conditions }) = cond else {
+            panic!("expected Or condition, got {cond:?}");
+        };
+        assert_eq!(conditions.len(), 2);
+        assert!(matches!(
+            &conditions[0],
+            AbilityCondition::ZoneChangeObjectMatchesFilter {
+                origin: Some(Zone::Library),
+                destination: Zone::Battlefield,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &conditions[1],
+            AbilityCondition::CastFromZone {
+                zone: Zone::Library
+            }
+        ));
+    }
+
+    /// CR 608.2e: Full instead-clause assembly for Fblthp's ETB draw rider.
+    #[test]
+    fn fblthp_library_origin_instead_clause() {
+        let instead = try_parse_generic_instead_clause(
+            "If it entered from your library or was cast from your library, draw two cards instead.",
+            AbilityKind::Spell,
+            &mut ParseContext::default(),
+        )
+        .expect("instead clause must parse");
+        assert!(matches!(&*instead.effect, Effect::Draw { .. }));
+        let cond = instead
+            .condition
+            .as_ref()
+            .expect("instead must carry condition");
+        let AbilityCondition::ConditionInstead { inner } = cond else {
+            panic!("expected ConditionInstead wrapper, got {cond:?}");
+        };
+        assert!(matches!(
+            inner.as_ref(),
+            AbilityCondition::Or { conditions } if conditions.len() == 2
+        ));
+    }
+
+    /// CR 608.2e: ETB base draw + library-origin instead override chain.
+    #[test]
+    fn fblthp_etb_draw_chain_with_library_instead() {
+        let def = parse_effect_chain(
+            "Draw a card. If it entered from your library or was cast from your library, draw two cards instead.",
+            AbilityKind::Spell,
+        );
+        assert!(matches!(&*def.effect, Effect::Draw { .. }));
+        let sub = def
+            .sub_ability
+            .as_ref()
+            .expect("expected instead sub_ability");
+        assert!(matches!(
+            &*sub.effect,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 2 },
+                ..
+            }
+        ));
+        let cond = sub.condition.as_ref().expect("instead sub must be gated");
+        assert!(matches!(
+            cond,
+            AbilityCondition::ConditionInstead { inner }
+                if matches!(inner.as_ref(), AbilityCondition::Or { .. })
+        ));
     }
 }

@@ -43,8 +43,18 @@ pub fn resolve(
         *player = ability.controller;
     }
 
-    // Build the delayed trigger's resolved ability from the definition
-    let mut delayed_effect = *effect_def.effect.clone();
+    // CR 603.7c: Build the delayed trigger's resolved ability from the full
+    // definition, preserving sub_ability chains. A bare `effect_def.effect`
+    // clone dropped continuation clauses — e.g. Dalkovan Encampment's
+    // "create … Warrior tokens … sacrifice them at the beginning of the next
+    // end step" inner chain (Token → CreateDelayedTrigger{Sacrifice}) never
+    // reached runtime when registered inside a WheneverEvent delayed trigger.
+    let mut delayed_ability = crate::game::ability_utils::build_resolved_from_def(
+        &effect_def,
+        ability.source_id,
+        ability.controller,
+    );
+    let delayed_effect = &mut delayed_ability.effect;
 
     // CR 603.7: Bind the most recent tracked set to the effect's target filter,
     // resolving sentinel TrackedSetId(0) or TargetFilter::Any, and upgrading
@@ -52,7 +62,7 @@ pub fn resolve(
     if uses_tracked_set {
         if let Some(real_id) = crate::game::targeting::latest_tracked_set_id(state) {
             bind_tracked_set_to_condition(&mut condition, real_id);
-            bind_tracked_set_to_effect(&mut delayed_effect, real_id);
+            bind_tracked_set_to_effect(delayed_effect, real_id);
         }
     }
 
@@ -80,14 +90,9 @@ pub fn resolve(
     // CR 603.7 + CR 608.2h: Snapshot parent-resolution-dependent
     // quantity refs to Fixed before the delayed trigger gets stashed.
     // After this call, `delayed_effect` holds no parent context refs.
-    snapshot_parent_dependent_quantities(&mut delayed_effect, state, ability);
+    snapshot_parent_dependent_quantities(delayed_effect, state, ability);
 
-    let mut delayed_ability = ResolvedAbility::new(
-        delayed_effect,
-        snapshot_targets,
-        ability.source_id,
-        ability.controller,
-    );
+    delayed_ability.targets = snapshot_targets;
     // CR 603.7c: A delayed triggered ability that refers to information from
     // its creation event keeps that creation-time binding for later resolution.
     delayed_ability.scoped_player = ability.scoped_player;

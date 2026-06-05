@@ -794,6 +794,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
     // card's id as the sub-ability's `source_id` (see `effects/mod.rs`
     // forward_result branch), so `Attach::resolve` operates on the correct
     // attaching object.
+    nest_whenever_this_turn_token_cleanup_delayed_trigger(&mut result);
     rewire_result_anchored_subchain(&mut result);
     wire_optional_cast_decline_fallback(&mut result);
     if matches!(&*result.effect, Effect::SearchOutsideGame { .. }) {
@@ -1257,6 +1258,64 @@ pub(super) fn rewrite_parent_target_to_last_created(effect: &mut Effect) {
         }
         _ => {}
     }
+}
+
+/// CR 603.7c: Sentence splitting can leave a WheneverEvent delayed trigger's
+/// token-creating inner effect and its end-step cleanup delayed trigger as
+/// sibling `sub_ability` links on the activated ability. Rewire the cleanup
+/// under the token creator so it registers when the WheneverEvent fires, not
+/// at activation time (Dalkovan Encampment, Encore sacrifice riders).
+fn nest_whenever_this_turn_token_cleanup_delayed_trigger(def: &mut AbilityDefinition) {
+    let cleanup_sub = match def.sub_ability.take() {
+        Some(sub) => sub,
+        None => return,
+    };
+
+    let inner = match &mut *def.effect {
+        Effect::CreateDelayedTrigger {
+            condition: DelayedTriggerCondition::WheneverEvent { .. },
+            effect: inner,
+            ..
+        } => inner,
+        _ => {
+            def.sub_ability = Some(cleanup_sub);
+            return;
+        }
+    };
+
+    let is_token_cleanup = matches!(
+        &*cleanup_sub.effect,
+        Effect::CreateDelayedTrigger {
+            condition: DelayedTriggerCondition::AtNextPhase { .. },
+            effect: cleanup_effect,
+            ..
+        } if matches!(
+            &*cleanup_effect.effect,
+            Effect::Sacrifice { .. } | Effect::ChangeZone { .. } | Effect::Destroy { .. }
+        )
+    );
+    if !is_token_cleanup || !is_token_creating_effect(&inner.effect) {
+        def.sub_ability = Some(cleanup_sub);
+        return;
+    }
+
+    let mut cleanup_sub = cleanup_sub;
+    if let Effect::CreateDelayedTrigger {
+        effect: cleanup_effect,
+        ..
+    } = &mut *cleanup_sub.effect
+    {
+        rewrite_parent_target_to_last_created(&mut cleanup_effect.effect);
+    }
+
+    let mut cursor = inner.as_mut();
+    while cursor.sub_ability.is_some() {
+        cursor = cursor
+            .sub_ability
+            .as_mut()
+            .expect("sub_ability checked above");
+    }
+    cursor.sub_ability = Some(cleanup_sub);
 }
 
 /// CR 705: Post-process parsed ability defs to consolidate coin flip conditional

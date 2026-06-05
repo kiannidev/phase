@@ -1500,7 +1500,9 @@ fn finish_exile_selection_for_cost(
                 && pending.cost == crate::types::mana::ManaCost::NoCost
                 && pending.base_cost.as_ref().is_some_and(cost_has_x)
             {
-                pending.ability.chosen_x = Some(obj.mana_cost.mana_value());
+                pending
+                    .ability
+                    .set_chosen_x_recursive(obj.mana_cost.mana_value());
             }
             pending
                 .ability

@@ -81,3 +81,52 @@ fn satoru_does_not_draw_when_creature_cast_for_mana() {
         "casting another creature for mana must not trigger Satoru's draw"
     );
 }
+
+#[test]
+fn satoru_draws_when_creature_cast_for_zero_mana() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let satoru = scenario
+        .add_creature_to_hand_from_oracle(P0, "Satoru, the Infiltrator", 2, 3, SATORU_ORACLE)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Blue, ManaCostShard::Black],
+            generic: 0,
+        })
+        .id();
+
+    let ornithopter = scenario
+        .add_creature_to_hand(P0, "Ornithopter", 0, 2)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![],
+            generic: 0,
+        })
+        .id();
+
+    // Keep a spare card in hand so the zero-mana creature's net cast/draw delta
+    // is measured against a non-empty hand.
+    scenario.add_creature_to_hand(P0, "Hand Decoy", 1, 1);
+
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            ManaUnit::new(ManaType::Blue, satoru, false, vec![]),
+            ManaUnit::new(ManaType::Black, satoru, false, vec![]),
+        ],
+    );
+
+    for name in ["Draw 1", "Draw 2", "Draw 3"] {
+        scenario.add_card_to_library_top(P0, name);
+    }
+
+    let mut runner = scenario.build();
+    runner.cast(satoru).resolve();
+    let hand_after_satoru = hand_count(&runner, P0);
+
+    runner.cast(ornithopter).resolve();
+    assert_eq!(
+        hand_count(&runner, P0),
+        hand_after_satoru,
+        "casting a {{0}} creature must satisfy Satoru's no-mana-spent intervening-if and draw one card"
+    );
+}

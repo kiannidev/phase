@@ -5399,6 +5399,8 @@ fn resolve_add_pending_etb_counters(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::synthesis::synthesize_extort;
+    use crate::game::ability_utils::build_resolved_from_def;
     use crate::game::zones::create_object;
     use crate::types::ability::{
         AbilityCondition, AbilityDefinition, AbilityKind, AggregateFunction, BounceSelection,
@@ -5409,6 +5411,7 @@ mod tests {
         UntilCondition,
     };
     use crate::types::actions::GameAction;
+    use crate::types::card::CardFace;
     use crate::types::card_type::CoreType;
     use crate::types::counter::CounterType;
     use crate::types::format::FormatConfig;
@@ -5418,10 +5421,11 @@ mod tests {
     };
     use crate::types::identifiers::{CardId, ObjectId, TrackedSetId};
     use crate::types::keywords::Keyword;
-    use crate::types::mana::{ManaColor, ManaCost};
+    use crate::types::mana::{ManaColor, ManaCost, ManaType, ManaUnit};
     use crate::types::phase::Phase;
     use crate::types::player::{PlayerCounterKind, PlayerId};
     use crate::types::statics::CastFrequency;
+    use crate::types::triggers::TriggerMode;
     use crate::types::zones::Zone;
 
     #[test]
@@ -13281,17 +13285,6 @@ mod tests {
     /// opponent, and gain life equal to the total life lost.
     #[test]
     fn issue_1972_extort_optional_accept_drains_all_opponents_and_gains() {
-        use crate::database::synthesis::synthesize_extort;
-        use crate::game::ability_utils::build_resolved_from_def;
-        use crate::types::card::CardFace;
-        use crate::types::format::FormatConfig;
-        use crate::types::game_state::{GameState, WaitingFor};
-        use crate::types::identifiers::ObjectId;
-        use crate::types::keywords::Keyword;
-        use crate::types::mana::{ManaType, ManaUnit};
-        use crate::types::player::PlayerId;
-        use crate::types::triggers::TriggerMode;
-
         let mut face = CardFace::default();
         face.keywords.push(Keyword::Extort);
         synthesize_extort(&mut face);
@@ -13342,16 +13335,6 @@ mod tests {
     /// Accept extort with no {W/B} available — drain must not run (CR 702.101a).
     #[test]
     fn issue_1972_extort_accept_without_payable_mana_does_not_drain() {
-        use crate::database::synthesis::synthesize_extort;
-        use crate::game::ability_utils::build_resolved_from_def;
-        use crate::types::card::CardFace;
-        use crate::types::format::FormatConfig;
-        use crate::types::game_state::{GameState, WaitingFor};
-        use crate::types::identifiers::ObjectId;
-        use crate::types::keywords::Keyword;
-        use crate::types::player::PlayerId;
-        use crate::types::triggers::TriggerMode;
-
         let mut face = CardFace::default();
         face.keywords.push(Keyword::Extort);
         synthesize_extort(&mut face);

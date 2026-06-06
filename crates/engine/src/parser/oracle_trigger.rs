@@ -2,7 +2,7 @@ use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::{one_of, space1};
-use nom::combinator::{all_consuming, eof, opt, peek, recognize, rest, value};
+use nom::combinator::{all_consuming, eof, map, opt, peek, recognize, rest, value};
 use nom::multi::{many1, separated_list1};
 use nom::sequence::{delimited, pair, preceded, terminated};
 use nom::Parser;
@@ -5699,62 +5699,62 @@ fn parse_attachment_self_host(input: &str) -> OracleResult<'_, ()> {
     .parse(input)
 }
 
-/// CR 603.2 + CR 106.1: Map a brace-delimited mana symbol from a TapsForMana
-/// "for {…}" clause to the produced mana types that satisfy the trigger event.
-fn taps_for_mana_symbol_to_types(symbol: &str) -> Option<Vec<ManaType>> {
-    let symbol = symbol.trim().to_ascii_uppercase();
-    if symbol == "C" {
-        return Some(vec![ManaType::Colorless]);
-    }
-    fn single(code: &str) -> Option<ManaType> {
-        match code {
-            "W" => Some(ManaType::White),
-            "U" => Some(ManaType::Blue),
-            "B" => Some(ManaType::Black),
-            "R" => Some(ManaType::Red),
-            "G" => Some(ManaType::Green),
-            _ => None,
-        }
-    }
-    if let Some(mana_type) = single(&symbol) {
-        return Some(vec![mana_type]);
-    }
-    let mut types = Vec::new();
-    for part in symbol.split('/') {
-        types.push(single(part.trim())?);
-    }
-    Some(types)
+/// CR 603.2 + CR 106.1: Parse a single mana letter from inside `{…}`.
+fn parse_taps_for_mana_color_code(i: &str) -> OracleResult<'_, ManaType> {
+    alt((
+        value(ManaType::Colorless, alt((tag("C"), tag("c")))),
+        value(ManaType::White, alt((tag("W"), tag("w")))),
+        value(ManaType::Blue, alt((tag("U"), tag("u")))),
+        value(ManaType::Black, alt((tag("B"), tag("b")))),
+        value(ManaType::Red, alt((tag("R"), tag("r")))),
+        value(ManaType::Green, alt((tag("G"), tag("g")))),
+    ))
+    .parse(i)
+}
+
+/// CR 603.2 + CR 106.1: Parse one braced mana symbol, expanding hybrids
+/// (`{W/U}` → two types).
+fn parse_taps_for_mana_braced_symbol(i: &str) -> OracleResult<'_, Vec<ManaType>> {
+    let (rest, types) = delimited(
+        tag("{"),
+        separated_list1(tag("/"), parse_taps_for_mana_color_code),
+        tag("}"),
+    )
+    .parse(i)?;
+    Ok((rest, types))
+}
+
+/// CR 603.2 + CR 106.1: Parse the trailing "for mana" / "for {C}" /
+/// "for {G} or {U}" clause of a TapsForMana trigger subject.
+fn parse_taps_for_mana_for_clause_body(i: &str) -> OracleResult<'_, Option<Vec<ManaType>>> {
+    alt((
+        value(None, tag("mana")),
+        map(
+            separated_list1(
+                preceded(space1, tag("or ")),
+                parse_taps_for_mana_braced_symbol,
+            ),
+            |chunks| {
+                let mut produced = Vec::new();
+                for types in chunks {
+                    produced.extend(types);
+                }
+                Some(produced)
+            },
+        ),
+    ))
+    .parse(i)
 }
 
 /// CR 603.2 + CR 106.1: Split a TapsForMana subject line into the permanent
 /// filter text and an optional produced-mana constraint from the trailing
 /// "for mana" / "for {C}" / "for {G}" clause.
 fn split_taps_for_mana_for_clause(text: &str) -> Option<(String, Option<Vec<ManaType>>)> {
-    let (subject, for_clause) = text.rsplit_once(" for ")?;
-    let for_clause = for_clause.trim();
-    if for_clause == "mana" {
-        return Some((subject.to_string(), None));
-    }
-    if !for_clause.starts_with('{') {
-        return None;
-    }
-    let mut produced = Vec::new();
-    let mut rest = for_clause;
-    loop {
-        let end = rest.find('}')?;
-        let symbol = &rest[1..end];
-        produced.extend(taps_for_mana_symbol_to_types(symbol)?);
-        rest = rest[end + 1..].trim_start();
-        if let Some(after_or) = rest.strip_prefix("or ") {
-            rest = after_or.trim_start();
-            continue;
-        }
-        if rest.is_empty() {
-            break;
-        }
-        return None;
-    }
-    Some((subject.to_string(), Some(produced)))
+    let (_, (subject, for_clause)) = nom_primitives::split_once_on(text, " for ").ok()?;
+    let (_, produced) = all_consuming(parse_taps_for_mana_for_clause_body)
+        .parse(for_clause.trim())
+        .ok()?;
+    Some((subject.to_string(), produced))
 }
 
 /// Try to parse an event verb and build a TriggerDefinition from subject + event.

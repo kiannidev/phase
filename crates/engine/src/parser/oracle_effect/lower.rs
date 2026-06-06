@@ -2346,8 +2346,9 @@ pub(super) fn strip_leading_duration(text: &str) -> Option<(Duration, &str)> {
 pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
     // Oracle sentences often end with a period before duration stripping runs
     // (e.g. Shifting Woodland: "... until end of turn. Activate only if ...").
-    let text = text.trim().trim_end_matches('.').trim();
-    let lower = text.to_lowercase();
+    let text = text.trim();
+    let duration_text = text.trim_end_matches('.').trim();
+    let lower = duration_text.to_lowercase();
     if target_relative_clause_owns_suffix(lower.as_str()) {
         return (text, None);
     }
@@ -2405,8 +2406,11 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
         ),
     ] {
         if lower.ends_with(suffix) {
-            let end = text.len() - suffix.len();
-            return (text[..end].trim_end_matches(',').trim(), Some(duration));
+            let end = duration_text.len() - suffix.len();
+            return (
+                duration_text[..end].trim_end_matches(',').trim(),
+                Some(duration),
+            );
         }
     }
 
@@ -2455,7 +2459,7 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
         for delimiter in [", or ", ", where "] {
             let pattern = format!("{phrase}{delimiter}");
             if let Some(pos) = lower.find(&pattern) {
-                return (text[..pos].trim_end(), Some(duration));
+                return (duration_text[..pos].trim_end(), Some(duration));
             }
         }
     }
@@ -2464,7 +2468,7 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
     if let Some(pos) = lower.rfind(" for as long as ") {
         let condition_text = &lower[pos + " for as long as ".len()..];
         if let Some(dur) = parse_for_as_long_as_condition(condition_text) {
-            let stripped = text[..pos].trim_end_matches(',').trim();
+            let stripped = duration_text[..pos].trim_end_matches(',').trim();
             return (stripped, Some(dur));
         }
     }

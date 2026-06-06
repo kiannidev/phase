@@ -3327,7 +3327,7 @@ mod tests {
         }
     }
 
-    /// CR 707.2 + CR 611.2b: Shifting Woodland's Delirium activated ability —
+    /// CR 707.2 + CR 611.2a: Shifting Woodland's Delirium activated ability —
     /// "becomes a copy of target permanent card in your graveyard until end of
     /// turn" must extract `UntilEndOfTurn`, not default to `Permanent`.
     #[test]

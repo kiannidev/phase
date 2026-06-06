@@ -30910,6 +30910,21 @@ mod tests {
     }
 
     #[test]
+    fn strip_trailing_duration_graveyard_target_copy() {
+        for text in [
+            "becomes a copy of target permanent card in your graveyard until end of turn",
+            "becomes a copy of target permanent card in your graveyard until end of turn.",
+        ] {
+            let (rest, dur) = strip_trailing_duration(text);
+            assert_eq!(
+                rest, "becomes a copy of target permanent card in your graveyard",
+                "failed for {text:?}"
+            );
+            assert_eq!(dur, Some(Duration::UntilEndOfTurn), "failed for {text:?}");
+        }
+    }
+
+    #[test]
     fn for_as_long_as_remains_tapped() {
         let (rest, dur) = strip_trailing_duration(
             "gain control of target creature for as long as ~ remains tapped",

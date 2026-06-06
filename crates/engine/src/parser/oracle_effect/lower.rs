@@ -2278,6 +2278,9 @@ pub(super) fn strip_leading_duration(text: &str) -> Option<(Duration, &str)> {
 }
 
 pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
+    // Oracle sentences often end with a period before duration stripping runs
+    // (e.g. Shifting Woodland: "... until end of turn. Activate only if ...").
+    let text = text.trim().trim_end_matches('.').trim();
     let lower = text.to_lowercase();
     if target_relative_clause_owns_suffix(lower.as_str()) {
         return (text, None);

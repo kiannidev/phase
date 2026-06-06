@@ -73,9 +73,9 @@ pub fn resolve(
     // time `last_created_token_ids` will have been overwritten by other
     // token-creating effects (CR 603.7c: a delayed trigger refers to a
     // particular object even if later events change it).
-    let snapshot_targets = if super::effect_refs_parent_target(&delayed_effect) {
+    let snapshot_targets = if super::effect_refs_parent_target(delayed_effect) {
         parent_target_snapshot(state, ability)
-    } else if effect_references_last_created(&delayed_effect)
+    } else if effect_references_last_created(delayed_effect)
         && !state.last_created_token_ids.is_empty()
     {
         state

@@ -3245,6 +3245,7 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
         | Effect::CastCopyOfCard { .. }
         | Effect::CopyTokenOf { .. }
         | Effect::Myriad
+        | Effect::Encore
         | Effect::CopyTokenBlockingAttacker { .. }
         | Effect::BecomeCopy { .. }
         | Effect::ChooseCard { .. }
@@ -4903,6 +4904,7 @@ mod tests {
         let copy = Effect::CopySpell {
             target: TargetFilter::SelfRef,
             retarget: CopyRetargetPermission::KeepOriginalTargets,
+            copier: None,
         };
         let result = parse_followup_continuation_ast(
             "may choose a new target for that copy",
@@ -4931,6 +4933,7 @@ mod tests {
             Effect::CopySpell {
                 target: TargetFilter::SelfRef,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
+                copier: None,
             },
         )));
 

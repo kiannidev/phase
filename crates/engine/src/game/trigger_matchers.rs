@@ -2445,7 +2445,10 @@ pub(super) fn match_taps_for_mana(
         }
 
         if let Some(required) = &trigger.taps_for_mana_produced {
-            if !produced.iter().any(|mana_type| required.contains(mana_type)) {
+            if !produced
+                .iter()
+                .any(|mana_type| required.contains(mana_type))
+            {
                 return false;
             }
         }

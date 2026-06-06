@@ -8685,7 +8685,8 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
         let Some((subject_text, produced_filter)) = split_taps_for_mana_for_clause(rest) else {
             continue;
         };
-        let (filter, remainder) = parse_trigger_subject(&subject_text, &mut ParseContext::default());
+        let (filter, remainder) =
+            parse_trigger_subject(&subject_text, &mut ParseContext::default());
         if !remainder.trim().is_empty() {
             continue;
         }
@@ -8719,8 +8720,8 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
             )),
         )
         .parse(i)?;
-        let (subject_text, produced_filter) = split_taps_for_mana_for_clause(rest)
-            .ok_or_else(|| oracle_err(rest))?;
+        let (subject_text, produced_filter) =
+            split_taps_for_mana_for_clause(rest).ok_or_else(|| oracle_err(rest))?;
         Ok(("", (actor_controller, subject_text, produced_filter)))
     }
     if let Ok((rem, (actor_controller, subject_text, produced_filter))) =
@@ -16833,10 +16834,7 @@ mod tests {
             ))
         );
         assert_eq!(def.valid_target, Some(TargetFilter::Controller));
-        assert_eq!(
-            def.taps_for_mana_produced,
-            Some(vec![ManaType::Colorless])
-        );
+        assert_eq!(def.taps_for_mana_produced, Some(vec![ManaType::Colorless]));
         let execute = def.execute.as_deref().expect("trigger should execute");
         assert!(matches!(
             execute.effect.as_ref(),

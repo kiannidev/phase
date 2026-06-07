@@ -2080,6 +2080,7 @@ pub(super) fn lower_search_and_creation_ast(ast: SearchCreationImperativeAst) ->
             filter: TargetFilter::Any,
             rest_destination: None,
             reveal,
+            enter_tapped: false,
         },
         SearchCreationImperativeAst::CopyTokenOf {
             target,

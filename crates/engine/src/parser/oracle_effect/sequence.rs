@@ -2056,6 +2056,7 @@ pub(super) fn apply_clause_continuation(
             rest_destination: rest_dest,
             enters_under,
             face_down_profile,
+            enter_tapped,
         } => {
             // CR 608.2c: the "from among those cards" continuation patches the
             // earlier "look at the top N" instruction. When a transparent
@@ -2076,6 +2077,7 @@ pub(super) fn apply_clause_continuation(
                 destination,
                 rest_destination,
                 reveal,
+                enter_tapped: dig_enter_tapped,
                 ..
             } = &mut *previous.effect
             {
@@ -2127,6 +2129,7 @@ pub(super) fn apply_clause_continuation(
                 if let Some(rd) = rest_dest {
                     *rest_destination = Some(rd);
                 }
+                *dig_enter_tapped = enter_tapped;
             } else if let Effect::Mill {
                 destination: mill_destination,
                 ..
@@ -2846,6 +2849,7 @@ pub(super) fn parse_dig_from_among(lower: &str, original: &str) -> Option<Contin
             rest_destination,
             enters_under: None,
             face_down_profile: None,
+            enter_tapped: false,
         });
     }
 
@@ -2966,6 +2970,7 @@ pub(super) fn parse_dig_from_among(lower: &str, original: &str) -> Option<Contin
             rest_destination: None,
             enters_under,
             face_down_profile,
+            enter_tapped: false,
         });
     }
 
@@ -3046,6 +3051,7 @@ pub(super) fn parse_dig_from_among(lower: &str, original: &str) -> Option<Contin
     } else {
         None
     };
+    let enter_tapped = nom_primitives::scan_contains(lower, "battlefield tapped");
 
     Some(ContinuationAst::DigFromAmong {
         quantity,
@@ -3054,6 +3060,7 @@ pub(super) fn parse_dig_from_among(lower: &str, original: &str) -> Option<Contin
         rest_destination: None, // rest_destination handled by subsequent PutRest continuation
         enters_under,
         face_down_profile,
+        enter_tapped,
     })
 }
 
@@ -3508,6 +3515,7 @@ pub(super) fn parse_followup_continuation_ast(
                 rest_destination: None,
                 enters_under: None,
                 face_down_profile: None,
+                enter_tapped: false,
             })
         }
         // "You may put one of those cards back on top of your library" after
@@ -3521,6 +3529,7 @@ pub(super) fn parse_followup_continuation_ast(
                 rest_destination: None,
                 enters_under: None,
                 face_down_profile: None,
+                enter_tapped: false,
             })
         }
         // "put them back in any order" after Dig means all looked-at cards
@@ -4972,6 +4981,7 @@ mod tests {
             filter: TargetFilter::Any,
             rest_destination: None,
             reveal: false,
+            enter_tapped: false,
         }
     }
 
@@ -5114,6 +5124,7 @@ mod tests {
                 rest_destination: Some(Zone::Library),
                 enters_under: None,
                 face_down_profile: None,
+                enter_tapped: false,
             })
         );
     }
@@ -5136,6 +5147,7 @@ mod tests {
                 rest_destination: Some(Zone::Library),
                 enters_under: None,
                 face_down_profile: None,
+                enter_tapped: false,
             })
         );
     }
@@ -5163,6 +5175,7 @@ mod tests {
                 rest_destination: Some(Zone::Library),
                 enters_under: None,
                 face_down_profile: None,
+                enter_tapped: false,
             })
         );
     }
@@ -5184,6 +5197,7 @@ mod tests {
                 rest_destination: Some(Zone::Graveyard),
                 enters_under: None,
                 face_down_profile: None,
+                enter_tapped: false,
             })
         );
     }
@@ -5322,6 +5336,7 @@ mod tests {
                 rest_destination: None,
                 enters_under: None,
                 face_down_profile: None,
+                enter_tapped: false,
             },
             AbilityKind::Spell,
         );
@@ -5863,6 +5878,7 @@ mod tests {
                 rest_destination: None,
                 enters_under: None,
                 face_down_profile: None,
+                enter_tapped: false,
             })
         );
     }

@@ -2461,6 +2461,9 @@ pub enum WaitingFor {
         /// Source ability's object ID for filter context.
         #[serde(default)]
         source_id: Option<ObjectId>,
+        /// CR 508.4: Kept cards entering the battlefield via this dig are tapped.
+        #[serde(default)]
+        enter_tapped: bool,
     },
     SurveilChoice {
         player: PlayerId,
@@ -6933,6 +6936,7 @@ mod tests {
             kept_destination: None,
             rest_destination: None,
             source_id: None,
+            enter_tapped: false,
         }
         .accepts_freeform_card_selection());
 
@@ -7196,6 +7200,7 @@ mod tests {
             kept_destination: None,
             rest_destination: None,
             source_id: None,
+            enter_tapped: false,
         }));
         variants.push(Box::new(WaitingFor::SurveilChoice {
             player: PlayerId(0),

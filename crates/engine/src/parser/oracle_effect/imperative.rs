@@ -5990,10 +5990,10 @@ pub(super) fn parse_imperative_family_ast(
         }
 
         // "look" → exiled/hand targets (step 4) → "look at the top" (step 5)
-        "look" => parse_hand_reveal_ast(text, lower, ctx)
+        "look" => parse_hand_reveal_ast(text, lower, ctx) // allow-noncombinator: pre-existing match dispatch; exiled-card look must precede library-top search
             .map(|ast| ImperativeFamilyAst::Structured(ImperativeAst::HandReveal(ast)))
             .or_else(|| {
-                parse_search_and_creation_ast(text, lower, ctx) // allow-noncombinator: pre-existing match dispatch, only threading ctx through
+                parse_search_and_creation_ast(text, lower, ctx)
                     .map(|ast| ImperativeFamilyAst::Structured(ImperativeAst::SearchCreation(ast)))
             }),
 

@@ -6,8 +6,8 @@ use nom::bytes::complete::tag;
 use nom::Parser;
 
 use crate::types::ability::{
-    AbilityDefinition, AbilityKind, ControllerRef, CounterTriggerFilter, Duration, Effect,
-    QuantityExpr, ReplacementDefinition, TargetFilter, TriggerDefinition,
+    AbilityDefinition, AbilityKind, CounterTriggerFilter, Duration, Effect, QuantityExpr,
+    ReplacementDefinition, TargetFilter, TriggerDefinition,
 };
 use crate::types::counter::CounterType;
 use crate::types::replacements::ReplacementEvent;

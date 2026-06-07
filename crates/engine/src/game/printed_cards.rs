@@ -905,11 +905,7 @@ fn build_conjure_registry(
 /// Mirror-Breaker chapter III, Ajani flip triggers, MDFC cast) — without this,
 /// `deliver_replaced_zone_change` silently skips transform when `back_face` is
 /// `None` and saga ETB lore-counter replacements fire on the front face.
-pub fn populate_back_face_if_dfc(
-    obj: &mut GameObject,
-    db: &CardDatabase,
-    card_face: &CardFace,
-) {
+pub fn populate_back_face_if_dfc(obj: &mut GameObject, db: &CardDatabase, card_face: &CardFace) {
     if obj.back_face.is_some() {
         return;
     }

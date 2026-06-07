@@ -157,5 +157,4 @@ fn fable_chapter_three_returns_transformed_not_as_saga() {
         0,
         "lore counters must not persist on the transformed creature back face"
     );
-
 }

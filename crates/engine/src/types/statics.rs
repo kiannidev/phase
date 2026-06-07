@@ -1412,7 +1412,94 @@ impl StaticMode {
             StaticMode::Trample => Some(Keyword::Trample),
             StaticMode::Deathtouch => Some(Keyword::Deathtouch),
             StaticMode::Lifelink => Some(Keyword::Lifelink),
-            _ => None,
+            StaticMode::Continuous
+            | StaticMode::CantAttack
+            | StaticMode::CantBlock
+            | StaticMode::CantAttackOrBlock
+            | StaticMode::MaxAttackersEachCombat { .. }
+            | StaticMode::MaxBlockersEachCombat { .. }
+            | StaticMode::CantBeTargeted
+            | StaticMode::CantBeCast { .. }
+            | StaticMode::CantBeActivated { .. }
+            | StaticMode::CantSearchLibrary { .. }
+            | StaticMode::CantCauseSacrificeOrExile { .. }
+            | StaticMode::CastWithFlash
+            | StaticMode::GrantsExtraVote
+            | StaticMode::CastWithKeyword { .. }
+            | StaticMode::CastWithAlternativeCost { .. }
+            | StaticMode::ModifyCost { .. }
+            | StaticMode::ReduceAbilityCost { .. }
+            | StaticMode::ModifyActivationLimit { .. }
+            | StaticMode::ActivateAsInstant { .. }
+            | StaticMode::CantPayCost { .. }
+            | StaticMode::CantGainLife
+            | StaticMode::CantLoseLife
+            | StaticMode::PlayerProtection(_)
+            | StaticMode::MustAttack
+            | StaticMode::MustAttackPlayer { .. }
+            | StaticMode::MustBlock
+            | StaticMode::MustBlockAttacker { .. }
+            | StaticMode::CantDraw { .. }
+            | StaticMode::DoubleTriggers { .. }
+            | StaticMode::IgnoreHexproof
+            | StaticMode::ExtraBlockers { .. }
+            | StaticMode::RevealTopOfLibrary { .. }
+            | StaticMode::GraveyardCastPermission { .. }
+            | StaticMode::TopOfLibraryCastPermission { .. }
+            | StaticMode::CastFromHandFree { .. }
+            | StaticMode::ExileCastPermission { .. }
+            | StaticMode::CantBeCountered
+            | StaticMode::CantBeCopied
+            | StaticMode::CantEnterBattlefieldFrom
+            | StaticMode::CantCastFrom { .. }
+            | StaticMode::CantCastDuring { .. }
+            | StaticMode::CantActivateDuring { .. }
+            | StaticMode::PerTurnCastLimit { .. }
+            | StaticMode::PerTurnDrawLimit { .. }
+            | StaticMode::SuppressTriggers { .. }
+            | StaticMode::CantBeBlocked
+            | StaticMode::CantBeBlockedExceptBy { .. }
+            | StaticMode::CantBeBlockedBy { .. }
+            | StaticMode::CantBeBlockedByMoreThan { .. }
+            | StaticMode::AttachmentRestriction { .. }
+            | StaticMode::Protection
+            | StaticMode::CantBeDestroyed
+            | StaticMode::CantBeRegenerated
+            | StaticMode::FlashBack
+            | StaticMode::CantTap
+            | StaticMode::CantUntap
+            | StaticMode::MustBeBlocked
+            | StaticMode::MustBeBlockedByAll
+            | StaticMode::Goaded
+            | StaticMode::CantAttackAlone
+            | StaticMode::CantBlockAlone
+            | StaticMode::CantCrew
+            | StaticMode::CrewContribution { .. }
+            | StaticMode::MayLookAtTopOfLibrary
+            | StaticMode::MayChooseNotToUntap
+            | StaticMode::AdditionalLandDrop { .. }
+            | StaticMode::EmblemStatic
+            | StaticMode::BlockRestriction
+            | StaticMode::NoMaximumHandSize
+            | StaticMode::MaximumHandSize { .. }
+            | StaticMode::MayPlayAdditionalLand
+            | StaticMode::CantHaveKeyword { .. }
+            | StaticMode::CantWinTheGame
+            | StaticMode::CantLoseTheGame
+            | StaticMode::LegendRuleDoesntApply
+            | StaticMode::SpeedCanIncreaseBeyondFour
+            | StaticMode::DefilerCostReduction { .. }
+            | StaticMode::SkipStep { .. }
+            | StaticMode::SpendManaAsAnyColor
+            | StaticMode::PayLifeAsColoredMana { .. }
+            | StaticMode::StepEndUnspentMana { .. }
+            | StaticMode::CanAttackWithDefender
+            | StaticMode::IgnoreLandwalkForBlocking { .. }
+            | StaticMode::CanActivateAbilitiesAsThoughHaste
+            | StaticMode::AssignNoCombatDamage
+            | StaticMode::UntapsDuringEachOtherPlayersUntapStep
+            | StaticMode::EntersWithAdditionalCounters { .. }
+            | StaticMode::Other(_) => None,
         }
     }
 }

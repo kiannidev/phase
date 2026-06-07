@@ -3373,11 +3373,8 @@ fn parse_prevent_effect(text: &str) -> Effect {
 fn parse_prevent_damage_source_filter(text: &str, lower: &str) -> Option<TargetFilter> {
     let mut cursor = lower;
     let mut after_by = None;
-    while let Ok((rest, _)) = preceded(
-        take_until::<_, _, OracleError<'_>>(" by "),
-        tag(" by "),
-    )
-    .parse(cursor)
+    while let Ok((rest, _)) =
+        preceded(take_until::<_, _, OracleError<'_>>(" by "), tag(" by ")).parse(cursor)
     {
         after_by = Some(rest);
         if rest.is_empty() {

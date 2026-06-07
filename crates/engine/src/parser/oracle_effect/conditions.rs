@@ -131,12 +131,11 @@ fn comma_inside_if_creature_subtype_list(lower: &str, comma_idx: usize) -> bool 
         Err(_) => return false,
     };
     let anchor = lower.len() - after_intro.len();
-    let (subtype_span, _) = match take_until::<_, _, OracleError<'_>>(" creature card")
-        .parse(after_intro)
-    {
-        Ok(parsed) => parsed,
-        Err(_) => return false,
-    };
+    let (subtype_span, _) =
+        match take_until::<_, _, OracleError<'_>>(" creature card").parse(after_intro) {
+            Ok(parsed) => parsed,
+            Err(_) => return false,
+        };
     let creature_card_end = anchor + (after_intro.len() - subtype_span.len());
     comma_idx < creature_card_end
 }

@@ -4752,12 +4752,23 @@ fn resolve_chain_body(
                         .push(TargetRef::Object(ability.source_id));
                 }
             } else if sub_with_context.targets.is_empty()
-                && ability.targets.is_empty()
                 && !effect_uses_implicit_tracked_set_targets(&sub.effect)
             {
-                sub_with_context
-                    .targets
-                    .insert(0, TargetRef::Object(forwarded_objects[0]));
+                // CR 608.2c: ParentTarget consumers in a forward_result sub-chain
+                // need the moved object's id in `targets`, not just a rebound
+                // `source_id`. Goryo's Vengeance ("return target … creature …
+                // That creature gains haste. Exile it at the beginning of the
+                // next end step.") carries explicit cast-time targets on the
+                // parent `ChangeZone`; Emperor-of-Bones-style descriptors do
+                // not. Both shapes must snapshot the just-moved card for
+                // downstream ParentTarget / delayed-trigger registration.
+                if !ability.targets.is_empty() {
+                    sub_with_context.targets = ability.targets.clone();
+                } else {
+                    sub_with_context
+                        .targets
+                        .insert(0, TargetRef::Object(forwarded_objects[0]));
+                }
             }
             apply_parent_chain_context(
                 &mut sub_with_context,
@@ -7684,6 +7695,125 @@ mod tests {
                 GameEvent::PermanentSacrificed { object_id, .. } if *object_id == source
             )),
             "ParentTarget must not fall back to the source permanent"
+        );
+    }
+
+    #[test]
+    fn forward_result_with_parent_targets_binds_moved_object() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Goryo's Vengeance".to_string(),
+            Zone::Stack,
+        );
+        let creature = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Returned Legend".to_string(),
+            Zone::Graveyard,
+        );
+        {
+            let obj = state.objects.get_mut(&creature).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+        }
+
+        let haste_grant = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![StaticDefinition::continuous()
+                    .affected(TargetFilter::ParentTarget)
+                    .modifications(vec![ContinuousModification::AddKeyword {
+                        keyword: Keyword::Haste,
+                    }])],
+                duration: None,
+                target: Some(TargetFilter::ParentTarget),
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let delayed_exile = ResolvedAbility::new(
+            Effect::CreateDelayedTrigger {
+                condition: DelayedTriggerCondition::AtNextPhase {
+                    phase: Phase::End,
+                },
+                effect: Box::new(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::ChangeZone {
+                        origin: Some(Zone::Battlefield),
+                        destination: Zone::Exile,
+                        target: TargetFilter::ParentTarget,
+                        owner_library: false,
+                        enter_transformed: false,
+                        enters_under: None,
+                        enter_tapped: false,
+                        enters_attacking: false,
+                        up_to: false,
+                        enter_with_counters: vec![],
+                        face_down_profile: None,
+                    },
+                )),
+                uses_tracked_set: false,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let haste_then_exile = haste_grant.sub_ability(delayed_exile);
+        let mut reanimate = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Battlefield,
+                target: TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Creature],
+                    controller: None,
+                    properties: vec![FilterProp::InZone {
+                        zone: Zone::Graveyard,
+                    }],
+                }),
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: Some(ControllerRef::You),
+                enter_tapped: false,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                face_down_profile: None,
+            },
+            vec![TargetRef::Object(creature)],
+            source,
+            PlayerId(0),
+        )
+        .sub_ability(haste_then_exile);
+        reanimate.forward_result = true;
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &reanimate, &mut events, 0).unwrap();
+
+        assert_eq!(state.objects[&creature].zone, Zone::Battlefield);
+        assert!(
+            state.transient_continuous_effects.iter().any(|tce| {
+                matches!(
+                    tce.affected,
+                    TargetFilter::SpecificObject { id } if id == creature
+                ) && tce.modifications.iter().any(|m| {
+                    matches!(
+                        m,
+                        ContinuousModification::AddKeyword { keyword }
+                            if matches!(keyword, Keyword::Haste)
+                    )
+                })
+            }),
+            "haste must attach to the returned creature when parent carried cast-time targets"
+        );
+        assert_eq!(state.delayed_triggers.len(), 1);
+        assert_eq!(
+            state.delayed_triggers[0].ability.targets,
+            vec![TargetRef::Object(creature)],
+            "delayed exile must snapshot the returned creature"
         );
     }
 

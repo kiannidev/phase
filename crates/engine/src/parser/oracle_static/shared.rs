@@ -1481,18 +1481,35 @@ pub(crate) fn parse_thats_a_subject_filter(text: &str, lower: &str) -> Option<Ta
 /// "Cleric, Rogue, Warrior, and/or Wizard", "Cat, Elemental, Nightmare, Dinosaur, or Beast".
 /// Returns `TargetFilter::Or` for multiple subtypes, single `TargetFilter::Typed` for one.
 pub(crate) fn parse_subtype_or_list(input: &str) -> Option<TargetFilter> {
-    fn parse_subtype_word(input: &str) -> nom::IResult<&str, &str, OracleError<'_>> {
-        use nom::bytes::complete::take_while1;
-        let (rest, word) = take_while1(|c: char| c.is_alphabetic() || c == '-').parse(input)?;
-        if !word.chars().next().is_some_and(|c| c.is_uppercase()) {
-            return Err(nom::Err::Error(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::Fail,
-            )));
-        }
-        Ok((rest, word))
-    }
+    parse_subtype_or_list_with_word_parser(input, parse_subtype_word_capitalized)
+}
 
+/// CR 205.3m: Lowercase oracle subtype lists (e.g. Kenessos conditional gates).
+pub(crate) fn parse_subtype_or_list_insensitive(input: &str) -> Option<TargetFilter> {
+    parse_subtype_or_list_with_word_parser(input, parse_subtype_word_any_case)
+}
+
+fn parse_subtype_word_capitalized(input: &str) -> nom::IResult<&str, &str, OracleError<'_>> {
+    use nom::bytes::complete::take_while1;
+    let (rest, word) = take_while1(|c: char| c.is_alphabetic() || c == '-').parse(input)?;
+    if !word.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    }
+    Ok((rest, word))
+}
+
+fn parse_subtype_word_any_case(input: &str) -> nom::IResult<&str, &str, OracleError<'_>> {
+    use nom::bytes::complete::take_while1;
+    take_while1(|c: char| c.is_alphabetic() || c == '-').parse(input)
+}
+
+fn parse_subtype_or_list_with_word_parser(
+    input: &str,
+    parse_subtype_word: fn(&str) -> nom::IResult<&str, &str, OracleError<'_>>,
+) -> Option<TargetFilter> {
     fn parse_list_separator(input: &str) -> nom::IResult<&str, &str, OracleError<'_>> {
         alt((
             tag(", and/or a "),

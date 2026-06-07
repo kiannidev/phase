@@ -4986,18 +4986,17 @@ pub(crate) fn evaluate_condition(
             let type_matches = subject_id
                 .map(|id| super::printed_cards::object_has_core_type(state, id, *card_type))
                 .unwrap_or(false);
-            let subtype_matches = match subtype_filter {
+            // CR 205.3m: Match the revealed card's subtype against the subtype filter.
+            let subtype_matches = match subtype_filter.as_ref() {
                 None => true,
-                Some(filter) => subject_id
-                    .map(|id| {
-                        crate::game::filter::matches_target_filter(
-                            state,
-                            id,
-                            filter.as_ref(),
-                            &crate::game::filter::FilterContext::from_ability(ability),
-                        )
-                    })
-                    .unwrap_or(false),
+                Some(filter) => subject_id.is_some_and(|id| {
+                    crate::game::filter::matches_target_filter(
+                        state,
+                        id,
+                        filter.as_ref(),
+                        &crate::game::filter::FilterContext::from_ability(ability),
+                    )
+                }),
             };
             let filter_matches = match additional_filter {
                 // CR 205.3m: "of the chosen type" — check the revealed card's subtype

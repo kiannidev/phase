@@ -5075,10 +5075,10 @@ fn parse_damage_prevention_replacement(
         None
     };
 
-    // CR 301.5 + CR 303.4 + CR 614.1a: Damage prevention scoped to the source's
+    // CR 301.5 + CR 303.4 + CR 615.1a: Damage prevention scoped to the source's
     // attached creature ("equipped creature" / "enchanted creature"). The dedicated
     // `DamageTargetFilter` enum can't express attachment relationships (it covers
-    // only player/creature type axes per CR 614.1a), so route through `valid_card`
+    // only player/creature type axes), so route through `valid_card`
     // — the runtime resolves `EquippedBy`/`EnchantedBy` against the source's own
     // `attached_to` (see `game/filter.rs` `FilterProp::EquippedBy`), correctly
     // scoping the shield to only the attached creature regardless of how many
@@ -6209,21 +6209,23 @@ mod tests {
     /// Anti-Venom self-scoped prevention must use `valid_card: SelfRef`, not `CreatureOnly`.
     #[test]
     fn anti_venom_self_prevention_uses_valid_card_self_ref() {
-        let def = parse_replacement_line(
+        for text in [
             "If damage would be dealt to ~, prevent that damage and put that many +1/+1 counters on him.",
-            "Anti-Venom, Horrifying Healer",
-        )
-        .expect("Anti-Venom prevention should parse");
+            "If damage would be dealt to and dealt by ~, prevent that damage and put that many +1/+1 counters on him.",
+        ] {
+            let def = parse_replacement_line(text, "Anti-Venom, Horrifying Healer")
+                .expect("Anti-Venom prevention should parse");
 
-        assert_eq!(
-            def.valid_card,
-            Some(TargetFilter::SelfRef),
-            "self-scoped prevention must gate on SelfRef"
-        );
-        assert!(
-            def.damage_target_filter.is_none(),
-            "must not use broad CreatureOnly damage_target_filter"
-        );
+            assert_eq!(
+                def.valid_card,
+                Some(TargetFilter::SelfRef),
+                "self-scoped prevention must gate on SelfRef: {text}"
+            );
+            assert!(
+                def.damage_target_filter.is_none(),
+                "must not use broad CreatureOnly damage_target_filter: {text}"
+            );
+        }
     }
 
     /// CR 614.1a + CR 615.5 + CR 608.2c: Vigor — "If damage would be dealt to

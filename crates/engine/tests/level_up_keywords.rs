@@ -198,7 +198,8 @@ fn coralhelm_commander_flying_is_level_gated() {
 
 /// Hada Spy Patrol — base 1/1; "Level up {2}{U}"; LEVEL 1-2 → 2/2 can't be blocked;
 /// LEVEL 3+ → 3/3 Shroud + can't be blocked (#2412).
-const HADA_SPY_PATROL: &str = "Level up {2}{U} ({2}{U}: Put a level counter on this. Level up only as a sorcery.)\n\
+const HADA_SPY_PATROL: &str =
+    "Level up {2}{U} ({2}{U}: Put a level counter on this. Level up only as a sorcery.)\n\
 LEVEL 1-2\n\
 2/2\n\
 This creature can't be blocked.\n\

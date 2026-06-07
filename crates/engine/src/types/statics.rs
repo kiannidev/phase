@@ -1398,6 +1398,25 @@ impl Hash for StaticMode {
     }
 }
 
+impl StaticMode {
+    /// Map bare keyword static modes onto their corresponding keyword identity.
+    pub fn as_keyword(&self) -> Option<Keyword> {
+        match self {
+            StaticMode::Indestructible => Some(Keyword::Indestructible),
+            StaticMode::Shroud => Some(Keyword::Shroud),
+            StaticMode::Hexproof => Some(Keyword::Hexproof),
+            StaticMode::Flying => Some(Keyword::Flying),
+            StaticMode::Vigilance => Some(Keyword::Vigilance),
+            StaticMode::Menace => Some(Keyword::Menace),
+            StaticMode::Reach => Some(Keyword::Reach),
+            StaticMode::Trample => Some(Keyword::Trample),
+            StaticMode::Deathtouch => Some(Keyword::Deathtouch),
+            StaticMode::Lifelink => Some(Keyword::Lifelink),
+            _ => None,
+        }
+    }
+}
+
 impl fmt::Display for StaticMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -2322,6 +2341,27 @@ mod tests {
             StaticMode::from_str("NoMaximumHandSize").unwrap(),
             StaticMode::NoMaximumHandSize
         );
+    }
+
+    #[test]
+    fn static_mode_as_keyword_maps_bare_keyword_modes() {
+        let cases = [
+            (StaticMode::Indestructible, Keyword::Indestructible),
+            (StaticMode::Shroud, Keyword::Shroud),
+            (StaticMode::Hexproof, Keyword::Hexproof),
+            (StaticMode::Flying, Keyword::Flying),
+            (StaticMode::Vigilance, Keyword::Vigilance),
+            (StaticMode::Menace, Keyword::Menace),
+            (StaticMode::Reach, Keyword::Reach),
+            (StaticMode::Trample, Keyword::Trample),
+            (StaticMode::Deathtouch, Keyword::Deathtouch),
+            (StaticMode::Lifelink, Keyword::Lifelink),
+        ];
+        for (mode, keyword) in cases {
+            assert_eq!(mode.as_keyword(), Some(keyword));
+        }
+        assert_eq!(StaticMode::Protection.as_keyword(), None);
+        assert_eq!(StaticMode::CantBeBlocked.as_keyword(), None);
     }
 
     #[test]

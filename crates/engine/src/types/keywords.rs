@@ -125,6 +125,7 @@ pub enum KeywordKind {
     Graft,
     Annihilator,
     Bushido,
+    Frenzy,
     Tribute,
     Soulbond,
     Unearth,
@@ -473,6 +474,8 @@ pub enum Keyword {
     Fabricate(u32),
     Annihilator(u32),
     Bushido(u32),
+    /// CR 702.68a: Frenzy N — "Whenever this creature attacks and isn't blocked, it gets +N/+0 until end of turn." CR 702.68b: each instance triggers separately.
+    Frenzy(u32),
     Tribute(u32),
     Soulbond,
     Unearth(ManaCost),
@@ -763,9 +766,13 @@ pub enum Keyword {
     /// Firebending N — produces N {R} when this creature attacks (Avatar crossover).
     Firebending(QuantityExpr),
 
-    /// CR 702.46a: Splice onto [type] — reveal from hand and pay splice cost while casting
-    /// a spell of the specified type to add this card's effects to that spell.
-    Splice(String),
+    /// CR 702.47a: Splice onto [type] [cost] — reveal this card from hand and pay
+    /// its splice cost as you cast a spell of the specified type to copy this
+    /// card's text box onto that spell.
+    Splice {
+        subtype: String,
+        cost: ManaCost,
+    },
     /// CR 702.166a: Bargain — you may sacrifice an artifact, enchantment, or token
     /// as an additional cost to cast this spell.
     Bargain,
@@ -985,6 +992,7 @@ impl Keyword {
             Keyword::Fabricate(_) => KeywordKind::Fabricate,
             Keyword::Annihilator(_) => KeywordKind::Annihilator,
             Keyword::Bushido(_) => KeywordKind::Bushido,
+            Keyword::Frenzy(_) => KeywordKind::Frenzy,
             Keyword::Tribute(_) => KeywordKind::Tribute,
             Keyword::Soulbond => KeywordKind::Soulbond,
             Keyword::Unearth(_) => KeywordKind::Unearth,
@@ -1047,7 +1055,7 @@ impl Keyword {
             Keyword::Warp(_) => KeywordKind::Warp,
             Keyword::Devour(_) => KeywordKind::Devour,
             Keyword::Offspring(_) => KeywordKind::Offspring,
-            Keyword::Splice(_) => KeywordKind::Splice,
+            Keyword::Splice { .. } => KeywordKind::Splice,
             Keyword::Bargain => KeywordKind::Bargain,
             Keyword::Sunburst => KeywordKind::Sunburst,
             Keyword::Champion(_) => KeywordKind::Champion,
@@ -1651,6 +1659,7 @@ impl FromStr for Keyword {
                 "landwalk" => return Ok(Keyword::Landwalk(p.clone())),
                 "rampage" => return Ok(Keyword::Rampage(p.parse().unwrap_or(1))),
                 "bushido" => return Ok(Keyword::Bushido(p.parse().unwrap_or(1))),
+                "frenzy" => return Ok(Keyword::Frenzy(p.parse().unwrap_or(1))),
                 "absorb" => return Ok(Keyword::Absorb(p.parse().unwrap_or(1))),
                 "fading" => return Ok(Keyword::Fading(p.parse().unwrap_or(0))),
                 "vanishing" => return Ok(Keyword::Vanishing(p.parse().unwrap_or(0))),
@@ -1861,12 +1870,18 @@ impl FromStr for Keyword {
                     // Strip "onto " prefix if present (e.g., "onto arcane {w}" → "arcane {w}")
                     let after_onto = p.strip_prefix("onto ").unwrap_or(p);
                     // Separate type name from cost — cost starts with '{'
-                    let type_str = match after_onto.find('{') {
-                        Some(brace_idx) => after_onto[..brace_idx].trim(),
-                        None => after_onto.trim(),
+                    let (type_str, cost_str) = match after_onto.find('{') {
+                        Some(brace_idx) => {
+                            (after_onto[..brace_idx].trim(), &after_onto[brace_idx..])
+                        }
+                        None => (after_onto.trim(), ""),
                     };
                     let capitalized = capitalize_first(type_str);
-                    return Ok(Keyword::Splice(capitalized));
+                    let cost = parse_keyword_mana_cost(cost_str);
+                    return Ok(Keyword::Splice {
+                        subtype: capitalized,
+                        cost,
+                    });
                 }
                 // CR 702.72a: Champion a [type]
                 "champion" => {
@@ -1948,6 +1963,7 @@ impl FromStr for Keyword {
             "wither" => Ok(Keyword::Wither),
             "infect" => Ok(Keyword::Infect),
             "afflict" => Ok(Keyword::Afflict(1)),
+            "frenzy" => Ok(Keyword::Frenzy(1)),
             "prowess" => Ok(Keyword::Prowess),
             "undying" => Ok(Keyword::Undying),
             "persist" => Ok(Keyword::Persist),
@@ -2564,6 +2580,7 @@ fn keyword_from_tagged(variant: &str, data: &serde_json::Value) -> Result<Keywor
         "Fabricate" => Ok(Keyword::Fabricate(uint(data))),
         "Annihilator" => Ok(Keyword::Annihilator(uint(data))),
         "Bushido" => Ok(Keyword::Bushido(uint(data))),
+        "Frenzy" => Ok(Keyword::Frenzy(uint(data))),
         "Tribute" => Ok(Keyword::Tribute(uint(data))),
         "Afterlife" => Ok(Keyword::Afterlife(uint(data))),
         "Fading" => Ok(Keyword::Fading(uint(data))),
@@ -2673,7 +2690,28 @@ fn keyword_from_tagged(variant: &str, data: &serde_json::Value) -> Result<Keywor
         }
         // CR 702.47a / CR 702.166a / CR 702.43a / CR 702.72a / CR 702.149a
         // CR 702.132a / CR 702.133a / CR 702.99a / CR 702.53a / CR 702.148a / CR 702.125a
-        "Splice" => Ok(Keyword::Splice(data.as_str().unwrap_or("").to_string())),
+        "Splice" => {
+            // Struct form `{ "subtype": "Arcane", "cost": {..} }` (mirrors Typecycling).
+            // A bare string is treated as a costless legacy subtype.
+            if let Some(subtype) = data.as_str() {
+                return Ok(Keyword::Splice {
+                    subtype: subtype.to_string(),
+                    cost: ManaCost::zero(),
+                });
+            }
+            let obj = data
+                .as_object()
+                .ok_or("Splice: expected object or string")?;
+            let cost: ManaCost =
+                serde_json::from_value(obj.get("cost").cloned().unwrap_or_default())
+                    .map_err(|e| format!("Splice cost: {e}"))?;
+            let subtype = obj
+                .get("subtype")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok(Keyword::Splice { subtype, cost })
+        }
         "Bargain" => Ok(Keyword::Bargain),
         "Sunburst" => Ok(Keyword::Sunburst),
         "Champion" => Ok(Keyword::Champion(data.as_str().unwrap_or("").to_string())),
@@ -2897,6 +2935,16 @@ mod tests {
             }
         );
         assert_eq!(Keyword::from_str("Rampage:2").unwrap(), Keyword::Rampage(2));
+    }
+
+    #[test]
+    fn parse_frenzy_colon_and_bare() {
+        // CR 702.68a: colon-form carries N.
+        assert_eq!(Keyword::from_str("Frenzy:2").unwrap(), Keyword::Frenzy(2));
+        // CR 702.68a: bare MTGJSON keyword-list form defaults to Frenzy(1),
+        // mirroring the bare `afflict` arm — must NOT fall to Unknown.
+        assert_eq!(Keyword::from_str("frenzy").unwrap(), Keyword::Frenzy(1));
+        assert_eq!(Keyword::from_str("Frenzy").unwrap(), Keyword::Frenzy(1));
     }
 
     #[test]

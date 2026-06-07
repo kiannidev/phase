@@ -31604,6 +31604,47 @@ mod tests {
         );
     }
 
+    /// Issue #2423 — Deadly Brew: sacrifice rider + optional graveyard return.
+    #[test]
+    fn deadly_brew_sacrifice_planeswalker_return_condition() {
+        let def = parse_effect_chain(
+            "Each player sacrifices a creature or planeswalker of their choice. If you sacrificed a permanent this way, you may return another permanent card from your graveyard to your hand.",
+            AbilityKind::Spell,
+        );
+        assert!(matches!(*def.effect, Effect::Sacrifice { .. }));
+        assert_eq!(def.player_scope, Some(PlayerFilter::All));
+
+        let return_sub = def.sub_ability.as_ref().expect("Deadly Brew return clause");
+        assert!(return_sub.optional);
+        assert!(matches!(
+            return_sub.condition,
+            Some(AbilityCondition::CostPaidObjectMatchesFilter {
+                filter: TargetFilter::Typed(TypedFilter { ref type_filters, .. })
+            }) if type_filters.contains(&TypeFilter::Permanent)
+        ));
+        match &*return_sub.effect {
+            Effect::Bounce { target, .. } => {
+                let TargetFilter::Typed(typed) = target else {
+                    panic!("expected typed graveyard permanent target, got {target:?}");
+                };
+                assert!(typed.type_filters.contains(&TypeFilter::Permanent));
+                assert!(typed.properties.iter().any(|p| {
+                    matches!(
+                        p,
+                        FilterProp::InZone {
+                            zone: Zone::Graveyard
+                        }
+                    )
+                }));
+                assert!(typed
+                    .properties
+                    .iter()
+                    .any(|p| matches!(p, FilterProp::Another)));
+            }
+            other => panic!("expected graveyard-to-hand Bounce, got {other:?}"),
+        }
+    }
+
     /// CR 101.3 + CR 118.12 + CR 109.5: Plaguecrafter's ETB body — "each
     /// player sacrifices a creature or planeswalker of their choice. Each
     /// player who can't discards a card." — must lower into a two-clause chain
@@ -41392,6 +41433,96 @@ mod tests {
         assert!(
             delayed_sacrifice,
             "expected a CreateDelayedTrigger with Sacrifice inside in the parsed chain"
+        );
+    }
+
+    /// Issue #2424: Goryo's Vengeance — "That creature gains haste. Exile it at
+    /// the beginning of the next end step." must bind to the returned legendary
+    /// creature, not the spell source.
+    #[test]
+    fn goryos_vengeance_reanimation_haste_and_delayed_exile() {
+        let def = parse_effect_chain(
+            "return target legendary creature card from your graveyard to the battlefield. that creature gains haste. exile it at the beginning of the next end step.",
+            AbilityKind::Spell,
+        );
+
+        fn find_change_zone_to_battlefield(def: &AbilityDefinition) -> Option<&AbilityDefinition> {
+            if matches!(
+                &*def.effect,
+                Effect::ChangeZone {
+                    destination: Zone::Battlefield,
+                    ..
+                }
+            ) {
+                return Some(def);
+            }
+            if let Some(sub) = def.sub_ability.as_ref() {
+                if let Some(found) = find_change_zone_to_battlefield(sub) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+
+        let parent = find_change_zone_to_battlefield(&def)
+            .expect("expected ChangeZone to Battlefield parent");
+        assert!(
+            parent.forward_result,
+            "Goryo's-style anaphor sub-chain must set forward_result"
+        );
+
+        fn haste_targets_parent(def: &AbilityDefinition) -> bool {
+            match &*def.effect {
+                Effect::GenericEffect {
+                    target,
+                    static_abilities,
+                    ..
+                } => {
+                    let outer = matches!(target, Some(TargetFilter::ParentTarget));
+                    let inner = static_abilities.iter().any(|s| {
+                        matches!(s.affected.as_ref(), Some(TargetFilter::ParentTarget))
+                            && s.modifications.iter().any(|m| {
+                                matches!(
+                                    m,
+                                    ContinuousModification::AddKeyword { keyword }
+                                        if matches!(keyword, Keyword::Haste)
+                                )
+                            })
+                    });
+                    outer || inner
+                }
+                Effect::CreateDelayedTrigger { effect, .. } => haste_targets_parent(effect),
+                _ => def.sub_ability.as_deref().is_some_and(haste_targets_parent),
+            }
+        }
+
+        fn delayed_exile_targets_parent(def: &AbilityDefinition) -> bool {
+            match &*def.effect {
+                Effect::CreateDelayedTrigger { effect, .. } => match &*effect.effect {
+                    Effect::ChangeZone {
+                        destination: Zone::Exile,
+                        target: TargetFilter::ParentTarget,
+                        ..
+                    } => true,
+                    other => delayed_exile_targets_parent(&AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        other.clone(),
+                    )),
+                },
+                _ => def
+                    .sub_ability
+                    .as_deref()
+                    .is_some_and(delayed_exile_targets_parent),
+            }
+        }
+
+        assert!(
+            haste_targets_parent(&def),
+            "haste grant must target ParentTarget (the returned creature)"
+        );
+        assert!(
+            delayed_exile_targets_parent(&def),
+            "delayed exile must target ParentTarget (the returned creature)"
         );
     }
 

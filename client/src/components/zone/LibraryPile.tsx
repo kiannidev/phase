@@ -65,8 +65,13 @@ export function LibraryPile({ playerId, size }: LibraryPileProps) {
       playerId === myId &&
       (s.gameState?.players[playerId]?.can_look_at_top_of_library ?? false);
     const revealed = s.gameState?.revealed_cards?.includes(topObjectId) ?? false;
-    if (!peek && !revealed) return null;
-    return s.gameState?.objects[topObjectId]?.name ?? null;
+    const name = s.gameState?.objects[topObjectId]?.name ?? null;
+    // CR 701.20e: private "look at" on an opponent's library (Mishra's Bauble)
+    // surfaces the peeked card name to the looker via engine viewer filtering.
+    const opponentPrivatePeek =
+      playerId !== myId && name != null && name !== "Hidden Card";
+    if (!peek && !revealed && !opponentPrivatePeek) return null;
+    return name;
   });
 
   const legalActionsByObject = useGameStore((s) => s.legalActionsByObject);
@@ -116,7 +121,7 @@ export function LibraryPile({ playerId, size }: LibraryPileProps) {
   if (count === 0) return null;
 
   const stackDepth = Math.min(count - 1, 4);
-  const isPeeking = (canPeek || isRevealed) && topCardName;
+  const isPeeking = topCardName != null;
   const libraryLabel = t("zone.libraryCount", { count });
   const playLabel = t("zone.playFromTop", { name: topCardName ?? t("zone.topOfLibrary") });
   const w = size?.width ?? "var(--card-w)";

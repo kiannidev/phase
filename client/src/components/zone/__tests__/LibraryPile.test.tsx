@@ -187,6 +187,65 @@ describe("LibraryPile play/cast surfacing (#297)", () => {
     });
   });
 
+  it("shows opponent library top after a private look peek (Mishra's Bauble)", () => {
+    const topCardId = 77;
+    const top = makeObject(topCardId, "Lightning Bolt");
+    const gameState = {
+      active_player: 0,
+      objects: { [topCardId]: top },
+      players: [
+        {
+          id: 0,
+          life: 20,
+          poison_counters: 0,
+          mana_pool: { mana: [] },
+          library: [],
+          hand: [],
+          graveyard: [],
+          has_drawn_this_turn: false,
+          lands_played_this_turn: 0,
+          turns_taken: 0,
+          can_look_at_top_of_library: false,
+        },
+        {
+          id: 1,
+          life: 20,
+          poison_counters: 0,
+          mana_pool: { mana: [] },
+          library: [topCardId],
+          hand: [],
+          graveyard: [],
+          has_drawn_this_turn: false,
+          lands_played_this_turn: 0,
+          turns_taken: 0,
+          can_look_at_top_of_library: false,
+        },
+      ],
+      battlefield: [],
+      exile: [],
+      stack: [],
+      combat: null,
+      revealed_cards: [],
+      waiting_for: { type: "Priority", data: { player: 0 } },
+    } as unknown as GameState;
+
+    useGameStore.setState({
+      gameState,
+      waitingFor: gameState.waiting_for,
+      legalActions: [],
+      legalActionsByObject: {},
+      spellCosts: {},
+      gameMode: "ai",
+    });
+
+    render(<LibraryPile playerId={1} />);
+    const button = screen.getByRole("button", { name: /library \(1 card\)/i });
+    expect(button).toBeInTheDocument();
+    // Peeked tops use the cyan border; card-back alt text is hidden.
+    expect(button.className).toContain("border-cyan-600");
+    expect(screen.queryByAltText(/library alt/i)).not.toBeInTheDocument();
+  });
+
   it("does not dispatch when there is no play action", () => {
     setStore({ canPeek: true, actions: [] });
     render(<LibraryPile playerId={0} />);

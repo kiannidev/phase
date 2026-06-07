@@ -864,6 +864,10 @@ pub(crate) enum SearchCreationImperativeAst {
     /// scoped to the owner of the parent target's exiled card. Used by
     /// Deadly Cover-Up.
     MultiZoneSameNameExile,
+    /// CR 406.6: Private look at a resolved target set (Scroll Rack exiled cards).
+    RevealTarget {
+        target: TargetFilter,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1006,6 +1010,9 @@ pub(crate) enum PutImperativeAst {
     NthFromTop {
         n: u32,
     },
+    /// CR 121.2: "put that many cards from the top of your library into your
+    /// hand" — draw count tracks cards exiled earlier this resolution (Scroll Rack).
+    DrawMatchingExileCount,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

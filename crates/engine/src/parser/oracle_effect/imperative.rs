@@ -1771,6 +1771,19 @@ pub(super) fn parse_search_and_creation_ast(
             source_zones: details.source_zones,
         });
     }
+    // CR 406.6: "look at the exiled cards" / "look at the cards exiled this way"
+    // (Scroll Rack) — private inspection of the source-linked exile set.
+    if alt((
+        tag::<_, _, OracleError<'_>>("look at the exiled cards"),
+        tag("look at the cards exiled this way"),
+    ))
+    .parse(lower)
+    .is_ok()
+    {
+        return Some(SearchCreationImperativeAst::RevealTarget {
+            target: TargetFilter::ExiledBySource,
+        });
+    }
     // CR 701.16a + CR 701.20a: "look at the top N" (private) and "reveal the top N" (public)
     // both produce Dig — the reveal flag distinguishes visibility semantics.
     if let Some((reveal, rest)) = nom_on_lower(text, lower, |input| {
@@ -2149,6 +2162,7 @@ pub(super) fn lower_search_and_creation_ast(ast: SearchCreationImperativeAst) ->
             enter_tapped: false,
             face_down_profile: None,
         },
+        SearchCreationImperativeAst::RevealTarget { target } => Effect::Reveal { target },
     }
 }
 
@@ -2187,6 +2201,20 @@ pub(super) fn parse_hand_reveal_ast(
 
         let (_, after_look_at) =
             nom_on_lower(text, lower, |input| value((), tag("look at ")).parse(input))?;
+        let after_look_at_lower = &lower[lower.len() - after_look_at.len()..];
+        if alt((
+            tag::<_, _, OracleError<'_>>("the exiled cards"),
+            tag("the cards exiled this way"),
+        ))
+        .parse(after_look_at_lower)
+        .is_ok()
+        {
+            return Some(HandRevealImperativeAst::LookAt {
+                target: TargetFilter::ExiledBySource,
+                count: None,
+                random: false,
+            });
+        }
         let (target, _) = parse_target(after_look_at);
         return Some(HandRevealImperativeAst::LookAt {
             target,
@@ -3331,6 +3359,8 @@ fn parse_prevent_effect(text: &str) -> Effect {
         TargetFilter::Any
     };
 
+    let damage_source_filter = parse_prevent_damage_source_filter(&lower);
+
     // CR 615.11 + CR 107.3i: `amount_dynamic` (the "prevent X … where X is
     // <quantity>" override) is populated at chunk level by
     // `apply_where_x_effect_expression`, not here — the chunk machinery
@@ -3342,8 +3372,28 @@ fn parse_prevent_effect(text: &str) -> Effect {
         amount_dynamic: None,
         target,
         scope,
-        damage_source_filter: None,
+        damage_source_filter,
     }
+}
+
+/// CR 615.3: Optional trailing "by [source-filter]" on prevent clauses
+/// (Arachnogenesis: "by non-Spider creatures").
+fn parse_prevent_damage_source_filter(lower: &str) -> Option<TargetFilter> {
+    let by_idx = lower.rfind(" by ")?;
+    let subject = lower[by_idx + 4..].trim().trim_end_matches('.');
+    let rest = subject.strip_prefix("non-")?;
+    let subtype_lower = rest.strip_suffix(" creatures")?;
+    if subtype_lower.is_empty() || subtype_lower.contains(' ') {
+        return None;
+    }
+    let subtype = format!(
+        "{}{}",
+        &subtype_lower[..1].to_uppercase(),
+        &subtype_lower[1..]
+    );
+    Some(TargetFilter::Typed(TypedFilter::creature().with_type(
+        TypeFilter::Non(Box::new(TypeFilter::Subtype(subtype))),
+    )))
 }
 
 /// CR 113.3 + CR 604.1: Parse "gain `<quoted ability>`" / `"gain "<...>" until
@@ -3468,6 +3518,13 @@ pub(super) fn lower_imperative_ast(ast: ImperativeAst) -> Effect {
 
 pub(super) fn parse_put_ast(text: &str, lower: &str) -> Option<PutImperativeAst> {
     tag::<_, _, OracleError<'_>>("put ").parse(lower).ok()?;
+
+    if tag::<_, _, OracleError<'_>>("put that many cards from the top of your library into your hand")
+        .parse(lower)
+        .is_ok()
+    {
+        return Some(PutImperativeAst::DrawMatchingExileCount);
+    }
 
     if let Ok((after, _)) = tag::<_, _, OracleError<'_>>("put the top ").parse(lower) {
         if nom_primitives::scan_contains(lower, "graveyard") {
@@ -3642,6 +3699,12 @@ pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
             target: TargetFilter::Any,
             count: QuantityExpr::Fixed { value: 1 },
             position: LibraryPosition::NthFromTop { n },
+        },
+        PutImperativeAst::DrawMatchingExileCount => Effect::Draw {
+            count: QuantityExpr::Ref {
+                qty: QuantityRef::CardsExiledBySource,
+            },
+            target: TargetFilter::Controller,
         },
     }
 }
@@ -5918,12 +5981,12 @@ pub(super) fn parse_imperative_family_ast(
             }
         }
 
-        // "look" → "look at the top" (step 5) → "look at hand" (step 10)
-        "look" => parse_search_and_creation_ast(text, lower, ctx) // allow-noncombinator: pre-existing match dispatch, only threading ctx through
-            .map(|ast| ImperativeFamilyAst::Structured(ImperativeAst::SearchCreation(ast)))
+        // "look" → exiled/hand targets (step 4) → "look at the top" (step 5)
+        "look" => parse_hand_reveal_ast(text, lower, ctx)
+            .map(|ast| ImperativeFamilyAst::Structured(ImperativeAst::HandReveal(ast)))
             .or_else(|| {
-                parse_hand_reveal_ast(text, lower, ctx)
-                    .map(|ast| ImperativeFamilyAst::Structured(ImperativeAst::HandReveal(ast)))
+                parse_search_and_creation_ast(text, lower, ctx) // allow-noncombinator: pre-existing match dispatch, only threading ctx through
+                    .map(|ast| ImperativeFamilyAst::Structured(ImperativeAst::SearchCreation(ast)))
             }),
 
         // "gets"/"get" → try player counter first, then the subjectless

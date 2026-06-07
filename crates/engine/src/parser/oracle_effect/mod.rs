@@ -55,6 +55,8 @@ pub(crate) use self::token::parse_token_description;
 use std::str::FromStr;
 
 use crate::parser::oracle_nom::error::OracleError;
+#[cfg(test)]
+use crate::parser::oracle_trigger::parse_trigger_line;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::{anychar, multispace1};
@@ -43981,7 +43983,6 @@ mod snapshot_tests {
 
 #[test]
 fn issue_2402_hazel_copy_target_token_trigger_parses() {
-    use crate::parser::oracle_trigger::parse_trigger_line;
     let def = parse_trigger_line(
         "At the beginning of your end step, create a token that's a copy of target token you control. If that token is a Squirrel, instead create two tokens that are copies of it.",
         "Hazel of the Rootbloom",

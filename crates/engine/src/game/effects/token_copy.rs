@@ -980,7 +980,7 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::types::ability::{
         AbilityDefinition, AbilityKind, ContinuousModification, ControllerRef,
-        CostPaidObjectSnapshot, Effect, FilterProp, ObjectScope, QuantityExpr,
+        CostPaidObjectSnapshot, Effect, FilterProp, ObjectScope, PtValue, QuantityExpr,
         QuantityModification, QuantityRef, ReplacementDefinition, RoundingMode, TargetFilter,
         TargetRef, TypeFilter, TypedFilter,
     };
@@ -1724,31 +1724,12 @@ mod tests {
         assert!(token.is_token);
     }
 
-    /// Issue #2402: Hazel of the Rootbloom — copy a token target whose live
-    /// characteristics were never mirrored into `base_*` fields.
+    /// Issue #2402: Hazel of the Rootbloom — copy a non-Squirrel token target
+    /// whose live characteristics must be mirrored into `base_*` fields by the
+    /// real token creation path before copy-token resolution reads copiable values.
     #[test]
     fn issue_2402_copy_token_of_token_target_creates_copy() {
         let mut state = GameState::new_two_player(42);
-
-        let squirrel = create_object(
-            &mut state,
-            CardId(0),
-            PlayerId(0),
-            "Squirrel".to_string(),
-            Zone::Battlefield,
-        );
-        {
-            let token = state.objects.get_mut(&squirrel).unwrap();
-            token.is_token = true;
-            token.power = Some(1);
-            token.toughness = Some(1);
-            token.card_types = CardType {
-                supertypes: vec![],
-                core_types: vec![CoreType::Creature],
-                subtypes: vec!["Squirrel".to_string()],
-            };
-        }
-
         let source_id = create_object(
             &mut state,
             CardId(2),
@@ -1756,6 +1737,39 @@ mod tests {
             "Hazel".to_string(),
             Zone::Battlefield,
         );
+        let create_food = ResolvedAbility::new(
+            Effect::Token {
+                name: "Food".to_string(),
+                power: PtValue::Fixed(0),
+                toughness: PtValue::Fixed(0),
+                types: vec!["Artifact".to_string(), "Food".to_string()],
+                colors: vec![],
+                keywords: vec![],
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                owner: TargetFilter::Controller,
+                attach_to: None,
+                enters_attacking: false,
+                supertypes: vec![],
+                static_abilities: vec![],
+                enter_with_counters: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        crate::game::effects::token::resolve(&mut state, &create_food, &mut events).unwrap();
+        crate::game::layers::evaluate_layers(&mut state);
+        let food = state.last_created_token_ids[0];
+        let food_token = state.objects.get(&food).unwrap();
+        assert!(food_token.base_characteristics_initialized);
+        assert_eq!(food_token.base_name, "Food");
+        assert_eq!(
+            food_token.base_card_types.core_types,
+            vec![CoreType::Artifact]
+        );
+        assert_eq!(food_token.base_card_types.subtypes, vec!["Food"]);
 
         let ability = ResolvedAbility::new(
             Effect::CopyTokenOf {
@@ -1768,19 +1782,18 @@ mod tests {
                 extra_keywords: vec![],
                 additional_modifications: vec![],
             },
-            vec![TargetRef::Object(squirrel)],
+            vec![TargetRef::Object(food)],
             source_id,
             PlayerId(0),
         );
-        let mut events = Vec::new();
         resolve(&mut state, &ability, &mut events).unwrap();
 
         let copy_id = ObjectId(state.next_object_id - 1);
         let copy = state.objects.get(&copy_id).unwrap();
         assert!(copy.is_token);
-        assert_eq!(copy.name, "Squirrel");
-        assert_eq!(copy.power, Some(1));
-        assert_eq!(copy.toughness, Some(1));
+        assert_eq!(copy.name, "Food");
+        assert_eq!(copy.card_types.core_types, vec![CoreType::Artifact]);
+        assert_eq!(copy.card_types.subtypes, vec!["Food"]);
     }
 
     /// CR 109.4 + CR 111.2: "target opponent creates a token that's a copy of

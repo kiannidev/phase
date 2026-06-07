@@ -3507,7 +3507,7 @@ fn resolve_chain_body(
         // a permanent this way" / ZoneChangedThisWay gates see every player's
         // sacrifice — not only the last iteration's overwrite of
         // `last_zone_changed_ids`.
-        state.last_zone_changed_ids = scoped_events
+        let mut ids: Vec<ObjectId> = scoped_events
             .iter()
             .filter_map(|event| match event {
                 GameEvent::ZoneChanged { object_id, .. }
@@ -3515,6 +3515,9 @@ fn resolve_chain_body(
                 _ => None,
             })
             .collect();
+        ids.sort_unstable_by_key(|id| id.0);
+        ids.dedup();
+        state.last_zone_changed_ids = ids;
         if next_sub_needs_tracked_set(ability) {
             publish_tracked_set(state, affected_ids);
         }
@@ -4878,17 +4881,18 @@ fn controller_sacrificed_matching_this_way(
         .unwrap_or_else(|| state.last_zone_changed_ids.clone());
 
     candidate_ids.iter().any(|&id| {
-        let sacrificed_by_controller = state
-            .lki_cache
-            .get(&id)
-            .is_some_and(|lki| lki.controller == controller || lki.owner == controller);
-        if !sacrificed_by_controller {
-            return false;
-        }
         if let Some(lki) = state.lki_cache.get(&id) {
-            crate::game::filter::matches_target_filter_on_lki_snapshot(state, id, lki, filter, &ctx)
+            let sacrificed_by_controller = lki.controller == controller || lki.owner == controller;
+            sacrificed_by_controller
+                && crate::game::filter::matches_target_filter_on_lki_snapshot(
+                    state, id, lki, filter, &ctx,
+                )
+        } else if let Some(obj) = state.objects.get(&id) {
+            let sacrificed_by_controller = obj.controller == controller || obj.owner == controller;
+            sacrificed_by_controller
+                && crate::game::filter::matches_target_filter(state, id, filter, &ctx)
         } else {
-            crate::game::filter::matches_target_filter(state, id, filter, &ctx)
+            false
         }
     })
 }

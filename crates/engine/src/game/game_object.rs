@@ -1181,6 +1181,8 @@ impl GameObject {
         self.power = self.base_power;
         self.toughness = self.base_toughness;
         self.loyalty = self.base_loyalty;
+        // CR 310.4a + CR 400.7: Battle defense reverts to printed baseline off the battlefield.
+        self.defense = self.base_defense;
         self.card_types = self.base_card_types.clone();
         self.mana_cost = self.base_mana_cost.clone();
         self.keywords = self.base_keywords.clone();

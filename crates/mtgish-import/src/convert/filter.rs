@@ -16,9 +16,9 @@ use engine::types::mana::ManaColor;
 use crate::convert::quantity::convert as convert_quantity;
 use crate::convert::result::{ConvResult, ConversionGap};
 use crate::schema::types::{
-    ArtifactType, CardType, CardtypeVariable, CheckHasable, ChoosableColor, Color, Comparison,
-    CounterType, CreatureType, CreatureTypeVariable, DamageSources, EnchantmentType, LandType,
-    NameFilter, Permanent, Permanents, PlaneswalkerType, Player, Players, SuperType,
+    ArtifactType, CardInExile, CardType, CardtypeVariable, CheckHasable, ChoosableColor, Color,
+    Comparison, CounterType, CreatureType, CreatureTypeVariable, DamageSources, EnchantmentType,
+    LandType, NameFilter, Permanent, Permanents, PlaneswalkerType, Player, Players, SuperType,
 };
 
 fn color_count_prop(comparator: Comparator, count: u8) -> FilterProp {
@@ -1100,15 +1100,23 @@ pub(crate) fn spells_to_filter(s: &crate::schema::types::Spells) -> ConvResult<T
         S::Not(inner) => TargetFilter::Not {
             filter: Box::new(spells_to_filter(inner)?),
         },
-        // CR 601.2f: Semblance Anvil — spells sharing a card type with the
-        // imprinted (exiled-by-source) card cost less to cast.
-        S::SharesACardtypeWithExiledCard(_) => TargetFilter::Typed(TypedFilter::card().properties(
-            vec![FilterProp::SharesQuality {
-                quality: SharedQuality::CardType,
-                reference: Some(Box::new(TargetFilter::ExiledBySource)),
-                relation: SharedQualityRelation::Shares,
-            }],
-        )),
+        // CR 601.2f + CR 607.2a + CR 607.3: Semblance Anvil-style spell cost
+        // reduction compares against "the exiled card" linked to the source.
+        S::SharesACardtypeWithExiledCard(card) => {
+            if !matches!(card.as_ref(), CardInExile::TheExiledCard) {
+                return Err(ConversionGap::EnginePrerequisiteMissing {
+                    engine_type: "TargetFilter",
+                    needed_variant: format!("SharesACardtypeWithExiledCard/{:?}", card.as_ref()),
+                });
+            }
+            TargetFilter::Typed(
+                TypedFilter::card().properties(vec![FilterProp::SharesQuality {
+                    quality: SharedQuality::CardType,
+                    reference: Some(Box::new(TargetFilter::ExiledBySource)),
+                    relation: SharedQualityRelation::Shares,
+                }]),
+            )
+        }
 
         other => {
             return Err(ConversionGap::EnginePrerequisiteMissing {

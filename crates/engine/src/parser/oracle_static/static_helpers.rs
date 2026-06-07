@@ -105,9 +105,9 @@ fn parse_cost_mod_spell_type_prefix(type_desc: &str) -> Option<TargetFilter> {
     filter.map(remap_cost_mod_imprint_exile_reference)
 }
 
-/// CR 603.10a: Cost-mod lines such as Semblance Anvil reference "the exiled
-/// card" as the imprinted card exiled by the source permanent. The shared-
-/// quality nom parser emits `TrackedSet` for that phrase; remap to
+/// CR 607.2a + CR 607.3: Cost-mod lines such as Semblance Anvil reference
+/// "the exiled card" as the imprinted card exiled by the source permanent. The
+/// shared-quality nom parser emits `TrackedSet` for that phrase; remap to
 /// `ExiledBySource` so live `exile_links` resolve the reference at cast time.
 fn remap_cost_mod_imprint_exile_reference(filter: TargetFilter) -> TargetFilter {
     match filter {

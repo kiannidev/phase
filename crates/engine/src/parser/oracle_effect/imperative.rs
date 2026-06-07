@@ -3371,20 +3371,14 @@ fn parse_prevent_effect(text: &str) -> Effect {
 /// CR 615.1: Optional trailing "by [source-filter]" on prevent clauses
 /// (Arachnogenesis: "by non-Spider creatures").
 fn parse_prevent_damage_source_filter(text: &str, lower: &str) -> Option<TargetFilter> {
-    let mut cursor = lower;
-    let mut after_by = None;
-    while let Ok((rest, _)) =
-        preceded(take_until::<_, _, OracleError<'_>>(" by "), tag(" by ")).parse(cursor)
-    {
-        after_by = Some(rest);
-        if rest.is_empty() {
-            break;
-        }
-        cursor = rest;
-    }
-    let filter_lower = after_by?;
-    let after_by_offset = lower.len() - filter_lower.len();
-    let filter_text = text[after_by_offset..].trim().trim_end_matches('.');
+    let (_, filter_text) = nom_on_lower(text, lower, |input| {
+        value(
+            (),
+            (take_until::<_, _, OracleError<'_>>(" by "), tag(" by ")),
+        )
+        .parse(input)
+    })?;
+    let filter_text = filter_text.trim().trim_end_matches('.');
     let (filter, rem) = parse_type_phrase(filter_text);
     if rem.trim().is_empty() && matches!(filter, TargetFilter::Typed(_)) {
         Some(filter)
@@ -3531,7 +3525,7 @@ pub(super) fn parse_put_ast(text: &str, lower: &str) -> Option<PutImperativeAst>
     })
     .is_some()
     {
-        return Some(PutImperativeAst::DrawMatchingExileCount);
+        return Some(PutImperativeAst::PutTopCardsIntoHandMatchingExileCount);
     }
 
     if let Ok((after, _)) = tag::<_, _, OracleError<'_>>("put the top ").parse(lower) {
@@ -3708,11 +3702,12 @@ pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
             count: QuantityExpr::Fixed { value: 1 },
             position: LibraryPosition::NthFromTop { n },
         },
-        PutImperativeAst::DrawMatchingExileCount => Effect::Draw {
+        PutImperativeAst::PutTopCardsIntoHandMatchingExileCount => Effect::Mill {
             count: QuantityExpr::Ref {
                 qty: QuantityRef::CardsExiledBySource,
             },
             target: TargetFilter::Controller,
+            destination: Zone::Hand,
         },
     }
 }

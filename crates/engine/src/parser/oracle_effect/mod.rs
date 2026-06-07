@@ -35292,15 +35292,20 @@ mod tests {
             effects.iter().any(|e| {
                 matches!(
                     e,
-                    Effect::Draw {
+                    Effect::Mill {
                         count: QuantityExpr::Ref {
                             qty: QuantityRef::CardsExiledBySource,
                         },
+                        destination: Zone::Hand,
                         ..
                     }
                 )
             }),
-            "expected library draw tied to CardsExiledBySource, got {effects:?}"
+            "expected top-library move to hand tied to CardsExiledBySource, got {effects:?}"
+        );
+        assert!(
+            !effects.iter().any(|e| matches!(e, Effect::Draw { .. })),
+            "CR 121.5: Scroll Rack puts cards into hand without drawing them"
         );
         assert!(
             effects.iter().any(|e| {

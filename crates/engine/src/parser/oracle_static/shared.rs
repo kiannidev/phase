@@ -1484,9 +1484,11 @@ pub(crate) fn parse_subtype_or_list(input: &str) -> Option<TargetFilter> {
     parse_subtype_or_list_with_word_parser(input, parse_subtype_word_capitalized)
 }
 
-/// CR 205.3m: Lowercase oracle subtype lists (e.g. Kenessos conditional gates).
-pub(crate) fn parse_subtype_or_list_insensitive(input: &str) -> Option<TargetFilter> {
-    parse_subtype_or_list_with_word_parser(input, parse_subtype_word_any_case)
+/// CR 205.3m: Lowercase subtype list prefix plus the unconsumed suffix.
+pub(crate) fn parse_subtype_or_list_insensitive_prefix(
+    input: &str,
+) -> Option<(TargetFilter, &str)> {
+    parse_subtype_or_list_prefix_with_word_parser(input, parse_subtype_word_any_case)
 }
 
 fn parse_subtype_word_capitalized(input: &str) -> nom::IResult<&str, &str, OracleError<'_>> {
@@ -1510,6 +1512,17 @@ fn parse_subtype_or_list_with_word_parser(
     input: &str,
     parse_subtype_word: fn(&str) -> nom::IResult<&str, &str, OracleError<'_>>,
 ) -> Option<TargetFilter> {
+    let (filter, rest) = parse_subtype_or_list_prefix_with_word_parser(input, parse_subtype_word)?;
+    if !rest.is_empty() && !rest.starts_with(' ') && !rest.starts_with('.') {
+        return None;
+    }
+    Some(filter)
+}
+
+fn parse_subtype_or_list_prefix_with_word_parser(
+    input: &str,
+    parse_subtype_word: fn(&str) -> nom::IResult<&str, &str, OracleError<'_>>,
+) -> Option<(TargetFilter, &str)> {
     fn parse_list_separator(input: &str) -> nom::IResult<&str, &str, OracleError<'_>> {
         alt((
             tag(", and/or a "),
@@ -1534,9 +1547,6 @@ fn parse_subtype_or_list_with_word_parser(
         separated_list1(parse_list_separator, parse_subtype_word)
             .parse(input)
             .ok()?;
-    if !rest.is_empty() && !rest.starts_with(' ') && !rest.starts_with('.') {
-        return None;
-    }
     let filters: Vec<TargetFilter> = words
         .iter()
         .map(|w| {
@@ -1547,9 +1557,9 @@ fn parse_subtype_or_list_with_word_parser(
         })
         .collect();
     if filters.len() == 1 {
-        filters.into_iter().next()
+        filters.into_iter().next().map(|filter| (filter, rest))
     } else {
-        Some(TargetFilter::Or { filters })
+        Some((TargetFilter::Or { filters }, rest))
     }
 }
 

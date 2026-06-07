@@ -16548,8 +16548,19 @@ mod idempotency_tests {
     //! the engine's per-event dedup (keyed on `(ObjectId, trig_idx)`) to fail
     //! — distinct `trig_idx` values register separately.
     use super::*;
-    use crate::types::ability::QuantityExpr;
+    use crate::game::ability_utils::build_resolved_from_def;
+    use crate::game::effects::resolve_ability_chain;
+    use crate::game::stack::resolve_top;
+    use crate::game::triggers::check_delayed_triggers;
+    use crate::game::zones::create_object;
+    use crate::types::ability::{
+        CountScope, QuantityExpr, QuantityRef, TargetRef, TypeFilter, ZoneRef,
+    };
     use crate::types::card_type::CoreType;
+    use crate::types::events::GameEvent;
+    use crate::types::game_state::GameState;
+    use crate::types::identifiers::CardId;
+    use crate::types::player::PlayerId;
 
     #[test]
     fn synthesize_mobilize_is_idempotent() {
@@ -16603,10 +16614,86 @@ mod idempotency_tests {
         );
     }
 
+    /// CR 702.181a: Mobilized tokens are sacrificed at the beginning of the
+    /// next end step, not the end of combat. This drives the synthesized
+    /// Token -> CreateDelayedTrigger(Sacrifice LastCreated) chain through the
+    /// runtime resolver so reverting to `Duration::UntilEndOfCombat` fails.
+    #[test]
+    fn synthesize_mobilize_runtime_sacrifices_tokens_at_next_end_step() {
+        let mut face = CardFace::default();
+        face.keywords
+            .push(Keyword::Mobilize(QuantityExpr::Fixed { value: 2 }));
+        synthesize_mobilize(&mut face);
+
+        let mut state = GameState::new_two_player(42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Mobilizer".to_string(),
+            Zone::Battlefield,
+        );
+        let execute = face
+            .triggers
+            .first()
+            .and_then(|trigger| trigger.execute.as_deref())
+            .expect("mobilize trigger must have an execute body");
+        let ability = build_resolved_from_def(execute, source_id, PlayerId(0));
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        let mobilized_tokens = state.last_created_token_ids.clone();
+        assert_eq!(
+            mobilized_tokens.len(),
+            2,
+            "Mobilize 2 must create exactly two tracked tokens"
+        );
+        assert_eq!(state.delayed_triggers.len(), 1);
+        assert_eq!(
+            state.delayed_triggers[0].condition,
+            DelayedTriggerCondition::AtNextPhase { phase: Phase::End }
+        );
+        assert_eq!(
+            state.delayed_triggers[0].ability.targets,
+            mobilized_tokens
+                .iter()
+                .copied()
+                .map(TargetRef::Object)
+                .collect::<Vec<_>>(),
+            "end-step cleanup must snapshot the exact mobilized tokens"
+        );
+
+        let stacked = check_delayed_triggers(
+            &mut state,
+            &[GameEvent::PhaseChanged {
+                phase: Phase::EndCombat,
+            }],
+        );
+        assert!(
+            stacked.is_empty(),
+            "Mobilize cleanup must not fire at end of combat"
+        );
+        for token_id in &mobilized_tokens {
+            assert!(state.battlefield.contains(token_id));
+        }
+
+        let stacked =
+            check_delayed_triggers(&mut state, &[GameEvent::PhaseChanged { phase: Phase::End }]);
+        assert_eq!(stacked.len(), 1, "end-step cleanup must stack once");
+        resolve_top(&mut state, &mut events);
+
+        for token_id in mobilized_tokens {
+            assert_eq!(
+                state.objects[&token_id].zone,
+                Zone::Graveyard,
+                "mobilized token must be sacrificed at the next end step"
+            );
+            assert!(!state.battlefield.contains(&token_id));
+        }
+    }
+
     #[test]
     fn synthesize_mobilize_preserves_dynamic_quantity() {
-        use crate::types::ability::{CountScope, QuantityRef, TypeFilter, ZoneRef};
-
         let quantity = QuantityExpr::Ref {
             qty: QuantityRef::ZoneCardCount {
                 zone: ZoneRef::Graveyard,

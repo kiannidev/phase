@@ -2121,6 +2121,59 @@ fn spell_object_matches_property(
             ctx.spell_object_id
                 .is_some_and(|spell_id| spell_id != ctx.source_id)
         }),
+        FilterProp::SharesQuality {
+            quality,
+            reference,
+            relation,
+        } => {
+            let Some(context) = context else {
+                return false;
+            };
+            let Some(spell_id) = context.spell_object_id else {
+                return false;
+            };
+            let Some(spell_obj) = context.state.objects.get(&spell_id) else {
+                return false;
+            };
+            let source_obj = context.state.objects.get(&context.source_id);
+            let source = SourceContext {
+                id: context.source_id,
+                controller: Some(context.source_controller),
+                attached_to: source_obj.and_then(|o| o.attached_to.clone()),
+                source_is_aura: source_obj
+                    .is_some_and(|o| o.card_types.subtypes.iter().any(|s| s == "Aura")),
+                source_is_equipment: source_obj
+                    .is_some_and(|o| o.card_types.subtypes.iter().any(|s| s == "Equipment")),
+                chosen_creature_type: source_obj.and_then(|o| o.chosen_creature_type()),
+                chosen_attributes: source_obj
+                    .map(|o| o.chosen_attributes.as_slice())
+                    .unwrap_or(&[]),
+                ability: None,
+                recipient_id: None,
+            };
+            let shares = reference.as_ref().is_none_or(|reference_filter| {
+                object_shares_quality_with_reference_filter(
+                    context.state,
+                    spell_obj,
+                    quality,
+                    reference_filter,
+                    &source,
+                )
+            });
+            match relation {
+                SharedQualityRelation::Shares => shares,
+                SharedQualityRelation::DoesNotShare => {
+                    !shares
+                        && (!matches!(quality, SharedQuality::Name)
+                            || !object_shared_quality_values(
+                                spell_obj,
+                                quality,
+                                &context.state.all_creature_types,
+                            )
+                            .is_empty())
+                }
+            }
+        }
         _ => spell_record_matches_property(record, prop),
     }
 }

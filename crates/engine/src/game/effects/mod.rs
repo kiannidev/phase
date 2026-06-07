@@ -2170,9 +2170,10 @@ fn effect_references_tracked_set(effect: &Effect) -> bool {
             return true;
         }
     }
-    // CR 603.7: `CopyTokenOf` may carry `TrackedSet` on `target` while
-    // `target_filter()` surfaces `owner` (context-ref copy sources). Sin,
-    // Spira's Punishment — random exile publishes the set for the chained copy.
+    // CR 608.2c + CR 707.2: `CopyTokenOf` may carry `TrackedSet` on
+    // `target` while `target_filter()` surfaces `owner` (context-ref copy
+    // sources). Sin, Spira's Punishment — random exile publishes the set for
+    // the chained copy.
     if let Effect::CopyTokenOf { target, .. } = effect {
         if filter_references_tracked_set(target) {
             return true;

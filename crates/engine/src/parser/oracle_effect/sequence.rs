@@ -2799,17 +2799,7 @@ pub(super) fn parse_dig_from_among(lower: &str, original: &str) -> Option<Contin
     // Experiment): "reveal up to N <filter> cards from among them, then put the
     // rest on the bottom" — the kept cards are NOT auto-routed; subsequent
     // sub_abilities route them by type via `TargetFilter::TrackedSetFiltered`.
-    let destination = if nom_primitives::scan_contains(lower, "onto the battlefield") {
-        Some(Zone::Battlefield)
-    } else if nom_primitives::scan_contains(lower, "into your hand")
-        || nom_primitives::scan_contains(lower, "into their hand")
-        || nom_primitives::scan_contains(lower, "to your hand")
-        || nom_primitives::scan_contains(lower, "to their hand")
-    {
-        Some(Zone::Hand)
-    } else {
-        None
-    };
+    let (destination, enter_tapped) = parse_dig_kept_destination(lower);
 
     // "put N of them into your hand [and the rest on the bottom]" — no filter, count explicit.
     // Must be checked BEFORE the "from among" path since "of them" appears in both forms.
@@ -2849,7 +2839,7 @@ pub(super) fn parse_dig_from_among(lower: &str, original: &str) -> Option<Contin
             rest_destination,
             enters_under: None,
             face_down_profile: None,
-            enter_tapped: false,
+            enter_tapped,
         });
     }
 
@@ -2970,7 +2960,7 @@ pub(super) fn parse_dig_from_among(lower: &str, original: &str) -> Option<Contin
             rest_destination: None,
             enters_under,
             face_down_profile,
-            enter_tapped: false,
+            enter_tapped,
         });
     }
 
@@ -3051,7 +3041,6 @@ pub(super) fn parse_dig_from_among(lower: &str, original: &str) -> Option<Contin
     } else {
         None
     };
-    let enter_tapped = nom_primitives::scan_contains(lower, "battlefield tapped");
 
     Some(ContinuationAst::DigFromAmong {
         quantity,
@@ -3062,6 +3051,85 @@ pub(super) fn parse_dig_from_among(lower: &str, original: &str) -> Option<Contin
         face_down_profile,
         enter_tapped,
     })
+}
+
+fn parse_dig_kept_destination(lower: &str) -> (Option<Zone>, bool) {
+    if let Some(parsed) = parse_dig_from_among_destination(lower) {
+        return parsed;
+    }
+
+    let destination = if nom_primitives::scan_contains(lower, "onto the battlefield") {
+        Some(Zone::Battlefield)
+    } else if nom_primitives::scan_contains(lower, "into your hand")
+        || nom_primitives::scan_contains(lower, "into their hand")
+        || nom_primitives::scan_contains(lower, "to your hand")
+        || nom_primitives::scan_contains(lower, "to their hand")
+    {
+        Some(Zone::Hand)
+    } else {
+        None
+    };
+    (destination, false)
+}
+
+fn parse_dig_from_among_destination(lower: &str) -> Option<(Option<Zone>, bool)> {
+    let (tail, _) = preceded(
+        take_until::<_, _, OracleError<'_>>("from among"),
+        (
+            tag::<_, _, OracleError<'_>>("from among "),
+            alt((tag("them"), tag("those cards"), tag("those"))),
+        ),
+    )
+    .parse(lower)
+    .ok()?;
+    parse_dig_destination_tail(tail)
+}
+
+fn parse_dig_destination_tail(input: &str) -> Option<(Option<Zone>, bool)> {
+    let input = input.trim_start();
+    let (input, _) = opt(alt((tag::<_, _, OracleError<'_>>("and "), tag("then "))))
+        .parse(input)
+        .ok()?;
+    let input = input.trim_start();
+    let (input, _) = opt(alt((
+        tag::<_, _, OracleError<'_>>("put it "),
+        tag("put them "),
+        tag("put that card "),
+        tag("put those cards "),
+        tag("put the card "),
+        tag("return it "),
+        tag("return them "),
+        tag("return that card "),
+    )))
+    .parse(input)
+    .ok()?;
+    let input = input.trim_start();
+
+    if let Ok((rest, _)) = alt((
+        tag::<_, _, OracleError<'_>>("onto the battlefield"),
+        tag("to the battlefield"),
+    ))
+    .parse(input)
+    {
+        let (_, tapped) = opt(tag::<_, _, OracleError<'_>>(" tapped"))
+            .parse(rest)
+            .ok()?;
+        return Some((Some(Zone::Battlefield), tapped.is_some()));
+    }
+
+    if alt((
+        tag::<_, _, OracleError<'_>>("into your hand"),
+        tag("into their hand"),
+        tag("to your hand"),
+        tag("to their hand"),
+    ))
+    .parse(input)
+    .is_ok()
+    {
+        return Some((Some(Zone::Hand), false));
+    }
+
+    None
 }
 
 /// CR 708.2a + CR 205.1a: Parse a "They're N/M [types] [subtypes] creatures."
@@ -5199,6 +5267,22 @@ mod tests {
                 face_down_profile: None,
                 enter_tapped: false,
             })
+        );
+    }
+
+    #[test]
+    fn from_among_enter_tapped_is_local_to_kept_destination() {
+        assert_eq!(
+            parse_dig_kept_destination(
+                "put a land card from among them onto the battlefield tapped. put the rest on the bottom of your library.",
+            ),
+            (Some(Zone::Battlefield), true)
+        );
+        assert_eq!(
+            parse_dig_kept_destination(
+                "put a land card from among them onto the battlefield. put the rest onto the battlefield tapped.",
+            ),
+            (Some(Zone::Battlefield), false)
         );
     }
 

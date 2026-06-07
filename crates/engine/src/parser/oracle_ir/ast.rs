@@ -302,7 +302,8 @@ pub(crate) enum ContinuationAst {
         /// Cyberman artifact creatures."). `None` = normal face-up entry.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         face_down_profile: Option<FaceDownProfile>,
-        /// CR 508.4: "onto the battlefield tapped" on the from-among put-step.
+        /// CR 614.1 / CR 110.5b: "onto the battlefield tapped" on the
+        /// from-among put-step.
         #[serde(default)]
         enter_tapped: bool,
     },

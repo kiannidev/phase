@@ -2461,7 +2461,8 @@ pub enum WaitingFor {
         /// Source ability's object ID for filter context.
         #[serde(default)]
         source_id: Option<ObjectId>,
-        /// CR 508.4: Kept cards entering the battlefield via this dig are tapped.
+        /// CR 614.1 / CR 110.5b: Kept cards entering the battlefield via this
+        /// dig are tapped.
         #[serde(default)]
         enter_tapped: bool,
     },

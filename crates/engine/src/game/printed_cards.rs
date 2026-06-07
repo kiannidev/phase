@@ -174,7 +174,8 @@ pub fn apply_card_face_to_object(obj: &mut GameObject, card_face: &CardFace) {
     // CR 306.5c + CR 310.4c: Rehydration must not clobber live counter-tracked
     // loyalty/defense. `rehydrate_game_from_card_db` re-applies printed faces
     // mid-game (multiplayer sync); the counter map is authoritative on the
-    // battlefield, mirroring the Class-level preservation gate above.
+    // battlefield, while off-battlefield loyalty/defense intentionally remains
+    // the printed value per CR 306.5a / CR 310.4a.
     if was_initialized && obj.zone == Zone::Battlefield {
         if let Some(&loyalty_counters) = obj.counters.get(&CounterType::Loyalty) {
             obj.loyalty = Some(loyalty_counters);
@@ -1984,6 +1985,60 @@ mod tests {
                 .counters
                 .get(&CounterType::Loyalty),
             Some(&1)
+        );
+    }
+
+    /// CR 310.4c: Rehydration must preserve live defense counters on battlefield
+    /// battles, matching the planeswalker loyalty path.
+    #[test]
+    fn rehydrate_preserves_battle_defense_counters() {
+        let mut face = test_face(
+            "Invasion of Testoria",
+            "invasion-of-testoria-oracle-id",
+            vec![CoreType::Battle],
+            ManaCost::default(),
+        );
+        face.defense = Some("5".to_string());
+        let export = serde_json::json!({
+            "invasion of testoria": serde_json::to_value(&face).unwrap(),
+        })
+        .to_string();
+        let db = CardDatabase::from_json_str(&export).expect("export db should parse");
+
+        let mut state = GameState::new_two_player(42);
+        let battle_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Invasion of Testoria".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&battle_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Battle);
+            obj.base_defense = Some(5);
+            obj.defense = Some(2);
+            obj.counters.insert(CounterType::Defense, 2);
+            obj.base_characteristics_initialized = true;
+            obj.printed_ref = printed_ref_from_face(&face);
+            obj.base_printed_ref = obj.printed_ref.clone();
+        }
+
+        rehydrate_game_from_card_db(&mut state, &db);
+
+        assert_eq!(
+            state.objects.get(&battle_id).unwrap().defense,
+            Some(2),
+            "rehydration must not reset defense to printed base when counters differ"
+        );
+        assert_eq!(
+            state
+                .objects
+                .get(&battle_id)
+                .unwrap()
+                .counters
+                .get(&CounterType::Defense),
+            Some(&2)
         );
     }
 

@@ -25822,6 +25822,21 @@ mod tests {
     }
 
     #[test]
+    fn effect_any_color_among_unparsed_filter_does_not_fall_back_to_unrestricted_mana() {
+        let e = parse_effect("Add one mana of any color among cards you own outside the game");
+        assert!(
+            !matches!(
+                e,
+                Effect::Mana {
+                    produced: ManaProduction::AnyOneColor { .. },
+                    ..
+                }
+            ),
+            "unsupported 'among' filters must not become unrestricted WUBRG mana"
+        );
+    }
+
+    #[test]
     fn effect_add_mana_any_color_in_commanders_color_identity() {
         // CR 903.4 + CR 903.4f: Path of Ancestry — "Add one mana of any color
         // in your commander's color identity" resolves to

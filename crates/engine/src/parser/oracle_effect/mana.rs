@@ -2,7 +2,7 @@ use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::char;
-use nom::combinator::{all_consuming, map, map_opt, opt, rest as nom_rest, value};
+use nom::combinator::{all_consuming, map, map_opt, not, opt, rest as nom_rest, value};
 use nom::multi::many1;
 use nom::sequence::{delimited, preceded, separated_pair, terminated};
 use nom::Parser;
@@ -352,6 +352,12 @@ pub(super) fn try_parse_add_mana_effect(text: &str) -> Option<Effect> {
                     filter,
                     contribution,
                 }
+            } else if nom_on_lower(after_color.trim(), &after_lower, |i| {
+                value((), tag("among ")).parse(i)
+            })
+            .is_some()
+            {
+                return None;
             } else if nom_on_lower(after_color.trim(), &after_lower, |i| {
                 // CR 903.4 + CR 903.4f: "any color in your commander('s/s')
                 // color identity" — Path of Ancestry, Study Hall. Colors
@@ -1104,7 +1110,10 @@ fn scan_mana_production_type(
                     color_options: all_mana_colors(),
                     contribution,
                 },
-                alt((tag("mana of any one color"), tag("mana of any color"))),
+                terminated(
+                    alt((tag("mana of any one color"), tag("mana of any color"))),
+                    not(tag(" among ")),
+                ),
             ),
             value(
                 ManaProduction::AnyCombination {

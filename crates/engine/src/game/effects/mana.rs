@@ -510,7 +510,7 @@ fn resolve_mana_types_impl(
         // found among permanents matching `filter`. Used by Faeburrow Elder.
         // Returns empty when no colored permanent matches (CR 106.5).
         ManaProduction::DistinctColorsAmongPermanents { filter } => {
-            distinct_colors_among_permanents(state, ability, controller, source_id, filter)
+            distinct_colors_among_permanents(state, ability, source_id, filter)
                 .into_iter()
                 .map(|c| mana_color_to_type(&c))
                 .collect()
@@ -521,8 +521,7 @@ fn resolve_mana_types_impl(
         // → no mana.
         ManaProduction::AnyOneColorAmongPermanents { count, filter, .. } => {
             let amount = resolve_count(count, state, ability, controller, source_id);
-            let color_options =
-                distinct_colors_among_permanents(state, ability, controller, source_id, filter);
+            let color_options = distinct_colors_among_permanents(state, ability, source_id, filter);
             let Some(first) = color_options.first().copied() else {
                 return Vec::new();
             };
@@ -569,12 +568,10 @@ fn resolve_mana_types_impl(
 pub(crate) fn distinct_colors_among_permanents(
     state: &GameState,
     ability: Option<&ResolvedAbility>,
-    controller: crate::types::player::PlayerId,
     source_id: crate::types::identifiers::ObjectId,
     filter: &crate::types::ability::TargetFilter,
 ) -> Vec<crate::types::mana::ManaColor> {
     use crate::game::filter::{matches_target_filter, FilterContext};
-    let _ = controller;
     let filter_ctx = match ability {
         Some(a) => FilterContext::from_ability(a),
         None => FilterContext::from_source(state, source_id),

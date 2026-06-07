@@ -21613,9 +21613,8 @@ mod tests {
     /// permanent.
     #[test]
     fn effect_bounce_all_nonhistoric_nonland_permanents_desynchronization() {
-        let e = parse_effect(
-            "Return each nonland permanent that's not historic to its owner's hand.",
-        );
+        let e =
+            parse_effect("Return each nonland permanent that's not historic to its owner's hand.");
         match e {
             Effect::BounceAll {
                 target: TargetFilter::Typed(filter),
@@ -21635,9 +21634,9 @@ mod tests {
                     filter.properties
                 );
             }
-            other => panic!(
-                "expected BounceAll {{ Permanent, Non(Land), NotHistoric }}, got {other:?}"
-            ),
+            other => {
+                panic!("expected BounceAll {{ Permanent, Non(Land), NotHistoric }}, got {other:?}")
+            }
         }
     }
 

@@ -2981,13 +2981,9 @@ fn matches_filter_prop(
                 || obj.card_types.core_types.contains(&CoreType::Artifact)
                 || obj.card_types.subtypes.iter().any(|s| s == "Saga")
         }
-        FilterProp::NotHistoric => !matches_filter_prop(
-            &FilterProp::Historic,
-            state,
-            obj,
-            object_id,
-            source,
-        ),
+        FilterProp::NotHistoric => {
+            !matches_filter_prop(&FilterProp::Historic, state, obj, object_id, source)
+        }
         // CR 510.1c: Match creatures whose toughness exceeds their power.
         FilterProp::ToughnessGTPower => {
             let power = obj.power.unwrap_or(0);

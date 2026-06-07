@@ -5,7 +5,7 @@ use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::char;
 use nom::combinator::{all_consuming, opt, value};
-use nom::sequence::{preceded, terminated};
+use nom::sequence::{pair, preceded, terminated};
 use nom::Parser;
 
 use super::super::oracle_nom::bridge::{nom_on_lower, nom_parse_lower};
@@ -45,6 +45,24 @@ fn maybe_negate(cond: AbilityCondition, negated: bool) -> AbilityCondition {
 
 fn parse_creature_subtype_or_list(lower: &str) -> Option<TargetFilter> {
     crate::parser::oracle_static::parse_subtype_or_list_insensitive(lower)
+}
+
+/// CR 205.3m: "Kraken, Leviathan, … Serpent creature" → subtype list text.
+fn creature_subtypes_before_creature_word(type_str: &str) -> Option<&str> {
+    let (_, (subtypes, _)) = pair(
+        take_until::<_, _, OracleError<'_>>(" creature"),
+        tag(" creature"),
+    )
+    .parse(type_str)
+    .ok()?;
+    (!subtypes.is_empty()).then_some(subtypes)
+}
+
+fn remainder_after_optional_comma(s: &str) -> &str {
+    opt(tag::<_, _, OracleError<'_>>(", "))
+        .parse(s)
+        .map(|(rest, _)| rest)
+        .unwrap_or(s)
 }
 
 /// CR 205.3: True when a `TypeFilter` references a subtype anywhere in its
@@ -637,9 +655,9 @@ pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityConditio
     // CR 205.3m: Multi-subtype creature gates ("Kraken, Leviathan, Octopus,
     // or Serpent creature card") must not collapse to bare CoreType::Creature.
     if type_word == "creature" && type_str != "creature" {
-        if let Some(subtypes_text) = type_str.strip_suffix(" creature") {
+        if let Some(subtypes_text) = creature_subtypes_before_creature_word(type_str) {
             if let Some(subtype_filter) = parse_creature_subtype_or_list(subtypes_text) {
-                let remainder = after_type.strip_prefix(", ").unwrap_or(after_type);
+                let remainder = remainder_after_optional_comma(after_type);
                 let offset = text.len() - remainder.len();
                 return (
                     Some(maybe_negate(
@@ -2843,7 +2861,7 @@ pub(super) fn try_nom_condition_as_ability_condition(
             ));
         }
         // CR 205.3m: Multi-subtype creature gates on a revealed/peeked card.
-        if let Some(subtypes_text) = rest.strip_suffix(" creature") {
+        if let Some(subtypes_text) = creature_subtypes_before_creature_word(rest) {
             if let Some(subtype_filter) = parse_creature_subtype_or_list(subtypes_text) {
                 return Some(maybe_negate(
                     AbilityCondition::RevealedHasCardType {

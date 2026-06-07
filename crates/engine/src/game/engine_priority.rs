@@ -62,17 +62,6 @@ pub(super) fn run_post_action_pipeline_from(
         }
     }
 
-    // CR 603.3c/d + CR 704.5j (#2420): An ETB trigger that paused mid-
-    // construction (`pending_trigger` / `pending_trigger_entry` set while
-    // `waiting_for` is still `Priority`) must surface its target/mode prompt
-    // before SBAs run. Otherwise `check_legend_rule` overwrites the pending
-    // trigger with `ChooseLegend` and the entering legendary's ability is
-    // silently dropped.
-    if let Some(waiting_for) = begin_pending_trigger_target_selection(state)? {
-        state.waiting_for = waiting_for.clone();
-        return Ok(waiting_for);
-    }
-
     // CR 704.3: SBA/trigger loop. SBAs may generate events (e.g., ZoneChanged for
     // dying creatures) that need trigger processing. Repeat until no new SBAs fire,
     // matching the loop pattern in process_combat_damage_triggers.
@@ -89,6 +78,9 @@ pub(super) fn run_post_action_pipeline_from(
         if events.len() > events_before {
             let sba_events: Vec<_> = events[events_before..].to_vec();
             triggers::process_triggers(state, &sba_events);
+            // CR 603.3d: SBA-generated zone changes (e.g. lethal damage) may put
+            // death triggers on the stack that need target/mode prompts before the
+            // next SBA pass.
             if let Some(waiting_for) = begin_pending_trigger_target_selection(state)? {
                 state.waiting_for = waiting_for.clone();
                 return Ok(waiting_for);

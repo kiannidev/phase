@@ -177,32 +177,33 @@ fn legend_rule_does_not_drop_targeted_etb_trigger_from_sacrificed_copy() {
         }
     }
 
-    // Two legal targets force manual ETB target selection (#2420 repro).
-    assert!(
-        matches!(
-            runner.state().waiting_for,
-            WaitingFor::TriggerTargetSelection { .. }
-        ),
-        "targeted ETB must prompt before legend rule, got {:?}",
-        runner.state().waiting_for
-    );
-
-    runner
-        .choose_first_legal_target()
-        .expect("choose opponent's artifact for ETB");
-
+    // CR 704.3: legend-rule SBA resolves before the stacked ETB's targets are chosen.
     match &runner.state().waiting_for {
         WaitingFor::ChooseLegend { candidates, .. } => {
             assert!(candidates.contains(&first));
             assert!(candidates.contains(&second));
         }
-        other => panic!("expected ChooseLegend after ETB targets, got {other:?}"),
+        other => panic!("expected ChooseLegend before ETB targets, got {other:?}"),
     }
 
     // Sacrifice the newly cast copy to satisfy the legend rule.
     runner
         .act(GameAction::ChooseLegend { keep: first })
         .expect("keep original copy");
+
+    // CR 603.3d: target selection surfaces on pipeline re-entry after SBAs settle.
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::TriggerTargetSelection { .. }
+        ),
+        "targeted ETB must prompt after legend rule, got {:?}",
+        runner.state().waiting_for
+    );
+
+    runner
+        .choose_first_legal_target()
+        .expect("choose opponent's artifact for ETB");
 
     runner.advance_until_stack_empty();
 

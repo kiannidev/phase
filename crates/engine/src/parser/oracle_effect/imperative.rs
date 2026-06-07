@@ -1771,19 +1771,6 @@ pub(super) fn parse_search_and_creation_ast(
             source_zones: details.source_zones,
         });
     }
-    // CR 406.6: "look at the exiled cards" / "look at the cards exiled this way"
-    // (Scroll Rack) — private inspection of the source-linked exile set.
-    if alt((
-        tag::<_, _, OracleError<'_>>("look at the exiled cards"),
-        tag("look at the cards exiled this way"),
-    ))
-    .parse(lower)
-    .is_ok()
-    {
-        return Some(SearchCreationImperativeAst::RevealTarget {
-            target: TargetFilter::ExiledBySource,
-        });
-    }
     // CR 701.16a + CR 701.20a: "look at the top N" (private) and "reveal the top N" (public)
     // both produce Dig — the reveal flag distinguishes visibility semantics.
     if let Some((reveal, rest)) = nom_on_lower(text, lower, |input| {
@@ -2162,7 +2149,6 @@ pub(super) fn lower_search_and_creation_ast(ast: SearchCreationImperativeAst) ->
             enter_tapped: false,
             face_down_profile: None,
         },
-        SearchCreationImperativeAst::RevealTarget { target } => Effect::Reveal { target },
     }
 }
 
@@ -2171,6 +2157,26 @@ pub(super) fn parse_hand_reveal_ast(
     lower: &str,
     _ctx: &mut ParseContext,
 ) -> Option<HandRevealImperativeAst> {
+    // CR 406.6: Private look at source-linked exile (Scroll Rack) — no "hand" in phrase.
+    if let Some((_, after_look_at)) =
+        nom_on_lower(text, lower, |input| value((), tag("look at ")).parse(input))
+    {
+        let after_look_at_lower = &lower[lower.len() - after_look_at.len()..];
+        if alt((
+            tag::<_, _, OracleError<'_>>("the exiled cards"),
+            tag("the cards exiled this way"),
+        ))
+        .parse(after_look_at_lower)
+        .is_ok()
+        {
+            return Some(HandRevealImperativeAst::LookAt {
+                target: TargetFilter::ExiledBySource,
+                count: None,
+                random: false,
+            });
+        }
+    }
+
     if nom_on_lower(text, lower, |input| value((), tag("look at ")).parse(input)).is_some()
         && nom_primitives::scan_contains(lower, "hand")
     {
@@ -2201,20 +2207,6 @@ pub(super) fn parse_hand_reveal_ast(
 
         let (_, after_look_at) =
             nom_on_lower(text, lower, |input| value((), tag("look at ")).parse(input))?;
-        let after_look_at_lower = &lower[lower.len() - after_look_at.len()..];
-        if alt((
-            tag::<_, _, OracleError<'_>>("the exiled cards"),
-            tag("the cards exiled this way"),
-        ))
-        .parse(after_look_at_lower)
-        .is_ok()
-        {
-            return Some(HandRevealImperativeAst::LookAt {
-                target: TargetFilter::ExiledBySource,
-                count: None,
-                random: false,
-            });
-        }
         let (target, _) = parse_target(after_look_at);
         return Some(HandRevealImperativeAst::LookAt {
             target,
@@ -3359,7 +3351,7 @@ fn parse_prevent_effect(text: &str) -> Effect {
         TargetFilter::Any
     };
 
-    let damage_source_filter = parse_prevent_damage_source_filter(&lower);
+    let damage_source_filter = parse_prevent_damage_source_filter(text, &lower);
 
     // CR 615.11 + CR 107.3i: `amount_dynamic` (the "prevent X … where X is
     // <quantity>" override) is populated at chunk level by
@@ -3376,24 +3368,32 @@ fn parse_prevent_effect(text: &str) -> Effect {
     }
 }
 
-/// CR 615.3: Optional trailing "by [source-filter]" on prevent clauses
+/// CR 615.1: Optional trailing "by [source-filter]" on prevent clauses
 /// (Arachnogenesis: "by non-Spider creatures").
-fn parse_prevent_damage_source_filter(lower: &str) -> Option<TargetFilter> {
-    let by_idx = lower.rfind(" by ")?;
-    let subject = lower[by_idx + 4..].trim().trim_end_matches('.');
-    let rest = subject.strip_prefix("non-")?;
-    let subtype_lower = rest.strip_suffix(" creatures")?;
-    if subtype_lower.is_empty() || subtype_lower.contains(' ') {
-        return None;
+fn parse_prevent_damage_source_filter(text: &str, lower: &str) -> Option<TargetFilter> {
+    let mut cursor = lower;
+    let mut after_by = None;
+    while let Ok((rest, _)) = preceded(
+        take_until::<_, _, OracleError<'_>>(" by "),
+        tag(" by "),
+    )
+    .parse(cursor)
+    {
+        after_by = Some(rest);
+        if rest.is_empty() {
+            break;
+        }
+        cursor = rest;
     }
-    let subtype = format!(
-        "{}{}",
-        &subtype_lower[..1].to_uppercase(),
-        &subtype_lower[1..]
-    );
-    Some(TargetFilter::Typed(TypedFilter::creature().with_type(
-        TypeFilter::Non(Box::new(TypeFilter::Subtype(subtype))),
-    )))
+    let filter_lower = after_by?;
+    let after_by_offset = lower.len() - filter_lower.len();
+    let filter_text = text[after_by_offset..].trim().trim_end_matches('.');
+    let (filter, rem) = parse_type_phrase(filter_text);
+    if rem.trim().is_empty() && matches!(filter, TargetFilter::Typed(_)) {
+        Some(filter)
+    } else {
+        None
+    }
 }
 
 /// CR 113.3 + CR 604.1: Parse "gain `<quoted ability>`" / `"gain "<...>" until
@@ -3519,9 +3519,20 @@ pub(super) fn lower_imperative_ast(ast: ImperativeAst) -> Effect {
 pub(super) fn parse_put_ast(text: &str, lower: &str) -> Option<PutImperativeAst> {
     tag::<_, _, OracleError<'_>>("put ").parse(lower).ok()?;
 
-    if tag::<_, _, OracleError<'_>>("put that many cards from the top of your library into your hand")
-        .parse(lower)
-        .is_ok()
+    if nom_on_lower(text, lower, |input| {
+        value(
+            (),
+            (
+                tag("put "),
+                tag("that many "),
+                tag("cards "),
+                tag("from the top of your library "),
+                tag("into your hand"),
+            ),
+        )
+        .parse(input)
+    })
+    .is_some()
     {
         return Some(PutImperativeAst::DrawMatchingExileCount);
     }

@@ -17308,10 +17308,10 @@ mod tests {
         ChoiceType, ChosenSubtypeKind, CombatRelation, CombatRelationSubject, Comparator,
         ContinuousModification, ControllerRef, CopyRetargetPermission, CountScope, DoublePTMode,
         Duration, FilterProp, LibraryPosition, LinkedExileScope, ManaContribution, ManaProduction,
-        ObjectProperty, ObjectScope, PaymentCost, PermissionGrantee, PlayerRelation, PreventionScope,
-        PtStat,
-        PtValue, PtValueScope, QuantityExpr, QuantityRef, SearchSelectionConstraint, SharedQuality,
-        TargetChoiceTiming, TypeFilter, TypedFilter, ZoneRef,
+        ObjectProperty, ObjectScope, PaymentCost, PermissionGrantee, PlayerRelation,
+        PreventionScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
+        SearchSelectionConstraint, SharedQuality, TargetChoiceTiming, TypeFilter, TypedFilter,
+        ZoneRef,
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::game_state::{DistributionUnit, TargetSelectionConstraint};
@@ -35283,6 +35283,18 @@ mod tests {
             "expected exiled cards put on library top, got {effects:?}"
         );
         assert!(
+            effects.iter().any(|e| {
+                matches!(
+                    e,
+                    Effect::RevealHand {
+                        target: TargetFilter::ExiledBySource,
+                        ..
+                    }
+                )
+            }),
+            "expected private look at exiled cards, got {effects:?}"
+        );
+        assert!(
             !effects
                 .iter()
                 .any(|e| matches!(e, Effect::Unimplemented { .. })),
@@ -35326,26 +35338,32 @@ mod tests {
             AbilityKind::Activated,
         );
         assert!(matches!(*chain.effect, Effect::Dig { .. }));
-        let sub = chain.sub_ability.as_ref().expect("conditional sub after Dig");
+        let sub = chain
+            .sub_ability
+            .as_ref()
+            .expect("conditional sub after Dig");
         let Some(AbilityCondition::RevealedHasCardType {
             card_type: CoreType::Creature,
-            subtype_filter: Some(Box::new(TargetFilter::Or { filters })),
+            subtype_filter: Some(subtype_filter),
             ..
         }) = &sub.condition
         else {
-            panic!("expected creature subtype Or condition, got {:?}", sub.condition);
+            panic!(
+                "expected creature subtype Or condition, got {:?}",
+                sub.condition
+            );
+        };
+        let TargetFilter::Or { filters } = subtype_filter.as_ref() else {
+            panic!("expected subtype Or filter, got {subtype_filter:?}");
         };
         assert_eq!(filters.len(), 4);
         let subtypes: Vec<_> = filters
             .iter()
             .filter_map(|f| match f {
-                TargetFilter::Typed(tf) => tf
-                    .type_filters
-                    .iter()
-                    .find_map(|t| match t {
-                        TypeFilter::Subtype(s) => Some(s.as_str()),
-                        _ => None,
-                    }),
+                TargetFilter::Typed(tf) => tf.type_filters.iter().find_map(|t| match t {
+                    TypeFilter::Subtype(s) => Some(s.as_str()),
+                    _ => None,
+                }),
                 _ => None,
             })
             .collect();

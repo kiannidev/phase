@@ -3354,6 +3354,7 @@ mod tests {
         assert!(properties.contains(&FilterProp::AttachedToSource));
     }
 
+    #[test]
     fn host_permanent_static_condition_lowers_to_attached_to_presence_filter() {
         let condition = Condition::PermanentPassesFilter(
             Box::new(Permanent::HostPermanent),

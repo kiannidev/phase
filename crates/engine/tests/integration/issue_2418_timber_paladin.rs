@@ -91,8 +91,7 @@ fn timber_paladin_without_auras_keeps_base_power_toughness() {
     assert_eq!(obj.power, Some(0), "0 Auras must not apply any tier");
     assert_eq!(obj.toughness, Some(0));
     assert!(
-        !obj
-            .keywords
+        !obj.keywords
             .iter()
             .any(|k| k.kind() == KeywordKind::Vigilance),
         "vigilance requires exactly two Auras"

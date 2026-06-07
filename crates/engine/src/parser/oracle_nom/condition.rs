@@ -963,8 +963,7 @@ fn parse_source_enchanted_by_aura_count(input: &str) -> OracleResult<'_, StaticC
         map(parse_ge_threshold, |n| (Comparator::GE, n)),
     ))
     .parse(rest)?;
-    let (rest, _) = tag(" ").parse(rest)?;
-    let (rest, _) = alt((tag("Aura"), tag("Auras"))).parse(rest)?;
+    let (rest, _) = alt((tag("Auras"), tag("Aura"))).parse(rest.trim_start())?;
     let aura_filter = TargetFilter::Typed(TypedFilter {
         type_filters: vec![
             TypeFilter::Enchantment,
@@ -6748,6 +6747,20 @@ mod tests {
         let (rest, c) = parse_inner_condition("enchanted creature is attacking").unwrap();
         assert_eq!(rest, "");
         assert_eq!(c, StaticCondition::SourceIsAttacking);
+    }
+
+    #[test]
+    fn test_source_enchanted_by_plural_aura_count() {
+        let (rest, c) = parse_inner_condition("~ is enchanted by 3 or more Auras").unwrap();
+        assert_eq!(rest, "");
+        let StaticCondition::QuantityComparison {
+            comparator, rhs, ..
+        } = c
+        else {
+            panic!("expected QuantityComparison, got {c:?}");
+        };
+        assert_eq!(comparator, Comparator::GE);
+        assert_eq!(rhs, QuantityExpr::Fixed { value: 3 });
     }
 
     #[test]

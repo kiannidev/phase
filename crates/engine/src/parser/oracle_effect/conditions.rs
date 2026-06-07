@@ -48,14 +48,19 @@ fn parse_creature_subtype_or_list(lower: &str) -> Option<TargetFilter> {
 }
 
 /// CR 205.3m: "Kraken, Leviathan, … Serpent creature" → subtype list text.
+/// Requires the suffix at end-of-string so "creature card that … a creature"
+/// (Descendants' Path) does not bisect at an interior " creature".
 fn creature_subtypes_before_creature_word(type_str: &str) -> Option<&str> {
-    let (_, (subtypes, _)) = pair(
+    let (after, (subtypes, _)) = pair(
         take_until::<_, _, OracleError<'_>>(" creature"),
         tag(" creature"),
     )
     .parse(type_str)
     .ok()?;
-    (!subtypes.is_empty()).then_some(subtypes)
+    if !after.is_empty() || subtypes.is_empty() {
+        return None;
+    }
+    Some(subtypes)
 }
 
 fn remainder_after_optional_comma(s: &str) -> &str {

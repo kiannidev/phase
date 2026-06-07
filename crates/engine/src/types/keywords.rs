@@ -202,6 +202,8 @@ pub enum KeywordKind {
     JumpStart,
     Cipher,
     Transmute,
+    /// CR 702.71: Transfigure — see `Keyword::Transfigure`.
+    Transfigure,
     Cleave,
     Undaunted,
     Station,
@@ -687,7 +689,9 @@ pub enum Keyword {
     Provoke,
     Rebound,
     Retrace,
-    Ripple,
+    /// CR 702.60a: Ripple N — when you cast this spell, reveal the top N cards and
+    /// cast same-named cards for free. `u32` is N.
+    Ripple(u32),
     SplitSecond,
     Storm,
     /// CR 702.62a: Suspend N—{cost} — exile from hand with N time counters,
@@ -813,6 +817,11 @@ pub enum Keyword {
     /// it, put it into your hand, then shuffle. Activate only as a sorcery."
     /// Runtime: `synthesize_transmute` (database/synthesis.rs).
     Transmute(ManaCost),
+    /// CR 702.71a: Transfigure {cost} — "[Cost], Sacrifice this permanent: Search
+    /// your library for a creature card with the same mana value as this permanent
+    /// and put it onto the battlefield. Then shuffle your library. Activate only as
+    /// a sorcery." Runtime: `synthesize_transfigure` (database/synthesis.rs).
+    Transfigure(ManaCost),
     /// CR 702.120a: Escalate [cost] — additional cost for each mode chosen beyond the first
     /// on a modal spell.
     Escalate(AbilityCost),
@@ -1068,6 +1077,7 @@ impl Keyword {
             Keyword::JumpStart => KeywordKind::JumpStart,
             Keyword::Cipher => KeywordKind::Cipher,
             Keyword::Transmute(_) => KeywordKind::Transmute,
+            Keyword::Transfigure(_) => KeywordKind::Transfigure,
             Keyword::Cleave(_) => KeywordKind::Cleave,
             Keyword::Undaunted => KeywordKind::Undaunted,
             Keyword::Station => KeywordKind::Station,
@@ -1141,7 +1151,7 @@ impl Keyword {
             | Keyword::ReadAhead
             | Keyword::Rebound
             | Keyword::Reinforce { .. }
-            | Keyword::Ripple
+            | Keyword::Ripple(_)
             | Keyword::Saddle(_)
             | Keyword::Scavenge(_)
             | Keyword::Soulshift(_)
@@ -1899,6 +1909,8 @@ impl FromStr for Keyword {
                 }
                 // CR 702.53a: Transmute {cost}
                 "transmute" => return Ok(Keyword::Transmute(parse_keyword_mana_cost(p))),
+                // CR 702.71a: Transfigure {cost}
+                "transfigure" => return Ok(Keyword::Transfigure(parse_keyword_mana_cost(p))),
                 // CR 702.120a: Escalate [cost]
                 "escalate" => {
                     return Ok(Keyword::Escalate(AbilityCost::Mana {
@@ -2056,7 +2068,7 @@ impl FromStr for Keyword {
             "cumulative" => Ok(Keyword::CumulativeUpkeep(AbilityCost::Mana {
                 cost: ManaCost::zero(),
             })),
-            "ripple" => Ok(Keyword::Ripple),
+            "ripple" => Ok(Keyword::Ripple(1)),
             "totem" => Ok(Keyword::Totem),
             // Unit keywords added for MTGJSON keyword name recognition
             "bargain" => Ok(Keyword::Bargain),
@@ -2342,7 +2354,7 @@ fn keyword_from_tagged(variant: &str, data: &serde_json::Value) -> Result<Keywor
         "CumulativeUpkeep" => Ok(Keyword::CumulativeUpkeep(AbilityCost::Mana {
             cost: ManaCost::zero(),
         })),
-        "Ripple" => Ok(Keyword::Ripple),
+        "Ripple" => Ok(Keyword::Ripple(1)),
         "Totem" => Ok(Keyword::Totem),
         // Parameterized: ManaCost (new keywords)
         "Warp" => Ok(Keyword::Warp(mana(data)?)),
@@ -2725,6 +2737,8 @@ fn keyword_from_tagged(variant: &str, data: &serde_json::Value) -> Result<Keywor
         "JumpStart" => Ok(Keyword::JumpStart),
         "Cipher" => Ok(Keyword::Cipher),
         "Transmute" => Ok(Keyword::Transmute(mana(data)?)),
+        // CR 702.71a: Transfigure {cost}
+        "Transfigure" => Ok(Keyword::Transfigure(mana(data)?)),
         "Cleave" => Ok(Keyword::Cleave(mana(data)?)),
         "Undaunted" => Ok(Keyword::Undaunted),
         // CR 702.184a: Station — fixed activated ability keyword.
@@ -3426,7 +3440,7 @@ mod tests {
                 cost: ManaCost::zero()
             })
         );
-        assert_eq!(Keyword::from_str("Ripple").unwrap(), Keyword::Ripple);
+        assert_eq!(Keyword::from_str("Ripple").unwrap(), Keyword::Ripple(1));
         assert_eq!(Keyword::from_str("Totem").unwrap(), Keyword::Totem);
         // Warp is now parameterized — bare "Warp" without cost falls through to Unknown
         assert!(matches!(

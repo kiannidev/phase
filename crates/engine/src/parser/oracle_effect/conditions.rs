@@ -5,7 +5,7 @@ use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::char;
 use nom::combinator::{all_consuming, opt, value};
-use nom::sequence::{pair, preceded, terminated};
+use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
 use super::super::oracle_nom::bridge::{nom_on_lower, nom_parse_lower};
@@ -43,24 +43,26 @@ fn maybe_negate(cond: AbilityCondition, negated: bool) -> AbilityCondition {
     }
 }
 
-fn parse_creature_subtype_or_list(lower: &str) -> Option<TargetFilter> {
-    crate::parser::oracle_static::parse_subtype_or_list_insensitive(lower)
+fn parse_creature_subtype_or_list_prefix(lower: &str) -> Option<(TargetFilter, &str)> {
+    crate::parser::oracle_static::parse_subtype_or_list_insensitive_prefix(lower)
 }
 
-/// CR 205.3m: "Kraken, Leviathan, … Serpent creature" → subtype list text.
-/// Requires the suffix at end-of-string so "creature card that … a creature"
-/// (Descendants' Path) does not bisect at an interior " creature".
-fn creature_subtypes_before_creature_word(type_str: &str) -> Option<&str> {
-    let (after, (subtypes, _)) = pair(
-        take_until::<_, _, OracleError<'_>>(" creature"),
-        tag(" creature"),
-    )
-    .parse(type_str)
-    .ok()?;
-    if !after.is_empty() || subtypes.is_empty() {
-        return None;
+fn parse_creature_subtype_card_tail(lower: &str) -> Option<(TargetFilter, &str)> {
+    let (subtype_filter, rest) = parse_creature_subtype_or_list_prefix(lower)?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" creature card")
+        .parse(rest)
+        .ok()?;
+    Some((subtype_filter, rest))
+}
+
+fn parse_creature_subtype_type_tail(lower: &str) -> Option<TargetFilter> {
+    let (subtype_filter, rest) = parse_creature_subtype_or_list_prefix(lower)?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" creature").parse(rest).ok()?;
+    if rest.is_empty() {
+        Some(subtype_filter)
+    } else {
+        None
     }
-    Some(subtypes)
 }
 
 fn remainder_after_optional_comma(s: &str) -> &str {
@@ -86,21 +88,8 @@ fn type_filter_references_subtype(filter: &TypeFilter) -> bool {
 
 pub(crate) fn split_leading_conditional(text: &str) -> Option<(String, String)> {
     let lower = text.to_lowercase();
-    if alt((
-        tag::<_, _, OracleError<'_>>("then, if "),
-        tag("then if "),
-        tag("if "),
-        // CR 508.6 + CR 608.2c: temporal "during any turn <cond>, <body>" gate
-        // (Neyali, Neriv, Boros Strike-Captain) — the head names a turn-scoped
-        // condition rather than "if", but splits and gates identically.
-        tag("during any turn "),
-        tag("during a turn "),
-    ))
-    .parse(lower.as_str())
-    .is_err()
-    {
-        return None;
-    }
+    let prefix_rest = parse_leading_conditional_prefix(&lower)?;
+    let condition_start_idx = lower.len() - prefix_rest.len();
 
     let mut paren_depth = 0u32;
     let mut in_quotes = false;
@@ -113,6 +102,7 @@ pub(crate) fn split_leading_conditional(text: &str) -> Option<(String, String)> 
             ')' if !in_quotes => paren_depth = paren_depth.saturating_sub(1),
             ',' if !in_quotes
                 && paren_depth == 0
+                && idx >= condition_start_idx
                 && !is_thousands_separator_comma(bytes, idx)
                 && !comma_inside_if_creature_subtype_list(&lower, idx) =>
             {
@@ -129,6 +119,22 @@ pub(crate) fn split_leading_conditional(text: &str) -> Option<(String, String)> 
     None
 }
 
+fn parse_leading_conditional_prefix(lower: &str) -> Option<&str> {
+    alt((
+        tag::<_, _, OracleError<'_>>("then, if "),
+        tag("then if "),
+        tag("if "),
+        // CR 508.6 + CR 608.2c: temporal "during any turn <cond>, <body>" gate
+        // (Neyali, Neriv, Boros Strike-Captain) — the head names a turn-scoped
+        // condition rather than "if", but splits and gates identically.
+        tag("during any turn "),
+        tag("during a turn "),
+    ))
+    .parse(lower)
+    .ok()
+    .map(|(rest, _)| rest)
+}
+
 /// True if the comma at `idx` is part of a numeric thousands-separator
 /// (digit before, exactly three digits after, no fourth digit). This mirrors
 /// the grouping that [`oracle_nom::primitives::parse_digit_number`] consumes,
@@ -137,30 +143,20 @@ pub(crate) fn split_leading_conditional(text: &str) -> Option<(String, String)> 
 /// CR 205.3m: Commas inside "if it's a Kraken, Leviathan, ... creature card"
 /// separate subtypes, not the condition from the effect body.
 fn comma_inside_if_creature_subtype_list(lower: &str, comma_idx: usize) -> bool {
-    use nom::bytes::complete::take_until;
-    let (after_intro, _) = match alt((
-        preceded(
-            take_until::<_, _, OracleError<'_>>("it's a "),
-            tag("it's a "),
-        ),
-        preceded(
-            take_until::<_, _, OracleError<'_>>("it's an "),
-            tag("it's an "),
-        ),
-    ))
-    .parse(lower)
-    {
-        Ok(parsed) => parsed,
-        Err(_) => return false,
+    let Some(after_prefix) = parse_leading_conditional_prefix(lower) else {
+        return false;
     };
-    let anchor = lower.len() - after_intro.len();
-    let (subtype_span, _) =
-        match take_until::<_, _, OracleError<'_>>(" creature card").parse(after_intro) {
+    let (after_intro, _) =
+        match alt((tag::<_, _, OracleError<'_>>("it's a "), tag("it's an "))).parse(after_prefix) {
             Ok(parsed) => parsed,
             Err(_) => return false,
         };
-    let creature_card_end = anchor + (after_intro.len() - subtype_span.len());
-    comma_idx < creature_card_end
+    let subtype_start = lower.len() - after_intro.len();
+    let Some((_, after_type)) = parse_creature_subtype_card_tail(after_intro) else {
+        return false;
+    };
+    let subtype_end = lower.len() - after_type.len();
+    (subtype_start..subtype_end).contains(&comma_idx)
 }
 
 fn is_thousands_separator_comma(bytes: &[u8], idx: usize) -> bool {
@@ -626,6 +622,23 @@ pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityConditio
         .parse(rest)
         .map(|(rest, matched)| (rest, matched.is_some()))
         .unwrap_or((rest, false));
+    // CR 205.3m: Multi-subtype creature gates ("Kraken, Leviathan, Octopus,
+    // or Serpent creature card") must not collapse to bare CoreType::Creature.
+    if let Some((subtype_filter, after_type)) = parse_creature_subtype_card_tail(rest) {
+        let remainder = remainder_after_optional_comma(after_type);
+        let offset = text.len() - remainder.len();
+        return (
+            Some(maybe_negate(
+                AbilityCondition::RevealedHasCardType {
+                    card_type: CoreType::Creature,
+                    additional_filter: None,
+                    subtype_filter: Some(Box::new(subtype_filter)),
+                },
+                negated,
+            )),
+            text[offset..].to_string(),
+        );
+    }
     let (type_str, after_type) = if let Some(type_end) = rest.find(" card") {
         (&rest[..type_end], &rest[type_end + " card".len()..])
     } else if let Some(comma_pos) = rest.find(", ") {
@@ -655,27 +668,6 @@ pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityConditio
                 )),
                 text[offset..].to_string(),
             );
-        }
-    }
-    // CR 205.3m: Multi-subtype creature gates ("Kraken, Leviathan, Octopus,
-    // or Serpent creature card") must not collapse to bare CoreType::Creature.
-    if type_word == "creature" && type_str != "creature" {
-        if let Some(subtypes_text) = creature_subtypes_before_creature_word(type_str) {
-            if let Some(subtype_filter) = parse_creature_subtype_or_list(subtypes_text) {
-                let remainder = remainder_after_optional_comma(after_type);
-                let offset = text.len() - remainder.len();
-                return (
-                    Some(maybe_negate(
-                        AbilityCondition::RevealedHasCardType {
-                            card_type: CoreType::Creature,
-                            additional_filter: None,
-                            subtype_filter: Some(Box::new(subtype_filter)),
-                        },
-                        negated,
-                    )),
-                    text[offset..].to_string(),
-                );
-            }
         }
     }
     if let Ok(card_type) = CoreType::from_str(&capitalized) {
@@ -716,6 +708,18 @@ fn parse_its_a_type_condition(condition_text: &str) -> Option<AbilityCondition> 
         .strip_suffix(" card")
         .unwrap_or(rest)
         .trim_end_matches('.');
+    // CR 205.3m: Keep the suffix-condition path in lockstep with
+    // `strip_card_type_conditional` for multi-subtype revealed creature gates.
+    if let Some(subtype_filter) = parse_creature_subtype_type_tail(type_str) {
+        return Some(maybe_negate(
+            AbilityCondition::RevealedHasCardType {
+                card_type: CoreType::Creature,
+                additional_filter: None,
+                subtype_filter: Some(Box::new(subtype_filter)),
+            },
+            negated,
+        ));
+    }
     let type_word = type_str.rsplit(' ').next().unwrap_or(type_str);
     let capitalized = format!("{}{}", &type_word[..1].to_uppercase(), &type_word[1..]);
     let card_type = CoreType::from_str(&capitalized).ok()?;
@@ -2866,17 +2870,15 @@ pub(super) fn try_nom_condition_as_ability_condition(
             ));
         }
         // CR 205.3m: Multi-subtype creature gates on a revealed/peeked card.
-        if let Some(subtypes_text) = creature_subtypes_before_creature_word(rest) {
-            if let Some(subtype_filter) = parse_creature_subtype_or_list(subtypes_text) {
-                return Some(maybe_negate(
-                    AbilityCondition::RevealedHasCardType {
-                        card_type: CoreType::Creature,
-                        additional_filter: None,
-                        subtype_filter: Some(Box::new(subtype_filter)),
-                    },
-                    negated,
-                ));
-            }
+        if let Some(subtype_filter) = parse_creature_subtype_type_tail(rest) {
+            return Some(maybe_negate(
+                AbilityCondition::RevealedHasCardType {
+                    card_type: CoreType::Creature,
+                    additional_filter: None,
+                    subtype_filter: Some(Box::new(subtype_filter)),
+                },
+                negated,
+            ));
         }
         // CR 608.2c + CR 205.3a: "it's a [subtype]" (Goblin, Aura, Equipment, ...).
         // The CoreType match above only covers card types; subtypes route through
@@ -4579,6 +4581,25 @@ mod tests {
         let cond = try_nom_condition_as_ability_condition(
             "it's a Kraken, Leviathan, Octopus, or Serpent creature card",
             &mut ParseContext::default(),
+        );
+        let Some(AbilityCondition::RevealedHasCardType {
+            card_type: CoreType::Creature,
+            subtype_filter: Some(subtype_filter),
+            ..
+        }) = cond
+        else {
+            panic!("expected multi-subtype RevealedHasCardType, got {cond:?}");
+        };
+        let TargetFilter::Or { filters } = *subtype_filter else {
+            panic!("expected subtype Or filter");
+        };
+        assert_eq!(filters.len(), 4);
+    }
+
+    #[test]
+    fn its_a_type_condition_preserves_multi_subtype() {
+        let cond = parse_its_a_type_condition(
+            "it's a kraken, leviathan, octopus, or serpent creature card",
         );
         let Some(AbilityCondition::RevealedHasCardType {
             card_type: CoreType::Creature,

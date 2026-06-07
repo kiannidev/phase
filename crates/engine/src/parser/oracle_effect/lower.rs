@@ -619,6 +619,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
             reveal: true,
             destination,
             rest_destination,
+            player,
             ..
         } = &*def.effect
         {
@@ -630,7 +631,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
                 _ => 1,
             };
             *def.effect = Effect::RevealTop {
-                player: TargetFilter::Controller,
+                player: player.clone(),
                 count: count_val,
             };
         }

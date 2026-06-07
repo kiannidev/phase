@@ -16347,6 +16347,15 @@ fn try_parse_put_zone_change_parts(
             // (see `parse_total_mana_value_target_constraint` in `lower.rs`).
             let stripped_mv = strip_total_mana_value_target_phrase(target_text);
             let target_text: &str = stripped_mv.as_deref().unwrap_or(target_text);
+            // CR 701.20e: Mass quantifiers ("put all/each <filter> from <zone>
+            // onto the battlefield") move every matching object — lower to
+            // `ChangeZoneAll`, mirroring the `return all` dispatcher.
+            let is_mass = {
+                let lower_target = target_text.to_ascii_lowercase();
+                alt((tag::<_, _, OracleError<'_>>("all "), tag("each ")))
+                    .parse(lower_target.as_str())
+                    .is_ok()
+            };
             let up_to = parse_up_to_one_target_prefix(before.lower) || choice_count.is_some();
             let (target, _) = parse_target(target_text);
             // CR 202.3 + CR 107.3i: A trailing "where X is <expression>"
@@ -16418,6 +16427,19 @@ fn try_parse_put_zone_change_parts(
             };
             let enter_transformed = destination == Zone::Battlefield
                 && parse_battlefield_transformed_qualifier(after.lower);
+            if is_mass && enter_with_counters.is_empty() {
+                return Some((
+                    Effect::ChangeZoneAll {
+                        origin: infer_origin_zone(after_put_tp.lower),
+                        destination,
+                        target,
+                        enters_under,
+                        enter_tapped,
+                        face_down_profile: None,
+                    },
+                    choice_count,
+                ));
+            }
             return Some((
                 Effect::ChangeZone {
                     origin: infer_origin_zone(after_put_tp.lower),
@@ -17014,6 +17036,7 @@ fn infer_origin_zone(lower: &str) -> Option<Zone> {
         || scan_contains_phrase(lower, "from a graveyard")
         || scan_contains_phrase(lower, "from a single graveyard")
         || scan_contains_phrase(lower, "from a random graveyard")
+        || scan_contains_phrase(lower, "from all graveyards")
     {
         Some(Zone::Graveyard)
     } else if scan_contains_phrase(lower, "from exile")
@@ -44002,4 +44025,22 @@ fn issue_2402_hazel_copy_target_token_trigger_parses() {
         .properties
         .iter()
         .any(|prop| matches!(prop, FilterProp::Token)));
+}
+
+#[test]
+fn issue_1973_rise_of_dark_realms_put_all_graveyards_parses_change_zone_all() {
+    let text = "Put all creature cards from all graveyards onto the battlefield under your control.";
+    let e = parse_effect(text);
+    assert!(
+        matches!(
+            e,
+            Effect::ChangeZoneAll {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Battlefield,
+                enters_under: Some(ControllerRef::You),
+                ..
+            }
+        ),
+        "Rise of the Dark Realms must lower to ChangeZoneAll, got {e:?}"
+    );
 }

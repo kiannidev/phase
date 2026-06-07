@@ -5062,7 +5062,13 @@ fn parse_zone_qual(i: &str) -> super::oracle_nom::error::OracleResult<'_, ZoneQu
         // which instance, not which zone). Longest-match-first ordering.
         value(
             ZoneQual::Plain,
-            alt((tag("a single "), tag("a random "), tag("a "), tag("the "))),
+            alt((
+                tag("all "),
+                tag("a single "),
+                tag("a random "),
+                tag("a "),
+                tag("the "),
+            )),
         ),
         // Bare form (e.g., "from exile"): zero-width match so the zone_word combinator runs next.
         value(ZoneQual::Plain, tag("")),

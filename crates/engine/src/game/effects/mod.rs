@@ -4857,10 +4857,6 @@ fn resolve_chain_body(
     Ok(())
 }
 
-/// CR 608.2c: Evaluate a condition against the current game state and ability context.
-/// Returns whether the condition is met. Handles all `AbilityCondition` variants as
-/// pure boolean evaluators — callers are responsible for any terminal control flow
-/// (e.g., "Instead" overrides that early-return in the sub-ability context).
 /// CR 608.2c + CR 109.5: Spell-effect "if you sacrificed a [filter] this way"
 /// (Deadly Brew, Rise of the Witch-king) when no activation-cost object is in
 /// scope. Consults the chain tracked sacrifice set (or the scoped
@@ -4882,14 +4878,12 @@ fn controller_sacrificed_matching_this_way(
 
     candidate_ids.iter().any(|&id| {
         if let Some(lki) = state.lki_cache.get(&id) {
-            let sacrificed_by_controller = lki.controller == controller || lki.owner == controller;
-            sacrificed_by_controller
+            lki.controller == controller
                 && crate::game::filter::matches_target_filter_on_lki_snapshot(
                     state, id, lki, filter, &ctx,
                 )
         } else if let Some(obj) = state.objects.get(&id) {
-            let sacrificed_by_controller = obj.controller == controller || obj.owner == controller;
-            sacrificed_by_controller
+            obj.controller == controller
                 && crate::game::filter::matches_target_filter(state, id, filter, &ctx)
         } else {
             false
@@ -4897,6 +4891,10 @@ fn controller_sacrificed_matching_this_way(
     })
 }
 
+/// CR 608.2c: Evaluate a condition against the current game state and ability context.
+/// Returns whether the condition is met. Handles all `AbilityCondition` variants as
+/// pure boolean evaluators — callers are responsible for any terminal control flow
+/// (e.g., "Instead" overrides that early-return in the sub-ability context).
 pub(crate) fn evaluate_condition(
     condition: &AbilityCondition,
     state: &GameState,

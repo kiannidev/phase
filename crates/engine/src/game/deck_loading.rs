@@ -188,21 +188,6 @@ pub fn create_object_from_card_face(
     obj_id
 }
 
-/// Like [`create_object_from_card_face`], but also hydrates `back_face` for
-/// dual-faced cards when a [`CardDatabase`] is available.
-pub fn create_object_from_card_face_with_db(
-    state: &mut GameState,
-    card_face: &CardFace,
-    owner: PlayerId,
-    db: &CardDatabase,
-) -> crate::types::identifiers::ObjectId {
-    let obj_id = create_object_from_card_face(state, card_face, owner);
-    if let Some(obj) = state.objects.get_mut(&obj_id) {
-        super::printed_cards::populate_back_face_if_dfc(obj, db, card_face);
-    }
-    obj_id
-}
-
 /// Create a commander GameObject from a CardFace, placing it in the command zone.
 pub fn create_commander_from_card_face(
     state: &mut GameState,

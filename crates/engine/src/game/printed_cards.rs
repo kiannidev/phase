@@ -902,11 +902,12 @@ fn build_conjure_registry(
     (registry, all_collected)
 }
 
-/// CR 712: Attach the other face of a dual-faced card to `obj.back_face` when
-/// absent. Required for `enter_transformed` zone changes (Fable of the
-/// Mirror-Breaker chapter III, Ajani flip triggers, MDFC cast) — without this,
-/// `deliver_replaced_zone_change` silently skips transform when `back_face` is
-/// `None` and saga ETB lore-counter replacements fire on the front face.
+/// CR 712 / CR 715 / CR 722: Attach the other printed face to `obj.back_face`
+/// when absent. Required for transformed zone changes (Fable of the
+/// Mirror-Breaker chapter III, Ajani flip triggers), adventurer casts, MDFC
+/// casts, and prepare spell access. Without this, `deliver_replaced_zone_change`
+/// silently skips transform when `back_face` is `None` and saga ETB lore-counter
+/// replacements fire on the front face.
 pub fn populate_back_face_if_dfc(obj: &mut GameObject, db: &CardDatabase, card_face: &CardFace) {
     if obj.back_face.is_some() {
         return;
@@ -915,11 +916,14 @@ pub fn populate_back_face_if_dfc(obj: &mut GameObject, db: &CardDatabase, card_f
     let second_face = db
         .get_by_name(&card_face.name)
         .and_then(|card_rules| match &card_rules.layout {
+            // CR 715: Adventurer cards have alternative Adventure characteristics.
             CardLayout::Adventure(_, back) => Some((LayoutKind::Adventure, back)),
+            // CR 712: Transforming, modal, meld, and omen DFCs need their other face.
             CardLayout::Transform(_, back) => Some((LayoutKind::Transform, back)),
             CardLayout::Modal(_, back) => Some((LayoutKind::Modal, back)),
             CardLayout::Meld(_, back) => Some((LayoutKind::Meld, back)),
             CardLayout::Omen(_, back) => Some((LayoutKind::Omen, back)),
+            // CR 722: Preparation cards expose prepare-spell characteristics.
             CardLayout::Prepare(_, back) => Some((LayoutKind::Prepare, back)),
             _ => None,
         })

@@ -1824,6 +1824,39 @@ fn apply_action(
                         &mut events,
                     )?
                 }
+                AlternativeCastKeyword::Emerge => {
+                    casting::handle_emerge_cost_choice_with_payment_mode(
+                        state,
+                        *player,
+                        *object_id,
+                        *card_id,
+                        choice,
+                        *payment_mode,
+                        &mut events,
+                    )?
+                }
+                AlternativeCastKeyword::Dash => {
+                    casting::handle_dash_cost_choice_with_payment_mode(
+                        state,
+                        *player,
+                        *object_id,
+                        *card_id,
+                        choice,
+                        *payment_mode,
+                        &mut events,
+                    )?
+                }
+                AlternativeCastKeyword::Blitz => {
+                    casting::handle_blitz_cost_choice_with_payment_mode(
+                        state,
+                        *player,
+                        *object_id,
+                        *card_id,
+                        choice,
+                        *payment_mode,
+                        &mut events,
+                    )?
+                }
                 AlternativeCastKeyword::Overload => {
                     casting::handle_overload_cost_choice_with_payment_mode(
                         state,
@@ -4048,6 +4081,65 @@ fn apply_action(
             effects::drain_pending_continuation(state, &mut events);
             state.waiting_for.clone()
         }
+        // CR 701.56a: Time travel — player selected objects for the current phase
+        // (remove a time counter, then add). Validate against the eligible set,
+        // apply the per-object counter change, then advance to the add phase or
+        // finish. Counter changes drive the existing suspend/vanishing triggers.
+        (
+            WaitingFor::TimeTravelChoice {
+                player,
+                eligible,
+                phase,
+            },
+            GameAction::SelectTargets { targets },
+        ) => {
+            let p = *player;
+            let phase = *phase;
+            let eligible_set = eligible.clone();
+            for t in &targets {
+                if !eligible_set.contains(t) {
+                    return Err(EngineError::InvalidAction(
+                        "Selected object not eligible for time travel".to_string(),
+                    ));
+                }
+            }
+            effects::time_travel::apply_phase(state, p, &targets, phase, &mut events);
+
+            if phase == crate::types::game_state::TimeTravelPhase::Remove {
+                // CR 701.56a: after the remove phase, offer the add phase over the
+                // still-eligible objects, excluding any just chosen to remove.
+                let add_eligible: Vec<_> = effects::time_travel::eligible_objects(state, p)
+                    .into_iter()
+                    .filter(|t| !targets.contains(t))
+                    .collect();
+                if !add_eligible.is_empty() {
+                    state.waiting_for = WaitingFor::TimeTravelChoice {
+                        player: p,
+                        eligible: add_eligible,
+                        phase: crate::types::game_state::TimeTravelPhase::Add,
+                    };
+                    state.waiting_for.clone()
+                } else {
+                    events.push(GameEvent::EffectResolved {
+                        kind: crate::types::ability::EffectKind::TimeTravel,
+                        source_id: ObjectId(0),
+                    });
+                    state.waiting_for = WaitingFor::Priority { player: p };
+                    state.priority_player = p;
+                    effects::drain_pending_continuation(state, &mut events);
+                    state.waiting_for.clone()
+                }
+            } else {
+                events.push(GameEvent::EffectResolved {
+                    kind: crate::types::ability::EffectKind::TimeTravel,
+                    source_id: ObjectId(0),
+                });
+                state.waiting_for = WaitingFor::Priority { player: p };
+                state.priority_player = p;
+                effects::drain_pending_continuation(state, &mut events);
+                state.waiting_for.clone()
+            }
+        }
         // CR 608.2c: ChooseObjectsIntoTrackedSet — player submitted their
         // battlefield-permanent selection. Publish a fresh tracked set so the
         // downstream `PayCost { ScaledMana }` and the `IfYouDo`/`Untap` tail
@@ -5437,11 +5529,18 @@ fn handle_crew_activation(
         })
         .collect();
 
-    // Validate total power of all eligible creatures can meet the threshold
+    // Validate total power of all eligible creatures can meet the threshold.
+    // CR 702.122c: a creature's contribution may be modified ("as though its
+    // power were N greater" / "using its toughness rather than its power").
     let total_power: i32 = eligible_creatures
         .iter()
-        .filter_map(|id| state.objects.get(id))
-        .map(|o| o.power.unwrap_or(0).max(0))
+        .map(|&id| {
+            super::static_abilities::object_crew_power_contribution(
+                state,
+                id,
+                crate::types::statics::CrewAction::Crew,
+            )
+        })
         .sum();
 
     if total_power < crew_power as i32 {
@@ -5545,7 +5644,12 @@ fn handle_crew_announcement(
                 "Creature can't crew Vehicles".to_string(),
             ));
         }
-        total_power += obj.power.unwrap_or(0).max(0);
+        // CR 702.122c: apply any crew power-contribution modifier.
+        total_power += super::static_abilities::object_crew_power_contribution(
+            state,
+            cid,
+            crate::types::statics::CrewAction::Crew,
+        );
     }
 
     // CR 702.122a: Total power must meet threshold
@@ -5715,10 +5819,15 @@ fn handle_station_announcement(
 
     // CR 702.184a + CR 113.7a: Snapshot the creature's power BEFORE tapping —
     // the counter count is determined at cost-payment time and survives the
-    // creature leaving the battlefield before resolution. CR 702.184c lets
-    // static abilities modify the characteristic read; this implementation
-    // reads `power`, which is the default per the rule.
-    let snapshot_power = creature.power.unwrap_or(0).max(0);
+    // creature leaving the battlefield before resolution. CR 702.184c +
+    // CR 702.122c: static abilities may modify the contributed value ("stations
+    // permanents as though its power were N greater"); the helper applies any
+    // such modifier and otherwise reads `power`, the default per the rule.
+    let snapshot_power = super::static_abilities::object_crew_power_contribution(
+        state,
+        creature_id,
+        crate::types::statics::CrewAction::Station,
+    );
 
     // CR 701.26a: Tap the creature as cost payment.
     if let Some(obj) = state.objects.get_mut(&creature_id) {
@@ -5811,10 +5920,16 @@ fn handle_saddle_activation(
         })
         .collect();
 
+    // CR 702.171a + CR 702.122c: a creature's saddle contribution may be modified.
     let total_power: i32 = eligible_creatures
         .iter()
-        .filter_map(|id| state.objects.get(id))
-        .map(|o| o.power.unwrap_or(0).max(0))
+        .map(|&id| {
+            super::static_abilities::object_crew_power_contribution(
+                state,
+                id,
+                crate::types::statics::CrewAction::Saddle,
+            )
+        })
         .sum();
 
     if total_power < saddle_power as i32 {
@@ -5881,7 +5996,12 @@ fn handle_saddle_announcement(
                 "Creature is no longer eligible for saddling".to_string(),
             ));
         }
-        total_power += obj.power.unwrap_or(0).max(0);
+        // CR 702.122c: apply any saddle power-contribution modifier.
+        total_power += super::static_abilities::object_crew_power_contribution(
+            state,
+            cid,
+            crate::types::statics::CrewAction::Saddle,
+        );
     }
 
     if total_power < saddle_power as i32 {
@@ -15534,6 +15654,137 @@ When this creature enters or dies, create a 1/1 red Goblin creature token.";
     }
 
     #[test]
+    fn rakdos_headliner_non_mana_echo_reaches_discard_payment() {
+        // CR 702.30a: "Echo—Discard a card." is a *non-mana* echo cost. On
+        // origin/main the parser drops the Echo keyword entirely for the em-dash
+        // (non-mana) form, so synthesis never installs the upkeep trigger and the
+        // permanent is never on the hook for a discard. This drives the real
+        // pipeline (parse -> synthesize_echo -> battlefield with echo due ->
+        // controller upkeep) and asserts the engine reaches the discard payment.
+        let mut state = new_game(42);
+        state.turn_number = 2;
+        state.phase = Phase::Untap;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+
+        let headliner = create_object(
+            &mut state,
+            CardId(1982),
+            PlayerId(0),
+            "Rakdos Headliner".to_string(),
+            Zone::Battlefield,
+        );
+
+        // A spare card in P0's hand so the discard cost has an eligible target
+        // (the engine surfaces the choice rather than auto-failing the payment).
+        let _spare = create_object(
+            &mut state,
+            CardId(1983),
+            PlayerId(0),
+            "Spare Card".to_string(),
+            Zone::Hand,
+        );
+
+        let oracle = "Haste\n\
+Echo—Discard a card. (At the beginning of your upkeep, if this came under your control since the beginning of your last upkeep, sacrifice it unless you pay its echo cost.)";
+        let parsed = parse_oracle_text(
+            oracle,
+            "Rakdos Headliner",
+            &[],
+            &["Creature".to_string()],
+            &["Devil".to_string()],
+        );
+
+        // Discriminating assertion: on origin/main the non-mana echo keyword is
+        // dropped, so this `Echo(NonMana(Discard))` is absent.
+        assert!(
+            parsed.extracted_keywords.iter().any(|kw| matches!(
+                kw,
+                Keyword::Echo(crate::types::keywords::EchoCost::NonMana(
+                    AbilityCost::Discard { .. }
+                ))
+            )),
+            "Rakdos Headliner must parse Echo(NonMana(Discard)) — got {:?}",
+            parsed.extracted_keywords
+        );
+
+        let mut face = CardFace {
+            keywords: parsed.extracted_keywords.clone(),
+            triggers: parsed.triggers.clone(),
+            ..CardFace::default()
+        };
+        crate::database::synthesis::synthesize_echo(&mut face);
+
+        {
+            let obj = state.objects.get_mut(&headliner).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.card_types.subtypes.push("Devil".to_string());
+            obj.power = Some(3);
+            obj.toughness = Some(1);
+            obj.base_power = Some(3);
+            obj.base_toughness = Some(1);
+            obj.keywords = face.keywords.clone();
+            obj.base_keywords = obj.keywords.clone();
+            for trigger in face.triggers.clone() {
+                obj.trigger_definitions.push(trigger);
+            }
+            obj.base_trigger_definitions =
+                Arc::new(obj.trigger_definitions.iter_all().cloned().collect());
+            // CR 702.30a: the next controller-upkeep echo payment is due.
+            obj.echo_due = true;
+        }
+
+        let mut events = Vec::new();
+        crate::game::turns::auto_advance(&mut state, &mut events);
+        assert_eq!(state.phase, Phase::Upkeep);
+        assert!(
+            !state.stack.is_empty(),
+            "echo trigger must be on the stack at the beginning of upkeep"
+        );
+
+        events.clear();
+        crate::game::stack::resolve_top(&mut state, &mut events);
+
+        // CR 702.30a: the echo trigger resolves to an unless-payment carrying the
+        // *non-mana* discard cost (not mana). On origin/main the Echo keyword is
+        // dropped for the em-dash form, so no echo trigger exists and this
+        // UnlessPayment-with-Discard never appears — the discriminating proof
+        // that the non-mana echo cost flowed through synthesis into the payment
+        // pipeline.
+        assert!(
+            matches!(
+                state.waiting_for,
+                WaitingFor::UnlessPayment {
+                    player: PlayerId(0),
+                    cost: AbilityCost::Discard { .. },
+                    ..
+                }
+            ),
+            "non-mana echo must surface an UnlessPayment carrying a Discard cost — got {:?}",
+            state.waiting_for
+        );
+
+        // CR 701.9: choosing to pay routes the discard cost through
+        // `handle_unless_payment`, which surfaces the discard-card choice — a
+        // discard cost, not a mana payment.
+        apply_as_current(&mut state, GameAction::PayUnlessCost { pay: true }).unwrap();
+        assert!(
+            matches!(
+                state.waiting_for,
+                WaitingFor::WardDiscardChoice {
+                    player: PlayerId(0),
+                    ..
+                }
+            ),
+            "paying the non-mana echo must reach the discard-choice payment — got {:?}",
+            state.waiting_for
+        );
+    }
+
+    #[test]
     fn attack_trigger_resolves_before_combat_damage_and_only_once() {
         let mut state = new_game(42);
         state.turn_number = 5;
@@ -19713,9 +19964,9 @@ mod crew_tests {
     use crate::types::card_type::CoreType;
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::player::PlayerId;
-    use crate::types::statics::StaticMode;
+    use crate::types::statics::{CrewAction, CrewContributionKind, StaticMode};
     use crate::types::zones::Zone;
-    use crate::types::StaticDefinition;
+    use crate::types::{StaticDefinition, TargetFilter};
 
     fn setup_game_at_main_phase() -> GameState {
         let mut state = new_game(42);
@@ -19976,6 +20227,84 @@ mod crew_tests {
         );
 
         assert!(result.is_err());
+    }
+
+    /// CR 702.122c: a creature with "crews Vehicles as though its power were N
+    /// greater" (Reckoner Bankbuster) contributes its modified power, letting an
+    /// otherwise-insufficient creature pay the crew cost alone.
+    #[test]
+    fn crew_contribution_power_delta_lets_low_power_creature_crew() {
+        let (mut state, vehicle_id, _creature_a, creature_b) = setup_crew_scenario();
+        // creature_b is 2/2; the Vehicle needs Crew 3, so it cannot crew alone
+        // (see `test_crew_fails_insufficient_power`). Grant it the +2 modifier.
+        {
+            let obj = state.objects.get_mut(&creature_b).unwrap();
+            obj.static_definitions.push(
+                StaticDefinition::new(StaticMode::CrewContribution {
+                    kind: CrewContributionKind::PowerDelta { delta: 2 },
+                    actions: vec![CrewAction::Crew],
+                })
+                .affected(TargetFilter::SelfRef),
+            );
+        }
+
+        apply_as_current(
+            &mut state,
+            GameAction::CrewVehicle {
+                vehicle_id,
+                creature_ids: vec![],
+            },
+        )
+        .unwrap();
+        let result = apply_as_current(
+            &mut state,
+            GameAction::CrewVehicle {
+                vehicle_id,
+                creature_ids: vec![creature_b],
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "power 2 + delta 2 = 4 should satisfy Crew 3: {result:?}"
+        );
+    }
+
+    /// CR 702.122c: "using its toughness rather than its power" (Giant Ox)
+    /// substitutes toughness for power, and the modifier applies only to the
+    /// named keyword actions (crew-only here, not saddle).
+    #[test]
+    fn crew_contribution_toughness_substitution_and_action_scope() {
+        let (mut state, _vehicle_id, _creature_a, creature_b) = setup_crew_scenario();
+        {
+            let obj = state.objects.get_mut(&creature_b).unwrap();
+            obj.power = Some(0);
+            obj.toughness = Some(4);
+            obj.static_definitions.push(
+                StaticDefinition::new(StaticMode::CrewContribution {
+                    kind: CrewContributionKind::ToughnessInsteadOfPower,
+                    actions: vec![CrewAction::Crew],
+                })
+                .affected(TargetFilter::SelfRef),
+            );
+        }
+        // Crew: contributes toughness (4) instead of power (0).
+        assert_eq!(
+            crate::game::static_abilities::object_crew_power_contribution(
+                &state,
+                creature_b,
+                CrewAction::Crew
+            ),
+            4
+        );
+        // Saddle: the modifier is crew-only, so the base power (0) is contributed.
+        assert_eq!(
+            crate::game::static_abilities::object_crew_power_contribution(
+                &state,
+                creature_b,
+                CrewAction::Saddle
+            ),
+            0
+        );
     }
 
     #[test]

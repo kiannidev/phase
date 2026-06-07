@@ -2045,6 +2045,10 @@ pub enum FilterProp {
     Tapped,
     /// CR 302.6 / CR 110.5: Untapped status as targeting qualifier.
     Untapped,
+    /// CR 302.6 + CR 702.10b + CR 702.154a: Matches creatures that either have
+    /// haste or have been under their controller's control continuously since
+    /// that player's most recent turn began. Used by Enlist's tap eligibility.
+    HasHasteOrControlledSinceTurnBegan,
     WithKeyword {
         value: Keyword,
     },
@@ -3302,10 +3306,16 @@ pub enum QuantityRef {
     /// A number chosen as the source entered the battlefield (e.g., Talion, the Kindly Lord).
     /// Resolved from the source object's `ChosenAttribute::Number`.
     ChosenNumber,
-    /// CR 508.1a: Number of creatures the controller attacked with this turn.
-    /// Used for "if you attacked this turn" and "for each creature you attacked
-    /// with this turn" patterns.
-    AttackedThisTurn,
+    /// CR 508.1a: Number of creatures the controller attacked with this turn,
+    /// optionally narrowed by `filter` (e.g. "attacked with a token / a
+    /// commander / a Wolf"). `None` counts all attacking creatures (the bare
+    /// "if you attacked this turn" / "for each creature you attacked with this
+    /// turn" patterns); `Some(filter)` counts only this-turn attackers matching
+    /// `filter`, resolved against `state.creatures_attacked_this_turn`.
+    AttackedThisTurn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<TargetFilter>,
+    },
     /// CR 603.4: Whether the controller descended this turn (permanent card entered graveyard).
     DescendedThisTurn,
     /// CR 606.1 + CR 603.4: Number of loyalty abilities the scoped player has
@@ -6200,6 +6210,24 @@ pub enum Effect {
     /// target (opponents and per-opponent attack binding are chosen by the
     /// effect, like `Myriad`).
     Encore,
+    /// CR 702.55a: Haunt — exile the source card (currently in a graveyard, put
+    /// there by dying or by resolving) from the graveyard, *haunting* the target
+    /// creature: it moves to exile and an `ExileLinkKind::Haunt` link records the
+    /// haunted creature. Resolver: `game/haunt.rs`. The target is the haunted
+    /// creature, chosen when the haunt triggered ability goes on the stack.
+    ExileHaunting {
+        #[serde(default = "default_target_filter_any")]
+        target: TargetFilter,
+    },
+    /// CR 702.75a: Hideaway conceal step — turn the just-exiled `target` card
+    /// face down and link it to the source in the `exile_links` pool. Chained as
+    /// a `sub_ability` after the `Effect::Dig` of a Hideaway ETB ability
+    /// (`database/hideaway.rs`); `target` is `ParentTarget` (the card the Dig
+    /// continuation exiled), never announced. Resolver: `game/effects/hideaway.rs`.
+    HideawayConceal {
+        #[serde(default = "default_target_filter_parent")]
+        target: TargetFilter,
+    },
     /// CR 509.1g + CR 506.3e + CR 707.2: For each attacking creature matched by
     /// `source_filter`, create a token that's a copy of it and put that token
     /// onto the battlefield blocking the attacker it copies. Mirror Match is the
@@ -7354,7 +7382,7 @@ pub enum Effect {
     },
     /// CR 701.48a: Learn — you may discard a card to draw a card, or get a Lesson from outside the game.
     Learn,
-    /// CR 702.166a: Forage — exile three cards from your graveyard or sacrifice a Food.
+    /// CR 701.61a: Forage — exile three cards from your graveyard or sacrifice a Food.
     Forage,
     /// CR 702.163a: Collect evidence N — exile cards with total mana value N or more from graveyard.
     CollectEvidence {
@@ -7666,6 +7694,12 @@ fn is_target_filter_controller(t: &TargetFilter) -> bool {
 
 fn default_target_filter_self_ref() -> TargetFilter {
     TargetFilter::SelfRef
+}
+
+/// CR 608.2c: default for continuation effects whose target is inherited from
+/// the parent ability (e.g. `Effect::HideawayConceal`).
+fn default_target_filter_parent() -> TargetFilter {
+    TargetFilter::ParentTarget
 }
 
 fn target_filter_is_self_ref(filter: &TargetFilter) -> bool {
@@ -8142,7 +8176,17 @@ impl Effect {
             // target slot and so resolution-time re-validation (CR 608.2b) checks
             // it against the StackSpell/StackAbility filter instead of the
             // battlefield-only default (which would always fizzle a stack target).
-            | Effect::ChangeTargets { target, .. } => Some(target),
+            | Effect::ChangeTargets { target, .. }
+            // CR 702.55a: Haunt — "exile it haunting target creature". The
+            // haunted creature is a real target chosen as the haunt trigger goes
+            // on the stack, so it must be surfaced for the target-slot path.
+            | Effect::ExileHaunting { target } => Some(target),
+
+            // CR 702.75a: Hideaway conceal acts on the just-exiled card inherited
+            // from the parent `Dig` continuation (`ParentTarget`); it is never
+            // announced as a target, but surfacing the filter keeps chain-time
+            // resolution consistent.
+            Effect::HideawayConceal { target } => Some(target),
 
             // CR 109.4 + CR 115.1 + CR 707.2: `CopyTokenOf` has two
             // potentially-targetable axes — the copy *source* (`target`) and
@@ -8414,6 +8458,8 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::CopyTokenOf { .. } => "CopyTokenOf",
         Effect::Myriad => "Myriad",
         Effect::Encore => "Encore",
+        Effect::ExileHaunting { .. } => "ExileHaunting",
+        Effect::HideawayConceal { .. } => "HideawayConceal",
         Effect::CopyTokenBlockingAttacker { .. } => "CopyTokenBlockingAttacker",
         Effect::BecomeCopy { .. } => "BecomeCopy",
         Effect::ChooseCard { .. } => "ChooseCard",
@@ -8605,6 +8651,8 @@ pub enum EffectKind {
     CopyTokenOf,
     Myriad,
     Encore,
+    ExileHaunting,
+    HideawayConceal,
     BecomeCopy,
     ChooseCard,
     PutCounter,
@@ -8793,6 +8841,8 @@ impl From<&Effect> for EffectKind {
             Effect::CopyTokenOf { .. } => EffectKind::CopyTokenOf,
             Effect::Myriad => EffectKind::Myriad,
             Effect::Encore => EffectKind::Encore,
+            Effect::ExileHaunting { .. } => EffectKind::ExileHaunting,
+            Effect::HideawayConceal { .. } => EffectKind::HideawayConceal,
             // CR 707.2: classified as a copy-token effect — the block placement
             // is bookkeeping layered on top of the same token-copy creation.
             Effect::CopyTokenBlockingAttacker { .. } => EffectKind::CopyTokenOf,
@@ -11455,8 +11505,10 @@ pub enum CombatDamageScope {
 }
 
 /// CR 614.1a: Which player(s) a replacement effect applies to, scoped relative
-/// to the replacement source's controller. `valid_player: None` keeps the
-/// controller-only default; `Some(You)` is the explicit controller scope,
+/// to the replacement source player. For permanents/spells this is the source's
+/// controller; for cards outside the battlefield/stack, CR 109.4 + CR 108.4a
+/// make this the owner. `valid_player: None` keeps the source-player default;
+/// `Some(You)` is the explicit source-player scope,
 /// `Some(Opponent)` an opponent-scoped replacement (Tainted Remedy), and
 /// `Some(AnyPlayer)` a global all-players replacement (Rain of Gore).
 ///
@@ -11465,9 +11517,9 @@ pub enum CombatDamageScope {
 /// `valid_player` values (`"You"` / `"Opponent"`) deserialize unchanged.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReplacementPlayerScope {
-    /// The replacement source's controller.
+    /// The replacement source player.
     You,
-    /// Any opponent of the replacement source's controller.
+    /// Any opponent of the replacement source player.
     Opponent,
     /// Every player in the game, regardless of who controls the source.
     AnyPlayer,
@@ -11577,7 +11629,7 @@ pub struct ReplacementDefinition {
     /// CR 614.1a: Restricts which player this replacement applies to.
     /// "an opponent would gain life" → Some(Opponent); "a spell or ability would
     /// cause its controller to gain life" (Rain of Gore) → Some(AnyPlayer).
-    /// None = applies to the replacement source's controller only.
+    /// None = applies to the replacement source player only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_player: Option<ReplacementPlayerScope>,
     /// Marks this replacement as consumed (one-shot). Skipped by find_applicable_replacements.
@@ -13797,6 +13849,7 @@ mod tests {
             FilterProp::Unblocked,
             FilterProp::Tapped,
             FilterProp::Untapped,
+            FilterProp::HasHasteOrControlledSinceTurnBegan,
             FilterProp::WithKeyword {
                 value: Keyword::Flying,
             },

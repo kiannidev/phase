@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::game::filter;
 use crate::game::speed::has_max_speed;
@@ -84,6 +84,7 @@ pub mod explore;
 pub mod extra_turn;
 pub mod fight;
 pub mod flip_coin;
+pub mod forage;
 pub mod force_attack;
 pub mod force_block;
 pub mod gain_control;
@@ -91,6 +92,7 @@ pub mod gift_delivery;
 pub mod goad;
 pub mod grant_extra_loyalty_activations;
 pub mod grant_permission;
+pub mod hideaway;
 pub mod incubate;
 pub mod investigate;
 pub mod learn;
@@ -145,6 +147,7 @@ pub mod surveil;
 pub mod suspect;
 pub mod switch_pt;
 pub mod tap_untap;
+pub mod time_travel;
 pub mod token;
 pub mod token_copy;
 pub mod transform_effect;
@@ -782,7 +785,38 @@ pub(crate) fn parent_referent_context_from_events(
         return Some(snapshot);
     }
 
-    revealed_object_context_from_events(state, events)
+    if let Some(snapshot) = revealed_object_context_from_events(state, events) {
+        return Some(snapshot);
+    }
+
+    // CR 608.2c: a later instruction's "that creature" may refer to a single
+    // creature an earlier instruction in the same resolution tapped — e.g.
+    // Enlist's "+X/+0 … where X is the tapped creature's power". Tried last so
+    // sacrifice/move/reveal referents continue to take precedence. The tapped
+    // permanent stays on the battlefield, so it is snapshot live.
+    tapped_object_context_from_events(state, events)
+}
+
+/// CR 608.2c: capture a single creature tapped by the parent instruction as the
+/// resolution's anaphoric referent. A multi-permanent tap has no singular "that
+/// creature", so it yields no snapshot (mirroring the sacrifice/move guards).
+fn tapped_object_context_from_events(
+    state: &GameState,
+    events: &[GameEvent],
+) -> Option<CostPaidObjectSnapshot> {
+    let mut seen = HashSet::new();
+    let mut tapped = events.iter().filter_map(|event| match event {
+        GameEvent::PermanentTapped { object_id, .. } if seen.insert(*object_id) => state
+            .objects
+            .get(object_id)
+            .map(|obj| CostPaidObjectSnapshot {
+                object_id: *object_id,
+                lki: obj.snapshot_for_mana_spent(),
+            }),
+        _ => None,
+    });
+    let first = tapped.next()?;
+    tapped.next().is_none().then_some(first)
 }
 
 fn sacrificed_object_context_from_events(
@@ -952,6 +986,7 @@ fn waits_for_resolution_choice(waiting_for: &WaitingFor) -> bool {
             }
             | WaitingFor::TopOrBottomChoice { .. }
             | WaitingFor::ProliferateChoice { .. }
+            | WaitingFor::TimeTravelChoice { .. }
             | WaitingFor::ChooseObjectsSelection { .. }
             | WaitingFor::ExploreChoice { .. }
             | WaitingFor::CopyRetarget { .. }
@@ -1829,7 +1864,7 @@ pub fn resolve_effect(
         Effect::Tribute { .. } => tribute::resolve(state, ability, events),
         // CR 701.56a: Time travel — interactive counter manipulation on suspended/time-countered permanents.
         // Currently a no-op; full interactive implementation requires WaitingFor infrastructure.
-        Effect::TimeTravel => Ok(()),
+        Effect::TimeTravel => time_travel::resolve(state, ability, events),
         Effect::BecomeMonarch => become_monarch::resolve(state, ability, events),
         Effect::Proliferate => proliferate::resolve(state, ability, events),
         Effect::ProliferateTarget { .. } => proliferate::resolve_target(state, ability, events),
@@ -1846,7 +1881,9 @@ pub fn resolve_effect(
         Effect::CastCopyOfCard { .. } => cast_copy_of_card::resolve(state, ability, events),
         Effect::CopyTokenOf { .. } => token_copy::resolve(state, ability, events),
         Effect::Myriad => myriad::resolve(state, ability, events),
+        Effect::ExileHaunting { .. } => crate::game::haunt::resolve(state, ability, events),
         Effect::Encore => encore::resolve(state, ability, events),
+        Effect::HideawayConceal { .. } => hideaway::resolve(state, ability, events),
         Effect::CopyTokenBlockingAttacker { .. } => {
             copy_token_blocking::resolve(state, ability, events)
         }
@@ -1988,11 +2025,7 @@ pub fn resolve_effect(
         Effect::Learn => learn::resolve(state, ability, events),
         Effect::BlightEffect { .. } => blight::resolve(state, ability, events),
         Effect::Endure { .. } => endure::resolve(state, ability, events),
-        Effect::Forage => {
-            // This keyword action is recognized by the parser but not yet implemented.
-            // It's a no-op at runtime but counts as supported for coverage.
-            Ok(())
-        }
+        Effect::Forage => forage::resolve(state, ability, events),
         Effect::CollectEvidence { .. } => collect_evidence::resolve(state, ability, events),
         Effect::SetLifeTotal { .. } => life::resolve_set_life_total(state, ability, events),
         Effect::ExchangeLifeWithStat { .. } => exchange_life::resolve(state, ability, events),
@@ -2266,6 +2299,12 @@ fn affected_objects_from_events(
                 // to that zone makes a downstream "from among the milled cards"
                 // sub-ability resolve against exactly the milled cards.
                 Effect::Mill { destination, .. } => Some(*destination),
+                // CR 701.20a + CR 608.2f: The kept card lands in `kept_destination`; scope the
+                // tracked set to that zone so downstream TrackedSet consumers (e.g. IC's
+                // ChangeZoneAll{Exile→Battlefield}) see only the kept card, not the rest pile.
+                Effect::RevealUntil {
+                    kept_destination, ..
+                } => Some(*kept_destination),
                 Effect::ExileTop { .. } | Effect::ExileFromTopUntil { .. } => {
                     Some(crate::types::zones::Zone::Exile)
                 }
@@ -5582,6 +5621,120 @@ mod tests {
     use crate::types::triggers::TriggerMode;
     use crate::types::zones::Zone;
 
+    /// CR 608.2c: a single tapped creature becomes the resolution's anaphoric
+    /// referent, so a later "that creature's power" (Enlist) reads it.
+    #[test]
+    fn tapped_creature_is_captured_as_anaphoric_referent() {
+        let mut state = GameState::new_two_player(42);
+        let creature = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Tapped".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&creature).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_power = Some(3);
+            obj.base_toughness = Some(3);
+            obj.power = Some(3);
+            obj.toughness = Some(3);
+        }
+        let events = vec![GameEvent::PermanentTapped {
+            object_id: creature,
+            caused_by: None,
+        }];
+        let referent = parent_referent_context_from_events(&state, &events)
+            .expect("a single tapped creature must be captured as the anaphoric referent");
+        assert_eq!(referent.object_id, creature);
+        assert_eq!(
+            referent.lki.power,
+            Some(3),
+            "the referent snapshot carries the tapped creature's power"
+        );
+    }
+
+    /// A multi-creature tap has no singular "that creature" (mirrors the
+    /// sacrifice/move guards).
+    #[test]
+    fn multiple_tapped_creatures_yield_no_singular_referent() {
+        let mut state = GameState::new_two_player(42);
+        let a = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "A".to_string(),
+            Zone::Battlefield,
+        );
+        let b = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "B".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [a, b] {
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+        }
+        let events = vec![
+            GameEvent::PermanentTapped {
+                object_id: a,
+                caused_by: None,
+            },
+            GameEvent::PermanentTapped {
+                object_id: b,
+                caused_by: None,
+            },
+        ];
+        assert!(
+            parent_referent_context_from_events(&state, &events).is_none(),
+            "two tapped creatures have no singular anaphoric referent"
+        );
+    }
+
+    /// CR 608.2c: duplicate events for the same tapped creature still describe
+    /// one singular referent.
+    #[test]
+    fn duplicate_tap_events_for_same_creature_still_capture_single_referent() {
+        let mut state = GameState::new_two_player(42);
+        let creature = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Tapped".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&creature).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_power = Some(4);
+            obj.base_toughness = Some(4);
+            obj.power = Some(4);
+            obj.toughness = Some(4);
+        }
+        let events = vec![
+            GameEvent::PermanentTapped {
+                object_id: creature,
+                caused_by: None,
+            },
+            GameEvent::PermanentTapped {
+                object_id: creature,
+                caused_by: None,
+            },
+        ];
+        let referent = parent_referent_context_from_events(&state, &events)
+            .expect("duplicate tap events for one creature still have a singular referent");
+        assert_eq!(referent.object_id, creature);
+        assert_eq!(referent.lki.power, Some(4));
+    }
+
     #[test]
     fn is_known_effect_rejects_unimplemented() {
         let known = Effect::DealDamage {
@@ -8331,6 +8484,53 @@ mod tests {
             .filter(|o| o.name == "Treasure")
             .count();
         assert_eq!(treasures0, 0, "Empty chain must mint zero tokens");
+    }
+
+    /// CR 701.20a + CR 608.2f: an Indomitable Creativity-style
+    /// `RevealUntil(kept_destination=Exile)` publishes only the kept card as
+    /// the chain tracked set. Without the `RevealUntil` destination filter in
+    /// `affected_objects_from_events`, both the kept card and miss pile zone
+    /// changes would be published.
+    #[test]
+    fn reveal_until_exile_kept_publishes_only_kept_card_for_tracked_set() {
+        let miss = ObjectId(2);
+        let hit = ObjectId(3);
+        let events = vec![
+            GameEvent::ZoneChanged {
+                object_id: miss,
+                from: Some(Zone::Library),
+                to: Zone::Library,
+                record: Box::new(ZoneChangeRecord::test_minimal(
+                    miss,
+                    Some(Zone::Library),
+                    Zone::Library,
+                )),
+            },
+            GameEvent::ZoneChanged {
+                object_id: hit,
+                from: Some(Zone::Library),
+                to: Zone::Exile,
+                record: Box::new(ZoneChangeRecord::test_minimal(
+                    hit,
+                    Some(Zone::Library),
+                    Zone::Exile,
+                )),
+            },
+        ];
+        let effect = Effect::RevealUntil {
+            player: TargetFilter::Controller,
+            filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact)),
+            kept_destination: Zone::Exile,
+            rest_destination: Zone::Library,
+            enter_tapped: false,
+            enters_attacking: false,
+            kept_optional_to: None,
+        };
+
+        assert_eq!(
+            affected_objects_from_events(&effect, &events, &[]),
+            vec![hit]
+        );
     }
 
     /// CR 608.2c + CR 400.7: a mass-destroy parent must publish the destroyed

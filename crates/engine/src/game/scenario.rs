@@ -1465,6 +1465,15 @@ impl GameRunner {
                 crate::types::game_state::AlternativeCastKeyword::Evoke => {
                     "AlternativeCastChoice(Evoke)"
                 }
+                crate::types::game_state::AlternativeCastKeyword::Emerge => {
+                    "AlternativeCastChoice(Emerge)"
+                }
+                crate::types::game_state::AlternativeCastKeyword::Dash => {
+                    "AlternativeCastChoice(Dash)"
+                }
+                crate::types::game_state::AlternativeCastKeyword::Blitz => {
+                    "AlternativeCastChoice(Blitz)"
+                }
                 crate::types::game_state::AlternativeCastKeyword::Overload => {
                     "AlternativeCastChoice(Overload)"
                 }
@@ -1523,6 +1532,7 @@ impl GameRunner {
             WaitingFor::ChooseLegend { .. } => "ChooseLegend",
             WaitingFor::BattleProtectorChoice { .. } => "BattleProtectorChoice",
             WaitingFor::ProliferateChoice { .. } => "ProliferateChoice",
+            WaitingFor::TimeTravelChoice { .. } => "TimeTravelChoice",
             WaitingFor::ChooseObjectsSelection { .. } => "ChooseObjectsSelection",
             WaitingFor::CopyRetarget { .. } => "CopyRetarget",
             WaitingFor::AssignCombatDamage { .. } => "AssignCombatDamage",

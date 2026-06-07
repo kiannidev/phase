@@ -61,6 +61,13 @@ fn apply_zone_exit_cleanup(state: &mut GameState, object_id: ObjectId, from: Zon
     // re-drawn does not surface as "still revealed."
     state.revealed_cards.remove(&object_id);
     state.public_revealed_cards.remove(&object_id);
+    // CR 400.7 + CR 702.187b: The "discarded this turn" mark (Mayhem's gate)
+    // belongs to the old object. Clear it on any zone change so a card that
+    // leaves the graveyard and returns is not treated as still discarded; the
+    // discard pipeline re-stamps it after the move-to-graveyard completes.
+    if let Some(obj) = state.objects.get_mut(&object_id) {
+        obj.discarded_turn = None;
+    }
     // CR 400.7 + CR 403.4: Activation-use history belongs to the old
     // object. `ObjectId` is storage identity here, so clear per-object counts
     // at the zone-change boundary before the same id can represent a new object.
@@ -217,6 +224,18 @@ fn apply_zone_exit_cleanup(state: &mut GameState, object_id: ObjectId, from: Zon
             state.layers_dirty.mark_full();
         }
 
+        // CR 400.7d + CR 702.150a: Compleated's Phyrexian life-payment count
+        // is cast metadata. Preserve it while the cast object moves to the
+        // stack, and while the resolving permanent spell becomes the
+        // battlefield object whose ETB counter replacement will consume it.
+        // Every other zone change creates an object with no memory of that
+        // payment.
+        let preserve_phyrexian_life_paid =
+            to == Zone::Stack || (from == Zone::Stack && to == Zone::Battlefield);
+        if !preserve_phyrexian_life_paid {
+            obj_mut.phyrexian_life_paid = 0;
+        }
+
         // CR 122.2: Counters cease to exist when an object changes zones.
         obj_mut.counters.clear();
     }
@@ -244,11 +263,16 @@ fn apply_zone_exit_cleanup(state: &mut GameState, object_id: ObjectId, from: Zon
         // `UntilSourceLeaves` links are intentionally preserved here because
         // `check_exile_returns` runs later in the priority loop and consumes
         // them to return the exiled cards (CR 610.3a).
+        // CR 702.55b + CR 702.55c: `Haunt` links are likewise preserved — the haunted
+        // creature leaving the battlefield (its death) is exactly when the
+        // card's haunt-payoff trigger reads the link to fire from exile. The
+        // link is pruned later, when the haunting card itself leaves exile.
         state.exile_links.retain(|link| {
             link.source_id != object_id
                 || matches!(
                     link.kind,
                     crate::types::game_state::ExileLinkKind::UntilSourceLeaves { .. }
+                        | crate::types::game_state::ExileLinkKind::Haunt
                 )
         });
     }

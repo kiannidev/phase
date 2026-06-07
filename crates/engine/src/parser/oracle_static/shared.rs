@@ -329,6 +329,9 @@ pub(crate) fn target_filter_is_your_graveyard(filter: &TargetFilter) -> bool {
 pub(crate) enum GraveyardGrantedKeywordKind {
     Flashback,
     Escape,
+    Mayhem,
+    Scavenge,
+    Encore,
 }
 
 impl GraveyardGrantedKeywordKind {
@@ -340,6 +343,14 @@ impl GraveyardGrantedKeywordKind {
             GraveyardGrantedKeywordKind::Escape => {
                 keyword.kind() == crate::types::keywords::KeywordKind::Escape
             }
+            // CR 702.187b: Green Goblin grants Mayhem to graveyard cards.
+            GraveyardGrantedKeywordKind::Mayhem => {
+                keyword.kind() == crate::types::keywords::KeywordKind::Mayhem
+            }
+            // CR 702.97 (Scavenge) / CR 702.141 (Encore): activated graveyard
+            // keywords share `KeywordKind::Unknown`, so match the variant directly.
+            GraveyardGrantedKeywordKind::Scavenge => matches!(keyword, Keyword::Scavenge(_)),
+            GraveyardGrantedKeywordKind::Encore => matches!(keyword, Keyword::Encore(_)),
         }
     }
 }
@@ -646,12 +657,27 @@ pub(crate) fn parse_static_line_multi_inner(text: &str) -> Vec<StaticDefinition>
         return defs;
     }
 
+    // CR 702.18a / CR 702.11a: "<grant or restriction> and can't be the target of
+    // …" pairs a first clause with a targeting restriction under one subject
+    // (Spectral Shield). Split so the CantBeTargeted/Hexproof clause is not
+    // dropped.
+    if let Some(defs) = try_split_and_cant_be_targeted(&stripped) {
+        return defs;
+    }
+
     // CR 602.5: "<grant or restriction> and its activated abilities can't be
     // activated" pairs a first clause with an activation prohibition under one
     // subject (Viper's Kiss). Split so the CantBeActivated clause is not dropped.
     // (The "can't attack/block, and activated abilities …" compound — Arrest,
     // Faith's Fetters — is handled by its own earlier branch above.)
     if let Some(defs) = try_split_and_cant_activate_abilities(&stripped) {
+        return defs;
+    }
+
+    // CR 701.21: "<grant or restriction> and can't be sacrificed" pairs a first
+    // clause with a sacrifice prohibition under one subject (Assault Suit). Split
+    // so the CantBeSacrificed clause is not dropped.
+    if let Some(defs) = try_split_and_cant_be_sacrificed(&stripped) {
         return defs;
     }
 

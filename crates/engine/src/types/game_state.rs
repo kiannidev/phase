@@ -420,6 +420,24 @@ pub struct ZoneChangeCombatStatus {
     pub defending_player: Option<PlayerId>,
 }
 
+/// CR 508.1a: Snapshot of a creature's public characteristics when it was
+/// declared as an attacker.
+///
+/// Later "you attacked with <quality> this turn" checks resolve after combat,
+/// after the attacker may have changed zones or ceased to exist, so they must
+/// read declaration-time characteristics instead of live battlefield state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttackDeclarationRecord {
+    pub object_id: ObjectId,
+    pub lki: LKISnapshot,
+    /// CR 111.1: Token identity at declaration time.
+    #[serde(default)]
+    pub is_token: bool,
+    /// CR 903.3d: Commander identity at declaration time.
+    #[serde(default)]
+    pub is_commander: bool,
+}
+
 /// CR 603.10a: Snapshot of a single attachment on a leaving-battlefield object
 /// at the instant before the zone change. Controller/kind are captured so that
 /// post-LTB resolvers can filter ("each Aura you controlled") without chasing
@@ -669,6 +687,29 @@ pub enum ExileLinkKind {
     /// creature leaves the battlefield (`zones.rs` battlefield-exit, since this
     /// is not an `UntilSourceLeaves` link) — exactly CR 702.99c's lifetime.
     Cipher,
+    /// CR 702.55b: Haunt — the exiled card (`exiled_id`) "haunts" the creature
+    /// (`source_id`) targeted by its haunt ability. The link drives the card's
+    /// haunt-payoff trigger, which fires from the exile zone when the haunted
+    /// creature dies (CR 702.55c). Unlike `Cipher`, this link is **preserved**
+    /// when the haunted creature leaves the battlefield (`zones.rs` battlefield
+    /// exit) — the haunted creature's death is exactly when the payoff must read
+    /// the link. The card "haunts the creature it haunts regardless of whether
+    /// or not that object is still a creature" (CR 702.55b), so the link is
+    /// pruned only when the haunting card itself leaves exile (`zones.rs`
+    /// exile-exit), not when the creature changes or dies.
+    Haunt,
+    /// CR 702.75a: Hideaway — the card (`exiled_id`) was exiled face down by the
+    /// permanent (`source_id`). Like `TrackedBySource` it tracks the card so the
+    /// companion "you may play the exiled card" ability (`TargetFilter::
+    /// ExiledBySource`, which is kind-agnostic) can later find it — but it
+    /// additionally grants a *look-permission*: the player who controls the
+    /// exiling permanent "may look at this card in the exile zone". Visibility
+    /// keys the controller's face-down look-through on this kind specifically, so
+    /// plain `TrackedBySource` face-down exiles that grant no such permission
+    /// (Bomat Courier's "(You can't look at it.)", Necropotence, Asmodeus) stay
+    /// redacted. Pruned on exile-exit / source-exit like `Cipher` (not an
+    /// `UntilSourceLeaves` link, so no automatic return).
+    HideawayLookable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1727,6 +1768,15 @@ pub enum AlternativeCastKeyword {
     /// CR 702.74a: ETB + sacrifice trigger fires when the resolving permanent
     /// was cast for its evoke cost (CR 702.74b).
     Evoke,
+    /// CR 702.119a-c: Emerge alternative cost requires sacrificing a creature
+    /// while casting and reduces the emerge cost by that creature's mana value.
+    Emerge,
+    /// CR 702.109a: Cast for the dash cost — the resolving permanent gains haste
+    /// and is returned to its owner's hand at the next end step.
+    Dash,
+    /// CR 702.152a: Cast for the blitz cost — the resolving permanent gains
+    /// haste and a dies-draw trigger, and is sacrificed at the next end step.
+    Blitz,
     /// CR 702.96a: Spell's text changes "target" to "each" (CR 702.96b-c).
     Overload,
     /// CR 702.103a: Spell becomes an Aura with enchant creature (CR 702.103b).
@@ -1827,6 +1877,7 @@ pub enum SpellCostSource {
     #[default]
     Other,
     Offering,
+    Emerge,
 }
 
 /// The specific kind of cast offer being presented to the player.
@@ -1871,6 +1922,15 @@ pub enum CastOfferKind {
         #[serde(default)]
         discover_value: u32,
     },
+}
+
+/// CR 701.56a: Which half of a time-travel choice is currently being
+/// presented. Typed instead of boolean so serialized engine state says whether
+/// the player is adding or removing counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimeTravelPhase {
+    Remove,
+    Add,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3038,6 +3098,19 @@ pub enum WaitingFor {
         /// Eligible permanents (with counters) and players (with poison/energy).
         eligible: Vec<TargetRef>,
     },
+    /// CR 701.56a: Time travel — the player chooses any number of eligible
+    /// objects (permanents they control with a time counter and/or suspended
+    /// cards they own in exile with a time counter) and, for each, puts or
+    /// removes a time counter. Modeled in two phases over
+    /// `GameAction::SelectTargets`: `TimeTravelPhase::Remove` first selects
+    /// objects to remove a time counter from; then `TimeTravelPhase::Add`
+    /// selects (from the still-eligible remainder) objects to add a time
+    /// counter to.
+    TimeTravelChoice {
+        player: PlayerId,
+        eligible: Vec<TargetRef>,
+        phase: TimeTravelPhase,
+    },
     /// CR 603.7e: The affected player of a `ChooseObjectsIntoTrackedSet` effect
     /// selects any number of battlefield permanents from `eligible`. The
     /// chosen objects are written into a fresh tracked set so a downstream
@@ -3395,6 +3468,7 @@ impl WaitingFor {
             WaitingFor::CommanderZoneChoice { .. } => "CommanderZoneChoice",
             WaitingFor::BattleProtectorChoice { .. } => "BattleProtectorChoice",
             WaitingFor::ProliferateChoice { .. } => "ProliferateChoice",
+            WaitingFor::TimeTravelChoice { .. } => "TimeTravelChoice",
             WaitingFor::ChooseObjectsSelection { .. } => "ChooseObjectsSelection",
             WaitingFor::CategoryChoice { .. } => "CategoryChoice",
             WaitingFor::CopyRetarget { .. } => "CopyRetarget",
@@ -3514,6 +3588,7 @@ impl WaitingFor {
             | WaitingFor::ChooseLegend { player, .. }
             | WaitingFor::BattleProtectorChoice { player, .. }
             | WaitingFor::ProliferateChoice { player, .. }
+            | WaitingFor::TimeTravelChoice { player, .. }
             | WaitingFor::ChooseObjectsSelection { player, .. }
             | WaitingFor::CategoryChoice { player, .. }
             | WaitingFor::CopyRetarget { player, .. }
@@ -3837,6 +3912,11 @@ pub enum CastingVariant {
     /// CR 702.180a: Cast from graveyard for harmonize cost. On resolution, exiled
     /// instead of going anywhere else (unlike Escape which returns to graveyard).
     Harmonize,
+    /// CR 702.187b: Cast from graveyard for mayhem cost (allowed only while the
+    /// card was discarded this turn). Unlike Flashback/Harmonize, the spell is
+    /// NOT exiled — it resolves normally (like Escape), so it can be discarded
+    /// and recast again on a later turn.
+    Mayhem,
     /// CR 702.34a: Cast from graveyard for flashback cost. On resolution (or
     /// whenever leaving the stack for any reason), exiled instead of going anywhere else.
     Flashback,
@@ -3933,6 +4013,20 @@ pub enum CastingVariant {
     /// the permanent enters tagged with `CastVariantPaid::Evoke`, which fires
     /// the synthesized intervening-if ETB sacrifice trigger.
     Evoke,
+    /// CR 702.119a-c: Cast from hand via Emerge's alternative cost. The printed
+    /// mana cost is replaced by `Keyword::Emerge(cost)` at cast preparation;
+    /// casting requires sacrificing a creature, then reduces that emerge cost by
+    /// the sacrificed creature's mana value. Resolution routing matches a normal
+    /// cast; Emerge has no resolution rider.
+    Emerge,
+    /// CR 702.109a: Cast from hand via Dash's alternative cost. On resolution,
+    /// `dash::install_dash_riders` grants the permanent haste and schedules a
+    /// next-end-step return to its owner's hand.
+    Dash,
+    /// CR 702.152a: Cast from hand via Blitz's alternative cost. On resolution,
+    /// `blitz::install_blitz_riders` grants the permanent haste and a dies-draw
+    /// trigger and schedules a next-end-step sacrifice.
+    Blitz,
     /// CR 702.62a: Cast from exile via Suspend's "play it without paying its
     /// mana cost" trigger after the last time counter was removed. On resolution
     /// of the resulting permanent, the stack handler tags
@@ -4040,6 +4134,14 @@ pub enum CastingVariant {
     /// matches a normal cast — no on-resolve special behavior — so this is a
     /// casting-context tag, not a resolution-affecting variant.
     Freerunning,
+    /// CR 702.76a: Cast from hand via Prowl's alternative cost. Legal only when a
+    /// player was dealt combat damage this turn by a source under the caster's
+    /// control that, at damage time, had any of this spell's creature types. The
+    /// printed mana cost is replaced by the `Keyword::Prowl(cost)` payload at cast
+    /// preparation (mirrors `Freerunning`/`Overload`). Resolution routing matches
+    /// a normal cast — no on-resolve special behavior — so this is a
+    /// casting-context tag, not a resolution-affecting variant.
+    Prowl,
     /// CR 702.133a: Cast from a graveyard via Jump-start. The card is cast for
     /// its normal mana cost plus an additional cost of discarding a card
     /// (CR 601.2b/601.2f–h) — so, like `Retrace`/`Aftermath`, this is an
@@ -4048,6 +4150,10 @@ pub enum CastingVariant {
     /// exiled instead of going anywhere else any time it would leave the stack
     /// (see `exiles_when_leaving_stack_for_any_reason`).
     JumpStart,
+    /// CR 702.117a: Cast from hand for the surge alternative cost, legal only if
+    /// the caster has cast another spell this turn. Resolution is normal (no
+    /// exile/restore), so it appears only in `uses_alternative_cost`.
+    Surge,
 }
 
 impl CastingVariant {
@@ -4061,6 +4167,7 @@ impl CastingVariant {
             CastingVariant::Warp
             | CastingVariant::Escape
             | CastingVariant::Harmonize
+            | CastingVariant::Mayhem
             | CastingVariant::Flashback
             | CastingVariant::HandPermission { .. }
             | CastingVariant::Sneak { .. }
@@ -4068,6 +4175,9 @@ impl CastingVariant {
             | CastingVariant::Miracle
             | CastingVariant::Madness
             | CastingVariant::Evoke
+            | CastingVariant::Emerge
+            | CastingVariant::Dash
+            | CastingVariant::Blitz
             | CastingVariant::Suspend
             | CastingVariant::Plot
             | CastingVariant::Foretell
@@ -4082,6 +4192,10 @@ impl CastingVariant {
             // CR 702.140a: Mutate replaces the spell's mana cost with the mutate
             // cost — an alternative cost, so only one may apply (CR 118.9a).
             | CastingVariant::Mutate
+            // CR 702.76a: Prowl substitutes the prowl cost for the printed cost.
+            | CastingVariant::Prowl
+            // CR 702.117a: Surge substitutes the surge cost for the printed cost.
+            | CastingVariant::Surge
             | CastingVariant::Freerunning => true,
             CastingVariant::Normal
             | CastingVariant::Adventure
@@ -4993,6 +5107,12 @@ pub struct GameState {
     /// Persists after combat ends for post-combat filtering.
     #[serde(default)]
     pub creatures_attacked_this_turn: HashSet<ObjectId>,
+    /// CR 508.1a + CR 608.2c: Declaration-time attacker snapshots for filtered
+    /// post-combat queries ("attacked with a token/commander/Dinosaur this
+    /// turn"). Persists after combat ends because attackers may have left the
+    /// battlefield by resolution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attacker_declarations_this_turn: Vec<AttackDeclarationRecord>,
     /// CR 509.1a: Object IDs of creatures declared as blockers this turn.
     /// Persists after combat ends for post-combat filtering.
     #[serde(default)]
@@ -5037,6 +5157,16 @@ pub struct GameState {
     /// to gate the Freerunning cast permission on the spell's controller.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub assassin_or_commander_dealt_combat_damage_this_turn: HashSet<PlayerId>,
+    /// CR 702.76a + CR 608.2i: Set of `(controller, creature type)` entries for
+    /// sources that dealt combat damage to a player this turn (snapshot at
+    /// damage-dealing time — "looks back in time", so a source that later
+    /// changes types or leaves does not invalidate the entry). Flat persistent
+    /// storage keeps `GameState::clone()` structurally shared on AI/search paths.
+    /// Populated by the `DamageDealt` observer in `game::triggers` and cleared in
+    /// `turns::start_next_turn` per CR 514. Read by `casting_variant_candidates`
+    /// to gate the Prowl cast permission ("had any of this spell's creature types").
+    #[serde(default, skip_serializing_if = "im::HashSet::is_empty")]
+    pub creature_types_dealt_combat_damage_this_turn: im::HashSet<(PlayerId, String)>,
     /// CR 700.14: Cumulative mana spent on spells this turn per player (for Expend triggers).
     #[serde(default)]
     pub mana_spent_on_spells_this_turn: HashMap<PlayerId, u32>,
@@ -5856,6 +5986,7 @@ impl GameState {
             creature_attacked_defenders_this_turn: HashMap::new(),
             combat_phases_started_this_turn: 0,
             creatures_attacked_this_turn: HashSet::new(),
+            attacker_declarations_this_turn: Vec::new(),
             creatures_blocked_this_turn: HashSet::new(),
             players_who_created_token_this_turn: HashSet::new(),
             created_tokens_this_turn: Vec::new(),
@@ -5868,6 +5999,7 @@ impl GameState {
             battlefield_entries_this_turn: Vec::new(),
             damage_dealt_this_turn: im::Vector::new(),
             assassin_or_commander_dealt_combat_damage_this_turn: HashSet::new(),
+            creature_types_dealt_combat_damage_this_turn: im::HashSet::new(),
             mana_spent_on_spells_this_turn: HashMap::new(),
             pending_spell_cost_reductions: Vec::new(),
             pending_next_spell_modifiers: Vec::new(),
@@ -6266,6 +6398,7 @@ impl PartialEq for GameState {
                 == other.creature_attacked_defenders_this_turn
             && self.combat_phases_started_this_turn == other.combat_phases_started_this_turn
             && self.creatures_attacked_this_turn == other.creatures_attacked_this_turn
+            && self.attacker_declarations_this_turn == other.attacker_declarations_this_turn
             && self.creatures_blocked_this_turn == other.creatures_blocked_this_turn
             && self.players_who_created_token_this_turn == other.players_who_created_token_this_turn
             && self.created_tokens_this_turn == other.created_tokens_this_turn
@@ -6281,6 +6414,8 @@ impl PartialEq for GameState {
             && self.damage_dealt_this_turn == other.damage_dealt_this_turn
             && self.assassin_or_commander_dealt_combat_damage_this_turn
                 == other.assassin_or_commander_dealt_combat_damage_this_turn
+            && self.creature_types_dealt_combat_damage_this_turn
+                == other.creature_types_dealt_combat_damage_this_turn
             && self.pending_spell_cost_reductions == other.pending_spell_cost_reductions
             && self.pending_next_spell_modifiers == other.pending_next_spell_modifiers
             && self.pending_etb_counters == other.pending_etb_counters

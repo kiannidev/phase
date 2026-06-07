@@ -326,6 +326,33 @@ fn parse_life_equal_quantity(after_verb_lower: &str) -> Option<QuantityExpr> {
         .map(|qty| QuantityExpr::Ref { qty })
 }
 
+/// CR 119.3 + CR 102.1: "gain 1 life for each player" (a/an/1) → the count of
+/// every player in the game (`PlayerFilter::All`). Narrow to the one-life-per
+/// form, the only shape that occurs (Benediction of Moons); other multipliers
+/// fall through to the generic quantity paths. `text` is the remainder after
+/// the "gain" verb, lowercased.
+fn parse_gain_life_per_player(after_gain_lower: &str) -> Option<QuantityExpr> {
+    // `(1|a|an) life for each player(s)` — `players` first so the longer tag
+    // wins; the optional trailing period is consumed so `all_consuming` accepts
+    // both the sentence-final and mid-clause forms.
+    all_consuming((
+        alt((
+            tag::<_, _, OracleError<'_>>("1 life for each "),
+            tag("a life for each "),
+            tag("an life for each "),
+        )),
+        alt((tag("players"), tag("player"))),
+        opt(tag(".")),
+    ))
+    .parse(after_gain_lower.trim())
+    .ok()
+    .map(|_| QuantityExpr::Ref {
+        qty: QuantityRef::PlayerCount {
+            filter: crate::types::ability::PlayerFilter::All,
+        },
+    })
+}
+
 pub(super) fn parse_numeric_imperative_ast(
     text: &str,
     lower: &str,
@@ -367,6 +394,13 @@ pub(super) fn parse_numeric_imperative_ast(
 
     if let Some(after_gain) = parse_life_verb_remainder(text, lower, "gain", "gains") {
         let after_lower = after_gain.to_ascii_lowercase();
+        // CR 119.3 + CR 102.1: "gain N life for each player" — the life gained is
+        // the number of players (the per-each amount is 1). Benediction of Moons.
+        // Probed before the bare-quantity fallback, which would otherwise parse
+        // "1" and silently drop the "for each player" multiplier.
+        if let Some(amount) = parse_gain_life_per_player(&after_lower) {
+            return Some(NumericImperativeAst::GainLife { amount });
+        }
         // CR 119.3: Handle "life equal to {quantity}" — dynamic amount from game state.
         // CR 119.3: target-relative quantity refs ("target creature's
         // power/toughness/mana value"). Mirrors LoseLife. Soul's Grace,
@@ -1618,6 +1652,7 @@ fn try_parse_multi_zone_same_name_exile(lower: &str) -> Option<()> {
         let (input, _) = tag::<_, _, OracleError<'_>>("search ").parse(input)?;
         let (input, _) = alt((
             tag::<_, _, OracleError<'_>>("its owner's "),
+            tag("its controller's "),
             tag("their "),
             tag("that player's "),
             tag("target player's "),
@@ -1642,15 +1677,35 @@ fn try_parse_multi_zone_same_name_exile(lower: &str) -> Option<()> {
             value((), tag("a card")),
         ))
         .parse(input)?;
-        // Match the trailing same-name suffix in either of two synonymous forms:
-        //   " with that name and exile them"            (Deadly Cover-Up, Lost Legacy)
-        //   " with the same name as that card and exile them"  (Surgical Extraction)
+        // Match the trailing same-name suffix. The name source is either a
+        // previously-named card ("with that name", Lost Legacy / Deadly Cover-Up)
+        // or the spell's exiled/countered target referenced by its card type
+        // ("with the same name as that card/creature/land/spell/…", Surgical
+        // Extraction / Eradicate / Crumble to Dust / Counterbore / Deicide). The
+        // card-type is composed as one `alt` axis rather than enumerated as full
+        // strings; all forms lower to the same `SameNameAsParentTarget` effect.
         let (input, _) = alt((
             value(
                 (),
                 tag::<_, _, OracleError<'_>>(" with that name and exile them"),
             ),
-            value((), tag(" with the same name as that card and exile them")),
+            value(
+                (),
+                (
+                    tag::<_, _, OracleError<'_>>(" with the same name as that "),
+                    alt((
+                        tag("creature"),
+                        tag("permanent"),
+                        tag("planeswalker"),
+                        tag("artifact"),
+                        tag("enchantment"),
+                        tag("land"),
+                        tag("spell"),
+                        tag("card"),
+                    )),
+                    tag(" and exile them"),
+                ),
+            ),
         ))
         .parse(input)?;
         Ok((input, ()))
@@ -5474,7 +5529,7 @@ pub(super) fn parse_imperative_family_ast(
                 count,
             }))
         }
-        // Forage keyword action (CR 702.166a)
+        // Forage keyword action (CR 701.61a)
         "forage" => Some(ImperativeFamilyAst::GainKeyword(Effect::Forage)),
         // Collect evidence N keyword action (CR 702.163a)
         "collect" => {
@@ -10626,6 +10681,13 @@ mod tests {
             "search target player's graveyard, hand, and library for all cards with that name and exile them",
             "search its owner's graveyard, hand, and library for any number of cards with the same name as that card and exile them",
             "search their graveyard, hand, and library for a card with that name and exile them",
+            // CR 201.2a: "its controller's" possessive + card-type name source —
+            // Eradicate ("that creature"), Crumble to Dust ("that land"),
+            // Counterbore ("that spell"), Deicide ("its controller's … that card").
+            "search its controller's graveyard, hand, and library for all cards with the same name as that creature and exile them",
+            "search its controller's graveyard, hand, and library for any number of cards with the same name as that land and exile them",
+            "search its controller's graveyard, hand, and library for all cards with the same name as that spell and exile them",
+            "search its controller's graveyard, hand, and library for any number of cards with the same name as that card and exile them",
         ];
         for text in positives {
             assert!(

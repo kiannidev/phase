@@ -36,6 +36,10 @@ fn parse_cost_mod_spell_type_prefix(type_desc: &str) -> Option<TargetFilter> {
             take_until(" that are "),
             recognize((tag::<_, _, OracleError<'_>>(" that are "), rest)),
         ),
+        (
+            take_until(" that "),
+            recognize((tag::<_, _, OracleError<'_>>(" that "), rest)),
+        ),
     )))
     .parse(base);
 
@@ -82,7 +86,7 @@ fn parse_cost_mod_spell_type_prefix(type_desc: &str) -> Option<TargetFilter> {
         }
     };
 
-    match (typed_filter, qual_props.is_empty()) {
+    let filter = match (typed_filter, qual_props.is_empty()) {
         (filter, true) => filter,
         (Some(TargetFilter::Typed(mut tf)), false) => {
             tf.properties.extend(qual_props);
@@ -97,6 +101,37 @@ fn parse_cost_mod_spell_type_prefix(type_desc: &str) -> Option<TargetFilter> {
         (None, false) => Some(TargetFilter::Typed(
             TypedFilter::card().properties(qual_props),
         )),
+    };
+    filter.map(remap_cost_mod_imprint_exile_reference)
+}
+
+/// CR 603.10a: Cost-mod lines such as Semblance Anvil reference "the exiled
+/// card" as the imprinted card exiled by the source permanent. The shared-
+/// quality nom parser emits `TrackedSet` for that phrase; remap to
+/// `ExiledBySource` so live `exile_links` resolve the reference at cast time.
+fn remap_cost_mod_imprint_exile_reference(filter: TargetFilter) -> TargetFilter {
+    match filter {
+        TargetFilter::Typed(mut tf) => {
+            for prop in &mut tf.properties {
+                remap_shares_quality_imprint_reference(prop);
+            }
+            TargetFilter::Typed(tf)
+        }
+        TargetFilter::And { filters } => TargetFilter::And {
+            filters: filters
+                .into_iter()
+                .map(remap_cost_mod_imprint_exile_reference)
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+fn remap_shares_quality_imprint_reference(prop: &mut FilterProp) {
+    if let FilterProp::SharesQuality { reference, .. } = prop {
+        if matches!(reference.as_deref(), Some(TargetFilter::TrackedSet { .. })) {
+            *reference = Some(Box::new(TargetFilter::ExiledBySource));
+        }
     }
 }
 
@@ -216,121 +251,109 @@ pub(crate) fn try_parse_cost_modification(text: &str, lower: &str) -> Option<Sta
 
     // Extract spell type filter from the text before "cost"
     // E.g., "Creature spells you cast" → Creature, "Instant and sorcery spells" → AnyOf(Instant, Sorcery)
-    let spell_filter =
-        if nom_primitives::scan_contains(lower, "share a card type with the exiled card")
-            || nom_primitives::scan_contains(lower, "shares a card type with the exiled card")
-        {
-            // CR 601.2f: Semblance Anvil — imprinted card type gates the reduction.
-            Some(TargetFilter::Typed(TypedFilter::card().properties(vec![
-                FilterProp::SharesQuality {
-                    quality: SharedQuality::CardType,
-                    reference: Some(Box::new(TargetFilter::ExiledBySource)),
-                    relation: SharedQualityRelation::Shares,
-                },
-            ])))
-        } else if is_self_spell {
-            parse_self_spell_target_cost_filter(lower)
-        } else if let Some(filter) = first_qualified_spell_filter.clone() {
-            Some(filter)
+    let spell_filter = if is_self_spell {
+        parse_self_spell_target_cost_filter(lower)
+    } else if let Some(filter) = first_qualified_spell_filter.clone() {
+        Some(filter)
+    // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
+    } else if let Some(cost_idx) = lower.find(" cost") {
         // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-        } else if let Some(cost_idx) = lower.find(" cost") {
+        let prefix = &lower[..cost_idx];
+        let prefix = strip_cost_modifier_target_clause(prefix);
+        // Strip "from [zones]" clause (only if zones were detected), player scope, then "spells"
+        let without_from = if !cast_from_zones.is_empty() {
             // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-            let prefix = &lower[..cost_idx];
-            let prefix = strip_cost_modifier_target_clause(prefix);
-            // Strip "from [zones]" clause (only if zones were detected), player scope, then "spells"
-            let without_from = if !cast_from_zones.is_empty() {
+            if let Some(from_idx) = prefix.find(" from ") {
                 // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-                if let Some(from_idx) = prefix.find(" from ") {
-                    // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-                    &prefix[..from_idx]
-                } else {
-                    prefix
-                }
+                &prefix[..from_idx]
             } else {
                 prefix
-            };
-            // CR 201.3 / CR 113.6: Strip the trailing "with the chosen name" qualifier
-            // (Disruptor Flute: "Spells with the chosen name cost {3} more to cast.")
-            // before the standard suffix-trim chain runs. Track it so the spell filter is
-            // composed with `HasChosenName` after type parsing — same convention used by
-            // `parse_continuous_subject_filter` for object-class chosen-name phrases.
-            let (without_chosen, has_chosen_name) =
-                match nom_primitives::split_once_on(without_from, " with the chosen name") {
-                    Ok((_, (before, _))) => (before, true),
-                    Err(_) => (without_from, false),
-                };
-            // CR 205.2a + CR 601.2f: Strip the "of the chosen type" / "of that type"
-            // qualifier (Cloud Key, Umori, Stenn, Herald's Horn: "Spells you cast of
-            // the chosen type cost {1} less"). A "you cast" infix sits between the
-            // type word and this qualifier, so the trim chain below can't reach the
-            // type word and `parse_type_phrase` never extracts the chosen-type
-            // discriminator. Strip it here and re-attach IsChosenCardType /
-            // IsChosenCreatureType after the base type is parsed — mirrors the
-            // "with the chosen name" handling above.
-            let (without_chosen, has_chosen_type) = if let Ok((_, (before, _))) =
-                nom_primitives::split_once_on(without_chosen, " of the chosen type")
-            {
-                (before, true)
-            } else if let Ok((_, (before, _))) =
-                nom_primitives::split_once_on(without_chosen, " of that type")
-            {
-                (before, true)
-            } else {
-                (without_chosen, false)
-            };
-            let type_desc = without_chosen
-                .trim_end_matches(" you cast") // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-                .trim_end_matches(" your opponents cast") // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-                .trim_end_matches(" opponents cast") // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-                .trim_end_matches(" spells") // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-                .trim_end_matches(" spell") // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-                .trim();
-            // "spells" alone means no type restriction (bare "Spells you cast cost...")
-            let typed_filter =
-                if type_desc.is_empty() || type_desc == "spells" || type_desc == "spell" {
-                    None
-                } else {
-                    parse_cost_mod_spell_type_prefix(type_desc)
-                };
-            // CR 205.2a: Re-attach the chosen-type discriminator stripped above. A
-            // creature-typed base ("Creature spells ... of the chosen type",
-            // Herald's Horn) pairs with a chosen CREATURE type; a bare-spells base
-            // ("Spells ... of the chosen type", Cloud Key / Umori / Stenn) pairs
-            // with a chosen CARD type. Resolved at cast time against the source
-            // permanent's `ChosenAttribute` (CR 601.2f).
-            let typed_filter = if has_chosen_type {
-                match typed_filter {
-                    Some(TargetFilter::Typed(mut tf))
-                        if tf.type_filters.contains(&TypeFilter::Creature) =>
-                    {
-                        tf.properties.push(FilterProp::IsChosenCreatureType);
-                        Some(TargetFilter::Typed(tf))
-                    }
-                    Some(TargetFilter::Typed(mut tf)) => {
-                        tf.properties.push(FilterProp::IsChosenCardType);
-                        Some(TargetFilter::Typed(tf))
-                    }
-                    None => Some(TargetFilter::Typed(
-                        TypedFilter::card().properties(vec![FilterProp::IsChosenCardType]),
-                    )),
-                    other => other,
-                }
-            } else {
-                typed_filter
-            };
-            // Compose chosen-name constraint with the typed prefix (if any). Bare
-            // "Spells with the chosen name" → `HasChosenName` alone; typed
-            // "<Type> spells with the chosen name" → `And{Typed, HasChosenName}`.
-            match (typed_filter, has_chosen_name) {
-                (Some(tf), true) => Some(TargetFilter::And {
-                    filters: vec![tf, TargetFilter::HasChosenName],
-                }),
-                (None, true) => Some(TargetFilter::HasChosenName),
-                (tf, false) => tf,
             }
         } else {
-            None
+            prefix
         };
+        // CR 201.3 / CR 113.6: Strip the trailing "with the chosen name" qualifier
+        // (Disruptor Flute: "Spells with the chosen name cost {3} more to cast.")
+        // before the standard suffix-trim chain runs. Track it so the spell filter is
+        // composed with `HasChosenName` after type parsing — same convention used by
+        // `parse_continuous_subject_filter` for object-class chosen-name phrases.
+        let (without_chosen, has_chosen_name) =
+            match nom_primitives::split_once_on(without_from, " with the chosen name") {
+                Ok((_, (before, _))) => (before, true),
+                Err(_) => (without_from, false),
+            };
+        // CR 205.2a + CR 601.2f: Strip the "of the chosen type" / "of that type"
+        // qualifier (Cloud Key, Umori, Stenn, Herald's Horn: "Spells you cast of
+        // the chosen type cost {1} less"). A "you cast" infix sits between the
+        // type word and this qualifier, so the trim chain below can't reach the
+        // type word and `parse_type_phrase` never extracts the chosen-type
+        // discriminator. Strip it here and re-attach IsChosenCardType /
+        // IsChosenCreatureType after the base type is parsed — mirrors the
+        // "with the chosen name" handling above.
+        let (without_chosen, has_chosen_type) = if let Ok((_, (before, _))) =
+            nom_primitives::split_once_on(without_chosen, " of the chosen type")
+        {
+            (before, true)
+        } else if let Ok((_, (before, _))) =
+            nom_primitives::split_once_on(without_chosen, " of that type")
+        {
+            (before, true)
+        } else {
+            (without_chosen, false)
+        };
+        let type_desc = without_chosen
+            .trim_end_matches(" you cast") // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
+            .trim_end_matches(" your opponents cast") // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
+            .trim_end_matches(" opponents cast") // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
+            .trim_end_matches(" spells") // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
+            .trim_end_matches(" spell") // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
+            .trim();
+        // "spells" alone means no type restriction (bare "Spells you cast cost...")
+        let typed_filter = if type_desc.is_empty() || type_desc == "spells" || type_desc == "spell"
+        {
+            None
+        } else {
+            parse_cost_mod_spell_type_prefix(type_desc)
+        };
+        // CR 205.2a: Re-attach the chosen-type discriminator stripped above. A
+        // creature-typed base ("Creature spells ... of the chosen type",
+        // Herald's Horn) pairs with a chosen CREATURE type; a bare-spells base
+        // ("Spells ... of the chosen type", Cloud Key / Umori / Stenn) pairs
+        // with a chosen CARD type. Resolved at cast time against the source
+        // permanent's `ChosenAttribute` (CR 601.2f).
+        let typed_filter = if has_chosen_type {
+            match typed_filter {
+                Some(TargetFilter::Typed(mut tf))
+                    if tf.type_filters.contains(&TypeFilter::Creature) =>
+                {
+                    tf.properties.push(FilterProp::IsChosenCreatureType);
+                    Some(TargetFilter::Typed(tf))
+                }
+                Some(TargetFilter::Typed(mut tf)) => {
+                    tf.properties.push(FilterProp::IsChosenCardType);
+                    Some(TargetFilter::Typed(tf))
+                }
+                None => Some(TargetFilter::Typed(
+                    TypedFilter::card().properties(vec![FilterProp::IsChosenCardType]),
+                )),
+                other => other,
+            }
+        } else {
+            typed_filter
+        };
+        // Compose chosen-name constraint with the typed prefix (if any). Bare
+        // "Spells with the chosen name" → `HasChosenName` alone; typed
+        // "<Type> spells with the chosen name" → `And{Typed, HasChosenName}`.
+        match (typed_filter, has_chosen_name) {
+            (Some(tf), true) => Some(TargetFilter::And {
+                filters: vec![tf, TargetFilter::HasChosenName],
+            }),
+            (None, true) => Some(TargetFilter::HasChosenName),
+            (tf, false) => tf,
+        }
+    } else {
+        None
+    };
 
     let spell_filter = merge_cost_modifier_target_filter(spell_filter, target_cost_filter);
 

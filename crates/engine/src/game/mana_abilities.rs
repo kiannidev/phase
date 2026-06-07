@@ -520,9 +520,11 @@ pub(crate) fn mana_choice_prompt(
             }
         }
         ManaProduction::AnyOneColorAmongPermanents { filter, .. } => {
-            let owner = state.objects.get(&source_id).map(|obj| obj.controller)?;
+            // CR 106.1: Player chooses one of the colors among matching permanents they
+            // control.
+            let controller = state.objects.get(&source_id).map(|obj| obj.controller)?;
             let options = super::effects::mana::distinct_colors_among_permanents(
-                state, ability, owner, source_id, filter,
+                state, ability, controller, source_id, filter,
             )
             .into_iter()
             .map(|color| mana_color_to_type(&color))

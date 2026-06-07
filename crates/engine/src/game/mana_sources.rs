@@ -604,6 +604,8 @@ pub fn display_land_mana_pips(
                     push(&mut pips, ManaPip::CombinationOfColors(colors));
                 }
             }
+            // CR 106.1: Determine distinct colors among matching permanents to display
+            // pips.
             ManaProduction::AnyOneColorAmongPermanents { filter, .. } => {
                 let colors = super::effects::mana::distinct_colors_among_permanents(
                     state, None, controller, object_id, filter,
@@ -1166,6 +1168,7 @@ fn mana_options_from_production(
             .map(mana_color_to_type)
             .collect()
         }
+        // CR 106.1: Determine available mana options from colors among matching permanents.
         ManaProduction::AnyOneColorAmongPermanents { filter, .. } => {
             super::effects::mana::distinct_colors_among_permanents(
                 state, None, controller, object_id, filter,

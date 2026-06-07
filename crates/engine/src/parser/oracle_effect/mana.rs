@@ -2,7 +2,7 @@ use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::char;
-use nom::combinator::{all_consuming, map, opt, rest as nom_rest, value};
+use nom::combinator::{all_consuming, map, map_opt, opt, rest as nom_rest, value};
 use nom::multi::many1;
 use nom::sequence::{delimited, preceded, separated_pair, terminated};
 use nom::Parser;
@@ -1077,7 +1077,8 @@ fn scan_mana_production_type(
                     tag("mana of any color among the exiled cards"),
                 )),
             ),
-            map(
+            // CR 106.1 + CR 109.1: Parse "mana of any [one] color among [permanents]"
+            map_opt(
                 preceded(
                     alt((
                         tag::<_, _, OracleError<'_>>("mana of any one color among "),
@@ -1088,17 +1089,13 @@ fn scan_mana_production_type(
                 |type_text: &str| {
                     let (filter, remainder) = parse_type_phrase(type_text.trim());
                     if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
-                        return ManaProduction::AnyOneColor {
-                            count: count.clone(),
-                            color_options: all_mana_colors(),
-                            contribution,
-                        };
+                        return None;
                     }
-                    ManaProduction::AnyOneColorAmongPermanents {
+                    Some(ManaProduction::AnyOneColorAmongPermanents {
                         count: count.clone(),
                         filter,
                         contribution,
-                    }
+                    })
                 },
             ),
             value(

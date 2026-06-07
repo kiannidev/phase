@@ -344,11 +344,7 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
                 .collect();
             scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             Some(GameAction::SelectCards {
-                cards: scored
-                    .iter()
-                    .take(*count as usize)
-                    .map(|(id, _)| *id)
-                    .collect(),
+                cards: scored.iter().take(*count).map(|(id, _)| *id).collect(),
             })
         }
 
@@ -1484,11 +1480,7 @@ pub(crate) fn deterministic_choice(
                 .collect();
             scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             return Some(GameAction::SelectCards {
-                cards: scored
-                    .iter()
-                    .take(*count as usize)
-                    .map(|(id, _)| *id)
-                    .collect(),
+                cards: scored.iter().take(*count).map(|(id, _)| *id).collect(),
             });
         }
     }

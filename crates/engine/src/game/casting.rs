@@ -2640,6 +2640,24 @@ fn casting_variant_candidates(
         candidates.push(CastingVariant::Blitz);
     }
 
+    // CR 702.102a: Fuse is a static ability on split cards that applies while
+    // the card is in a player's hand. It lets the caster cast both halves as a
+    // fused split spell. Only offered when the back face is the right (Split)
+    // half so single-faced cards never surface it.
+    let has_fuse_candidate = obj.zone == Zone::Hand
+        && obj
+            .keywords
+            .iter()
+            .any(|k| matches!(k, crate::types::keywords::Keyword::Fuse))
+        && obj
+            .back_face
+            .as_ref()
+            .is_some_and(|bf| bf.layout_kind == Some(LayoutKind::Split));
+    if has_fuse_candidate {
+        candidates.push(CastingVariant::Normal);
+        candidates.push(CastingVariant::Fuse);
+    }
+
     candidates
 }
 
@@ -3540,6 +3558,20 @@ fn prepare_spell_cast_with_variant_override_inner(
         }
     }
 
+    // CR 702.102c: The total cost of a fused split spell includes the mana cost
+    // of each half. The front face's cost is already in `mana_cost`; add the
+    // right (Split) half's cost so the combined printed cost becomes the base
+    // that cost reductions/increases (CR 601.2f) then apply to.
+    if matches!(casting_variant, CastingVariant::Fuse) {
+        if let Some(back) = obj
+            .back_face
+            .as_ref()
+            .filter(|bf| bf.layout_kind == Some(LayoutKind::Split))
+        {
+            mana_cost = restrictions::add_mana_cost(&mana_cost, &back.mana_cost);
+        }
+    }
+
     // CR 601.2f: Capture the tax-inclusive base BEFORE any cost reductions /
     // increases or {X} concretization. Threaded onto `PendingCast.base_cost` so
     // the full concrete cost can be recomputed from scratch for any chosen X with
@@ -3574,6 +3606,43 @@ fn prepare_spell_cast_with_variant_override_inner(
         }
     }
 
+    // CR 702.102d: As a fused split spell resolves, the controller follows the
+    // instructions of the left half (this object's spell ability) and then the
+    // right half (the Split back face's spell ability). Build the right half's
+    // combined ability and append it to the tail of the left half's sub-chain so
+    // resolution walks left → right in order.
+    //
+    // CR 601.2c: Both halves' targets are chosen at cast time in a single pass —
+    // `build_target_slots` / `collect_target_slots` recurse the sub_ability chain
+    // and `assign_targets_in_chain` distributes the chosen targets back across the
+    // whole chain (left slots first, then right). No separate right-half
+    // targeting phase or pending-cast side storage is required; the merged
+    // ability chain is the single authority for target slots.
+    if casting_variant == CastingVariant::Fuse {
+        if let Some(back) = obj
+            .back_face
+            .as_ref()
+            .filter(|bf| bf.layout_kind == Some(LayoutKind::Split))
+        {
+            let mut right_abilities = back
+                .abilities
+                .iter()
+                .filter(|a| a.kind == AbilityKind::Spell);
+            if let Some(first_right) = right_abilities.next() {
+                let mut right = first_right.clone();
+                for extra in right_abilities {
+                    append_to_ability_def_sub_chain(&mut right, extra.clone());
+                }
+                match ability_def.as_mut() {
+                    Some(def) => append_to_ability_def_sub_chain(def, right),
+                    // Left half had no spell-level effect (rare for split cards);
+                    // the right half alone becomes the spell's ability.
+                    None => ability_def = Some(right),
+                }
+            }
+        }
+    }
+
     let origin_zone = obj.zone;
     Ok(PreparedSpellCast {
         object_id,
@@ -3600,10 +3669,14 @@ fn apply_non_floor_cost_modifiers(
     object_id: ObjectId,
     mana_cost: &mut ManaCost,
 ) {
-    // CR 117.7 + CR 601.2f: Self-spell statics ("This spell costs {N} less ...").
-    apply_self_spell_cost_modifiers(state, player, object_id, mana_cost);
-    // CR 601.2f: Battlefield-based cost modifications (ReduceCost/RaiseCost statics).
-    apply_battlefield_cost_modifiers(state, player, object_id, mana_cost);
+    // CR 117.7 + CR 601.2f: collect self-spell statics ("This spell costs
+    // {N} less ...") and battlefield statics together so all increases apply
+    // before any reductions across both passes.
+    let mut collected = collect_self_spell_cost_modifiers(state, player, object_id, None, false);
+    collected.extend(collect_battlefield_cost_modifiers(
+        state, player, object_id, None, false,
+    ));
+    apply_cost_modifications_in_order(mana_cost, &collected);
     // CR 702.41a: Affinity — reduce cost by {1} per matching permanent controlled.
     apply_affinity_reduction(state, player, object_id, mana_cost);
     // CR 702.125a: Undaunted — reduce cost by {1} per living opponent you have.
@@ -3663,12 +3736,16 @@ pub(super) fn apply_target_dependent_cost_modifiers(
             *mana_cost = super::restrictions::add_mana_cost(mana_cost, &strive_cost);
         }
     }
-    apply_self_spell_cost_modifiers_with_selected_targets(
-        state, player, object_id, ability, mana_cost,
-    );
-    apply_battlefield_cost_modifiers_with_selected_targets(
-        state, player, object_id, ability, mana_cost,
-    );
+    let mut collected =
+        collect_self_spell_cost_modifiers(state, player, object_id, Some(ability), true);
+    collected.extend(collect_battlefield_cost_modifiers(
+        state,
+        player,
+        object_id,
+        Some(ability),
+        true,
+    ));
+    apply_cost_modifications_in_order(mana_cost, &collected);
 }
 
 /// CR 601.2f: Recompute the FULL concrete pending cost for a known X. Floors
@@ -3797,15 +3874,24 @@ pub(super) fn recompute_pending_cast_cost(
 /// covering the card's current zone (Hand for normal casting, Stack for the cost-
 /// determination step). Handles cards like Tolarian Terror where the cost reduction is
 /// inherent to the spell and must apply before the spell resolves.
+///
+/// Test-only isolation helper: production cost calculation now collects self-spell
+/// and battlefield modifiers together (CR 601.2f aggregate ordering) via
+/// `collect_self_spell_cost_modifiers` + `apply_cost_modifications_in_order` in
+/// `apply_non_floor_cost_modifiers`; this wrapper exists so tests can exercise the
+/// self-spell pass in isolation.
+#[cfg(test)]
 fn apply_self_spell_cost_modifiers(
     state: &GameState,
     caster: PlayerId,
     spell_id: ObjectId,
     mana_cost: &mut ManaCost,
 ) {
-    apply_self_spell_cost_modifiers_inner(state, caster, spell_id, None, false, mana_cost);
+    let collected = collect_self_spell_cost_modifiers(state, caster, spell_id, None, false);
+    apply_cost_modifications_in_order(mana_cost, &collected);
 }
 
+#[cfg(test)]
 pub(super) fn apply_self_spell_cost_modifiers_with_selected_targets(
     state: &GameState,
     caster: PlayerId,
@@ -3813,20 +3899,28 @@ pub(super) fn apply_self_spell_cost_modifiers_with_selected_targets(
     ability: &ResolvedAbility,
     mana_cost: &mut ManaCost,
 ) {
-    apply_self_spell_cost_modifiers_inner(state, caster, spell_id, Some(ability), true, mana_cost);
+    let collected = collect_self_spell_cost_modifiers(state, caster, spell_id, Some(ability), true);
+    apply_cost_modifications_in_order(mana_cost, &collected);
 }
 
-fn apply_self_spell_cost_modifiers_inner(
+struct CostModification {
+    is_raise: bool,
+    amount: ManaCost,
+    multiplier: u32,
+}
+
+fn collect_self_spell_cost_modifiers(
     state: &GameState,
     caster: PlayerId,
     spell_id: ObjectId,
     selected_ability: Option<&ResolvedAbility>,
     target_sensitive_only: bool,
-    mana_cost: &mut ManaCost,
-) {
+) -> Vec<CostModification> {
     let Some(spell_obj) = state.objects.get(&spell_id) else {
-        return;
+        return Vec::new();
     };
+
+    let mut collected = Vec::new();
 
     // CR 113.6 + CR 604.1: A static ability only functions in zones listed by
     // `active_zones`; battlefield-default (empty) statics do not apply here.
@@ -3904,8 +3998,14 @@ fn apply_self_spell_cost_modifiers_inner(
             1
         };
 
-        apply_cost_mod_to_mana(mana_cost, amount, multiplier, is_raise);
+        collected.push(CostModification {
+            is_raise,
+            amount: amount.clone(),
+            multiplier,
+        });
     }
+
+    collected
 }
 
 fn cost_filter_has_target_ref(filter: &TargetFilter) -> bool {
@@ -4059,15 +4159,24 @@ fn spell_matches_cost_filter_with_selected_targets(
 /// Player scope is checked via the `affected` filter on the StaticDefinition (You = source's
 /// controller casts, Opponent = source's opponent casts, no controller = all players).
 /// Spell type is checked via the `spell_filter` field in the StaticMode variant.
+///
+/// Test-only isolation helper: production cost calculation now collects self-spell
+/// and battlefield modifiers together (CR 601.2f aggregate ordering) via
+/// `collect_battlefield_cost_modifiers` + `apply_cost_modifications_in_order` in
+/// `apply_non_floor_cost_modifiers`; this wrapper exists so tests can exercise the
+/// battlefield pass in isolation.
+#[cfg(test)]
 fn apply_battlefield_cost_modifiers(
     state: &GameState,
     caster: PlayerId,
     spell_id: ObjectId,
     mana_cost: &mut ManaCost,
 ) {
-    apply_battlefield_cost_modifiers_inner(state, caster, spell_id, None, false, mana_cost);
+    let collected = collect_battlefield_cost_modifiers(state, caster, spell_id, None, false);
+    apply_cost_modifications_in_order(mana_cost, &collected);
 }
 
+#[cfg(test)]
 pub(super) fn apply_battlefield_cost_modifiers_with_selected_targets(
     state: &GameState,
     caster: PlayerId,
@@ -4075,17 +4184,18 @@ pub(super) fn apply_battlefield_cost_modifiers_with_selected_targets(
     ability: &ResolvedAbility,
     mana_cost: &mut ManaCost,
 ) {
-    apply_battlefield_cost_modifiers_inner(state, caster, spell_id, Some(ability), true, mana_cost);
+    let collected =
+        collect_battlefield_cost_modifiers(state, caster, spell_id, Some(ability), true);
+    apply_cost_modifications_in_order(mana_cost, &collected);
 }
 
-fn apply_battlefield_cost_modifiers_inner(
+fn collect_battlefield_cost_modifiers(
     state: &GameState,
     caster: PlayerId,
     spell_id: ObjectId,
     selected_ability: Option<&ResolvedAbility>,
     target_sensitive_only: bool,
-    mana_cost: &mut ManaCost,
-) {
+) -> Vec<CostModification> {
     use crate::types::ability::ControllerRef;
 
     // CR 702.26b + CR 114.4 + CR 113.6b: Functioning gate (phased-out /
@@ -4101,6 +4211,13 @@ fn apply_battlefield_cost_modifiers_inner(
     // function from the command zone for non-emblem objects; the per-static
     // `active_zones` filter below still enforces the static's declared zones
     // when the source is on the battlefield.
+    //
+    // CR 601.2f: the {0} floor is a property of the aggregate total
+    // (base + all increases - all reductions), applied once. Collect every
+    // matching modifier first, then apply ALL increases before ANY reductions, so
+    // a reduction's `saturating_sub` floor can never clamp generic to 0 ahead of a
+    // later increase (which would overcharge the spell, order-dependently).
+    let mut collected = Vec::new();
     for (src_obj, def) in super::functioning_abilities::game_functioning_statics(state) {
         let bf_id = src_obj.id;
         let source_controller = src_obj.controller;
@@ -4196,9 +4313,38 @@ fn apply_battlefield_cost_modifiers_inner(
                 1
             };
 
-            // Apply the cost modification.
-            apply_cost_mod_to_mana(mana_cost, &base_amount, multiplier, is_raise);
+            // CR 601.2f: defer application so increases land before reductions.
+            collected.push(CostModification {
+                is_raise,
+                amount: base_amount,
+                multiplier,
+            });
         }
+    }
+
+    collected
+}
+
+fn apply_cost_modifications_in_order(mana_cost: &mut ManaCost, collected: &[CostModification]) {
+    // CR 601.2f: apply all cost increases first, then all reductions, so the
+    // single {0} floor (the `saturating_sub` in `apply_cost_mod_to_mana`) acts on
+    // base + increases. Reductions among themselves commute (each floors at 0), so
+    // their relative order is irrelevant.
+    for modification in collected.iter().filter(|m| m.is_raise) {
+        apply_cost_mod_to_mana(
+            mana_cost,
+            &modification.amount,
+            modification.multiplier,
+            true,
+        );
+    }
+    for modification in collected.iter().filter(|m| !m.is_raise) {
+        apply_cost_mod_to_mana(
+            mana_cost,
+            &modification.amount,
+            modification.multiplier,
+            false,
+        );
     }
 }
 
@@ -9832,14 +9978,18 @@ fn pay_ability_cost_inner(
                     target: TargetFilter::SelfRef,
                 } => {
                     let count = super::quantity::resolve_quantity(state, count, player, source_id);
-                    super::effects::counters::add_counter_with_replacement(
+                    if !super::effects::counters::add_counter_with_replacement(
                         state,
                         player,
                         source_id,
                         counter_type.clone(),
                         count.unsigned_abs(),
                         events,
-                    );
+                    ) {
+                        return Ok(AbilityCostPaymentOutcome::Paused {
+                            remaining_cost: None,
+                        });
+                    }
                 }
                 _ => {
                     return Err(EngineError::ActionNotAllowed(format!(
@@ -9919,14 +10069,18 @@ fn pay_ability_cost_inner(
             let amount = *amount;
             match amount.cmp(&0) {
                 std::cmp::Ordering::Greater => {
-                    super::effects::counters::add_counter_with_replacement(
+                    if !super::effects::counters::add_counter_with_replacement(
                         state,
                         player,
                         source_id,
                         crate::types::counter::CounterType::Loyalty,
                         amount as u32,
                         events,
-                    );
+                    ) {
+                        return Ok(AbilityCostPaymentOutcome::Paused {
+                            remaining_cost: None,
+                        });
+                    }
                 }
                 std::cmp::Ordering::Less => {
                     super::effects::counters::remove_counter_with_replacement(
@@ -27372,6 +27526,153 @@ mod tests {
                 generic: 0,
                 shards: vec![],
             }
+        );
+    }
+
+    /// CR 601.2f: "The total cost is the mana cost ... plus all ... cost
+    /// increases, and minus all cost reductions. ... If the mana component of the
+    /// total cost is reduced to nothing by cost reduction effects, it is considered
+    /// to be {0}. It can't be reduced to less than {0}." The {0} floor applies once
+    /// to the aggregate — not per individual reduction interleaved with increases.
+    /// A {1} spell under a battlefield +{1} increase and a -{2} reduction must cost
+    /// {0} regardless of the order the statics are scanned. Scanning the reducer
+    /// first floored generic to 0, then the later increase added {1} back → {1}.
+    #[test]
+    fn battlefield_cost_increase_applies_before_reduction_floor() {
+        use crate::types::ability::{ControllerRef, StaticDefinition, TypedFilter};
+        use crate::types::statics::{CostModifyMode, StaticMode};
+
+        let mut state = GameState::new_two_player(42);
+
+        // The spell being cast: printed {1}, controlled by P0.
+        let spell = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Spell".to_string(),
+            Zone::Stack,
+        );
+        state.objects.get_mut(&spell).unwrap().mana_cost = ManaCost::generic(1);
+
+        let you_spells = || TargetFilter::Typed(TypedFilter::card().controller(ControllerRef::You));
+
+        // Reducer created FIRST → scanned first in battlefield order: spells you
+        // cast cost {2} less.
+        let reducer = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Medallion".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&reducer)
+            .unwrap()
+            .static_definitions
+            .push(
+                StaticDefinition::new(StaticMode::ModifyCost {
+                    mode: CostModifyMode::Reduce,
+                    amount: ManaCost::generic(2),
+                    spell_filter: None,
+                    dynamic_count: None,
+                })
+                .affected(you_spells()),
+            );
+
+        // Raiser created SECOND: spells you cast cost {1} more.
+        let raiser = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Sphere".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&raiser)
+            .unwrap()
+            .static_definitions
+            .push(
+                StaticDefinition::new(StaticMode::ModifyCost {
+                    mode: CostModifyMode::Raise,
+                    amount: ManaCost::generic(1),
+                    spell_filter: None,
+                    dynamic_count: None,
+                })
+                .affected(you_spells()),
+            );
+
+        let cost = apply_cost_modifiers_to_base(&state, PlayerId(0), spell, ManaCost::generic(1))
+            .expect("cost computed");
+        // 1 + 1 (increase) - 2 (reduction) = 0, floored once.
+        assert_eq!(
+            cost,
+            ManaCost::generic(0),
+            "CR 601.2f: the {{0}} floor applies to the aggregate, not per reduction"
+        );
+    }
+
+    /// CR 601.2f: self-spell reductions and battlefield raises share one total
+    /// cost calculation. A self reduction must not floor the spell to {0}
+    /// before a battlefield tax is added.
+    #[test]
+    fn self_cost_reduction_applies_after_battlefield_increase_floor() {
+        use crate::types::ability::{ControllerRef, StaticDefinition, TypedFilter};
+        use crate::types::statics::{CostModifyMode, StaticMode};
+
+        let mut state = GameState::new_two_player(42);
+        let spell = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Self-Reducing Spell".to_string(),
+            Zone::Stack,
+        );
+        {
+            let obj = state.objects.get_mut(&spell).unwrap();
+            obj.mana_cost = ManaCost::generic(1);
+            let mut reduction = StaticDefinition::new(StaticMode::ModifyCost {
+                mode: CostModifyMode::Reduce,
+                amount: ManaCost::generic(2),
+                spell_filter: None,
+                dynamic_count: None,
+            })
+            .affected(TargetFilter::SelfRef);
+            reduction.active_zones = vec![Zone::Hand, Zone::Stack];
+            obj.static_definitions.push(reduction);
+        }
+
+        let tax = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Sphere".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&tax)
+            .unwrap()
+            .static_definitions
+            .push(
+                StaticDefinition::new(StaticMode::ModifyCost {
+                    mode: CostModifyMode::Raise,
+                    amount: ManaCost::generic(1),
+                    spell_filter: None,
+                    dynamic_count: None,
+                })
+                .affected(TargetFilter::Typed(
+                    TypedFilter::card().controller(ControllerRef::You),
+                )),
+            );
+
+        let cost = apply_cost_modifiers_to_base(&state, PlayerId(0), spell, ManaCost::generic(1))
+            .expect("cost computed");
+        assert_eq!(
+            cost,
+            ManaCost::generic(0),
+            "CR 601.2f: self reductions must apply after battlefield increases in the aggregate"
         );
     }
 

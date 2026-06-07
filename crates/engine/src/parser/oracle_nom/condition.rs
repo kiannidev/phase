@@ -915,8 +915,8 @@ fn parse_source_state_conditions(input: &str) -> OracleResult<'_, StaticConditio
         // Must precede `parse_source_is_type` so the specific "is attached to a creature"
         // predicate wins over generic "is <type>" dispatch.
         parse_source_attached_to_creature,
-        // CR 303.4 + CR 611.2c: "~ is enchanted by exactly N Aura(s)" /
-        // "N or more Auras" (Timber Paladin tiered P/T gates).
+        // CR 303.4 + CR 604.1 + CR 613.1g: "~ is enchanted by exactly N
+        // Aura(s)" / "N or more Auras" (Timber Paladin tiered static P/T gates).
         parse_source_enchanted_by_aura_count,
         // CR 122.1: "<subject> has <quantity> <counter_type> counter(s) on it"
         // — covers Unleash/Outlast/Renown bodies, Primordial Hydra's trample gate,
@@ -6761,6 +6761,34 @@ mod tests {
         };
         assert_eq!(comparator, Comparator::GE);
         assert_eq!(rhs, QuantityExpr::Fixed { value: 3 });
+    }
+
+    #[test]
+    fn test_source_enchanted_by_exactly_one_aura() {
+        let (rest, c) = parse_inner_condition("~ is enchanted by exactly one Aura").unwrap();
+        assert_eq!(rest, "");
+        let StaticCondition::QuantityComparison {
+            comparator, rhs, ..
+        } = c
+        else {
+            panic!("expected QuantityComparison, got {c:?}");
+        };
+        assert_eq!(comparator, Comparator::EQ);
+        assert_eq!(rhs, QuantityExpr::Fixed { value: 1 });
+    }
+
+    #[test]
+    fn test_source_enchanted_by_exactly_two_auras() {
+        let (rest, c) = parse_inner_condition("~ is enchanted by exactly two Auras").unwrap();
+        assert_eq!(rest, "");
+        let StaticCondition::QuantityComparison {
+            comparator, rhs, ..
+        } = c
+        else {
+            panic!("expected QuantityComparison, got {c:?}");
+        };
+        assert_eq!(comparator, Comparator::EQ);
+        assert_eq!(rhs, QuantityExpr::Fixed { value: 2 });
     }
 
     #[test]

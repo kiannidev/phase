@@ -1209,9 +1209,9 @@ fn permanent_filter_to_static(perm: &Permanent, pred: &Permanents) -> ConvResult
     }
 }
 
-/// CR 303.4: Count Auras (or other enchanting permanents) attached to the
-/// source object — Timber Paladin's tiered P/T gates and Kitsune Mystic's
-/// flip condition.
+/// CR 303.4 + CR 604.1 + CR 613.1g: Count Auras (or other enchanting
+/// permanents) attached to the source object for static P/T gates such as
+/// Timber Paladin's tiers.
 fn enchanted_by_count_static_condition(
     cmp: &Comparison,
     enchanting: &Permanents,
@@ -1278,8 +1278,8 @@ fn source_permanent_filter_to_static(p: &Permanents) -> ConvResult<StaticConditi
             let filter = crate::convert::filter::convert(p)?;
             StaticCondition::SourceMatchesFilter { filter }
         }
-        // CR 303.4 + CR 611.2c: "~ is enchanted by exactly N Auras" /
-        // "N or more Auras" (Timber Paladin, Kitsune Mystic flip condition).
+        // CR 303.4 + CR 604.1 + CR 613.1g: "~ is enchanted by exactly N
+        // Auras" / "N or more Auras" (Timber Paladin tiered static P/T gates).
         Permanents::IsEnchantedByANumberOfEnchantingPermanents(cmp, enchanting) => {
             enchanted_by_count_static_condition(cmp, enchanting)?
         }

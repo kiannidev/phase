@@ -7737,9 +7737,7 @@ mod tests {
         );
         let delayed_exile = ResolvedAbility::new(
             Effect::CreateDelayedTrigger {
-                condition: DelayedTriggerCondition::AtNextPhase {
-                    phase: Phase::End,
-                },
+                condition: DelayedTriggerCondition::AtNextPhase { phase: Phase::End },
                 effect: Box::new(AbilityDefinition::new(
                     AbilityKind::Spell,
                     Effect::ChangeZone {

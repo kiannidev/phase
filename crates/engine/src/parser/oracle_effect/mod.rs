@@ -41424,10 +41424,7 @@ mod tests {
                     outer || inner
                 }
                 Effect::CreateDelayedTrigger { effect, .. } => haste_targets_parent(effect),
-                _ => def
-                    .sub_ability
-                    .as_deref()
-                    .is_some_and(haste_targets_parent),
+                _ => def.sub_ability.as_deref().is_some_and(haste_targets_parent),
             }
         }
 

@@ -1,7 +1,7 @@
 import { useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 
-import type { ObjectId } from "../../adapter/types.ts";
+import { HIDDEN_CARD_NAME, type ObjectId } from "../../adapter/types.ts";
 import { useCardImage } from "../../hooks/useCardImage.ts";
 import { useGameDispatch } from "../../hooks/useGameDispatch.ts";
 import { useLongPress } from "../../hooks/useLongPress.ts";
@@ -61,11 +61,11 @@ export function LibraryPile({ playerId, size }: LibraryPileProps) {
       (s.gameState?.players[playerId]?.can_look_at_top_of_library ?? false);
     const revealed = s.gameState?.revealed_cards?.includes(topObjectId) ?? false;
     const name = s.gameState?.objects[topObjectId]?.name ?? null;
-    // CR 701.20e: private "look at" on an opponent's library (Mishra's Bauble)
-    // surfaces the peeked card name to the looker via engine viewer filtering.
-    const opponentPrivatePeek =
-      playerId !== myId && name != null && name !== "Hidden Card";
-    if (!peek && !revealed && !opponentPrivatePeek) return null;
+    // Engine viewer filtering exposes opponent library tops for private looks
+    // (CR 701.20e) and other visibility windows; masked tops stay hidden.
+    const opponentVisibleTop =
+      playerId !== myId && name != null && name !== HIDDEN_CARD_NAME;
+    if (!peek && !revealed && !opponentVisibleTop) return null;
     return name;
   });
 

@@ -44,11 +44,6 @@ export function LibraryPile({ playerId, size }: LibraryPileProps) {
   const count = useGameStore(
     (s) => s.gameState?.players[playerId]?.library?.length ?? 0,
   );
-  const canPeek = useGameStore(
-    (s) =>
-      playerId === myId &&
-      (s.gameState?.players[playerId]?.can_look_at_top_of_library ?? false),
-  );
   const topObjectId = useGameStore((s) => {
     const lib = s.gameState?.players[playerId]?.library;
     if (!lib || lib.length === 0) return null;

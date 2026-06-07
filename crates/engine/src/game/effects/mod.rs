@@ -2578,10 +2578,32 @@ fn effect_parent_ref_slots(effect: &Effect) -> Vec<&TargetFilter> {
 /// True if any object-target slot of the effect references the per-iteration
 /// object via a parent context ref. Member-driven `repeat_for: ObjectCount`
 /// loops use this to decide whether to rebind the parent target each iteration.
+fn filter_refs_same_name_as_parent_target(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(typed) => typed
+            .properties
+            .iter()
+            .any(|p| matches!(p, FilterProp::SameNameAsParentTarget)),
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            filters.iter().any(filter_refs_same_name_as_parent_target)
+        }
+        TargetFilter::Not { filter } => filter_refs_same_name_as_parent_target(filter),
+        _ => false,
+    }
+}
+
 fn effect_iterates_over_parent_target(effect: &Effect) -> bool {
-    effect_parent_ref_slots(effect)
+    if effect_parent_ref_slots(effect)
         .iter()
         .any(|f| filter_refs_parent_target(f))
+    {
+        return true;
+    }
+    // CR 608.2c: Doubling Chant — `repeat_for: ObjectCount` over creatures you
+    // control with a `SearchLibrary` filter using `SameNameAsParentTarget` must
+    // rebind the parent target each iteration even though the parent-ref lives on
+    // the search filter, not a `TargetFilter::ParentTarget` slot.
+    matches!(effect, Effect::SearchLibrary { filter, .. } if filter_refs_same_name_as_parent_target(filter))
 }
 
 /// Recurse into compound filters so a wrapped `ParentTargetController` is
@@ -2640,6 +2662,20 @@ fn has_kind_driven_repeat(ability: &ResolvedAbility) -> bool {
             qty: QuantityRef::DistinctCounterKindsAmong { .. },
         })
     )
+}
+
+/// CR 608.2c + CR 608.2d: Doubling Chant — `repeat_for: ObjectCount` with a
+/// per-iteration parent ref (`SameNameAsParentTarget` on `SearchLibrary`) makes
+/// its "you may" apply per iterated creature, not once up front. Suppress the
+/// single optional gate in `resolve_chain_body` and fire optionality inside the
+/// `repeat_for` loop instead (mirrors `has_kind_driven_repeat`).
+fn has_member_driven_repeat(ability: &ResolvedAbility) -> bool {
+    matches!(
+        ability.repeat_for,
+        Some(QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount { .. },
+        })
+    ) && effect_iterates_over_parent_target(&ability.effect)
 }
 
 fn rebind_iterated_counter_kind(
@@ -3790,7 +3826,7 @@ fn resolve_chain_body(
     // accept another. Suppress the single up-front gate here; the `repeat_for`
     // loop below fires its own per-iteration `OptionalEffectChoice` for each
     // counter kind (see the `kind_driven` optional path in the loop).
-    if ability.optional && !has_kind_driven_repeat(ability) {
+    if ability.optional && !has_kind_driven_repeat(ability) && !has_member_driven_repeat(ability) {
         let description = ability.description.clone();
         let prompt_player = optional_prompt_player(state, ability);
         let may_trigger_key = ability
@@ -4180,17 +4216,14 @@ fn resolve_chain_body(
                                 &mut iter_ability,
                                 iterated_counter_kinds[iteration].clone(),
                             );
-                            // CR 608.2c + CR 608.2d: when the per-kind action is
-                            // optional (Bribe Taker's "you may"), this iteration
-                            // must route through `resolve_ability_chain` so the
-                            // up-front optional gate fires its OWN
-                            // `OptionalEffectChoice` for THIS kind (decline →
-                            // place nothing for this kind and advance; accept →
-                            // the `ChooseOneOf` branch prompt). The loop owns
-                            // iteration, so clear `repeat_for` on the clone to
-                            // prevent re-entering this loop (the up-front gate at
-                            // the top of `resolve_chain_body` is suppressed for
-                            // kind-driven loops via `has_kind_driven_repeat`).
+                        }
+                        // CR 608.2c + CR 608.2d: per-iteration optional actions
+                        // (Bribe Taker per counter kind; Doubling Chant per
+                        // creature search) route through `resolve_ability_chain`
+                        // so each iteration fires its own `OptionalEffectChoice`.
+                        // Clear `repeat_for` on the clone so the inner chain does
+                        // not re-enter this outer loop.
+                        if kind_driven || (member_driven && iter_ability.optional) {
                             iter_ability.repeat_for = None;
                         }
                         if let (true, Effect::CopySpell { retarget, .. }) =
@@ -4202,13 +4235,13 @@ fn resolve_chain_body(
                     } else {
                         effective
                     };
-                // CR 608.2d: A kind-driven iteration whose action is optional
-                // fires its per-kind "you may" gate (and any accepted
-                // `ChooseOneOf` branch prompt) through the full chain. All other
-                // iterations resolve the effect directly — `resolve_effect` does
-                // not check `optional`, which is correct because non-kind loops
-                // apply their `optional` once up front in `resolve_chain_body`.
-                if kind_driven && iter_effective.optional {
+                // CR 608.2d: A kind-driven or member-driven iteration whose action
+                // is optional fires its per-iteration "you may" gate through the
+                // full chain. All other iterations resolve the effect directly —
+                // `resolve_effect` does not check `optional`, which is correct
+                // because non-per-iteration loops apply their `optional` once up
+                // front in `resolve_chain_body`.
+                if (kind_driven || member_driven) && iter_effective.optional {
                     // CR 608.2c: pass a non-zero depth so the depth==0 prelude
                     // (chain-local state clearing, resolution counter) does not
                     // re-run mid-loop — this iteration continues the current
@@ -15360,5 +15393,61 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// Issue #2400: Doubling Chant — `repeat_for: ObjectCount` over controlled
+    /// creatures must drive the `SearchLibrary` loop when the search filter uses
+    /// `SameNameAsParentTarget`, not silently produce zero iterations.
+    #[test]
+    fn issue_2400_doubling_chant_member_driven_search_iterations() {
+        let mut state = GameState::new_two_player(42);
+
+        for (card_id, name) in [(CardId(1), "Bear"), (CardId(2), "Elephant")] {
+            let id = create_object(
+                &mut state,
+                card_id,
+                PlayerId(0),
+                name.to_string(),
+                Zone::Battlefield,
+            );
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types = vec![CoreType::Creature];
+        }
+
+        let source = create_object(
+            &mut state,
+            CardId(99),
+            PlayerId(0),
+            "Doubling Chant".to_string(),
+            Zone::Stack,
+        );
+
+        let def = crate::parser::oracle_effect::parse_effect_chain(
+            "For each creature you control, you may search your library for a creature card with the same name as that creature. Put those cards onto the battlefield, then shuffle.",
+            AbilityKind::Spell,
+        );
+        let ability =
+            crate::game::ability_utils::build_resolved_from_def(&def, source, PlayerId(0));
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        assert!(
+            state.pending_repeat_iteration.is_some()
+                || matches!(
+                    state.waiting_for,
+                    WaitingFor::SearchChoice { .. } | WaitingFor::OptionalEffectChoice { .. }
+                ),
+            "member-driven search must enter the repeat loop, got waiting_for={:?} pending={:?}",
+            state.waiting_for,
+            state.pending_repeat_iteration
+        );
+        if let Some(pending) = state.pending_repeat_iteration.as_ref() {
+            assert_eq!(
+                pending.total_iterations, 2,
+                "two controlled creatures ⇒ two search iterations"
+            );
+            assert_eq!(pending.tracked_members.len(), 2);
+        }
     }
 }

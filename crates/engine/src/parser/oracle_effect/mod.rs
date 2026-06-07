@@ -43978,3 +43978,30 @@ mod snapshot_tests {
         ));
     }
 }
+
+#[test]
+fn issue_2400_doubling_chant_repeat_for_member_driven_search() {
+    let def = parse_effect_chain(
+        "For each creature you control, you may search your library for a creature card with the same name as that creature. Put those cards onto the battlefield, then shuffle.",
+        AbilityKind::Spell,
+    );
+    assert!(matches!(&*def.effect, Effect::SearchLibrary { .. }));
+    assert!(matches!(
+        def.repeat_for,
+        Some(QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount { .. }
+        })
+    ));
+    let Effect::SearchLibrary { filter, .. } = def.effect.as_ref() else {
+        panic!("expected SearchLibrary");
+    };
+    let TargetFilter::Typed(typed) = filter else {
+        panic!("expected typed search filter, got {filter:?}");
+    };
+    assert!(
+        typed
+            .properties
+            .contains(&FilterProp::SameNameAsParentTarget),
+        "search must bind same name as per-iteration creature"
+    );
+}

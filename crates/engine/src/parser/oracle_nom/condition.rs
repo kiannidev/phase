@@ -915,6 +915,9 @@ fn parse_source_state_conditions(input: &str) -> OracleResult<'_, StaticConditio
         // Must precede `parse_source_is_type` so the specific "is attached to a creature"
         // predicate wins over generic "is <type>" dispatch.
         parse_source_attached_to_creature,
+        // CR 303.4 + CR 611.2c: "~ is enchanted by exactly N Aura(s)" /
+        // "N or more Auras" (Timber Paladin tiered P/T gates).
+        parse_source_enchanted_by_aura_count,
         // CR 122.1: "<subject> has <quantity> <counter_type> counter(s) on it"
         // — covers Unleash/Outlast/Renown bodies, Primordial Hydra's trample gate,
         // and every "as long as it has …" counter-comparator static.
@@ -946,6 +949,40 @@ fn parse_source_state_conditions(input: &str) -> OracleResult<'_, StaticConditio
         parse_source_power_toughness_condition,
     ))
     .parse(input)
+}
+
+/// CR 303.4: Parse "<subject> is enchanted by exactly N Aura(s)" or
+/// "N or more Auras" into an `ObjectCount` + `AttachedToSource` gate.
+fn parse_source_enchanted_by_aura_count(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = parse_source_subject(input)?;
+    let (rest, _) = tag("is enchanted by ").parse(rest)?;
+    let (rest, (comparator, n)) = alt((
+        map((tag("exactly "), parse_number), |(_, n)| {
+            (Comparator::EQ, n)
+        }),
+        map(parse_ge_threshold, |n| (Comparator::GE, n)),
+    ))
+    .parse(rest)?;
+    let (rest, _) = tag(" ").parse(rest)?;
+    let (rest, _) = alt((tag("Aura"), tag("Auras"))).parse(rest)?;
+    let aura_filter = TargetFilter::Typed(TypedFilter {
+        type_filters: vec![
+            TypeFilter::Enchantment,
+            TypeFilter::Subtype("Aura".to_string()),
+        ],
+        controller: None,
+        properties: vec![FilterProp::AttachedToSource],
+    });
+    Ok((
+        rest,
+        make_quantity_comparison(
+            QuantityRef::ObjectCount {
+                filter: aura_filter,
+            },
+            comparator,
+            n,
+        ),
+    ))
 }
 
 /// CR 122.1: Parse "<subject> has <quantity> [type] counter[s] on it" into a

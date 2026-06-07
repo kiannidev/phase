@@ -21641,6 +21641,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn effect_bounce_all_nonland_permanents_devastation_tide() {
         let e = parse_effect("Return all nonland permanents to their owners' hands");
         match e {

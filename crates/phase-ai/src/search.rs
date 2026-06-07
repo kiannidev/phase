@@ -328,6 +328,26 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
             Some(GameAction::ChooseTarget { target: None })
         }
 
+        // CR 701.21a: Mandatory spell-effect sacrifices (Deadly Brew, Edict
+        // riders) must pick a legal permanent — an empty SelectCards fails
+        // validation when `count > 0` and `up_to` is false.
+        WaitingFor::EffectZoneChoice {
+            cards,
+            count,
+            up_to,
+            effect_kind: engine::types::ability::EffectKind::Sacrifice,
+            ..
+        } if !cards.is_empty() && !*up_to && *count > 0 => {
+            let mut scored: Vec<_> = cards
+                .iter()
+                .map(|&id| (id, evaluate_card_value(state, id)))
+                .collect();
+            scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            Some(GameAction::SelectCards {
+                cards: vec![scored[0].0],
+            })
+        }
+
         // Selection states: empty selection is a valid "choose nothing".
         WaitingFor::ScryChoice { .. }
         | WaitingFor::DigChoice { .. }
@@ -1438,6 +1458,30 @@ pub(crate) fn deterministic_choice(
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         if let Some((best, _)) = scored.first() {
             return Some(GameAction::SelectCards { cards: vec![*best] });
+        }
+    }
+
+    if let WaitingFor::EffectZoneChoice {
+        cards,
+        count,
+        up_to,
+        effect_kind,
+        ..
+    } = &state.waiting_for
+    {
+        if matches!(effect_kind, engine::types::ability::EffectKind::Sacrifice)
+            && !cards.is_empty()
+            && !*up_to
+            && *count > 0
+        {
+            let mut scored: Vec<_> = cards
+                .iter()
+                .map(|&id| (id, evaluate_card_value(state, id)))
+                .collect();
+            scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            return Some(GameAction::SelectCards {
+                cards: vec![scored[0].0],
+            });
         }
     }
 

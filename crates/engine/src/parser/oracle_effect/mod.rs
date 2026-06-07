@@ -31577,6 +31577,47 @@ mod tests {
         );
     }
 
+    /// Issue #2423 — Deadly Brew: sacrifice rider + optional graveyard return.
+    #[test]
+    fn deadly_brew_sacrifice_planeswalker_return_condition() {
+        let def = parse_effect_chain(
+            "Each player sacrifices a creature or planeswalker of their choice. If you sacrificed a permanent this way, you may return another permanent card from your graveyard to your hand.",
+            AbilityKind::Spell,
+        );
+        assert!(matches!(*def.effect, Effect::Sacrifice { .. }));
+        assert_eq!(def.player_scope, Some(PlayerFilter::All));
+
+        let return_sub = def.sub_ability.as_ref().expect("Deadly Brew return clause");
+        assert!(return_sub.optional);
+        assert!(matches!(
+            return_sub.condition,
+            Some(AbilityCondition::CostPaidObjectMatchesFilter {
+                filter: TargetFilter::Typed(TypedFilter { ref type_filters, .. })
+            }) if type_filters.contains(&TypeFilter::Permanent)
+        ));
+        match &*return_sub.effect {
+            Effect::Bounce { target, .. } => {
+                let TargetFilter::Typed(typed) = target else {
+                    panic!("expected typed graveyard permanent target, got {target:?}");
+                };
+                assert!(typed.type_filters.contains(&TypeFilter::Permanent));
+                assert!(typed.properties.iter().any(|p| {
+                    matches!(
+                        p,
+                        FilterProp::InZone {
+                            zone: Zone::Graveyard
+                        }
+                    )
+                }));
+                assert!(typed
+                    .properties
+                    .iter()
+                    .any(|p| matches!(p, FilterProp::Another)));
+            }
+            other => panic!("expected graveyard-to-hand Bounce, got {other:?}"),
+        }
+    }
+
     /// CR 101.3 + CR 118.12 + CR 109.5: Plaguecrafter's ETB body — "each
     /// player sacrifices a creature or planeswalker of their choice. Each
     /// player who can't discards a card." — must lower into a two-clause chain

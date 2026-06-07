@@ -43808,3 +43808,27 @@ mod snapshot_tests {
         ));
     }
 }
+
+#[test]
+fn issue_2402_hazel_copy_target_token_trigger_parses() {
+    use crate::parser::oracle_trigger::parse_trigger_line;
+    let def = parse_trigger_line(
+        "At the beginning of your end step, create a token that's a copy of target token you control. If that token is a Squirrel, instead create two tokens that are copies of it.",
+        "Hazel of the Rootbloom",
+    );
+    let execute = def.execute.as_ref().expect("trigger execute");
+    let Effect::CopyTokenOf { target, .. } = execute.effect.as_ref() else {
+        panic!(
+            "expected CopyTokenOf trigger effect, got {:?}",
+            execute.effect
+        );
+    };
+    let TargetFilter::Typed(tf) = target else {
+        panic!("expected typed target token filter, got {target:?}");
+    };
+    assert_eq!(tf.controller, Some(ControllerRef::You));
+    assert!(tf
+        .properties
+        .iter()
+        .any(|prop| matches!(prop, FilterProp::Token)));
+}

@@ -316,15 +316,49 @@ pub fn intrinsic_etb_counters(obj: &GameObject) -> Vec<(CounterType, u32)> {
 }
 
 pub fn intrinsic_copiable_values(obj: &GameObject) -> CopiableValues {
+    // CR 707.2: Tokens created by `Effect::Token` seed live characteristics
+    // (`name`, `power`, …) but often leave the parallel `base_*` fields empty.
+    // Copy-token resolution reads copiable values through this helper, so fall
+    // back to the live fields when the base snapshot was never initialized
+    // (Hazel of the Rootbloom — copy target token you control).
+    let use_live = obj.is_token && !obj.base_characteristics_initialized;
     CopiableValues {
-        name: obj.base_name.clone(),
-        mana_cost: obj.base_mana_cost.clone(),
-        color: obj.base_color.clone(),
-        card_types: obj.base_card_types.clone(),
-        power: obj.base_power,
-        toughness: obj.base_toughness,
-        loyalty: obj.base_loyalty,
-        keywords: obj.base_keywords.clone(),
+        name: if use_live {
+            obj.name.clone()
+        } else {
+            obj.base_name.clone()
+        },
+        mana_cost: if use_live {
+            obj.mana_cost.clone()
+        } else {
+            obj.base_mana_cost.clone()
+        },
+        color: if use_live {
+            obj.color.clone()
+        } else {
+            obj.base_color.clone()
+        },
+        card_types: if use_live {
+            obj.card_types.clone()
+        } else {
+            obj.base_card_types.clone()
+        },
+        power: if use_live { obj.power } else { obj.base_power },
+        toughness: if use_live {
+            obj.toughness
+        } else {
+            obj.base_toughness
+        },
+        loyalty: if use_live {
+            obj.loyalty
+        } else {
+            obj.base_loyalty
+        },
+        keywords: if use_live {
+            obj.keywords.clone()
+        } else {
+            obj.base_keywords.clone()
+        },
         // CopiableValues now shares `Arc<Vec<_>>` with the source object —
         // a copy-effect never mutates the ability set, so refcount sharing
         // is both correct and zero-allocation.

@@ -101,6 +101,9 @@ pub(crate) fn parse_level_blocks(
                 let keywords: Vec<&str> = next.split(',').map(|s| s.trim()).collect();
                 let mut any_keyword = false;
                 for kw_text in &keywords {
+                    // CR 711.2a: Reminder text in parentheses ("Shroud (This creature…)")
+                    // must not prevent keyword recognition inside a {LEVEL} striation.
+                    let kw_text = kw_text.split('(').next().unwrap_or(kw_text).trim();
                     if let Some(kw) = parse_keyword_from_oracle(&kw_text.to_lowercase()) {
                         if !matches!(kw, crate::types::keywords::Keyword::Unknown(_)) {
                             modifications.push(ContinuousModification::AddKeyword { keyword: kw });

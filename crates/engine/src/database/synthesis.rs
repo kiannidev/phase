@@ -8998,6 +8998,39 @@ pub(crate) fn merge_extracted_keywords(base: &mut Vec<Keyword>, extracted: Vec<K
 /// legitimate base-text (level-0) keyword on the same card. True for all 26
 /// current levelers — none print a keyword both outside and inside a {LEVEL}
 /// striation.
+fn keyword_granted_by_level_gated_static(stat: &StaticDefinition) -> Vec<Keyword> {
+    let mut gated = stat
+        .modifications
+        .iter()
+        .filter_map(|m| match m {
+            ContinuousModification::AddKeyword { keyword } => Some(keyword.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if let Some(kw) = keyword_from_static_mode(&stat.mode) {
+        gated.push(kw);
+    }
+    gated
+}
+
+/// CR 711.2a: Map standalone keyword static modes emitted from {LEVEL} blocks
+/// (e.g. Hada Spy Patrol's "Shroud" line) onto the `Keyword` axis stripped
+/// from `face.keywords`.
+fn keyword_from_static_mode(mode: &StaticMode) -> Option<Keyword> {
+    match mode {
+        StaticMode::Shroud => Some(Keyword::Shroud),
+        StaticMode::Hexproof => Some(Keyword::Hexproof),
+        StaticMode::Flying => Some(Keyword::Flying),
+        StaticMode::Vigilance => Some(Keyword::Vigilance),
+        StaticMode::Menace => Some(Keyword::Menace),
+        StaticMode::Reach => Some(Keyword::Reach),
+        StaticMode::Trample => Some(Keyword::Trample),
+        StaticMode::Deathtouch => Some(Keyword::Deathtouch),
+        StaticMode::Lifelink => Some(Keyword::Lifelink),
+        _ => None,
+    }
+}
+
 pub(crate) fn strip_level_gated_keywords(face: &mut CardFace) {
     let gated: Vec<Keyword> = face
         .static_abilities
@@ -9012,12 +9045,7 @@ pub(crate) fn strip_level_gated_keywords(face: &mut CardFace) {
                     )
             )
         })
-        .flat_map(|stat| {
-            stat.modifications.iter().filter_map(|m| match m {
-                ContinuousModification::AddKeyword { keyword } => Some(keyword.clone()),
-                _ => None,
-            })
-        })
+        .flat_map(keyword_granted_by_level_gated_static)
         .collect();
 
     face.keywords.retain(|kw| !gated.contains(kw));
@@ -16630,6 +16658,27 @@ mod sorcery_speed_invariant_tests {
 
         // Both gated keywords stripped; the LevelUp keyword survives.
         assert_eq!(face.keywords, vec![level_up]);
+    }
+
+    /// CR 711.4: Level-block standalone keyword static modes (Hada Spy Patrol's
+    /// "Shroud" line) must strip the matching base keyword.
+    #[test]
+    fn strip_level_gated_keywords_strips_static_mode_keyword_grants() {
+        let mut face = CardFace {
+            keywords: vec![Keyword::Shroud],
+            static_abilities: vec![StaticDefinition::new(StaticMode::Shroud)
+                .affected(TargetFilter::SelfRef)
+                .condition(StaticCondition::HasCounters {
+                    counters: CounterMatch::OfType(CounterType::Generic("level".to_string())),
+                    minimum: 3,
+                    maximum: None,
+                })],
+            ..Default::default()
+        };
+
+        strip_level_gated_keywords(&mut face);
+
+        assert!(face.keywords.is_empty(), "Shroud must strip from base keywords");
     }
 
     /// Negative case: a `HasCounters` static on a NON-"level" generic counter

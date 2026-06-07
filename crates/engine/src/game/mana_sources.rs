@@ -604,6 +604,14 @@ pub fn display_land_mana_pips(
                     push(&mut pips, ManaPip::CombinationOfColors(colors));
                 }
             }
+            ManaProduction::AnyOneColorAmongPermanents { filter, .. } => {
+                let colors = super::effects::mana::distinct_colors_among_permanents(
+                    state, None, controller, object_id, filter,
+                );
+                if !colors.is_empty() {
+                    push(&mut pips, ManaPip::OneOfColors(colors));
+                }
+            }
             // CR 603.7c + CR 106.3: Resolves only inside a TapsForMana
             // trigger; outside a trigger context there is no pre-resolution
             // pip to display, so contribute nothing.
@@ -1151,6 +1159,14 @@ fn mana_options_from_production(
         // you control". Delegates to the shared resolver so the cost-payment path
         // and direct activation see identical option sets.
         ManaProduction::DistinctColorsAmongPermanents { filter } => {
+            super::effects::mana::distinct_colors_among_permanents(
+                state, None, controller, object_id, filter,
+            )
+            .iter()
+            .map(mana_color_to_type)
+            .collect()
+        }
+        ManaProduction::AnyOneColorAmongPermanents { filter, .. } => {
             super::effects::mana::distinct_colors_among_permanents(
                 state, None, controller, object_id, filter,
             )

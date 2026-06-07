@@ -5003,6 +5003,7 @@ fn production_override_for_option(
     match produced {
         crate::types::ability::ManaProduction::AnyOneColor { .. }
         | crate::types::ability::ManaProduction::AnyCombination { .. }
+        | crate::types::ability::ManaProduction::AnyOneColorAmongPermanents { .. }
         | crate::types::ability::ManaProduction::ChoiceAmongExiledColors { .. }
         | crate::types::ability::ManaProduction::OpponentLandColors { .. }
         | crate::types::ability::ManaProduction::AnyTypeProduceableBy { .. }

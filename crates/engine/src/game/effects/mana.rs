@@ -515,6 +515,19 @@ fn resolve_mana_types_impl(
                 .map(|c| mana_color_to_type(&c))
                 .collect()
         }
+        // CR 106.1 + CR 109.1: Mox Amber — one chosen color from among matching
+        // permanents. Without a color_override, produce the first listed color
+        // (mirrors ChoiceAmongExiledColors / AnyOneColor). CR 106.5: empty set
+        // → no mana.
+        ManaProduction::AnyOneColorAmongPermanents { count, filter, .. } => {
+            let amount = resolve_count(count, state, ability, controller, source_id);
+            let color_options =
+                distinct_colors_among_permanents(state, ability, controller, source_id, filter);
+            let Some(first) = color_options.first().copied() else {
+                return Vec::new();
+            };
+            vec![mana_color_to_type(&first); amount]
+        }
         // CR 603.7c + CR 106.3 + CR 106.5 + CR 106.12a: Vorinclex / Dictate of
         // Karametra — "add one mana of any type that land produced." The set of
         // produced types is read from the triggering `TappedForMana` event

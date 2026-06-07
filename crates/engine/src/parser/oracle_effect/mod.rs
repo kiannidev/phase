@@ -13538,6 +13538,15 @@ fn mana_production_with_count(
                 contribution: *contribution,
             })
         }
+        ManaProduction::AnyOneColorAmongPermanents {
+            filter,
+            contribution,
+            ..
+        } => Some(ManaProduction::AnyOneColorAmongPermanents {
+            count,
+            filter: filter.clone(),
+            contribution: *contribution,
+        }),
         ManaProduction::Fixed { .. }
         | ManaProduction::Mixed { .. }
         | ManaProduction::ChoiceAmongExiledColors { .. }
@@ -25791,6 +25800,24 @@ mod tests {
                 expiry: None,
                 target: None,
             }
+        );
+    }
+
+    #[test]
+    fn effect_mox_amber_among_legendary_creatures_and_planeswalkers() {
+        let e = parse_effect(
+            "Add one mana of any color among legendary creatures and planeswalkers you control",
+        );
+        let Effect::Mana { produced, .. } = e else {
+            panic!("expected Mana effect");
+        };
+        let ManaProduction::AnyOneColorAmongPermanents { count, filter, .. } = produced else {
+            panic!("expected AnyOneColorAmongPermanents, got {produced:?}");
+        };
+        assert_eq!(count, QuantityExpr::Fixed { value: 1 });
+        assert!(
+            !matches!(filter, TargetFilter::Any),
+            "legendary creature/planeswalker filter must be typed, got {filter:?}"
         );
     }
 

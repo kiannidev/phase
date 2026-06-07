@@ -16350,12 +16350,10 @@ fn try_parse_put_zone_change_parts(
             // CR 701.20e: Mass quantifiers ("put all/each <filter> from <zone>
             // onto the battlefield") move every matching object — lower to
             // `ChangeZoneAll`, mirroring the `return all` dispatcher.
-            let is_mass = {
-                let lower_target = target_text.to_ascii_lowercase();
-                alt((tag::<_, _, OracleError<'_>>("all "), tag("each ")))
-                    .parse(lower_target.as_str())
-                    .is_ok()
-            };
+            let lower_target = target_text.to_ascii_lowercase();
+            let is_mass = alt((tag::<_, _, OracleError<'_>>("all "), tag("each ")))
+                .parse(lower_target.as_str())
+                .is_ok();
             let up_to = parse_up_to_one_target_prefix(before.lower) || choice_count.is_some();
             let (target, _) = parse_target(target_text);
             // CR 202.3 + CR 107.3i: A trailing "where X is <expression>"

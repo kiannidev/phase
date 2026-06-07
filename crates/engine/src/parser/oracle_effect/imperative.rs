@@ -97,8 +97,9 @@ fn parse_dig_library_owner(rest_lower: &str) -> TargetFilter {
         return TargetFilter::ParentTarget;
     }
 
-    // CR 109.5 + CR 400.3: "that library" — anaphoric to a library identified
-    // earlier in the instruction (Chaos Warp: owner's library after shuffle).
+    // CR 608.2c + CR 400.3: "that library" — anaphoric to a library
+    // identified earlier in the instruction (Chaos Warp: owner's library
+    // after shuffle).
     if preceded(
         take_until::<_, _, OracleError<'_>>("that library"),
         tag::<_, _, OracleError<'_>>("that library"),

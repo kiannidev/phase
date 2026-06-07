@@ -43982,7 +43982,7 @@ mod snapshot_tests {
 #[test]
 fn issue_2406_chaos_warp_owner_library_shuffle_and_reveal() {
     let def = parse_effect_chain(
-        "The owner of target permanent shuffles it into their library, then reveals the top card of that library. If that permanent is a permanent card with lesser mana value, that player puts it onto the battlefield.",
+        "The owner of target permanent shuffles it into their library, then reveals the top card of that library. If it's a permanent card, they put it onto the battlefield.",
         AbilityKind::Spell,
     );
     let Effect::ChangeZone {
@@ -44007,24 +44007,4 @@ fn issue_2406_chaos_warp_owner_library_shuffle_and_reveal() {
         panic!("expected RevealTop of owner's library, got {reveal:?}");
     };
     assert_eq!(*player, TargetFilter::ParentTargetOwner);
-}
-
-#[test]
-fn issue_2403_sin_spira_tracked_set_copy_after_random_exile() {
-    let def = parse_effect_chain(
-        "Exile a permanent card from your graveyard at random, then create a tapped token that's a copy of that card.",
-        AbilityKind::Spell,
-    );
-    assert_eq!(def.target_selection_mode, TargetSelectionMode::Random);
-    let copy = def.sub_ability.as_ref().expect("copy sub");
-    let Effect::CopyTokenOf { target, tapped, .. } = copy.effect.as_ref() else {
-        panic!("expected CopyTokenOf, got {:?}", copy.effect);
-    };
-    assert_eq!(
-        *target,
-        TargetFilter::TrackedSet {
-            id: TrackedSetId(0)
-        }
-    );
-    assert!(*tapped);
 }

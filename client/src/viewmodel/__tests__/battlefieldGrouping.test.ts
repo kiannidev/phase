@@ -369,7 +369,10 @@ describe("groupByName", () => {
       toughness: 1,
       display_source: "Token",
       token_rules_text: "Whenever this token attacks, you gain 1 life.",
-      token_image_ref: { preset_id: "pest-sos", scryfall_id: "" },
+      token_image_ref: {
+        preset_id: "00a0801d-0212-5890-8957-3cde30f382f9",
+        scryfall_id: "ba854032-6ad2-4654-990a-64006e7f92fd",
+      },
       card_types: {
         supertypes: [],
         core_types: ["Creature"],
@@ -385,7 +388,10 @@ describe("groupByName", () => {
       toughness: 1,
       display_source: "Token",
       token_rules_text: "When this creature dies, you gain 1 life.",
-      token_image_ref: { preset_id: "pest-blc", scryfall_id: "" },
+      token_image_ref: {
+        preset_id: "14c28cbd-1740-5c17-98ea-4aea094067f1",
+        scryfall_id: "2b613822-b9c2-439e-9533-a91bed12b5e9",
+      },
       card_types: {
         supertypes: [],
         core_types: ["Creature"],
@@ -398,6 +404,103 @@ describe("groupByName", () => {
 
     expect(groups).toHaveLength(2);
     expect(groups.map((g) => g.count).sort()).toEqual([1, 1]);
+  });
+
+  it("separates tokens that differ only in token_rules_text", () => {
+    const sharedImage = {
+      preset_id: "14c28cbd-1740-5c17-98ea-4aea094067f1",
+      scryfall_id: "2b613822-b9c2-439e-9533-a91bed12b5e9",
+    };
+    const objects = [
+      makeGameObject({
+        id: 1,
+        card_id: 0,
+        name: "Pest",
+        power: 1,
+        toughness: 1,
+        is_token: true,
+        display_source: "Token",
+        token_rules_text: "Whenever this token attacks, you gain 1 life.",
+        token_image_ref: sharedImage,
+        card_types: {
+          supertypes: [],
+          core_types: ["Creature"],
+          subtypes: ["Pest"],
+        },
+        color: ["Black", "Green"],
+      }),
+      makeGameObject({
+        id: 2,
+        card_id: 0,
+        name: "Pest",
+        power: 1,
+        toughness: 1,
+        is_token: true,
+        display_source: "Token",
+        token_rules_text: "When this creature dies, you gain 1 life.",
+        token_image_ref: sharedImage,
+        card_types: {
+          supertypes: [],
+          core_types: ["Creature"],
+          subtypes: ["Pest"],
+        },
+        color: ["Black", "Green"],
+      }),
+    ];
+
+    const groups = groupByName(objects);
+
+    expect(groups).toHaveLength(2);
+  });
+
+  it("separates tokens that differ only in token_image_ref.preset_id", () => {
+    const sharedRules = "When this creature dies, you gain 1 life.";
+    const objects = [
+      makeGameObject({
+        id: 1,
+        card_id: 0,
+        name: "Pest",
+        power: 1,
+        toughness: 1,
+        is_token: true,
+        display_source: "Token",
+        token_rules_text: sharedRules,
+        token_image_ref: {
+          preset_id: "00a0801d-0212-5890-8957-3cde30f382f9",
+          scryfall_id: "ba854032-6ad2-4654-990a-64006e7f92fd",
+        },
+        card_types: {
+          supertypes: [],
+          core_types: ["Creature"],
+          subtypes: ["Pest"],
+        },
+        color: ["Black", "Green"],
+      }),
+      makeGameObject({
+        id: 2,
+        card_id: 0,
+        name: "Pest",
+        power: 1,
+        toughness: 1,
+        is_token: true,
+        display_source: "Token",
+        token_rules_text: sharedRules,
+        token_image_ref: {
+          preset_id: "14c28cbd-1740-5c17-98ea-4aea094067f1",
+          scryfall_id: "2b613822-b9c2-439e-9533-a91bed12b5e9",
+        },
+        card_types: {
+          supertypes: [],
+          core_types: ["Creature"],
+          subtypes: ["Pest"],
+        },
+        color: ["Black", "Green"],
+      }),
+    ];
+
+    const groups = groupByName(objects);
+
+    expect(groups).toHaveLength(2);
   });
 
   it("keeps tokens separate from non-token cards with the same name", () => {

@@ -1005,7 +1005,7 @@ pub(crate) enum PutImperativeAst {
         /// `(counter_type, count)`.
         enter_with_counters: Vec<(CounterType, QuantityExpr)>,
     },
-    /// CR 701.20e: Mass put effects ("put all creature cards from all
+    /// CR 400.7 + CR 110.2a: Mass put effects ("put all creature cards from all
     /// graveyards onto the battlefield") lower to `Effect::ChangeZoneAll`.
     ZoneChangeAll {
         origin: Option<Zone>,

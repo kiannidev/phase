@@ -369,7 +369,7 @@ describe("groupByName", () => {
       toughness: 1,
       display_source: "Token",
       token_rules_text: "Whenever this token attacks, you gain 1 life.",
-      token_image_ref: { preset_id: "pest-sos", scryfall_id: null },
+      token_image_ref: { preset_id: "pest-sos", scryfall_id: "" },
       card_types: {
         supertypes: [],
         core_types: ["Creature"],
@@ -385,7 +385,7 @@ describe("groupByName", () => {
       toughness: 1,
       display_source: "Token",
       token_rules_text: "When this creature dies, you gain 1 life.",
-      token_image_ref: { preset_id: "pest-blc", scryfall_id: null },
+      token_image_ref: { preset_id: "pest-blc", scryfall_id: "" },
       card_types: {
         supertypes: [],
         core_types: ["Creature"],
@@ -398,6 +398,25 @@ describe("groupByName", () => {
 
     expect(groups).toHaveLength(2);
     expect(groups.map((g) => g.count).sort()).toEqual([1, 1]);
+  });
+
+  it("keeps tokens separate from non-token cards with the same name", () => {
+    const objects = [
+      makeGameObject({ id: 1, name: "Soldier", power: 1, toughness: 1 }),
+      makeGameObject({
+        id: 2,
+        card_id: 0,
+        name: "Soldier",
+        power: 1,
+        toughness: 1,
+        is_token: true,
+        display_source: "Token",
+      }),
+    ];
+
+    const groups = groupByName(objects);
+
+    expect(groups).toHaveLength(2);
   });
 
   it("groups face-down permanents by public characteristics instead of hidden names", () => {

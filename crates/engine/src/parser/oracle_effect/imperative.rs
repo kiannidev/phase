@@ -2313,14 +2313,14 @@ fn parse_hand_reveal_card_filter(after_reveal_lower: &str) -> TargetFilter {
     {
         return TargetFilter::Any;
     }
-    let Ok((rest, descriptor)) =
+    let Ok((_, descriptor)) =
         take_until::<_, _, OracleError<'_>>(" card from ").parse(after_article)
     else {
         return TargetFilter::None;
     };
     let singular = format!("{} card", descriptor.trim());
     let (filter, rem) = parse_type_phrase(&singular);
-    if rem.trim().is_empty() && matches!(filter, TargetFilter::Typed(_) | TargetFilter::Any) {
+    if rem.trim().is_empty() && matches!(filter, TargetFilter::Typed(_)) {
         filter
     } else {
         TargetFilter::None

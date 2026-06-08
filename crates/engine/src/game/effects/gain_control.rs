@@ -84,18 +84,7 @@ pub fn resolve_give(
         unique_recipient_from_filter(state, recipient, ability.controller)?
     };
 
-    // CR 608.2c: Resolve the permanent target from the effect's `target`
-    // filter — `SelfRef` ("this artifact") must bind to `ability.source_id`
-    // even when `ability.targets` is empty, so chained GiveControl sub-
-    // abilities (Bucknard's Everfull Purse) transfer the source object.
-    let object_ids: Vec<ObjectId> =
-        crate::game::targeting::resolved_targets(ability, target, state)
-            .into_iter()
-            .filter_map(|t| match t {
-                TargetRef::Object(id) => Some(id),
-                TargetRef::Player(_) => None,
-            })
-            .collect();
+    let object_ids = give_control_object_targets(state, ability, target);
 
     for obj_id in object_ids {
         if !state.objects.contains_key(&obj_id) {
@@ -121,6 +110,32 @@ pub fn resolve_give(
     });
 
     Ok(())
+}
+
+fn give_control_object_targets(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    filter: &TargetFilter,
+) -> Vec<ObjectId> {
+    // CR 608.2c: `SelfRef` ("this artifact") binds to the ability source even
+    // when target propagation has populated `ability.targets`.
+    if matches!(filter, TargetFilter::SelfRef) {
+        return vec![ability.source_id];
+    }
+
+    let chosen_objects = super::effect_object_targets(filter, &ability.targets);
+
+    if !chosen_objects.is_empty() {
+        return chosen_objects;
+    }
+
+    crate::game::targeting::resolved_targets(ability, filter, state)
+        .into_iter()
+        .filter_map(|target| match target {
+            TargetRef::Object(id) => Some(id),
+            TargetRef::Player(_) => None,
+        })
+        .collect()
 }
 
 fn unique_recipient_from_filter(
@@ -368,6 +383,66 @@ mod tests {
         assert_eq!(
             state.objects.get(&target_id).unwrap().controller,
             PlayerId(1)
+        );
+    }
+
+    /// CR 601.2c + CR 608.2c: explicit GiveControl object targets are the
+    /// selected spell/ability targets. A live trigger event may also make
+    /// `ParentTarget` resolvable, but that event context must not override the
+    /// chosen target when `ability.targets` already carries one.
+    #[test]
+    fn give_control_prefers_chosen_object_over_live_event_context() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Blocking Source".to_string(),
+            Zone::Battlefield,
+        );
+        let chosen_target = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Chosen Gift".to_string(),
+            Zone::Battlefield,
+        );
+        let event_context_target = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Blocked Attacker".to_string(),
+            Zone::Battlefield,
+        );
+        state.current_trigger_event = Some(GameEvent::BlockersDeclared {
+            assignments: vec![(source, event_context_target)],
+        });
+        let ability = ResolvedAbility::new(
+            Effect::GiveControl {
+                target: TargetFilter::ParentTarget,
+                recipient: TargetFilter::Any,
+            },
+            vec![
+                TargetRef::Object(chosen_target),
+                TargetRef::Player(PlayerId(1)),
+            ],
+            source,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+
+        resolve_give(&mut state, &ability, &mut events).unwrap();
+        crate::game::layers::evaluate_layers(&mut state);
+
+        assert_eq!(
+            state.objects.get(&chosen_target).unwrap().controller,
+            PlayerId(1),
+            "the explicitly chosen object must be transferred"
+        );
+        assert_eq!(
+            state.objects.get(&event_context_target).unwrap().controller,
+            PlayerId(0),
+            "live event context must not replace the chosen object target"
         );
     }
 

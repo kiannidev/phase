@@ -2318,12 +2318,6 @@ fn parse_hand_reveal_card_filter(after_reveal_lower: &str) -> TargetFilter {
     else {
         return TargetFilter::None;
     };
-    if tag::<_, _, OracleError<'_>>(" card from ")
-        .parse(rest)
-        .is_err()
-    {
-        return TargetFilter::None;
-    }
     let singular = format!("{} card", descriptor.trim());
     let (filter, rem) = parse_type_phrase(&singular);
     if rem.trim().is_empty() && matches!(filter, TargetFilter::Typed(_) | TargetFilter::Any) {

@@ -6545,18 +6545,22 @@ fn for_each_clause_target_controller_filter(for_each_clause: &str) -> Option<Tar
                 TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent)),
                 tag("target opponent controls"),
             ),
-            value(TargetFilter::Player, tag("target player controls")),
+            value(
+                TargetFilter::Typed(TypedFilter::default()),
+                tag("target player controls"),
+            ),
         ))
         .parse(input)
     })
 }
 
 fn parsed_for_each_quantity_effect(
-    effect: Effect,
+    mut effect: Effect,
     duration: Option<Duration>,
     reference_target: Option<TargetFilter>,
 ) -> ParsedEffectClause {
     if let Some(target) = reference_target {
+        bind_search_library_for_each_antecedent(&mut effect, &target, "");
         if matches!(
             effect,
             Effect::Draw {
@@ -6589,6 +6593,32 @@ fn parsed_for_each_quantity_effect(
         optional: false,
         unless_pay: None,
     }
+}
+
+fn bind_search_library_for_each_antecedent(
+    effect: &mut Effect,
+    target: &TargetFilter,
+    text_lower: &str,
+) {
+    if let Effect::SearchLibrary { target_player, .. } = effect {
+        if target_player
+            .as_ref()
+            .is_some_and(search_library_target_player_is_for_each_antecedent)
+            || (target_player.is_none()
+                && nom_primitives::scan_contains(text_lower, "search that player's "))
+        {
+            *target_player = Some(target.clone());
+        }
+    }
+}
+
+fn search_library_target_player_is_for_each_antecedent(target: &TargetFilter) -> bool {
+    let TargetFilter::Typed(typed) = target else {
+        return false;
+    };
+    typed.type_filters.is_empty()
+        && typed.properties.is_empty()
+        && typed.controller == Some(ControllerRef::TargetPlayer)
 }
 
 fn try_parse_gain_energy(tp: TextPair<'_>, ctx: &mut ParseContext) -> Option<ParsedEffectClause> {
@@ -15008,11 +15038,15 @@ pub(crate) fn parse_effect_chain_ir(
         // `parse_effect_clause` claims it. The generic `for each` strip would
         // otherwise lift the counter-kind iteration into `repeat_for` and drop
         // the target, leaving an Unimplemented "give … counter" body.
-        let (repeat_for, text) = if try_parse_proliferate_target(&text).is_some() {
-            (None, text)
-        } else {
-            strip_for_each_prefix(&text)
-        };
+        let (repeat_for, text, for_each_reference_target) =
+            if try_parse_proliferate_target(&text).is_some() {
+                (None, text, None)
+            } else {
+                let reference_target = for_each_clause_target_controller_filter(&text);
+                let (repeat_for, text) = strip_for_each_prefix(&text);
+                let reference_target = repeat_for.as_ref().and(reference_target);
+                (repeat_for, text, reference_target)
+            };
         let (text_without_where_x, local_where_x_expression) = {
             let text_where_x_lower = text.to_lowercase();
             let (without_where_x, where_x_expression) =
@@ -15542,6 +15576,9 @@ pub(crate) fn parse_effect_chain_ir(
         // carries the caster default (Controller). Per D-04, this is parse-time
         // pronoun resolution that belongs in IR production.
         let mut clause = clause;
+        if let Some(target) = &for_each_reference_target {
+            bind_search_library_for_each_antecedent(&mut clause.effect, target, &text_no_qty_lower);
+        }
         // CR 608.2: `parse_exile_ast` uses `ScopedPlayer` as the structural
         // marker for "each player's library". Lower it into the same
         // player_scope-driven shape used by Evelyn/Jeleva-class effects:
@@ -43982,6 +44019,98 @@ mod snapshot_tests {
 }
 
 #[test]
+fn issue_2405_broken_bond_optional_land_from_hand() {
+    let def = parse_effect_chain(
+        "Destroy target artifact or enchantment. You may put a land card from your hand onto the battlefield.",
+        AbilityKind::Spell,
+    );
+    let sub = def.sub_ability.as_ref().expect("land put sub");
+    assert!(sub.optional);
+    let Effect::ChangeZone {
+        origin: Some(Zone::Hand),
+        destination: Zone::Battlefield,
+        ..
+    } = sub.effect.as_ref()
+    else {
+        panic!(
+            "expected optional hand->battlefield ChangeZone, got {:?}",
+            sub.effect
+        );
+    };
+}
+
+#[test]
+fn issue_2405_planar_genesis_dig_land_enters_tapped() {
+    let def = parse_effect_chain(
+        "Look at the top four cards of your library. You may put a land card from among them onto the battlefield tapped. If you don't, put those cards into your hand. Put the rest on the bottom of your library in a random order.",
+        AbilityKind::Spell,
+    );
+    let Effect::Dig {
+        destination: Some(Zone::Battlefield),
+        enter_tapped: true,
+        filter,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("expected tapped battlefield Dig, got {:?}", def.effect);
+    };
+    let TargetFilter::Typed(typed) = filter else {
+        panic!("expected land filter");
+    };
+    assert_eq!(typed.type_filters, vec![TypeFilter::Land]);
+}
+
+#[test]
+fn issue_2403_sin_spira_tracked_set_copy_after_random_exile() {
+    let def = parse_effect_chain(
+        "Exile a permanent card from your graveyard at random, then create a tapped token that's a copy of that card.",
+        AbilityKind::Spell,
+    );
+    assert_eq!(def.target_selection_mode, TargetSelectionMode::Random);
+    let copy = def.sub_ability.as_ref().expect("copy sub");
+    let Effect::CopyTokenOf { target, tapped, .. } = copy.effect.as_ref() else {
+        panic!("expected CopyTokenOf, got {:?}", copy.effect);
+    };
+    assert_eq!(
+        *target,
+        TargetFilter::TrackedSet {
+            id: TrackedSetId(0)
+        }
+    );
+    assert!(*tapped);
+}
+
+#[test]
+fn issue_2406_chaos_warp_owner_library_shuffle_and_reveal() {
+    let def = parse_effect_chain(
+        "The owner of target permanent shuffles it into their library, then reveals the top card of that library. If it's a permanent card, they put it onto the battlefield.",
+        AbilityKind::Spell,
+    );
+    let Effect::ChangeZone {
+        owner_library: true,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("expected owner-library ChangeZone, got {:?}", def.effect);
+    };
+    let shuffle = def.sub_ability.as_ref().expect("shuffle sub");
+    assert_eq!(
+        shuffle.effect.target_filter(),
+        Some(&TargetFilter::ParentTargetOwner)
+    );
+    let reveal = shuffle
+        .sub_ability
+        .as_ref()
+        .expect("reveal sub")
+        .effect
+        .as_ref();
+    let Effect::RevealTop { player, count: 1 } = reveal else {
+        panic!("expected RevealTop of owner's library, got {reveal:?}");
+    };
+    assert_eq!(*player, TargetFilter::ParentTargetOwner);
+}
+
+#[test]
 fn issue_2402_hazel_copy_target_token_trigger_parses() {
     let def = parse_trigger_line(
         "At the beginning of your end step, create a token that's a copy of target token you control. If that token is a Squirrel, instead create two tokens that are copies of it.",
@@ -44002,4 +44131,87 @@ fn issue_2402_hazel_copy_target_token_trigger_parses() {
         .properties
         .iter()
         .any(|prop| matches!(prop, FilterProp::Token)));
+}
+
+#[test]
+fn issue_2400_doubling_chant_repeat_for_member_driven_search() {
+    let def = parse_effect_chain(
+        "For each creature you control, you may search your library for a creature card with the same name as that creature. Put those cards onto the battlefield, then shuffle.",
+        AbilityKind::Spell,
+    );
+    assert!(matches!(&*def.effect, Effect::SearchLibrary { .. }));
+    assert!(matches!(
+        def.repeat_for,
+        Some(QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount { .. }
+        })
+    ));
+    let Effect::SearchLibrary { filter, .. } = def.effect.as_ref() else {
+        panic!("expected SearchLibrary");
+    };
+    let TargetFilter::Typed(typed) = filter else {
+        panic!("expected typed search filter, got {filter:?}");
+    };
+    assert!(
+        typed
+            .properties
+            .contains(&FilterProp::SameNameAsParentTarget),
+        "search must bind same name as per-iteration creature"
+    );
+}
+
+#[test]
+fn dichotomancy_searches_target_players_library_per_iterated_permanent() {
+    let def = parse_effect_chain(
+        "For each tapped nonland permanent target opponent controls, search that player's library for a card with the same name as that permanent and put it onto the battlefield under your control. Then that player shuffles.",
+        AbilityKind::Spell,
+    );
+    assert!(matches!(&*def.effect, Effect::SearchLibrary { .. }));
+    let Some(QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCount { filter },
+    }) = &def.repeat_for
+    else {
+        panic!("expected ObjectCount repeat_for, got {:?}", def.repeat_for);
+    };
+    let TargetFilter::Typed(repeat_filter) = filter else {
+        panic!("expected typed repeat filter, got {filter:?}");
+    };
+    assert_eq!(repeat_filter.controller, Some(ControllerRef::TargetPlayer));
+
+    let Effect::SearchLibrary {
+        filter,
+        target_player,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("expected SearchLibrary");
+    };
+    let Some(TargetFilter::Typed(target_player)) = target_player else {
+        panic!("expected target-player scoped library owner");
+    };
+    assert_eq!(target_player.controller, Some(ControllerRef::Opponent));
+    let TargetFilter::Typed(search_filter) = filter else {
+        panic!("expected typed search filter, got {filter:?}");
+    };
+    assert!(
+        search_filter
+            .properties
+            .contains(&FilterProp::SameNameAsParentTarget),
+        "search must bind same name as per-iteration permanent"
+    );
+}
+
+#[test]
+fn for_each_target_player_controls_search_that_players_library_keeps_caster_searcher_shape() {
+    let def = parse_effect_chain(
+        "For each tapped nonland permanent target player controls, search that player's library for a card with the same name as that permanent and put it onto the battlefield under your control.",
+        AbilityKind::Spell,
+    );
+    let Effect::SearchLibrary { target_player, .. } = def.effect.as_ref() else {
+        panic!("expected SearchLibrary");
+    };
+    let Some(TargetFilter::Typed(target_player)) = target_player else {
+        panic!("expected typed target-player library owner, got {target_player:?}");
+    };
+    assert_eq!(target_player.controller, None);
 }

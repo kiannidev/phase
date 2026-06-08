@@ -14,7 +14,6 @@ fn until_end_of_turn_auto_pass_still_deals_combat_damage() {
     let attacker_id = scenario.add_creature(P0, "Bear", 3, 3).id();
     let mut runner = scenario.build();
 
-    // Reach declare attackers without auto-pass interfering.
     runner.pass_both_players();
     runner
         .act(GameAction::DeclareAttackers {
@@ -22,52 +21,68 @@ fn until_end_of_turn_auto_pass_still_deals_combat_damage() {
             bands: vec![],
         })
         .expect("declare attackers");
-    if matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
-        runner.pass_both_players();
-    }
-    if matches!(
-        runner.state().waiting_for,
-        WaitingFor::DeclareBlockers { .. }
-    ) {
-        runner
-            .act(GameAction::DeclareBlockers {
-                assignments: vec![],
-            })
-            .expect("declare no blockers");
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
+        "active player receives priority after attackers"
+    );
+    runner.pass_both_players();
+
+    match &runner.state().waiting_for {
+        WaitingFor::DeclareBlockers { .. } => {
+            runner
+                .act(GameAction::DeclareBlockers {
+                    assignments: vec![],
+                })
+                .expect("declare no blockers");
+        }
+        WaitingFor::Priority { .. } => {
+            assert!(
+                matches!(
+                    runner.state().phase,
+                    Phase::DeclareBlockers | Phase::CombatDamage
+                ),
+                "priority after attackers must be in declare blockers or combat damage"
+            );
+        }
+        other => panic!(
+            "expected DeclareBlockers or Priority after attackers, got {other:?} (phase={:?})",
+            runner.state().phase
+        ),
     }
 
-    // Enable "pass to end step" before the declare-blockers priority window drains.
     runner
         .act(GameAction::SetAutoPass {
             mode: AutoPassRequest::UntilEndOfTurn,
         })
         .expect("enable pass-to-end");
 
-    // Auto-pass through combat damage and the rest of combat.
     for _ in 0..40 {
         if runner.state().phase == Phase::PostCombatMain {
             break;
         }
         match &runner.state().waiting_for {
             WaitingFor::Priority { .. } => {
-                let _ = runner.act(GameAction::PassPriority);
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("pass priority during auto-pass drain");
             }
-            _ => break,
+            other => panic!(
+                "unexpected waiting state while draining combat: {other:?} (phase={:?})",
+                runner.state().phase
+            ),
         }
     }
 
-    let p1_life = runner
-        .state()
-        .players
-        .iter()
-        .find(|p| p.id == P1)
-        .unwrap()
-        .life;
     assert_eq!(
-        p1_life, 17,
-        "defender must take 3 combat damage even under UntilEndOfTurn auto-pass; \
-         phase={:?}, waiting_for={:?}",
         runner.state().phase,
+        Phase::PostCombatMain,
+        "auto-pass must advance through combat damage to postcombat main"
+    );
+    assert_eq!(
+        runner.life(P1),
+        17,
+        "defender must take 3 combat damage even under UntilEndOfTurn auto-pass; \
+         waiting_for={:?}",
         runner.state().waiting_for
     );
 }

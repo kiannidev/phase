@@ -189,3 +189,41 @@ fn joel_triggers_when_spell_created_token_dies() {
     );
     assert_eq!(hand_size(&runner, P0), hand_before + 1);
 }
+
+/// Joel's trigger is limited to once per turn (CR 603.9).
+#[test]
+fn joel_triggers_only_once_per_turn() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    for _ in 0..10 {
+        scenario.add_card_to_library_top(P0, "Forest");
+    }
+
+    let joel_id = scenario
+        .add_creature_from_oracle(P0, "Joel, Resolute Survivor", 4, 4, JOEL_ORACLE)
+        .id();
+    let token_a = scenario.add_creature(P0, "Pest A", 1, 1).id();
+    let token_b = scenario.add_creature(P0, "Pest B", 1, 1).id();
+
+    let mut runner = scenario.build();
+    for id in [token_a, token_b] {
+        runner.state_mut().objects.get_mut(&id).unwrap().is_token = true;
+    }
+
+    let hand_before = hand_size(&runner, P0);
+
+    destroy_with_lethal_damage(&mut runner, token_a);
+    destroy_with_lethal_damage(&mut runner, token_b);
+
+    let joel = runner.state().objects.get(&joel_id).unwrap();
+    assert_eq!(
+        joel.counters.get(&CounterType::Plus1Plus1).copied().unwrap_or(0),
+        1,
+        "Joel must trigger only once per turn even if multiple tokens die"
+    );
+    assert_eq!(
+        hand_size(&runner, P0),
+        hand_before + 1,
+        "Joel must draw at most one card per turn from this trigger"
+    );
+}

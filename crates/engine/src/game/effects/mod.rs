@@ -2678,6 +2678,10 @@ fn has_member_driven_repeat(ability: &ResolvedAbility) -> bool {
     ) && effect_iterates_over_parent_target(&ability.effect)
 }
 
+fn has_member_driven_repeat_after_hydration(state: &GameState, ability: &ResolvedAbility) -> bool {
+    has_member_driven_repeat(&ability_with_event_context_targets(state, ability))
+}
+
 fn rebind_iterated_counter_kind(
     ability: &mut ResolvedAbility,
     kind: crate::types::counter::CounterType,
@@ -3826,7 +3830,10 @@ fn resolve_chain_body(
     // accept another. Suppress the single up-front gate here; the `repeat_for`
     // loop below fires its own per-iteration `OptionalEffectChoice` for each
     // counter kind (see the `kind_driven` optional path in the loop).
-    if ability.optional && !has_kind_driven_repeat(ability) && !has_member_driven_repeat(ability) {
+    if ability.optional
+        && !has_kind_driven_repeat(ability)
+        && !has_member_driven_repeat_after_hydration(state, ability)
+    {
         let description = ability.description.clone();
         let prompt_player = optional_prompt_player(state, ability);
         let may_trigger_key = ability
@@ -15413,6 +15420,39 @@ mod tests {
             let obj = state.objects.get_mut(&id).unwrap();
             obj.card_types.core_types = vec![CoreType::Creature];
         }
+        let library_bear = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Bear".to_string(),
+            Zone::Library,
+        );
+        state
+            .objects
+            .get_mut(&library_bear)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+        let library_elephant = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(0),
+            "Elephant".to_string(),
+            Zone::Library,
+        );
+        state
+            .objects
+            .get_mut(&library_elephant)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+        let library_bear_noncreature = create_object(
+            &mut state,
+            CardId(5),
+            PlayerId(0),
+            "Bear".to_string(),
+            Zone::Library,
+        );
 
         let source = create_object(
             &mut state,
@@ -15432,22 +15472,134 @@ mod tests {
         let mut events = Vec::new();
         resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
 
-        assert!(
-            state.pending_repeat_iteration.is_some()
-                || matches!(
-                    state.waiting_for,
-                    WaitingFor::SearchChoice { .. } | WaitingFor::OptionalEffectChoice { .. }
-                ),
-            "member-driven search must enter the repeat loop, got waiting_for={:?} pending={:?}",
+        assert!(matches!(
             state.waiting_for,
-            state.pending_repeat_iteration
+            WaitingFor::OptionalEffectChoice { .. }
+        ));
+        let pending = state
+            .pending_repeat_iteration
+            .as_ref()
+            .expect("first optional prompt must stash the remaining iteration");
+        assert_eq!(
+            pending.total_iterations, 2,
+            "two controlled creatures imply two search iterations"
         );
-        if let Some(pending) = state.pending_repeat_iteration.as_ref() {
-            assert_eq!(
-                pending.total_iterations, 2,
-                "two controlled creatures ⇒ two search iterations"
+        assert_eq!(pending.next_iteration, 1);
+        assert_eq!(pending.tracked_members.len(), 2);
+
+        let first_member = pending.tracked_members[0];
+        let first_name = state.objects.get(&first_member).unwrap().name.clone();
+        let expected_first_card = match first_name.as_str() {
+            "Bear" => library_bear,
+            "Elephant" => library_elephant,
+            other => panic!("unexpected iterated creature {other}"),
+        };
+        let other_card = if expected_first_card == library_bear {
+            library_elephant
+        } else {
+            library_bear
+        };
+
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::DecideOptionalEffect { accept: true },
+        )
+        .unwrap();
+
+        let WaitingFor::SearchChoice { cards, count, .. } = &state.waiting_for else {
+            panic!(
+                "accepting first per-creature optional search must enter SearchChoice, got {:?}",
+                state.waiting_for
             );
-            assert_eq!(pending.tracked_members.len(), 2);
+        };
+        assert_eq!(*count, 1);
+        assert!(
+            cards.contains(&expected_first_card),
+            "SearchChoice must offer same-named creature card {expected_first_card:?} for {first_name}"
+        );
+        assert!(
+            !cards.contains(&other_card),
+            "SearchChoice must not offer a creature with the other iterated name"
+        );
+        assert!(
+            !cards.contains(&library_bear_noncreature),
+            "SearchChoice must still require a creature card"
+        );
+    }
+
+    #[test]
+    fn dichotomancy_member_driven_search_uses_target_players_library() {
+        let mut state = GameState::new_two_player(42);
+
+        let battlefield_relic = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Relic".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&battlefield_relic).unwrap();
+            obj.controller = PlayerId(1);
+            obj.tapped = true;
+            obj.card_types.core_types = vec![crate::types::card_type::CoreType::Artifact];
         }
+
+        let caster_library_relic = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Relic".to_string(),
+            Zone::Library,
+        );
+        let opponent_library_relic = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Relic".to_string(),
+            Zone::Library,
+        );
+
+        let source = create_object(
+            &mut state,
+            CardId(99),
+            PlayerId(0),
+            "Dichotomancy".to_string(),
+            Zone::Stack,
+        );
+
+        let def = crate::parser::oracle_effect::parse_effect_chain(
+            "For each tapped nonland permanent target opponent controls, search that player's library for a card with the same name as that permanent and put it onto the battlefield under your control. Then that player shuffles.",
+            AbilityKind::Spell,
+        );
+        let mut ability =
+            crate::game::ability_utils::build_resolved_from_def(&def, source, PlayerId(0));
+        ability.targets = vec![TargetRef::Player(PlayerId(1))];
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        let WaitingFor::SearchChoice {
+            player,
+            cards,
+            count,
+            ..
+        } = &state.waiting_for
+        else {
+            panic!(
+                "Dichotomancy must enter a search choice for the target player's library, got {:?}",
+                state.waiting_for
+            );
+        };
+        assert_eq!(*player, PlayerId(0), "the caster searches that library");
+        assert_eq!(*count, 1);
+        assert!(
+            cards.contains(&opponent_library_relic),
+            "search must offer same-named card from the target opponent's library"
+        );
+        assert!(
+            !cards.contains(&caster_library_relic),
+            "search must not offer same-named card from the caster's library"
+        );
     }
 }

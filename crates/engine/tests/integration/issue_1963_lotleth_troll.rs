@@ -3,8 +3,9 @@
 
 use engine::game::scenario::{GameScenario, P0};
 use engine::parser::oracle_cost::parse_oracle_cost;
-use engine::types::ability::{AbilityCost, TargetFilter, TypedFilter};
+use engine::types::ability::{AbilityCost, QuantityExpr, TargetFilter, TypedFilter};
 use engine::types::actions::GameAction;
+use engine::types::counter::CounterType;
 use engine::types::game_state::{PayCostKind, WaitingFor};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
@@ -19,7 +20,7 @@ fn lotleth_discard_cost_parses_creature_card_filter() {
     assert_eq!(
         parse_oracle_cost("Discard a creature card"),
         AbilityCost::Discard {
-            count: engine::types::ability::QuantityExpr::Fixed { value: 1 },
+            count: QuantityExpr::Fixed { value: 1 },
             filter: Some(TargetFilter::Typed(TypedFilter::creature())),
             random: false,
             self_ref: false,
@@ -38,7 +39,7 @@ fn lotleth_discard_activation_only_offers_creature_cards_in_hand() {
     let creature_in_hand = scenario
         .add_creature_to_hand(P0, "Grizzly Bears", 2, 2)
         .id();
-    let _land_in_hand = scenario.add_card_to_hand(P0, "Forest");
+    let _land_in_hand = scenario.add_land_to_hand(P0, "Forest").id();
 
     let mut runner = scenario.build();
 
@@ -105,7 +106,7 @@ fn lotleth_discard_creature_puts_counter_on_troll() {
             .get(&troll_id)
             .unwrap()
             .counters
-            .get(&engine::types::counter::CounterType::Plus1Plus1)
+            .get(&CounterType::Plus1Plus1)
             .copied()
             .unwrap_or(0),
         1,

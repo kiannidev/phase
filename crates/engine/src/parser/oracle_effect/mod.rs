@@ -30004,14 +30004,43 @@ mod tests {
     fn parse_reveal_a_card_from_your_hand_sets_any_card_filter() {
         let def = parse_effect_chain("Reveal a card from your hand.", AbilityKind::Spell);
 
-        let Effect::RevealHand { card_filter, .. } = &*def.effect else {
+        let Effect::RevealHand {
+            target,
+            card_filter,
+            ..
+        } = &*def.effect
+        else {
             panic!("Expected RevealHand, got {:?}", def.effect);
         };
+        assert_eq!(*target, TargetFilter::Controller);
         assert_eq!(
             *card_filter,
             TargetFilter::Any,
             "singular hand reveal must let the player choose any hand card"
         );
+    }
+
+    #[test]
+    fn parse_reveal_a_card_from_target_opponents_hand_preserves_hand_owner() {
+        let def = parse_effect_chain(
+            "Reveal a card from target opponent's hand.",
+            AbilityKind::Spell,
+        );
+
+        let Effect::RevealHand {
+            target,
+            card_filter,
+            ..
+        } = &*def.effect
+        else {
+            panic!("Expected RevealHand, got {:?}", def.effect);
+        };
+        assert!(matches!(
+            target,
+            TargetFilter::Typed(tf)
+                if tf.controller == Some(crate::types::ability::ControllerRef::Opponent)
+        ));
+        assert_eq!(*card_filter, TargetFilter::Any);
     }
 
     #[test]
@@ -30021,9 +30050,15 @@ mod tests {
             AbilityKind::Activated,
         );
 
-        let Effect::RevealHand { card_filter, .. } = &*def.effect else {
+        let Effect::RevealHand {
+            target,
+            card_filter,
+            ..
+        } = &*def.effect
+        else {
             panic!("Expected RevealHand, got {:?}", def.effect);
         };
+        assert_eq!(*target, TargetFilter::Controller);
         assert_eq!(*card_filter, TargetFilter::Any);
     }
 
@@ -30031,9 +30066,15 @@ mod tests {
     fn parse_reveal_creature_card_from_your_hand_sets_creature_filter() {
         let def = parse_effect_chain("Reveal a creature card from your hand.", AbilityKind::Spell);
 
-        let Effect::RevealHand { card_filter, .. } = &*def.effect else {
+        let Effect::RevealHand {
+            target,
+            card_filter,
+            ..
+        } = &*def.effect
+        else {
             panic!("Expected RevealHand, got {:?}", def.effect);
         };
+        assert_eq!(*target, TargetFilter::Controller);
         assert!(
             matches!(
                 card_filter,

@@ -2267,63 +2267,72 @@ pub(super) fn parse_hand_reveal_ast(
     // This function only handles hand-related reveals.
 
     if nom_primitives::scan_contains(lower, "hand") {
+        let (target, card_filter) = parse_hand_reveal_target_and_card_filter(after_reveal_lower);
         return Some(HandRevealImperativeAst::RevealAll {
-            card_filter: parse_hand_reveal_card_filter(after_reveal_lower),
+            target,
+            card_filter,
         });
     }
 
     None
 }
 
-fn parse_hand_reveal_card_filter(after_reveal_lower: &str) -> TargetFilter {
+fn parse_hand_reveal_target_and_card_filter(
+    after_reveal_lower: &str,
+) -> (TargetFilter, TargetFilter) {
     if let Ok((after_all, _)) = tag::<_, _, OracleError<'_>>("all ").parse(after_reveal_lower) {
-        let Ok((rest, descriptor)) = take_until::<_, _, OracleError<'_>>(" cards").parse(after_all)
-        else {
-            return TargetFilter::None;
+        let Ok((hand_phrase, descriptor)) = terminated(
+            take_until::<_, _, OracleError<'_>>(" cards"),
+            alt((
+                tag::<_, _, OracleError<'_>>(" cards in "),
+                tag(" cards from "),
+            )),
+        )
+        .parse(after_all) else {
+            return (TargetFilter::Any, TargetFilter::None);
         };
-        if alt((
-            tag::<_, _, OracleError<'_>>(" cards in "),
-            tag(" cards from "),
-        ))
-        .parse(rest)
-        .is_err()
-        {
-            return TargetFilter::None;
-        }
+        let target = parse_hand_possessive_target(hand_phrase)
+            .map(|(_, target)| target)
+            .unwrap_or(TargetFilter::Any);
         if descriptor.trim().is_empty() {
-            return TargetFilter::Any;
+            return (target, TargetFilter::Any);
         }
         let singular = format!("{} card", descriptor.trim());
         let (filter, rem) = parse_type_phrase(&singular);
         if rem.trim().is_empty() && matches!(filter, TargetFilter::Typed(_)) {
-            return filter;
+            return (target, filter);
         }
-        return TargetFilter::None;
+        return (target, TargetFilter::None);
     }
 
     // CR 701.20a: "reveal a card from your hand" / "reveal an [type] card from ..."
     let Ok((after_article, _)) =
         alt((tag::<_, _, OracleError<'_>>("a "), tag("an "))).parse(after_reveal_lower)
     else {
-        return TargetFilter::None;
+        return (TargetFilter::Any, TargetFilter::None);
     };
-    if tag::<_, _, OracleError<'_>>("card from ")
-        .parse(after_article)
-        .is_ok()
-    {
-        return TargetFilter::Any;
+    if let Ok((hand_phrase, _)) = tag::<_, _, OracleError<'_>>("card from ").parse(after_article) {
+        let target = parse_hand_possessive_target(hand_phrase)
+            .map(|(_, target)| target)
+            .unwrap_or(TargetFilter::Any);
+        return (target, TargetFilter::Any);
     }
-    let Ok((_, descriptor)) =
-        take_until::<_, _, OracleError<'_>>(" card from ").parse(after_article)
-    else {
-        return TargetFilter::None;
+    let Ok((hand_phrase, descriptor)) = terminated(
+        take_until::<_, _, OracleError<'_>>(" card from "),
+        tag(" card from "),
+    )
+    .parse(after_article) else {
+        return (TargetFilter::Any, TargetFilter::None);
     };
+    let target = parse_hand_possessive_target(hand_phrase)
+        .map(|(_, target)| target)
+        .unwrap_or(TargetFilter::Any);
     let singular = format!("{} card", descriptor.trim());
     let (filter, rem) = parse_type_phrase(&singular);
     if rem.trim().is_empty() && matches!(filter, TargetFilter::Typed(_)) {
-        filter
+        (target, filter)
     } else {
-        TargetFilter::None
+        (target, TargetFilter::None)
     }
 }
 
@@ -2340,8 +2349,11 @@ pub(super) fn lower_hand_reveal_ast(ast: HandRevealImperativeAst) -> Effect {
             random,
             choice_optional: false,
         },
-        HandRevealImperativeAst::RevealAll { card_filter } => Effect::RevealHand {
-            target: TargetFilter::Any,
+        HandRevealImperativeAst::RevealAll {
+            target,
+            card_filter,
+        } => Effect::RevealHand {
+            target,
             card_filter,
             count: None,
             random: false,

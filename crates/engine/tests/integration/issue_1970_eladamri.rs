@@ -26,9 +26,19 @@ fn hand_creature(state: &mut GameState, card_id: u64, owner: PlayerId, name: &st
 #[test]
 fn eladamri_hand_mode_offers_reveal_choice_for_controller_hand() {
     let def = parse_effect_chain(ELADAMRI_HAND_MODE, AbilityKind::Activated);
-    let Effect::RevealHand { card_filter, .. } = def.effect.as_ref() else {
+    let Effect::RevealHand {
+        target,
+        card_filter,
+        ..
+    } = def.effect.as_ref()
+    else {
         panic!("parsed shape: {:?}", def.effect);
     };
+    assert_eq!(
+        *target,
+        TargetFilter::Controller,
+        "hand mode should reveal from the controller's hand"
+    );
     assert_eq!(
         *card_filter,
         TargetFilter::Any,

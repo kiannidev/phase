@@ -360,6 +360,46 @@ describe("groupByName", () => {
     expect(groups[1].representative.id).toBe(9);
   });
 
+  it("keeps visually distinct tokens with the same name in separate groups", () => {
+    const attackPest = makeGameObject({
+      id: 1,
+      card_id: 0,
+      name: "Pest",
+      power: 1,
+      toughness: 1,
+      display_source: "Token",
+      token_rules_text: "Whenever this token attacks, you gain 1 life.",
+      token_image_ref: { preset_id: "pest-sos", scryfall_id: null },
+      card_types: {
+        supertypes: [],
+        core_types: ["Creature"],
+        subtypes: ["Pest"],
+      },
+      color: ["Black", "Green"],
+    });
+    const diesPest = makeGameObject({
+      id: 2,
+      card_id: 0,
+      name: "Pest",
+      power: 1,
+      toughness: 1,
+      display_source: "Token",
+      token_rules_text: "When this creature dies, you gain 1 life.",
+      token_image_ref: { preset_id: "pest-blc", scryfall_id: null },
+      card_types: {
+        supertypes: [],
+        core_types: ["Creature"],
+        subtypes: ["Pest"],
+      },
+      color: ["Black", "Green"],
+    });
+
+    const groups = groupByName([attackPest, diesPest]);
+
+    expect(groups).toHaveLength(2);
+    expect(groups.map((g) => g.count).sort()).toEqual([1, 1]);
+  });
+
   it("groups face-down permanents by public characteristics instead of hidden names", () => {
     const objects = [
       makeGameObject({

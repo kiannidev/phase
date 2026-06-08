@@ -209,7 +209,7 @@ fn joel_triggers_when_spell_created_token_dies() {
     assert_eq!(hand_size(&runner, P0), hand_before + 1);
 }
 
-/// Joel's trigger is limited to once per turn (CR 603.9).
+/// Joel's trigger is limited to once per turn (CR 603.2h).
 #[test]
 fn joel_triggers_only_once_per_turn() {
     let mut scenario = GameScenario::new();

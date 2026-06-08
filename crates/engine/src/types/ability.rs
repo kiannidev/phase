@@ -6,7 +6,7 @@ use serde::ser::SerializeStructVariant;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
-use super::card::PrintedCardRef;
+use super::card::{PrintedCardRef, TokenImageRef};
 use super::card_type::{CardType, CoreType, SubtypeSet, Supertype};
 use super::counter::{CounterMatch, CounterType};
 use super::events::BendingType;
@@ -23,6 +23,7 @@ use super::replacements::ReplacementEvent;
 use super::statics::{ActivationExemption, CastFrequency, StaticMode};
 use super::triggers::TriggerMode;
 use super::zones::Zone;
+use crate::game::game_object::DisplaySource;
 use crate::types::events::PlayerActionKind;
 
 // ---------------------------------------------------------------------------
@@ -1772,6 +1773,22 @@ pub enum ResolutionCastSuccessAction {
     /// offering the remaining hits before bottoming the non-hit revealed cards.
     RippleOfferRemaining {
         remaining_hits: Vec<super::identifiers::ObjectId>,
+    },
+    /// CR 608.2g + CR 601.2 + CR 202.3: Invoke Calamity's free-cast window — after
+    /// a spell cast this way resolves, re-open the window with the cast count
+    /// decremented and the running mana-value budget reduced by the spell's
+    /// resulting mana value, until the count hits zero or the controller
+    /// declines. Carries the window's parameters so the candidate set can be
+    /// recomputed from the controller's current graveyard/hand.
+    FreeCastOfferRemaining {
+        controller: PlayerId,
+        remaining_casts: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remaining_mv_budget: Option<u32>,
+        filter: TargetFilter,
+        zones: Vec<Zone>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        exile_instead_of_graveyard: bool,
     },
 }
 
@@ -5964,7 +5981,10 @@ pub enum Effect {
         /// Kept-card destination override (None = Hand).
         #[serde(default)]
         destination: Option<Zone>,
-        /// How many cards to keep (None = 1).
+        /// How many cards to keep. `None` is the default single keep unless the
+        /// Dig is in all-seen reorder mode. Parser-generated unbounded "all" /
+        /// "any number" continuations use `u32::MAX`, clamped by the resolver
+        /// to the number of seen cards.
         #[serde(default)]
         keep_count: Option<u32>,
         /// True = select 0..=keep_count ("up to N"), false = exactly keep_count.
@@ -6893,6 +6913,44 @@ pub enum Effect {
         #[serde(default, skip_serializing_if = "CastFromZoneDriver::is_default")]
         driver: CastFromZoneDriver,
     },
+    /// CR 608.2g + CR 601.2 + CR 118.9: Open an interactive "free-cast window"
+    /// during this spell/ability's resolution: the controller may cast up to
+    /// `count` spells matching `filter` from any of `zones` (their own
+    /// graveyard and/or hand), each without paying its mana cost, casting them
+    /// one at a time during resolution (CR 608.2g — "casting other spells this
+    /// way"). When `max_total_mv` is `Some(n)`, the *running total* mana value
+    /// of the spells cast this way must not exceed `n` (CR 202.3) — a
+    /// cross-selection budget that shrinks as each spell is cast. "Up to N"
+    /// makes every cast optional (the controller may stop early or cast none).
+    ///
+    /// When `exile_instead_of_graveyard` is true, each spell cast this way
+    /// carries the rider "if those spells would be put into your graveyard,
+    /// exile them instead" (CR 614.1a) for the rest of the cast — applied as a
+    /// duration-scoped replacement on the cast spell.
+    ///
+    /// Distinct from `CastFromZone`, which grants a casting *permission* on a
+    /// targeted object (lingering or a single self-cast). This effect owns the
+    /// interactive multi-cast selection loop with the shared MV budget — there
+    /// is no target slot; candidates are gathered by `filter` across `zones` at
+    /// resolution time. Invoke Calamity is the type specimen.
+    FreeCastFromZones {
+        /// CR 601.2: Maximum number of spells the controller may cast this way.
+        count: u8,
+        /// CR 202.3: Optional running-total mana-value budget shared across all
+        /// spells cast this way. `None` means no MV cap.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        max_total_mv: Option<u32>,
+        /// CR 601.2a: Filter the candidate cards must match (e.g. instant
+        /// and/or sorcery).
+        filter: TargetFilter,
+        /// CR 601.2a: Zones searched for candidates (the controller's own
+        /// graveyard and/or hand).
+        zones: Vec<Zone>,
+        /// CR 614.1a: When true, spells cast this way are exiled instead of
+        /// being put into their owner's graveyard ("exile them instead").
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        exile_instead_of_graveyard: bool,
+    },
     /// CR 615: Prevent damage to a target.
     PreventDamage {
         amount: PreventionAmount,
@@ -7548,6 +7606,19 @@ pub enum Effect {
     Conjure {
         /// One or more (card_name, count) pairs for multi-card conjure patterns.
         cards: Vec<ConjureCard>,
+        destination: Zone,
+        #[serde(default)]
+        tapped: bool,
+    },
+    /// Digital-only Alchemy keyword action (no CR entry): "draft a card from
+    /// [this card]'s spellbook" — reveal the source card's fixed spellbook list,
+    /// the controller chooses one card name from it, and that card is conjured
+    /// into `destination` (mirrors `Conjure`, but the controller picks one entry
+    /// from a per-card list). The list is not in the Oracle text; it is carried
+    /// on the source object (`GameObject::spellbook`, from
+    /// `CardFace::metadata.spellbook`), so the resolver reads it from the source.
+    /// An empty list resolves as a no-op.
+    DraftFromSpellbook {
         destination: Zone,
         #[serde(default)]
         tapped: bool,
@@ -8419,6 +8490,9 @@ impl Effect {
             | Effect::MadnessCast { .. }
             | Effect::GiftDelivery { .. }
             | Effect::ExchangeControl { .. }
+            // CR 601.2a: candidates gathered by `filter`/`zones` at resolution,
+            // no player-selectable target slot.
+            | Effect::FreeCastFromZones { .. }
             | Effect::Manifest { .. }
             | Effect::ManifestDread
             | Effect::RollDie { .. }
@@ -8453,6 +8527,7 @@ impl Effect {
             | Effect::TimeTravel
             | Effect::RuntimeHandled { .. }
             | Effect::Conjure { .. }
+            | Effect::DraftFromSpellbook { .. }
             | Effect::ChooseOneOf { .. }
             | Effect::Unimplemented { .. }
             // CR 603.7e: ChooseObjectsIntoTrackedSet has no discrete effect-target
@@ -8595,6 +8670,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::CreateEmblem { .. } => "CreateEmblem",
         Effect::PayCost { .. } => "PayCost",
         Effect::CastFromZone { .. } => "CastFromZone",
+        Effect::FreeCastFromZones { .. } => "FreeCastFromZones",
         Effect::PreventDamage { .. } => "PreventDamage",
         Effect::CreateDamageReplacement { .. } => "CreateDamageReplacement",
         Effect::LoseTheGame { .. } => "LoseTheGame",
@@ -8664,6 +8740,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::GiveControl { .. } => "GiveControl",
         Effect::RemoveFromCombat { .. } => "RemoveFromCombat",
         Effect::Conjure { .. } => "Conjure",
+        Effect::DraftFromSpellbook { .. } => "DraftFromSpellbook",
         Effect::ChooseOneOf { .. } => "ChooseOneOf",
         Effect::Unimplemented { name, .. } => name,
     }
@@ -8786,6 +8863,7 @@ pub enum EffectKind {
     CreateEmblem,
     PayCost,
     CastFromZone,
+    FreeCastFromZones,
     PreventDamage,
     CreateDamageReplacement,
     Regenerate,
@@ -8854,6 +8932,7 @@ pub enum EffectKind {
     GiveControl,
     RemoveFromCombat,
     Conjure,
+    DraftFromSpellbook,
     ChooseOneOf,
     Unimplemented,
     /// Engine-level equip action (not via an Effect handler).
@@ -8984,6 +9063,7 @@ impl From<&Effect> for EffectKind {
             Effect::CreateEmblem { .. } => EffectKind::CreateEmblem,
             Effect::PayCost { .. } => EffectKind::PayCost,
             Effect::CastFromZone { .. } => EffectKind::CastFromZone,
+            Effect::FreeCastFromZones { .. } => EffectKind::FreeCastFromZones,
             Effect::PreventDamage { .. } => EffectKind::PreventDamage,
             Effect::CreateDamageReplacement { .. } => EffectKind::CreateDamageReplacement,
             Effect::LoseTheGame { .. } => EffectKind::LoseTheGame,
@@ -9053,6 +9133,7 @@ impl From<&Effect> for EffectKind {
             Effect::GiveControl { .. } => EffectKind::GiveControl,
             Effect::RemoveFromCombat { .. } => EffectKind::RemoveFromCombat,
             Effect::Conjure { .. } => EffectKind::Conjure,
+            Effect::DraftFromSpellbook { .. } => EffectKind::DraftFromSpellbook,
             Effect::ChooseOneOf { .. } => EffectKind::ChooseOneOf,
             Effect::Unimplemented { .. } => EffectKind::Unimplemented,
         }
@@ -12023,14 +12104,31 @@ pub struct CopiableValues {
 pub enum ContinuousModification {
     CopyValues {
         values: Box<CopiableValues>,
-        /// Display-identity pointer of the copy source (oracle id + displayed
-        /// face name). NOT a CR 707.2 copiable characteristic — it carries no
-        /// rules weight and is deliberately kept off `CopiableValues`. It rides
-        /// on the modification so the copy's art is applied (and reverts) through
-        /// the same layer pass as the copied characteristics. `None` when the
-        /// source is a true token with no printed identity.
+        /// Image-routing identity of the copy source, carried so the copy renders
+        /// the source's art and reverts through the same layer pass as the copied
+        /// characteristics. NONE of these three are CR 707.2 copiable values
+        /// (status/art are not copied per CR 707.2) — they are display routing
+        /// only, deliberately kept off `CopiableValues`, and mirror the flat
+        /// `GameObject`/`CopyTokenSpec` storage (`display_source` discriminates:
+        /// `Card` ⇒ read `printed_ref`; `Token` ⇒ read `token_image_ref`).
+        ///
+        /// CR 111.1 + CR 707.2: a permanent that becomes a copy of a *token*
+        /// stays a nontoken (token-ness is created by a token-making effect per
+        /// CR 111.1, and is not among the CR 707.2 copiable values), but its name
+        /// is the token's, which only resolves in the token art database — so the
+        /// source's `display_source = Token` and `token_image_ref` must ride
+        /// along, not just `printed_ref`.
+        #[serde(default)]
+        display_source: DisplaySource,
+        /// Scryfall oracle-id pointer of the source when it is a printed card.
+        /// `None` when the source is a true token (then `token_image_ref` carries
+        /// the routing).
         #[serde(default)]
         printed_ref: Option<PrintedCardRef>,
+        /// Exact token-art pointer of the source when it is a true token.
+        /// `None` for printed-card sources.
+        #[serde(default)]
+        token_image_ref: Option<TokenImageRef>,
     },
     /// CR 707.9 + CR 707.2: Override the copy's name after `CopyValues` applies.
     /// Used by "enter as a copy, except its name is X" (e.g., Superior Spider-Man's

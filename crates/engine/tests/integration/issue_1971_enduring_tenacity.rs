@@ -5,6 +5,7 @@ use engine::game::scenario::{GameScenario, P0};
 use engine::game::triggers::process_triggers;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::WaitingFor;
+use engine::types::identifiers::ObjectId;
 use engine::types::zones::Zone;
 
 const ENDURING_TENACITY_ORACLE: &str = "\
@@ -34,6 +35,31 @@ fn drain_to_priority(runner: &mut engine::game::scenario::GameRunner) {
     }
 }
 
+fn process_death_events(
+    runner: &mut engine::game::scenario::GameRunner,
+    events: &[engine::types::events::GameEvent],
+) {
+    process_triggers(runner.state_mut(), events);
+    drain_to_priority(runner);
+}
+
+fn destroy_creature_with_lethal_damage(
+    runner: &mut engine::game::scenario::GameRunner,
+    object_id: ObjectId,
+) {
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&object_id)
+        .unwrap()
+        .damage_marked = 3;
+
+    let mut events = Vec::new();
+    // CR 704.5g: lethal damage destroys the creature through the production SBA path.
+    engine::game::sba::check_state_based_actions(runner.state_mut(), &mut events);
+    process_death_events(runner, &events);
+}
+
 #[test]
 fn enduring_tenacity_dies_returns_as_enchantment_only() {
     let mut scenario = GameScenario::new();
@@ -45,12 +71,13 @@ fn enduring_tenacity_dies_returns_as_enchantment_only() {
 
     let mut runner = scenario.build();
 
-    let mut events = Vec::new();
-    engine::game::zones::move_to_zone(runner.state_mut(), tenacity_id, Zone::Graveyard, &mut events);
-    process_triggers(runner.state_mut(), &events);
-    drain_to_priority(&mut runner);
+    destroy_creature_with_lethal_damage(&mut runner, tenacity_id);
 
-    let returned = runner.state().objects.get(&tenacity_id).expect("object exists");
+    let returned = runner
+        .state()
+        .objects
+        .get(&tenacity_id)
+        .expect("object exists");
     assert_eq!(
         returned.zone,
         Zone::Battlefield,
@@ -59,7 +86,10 @@ fn enduring_tenacity_dies_returns_as_enchantment_only() {
         runner.state().stack.len()
     );
     assert!(
-        returned.card_types.core_types.contains(&CoreType::Enchantment),
+        returned
+            .card_types
+            .core_types
+            .contains(&CoreType::Enchantment),
         "expected Enchantment, got {:?}",
         returned.card_types.core_types
     );
@@ -67,5 +97,41 @@ fn enduring_tenacity_dies_returns_as_enchantment_only() {
         !returned.card_types.core_types.contains(&CoreType::Creature),
         "should not remain a creature, got {:?}",
         returned.card_types.core_types
+    );
+}
+
+#[test]
+fn enduring_tenacity_noncreature_death_does_not_return() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(engine::types::phase::Phase::PreCombatMain);
+
+    let tenacity_id = scenario
+        .add_creature_from_oracle(P0, "Enduring Tenacity", 3, 3, ENDURING_TENACITY_ORACLE)
+        .as_enchantment()
+        .id();
+
+    let mut runner = scenario.build();
+
+    let mut events = Vec::new();
+    // CR 700.4: "dies" is a battlefield-to-graveyard move. This fixture keeps
+    // the permanent noncreature at death so CR 603.4's intervening-if condition
+    // must prevent the return trigger from firing.
+    engine::game::zones::move_to_zone(
+        runner.state_mut(),
+        tenacity_id,
+        Zone::Graveyard,
+        &mut events,
+    );
+    process_death_events(&mut runner, &events);
+
+    let object = runner
+        .state()
+        .objects
+        .get(&tenacity_id)
+        .expect("object exists");
+    assert_eq!(object.zone, Zone::Graveyard);
+    assert!(
+        runner.state().stack.is_empty(),
+        "noncreature death must not put the intervening-if trigger on the stack"
     );
 }

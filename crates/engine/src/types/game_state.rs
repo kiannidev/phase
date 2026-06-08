@@ -16,7 +16,7 @@ use super::ability::{
 use super::attribution::ObjectAttribution;
 use super::card::CardFace;
 use super::card_type::{CoreType, Supertype};
-use super::counter::{CounterMatch, CounterType};
+use super::counter::{counter_map_serde, CounterMatch, CounterType};
 use super::events::{GameEvent, PlayerActionKind};
 use super::format::FormatConfig;
 use super::identifiers::{CardId, ObjectId, TrackedSetId};
@@ -196,7 +196,7 @@ pub struct LKISnapshot {
     pub chosen_attributes: Vec<ChosenAttribute>,
     /// CR 400.7: Counters as they last existed on the object.
     /// Used by `TriggerCondition::HadCounters` for "if it had counters on it" patterns.
-    #[serde(default)]
+    #[serde(default, with = "counter_map_serde")]
     pub counters: HashMap<CounterType, u32>,
 }
 
@@ -678,7 +678,7 @@ pub struct CounterAddedRecord {
     pub mana_value: u32,
     pub controller: PlayerId,
     pub owner: PlayerId,
-    #[serde(default)]
+    #[serde(default, with = "counter_map_serde")]
     pub counters: HashMap<CounterType, u32>,
 }
 
@@ -2180,6 +2180,35 @@ pub enum CastOfferKind {
         remaining_hits: Vec<ObjectId>,
         revealed_misses: Vec<ObjectId>,
     },
+    /// CR 608.2g + CR 601.2 + CR 118.9: Interactive free-cast window opened by
+    /// `Effect::FreeCastFromZones` (Invoke Calamity). The controller repeatedly
+    /// chooses one `candidate` to cast for free (or declines to finish), up to
+    /// `remaining_casts` times, while the chosen spells' running total mana
+    /// value stays within `remaining_mv_budget`. After each successful cast the
+    /// window is re-offered with `remaining_casts` decremented, the budget
+    /// reduced, and `candidates` re-filtered to those still affordable.
+    FreeCastWindow {
+        /// CR 601.2a: Instant/sorcery cards (in the controller's graveyard
+        /// and/or hand) that match the effect's filter and still fit the
+        /// remaining MV budget.
+        candidates: Vec<ObjectId>,
+        /// CR 601.2: Casts still available in this window.
+        remaining_casts: u8,
+        /// CR 202.3: Running-total mana-value budget remaining, or `None` for
+        /// no MV cap.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        remaining_mv_budget: Option<u32>,
+        /// CR 601.2a: Filter the candidates must match. Carried so the handler
+        /// can rebuild the post-cast re-offer's candidate set.
+        filter: crate::types::ability::TargetFilter,
+        /// CR 601.2a: Zones searched for candidates (controller's graveyard
+        /// and/or hand).
+        zones: Vec<crate::types::zones::Zone>,
+        /// CR 614.1a: Whether spells cast this way are exiled instead of going
+        /// to their owner's graveyard.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        exile_instead_of_graveyard: bool,
+    },
 }
 
 /// CR 701.56a: Which half of a time-travel choice is currently being
@@ -2740,6 +2769,17 @@ pub enum WaitingFor {
         /// The object that originated this choice (for persisting to chosen_attributes).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_id: Option<ObjectId>,
+    },
+    /// Alchemy "draft a card from [card]'s spellbook": `player` chooses one card
+    /// name from `options` (the source card's spellbook list); the chosen card is
+    /// then conjured into `destination` (`tapped` if a "tapped" rider applied).
+    SpellbookDraft {
+        player: PlayerId,
+        source_id: ObjectId,
+        options: Vec<String>,
+        destination: Zone,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        tapped: bool,
     },
     /// CR 609.7a: Player must choose a source of damage from currently
     /// represented legal source objects.
@@ -3734,6 +3774,7 @@ impl WaitingFor {
             WaitingFor::BetweenGamesSideboard { .. } => "BetweenGamesSideboard",
             WaitingFor::BetweenGamesChoosePlayDraw { .. } => "BetweenGamesChoosePlayDraw",
             WaitingFor::NamedChoice { .. } => "NamedChoice",
+            WaitingFor::SpellbookDraft { .. } => "SpellbookDraft",
             WaitingFor::DamageSourceChoice { .. } => "DamageSourceChoice",
             WaitingFor::ModeChoice { .. } => "ModeChoice",
             WaitingFor::DiscardToHandSize { .. } => "DiscardToHandSize",
@@ -3865,6 +3906,7 @@ impl WaitingFor {
             | WaitingFor::BetweenGamesSideboard { player, .. }
             | WaitingFor::BetweenGamesChoosePlayDraw { player, .. }
             | WaitingFor::NamedChoice { player, .. }
+            | WaitingFor::SpellbookDraft { player, .. }
             | WaitingFor::DamageSourceChoice { player, .. }
             | WaitingFor::ModeChoice { player, .. }
             | WaitingFor::DiscardToHandSize { player, .. }

@@ -93,6 +93,10 @@ pub(super) fn handles(waiting_for: &WaitingFor) -> bool {
                 kind: CastOfferKind::Ripple { .. },
                 ..
             }
+            | WaitingFor::CastOffer {
+                kind: CastOfferKind::FreeCastWindow { .. },
+                ..
+            }
             | WaitingFor::LearnChoice { .. }
             | WaitingFor::TopOrBottomChoice { .. }
             | WaitingFor::PopulateChoice { .. }
@@ -115,6 +119,7 @@ pub(super) fn handles(waiting_for: &WaitingFor) -> bool {
             | WaitingFor::EffectZoneChoice { .. }
             | WaitingFor::DrawnThisTurnTopdeckChoice { .. }
             | WaitingFor::NamedChoice { .. }
+            | WaitingFor::SpellbookDraft { .. }
             | WaitingFor::DamageSourceChoice { .. }
             | WaitingFor::ChooseRingBearer { .. }
             | WaitingFor::ChooseDungeon { .. }
@@ -610,6 +615,80 @@ pub(super) fn handle_resolution_choice(
 
                 ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
             }
+        }
+        // CR 608.2g + CR 601.2 + CR 202.3: Invoke Calamity's free-cast window —
+        // the controller either picks one candidate to cast for free or declines
+        // (`selection: None`) to finish the window. A chosen candidate is cast
+        // during resolution via `initiate_cast_during_resolution`; after it
+        // resolves, `ResolutionCastSuccessAction::FreeCastOfferRemaining` reduces
+        // the budget and re-opens the window. Declining drains the continuation
+        // (the "Exile ~" sub-ability).
+        (
+            WaitingFor::CastOffer {
+                player,
+                kind:
+                    CastOfferKind::FreeCastWindow {
+                        candidates,
+                        remaining_casts,
+                        remaining_mv_budget,
+                        filter,
+                        zones,
+                        exile_instead_of_graveyard,
+                    },
+            },
+            GameAction::FreeCastWindowChoice { selection },
+        ) => {
+            let Some(chosen) = selection else {
+                // CR 601.2: "Up to N" — the controller may stop early. Finish the
+                // window and run the continuation (Exile ~).
+                return Ok(ResolutionChoiceOutcome::WaitingFor(
+                    finish_with_continuation(state, player, events),
+                ));
+            };
+            // CR 608.2c: Validate the choice against the offered candidate set.
+            if !candidates.contains(&chosen) {
+                return Err(EngineError::InvalidAction(
+                    "Selected card is not an eligible free-cast candidate".to_string(),
+                ));
+            }
+            // CR 202.3: Re-check the MV budget at submission so a stale or
+            // hand-crafted action cannot exceed the running total.
+            if let Some(budget) = remaining_mv_budget {
+                let mv = state
+                    .objects
+                    .get(&chosen)
+                    .map(|obj| obj.mana_cost.mana_value())
+                    .unwrap_or(0);
+                if mv > budget {
+                    return Err(EngineError::InvalidAction(
+                        "Selected card exceeds the remaining total mana value".to_string(),
+                    ));
+                }
+            }
+            // CR 608.2g: Cast the chosen spell during this resolution. The
+            // success action re-opens the window with the count decremented and
+            // the budget reduced by the spell's resulting mana value; there are
+            // no dig misses and a declined finalize-time MV check leaves the card
+            // where it is (RemainExiled — never reached here because the
+            // per-card MV is pre-checked and these casts carry no resulting-MV
+            // permission constraint).
+            let cleanup = crate::types::ability::ResolutionCastCleanup {
+                exiled_misses: Vec::new(),
+                reject_action: crate::types::ability::ResolutionMvRejectAction::RemainExiled,
+                success_action:
+                    crate::types::ability::ResolutionCastSuccessAction::FreeCastOfferRemaining {
+                        controller: player,
+                        remaining_casts,
+                        remaining_mv_budget,
+                        filter,
+                        zones,
+                        exile_instead_of_graveyard,
+                    },
+            };
+            let result = casting::initiate_cast_during_resolution(
+                state, player, chosen, None, false, cleanup, events,
+            )?;
+            ResolutionChoiceOutcome::WaitingFor(result)
         }
         (WaitingFor::LearnChoice { player, hand_cards }, GameAction::LearnDecision { choice }) => {
             match choice {
@@ -2480,6 +2559,31 @@ pub(super) fn handle_resolution_choice(
             }
             state.last_named_choice = None;
             ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
+        }
+        // Alchemy spellbook draft: the player chose a card from the source's
+        // spellbook — conjure it, then resume the rest of the ability chain.
+        (
+            WaitingFor::SpellbookDraft {
+                player,
+                source_id,
+                options,
+                destination,
+                tapped,
+            },
+            GameAction::SubmitSpellbookDraft { card },
+        ) => {
+            crate::game::effects::spellbook::complete_draft(
+                state,
+                player,
+                source_id,
+                &options,
+                &card,
+                destination,
+                tapped,
+                events,
+            )
+            .map_err(|e| EngineError::InvalidAction(format!("spellbook draft: {e:?}")))?;
+            ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
         }
         (
             WaitingFor::DamageSourceChoice {

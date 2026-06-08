@@ -2276,28 +2276,57 @@ pub(super) fn parse_hand_reveal_ast(
 }
 
 fn parse_hand_reveal_card_filter(after_reveal_lower: &str) -> TargetFilter {
-    let Ok((after_all, _)) = tag::<_, _, OracleError<'_>>("all ").parse(after_reveal_lower) else {
+    if let Ok((after_all, _)) = tag::<_, _, OracleError<'_>>("all ").parse(after_reveal_lower) {
+        let Ok((rest, descriptor)) = take_until::<_, _, OracleError<'_>>(" cards").parse(after_all)
+        else {
+            return TargetFilter::None;
+        };
+        if alt((
+            tag::<_, _, OracleError<'_>>(" cards in "),
+            tag(" cards from "),
+        ))
+        .parse(rest)
+        .is_err()
+        {
+            return TargetFilter::None;
+        }
+        if descriptor.trim().is_empty() {
+            return TargetFilter::Any;
+        }
+        let singular = format!("{} card", descriptor.trim());
+        let (filter, rem) = parse_type_phrase(&singular);
+        if rem.trim().is_empty() && matches!(filter, TargetFilter::Typed(_)) {
+            return filter;
+        }
         return TargetFilter::None;
-    };
-    let Ok((rest, descriptor)) = take_until::<_, _, OracleError<'_>>(" cards").parse(after_all)
+    }
+
+    // CR 701.20a: "reveal a card from your hand" / "reveal an [type] card from ..."
+    let Ok((after_article, _)) =
+        alt((tag::<_, _, OracleError<'_>>("a "), tag("an "))).parse(after_reveal_lower)
     else {
         return TargetFilter::None;
     };
-    if alt((
-        tag::<_, _, OracleError<'_>>(" cards in "),
-        tag(" cards from "),
-    ))
-    .parse(rest)
-    .is_err()
+    if tag::<_, _, OracleError<'_>>("card from ")
+        .parse(after_article)
+        .is_ok()
+    {
+        return TargetFilter::Any;
+    }
+    let Ok((rest, descriptor)) =
+        take_until::<_, _, OracleError<'_>>(" card from ").parse(after_article)
+    else {
+        return TargetFilter::None;
+    };
+    if tag::<_, _, OracleError<'_>>(" card from ")
+        .parse(rest)
+        .is_err()
     {
         return TargetFilter::None;
     }
-    if descriptor.trim().is_empty() {
-        return TargetFilter::Any;
-    }
     let singular = format!("{} card", descriptor.trim());
     let (filter, rem) = parse_type_phrase(&singular);
-    if rem.trim().is_empty() && matches!(filter, TargetFilter::Typed(_)) {
+    if rem.trim().is_empty() && matches!(filter, TargetFilter::Typed(_) | TargetFilter::Any) {
         filter
     } else {
         TargetFilter::None

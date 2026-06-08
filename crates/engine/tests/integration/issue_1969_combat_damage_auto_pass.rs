@@ -1,4 +1,4 @@
-//! Issue #1969 — combat damage must be dealt even when the active player is in an
+//! Issue #1969 - combat damage must be dealt even when the active player is in an
 //! UntilEndOfTurn auto-pass session ("pass to end step" must not skip damage).
 
 use engine::game::combat::AttackTarget;

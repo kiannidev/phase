@@ -2,12 +2,12 @@
 //! putting a +1/+1 counter on Joel and drawing a card (once per turn).
 
 use engine::game::scenario::{GameScenario, P0};
-use engine::types::phase::Phase;
 use engine::game::triggers::process_triggers;
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
+use engine::types::phase::Phase;
 const JOEL_ORACLE: &str = "\
 Menace\n\
 Whenever a creature token dies, put a +1/+1 counter on Joel and draw a card. This ability triggers only once each turn.\n\
@@ -50,7 +50,10 @@ fn destroy_with_lethal_damage(
     drain_to_priority(runner);
 }
 
-fn hand_size(runner: &engine::game::scenario::GameRunner, player: engine::types::player::PlayerId) -> usize {
+fn hand_size(
+    runner: &engine::game::scenario::GameRunner,
+    player: engine::types::player::PlayerId,
+) -> usize {
     runner
         .state()
         .players
@@ -84,7 +87,12 @@ fn joel_triggers_on_creature_token_death() {
         joel_triggers >= 1,
         "Joel must parse at least one trigger from oracle text, got {joel_triggers}"
     );
-    runner.state_mut().objects.get_mut(&token_id).unwrap().is_token = true;
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&token_id)
+        .unwrap()
+        .is_token = true;
 
     let hand_before = hand_size(&runner, P0);
 
@@ -102,7 +110,10 @@ fn joel_triggers_on_creature_token_death() {
         .get(&joel_id)
         .expect("Joel still on battlefield");
     assert_eq!(
-        joel.counters.get(&CounterType::Plus1Plus1).copied().unwrap_or(0),
+        joel.counters
+            .get(&CounterType::Plus1Plus1)
+            .copied()
+            .unwrap_or(0),
         1,
         "Joel must receive a +1/+1 counter when a creature token dies; waiting_for={:?}, stack={}",
         runner.state().waiting_for,
@@ -136,7 +147,10 @@ fn joel_ignores_nontoken_creature_death() {
 
     let joel = runner.state().objects.get(&joel_id).unwrap();
     assert_eq!(
-        joel.counters.get(&CounterType::Plus1Plus1).copied().unwrap_or(0),
+        joel.counters
+            .get(&CounterType::Plus1Plus1)
+            .copied()
+            .unwrap_or(0),
         0,
         "non-token creature death must not trigger Joel"
     );
@@ -171,9 +185,11 @@ fn joel_triggers_when_spell_created_token_dies() {
         .battlefield
         .iter()
         .find(|id| {
-            outcome.state().objects.get(id).is_some_and(|o| {
-                o.is_token && o.id != joel_id
-            })
+            outcome
+                .state()
+                .objects
+                .get(id)
+                .is_some_and(|o| o.is_token && o.id != joel_id)
         })
         .copied()
         .expect("spell must create a Pest token on the battlefield");
@@ -183,7 +199,10 @@ fn joel_triggers_when_spell_created_token_dies() {
 
     let joel = runner.state().objects.get(&joel_id).unwrap();
     assert_eq!(
-        joel.counters.get(&CounterType::Plus1Plus1).copied().unwrap_or(0),
+        joel.counters
+            .get(&CounterType::Plus1Plus1)
+            .copied()
+            .unwrap_or(0),
         1,
         "Joel must trigger when a spell-created creature token dies"
     );
@@ -217,7 +236,10 @@ fn joel_triggers_only_once_per_turn() {
 
     let joel = runner.state().objects.get(&joel_id).unwrap();
     assert_eq!(
-        joel.counters.get(&CounterType::Plus1Plus1).copied().unwrap_or(0),
+        joel.counters
+            .get(&CounterType::Plus1Plus1)
+            .copied()
+            .unwrap_or(0),
         1,
         "Joel must trigger only once per turn even if multiple tokens die"
     );

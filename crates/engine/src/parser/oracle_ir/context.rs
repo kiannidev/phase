@@ -81,6 +81,10 @@ pub(crate) struct ParseContext {
     /// parsing leaves this false so bare "it" defaults to SelfRef instead of
     /// inventing a parent target.
     pub parent_target_available: bool,
+    /// CR 608.2c: Full lowercased effect-chain text for cross-clause features
+    /// like cultivate/Final-Parting split-destination detection on a search
+    /// clause that does not include the put-destination phrase in its chunk.
+    pub effect_chain_full_lower: Option<String>,
 }
 
 impl ParseContext {

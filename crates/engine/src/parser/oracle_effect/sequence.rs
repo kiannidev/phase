@@ -2988,6 +2988,11 @@ pub(super) fn parse_followup_continuation_ast(
 
     match previous_effect {
         Effect::ChooseAndSacrificeRest { .. } => parse_choose_and_sacrifice_rest_followup(&lower),
+        Effect::SearchLibrary { split: Some(_), .. }
+            if super::search::is_zone_pair_search_split_clause(&lower) =>
+        {
+            Some(ContinuationAst::SearchResultClauseHandled)
+        }
         Effect::SearchLibrary { .. } if is_search_result_reveal_clause(&lower) => {
             Some(ContinuationAst::SearchRevealResult)
         }

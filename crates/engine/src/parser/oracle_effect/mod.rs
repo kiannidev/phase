@@ -13407,6 +13407,7 @@ pub(crate) fn parse_effect_chain_ir(
     let (text, chain_rounding) = strip_trailing_rounding_annotation(&text);
     let text = text.as_str();
     let full_text = text; // Bind before `text` is shadowed by strip helpers in the loop
+    ctx.effect_chain_full_lower = Some(full_text.to_ascii_lowercase());
     let chunks = split_clause_sequence(text);
     // CR 107.3i: "Normally, all instances of X on an object have the same value."
     // Build a per-chunk sentence-scoped `where X is <expr>` binding so that when
@@ -14586,6 +14587,7 @@ pub(crate) fn parse_effect_chain_ir(
             // disambiguates to `CostPaidObject` (Jhoira of the Ghitu).
             current_ability_exile_cost_zone: ctx.current_ability_exile_cost_zone,
             parent_target_available,
+            effect_chain_full_lower: ctx.effect_chain_full_lower.clone(),
             ..Default::default()
         };
         let ctx = &mut chunk_ctx;

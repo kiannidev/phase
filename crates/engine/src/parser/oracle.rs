@@ -4147,6 +4147,14 @@ pub(super) fn strip_activated_constraints(text: &str) -> (String, ActivatedConst
         let lower = remaining.to_lowercase();
         let tp = TextPair::new(&remaining, &lower);
 
+        if lower.starts_with("once each turn, ") {
+            constraints
+                .restrictions
+                .push(ActivationRestriction::OnlyOnceEachTurn);
+            remaining = remaining["once each turn, ".len()..].trim().to_string();
+            continue;
+        }
+
         if let Some((before, after)) = tp.rsplit_around(" and only if ") {
             if !before.original.trim().is_empty() {
                 let mut condition_text = after.original.trim().to_string();

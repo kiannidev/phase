@@ -91,6 +91,10 @@ pub(crate) fn parse_quantity_ref_with_context(
 
     // Complex patterns requiring type phrase parsing or counter normalization.
 
+    if let Some(qty) = parse_sacrificed_permanents_this_turn_quantity(trimmed) {
+        return Some(qty);
+    }
+
     // CR 608.2c + CR 122.1: "the number of [kind] counter[s] removed this way"
     // is a dynamic amount from the preceding RemoveCounter effect, not an
     // object count over a battlefield type phrase.
@@ -804,6 +808,55 @@ pub(crate) fn parse_cda_quantity_with_context(
     }
 
     None
+}
+
+/// CR 701.21a: "the number of permanents you've sacrificed this turn" and typed
+/// variants ("the number of artifacts you've sacrificed this turn").
+fn parse_sacrificed_permanents_this_turn_quantity(text: &str) -> Option<QuantityRef> {
+    let trimmed = text.trim().trim_end_matches('.');
+    let (rest, _) = tag::<_, _, OracleError<'_>>("the number of ")
+        .parse(trimmed)
+        .ok()?;
+    let (rest, filter) = parse_sacrificed_permanents_this_turn_filter(rest)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(QuantityRef::SacrificedThisTurn {
+        player: PlayerScope::Controller,
+        filter,
+    })
+}
+
+fn parse_sacrificed_permanents_this_turn_filter(input: &str) -> Option<(&str, TargetFilter)> {
+    if let Ok((rest, filter)) = alt((
+        value(
+            TargetFilter::Typed(TypedFilter {
+                type_filters: vec![TypeFilter::Permanent],
+                ..Default::default()
+            }),
+            tag::<_, _, OracleError<'_>>("permanents you've sacrificed this turn"),
+        ),
+        value(
+            TargetFilter::Typed(TypedFilter {
+                type_filters: vec![TypeFilter::Permanent],
+                ..Default::default()
+            }),
+            tag("permanents you sacrificed this turn"),
+        ),
+    ))
+    .parse(input)
+    {
+        return Some((rest, filter));
+    }
+
+    let (type_text, rest) = input
+        .split_once(" you've sacrificed this turn")
+        .or_else(|| input.split_once(" you sacrificed this turn"))?;
+    let (filter, leftover) = parse_type_phrase(type_text.trim());
+    if !leftover.trim().is_empty() || filter == TargetFilter::Any {
+        return None;
+    }
+    Some((rest, filter))
 }
 
 // CR 604.3: Characteristic-defining abilities can define power/toughness using
@@ -2785,6 +2838,24 @@ mod tests {
                 panic!("Expected PlayerCount{{ControlsCount(creature+pt)}}, got {other:?}")
             }
         }
+    }
+
+    #[test]
+    fn parse_cda_quantity_permanents_sacrificed_this_turn() {
+        let expr = parse_cda_quantity("the number of permanents you've sacrificed this turn")
+            .expect("should parse");
+        assert_eq!(
+            expr,
+            QuantityExpr::Ref {
+                qty: QuantityRef::SacrificedThisTurn {
+                    player: PlayerScope::Controller,
+                    filter: TargetFilter::Typed(TypedFilter {
+                        type_filters: vec![TypeFilter::Permanent],
+                        ..Default::default()
+                    }),
+                }
+            }
+        );
     }
 
     // A1 "one plus" path: the Offset arm wraps the inner PlayerCount unchanged

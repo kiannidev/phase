@@ -76,10 +76,7 @@ fn strip_spell_not_owned_qualifier(payload: &str) -> (&str, bool) {
             take_until(" you don't own"),
             tag::<_, _, OracleError<'_>>(" you don't own"),
         ),
-        terminated(
-            take_until(" you do not own"),
-            tag(" you do not own"),
-        ),
+        terminated(take_until(" you do not own"), tag(" you do not own")),
     ));
     parser
         .parse(payload)

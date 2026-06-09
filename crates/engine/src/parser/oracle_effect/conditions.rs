@@ -2408,6 +2408,9 @@ pub(crate) fn static_condition_to_ability_condition(
         | StaticCondition::SourceIsEquipped
         | StaticCondition::SourceIsPaired
         | StaticCondition::SourceIsMonstrous
+        // CR 702.171b: the saddled designation is a static-only predicate with no
+        // effect-resolution (`AbilityCondition`) equivalent.
+        | StaticCondition::SourceIsSaddled
         | StaticCondition::SourceAttachedToCreature
         | StaticCondition::OpponentPoisonAtLeast { .. }
         | StaticCondition::UnlessPay { .. }

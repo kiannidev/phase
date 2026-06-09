@@ -2294,42 +2294,10 @@ pub(super) fn handle_resolution_choice(
                         ));
                     };
                     let ability = *cont.chain;
-                    let (
-                        without_paying,
-                        cast_transformed,
-                        alt_ability_cost,
-                        constraint,
-                        duration,
-                    ) = match &ability.effect {
-                        Effect::CastFromZone {
-                            without_paying_mana_cost,
-                            cast_transformed,
-                            alt_ability_cost,
-                            constraint,
-                            duration,
-                            ..
-                        } => (
-                            *without_paying_mana_cost,
-                            *cast_transformed,
-                            alt_ability_cost.clone(),
-                            constraint.clone(),
-                            duration.clone(),
-                        ),
-                        _ => {
-                            return Err(EngineError::InvalidAction(
-                                "CastFromZone EffectZoneChoice ability mismatch".to_string(),
-                            ));
-                        }
-                    };
                     effects::cast_from_zone::grant_lingering_permissions(
                         &mut *state,
                         &ability,
                         &chosen,
-                        without_paying,
-                        cast_transformed,
-                        alt_ability_cost,
-                        constraint,
-                        duration,
                         events,
                     )
                     .map_err(|e| EngineError::InvalidAction(e.to_string()))?;

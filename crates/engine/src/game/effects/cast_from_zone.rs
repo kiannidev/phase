@@ -21,24 +21,18 @@ fn open_private_zone_cast_selection(
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
     let ctx = crate::game::filter::FilterContext::from_ability(ability);
-    let eligible: Vec<_> = match source_zone {
-        Zone::Hand => state.players[ability.controller.0 as usize]
-            .hand
-            .iter()
-            .copied()
-            .collect::<Vec<_>>(),
-        Zone::Library => state.players[ability.controller.0 as usize]
-            .library
-            .iter()
-            .copied()
-            .collect::<Vec<_>>(),
+    let Some(player) = state.players.iter().find(|p| p.id == ability.controller) else {
+        return Err(EffectError::PlayerNotFound);
+    };
+    let cards_iter = match source_zone {
+        Zone::Hand => player.hand.iter(),
+        Zone::Library => player.library.iter(),
         _ => unreachable!(),
-    }
-    .into_iter()
-    .filter(|id| {
-        crate::game::filter::matches_target_filter(state, *id, target_filter, &ctx)
-    })
-    .collect();
+    };
+    let eligible: Vec<_> = cards_iter
+        .copied()
+        .filter(|id| crate::game::filter::matches_target_filter(state, *id, target_filter, &ctx))
+        .collect();
 
     if eligible.is_empty() {
         events.push(GameEvent::EffectResolved {
@@ -94,7 +88,7 @@ pub fn resolve(
         cast_transformed,
         alt_ability_cost,
         constraint,
-        duration,
+        _duration,
         driver,
     ) = match &ability.effect {
         Effect::CastFromZone {
@@ -254,17 +248,7 @@ pub fn resolve(
         return Ok(());
     }
 
-    grant_lingering_permissions(
-        state,
-        ability,
-        &target_ids,
-        without_paying,
-        cast_transformed,
-        alt_ability_cost,
-        constraint,
-        duration,
-        events,
-    )?;
+    grant_lingering_permissions(state, ability, &target_ids, events)?;
 
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::CastFromZone,
@@ -281,13 +265,27 @@ pub(crate) fn grant_lingering_permissions(
     state: &mut GameState,
     ability: &ResolvedAbility,
     target_ids: &[ObjectId],
-    without_paying: bool,
-    cast_transformed: bool,
-    alt_ability_cost: Option<crate::types::ability::AbilityCost>,
-    constraint: Option<crate::types::ability::CastPermissionConstraint>,
-    duration: Option<Duration>,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
+    let (without_paying, cast_transformed, alt_ability_cost, constraint, duration) =
+        match &ability.effect {
+            Effect::CastFromZone {
+                without_paying_mana_cost,
+                cast_transformed,
+                alt_ability_cost,
+                constraint,
+                duration,
+                ..
+            } => (
+                *without_paying_mana_cost,
+                *cast_transformed,
+                alt_ability_cost.clone(),
+                constraint.clone(),
+                duration.clone(),
+            ),
+            _ => return Err(EffectError::MissingParam("CastFromZone".to_string())),
+        };
+
     for &obj_id in target_ids {
         // CR 601.2a: Impulse-draw and similar grants move non-exile cards to
         // exile before attaching `ExileWithAltCost`. Targeted graveyard grants

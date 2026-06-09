@@ -825,11 +825,8 @@ fn parse_zone_card_that_are_filter_list(input: &str) -> OracleResult<'_, Vec<Typ
         Ok((rest, TypeFilter::Named(name.trim().to_string())))
     }
 
-    let (mut rest, first) = alt((
-        parse_named_card_filter,
-        nom_target::parse_type_filter_word,
-    ))
-    .parse(input)?;
+    let (mut rest, first) =
+        alt((parse_named_card_filter, nom_target::parse_type_filter_word)).parse(input)?;
     let mut filters = vec![first];
     loop {
         if let Ok((next_rest, _)) = tag::<_, _, OracleError<'_>>(" or are named ").parse(rest) {
@@ -838,9 +835,8 @@ fn parse_zone_card_that_are_filter_list(input: &str) -> OracleResult<'_, Vec<Typ
             rest = "";
             break;
         } else if let Ok((next_rest, _)) = tag::<_, _, OracleError<'_>>(" or ").parse(rest) {
-            let (after, next) =
-                alt((parse_named_card_filter, nom_target::parse_type_filter_word))
-                    .parse(next_rest)?;
+            let (after, next) = alt((parse_named_card_filter, nom_target::parse_type_filter_word))
+                .parse(next_rest)?;
             filters.push(next);
             rest = after;
         } else {
@@ -4617,14 +4613,16 @@ mod tests {
                 QuantityExpr::Ref {
                     qty:
                         QuantityRef::ZoneCardCount {
-                            card_types,
-                            scope,
-                            ..
+                            card_types, scope, ..
                         },
                 } => {
                     assert_eq!(scope, &CountScope::Owner);
-                    assert!(card_types.iter().any(|f| matches!(f, TypeFilter::Subtype(s) if s == "Ooze")));
-                    assert!(card_types.iter().any(|f| matches!(f, TypeFilter::Named(name) if name == "Slime Against Humanity")));
+                    assert!(card_types
+                        .iter()
+                        .any(|f| matches!(f, TypeFilter::Subtype(s) if s == "Ooze")));
+                    assert!(card_types.iter().any(
+                        |f| matches!(f, TypeFilter::Named(name) if name == "Slime Against Humanity")
+                    ));
                 }
                 other => panic!("expected ZoneCardCount, got {other:?}"),
             }

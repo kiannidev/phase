@@ -3771,7 +3771,10 @@ fn extract_etb_counters(
             break;
         }
         counters.extend(extract_etb_counters_from_effect(
-            &exec.effect, state, source_id, event,
+            &exec.effect,
+            state,
+            source_id,
+            event,
         ));
         current = exec.sub_ability.as_deref();
     }

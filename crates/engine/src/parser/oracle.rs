@@ -16,12 +16,12 @@ use crate::types::ability::{
     SolveCondition, SpellCastingOption, StaticCondition, StaticDefinition, TargetFilter,
     TriggerCondition, TriggerDefinition, TypedFilter,
 };
-use crate::types::replacements::ReplacementEvent;
 use crate::types::format::DeckCopyLimit;
 use crate::types::keywords::{ActivationCadence, FlashbackCost, Keyword, KeywordKind};
 use crate::types::mana::ManaCost;
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
+use crate::types::replacements::ReplacementEvent;
 use crate::types::triggers::TriggerMode;
 use crate::types::zones::Zone;
 
@@ -765,21 +765,13 @@ fn reconcile_choose_then_chosen_dependent_etb_counters(result: &mut ParsedAbilit
         return;
     };
     let choose_repl = &mut result.replacements[choose_idx];
-    let Some(mut choose_exec) = choose_repl.execute.take() else {
-        return;
-    };
-    append_sub_ability(&mut choose_exec, *counter_exec);
-    choose_repl.execute = Some(choose_exec);
+    if let Some(ref mut choose_exec) = choose_repl.execute {
+        append_sub_ability(choose_exec, *counter_exec);
+    }
 }
 
 fn is_persisted_as_enters_choice(def: &AbilityDefinition) -> bool {
-    matches!(
-        &*def.effect,
-        Effect::Choose {
-            persist: true,
-            ..
-        }
-    )
+    matches!(&*def.effect, Effect::Choose { persist: true, .. })
 }
 
 fn is_chosen_dependent_self_etb_counter(def: &AbilityDefinition) -> bool {
@@ -830,10 +822,7 @@ fn quantity_expr_uses_filter_prop(
     }
 }
 
-fn quantity_ref_uses_filter_prop(
-    qty: &QuantityRef,
-    pred: &impl Fn(&FilterProp) -> bool,
-) -> bool {
+fn quantity_ref_uses_filter_prop(qty: &QuantityRef, pred: &impl Fn(&FilterProp) -> bool) -> bool {
     match qty {
         QuantityRef::ObjectCount { filter }
         | QuantityRef::ObjectCountDistinct { filter, .. }
@@ -844,12 +833,9 @@ fn quantity_ref_uses_filter_prop(
         | QuantityRef::DistinctColorsAmongPermanents { filter }
         | QuantityRef::DistinctCounterKindsAmong { filter }
         | QuantityRef::EnteredThisTurn { filter } => target_filter_uses_filter_prop(filter, pred),
-        QuantityRef::DistinctCardTypes { source } => match source {
-            crate::types::ability::CardTypeSetSource::Objects { filter } => {
-                target_filter_uses_filter_prop(filter, pred)
-            }
-            _ => false,
-        },
+        QuantityRef::DistinctCardTypes {
+            source: crate::types::ability::CardTypeSetSource::Objects { filter },
+        } => target_filter_uses_filter_prop(filter, pred),
         _ => false,
     }
 }
@@ -870,13 +856,10 @@ fn target_filter_uses_filter_prop(
 
 fn append_sub_ability(chain: &mut AbilityDefinition, tail: AbilityDefinition) {
     let mut cursor = chain;
-    loop {
-        if cursor.sub_ability.is_none() {
-            cursor.sub_ability = Some(Box::new(tail));
-            return;
-        }
-        cursor = cursor.sub_ability.as_mut().expect("sub_ability present");
+    while let Some(ref mut next) = cursor.sub_ability {
+        cursor = next;
     }
+    cursor.sub_ability = Some(Box::new(tail));
 }
 
 fn reconcile_self_chosen_type_statics(result: &mut ParsedAbilities, types: &[String]) {

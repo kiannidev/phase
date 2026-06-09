@@ -27041,12 +27041,12 @@ mod snapshot_tests {
             "enters+upkeep compound must split into 2 triggers"
         );
         assert!(
-            matches!(defs[0].mode, TriggerMode::ChangesZone { .. }),
+            matches!(defs[0].mode, TriggerMode::ChangesZone),
             "first half should be ETB, got {:?}",
             defs[0].mode
         );
         assert!(
-            matches!(defs[1].mode, TriggerMode::Phase { .. }),
+            matches!(defs[1].mode, TriggerMode::Phase),
             "second half should be upkeep phase, got {:?}",
             defs[1].mode
         );

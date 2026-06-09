@@ -527,11 +527,12 @@ mod tests {
                 },
                 enters_under: None,
                 enter_transformed: false,
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 owner_library: false,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             },
         );
         let delayed = ResolvedAbility::new(

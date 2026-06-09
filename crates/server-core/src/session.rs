@@ -116,10 +116,10 @@ pub struct GameSession {
     /// Ranked rooms apply rating updates when a match completes.
     pub ranked: bool,
     /// Engine events produced by `start_game` (the d20 first-player contest's
-    /// `DieRolled` batch). Captured here so the INITIAL post-start broadcast can
-    /// surface them to clients; cleared after that broadcast so late joiners and
-    /// reconnects do not re-receive the contest dice. Empty when the game has
-    /// not started or the events have already been broadcast.
+    /// `StartingPlayerContest` event). Captured here so the INITIAL post-start
+    /// broadcast can surface them to clients; cleared after that broadcast so
+    /// late joiners and reconnects do not re-receive the contest. Empty when the
+    /// game has not started or the events have already been broadcast.
     pub start_events: Vec<GameEvent>,
 }
 
@@ -375,6 +375,7 @@ impl GameSession {
                 sideboard: deck.sideboard.clone(),
                 commander: deck.commander.clone(),
                 attraction_deck: deck.attraction_deck.clone(),
+                signature_spell: deck.signature_spell.clone(),
                 bracket_tier: deck.bracket_tier,
             };
             // The resolver (`ServerDeckResolver::resolve` in phase-server)
@@ -1087,7 +1088,16 @@ impl SessionManager {
                 && session
                     .state
                     .waiting_for
-                    .accepts_freeform_combat_damage_assignment());
+                    .accepts_freeform_combat_damage_assignment())
+            // CR 510.1d + CR 702.22k: a banded blocker's free damage division
+            // has too many legal splits to enumerate as candidates, so the
+            // server bypasses its legality gate and the engine handler
+            // (handle_assign_blocker_damage) validates the submission.
+            || (matches!(action, GameAction::AssignBlockerDamage { .. })
+                && session
+                    .state
+                    .waiting_for
+                    .accepts_freeform_blocker_damage_assignment());
         if !skip_legality {
             let (legal_actions, _, _) = engine_legal_actions_full(&session.state);
             if !legal_actions.contains(&action) {
@@ -1304,6 +1314,7 @@ mod tests {
                     parse_warnings: vec![],
                     brawl_commander: false,
                     is_commander: false,
+                    is_oathbreaker: false,
                     deck_copy_limit: None,
                     metadata: Default::default(),
                     rarities: Default::default(),
@@ -2098,6 +2109,7 @@ mod tests {
             kept_destination: Some(Zone::Library),
             rest_destination: Some(Zone::Library),
             source_id: None,
+            enter_tapped: false,
         };
 
         // Non-canonical permutation [c, a, b] — not an enumerated candidate.

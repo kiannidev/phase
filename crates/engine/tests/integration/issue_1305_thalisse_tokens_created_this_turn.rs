@@ -53,7 +53,10 @@ fn issue_1305_thalisse_creates_spirits_for_tokens_created_this_turn() {
             }
             WaitingFor::DeclareAttackers { .. } => {
                 runner
-                    .act(GameAction::DeclareAttackers { attacks: vec![] })
+                    .act(GameAction::DeclareAttackers {
+                        attacks: vec![],
+                        bands: vec![],
+                    })
                     .expect("declare attackers");
             }
             WaitingFor::DeclareBlockers { .. } => {

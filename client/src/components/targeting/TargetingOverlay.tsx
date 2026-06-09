@@ -25,6 +25,8 @@ export function TargetingOverlay() {
   const isCopyRetarget = waitingFor?.type === "CopyRetarget";
   const canKeepCurrentTargets = isCopyRetarget && waitingFor.data.target_slots.every((slot) => slot.current != null);
   const isExploreChoice = waitingFor?.type === "ExploreChoice";
+  // CR 701.36a: Populate — choose a creature token you control to copy.
+  const isPopulateChoice = waitingFor?.type === "PopulateChoice";
   // CR 303.4 + CR 303.4g + CR 115.1: Return-as-Aura attach pick. Picker is a
   // CHOICE (not a target), but the action shape mirrors ExploreChoice
   // (`GameAction::ChooseTarget` with the chosen ObjectId).
@@ -51,6 +53,8 @@ export function TargetingOverlay() {
     : waitingFor?.type === "TargetSelection"
       ? waitingFor.data.pending_cast?.object_id
       : waitingFor?.type === "ExploreChoice"
+        ? waitingFor.data.source_id
+      : waitingFor?.type === "PopulateChoice"
         ? waitingFor.data.source_id
       : waitingFor?.type === "ReturnAsAuraTarget"
         ? waitingFor.data.source_id
@@ -99,7 +103,7 @@ export function TargetingOverlay() {
     return () => clearSelectedCards();
   }, [clearSelectedCards, isTapCreatureChoice]);
 
-  if (!isTargetSelection && !isCopyTargetChoice && !isCopyRetarget && !isExploreChoice && !isReturnAsAuraTarget && !isRetargetChoice && !isTapCreatureChoice) return null;
+  if (!isTargetSelection && !isCopyTargetChoice && !isCopyRetarget && !isExploreChoice && !isPopulateChoice && !isReturnAsAuraTarget && !isRetargetChoice && !isTapCreatureChoice) return null;
 
   // Only show targeting UI for the human player
   if (!canActForWaitingState) return null;
@@ -138,6 +142,8 @@ export function TargetingOverlay() {
                   })()
               : isExploreChoice
                 ? t("targeting.chooseCreatureToExplore")
+              : isPopulateChoice
+                ? t("targeting.chooseCreatureTokenToPopulate")
               : isReturnAsAuraTarget
                 ? t("targeting.chooseReturnAsAuraTarget")
               : isRetargetChoice
@@ -284,6 +290,11 @@ function inferTargetNoun(
     return t("targeting.nounTarget");
   }
   if (objectTargets.length === 0) return t("targeting.nounTarget");
+  // CR 112.1: Spells on the stack are not permanents; infer from zone so
+  // Counterspell-style targeting does not fall through to "nonland permanent".
+  if (objectTargets.every((obj) => obj.zone === "Stack")) {
+    return t("targeting.nounSpell");
+  }
   if (objectTargets.every((obj) => !obj.card_types.core_types.includes("Land"))) {
     return t("targeting.nounNonlandPermanent");
   }

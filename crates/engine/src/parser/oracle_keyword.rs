@@ -4,7 +4,7 @@ use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::{alpha1, space0, space1};
-use nom::combinator::{all_consuming, not, opt, peek, value};
+use nom::combinator::{all_consuming, eof, not, opt, peek, value};
 use nom::sequence::preceded;
 use nom::Parser;
 
@@ -14,15 +14,16 @@ use super::oracle_nom::primitives::{scan_at_word_boundaries, scan_contains, spli
 use super::oracle_quantity::parse_cda_quantity;
 use super::oracle_target::parse_type_phrase;
 use super::oracle_util::strip_reminder_text;
-#[cfg(test)]
-use crate::types::ability::ControllerRef;
 use crate::types::ability::{
-    AbilityCost, AdditionalCost, Effect, QuantityExpr, TargetFilter, TypeFilter, TypedFilter,
+    AbilityCost, AdditionalCost, ControllerRef, CostObjectCount, Effect, FilterProp, QuantityExpr,
+    TargetFilter, TypeFilter, TypedFilter,
 };
 use crate::types::keywords::{
-    BloodthirstValue, BuybackCost, CyclingCost, FlashbackCost, Keyword, WardCost,
+    normalize_bands_with_other_quality, BloodthirstValue, BuybackCost, CyclingCost, FlashbackCost,
+    Keyword, WardCost,
 };
 use crate::types::mana::{ManaCost, ManaCostShard};
+use crate::types::zones::Zone;
 
 /// CR 702.16 + CR 702.11f: Expand compound "X from A and from B" keyword lines.
 /// Handles both "protection from X and from Y" and "hexproof from X and from Y"
@@ -164,7 +165,7 @@ pub(crate) fn parse_kicker_additional_cost_line(raw: &str, lower: &str) -> Optio
     if repeatable {
         return Some(AdditionalCost::Kicker {
             costs: vec![parse_kicker_cost_payload(raw_after_prefix)?],
-            repeatable: true,
+            repeatability: crate::types::ability::AdditionalCostRepeatability::Repeatable,
         });
     }
 
@@ -185,7 +186,7 @@ pub(crate) fn parse_kicker_additional_cost_line(raw: &str, lower: &str) -> Optio
 
     Some(AdditionalCost::Kicker {
         costs,
-        repeatable: false,
+        repeatability: crate::types::ability::AdditionalCostRepeatability::Once,
     })
 }
 
@@ -211,7 +212,7 @@ pub(crate) fn extract_keyword_line(
     mtgjson_keyword_names: &[String],
 ) -> Option<Vec<Keyword>> {
     let line_without_reminder = strip_reminder_text(line);
-    let line = line_without_reminder.trim();
+    let line = strip_keyword_activation_cost_prefix(line_without_reminder.trim());
 
     if mtgjson_keyword_names.is_empty() {
         return parse_mtgjson_missing_standalone_keyword_line(line);
@@ -279,19 +280,25 @@ pub(crate) fn extract_keyword_line(
         if mtgjson_match {
             any_mtgjson_match = true;
 
-            // Exact name match means MTGJSON already has the parsed keyword — skip
+            // Exact name match means MTGJSON already carries one parsed copy.
             if mtgjson_keyword_names.contains(&lower) {
+                // CR 702.85c / CR 702.40b: keywords whose instances each trigger
+                // separately are printed as repeated bare words ("Cascade, cascade"),
+                // but MTGJSON's keywords array dedupes them. The Oracle line is the only
+                // place printed multiplicity survives — emit one Keyword per occurrence
+                // so the runtime's per-instance trigger loop fires correctly. Synthesis
+                // reconciles the deduped MTGJSON copy against these.
+                if let Some(kw) = parse_keyword_from_oracle(&lower) {
+                    if kw.instances_function_separately() {
+                        new_keywords.push(kw);
+                    }
+                }
                 continue;
             }
 
             // Prefix match: Oracle text has more detail (e.g. "protection from red").
             // Extract the full parameterized keyword.
             if let Some(kw) = parse_keyword_from_oracle(&lower) {
-                if matches!(kw, Keyword::Ripple)
-                    && mtgjson_keyword_names.contains(&keyword_display_name(&kw))
-                {
-                    continue;
-                }
                 new_keywords.push(kw);
                 continue;
             }
@@ -319,11 +326,63 @@ pub(crate) fn extract_keyword_line(
     }
 }
 
+fn strip_keyword_activation_cost_prefix(line: &str) -> &str {
+    if let Some(keyword_text) = strip_mana_activation_cost_prefix(line) {
+        return keyword_text;
+    }
+    strip_ticket_activation_cost_prefix(line).unwrap_or(line)
+}
+
+fn strip_mana_activation_cost_prefix(line: &str) -> Option<&str> {
+    let Ok((rest, _cost)) = nom_primitives::parse_mana_cost.parse(line) else {
+        return None;
+    };
+    strip_activation_cost_dash(rest)
+}
+
+fn strip_ticket_activation_cost_prefix(line: &str) -> Option<&str> {
+    let lower = line.to_ascii_lowercase();
+    let mut rest = lower.as_str();
+    let mut consumed = 0;
+    let mut matched = false;
+
+    while let Ok((next, _)) = tag::<_, _, OracleError<'_>>("{tk}").parse(rest) {
+        matched = true;
+        consumed = lower.len() - next.len();
+        rest = next;
+    }
+
+    matched
+        .then(|| &line[consumed..])
+        .and_then(strip_activation_cost_dash)
+}
+
+fn strip_activation_cost_dash(rest: &str) -> Option<&str> {
+    preceded(
+        space0,
+        alt((
+            tag::<_, _, OracleError<'_>>("\u{2014}"),
+            tag("\u{2013}"),
+            tag("-"),
+        )),
+    )
+    .parse(rest)
+    .ok()
+    .map(|(keyword_text, _)| keyword_text.trim_start())
+}
+
 fn parse_mtgjson_missing_standalone_keyword_line(line: &str) -> Option<Vec<Keyword>> {
     let lower = line.to_lowercase();
     let keyword = parse_keyword_from_oracle(&lower)?;
     match keyword {
         Keyword::ForMirrodin => Some(vec![keyword]),
+        // CR 702.89a: Umbra armor (printed as "umbra armor"/"totem armor") is a
+        // standalone keyword line MTGJSON does not surface in its `keywords` array,
+        // so it must be recovered from the Oracle line here.
+        Keyword::TotemArmor => Some(vec![keyword]),
+        // CR 702.22: "Bands with other [quality]" carries the quality in Oracle
+        // text; MTGJSON's keyword list has no typed payload to preserve it.
+        Keyword::BandsWithOther(_) => Some(vec![keyword]),
         _ => None,
     }
 }
@@ -610,6 +669,31 @@ fn parse_evoke_cost(cost_text: &str) -> Option<crate::types::keywords::EvokeCost
     }
 }
 
+/// CR 702.30a: Parse an echo cost following the em-dash separator
+/// (e.g., "echo—discard a card" on Rakdos Headliner / Deepcavern Imp).
+/// Mirrors `parse_evoke_cost`: delegates to `parse_oracle_cost` so
+/// comma-separated parts compose into `AbilityCost::Composite`, and wraps the
+/// result in `EchoCost::Mana` when it's a pure mana cost or `EchoCost::NonMana`
+/// otherwise.
+fn parse_echo_cost(cost_text: &str) -> Option<crate::types::keywords::EchoCost> {
+    use crate::types::keywords::EchoCost;
+    let trimmed = cost_text.trim().trim_end_matches('.').trim_end_matches(')');
+    let clean = opt(take_until::<_, _, OracleError<'_>>(" ("))
+        .parse(trimmed)
+        .map(|(_, before)| before.unwrap_or(trimmed))
+        .unwrap_or(trimmed)
+        .trim();
+    if clean.is_empty() {
+        return None;
+    }
+    let cost = super::oracle_cost::parse_oracle_cost(clean);
+    match cost {
+        AbilityCost::Mana { cost: mana_cost } => Some(EchoCost::Mana(mana_cost)),
+        AbilityCost::Unimplemented { .. } => None,
+        other => Some(EchoCost::NonMana(other)),
+    }
+}
+
 fn parse_cycling_cost(cost_text: &str) -> Option<CyclingCost> {
     let trimmed = cost_text.trim().trim_end_matches('.').trim_end_matches(')');
     // Strip reminder text in parentheses: take everything before the first " (".
@@ -646,6 +730,232 @@ fn parse_bloodthirst_keyword_line(line: &str) -> Option<Keyword> {
     } else {
         None
     }
+}
+
+/// CR 702.48a: Offering — "<Subtype> offering (reminder text)". The leading word
+/// is the creature/permanent type a player may sacrifice to cast this spell for
+/// its alternative cost (e.g. "Goblin offering", "Artifact offering"). MTGJSON
+/// sends only the bare "Offering" keyword name with no quality, so without this
+/// the line carrying the quality is never turned into `Keyword::Offering(quality)`
+/// and the cast path (which keys on that quality) is unreachable.
+fn parse_offering_keyword_line(line: &str) -> Option<Keyword> {
+    let stripped = strip_reminder_text(line);
+    let text = stripped.trim().trim_end_matches('.').trim();
+    // Input is lowercased; the whole line must be "<single word> offering".
+    let (_, (quality, _)) = all_consuming((alpha1, tag::<_, _, OracleError<'_>>(" offering")))
+        .parse(text)
+        .ok()?;
+    // Canonicalize to subtype casing ("goblin" -> "Goblin") so the runtime cost
+    // path (`effective_offering_quality`) matches the printed subtype.
+    let mut chars = quality.chars();
+    let capitalized = chars.next()?.to_ascii_uppercase().to_string() + chars.as_str();
+    Some(Keyword::Offering(capitalized))
+}
+
+/// CR 702.167b: Build the typed materials filter for a Craft ability. A bare
+/// type/subtype in the materials clause matches *either* a permanent on the
+/// battlefield you control *or* a card in your graveyard you own (an exception
+/// to CR 109.2). The result is a `TargetFilter::Or` of those two zone-scoped
+/// legs so the dual-zone eligibility helper and the runtime filter evaluator
+/// agree on what may be exiled. This is the single authority for the materials
+/// filter shape — `FromStr`, `keyword_from_tagged`, and the Oracle-line parser
+/// all route through it.
+pub fn craft_materials_filter(types: &[TypeFilter]) -> TargetFilter {
+    craft_materials_from_typed_filter(TypedFilter {
+        type_filters: types.to_vec(),
+        ..TypedFilter::default()
+    })
+}
+
+fn craft_materials_from_typed_filter(filter: TypedFilter) -> TargetFilter {
+    let with_types = |base: TypedFilter| -> TypedFilter {
+        filter
+            .type_filters
+            .iter()
+            .cloned()
+            .fold(base, |acc, tf| acc.with_type(tf))
+    };
+    TargetFilter::Or {
+        filters: vec![
+            // Battlefield leg: a permanent you control matching the printed materials class.
+            TargetFilter::Typed(
+                with_types(TypedFilter::permanent())
+                    .controller(ControllerRef::You)
+                    .properties({
+                        let mut props = filter.properties.clone();
+                        props.push(FilterProp::InZone {
+                            zone: Zone::Battlefield,
+                        });
+                        props
+                    }),
+            ),
+            // Graveyard leg: a card you own matching the printed materials class.
+            TargetFilter::Typed(with_types(TypedFilter::card()).properties({
+                let mut props = filter.properties.clone();
+                props.push(FilterProp::InZone {
+                    zone: Zone::Graveyard,
+                });
+                props.push(FilterProp::Owned {
+                    controller: ControllerRef::You,
+                });
+                props
+            })),
+        ],
+    }
+}
+
+fn craft_materials_from_filter(filter: TargetFilter) -> Option<TargetFilter> {
+    match filter {
+        TargetFilter::Typed(typed) => Some(craft_materials_from_typed_filter(typed)),
+        TargetFilter::Or { filters } => Some(TargetFilter::Or {
+            filters: filters
+                .into_iter()
+                .map(craft_materials_from_filter)
+                .collect::<Option<Vec<_>>>()?,
+        }),
+        _ => None,
+    }
+}
+
+fn craft_materials_any() -> TargetFilter {
+    craft_materials_from_typed_filter(TypedFilter::default())
+}
+
+/// CR 702.167b: Default materials class (creature) used when only the bare
+/// "Craft" keyword is available (no Oracle line to specify the materials).
+pub fn craft_materials_default() -> TargetFilter {
+    craft_materials_filter(&[TypeFilter::Creature])
+}
+
+/// CR 702.167a/b: Parse a "craft with [materials] [cost]" Oracle line into a
+/// `Keyword::Craft`. Craft owns the count prefix and the CR 702.167b dual-zone
+/// lowering; the material class itself delegates to the shared type-phrase
+/// parser so colors, type disjunctions, and subtypes stay on the project-wide
+/// target-filter grammar instead of a Craft-only tag list.
+fn parse_craft_keyword_line(text: &str) -> Option<Keyword> {
+    let (rest, _) = tag::<_, _, OracleError<'_>>("craft with ")
+        .parse(text)
+        .ok()?;
+    let (rest, (materials, count)) = parse_craft_materials(rest)?;
+    let cost = crate::database::mtgjson::parse_mtgjson_mana_cost(rest.trim());
+    Some(Keyword::Craft {
+        cost,
+        materials,
+        count,
+    })
+}
+
+/// CR 702.167b: Parse the materials clause of a craft line into
+/// `(filter, count, remainder)`. The remainder is the trailing mana-cost text.
+fn parse_craft_materials(input: &str) -> Option<(&str, (TargetFilter, CostObjectCount))> {
+    let (cost_text, materials_text) = take_until::<_, _, OracleError<'_>>("{").parse(input).ok()?;
+    let materials_text = materials_text.trim();
+    if parse_craft_unmodeled_material_clause(materials_text).is_ok() {
+        return None;
+    }
+    let (materials_text, count) = parse_craft_material_count(materials_text)?;
+    let materials_text = materials_text.trim();
+    let materials = if materials_text.is_empty() {
+        craft_materials_any()
+    } else if parse_craft_relative_material_clause(materials_text).is_ok()
+        || take_until::<_, _, OracleError<'_>>(",")
+            .parse(materials_text)
+            .is_ok()
+    {
+        return None;
+    } else {
+        let (filter, rest) = parse_type_phrase(materials_text);
+        if !rest.trim().is_empty() {
+            return None;
+        }
+        craft_materials_from_filter(filter)?
+    };
+    Some((cost_text, (materials, count)))
+}
+
+fn parse_craft_relative_material_clause(input: &str) -> nom::IResult<&str, (), OracleError<'_>> {
+    let (rest, _) = tag("that").parse(input)?;
+    let (rest, _) = alt((value((), space1), value((), eof))).parse(rest)?;
+    Ok((rest, ()))
+}
+
+fn parse_craft_unmodeled_material_clause(input: &str) -> nom::IResult<&str, (), OracleError<'_>> {
+    alt((
+        parse_craft_relative_material_clause,
+        value(
+            (),
+            (
+                nom_primitives::parse_number,
+                space1,
+                parse_craft_relative_material_clause,
+            ),
+        ),
+    ))
+    .parse(input)
+}
+
+fn parse_craft_material_count(input: &str) -> Option<(&str, CostObjectCount)> {
+    if input == "one or more" {
+        return Some(("", CostObjectCount::at_least(1)));
+    }
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("one or more ").parse(input) {
+        return Some((rest, CostObjectCount::at_least(1)));
+    }
+    if let Ok((rest, count)) = nom_primitives::parse_number.parse(input) {
+        if rest == " or more" {
+            return Some(("", CostObjectCount::at_least(count)));
+        }
+        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(" or more ").parse(rest) {
+            return Some((rest, CostObjectCount::at_least(count)));
+        }
+        if let Ok((rest, _)) = space1::<_, OracleError<'_>>.parse(rest) {
+            return Some((rest, CostObjectCount::exactly(count)));
+        }
+    }
+    Some((input, CostObjectCount::exactly(1)))
+}
+
+/// CR 702.18a / 702.11a: the CR keyword that a descriptive "can't be the target
+/// [of ...]" prohibition corresponds to. These phrasings ARE Shroud / Hexproof
+/// (CR 702.18a: "Shroud" means "can't be the target of spells or abilities";
+/// CR 702.11a: Hexproof restricts only opponents' spells/abilities), so callers
+/// map them onto the existing keyword targeting checks rather than a bespoke rule
+/// static, getting the correct controller scope for free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CantBeTargetedScope {
+    /// CR 702.18a: blanket — can't be targeted by ANY player (Shroud).
+    AnyPlayer,
+    /// CR 702.11a: only spells/abilities an opponent controls (Hexproof).
+    OpponentsOnly,
+}
+
+/// Classify a predicate carrying a "can't be the target[ed]" prohibition.
+///
+/// Returns `None` when no such prohibition is present, or when its scope is one
+/// this parser does not yet model precisely (e.g. a specific spell type), so a
+/// caller never collapses an unrecognized scope into a blanket restriction.
+pub(crate) fn classify_cant_be_targeted(predicate_lower: &str) -> Option<CantBeTargetedScope> {
+    let is_prohibition = scan_contains(predicate_lower, "can't be the target")
+        || scan_contains(predicate_lower, "cannot be the target")
+        || scan_contains(predicate_lower, "can't be targeted")
+        || scan_contains(predicate_lower, "cannot be targeted");
+    if !is_prohibition {
+        return None;
+    }
+    // CR 702.11a: an opponent-controlled qualifier makes this Hexproof, not Shroud.
+    if scan_contains(predicate_lower, "your opponents control")
+        || scan_contains(predicate_lower, "an opponent controls")
+    {
+        return Some(CantBeTargetedScope::OpponentsOnly);
+    }
+    // CR 702.18a: the bare form ("~ can't be targeted") or the unqualified
+    // "spells or abilities" scope is blanket Shroud. Any other qualifier is left
+    // unclassified so it is not mistreated as a blanket restriction.
+    let bare = !scan_contains(predicate_lower, " of ");
+    let unqualified_scope = scan_contains(predicate_lower, "spells or abilities")
+        || scan_contains(predicate_lower, "spell or ability")
+        || scan_contains(predicate_lower, "spells and abilities");
+    (bare || unqualified_scope).then_some(CantBeTargetedScope::AnyPlayer)
 }
 
 ///
@@ -693,6 +1003,12 @@ pub(crate) fn parse_keyword_from_oracle(text: &str) -> Option<Keyword> {
         return Some(kw);
     }
 
+    // CR 702.48a: "<Subtype> offering" — the Oracle line carries the quality the
+    // bare "Offering" keyword name lacks.
+    if let Some(kw) = parse_offering_keyword_line(text) {
+        return Some(kw);
+    }
+
     // CR 702.112a: Renown N — parameterized keyword from Oracle text.
     // MTGJSON's keyword list carries only "Renown"; the Oracle line supplies N.
     if let Ok((_, (_, _, n))) = all_consuming((
@@ -703,6 +1019,30 @@ pub(crate) fn parse_keyword_from_oracle(text: &str) -> Option<Keyword> {
     .parse(text)
     {
         return Some(Keyword::Renown(n));
+    }
+
+    // CR 702.68a: Frenzy N — parameterized keyword from Oracle/reminder/grant text.
+    // MTGJSON's keyword list carries only "Frenzy"; the Oracle line supplies N.
+    if let Ok((_, (_, _, n))) = all_consuming((
+        tag::<_, _, OracleError<'_>>("frenzy"),
+        space1,
+        nom_primitives::parse_number,
+    ))
+    .parse(text)
+    {
+        return Some(Keyword::Frenzy(n));
+    }
+
+    // CR 702.167a/b: Craft with [materials] [cost] — the Oracle line carries the
+    // materials class and activation cost that the bare "Craft" keyword lacks.
+    if let Some(kw) = parse_craft_keyword_line(text) {
+        return Some(kw);
+    }
+    if tag::<_, _, OracleError<'_>>("craft with ")
+        .parse(text)
+        .is_ok()
+    {
+        return None;
     }
 
     // First try direct parse (handles simple keywords like "flying")
@@ -791,6 +1131,16 @@ pub(crate) fn parse_keyword_from_oracle(text: &str) -> Option<Keyword> {
         }
     }
 
+    // CR 702.30a: Echo with em-dash cost — non-mana echo ("echo—discard a card"
+    // on Rakdos Headliner / Deepcavern Imp). Pure-mana echo ("Echo {R}") arrives
+    // via the space-mana fallback below. Placed before that fallback because the
+    // generic space-split mangles "echo—discard a card".
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("echo\u{2014}").parse(text) {
+        if let Some(echo_cost) = parse_echo_cost(rest) {
+            return Some(Keyword::Echo(echo_cost));
+        }
+    }
+
     // CR 702.120a: Escalate with em-dash cost — covers non-mana costs such as
     // Collective Effort's "Escalate—Tap an untapped creature you control."
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("escalate\u{2014}").parse(text) {
@@ -807,6 +1157,15 @@ pub(crate) fn parse_keyword_from_oracle(text: &str) -> Option<Keyword> {
             if rem.is_empty() {
                 return Some(Keyword::Hideaway(n));
             }
+        }
+    }
+
+    // Digital-only Specialize: "specialize {cost}" alternative activation cost.
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("specialize ").parse(text) {
+        let cost_str = rest.trim();
+        if !cost_str.is_empty() {
+            let cost = crate::database::mtgjson::parse_mtgjson_mana_cost(cost_str);
+            return Some(Keyword::Specialize(cost));
         }
     }
 
@@ -916,16 +1275,36 @@ pub(crate) fn parse_keyword_from_oracle(text: &str) -> Option<Keyword> {
 
     // CR 702.60a: Ripple N — when you cast this spell, you may reveal the top N cards
     // of your library and cast any with the same name without paying their mana cost.
-    // Keyword::Ripple is currently a unit variant (N is not yet tracked by the engine).
-    // Cards: Surging Aether, Surging Dementia, Surging Might, Surging Sentinels.
-    if all_consuming(preceded(
+    // Cards: Surging Aether, Surging Dementia, Surging Might, Surging Sentinels;
+    // Thrumming Stone grants Ripple 4.
+    if let Ok((_, n)) = all_consuming(preceded(
         tag::<_, _, OracleError<'_>>("ripple "),
         nom_primitives::parse_number,
     ))
     .parse(text)
+    {
+        return Some(Keyword::Ripple(n));
+    }
+
+    // CR 702.89a/b: "umbra armor" — and the obsolete "totem armor" the Oracle text
+    // of older cards was updated from — is a single two-word keyword. The generic
+    // name/parameter split below would read "umbra"/"totem" as the name and drop
+    // "armor", so recognize the whole phrase here (mirrors the `ripple N` check).
+    if all_consuming(alt((
+        tag::<_, _, OracleError<'_>>("umbra armor"),
+        tag("totem armor"),
+    )))
+    .parse(text)
     .is_ok()
     {
-        return Some(Keyword::Ripple);
+        return Some(Keyword::TotemArmor);
+    }
+
+    if let Ok((quality, _)) = tag::<_, _, OracleError<'_>>("bands with other ").parse(text) {
+        let normalized = normalize_bands_with_other_quality(quality);
+        if !normalized.is_empty() {
+            return Some(Keyword::BandsWithOther(normalized));
+        }
     }
 
     // For parameterized keywords, find the first space to split name from parameter.
@@ -990,6 +1369,7 @@ pub fn keyword_display_name(keyword: &Keyword) -> String {
         Keyword::Wither => "wither".to_string(),
         Keyword::Infect => "infect".to_string(),
         Keyword::Afflict(n) => format!("afflict {n}"),
+        Keyword::StartingIntensity(n) => format!("starting intensity {n}"),
         Keyword::Prowess => "prowess".to_string(),
         Keyword::Undying => "undying".to_string(),
         Keyword::Persist => "persist".to_string(),
@@ -1017,6 +1397,7 @@ pub fn keyword_display_name(keyword: &Keyword) -> String {
         Keyword::StartYourEngines => "start your engines!".to_string(),
         Keyword::Soulbond => "soulbond".to_string(),
         Keyword::Banding => "banding".to_string(),
+        Keyword::BandsWithOther(quality) => format!("bands with other {}", quality.to_lowercase()),
         // CR 702.24a: Cumulative upkeep's display includes its base cost so
         // tooltips and AI hint text show the actual payment ("cumulative upkeep
         // — {1}", "cumulative upkeep — Pay 2 life", etc.) instead of a bare
@@ -1041,7 +1422,7 @@ pub fn keyword_display_name(keyword: &Keyword) -> String {
         Keyword::Provoke => "provoke".to_string(),
         Keyword::Rebound => "rebound".to_string(),
         Keyword::Retrace => "retrace".to_string(),
-        Keyword::Ripple => "ripple".to_string(),
+        Keyword::Ripple(_) => "ripple".to_string(),
         Keyword::SplitSecond => "split second".to_string(),
         Keyword::Storm => "storm".to_string(),
         Keyword::Suspend { .. } => "suspend".to_string(),
@@ -1072,6 +1453,7 @@ pub fn keyword_display_name(keyword: &Keyword) -> String {
         Keyword::Fabricate(_) => "fabricate".to_string(),
         Keyword::Annihilator(_) => "annihilator".to_string(),
         Keyword::Bushido(_) => "bushido".to_string(),
+        Keyword::Frenzy(_) => "frenzy".to_string(),
         Keyword::Tribute(_) => "tribute".to_string(),
         Keyword::Afterlife(_) => "afterlife".to_string(),
         Keyword::Fading(_) => "fading".to_string(),
@@ -1129,6 +1511,7 @@ pub fn keyword_display_name(keyword: &Keyword) -> String {
         Keyword::Emerge(_) => "emerge".to_string(),
         Keyword::Escape { .. } => "escape".to_string(),
         Keyword::Harmonize(_) => "harmonize".to_string(),
+        Keyword::Mayhem(_) => "mayhem".to_string(),
         Keyword::Evoke(_) => "evoke".to_string(),
         Keyword::Foretell(_) => "foretell".to_string(),
         Keyword::Mutate(_) => "mutate".to_string(),
@@ -1144,9 +1527,9 @@ pub fn keyword_display_name(keyword: &Keyword) -> String {
         Keyword::Outlast(_) => "outlast".to_string(),
         Keyword::Scavenge(_) => "scavenge".to_string(),
         Keyword::Fortify(_) => "fortify".to_string(),
-        Keyword::Prototype(_) => "prototype".to_string(),
+        Keyword::Prototype { .. } => "prototype".to_string(),
         Keyword::Plot(_) => "plot".to_string(),
-        Keyword::Craft(_) => "craft".to_string(),
+        Keyword::Craft { .. } => "craft".to_string(),
         Keyword::Offspring(_) => "offspring".to_string(),
         Keyword::Impending { counters, .. } => format!("impending {counters}"),
         Keyword::LevelUp(_) => "level up".to_string(),
@@ -1154,7 +1537,7 @@ pub fn keyword_display_name(keyword: &Keyword) -> String {
         Keyword::Casualty(n) => format!("casualty {n}"),
         Keyword::Entwine(_) => "entwine".to_string(),
         Keyword::Affinity(_) => "affinity".to_string(),
-        Keyword::Splice(_) => "splice".to_string(),
+        Keyword::Splice { .. } => "splice".to_string(),
         Keyword::Bargain => "bargain".to_string(),
         Keyword::Sunburst => "sunburst".to_string(),
         Keyword::Champion(_) => "champion".to_string(),
@@ -1165,6 +1548,7 @@ pub fn keyword_display_name(keyword: &Keyword) -> String {
         Keyword::JumpStart => "jump-start".to_string(),
         Keyword::Cipher => "cipher".to_string(),
         Keyword::Transmute(_) => "transmute".to_string(),
+        Keyword::Transfigure(_) => "transfigure".to_string(),
         Keyword::Cleave(_) => "cleave".to_string(),
         Keyword::Undaunted => "undaunted".to_string(),
         Keyword::Station => "station".to_string(),
@@ -1460,34 +1844,194 @@ mod tests {
         assert_eq!(kw, Keyword::Cascade);
     }
 
-    /// CR 702.60a: Ripple N triggers when the spell is cast. The engine
-    /// currently stores `Keyword::Ripple` as a unit variant, so supported
-    /// numeric suffixes map to that variant while trailing text is rejected.
+    /// CR 702.85c: a spell printing cascade as repeated bare words has one instance
+    /// per word; each triggers separately. MTGJSON dedupes the keywords array to a
+    /// single "Cascade", so the Oracle line is the sole source of printed
+    /// multiplicity — extract_keyword_line must recover every occurrence.
+    #[test]
+    fn extract_keyword_line_recovers_repeated_cascade_instances() {
+        let mtgjson_kws = vec!["cascade".to_string()];
+        let two = extract_keyword_line("Cascade, cascade", &mtgjson_kws)
+            .expect("repeated cascade line is a keyword line");
+        assert_eq!(
+            two.iter().filter(|k| matches!(k, Keyword::Cascade)).count(),
+            2
+        );
+        let four = extract_keyword_line("Cascade, cascade, cascade, cascade", &mtgjson_kws)
+            .expect("repeated cascade line is a keyword line");
+        assert_eq!(
+            four.iter()
+                .filter(|k| matches!(k, Keyword::Cascade))
+                .count(),
+            4
+        );
+    }
+
+    /// CR 702.85c regression guard: a single printed cascade (Bloodbraid Elf) must
+    /// still net exactly one instance — recovery must not over-count.
+    #[test]
+    fn extract_keyword_line_single_cascade_yields_one_instance() {
+        let mtgjson_kws = vec!["cascade".to_string()];
+        let one = extract_keyword_line("Cascade", &mtgjson_kws)
+            .expect("single cascade line is a keyword line");
+        assert_eq!(
+            one.iter().filter(|k| matches!(k, Keyword::Cascade)).count(),
+            1
+        );
+    }
+
+    /// CR 702.116b: a creature printing myriad as repeated bare words has one
+    /// instance per word; each triggers separately. MTGJSON dedupes the keywords
+    /// array to a single "Myriad", so the Oracle line is the sole source of printed
+    /// multiplicity — extract_keyword_line must recover every occurrence. Scurry of
+    /// Squirrels ("Myriad, myriad") is the real card this fixes.
+    #[test]
+    fn extract_keyword_line_recovers_repeated_myriad_instances() {
+        let mtgjson_kws = vec!["myriad".to_string()];
+        let two = extract_keyword_line("Myriad, myriad", &mtgjson_kws)
+            .expect("repeated myriad line is a keyword line");
+        assert_eq!(
+            two.iter().filter(|k| matches!(k, Keyword::Myriad)).count(),
+            2
+        );
+    }
+
+    /// CR 702.116b regression guard: a single printed myriad must net exactly one
+    /// instance — recovery must not over-count.
+    #[test]
+    fn extract_keyword_line_single_myriad_yields_one_instance() {
+        let mtgjson_kws = vec!["myriad".to_string()];
+        let one = extract_keyword_line("Myriad", &mtgjson_kws)
+            .expect("single myriad line is a keyword line");
+        assert_eq!(
+            one.iter().filter(|k| matches!(k, Keyword::Myriad)).count(),
+            1
+        );
+    }
+
+    /// BUILDING-BLOCK / forward-looking test (CR 702.83a: Exalted is a triggered
+    /// ability; CR 113.2c: multiple instances of an ability function independently).
+    /// Exercises the `instances_function_separately()` recovery path for Exalted at
+    /// the building-block level. This is NOT a claim that a specific printed card is
+    /// fixed: no clean real "Exalted, exalted" keyword-only line exists yet — the one
+    /// candidate (Urza's Dark Cannonball) prints "{cost} — Exalted, exalted", which
+    /// the `{cost} —` keyword-line parser does not yet strip (see the deferred-gap
+    /// pin below). When a clean printed instance lands, this test already covers it.
+    #[test]
+    fn extract_keyword_line_recovers_repeated_exalted_instances() {
+        let mtgjson_kws = vec!["exalted".to_string()];
+        let two = extract_keyword_line("Exalted, exalted", &mtgjson_kws)
+            .expect("repeated exalted line is a keyword line");
+        assert_eq!(
+            two.iter().filter(|k| matches!(k, Keyword::Exalted)).count(),
+            2
+        );
+    }
+
+    /// CR 113.2c / CR 702.83a: Urza's Dark Cannonball prints a keyword line behind
+    /// an activation-cost prefix. The prefix is not part of the keyword text, so
+    /// `extract_keyword_line` must still recover both Exalted instances.
+    #[test]
+    fn extract_keyword_line_cost_prefixed_exalted_recovers_instances() {
+        let mtgjson_kws = vec!["exalted".to_string()];
+        let result = extract_keyword_line("{TK}{TK} — Exalted, exalted", &mtgjson_kws)
+            .expect("cost-prefixed repeated exalted line is a keyword line");
+        assert_eq!(
+            result
+                .iter()
+                .filter(|k| matches!(k, Keyword::Exalted))
+                .count(),
+            2
+        );
+    }
+
+    /// CR 702.39b: repeated Provoke instances each trigger separately. MTGJSON
+    /// dedupes the keywords array to one "Provoke", so keyword-line extraction
+    /// must recover every printed occurrence before synthesis installs triggers.
+    #[test]
+    fn extract_keyword_line_recovers_repeated_provoke_instances() {
+        let mtgjson_kws = vec!["provoke".to_string()];
+        let result = extract_keyword_line("Provoke, provoke", &mtgjson_kws)
+            .expect("repeated provoke line is a keyword line");
+        assert_eq!(
+            result
+                .iter()
+                .filter(|keyword| matches!(keyword, Keyword::Provoke))
+                .count(),
+            2
+        );
+    }
+
+    /// CR 702.60a: Ripple N triggers when the spell is cast. N is captured into
+    /// the parameterized `Keyword::Ripple(u32)`; trailing text is rejected.
     #[test]
     fn parse_keyword_from_oracle_ripple() {
         assert_eq!(
             parse_keyword_from_oracle("ripple 4"),
-            Some(Keyword::Ripple),
-            "ripple 4 (Surging Aether oracle text)"
+            Some(Keyword::Ripple(4)),
+            "ripple 4 (Thrumming Stone grant)"
         );
         assert_eq!(
             parse_keyword_from_oracle("ripple 2"),
-            Some(Keyword::Ripple),
-            "ripple 2 — numeric variant still maps to unit Ripple"
+            Some(Keyword::Ripple(2)),
+            "ripple 2 — N is captured"
         );
         assert_eq!(parse_keyword_from_oracle("ripple 4 extra"), None);
     }
 
     #[test]
-    fn extract_keyword_line_ripple_does_not_duplicate_mtgjson_keyword() {
+    fn parse_keyword_from_oracle_bands_with_other_quality() {
+        assert_eq!(
+            parse_keyword_from_oracle("bands with other wolves"),
+            Some(Keyword::BandsWithOther("Wolf".to_string()))
+        );
+        assert_eq!(
+            parse_keyword_from_oracle("bands with other legends"),
+            Some(Keyword::BandsWithOther("Legend".to_string()))
+        );
+    }
+
+    #[test]
+    fn extract_keyword_line_bands_with_other_quality() {
+        let result = extract_keyword_line("Bands with other Wolves", &[])
+            .expect("bands with other should parse from Oracle keyword line");
+        assert_eq!(result, vec![Keyword::BandsWithOther("Wolf".to_string())]);
+    }
+
+    /// CR 702.48a: Offering — the Oracle line "<Subtype> offering (...)" carries
+    /// the quality that the bare MTGJSON "Offering" keyword name lacks. Previously
+    /// no arm matched, so Keyword::Offering was never produced and the cast path
+    /// was unreachable. Quality is canonicalized to subtype casing.
+    #[test]
+    fn parse_keyword_from_oracle_offering() {
+        assert_eq!(
+            parse_keyword_from_oracle(
+                "goblin offering (you may cast this spell any time you could cast an instant \
+                 by sacrificing a goblin and paying the difference in mana costs.)"
+            ),
+            Some(Keyword::Offering("Goblin".to_string())),
+            "Patron of the Akki — Goblin offering"
+        );
+        assert_eq!(
+            parse_keyword_from_oracle("artifact offering (...)"),
+            Some(Keyword::Offering("Artifact".to_string())),
+            "Blast-Furnace Hellkite — Artifact offering"
+        );
+        // Not a keyword line: a prose sentence merely ending in "offering".
+        assert_eq!(parse_keyword_from_oracle("make a generous offering"), None);
+    }
+
+    #[test]
+    fn extract_keyword_line_ripple_preserves_oracle_depth() {
         let mtgjson_kws = vec!["ripple".to_string()];
 
         let result = extract_keyword_line("Ripple 4", &mtgjson_kws)
             .expect("Ripple N line should be recognized as a keyword line");
 
-        assert!(
-            result.is_empty(),
-            "MTGJSON already carries Keyword::Ripple; Oracle validation must not add a duplicate"
+        assert_eq!(
+            result,
+            vec![Keyword::Ripple(4)],
+            "Oracle text carries the ripple depth that MTGJSON's bare keyword omits"
         );
     }
 
@@ -1538,6 +2082,17 @@ mod tests {
         // CR 702.112a: Renown N — parameterized keyword from Oracle text.
         let kw = parse_keyword_from_oracle("renown 2").unwrap();
         assert_eq!(kw, Keyword::Renown(2));
+    }
+
+    #[test]
+    fn parse_keyword_from_oracle_frenzy() {
+        // CR 702.68a: Frenzy N — parameterized keyword from Oracle/grant text.
+        let kw = parse_keyword_from_oracle("frenzy 2").unwrap();
+        assert_eq!(kw, Keyword::Frenzy(2));
+        // CR 702.68a: the Frenzy Sliver grant line "frenzy 1" must resolve to
+        // Frenzy(1), not fall to Unknown/Unimplemented.
+        let kw1 = parse_keyword_from_oracle("frenzy 1").unwrap();
+        assert_eq!(kw1, Keyword::Frenzy(1));
     }
 
     #[test]
@@ -2099,7 +2654,7 @@ mod tests {
 
     #[test]
     fn extract_keyword_line_transmute() {
-        // CR 702.52a: Transmute {cost} — single-keyword line with parameterized cost
+        // CR 702.53a: Transmute {cost} — single-keyword line with parameterized cost
         let mtgjson_kws = vec!["transmute".to_string()];
 
         // Verify parse_keyword_from_oracle works directly
@@ -2118,6 +2673,39 @@ mod tests {
     }
 
     #[test]
+    fn parse_keyword_from_oracle_umbra_and_totem_armor() {
+        // CR 702.89a/b: both the current "umbra armor" and the obsolete
+        // "totem armor" spelling map to Keyword::TotemArmor.
+        assert_eq!(
+            parse_keyword_from_oracle("umbra armor"),
+            Some(Keyword::TotemArmor)
+        );
+        assert_eq!(
+            parse_keyword_from_oracle("totem armor"),
+            Some(Keyword::TotemArmor)
+        );
+    }
+
+    #[test]
+    fn extract_keyword_line_umbra_armor_reachable_without_mtgjson_keyword() {
+        // CR 702.89a: the Umbra cycle's "Umbra armor (…)" line carries reminder
+        // text and is NOT surfaced in MTGJSON's `keywords` array, so it must be
+        // recovered from the Oracle line. Regression guard that the runtime
+        // umbra-armor replacement is actually reachable (the keyword is produced).
+        for line in [
+            "Umbra armor (If enchanted permanent would be destroyed, instead remove all damage marked on it and destroy this Aura.)",
+            "Totem armor (If enchanted creature would be destroyed, instead remove all damage marked on it and destroy this Aura.)",
+        ] {
+            let result = extract_keyword_line(line, &[]);
+            assert_eq!(
+                result,
+                Some(vec![Keyword::TotemArmor]),
+                "umbra/totem armor line must yield Keyword::TotemArmor, got {result:?} for {line:?}"
+            );
+        }
+    }
+
+    #[test]
     fn extract_keyword_line_splice() {
         // CR 702.47a: Splice onto [type] {cost}
         let mtgjson_kws = vec!["splice".to_string()];
@@ -2125,7 +2713,17 @@ mod tests {
         assert!(result.is_some(), "Should recognize as keyword line");
         let keywords = result.unwrap();
         assert_eq!(keywords.len(), 1);
-        assert!(matches!(keywords[0], Keyword::Splice(_)));
+        // CR 702.47a: the splice subtype AND its cost must both be captured.
+        match &keywords[0] {
+            Keyword::Splice { subtype, cost } => {
+                assert_eq!(subtype, "Arcane");
+                assert_eq!(
+                    *cost,
+                    crate::database::mtgjson::parse_mtgjson_mana_cost("{1}{W}")
+                );
+            }
+            other => panic!("expected Keyword::Splice, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2268,6 +2866,78 @@ mod tests {
                 }
             })
         ));
+    }
+
+    fn craft_keyword(text: &str) -> (TargetFilter, CostObjectCount) {
+        match parse_keyword_from_oracle(text).expect("craft keyword should parse") {
+            Keyword::Craft {
+                materials, count, ..
+            } => (materials, count),
+            other => panic!("expected Craft keyword, got {other:?}"),
+        }
+    }
+
+    fn craft_filter_has_type(filter: &TargetFilter, wanted: &TypeFilter) -> bool {
+        match filter {
+            TargetFilter::Typed(typed) => typed.type_filters.iter().any(|tf| tf == wanted),
+            TargetFilter::Or { filters } => filters
+                .iter()
+                .any(|filter| craft_filter_has_type(filter, wanted)),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn parse_craft_materials_composes_count_and_type_phrase() {
+        let (materials, count) = craft_keyword("craft with two creatures {5}{b}");
+        assert_eq!(count, CostObjectCount::exactly(2));
+        assert!(craft_filter_has_type(&materials, &TypeFilter::Creature));
+
+        let (materials, count) = craft_keyword("craft with six artifacts {4}");
+        assert_eq!(count, CostObjectCount::exactly(6));
+        assert!(craft_filter_has_type(&materials, &TypeFilter::Artifact));
+    }
+
+    #[test]
+    fn parse_craft_materials_supports_at_least_and_subtypes() {
+        let (materials, count) = craft_keyword("craft with one or more dinosaurs {4}{r}");
+        assert_eq!(count, CostObjectCount::at_least(1));
+        assert!(craft_filter_has_type(
+            &materials,
+            &TypeFilter::Subtype("Dinosaur".to_string())
+        ));
+
+        let (materials, count) = craft_keyword("craft with cave {5}{g}");
+        assert_eq!(count, CostObjectCount::exactly(1));
+        assert!(craft_filter_has_type(
+            &materials,
+            &TypeFilter::Subtype("Cave".to_string())
+        ));
+    }
+
+    #[test]
+    fn parse_craft_materials_supports_unqualified_one_or_more() {
+        let (materials, count) = craft_keyword("craft with one or more {5}");
+        assert_eq!(count, CostObjectCount::at_least(1));
+        match materials {
+            TargetFilter::Or { filters } => assert_eq!(filters.len(), 2),
+            other => panic!("expected any-material dual-zone filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_craft_materials_refuses_unmodeled_selection_constraints() {
+        for text in [
+            "craft with two that share a card type {6}",
+            "craft with four or more nonlands with activated abilities {8}{u}",
+            "craft with a dinosaur, a merfolk, a pirate, and a vampire {4}",
+        ] {
+            let parsed = parse_keyword_from_oracle(text);
+            assert!(
+                parsed.is_none(),
+                "{text} must not parse as an approximate Craft cost, got {parsed:?}"
+            );
+        }
     }
 
     #[test]
@@ -2696,6 +3366,61 @@ mod tests {
             };
             assert_eq!(tf.controller, Some(ControllerRef::You));
         }
+    }
+
+    /// CR 702.5a: "Enchant creature or Food" (Sugar Coat, BLB) — Food is an
+    /// artifact subtype, not a core card type, so it requires explicit support
+    /// in `parse_enchant_type_leg`. The result must be a two-leg `Or` filter
+    /// covering both creatures and Food artifacts.
+    #[test]
+    fn extract_enchant_creature_or_food_subtype() {
+        let kw = super::try_parse_multi_type_enchant("Enchant creature or Food")
+            .expect("\"Enchant creature or Food\" should parse");
+        let Keyword::Enchant(TargetFilter::Or { ref filters }) = kw else {
+            panic!("expected Keyword::Enchant(Or), got {kw:?}");
+        };
+        assert_eq!(filters.len(), 2, "expected two legs");
+        let types: Vec<_> = filters
+            .iter()
+            .map(|f| match f {
+                TargetFilter::Typed(tf) => tf.type_filters.clone(),
+                other => panic!("expected Typed leg, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            types,
+            vec![
+                vec![TypeFilter::Creature],
+                vec![TypeFilter::Subtype("Food".to_string())],
+            ]
+        );
+    }
+
+    /// CR 702.5a: Artifact subtypes must parse as enchant target legs through
+    /// the canonical subtype classifier, not a hand-maintained token subset.
+    #[test]
+    fn extract_enchant_artifact_subtypes() {
+        for subtype in crate::types::card_type::ARTIFACT_SUBTYPES {
+            let line = format!("Enchant creature or {subtype}");
+            let kw = super::try_parse_multi_type_enchant(&line)
+                .unwrap_or_else(|| panic!("\"{}\" should parse", line));
+            let Keyword::Enchant(TargetFilter::Or { filters }) = kw else {
+                panic!("expected Or for {subtype}");
+            };
+            assert_eq!(filters.len(), 2);
+            let TargetFilter::Typed(tf) = &filters[1] else {
+                panic!("expected Typed artifact subtype leg for {subtype}");
+            };
+            assert_eq!(
+                tf.type_filters,
+                vec![TypeFilter::Subtype((*subtype).to_string())]
+            );
+        }
+
+        assert!(
+            super::try_parse_multi_type_enchant("Enchant creature or Goblin").is_none(),
+            "creature subtypes must not be accepted as artifact enchant target legs"
+        );
     }
 
     // ── Cumulative upkeep display (CR 702.24a) ──

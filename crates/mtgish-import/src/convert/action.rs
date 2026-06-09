@@ -262,6 +262,7 @@ fn rewrite_bound_x_in_quantity_expr(expr: &mut QuantityExpr, binding: &QuantityE
         }
         QuantityExpr::Fixed { .. } | QuantityExpr::Ref { .. } => 0,
         QuantityExpr::DivideRounded { inner, .. }
+        | QuantityExpr::ClampMin { inner, .. }
         | QuantityExpr::Offset { inner, .. }
         | QuantityExpr::Multiply { inner, .. }
         | QuantityExpr::UpTo { max: inner }
@@ -316,6 +317,7 @@ fn rewrite_bound_x_in_mana_production(
         | ManaProduction::ChoiceAmongExiledColors { .. }
         | ManaProduction::ChoiceAmongCombinations { .. }
         | ManaProduction::DistinctColorsAmongPermanents { .. }
+        | ManaProduction::AnyOneColorAmongPermanents { .. }
         | ManaProduction::TriggerEventManaType => 0,
     }
 }
@@ -369,6 +371,8 @@ fn rewrite_bound_x_in_ability_cost(cost: &mut AbilityCost, binding: &QuantityExp
         | AbilityCost::Loyalty { .. }
         | AbilityCost::Sacrifice { .. }
         | AbilityCost::Exile { .. }
+        // CR 702.167a/b: Craft materials carry no X-bound quantity.
+        | AbilityCost::ExileMaterials { .. }
         | AbilityCost::CollectEvidence { .. }
         | AbilityCost::TapCreatures { .. }
         | AbilityCost::RemoveCounter { .. }
@@ -2306,7 +2310,7 @@ fn convert_many_with_bindings(a: &Action, bindings: &VariableBindings) -> ConvRe
                     target: TargetFilter::Controller,
                     card_filter: filter_mod::cards_to_filter(cards)?,
                     count: None,
-                    random: false,
+                    selection: engine::types::ability::CardSelectionMode::Chosen,
                     choice_optional: false,
                 },
                 Effect::DiscardCard {
@@ -2335,7 +2339,7 @@ fn convert_many_with_bindings(a: &Action, bindings: &VariableBindings) -> ConvRe
                     target: TargetFilter::Controller,
                     card_filter: filter_mod::cards_to_filter(cards)?,
                     count: None,
-                    random: false,
+                    selection: engine::types::ability::CardSelectionMode::Chosen,
                     choice_optional: false,
                 },
                 Effect::ChangeZone {
@@ -2345,10 +2349,11 @@ fn convert_many_with_bindings(a: &Action, bindings: &VariableBindings) -> ConvRe
                     owner_library: false,
                     enter_transformed: false,
                     enters_under: None,
-                    enter_tapped: false,
+                    enter_tapped: engine::types::zones::EtbTapState::Unspecified,
                     enters_attacking: false,
                     up_to: false,
                     enter_with_counters: vec![],
+                    face_down_profile: None,
                 },
             ])
         }
@@ -2374,10 +2379,11 @@ fn convert_many_with_bindings(a: &Action, bindings: &VariableBindings) -> ConvRe
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             };
             let return_ability = AbilityDefinition::new(AbilityKind::Spell, return_effect);
             Ok(vec![
@@ -2388,10 +2394,11 @@ fn convert_many_with_bindings(a: &Action, bindings: &VariableBindings) -> ConvRe
                     owner_library: false,
                     enter_transformed: false,
                     enters_under: None,
-                    enter_tapped: false,
+                    enter_tapped: engine::types::zones::EtbTapState::Unspecified,
                     enters_attacking: false,
                     up_to: false,
                     enter_with_counters: vec![],
+                    face_down_profile: None,
                 },
                 Effect::CreateDelayedTrigger {
                     condition,
@@ -2764,6 +2771,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             filter: TargetFilter::Any,
             rest_destination: None,
             reveal: false,
+            enter_tapped: false,
         },
 
         // CR 701.20e + CR 608.2c: "Look at the top N cards of your library.
@@ -2816,10 +2824,11 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         },
         Action::ExileAPermanent(filter) => Effect::ChangeZone {
             origin: Some(engine::types::zones::Zone::Battlefield),
@@ -2828,10 +2837,11 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         },
 
         // CR 701.13 + CR 400.7: Mass exile — "Exile each <filter>"
@@ -2846,10 +2856,11 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         },
 
         // CR 701.13a + CR 400.3: "Exile target player's graveyard" moves the
@@ -2867,10 +2878,11 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             }
         }
 
@@ -2971,10 +2983,11 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         },
 
         // CR 400.7: Mass return-from-graveyard-to-hand — "Return each <filter>
@@ -2990,10 +3003,11 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         },
 
         // CR 400.7 + CR 614.12: Mass reanimate from a specific player's
@@ -3022,6 +3036,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
                 enters_attacking: r.enters_attacking,
                 up_to: false,
                 enter_with_counters: r.enter_with_counters,
+                face_down_profile: None,
             }
         }
 
@@ -3046,6 +3061,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
                 enters_attacking: r.enters_attacking,
                 up_to: false,
                 enter_with_counters: r.enter_with_counters,
+                face_down_profile: None,
             }
         }
 
@@ -3225,10 +3241,11 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         },
 
         // CR 122.1: Mass counter placement — "Put a [counter] on each
@@ -3444,6 +3461,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
                 enters_attacking: r.enters_attacking,
                 up_to: false,
                 enter_with_counters: r.enter_with_counters,
+                face_down_profile: None,
             }
         }
 
@@ -3459,10 +3477,11 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         },
 
         // CR 111.1 + CR 111.5: Token creation with attached `TokenFlag`s.
@@ -3580,7 +3599,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
             target: TargetFilter::Controller,
             card_filter: TargetFilter::Any,
             count: None,
-            random: false,
+            selection: engine::types::ability::CardSelectionMode::Chosen,
             choice_optional: false,
         },
 
@@ -3647,7 +3666,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
                 },
             },
             target: TargetFilter::Controller,
-            random: false,
+            selection: engine::types::ability::CardSelectionMode::Chosen,
             unless_filter: None,
             filter: None,
         },
@@ -3672,6 +3691,7 @@ pub fn convert(a: &Action) -> ConvResult<Effect> {
                 enters_attacking: r.enters_attacking,
                 up_to: false,
                 enter_with_counters: r.enter_with_counters,
+                face_down_profile: None,
             }
         }
 
@@ -4348,6 +4368,7 @@ fn convert_look_at_top(
             filter: TargetFilter::Any,
             rest_destination: None,
             reveal: false,
+            enter_tapped: false,
         }),
 
         // Brainstorm-style "put one into your hand and the rest on the
@@ -4365,6 +4386,7 @@ fn convert_look_at_top(
                 filter: TargetFilter::Any,
                 rest_destination: Some(Zone::Library),
                 reveal: false,
+                enter_tapped: false,
             })
         }
 
@@ -4381,6 +4403,7 @@ fn convert_look_at_top(
                 filter: TargetFilter::Any,
                 rest_destination: None,
                 reveal: false,
+                enter_tapped: false,
             })
         }
 
@@ -4400,6 +4423,7 @@ fn convert_look_at_top(
                 filter: filter_mod::cards_to_filter(cards)?,
                 rest_destination: Some(Zone::Library),
                 reveal: true,
+                enter_tapped: false,
             })
         }
 
@@ -4415,6 +4439,7 @@ fn convert_look_at_top(
                 filter: filter_mod::cards_to_filter(cards)?,
                 rest_destination: Some(Zone::Graveyard),
                 reveal: true,
+                enter_tapped: false,
             })
         }
 
@@ -4473,6 +4498,7 @@ fn convert_reveal_top_dig(
                 filter: filter_mod::cards_to_filter(cards)?,
                 rest_destination: None,
                 reveal: true,
+                enter_tapped: false,
             })
         }
         [RevealTheTopNumberCardsOfLibraryAction::PutACardOfTypeIntoHand(cards), RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsIntoGraveyard] => {
@@ -4485,6 +4511,7 @@ fn convert_reveal_top_dig(
                 filter: filter_mod::cards_to_filter(cards)?,
                 rest_destination: None,
                 reveal: true,
+                enter_tapped: false,
             })
         }
         [RevealTheTopNumberCardsOfLibraryAction::PutAGenericCardIntoHand, RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsIntoGraveyard] => {
@@ -4497,6 +4524,7 @@ fn convert_reveal_top_dig(
                 filter: TargetFilter::Any,
                 rest_destination: None,
                 reveal: true,
+                enter_tapped: false,
             })
         }
         [RevealTheTopNumberCardsOfLibraryAction::MayPutACardOfTypeIntoHand(cards), RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsOnTheBottomOfLibraryInAnyOrder]
@@ -4510,6 +4538,7 @@ fn convert_reveal_top_dig(
                 filter: filter_mod::cards_to_filter(cards)?,
                 rest_destination: Some(Zone::Library),
                 reveal: true,
+                enter_tapped: false,
             })
         }
         [RevealTheTopNumberCardsOfLibraryAction::PutACardOfTypeIntoHand(cards), RevealTheTopNumberCardsOfLibraryAction::PutTheRemainingCardsOnTheBottomOfLibraryInAnyOrder]
@@ -4523,6 +4552,7 @@ fn convert_reveal_top_dig(
                 filter: filter_mod::cards_to_filter(cards)?,
                 rest_destination: Some(Zone::Library),
                 reveal: true,
+                enter_tapped: false,
             })
         }
         _ => Err(prereq(format!(
@@ -5468,14 +5498,14 @@ fn apply_player_target(effect: Effect, target_filter: TargetFilter) -> ConvResul
         Effect::RevealHand {
             card_filter,
             count,
-            random,
+            selection,
             choice_optional,
             ..
         } => Effect::RevealHand {
             target: target_filter,
             card_filter,
             count,
-            random,
+            selection,
             choice_optional,
         },
         // CR 701.10 + CR 115.2: "Target player exiles the top N cards
@@ -6122,6 +6152,7 @@ fn convert_search_library(actions: &[SearchLibraryAction]) -> ConvResult<Vec<Eff
         enters_attacking: enter_repls.enters_attacking,
         up_to: false,
         enter_with_counters: enter_repls.enter_with_counters,
+        face_down_profile: None,
     });
     if shuffle {
         out.push(Effect::Shuffle {
@@ -6185,6 +6216,7 @@ fn convert_multi_filter_search_library(
             enters_attacking: enter_repls.enters_attacking,
             up_to: false,
             enter_with_counters: enter_repls.enter_with_counters.clone(),
+            face_down_profile: None,
         });
     }
     if shuffle {
@@ -6230,7 +6262,7 @@ fn group_filter_tag(group: &GroupFilter) -> String {
 #[derive(Debug, Default, Clone)]
 struct EnterReplacements {
     /// CR 614.1: Object enters tapped.
-    enter_tapped: bool,
+    enter_tapped: engine::types::zones::EtbTapState,
     /// CR 110.2a: Object enters under the ability controller's control
     /// (rather than its owner's). Local bool carrier — mapped at the
     /// `Effect::ChangeZone` boundary via
@@ -6272,7 +6304,7 @@ fn extract_enter_replacements(
     for r in repls {
         match r {
             R::EntersNormally | R::EntersUnderOwnersControl => {}
-            R::EntersTapped => out.enter_tapped = true,
+            R::EntersTapped => out.enter_tapped = engine::types::zones::EtbTapState::Tapped,
             R::EntersTransformed => out.enter_transformed = true,
             R::EntersAttacking => out.enters_attacking = true,
             R::EntersWithACounter(ct) => {
@@ -6720,8 +6752,8 @@ mod tests {
                 cost: AbilityCost::Discard {
                     count: QuantityExpr::Fixed { value: 1 },
                     filter: None,
-                    random: false,
-                    self_ref: false,
+                    selection: engine::types::ability::CardSelectionMode::Chosen,
+                    self_scope: engine::types::ability::DiscardSelfScope::FromHand,
                 },
             }
         ));
@@ -7086,7 +7118,7 @@ mod tests {
             Effect::ChangeZone {
                 origin: Some(Zone::Library),
                 destination: Zone::Battlefield,
-                enter_tapped: true,
+                enter_tapped: engine::types::zones::EtbTapState::Tapped,
                 ..
             }
         ));
@@ -7124,7 +7156,7 @@ mod tests {
             &effects[1],
             Effect::ChangeZone {
                 destination: Zone::Battlefield,
-                enter_tapped: true,
+                enter_tapped: engine::types::zones::EtbTapState::Tapped,
                 ..
             }
         ));
@@ -7246,7 +7278,7 @@ mod tests {
             Effect::Discard {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::Any,
-                random: false,
+                selection: engine::types::ability::CardSelectionMode::Chosen,
                 unless_filter: None,
                 filter: None,
             },

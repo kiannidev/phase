@@ -9,7 +9,6 @@
 use std::str::FromStr;
 
 use crate::parser::oracle_nom::error::{OracleError, OracleResult};
-use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till1, take_until};
 use nom::combinator::{all_consuming, eof, opt, peek, value};
 use nom::multi::separated_list1;
@@ -4613,6 +4612,14 @@ mod tests {
                 other => panic!("expected ZoneCardCount segment, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn zone_card_filter_list_named_before_type_is_order_independent() {
+        let (_, filter) =
+            parse_zone_card_that_are_filter_list("named Slime Against Humanity or are Oozes")
+                .expect("reversed filter order must parse");
+        assert_slime_against_humanity_filter(&filter);
     }
 
     /// Slime Against Humanity: cards-with-filter suffix after zone list.

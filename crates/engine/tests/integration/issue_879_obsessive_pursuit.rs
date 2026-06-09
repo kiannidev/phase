@@ -2,7 +2,7 @@
 //! turn, still triggers at X = 0, and grants lifelink when X >= 3.
 
 use engine::game::scenario::{GameScenario, P0, P1};
-use engine::types::ability::TargetRef;
+use engine::types::ability::{TargetFilter, TargetRef};
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::game_state::WaitingFor;
@@ -89,6 +89,24 @@ fn issue_879_obsessive_pursuit_puts_counters_and_lifelink_after_three_sacrifices
         p1p1_counters(&runner, attacker),
         3,
         "Obsessive Pursuit must put X +1/+1 counters where X is sacrifices this turn"
+    );
+    assert!(
+        runner
+            .state()
+            .transient_continuous_effects
+            .iter()
+            .any(|effect| {
+                effect.affected == TargetFilter::SpecificObject { id: attacker }
+                    && effect.modifications.iter().any(|modification| {
+                        matches!(
+                            modification,
+                            engine::types::ability::ContinuousModification::AddKeyword {
+                                keyword: Keyword::Lifelink
+                            }
+                        )
+                    })
+            }),
+        "Obsessive Pursuit must register a lifelink transient effect for the targeted creature"
     );
 
     let mut events = Vec::new();

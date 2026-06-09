@@ -1150,6 +1150,12 @@ pub fn evaluate_layers(state: &mut GameState) {
     let bf_ids: Vec<ObjectId> = state.battlefield.iter().copied().collect();
     for &id in &bf_ids {
         if let Some(obj) = state.objects.get_mut(&id) {
+            // CR 702.26c: Phased-out permanents are treated as though they don't
+            // exist — skip the Step-1 reset so their derived state isn't wiped
+            // while their continuous-effect sources are offline (CR 702.26e).
+            if obj.is_phased_out() {
+                continue;
+            }
             obj.sync_missing_base_characteristics();
             obj.name = obj.base_name.clone();
             obj.power = obj.base_power;

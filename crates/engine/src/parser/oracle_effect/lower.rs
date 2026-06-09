@@ -4727,6 +4727,20 @@ pub(super) fn apply_where_x_quantity_expression(
     where_x_expression: Option<&str>,
 ) -> QuantityExpr {
     match value {
+        // CR 107.3i: Generic "X is N or more" condition parsing defaults to
+        // CostXPaid for X-cost spells, but a surrounding "where X is ..." clause
+        // is the more specific binding and must own every X reference in the
+        // ability, including later-sentence rider conditions.
+        QuantityExpr::Ref {
+            qty: QuantityRef::CostXPaid,
+        } if where_x_expression.is_some() => {
+            let expression = where_x_expression.expect("checked is_some above");
+            parse_where_x_quantity_expression(expression).unwrap_or_else(|| QuantityExpr::Ref {
+                qty: QuantityRef::Variable {
+                    name: expression.to_string(),
+                },
+            })
+        }
         QuantityExpr::Ref {
             qty: QuantityRef::Variable { name },
         } if where_x_expression.is_some() && name.eq_ignore_ascii_case("X") => {

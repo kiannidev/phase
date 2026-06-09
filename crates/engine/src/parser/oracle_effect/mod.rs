@@ -34635,6 +34635,28 @@ mod tests {
     }
 
     #[test]
+    fn where_x_threshold_sub_ability_condition_uses_where_binding() {
+        let def = parse_effect_chain(
+            "put X +1/+1 counters on target attacking creature, where X is the number of permanents you've sacrificed this turn. If X is three or more, that creature gains lifelink until end of turn.",
+            AbilityKind::Triggered,
+        );
+        let sub = def.sub_ability.expect("expected conditional continuation");
+        assert_eq!(
+            sub.condition,
+            Some(AbilityCondition::QuantityCheck {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::SacrificedThisTurn {
+                        player: PlayerScope::Controller,
+                        filter: TargetFilter::Typed(TypedFilter::permanent()),
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 3 },
+            })
+        );
+    }
+
+    #[test]
     fn parse_condition_text_non_comparison_returns_none() {
         assert!(parse_condition_text("the creature that is exiled").is_none());
     }

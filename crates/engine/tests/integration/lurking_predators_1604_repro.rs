@@ -242,7 +242,7 @@ fn lurking_predators_parsed_trigger_chain_shape() {
         .as_ref()
         .expect("RevealTop must chain to conditional sub");
     assert!(matches!(
-        conditional.condition,
+        conditional.condition.as_ref(),
         Some(AbilityCondition::RevealedHasCardType {
             card_types,
             ..

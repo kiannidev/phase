@@ -34640,7 +34640,7 @@ mod tests {
     fn where_x_threshold_sub_ability_condition_uses_where_binding() {
         let def = parse_effect_chain(
             "put X +1/+1 counters on target attacking creature, where X is the number of permanents you've sacrificed this turn. If X is three or more, that creature gains lifelink until end of turn.",
-            AbilityKind::Triggered,
+            AbilityKind::Spell,
         );
         let sub = def.sub_ability.expect("expected conditional continuation");
         assert_eq!(

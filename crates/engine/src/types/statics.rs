@@ -1751,7 +1751,11 @@ impl fmt::Display for StaticMode {
             }
             StaticMode::EmblemStatic => write!(f, "EmblemStatic"),
             StaticMode::BlockRestriction { filter } => {
-                write!(f, "BlockRestriction:Quality({filter:?})")
+                if *filter == block_only_creatures_with_flying_filter() {
+                    write!(f, "BlockRestriction")
+                } else {
+                    write!(f, "BlockRestriction:Quality({filter:?})")
+                }
             }
             StaticMode::NoMaximumHandSize => write!(f, "NoMaximumHandSize"),
             StaticMode::MaximumHandSize { modification } => {

@@ -71,13 +71,20 @@ fn filter_references_self(filter: &TargetFilter) -> bool {
 /// CR 109.5: "Whenever you cast a spell you don't own" — the spell's owner is
 /// an opponent even though its controller on the stack is you.
 fn strip_spell_not_owned_qualifier(payload: &str) -> (&str, bool) {
-    const SUFFIXES: &[&str] = &[" you don't own", " you do not own"];
-    for suffix in SUFFIXES {
-        if let Some(stripped) = payload.strip_suffix(suffix) {
-            return (stripped.trim(), true);
-        }
-    }
-    (payload, false)
+    let mut parser = alt((
+        terminated(
+            take_until(" you don't own"),
+            tag::<_, _, OracleError<'_>>(" you don't own"),
+        ),
+        terminated(
+            take_until(" you do not own"),
+            tag(" you do not own"),
+        ),
+    ));
+    parser
+        .parse(payload)
+        .map(|(body, _)| (body.trim(), true))
+        .unwrap_or((payload, false))
 }
 
 fn with_owner_scope(filter: TargetFilter, controller: ControllerRef) -> TargetFilter {

@@ -13,7 +13,7 @@ use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::combinator::{all_consuming, eof, opt, value};
 use nom::multi::separated_list1;
-use nom::sequence::{pair, preceded, terminated, tuple};
+use nom::sequence::{pair, preceded, terminated};
 use nom::Parser;
 
 use super::oracle_ir::context::ParseContext;
@@ -831,13 +831,13 @@ fn parse_sacrificed_permanents_this_turn_filter(input: &str) -> Option<(&str, Ta
     let (suffix_rest, type_text) = take_until::<_, _, OracleError<'_>>(" you")
         .parse(input)
         .ok()?;
-    let (rest, _) = tuple((
+    let (rest, _) = (
         tag::<_, _, OracleError<'_>>(" you"),
         opt(tag("'ve")),
         tag(" sacrificed this turn"),
-    ))
-    .parse(suffix_rest)
-    .ok()?;
+    )
+        .parse(suffix_rest)
+        .ok()?;
     if type_text.trim() == "permanents" {
         return Some((
             rest,

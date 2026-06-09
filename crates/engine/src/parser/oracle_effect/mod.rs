@@ -30654,8 +30654,7 @@ mod tests {
         assert_eq!(
             sub.condition,
             Some(AbilityCondition::RevealedHasCardType {
-                card_type: CoreType::Land,
-                alt_card_types: vec![],
+                card_types: vec![CoreType::Land],
                 additional_filter: None,
                 subtype_filter: None,
             })
@@ -30848,8 +30847,7 @@ mod tests {
                 assert!(matches!(*def.effect, Effect::RevealTop { .. }));
                 let sub = def.sub_ability.as_deref().unwrap();
                 assert!(sub.condition == Some(AbilityCondition::RevealedHasCardType {
-                    card_type: CoreType::Land,
-                    alt_card_types: vec![],
+                    card_types: vec![CoreType::Land],
                     additional_filter: None,
                     subtype_filter: None,
                 }));
@@ -30958,8 +30956,7 @@ mod tests {
             sub.condition,
             Some(AbilityCondition::Not {
                 condition: Box::new(AbilityCondition::RevealedHasCardType {
-                    card_type: CoreType::Land,
-                    alt_card_types: vec![],
+                    card_types: vec![CoreType::Land],
                     additional_filter: None,
                     subtype_filter: None,
                 }),
@@ -35984,8 +35981,7 @@ mod tests {
         assert_eq!(
             sub.condition,
             Some(AbilityCondition::RevealedHasCardType {
-                card_type: CoreType::Creature,
-                alt_card_types: vec![],
+                card_types: vec![CoreType::Creature],
                 additional_filter: Some(FilterProp::IsChosenCreatureType),
                 subtype_filter: None,
             }),
@@ -36119,7 +36115,7 @@ mod tests {
             .as_ref()
             .expect("conditional sub after Dig");
         let Some(AbilityCondition::RevealedHasCardType {
-            card_type: CoreType::Creature,
+            card_types,
             subtype_filter: Some(subtype_filter),
             ..
         }) = &sub.condition
@@ -36129,6 +36125,7 @@ mod tests {
                 sub.condition
             );
         };
+        assert_eq!(card_types.as_slice(), [CoreType::Creature]);
         let TargetFilter::Or { filters } = subtype_filter.as_ref() else {
             panic!("expected subtype Or filter, got {subtype_filter:?}");
         };
@@ -43589,8 +43586,7 @@ mod snapshot_tests {
         assert_eq!(
             put_land.condition,
             Some(AbilityCondition::RevealedHasCardType {
-                card_type: CoreType::Land,
-                alt_card_types: vec![],
+                card_types: vec![CoreType::Land],
                 additional_filter: None,
                 subtype_filter: None,
             })

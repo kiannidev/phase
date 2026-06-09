@@ -5102,8 +5102,7 @@ pub(crate) fn evaluate_condition(
         // trackers are populated, so existing reveal+rider cards keep their
         // pre-fix behavior.
         AbilityCondition::RevealedHasCardType {
-            card_type,
-            alt_card_types,
+            card_types,
             additional_filter,
             subtype_filter,
         } => {
@@ -5114,10 +5113,9 @@ pub(crate) fn evaluate_condition(
                 .copied();
             let type_matches = subject_id
                 .map(|id| {
-                    super::printed_cards::object_has_core_type(state, id, *card_type)
-                        || alt_card_types
-                            .iter()
-                            .any(|alt| super::printed_cards::object_has_core_type(state, id, *alt))
+                    card_types.iter().any(|card_type| {
+                        super::printed_cards::object_has_core_type(state, id, *card_type)
+                    })
                 })
                 .unwrap_or(false);
             // CR 205.3m: Match the revealed card's subtype against the subtype filter.
@@ -13484,8 +13482,7 @@ mod tests {
             PlayerId(0),
         );
         let land_cond = AbilityCondition::RevealedHasCardType {
-            card_type: CoreType::Land,
-            alt_card_types: vec![],
+            card_types: vec![CoreType::Land],
             additional_filter: None,
             subtype_filter: None,
         };
@@ -13585,8 +13582,7 @@ mod tests {
             PlayerId(0),
         )
         .condition(AbilityCondition::RevealedHasCardType {
-            card_type: CoreType::Land,
-            alt_card_types: vec![],
+            card_types: vec![CoreType::Land],
             additional_filter: None,
             subtype_filter: None,
         });

@@ -681,12 +681,9 @@ fn parse_if_revealed_card_type_conditional(text: &str) -> Option<(AbilityConditi
     if core_types.is_empty() {
         return None;
     }
-    let mut alt_types = core_types;
-    let primary = alt_types.remove(0);
     Some((
         AbilityCondition::RevealedHasCardType {
-            card_type: primary,
-            alt_card_types: alt_types,
+            card_types: core_types,
             additional_filter: None,
             subtype_filter: None,
         },
@@ -721,8 +718,7 @@ pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityConditio
         return (
             Some(maybe_negate(
                 AbilityCondition::RevealedHasCardType {
-                    card_type: CoreType::Creature,
-                    alt_card_types: vec![],
+                    card_types: vec![CoreType::Creature],
                     additional_filter: None,
                     subtype_filter: Some(Box::new(subtype_filter)),
                 },
@@ -776,8 +772,7 @@ pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityConditio
         return (
             Some(maybe_negate(
                 AbilityCondition::RevealedHasCardType {
-                    card_type,
-                    alt_card_types: vec![],
+                    card_types: vec![card_type],
                     additional_filter,
                     subtype_filter: None,
                 },
@@ -806,8 +801,7 @@ fn parse_its_a_type_condition(condition_text: &str) -> Option<AbilityCondition> 
     if let Some(subtype_filter) = parse_creature_subtype_type_tail(type_str) {
         return Some(maybe_negate(
             AbilityCondition::RevealedHasCardType {
-                card_type: CoreType::Creature,
-                alt_card_types: vec![],
+                card_types: vec![CoreType::Creature],
                 additional_filter: None,
                 subtype_filter: Some(Box::new(subtype_filter)),
             },
@@ -819,8 +813,7 @@ fn parse_its_a_type_condition(condition_text: &str) -> Option<AbilityCondition> 
     let card_type = CoreType::from_str(&capitalized).ok()?;
     Some(maybe_negate(
         AbilityCondition::RevealedHasCardType {
-            card_type,
-            alt_card_types: vec![],
+            card_types: vec![card_type],
             additional_filter: None,
             subtype_filter: None,
         },
@@ -2948,8 +2941,7 @@ pub(super) fn try_nom_condition_as_ability_condition(
             "nonland" => {
                 return Some(maybe_negate(
                     AbilityCondition::RevealedHasCardType {
-                        card_type: CoreType::Land,
-                        alt_card_types: vec![],
+                        card_types: vec![CoreType::Land],
                         additional_filter: None,
                         subtype_filter: None,
                     },
@@ -2966,8 +2958,7 @@ pub(super) fn try_nom_condition_as_ability_condition(
         if let Some(card_type) = card_type {
             return Some(maybe_negate(
                 AbilityCondition::RevealedHasCardType {
-                    card_type,
-                    alt_card_types: vec![],
+                    card_types: vec![card_type],
                     additional_filter: None,
                     subtype_filter: None,
                 },
@@ -2978,8 +2969,7 @@ pub(super) fn try_nom_condition_as_ability_condition(
         if let Some(subtype_filter) = parse_creature_subtype_type_tail(rest) {
             return Some(maybe_negate(
                 AbilityCondition::RevealedHasCardType {
-                    card_type: CoreType::Creature,
-                    alt_card_types: vec![],
+                    card_types: vec![CoreType::Creature],
                     additional_filter: None,
                     subtype_filter: Some(Box::new(subtype_filter)),
                 },
@@ -4558,8 +4548,7 @@ mod tests {
         assert_eq!(
             cond,
             Some(AbilityCondition::RevealedHasCardType {
-                card_type: CoreType::Instant,
-                alt_card_types: vec![CoreType::Sorcery],
+                card_types: vec![CoreType::Instant, CoreType::Sorcery],
                 additional_filter: None,
                 subtype_filter: None,
             })
@@ -4713,13 +4702,14 @@ mod tests {
             &mut ParseContext::default(),
         );
         let Some(AbilityCondition::RevealedHasCardType {
-            card_type: CoreType::Creature,
+            card_types,
             subtype_filter: Some(subtype_filter),
             ..
         }) = cond
         else {
             panic!("expected RevealedHasCardType creature subtype Or, got {cond:?}");
         };
+        assert_eq!(card_types, vec![CoreType::Creature]);
         let TargetFilter::Or { filters } = *subtype_filter else {
             panic!("expected subtype Or filter, got {subtype_filter:?}");
         };
@@ -4742,13 +4732,14 @@ mod tests {
             &mut ParseContext::default(),
         );
         let Some(AbilityCondition::RevealedHasCardType {
-            card_type: CoreType::Creature,
+            card_types,
             subtype_filter: Some(subtype_filter),
             ..
         }) = cond
         else {
             panic!("expected multi-subtype RevealedHasCardType, got {cond:?}");
         };
+        assert_eq!(card_types, vec![CoreType::Creature]);
         let TargetFilter::Or { filters } = *subtype_filter else {
             panic!("expected subtype Or filter");
         };
@@ -4761,13 +4752,14 @@ mod tests {
             "it's a kraken, leviathan, octopus, or serpent creature card",
         );
         let Some(AbilityCondition::RevealedHasCardType {
-            card_type: CoreType::Creature,
+            card_types,
             subtype_filter: Some(subtype_filter),
             ..
         }) = cond
         else {
             panic!("expected multi-subtype RevealedHasCardType, got {cond:?}");
         };
+        assert_eq!(card_types, vec![CoreType::Creature]);
         let TargetFilter::Or { filters } = *subtype_filter else {
             panic!("expected subtype Or filter");
         };

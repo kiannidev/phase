@@ -244,9 +244,9 @@ fn lurking_predators_parsed_trigger_chain_shape() {
     assert!(matches!(
         conditional.condition,
         Some(AbilityCondition::RevealedHasCardType {
-            card_type: CoreType::Creature,
+            card_types,
             ..
-        })
+        }) if card_types.as_slice() == [CoreType::Creature]
     ));
     assert!(matches!(
         *conditional.effect,

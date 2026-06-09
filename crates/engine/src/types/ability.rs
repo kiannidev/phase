@@ -10849,15 +10849,13 @@ pub enum AbilityCondition {
     /// for "creature card of the chosen type"). For "if it's a nonland card" patterns,
     /// wrap with `AbilityCondition::Not`.
     RevealedHasCardType {
-        card_type: CoreType,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        alt_card_types: Vec<CoreType>,
+        card_types: Vec<CoreType>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         additional_filter: Option<FilterProp>,
         /// CR 205.3m: Optional subtype constraint on the revealed card (e.g.
         /// Kenessos: "If it's a Kraken, Leviathan, Octopus, or Serpent
         /// creature card"). Evaluated against `last_revealed_ids` alongside
-        /// `card_type`.
+        /// `card_types`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subtype_filter: Option<Box<TargetFilter>>,
     },

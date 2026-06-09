@@ -83,6 +83,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
                 // Apply the followup continuation to the defs built so far.
                 if let Some(ref continuation) = clause_ir.followup_continuation {
                     apply_clause_continuation(&mut defs, continuation.clone(), kind);
+                    apply_where_x_to_latest_def(&mut defs, clause_ir.where_x_expression.as_deref());
                 }
                 true
             } else if let Some(ref special) = clause_ir.special {
@@ -350,6 +351,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
         // previous defs before building this clause's def.
         if let Some(ref continuation) = clause_ir.followup_continuation {
             apply_clause_continuation(&mut defs, continuation.clone(), kind);
+            apply_where_x_to_latest_def(&mut defs, clause_ir.where_x_expression.as_deref());
         }
 
         // ── Build AbilityDefinition from ClauseIr ──
@@ -593,6 +595,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
         // Apply intrinsic continuation after extending defs with current clause's defs.
         if let Some(ref continuation) = clause_ir.intrinsic_continuation {
             apply_clause_continuation(&mut defs, continuation.clone(), kind);
+            apply_where_x_to_latest_def(&mut defs, clause_ir.where_x_expression.as_deref());
         }
 
         // CR 608.2c: Advance the separating boundary for the next normal-path
@@ -4873,6 +4876,12 @@ pub(super) fn apply_where_x_effect_expression(
             PaymentCost::Mana { .. } | PaymentCost::AbilityCost { .. } => {}
         },
         _ => {}
+    }
+}
+
+fn apply_where_x_to_latest_def(defs: &mut [AbilityDefinition], where_x_expression: Option<&str>) {
+    if let Some(def) = defs.last_mut() {
+        apply_where_x_ability_expression(def, where_x_expression);
     }
 }
 

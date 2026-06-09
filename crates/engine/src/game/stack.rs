@@ -1,13 +1,13 @@
 use crate::types::ability::{
-    CastingPermission, ContinuousModification, Duration, Effect, EffectKind, KeywordAction,
-    ResolvedAbility, TargetFilter, TargetRef,
+    ContinuousModification, Duration, Effect, EffectKind, KeywordAction, ResolvedAbility,
+    TargetFilter, TargetRef,
 };
 use crate::types::card_type::CoreType;
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    CastingVariant, ExileLink, ExileLinkKind, GameState, StackEntry, StackEntryKind,
-    StackPaidSnapshot,
+    CastingVariant, ExileLink, ExileLinkKind, GameState, PendingCounterPostAction, StackEntry,
+    StackEntryKind, StackPaidSnapshot,
 };
 use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
@@ -100,7 +100,7 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
         Some(e) => e,
         None => return,
     };
-    state.stack_paid_facts.remove(&entry.id);
+    let paid_snapshot = state.stack_paid_facts.remove(&entry.id);
 
     // CR 113.3b: Activated keyword abilities (Equip / Crew / Saddle / Station)
     // resolve via their typed payload — they have no ResolvedAbility/targets
@@ -256,6 +256,75 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
         }
     }
 
+    // CR 702.140b-c: A mutating creature spell begins resolving. Mirror the
+    // Bestow illegal-target detection (above) — both run BEFORE the generic
+    // CR 608.2b fizzle check, because a mutating spell with an illegal target
+    // does NOT fizzle to the graveyard: it reverts to a plain creature spell and
+    // resolves (CR 702.140b). The LEGAL case diverts entirely:
+    //   * CR 702.140b — target illegal: revert to a plain creature spell and
+    //     continue resolving (falls through to the normal permanent-spell
+    //     battlefield entry below); the fizzle check is suppressed via
+    //     `mutate_reverted_at_resolution`.
+    //   * CR 702.140c — target legal: the spell does NOT enter the battlefield.
+    //     Instead it pauses for the controller's top/bottom choice;
+    //     `merge::handle_mutate_merge_choice` performs the merge.
+    let mut mutate_reverted_at_resolution = false;
+    if casting_variant == CastingVariant::Mutate {
+        let mutate_target = spell_targets.iter().find_map(|t| match t {
+            crate::types::ability::TargetRef::Object(id) => Some(*id),
+            _ => None,
+        });
+        // CR 608.2b + CR 702.140b: re-check the captured target is STILL legal at
+        // resolution — not merely present. A target that stopped being a creature,
+        // became Human, or changed owner is now illegal and the spell reverts to a
+        // plain creature spell. Re-evaluate against the SAME predicate the
+        // cast-offer / target-attachment path used (`casting::mutate_target_filter`)
+        // via the shared targeting/filter machinery so the two cannot drift.
+        let legal_target = mutate_target.filter(|&id| {
+            if !state.battlefield.contains(&id) {
+                return false;
+            }
+            let filter = super::casting::mutate_target_filter();
+            let ctx = super::filter::FilterContext::from_source_with_controller(
+                entry.id,
+                entry.controller,
+            );
+            super::filter::matches_target_filter(state, id, &filter, &ctx)
+        });
+        match legal_target {
+            Some(target_id) => {
+                // CR 702.140c: pause for the top/bottom choice. The merging spell
+                // (`entry.id`) has already been popped from the stack.
+                state.pending_mutate_merge = Some(crate::types::game_state::PendingMutateMerge {
+                    merging_id: entry.id,
+                    target_id,
+                    controller: entry.controller,
+                });
+                state.waiting_for = crate::types::game_state::WaitingFor::MutateMergeChoice {
+                    player: entry.controller,
+                    merging_id: entry.id,
+                    target_id,
+                };
+                events.push(GameEvent::StackResolved {
+                    object_id: entry.id,
+                });
+                state.current_trigger_event = None;
+                state.current_trigger_events.clear();
+                state.current_trigger_match_count = None;
+                state.die_result_this_resolution = None;
+                return;
+            }
+            None => {
+                // CR 702.140b: illegal target — revert to a plain creature spell
+                // and continue resolving via the normal battlefield-entry path.
+                // Suppress the fizzle check below so it does not route the spell to
+                // the graveyard (it is no longer a targeted mutating spell).
+                super::casting::revert_mutate_form(state, entry.id);
+                mutate_reverted_at_resolution = true;
+            }
+        }
+    }
+
     // CR 707.10: Expose the resolving stack entry so a `CopySpell` carried as
     // the spell's own effect (the Chain cycle's "you may copy this spell")
     // can copy itself even though `resolve_top` has already popped it off the
@@ -263,6 +332,7 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // optional copy decision is pending. Cleared at the start of the next
     // `resolve_top`.
     state.resolving_stack_entry = Some(entry.clone());
+    let resolution_start_phase = state.phase;
 
     // Only run targeting validation and effect execution when an ability exists.
     // Permanent spells with no spell ability (ability is None) skip straight to
@@ -272,7 +342,10 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
         // CR 702.103e: when a bestowed Aura reverted at the start of resolution,
         // suppress the fizzle check — the spell is no longer an Aura and proceeds
         // to resolve as a creature spell with no remaining target.
-        if !original_targets.is_empty() && !bestow_reverted_at_resolution {
+        if !original_targets.is_empty()
+            && !bestow_reverted_at_resolution
+            && !mutate_reverted_at_resolution
+        {
             let validated = validate_targets_in_chain(state, ability);
             let legal_targets = flatten_targets_in_chain(&validated);
             if targeting::check_fizzle(&original_targets, &legal_targets) {
@@ -282,7 +355,9 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                     // Aftermath, and Harmonize exile when leaving the stack
                     // for any reason, including fizzle. Escape (CR 702.138)
                     // has no such clause — escaped spells go to graveyard normally.
-                    let dest = if casting_variant.replaces_stack_to_graveyard_with_exile() {
+                    let dest = if casting_variant.replaces_stack_to_graveyard_with_exile()
+                        || object_exiles_instead_of_graveyard(state, entry.id)
+                    {
                         Zone::Exile
                     } else {
                         Zone::Graveyard
@@ -307,6 +382,25 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
         } else {
             execute_effect(state, ability, events);
         }
+    }
+
+    // CR 702.99a: Cipher — on-resolution hook. If the resolving spell carries
+    // `Keyword::Cipher`, is represented by a card, and its controller has a
+    // creature to host it, pause for the optional "exile this card encoded on a
+    // creature you control" choice. The card is held off the stack until the
+    // choice completes (mirroring the Mutate merge pause); the choice handler
+    // exiles+encodes on accept, or routes the card to its graveyard on decline.
+    // Skipped (resolution proceeds to graveyard normally) when there is no legal
+    // host. `is_spell` gates out triggered/activated stack entries.
+    if is_spell && super::cipher::begin_encode_choice(state, entry.id, entry.controller) {
+        events.push(GameEvent::StackResolved {
+            object_id: entry.id,
+        });
+        state.current_trigger_event = None;
+        state.current_trigger_events.clear();
+        state.current_trigger_match_count = None;
+        state.die_result_this_resolution = None;
+        return;
     }
 
     // CR 702.xxx: Paradigm (Strixhaven) — first-resolution hook. If the
@@ -360,15 +454,38 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
         false
     };
 
+    // CR 702.50a-b: Epic — on-resolve hook. If the resolving spell still
+    // carries `Keyword::Epic`, lock its controller out of casting spells for
+    // the rest of the game (CR 702.50b) and arm a RECURRING delayed triggered
+    // ability that copies the spell at the beginning of each of the
+    // controller's upkeeps (CR 702.50a). A copied spell that still has Epic
+    // also arms this effect when it resolves; Epic-generated copies do not
+    // recurse because `EpicCopy` strips `Keyword::Epic` before pushing them.
+    // The Epic spell itself takes the normal destination below (no override);
+    // that object is the prototype the upkeep copies clone.
+    if is_spell {
+        let has_epic = state.objects.get(&entry.id).is_some_and(|o| {
+            super::keywords::has_keyword(o, &crate::types::keywords::Keyword::Epic)
+        });
+        if has_epic {
+            if let Some(spell_ability) = ability.clone() {
+                super::effects::epic::arm_epic(state, entry.id, entry.controller, spell_ability);
+            }
+        }
+    }
+
     // CR 608.3: Determine destination zone for spells.
     if is_spell {
-        let end_the_turn_resolving_object = ability
-            .as_ref()
-            .is_some_and(|ability| matches!(ability.effect, Effect::EndTheTurn));
-        let dest = if end_the_turn_resolving_object {
-            // CR 724.1b: The "end the turn" procedure exiles every object on
-            // the stack, including the resolving object that `resolve_top`
-            // already popped before executing its effect.
+        let end_procedure_exiles_resolving_object = ability.as_ref().is_some_and(|ability| {
+            matches!(ability.effect, Effect::EndTheTurn)
+                || (matches!(ability.effect, Effect::EndCombatPhase)
+                    && resolution_start_phase.is_combat())
+        });
+        let dest = if end_procedure_exiles_resolving_object {
+            // CR 724.1b / CR 724.2b: The "end the turn" and "end the combat
+            // phase" procedures exile every object on the stack, including the
+            // resolving object that `resolve_top` already popped before
+            // executing its effect.
             Zone::Exile
         } else if paradigm_armed {
             // CR 702.xxx: Paradigm-armed spell exiles instead of going to
@@ -402,13 +519,15 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
             // instead of putting it anywhere else any time it would leave the stack.
             // Flashback only appears on instants/sorceries — unconditional exile is correct.
             Zone::Exile
-        } else if casting_variant.replaces_stack_to_graveyard_with_exile()
+        } else if (casting_variant.replaces_stack_to_graveyard_with_exile()
+            || object_exiles_instead_of_graveyard(state, entry.id))
             && !is_permanent_spell(state, entry.id)
         {
-            // CR 614.1a + CR 608.2n: Graveyard-cast permission riders that
-            // say "If a spell cast this way would be put into your graveyard,
-            // exile it instead" replace the normal non-permanent resolution
-            // destination. Permanent spells still resolve to the battlefield.
+            // CR 614.1a + CR 608.2n: Graveyard-cast permission riders ("If a
+            // spell cast this way would be put into your graveyard, exile it
+            // instead") and the per-object Invoke Calamity rider both replace the
+            // normal non-permanent resolution destination. Permanent spells still
+            // resolve to the battlefield.
             Zone::Exile
         } else if is_permanent_spell(state, entry.id) {
             // CR 608.3: Permanent spells enter the battlefield.
@@ -454,20 +573,16 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                     *enter_tapped = crate::types::proposed_event::EtbTapState::Tapped;
                 }
             }
-            // CR 712.14a + CR 310.11b: If this spell was cast via an
-            // ExileWithAltCost permission with `cast_transformed`, the
-            // permanent enters the battlefield transformed (resolving to its
-            // back face). Used by the Siege victory trigger.
+            // CR 712.14a + CR 310.11b: If this spell was finalized from an
+            // ExileWithAltCost permission with `cast_transformed`, the permanent
+            // enters the battlefield transformed (resolving to its back face).
+            // The finalized stack-paid snapshot is authoritative here; the
+            // mutable permission list is casting-time authorization, not
+            // resolution-time cast metadata.
             if let Some(obj) = state.objects.get(&entry.id) {
-                let cast_transformed = obj.casting_permissions.iter().any(|p| {
-                    matches!(
-                        p,
-                        CastingPermission::ExileWithAltCost {
-                            cast_transformed: true,
-                            ..
-                        }
-                    )
-                });
+                let cast_transformed = paid_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.cast_transformed);
                 if cast_transformed {
                     if let crate::types::proposed_event::ProposedEvent::ZoneChange {
                         enter_transformed,
@@ -483,7 +598,16 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                 // the ZoneChange ProposedEvent so Doubling-Season-class
                 // AddCounter replacements (CR 614.1a) see and modify them as
                 // the replacement pipeline runs.
-                let intrinsic = super::printed_cards::intrinsic_etb_counters(obj);
+                // CR 712.14a: For cast_transformed (Craft / ExileWithAltCost) the
+                // spell is on the stack with the front face but enters as the back
+                // face — read loyalty/defense from the back face directly so the
+                // replacement pipeline sees the correct counter count.
+                let intrinsic = match (cast_transformed, obj.back_face.as_ref()) {
+                    (true, Some(back)) => {
+                        super::printed_cards::intrinsic_face_counters(back.loyalty, back.defense)
+                    }
+                    _ => super::printed_cards::intrinsic_etb_counters(obj),
+                };
                 if !intrinsic.is_empty() {
                     if let crate::types::proposed_event::ProposedEvent::ZoneChange {
                         enter_with_counters,
@@ -612,12 +736,14 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                             // (e.g., saga lore counters per CR 714.3a, planeswalker
                             // intrinsic loyalty per CR 306.5b, battle intrinsic
                             // defense per CR 310.4b).
-                            super::engine_replacement::apply_etb_counters(
+                            if !super::engine_replacement::apply_etb_counters(
                                 state,
                                 object_id,
                                 &enter_with_counters,
                                 events,
-                            );
+                            ) {
+                                return;
+                            }
                             // CR 712.14a + CR 310.11b: Apply transformation if entering
                             // transformed (propagated from ExileWithAltCost permission).
                             if enter_transformed && to == Zone::Battlefield {
@@ -629,14 +755,16 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                                     }
                                 }
                             }
-                            // CR 702.162a + CR 712.11a + CR 712.13: MTMTE
-                            // puts the converted spell on the stack with its
-                            // back face up. A resolving DFC spell becomes a
-                            // permanent with the same face up; mark the
-                            // battlefield object transformed without swapping
-                            // faces again.
-                            if casting_variant == CastingVariant::MoreThanMeetsTheEye
-                                && to == Zone::Battlefield
+                            // CR 702.146b / CR 702.162a + CR 712.11a + CR
+                            // 712.13: Disturb and MTMTE put the spell on the
+                            // stack with its back face up. A resolving DFC
+                            // spell becomes a permanent with the same face up;
+                            // mark the battlefield object transformed without
+                            // swapping faces again.
+                            if matches!(
+                                casting_variant,
+                                CastingVariant::MoreThanMeetsTheEye | CastingVariant::Disturb
+                            ) && to == Zone::Battlefield
                             {
                                 let mut marked = false;
                                 if let Some(obj) = state.objects.get_mut(&object_id) {
@@ -659,9 +787,11 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                                 .map(|(_, ct, n)| (ct.clone(), *n))
                                 .collect();
                             if !pending.is_empty() {
-                                super::engine_replacement::apply_etb_counters(
+                                if !super::engine_replacement::apply_etb_counters(
                                     state, object_id, &pending, events,
-                                );
+                                ) {
+                                    return;
+                                }
                                 state
                                     .pending_etb_counters
                                     .retain(|(oid, _, _)| *oid != object_id);
@@ -950,6 +1080,14 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                         crate::types::ability::CastVariantPaid::Evoke,
                         state.turn_number,
                     ));
+                    // CR 702.74a + CR 611.2 + CR 604.1: install the ETB-sac on
+                    // the resolving permanent for granted evoke (keyword lived
+                    // on the spell, not the permanent). Idempotent no-op for
+                    // printed evoke (already baked into the card face by
+                    // `synthesize_evoke`); `process_triggers` later in
+                    // `run_post_action_pipeline` reads the live
+                    // `trigger_definitions` after the zone change buffers.
+                    crate::database::synthesis::ensure_evoke_etb_sac_trigger(obj);
                 }
             }
 
@@ -979,6 +1117,32 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                 if let Some(obj) = state.objects.get_mut(&entry.id) {
                     obj.cast_variant_paid = Some((
                         crate::types::ability::CastVariantPaid::Escape,
+                        state.turn_number,
+                    ));
+                }
+            }
+
+            // CR 702.117a: Surge-cast permanent is tagged so "if its surge cost
+            // was paid" ETB triggers (Reckless Bushwhacker, Tyrant of Valakut)
+            // can distinguish a surge cast from a hard-cast. The intervening-if
+            // re-checks at resolution (CR 603.4) and the marker must be present.
+            if casting_variant == CastingVariant::Surge {
+                if let Some(obj) = state.objects.get_mut(&entry.id) {
+                    obj.cast_variant_paid = Some((
+                        crate::types::ability::CastVariantPaid::Surge,
+                        state.turn_number,
+                    ));
+                }
+            }
+
+            // CR 702.137a: Spectacle-cast permanent is tagged so "if its
+            // spectacle cost was paid" ETB triggers (Rafter Demon) and
+            // "...instead" clauses (Rix Maadi Reveler) can distinguish a
+            // spectacle cast from a hard-cast.
+            if casting_variant == CastingVariant::Spectacle {
+                if let Some(obj) = state.objects.get_mut(&entry.id) {
+                    obj.cast_variant_paid = Some((
+                        crate::types::ability::CastVariantPaid::Spectacle,
                         state.turn_number,
                     ));
                 }
@@ -1041,6 +1205,17 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                         None,
                     );
                 }
+            }
+
+            // CR 702.109a: a dash-cast permanent gains haste and is returned to
+            // its owner's hand at the beginning of the next end step.
+            if casting_variant == CastingVariant::Dash {
+                crate::game::dash::install_dash_riders(state, entry.id, entry.controller);
+            }
+            // CR 702.152a: a blitz-cast permanent gains haste and a dies-draw
+            // trigger, and is sacrificed at the beginning of the next end step.
+            if casting_variant == CastingVariant::Blitz {
+                crate::game::blitz::install_blitz_riders(state, entry.id, entry.controller);
             }
         }
     }
@@ -1141,6 +1316,12 @@ fn resolve_keyword_action(
             if let Some(mount) = state.objects.get_mut(&mount_id) {
                 if mount.zone == Zone::Battlefield {
                     mount.is_saddled = true;
+                    // CR 702.171c: record the creatures that saddled this permanent.
+                    for creature_id in &paid_creature_ids {
+                        if !mount.saddled_by.contains(creature_id) {
+                            mount.saddled_by.push(*creature_id);
+                        }
+                    }
                 }
             }
             events.push(GameEvent::Saddled {
@@ -1167,14 +1348,26 @@ fn resolve_keyword_action(
                 .filter(|sc| sc.zone == Zone::Battlefield)
                 .map(|sc| sc.controller);
             if let (Some(controller), true) = (spacecraft_controller, counters_added > 0) {
-                effects::counters::add_counter_with_replacement(
+                if !effects::counters::add_counter_with_replacement(
                     state,
                     controller,
                     spacecraft_id,
                     CounterType::Generic("charge".to_string()),
                     counters_added,
                     events,
-                );
+                ) {
+                    effects::counters::stash_pending_counter_completion_with_actions(
+                        state,
+                        EffectKind::Station,
+                        spacecraft_id,
+                        vec![PendingCounterPostAction::RecordStationed {
+                            spacecraft_id,
+                            creature_id: paid_creature_id,
+                            counters_added,
+                        }],
+                    );
+                    return;
+                }
             }
             events.push(GameEvent::Stationed {
                 spacecraft_id,
@@ -1364,6 +1557,9 @@ fn observers_are_batch_safe(state: &GameState, plan: &effects::BatchPlan) -> boo
         let tc = GameEvent::TokenCreated {
             object_id: PROBE_ID,
             name: spec.characteristics.display_name.clone(),
+            // Synthetic batch-safety probe; the creating source is irrelevant to the
+            // observer-shape check, so reuse the probe sentinel id.
+            source_id: PROBE_ID,
         };
         for ev in [&zc, &tc] {
             // unclassified ∪ buckets matching keys_from_event(ev). The
@@ -1776,6 +1972,16 @@ fn group_key(state: &GameState, entry: &StackEntry) -> StackGroupKey {
 /// "spell that will enter the battlefield" from "non-permanent spell"
 /// (e.g., Sneak's CR 702.190b alongside-attacker placement, which applies
 /// only to permanent spells).
+/// CR 614.1a + CR 608.2n: True when a spell carries the per-object "exile
+/// instead of graveyard" rider (Invoke Calamity's free-cast spells). Read by the
+/// stack-resolution router to send the spell to exile when it leaves the stack.
+fn object_exiles_instead_of_graveyard(state: &GameState, object_id: ObjectId) -> bool {
+    state
+        .objects
+        .get(&object_id)
+        .is_some_and(|obj| obj.exile_from_stack_instead_of_graveyard)
+}
+
 pub(crate) fn is_permanent_spell(state: &GameState, object_id: ObjectId) -> bool {
     use crate::types::card_type::CoreType;
 
@@ -1817,10 +2023,11 @@ pub(crate) fn create_warp_delayed_trigger(
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         },
     )
     .sub_ability(AbilityDefinition::new(
@@ -1859,6 +2066,7 @@ pub(crate) fn create_warp_delayed_trigger(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::game_object::BackFaceData;
     use crate::game::zones::create_object;
     use crate::types::ability::{
         CostPaidObjectSnapshot, Effect, QuantityExpr, ResolvedAbility, TargetFilter, TargetRef,
@@ -1871,6 +2079,38 @@ mod tests {
 
     fn setup() -> GameState {
         GameState::new_two_player(42)
+    }
+
+    fn back_face_data(
+        name: &str,
+        core_type: CoreType,
+        loyalty: Option<u32>,
+        defense: Option<u32>,
+    ) -> BackFaceData {
+        let mut card_types = crate::types::card_type::CardType::default();
+        card_types.core_types.push(core_type);
+        BackFaceData {
+            name: name.to_string(),
+            power: None,
+            toughness: None,
+            loyalty,
+            defense,
+            card_types,
+            mana_cost: Default::default(),
+            keywords: vec![],
+            abilities: vec![],
+            trigger_definitions: Default::default(),
+            replacement_definitions: Default::default(),
+            static_definitions: Default::default(),
+            color: vec![],
+            printed_ref: None,
+            modal: None,
+            additional_cost: None,
+            strive_cost: None,
+            casting_restrictions: vec![],
+            casting_options: vec![],
+            layout_kind: None,
+        }
     }
 
     fn create_aura_on_stack(state: &mut GameState, target_id: ObjectId) -> ObjectId {
@@ -3240,10 +3480,11 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             },
             vec![],
             spell_id,
@@ -3287,10 +3528,11 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             },
             vec![TargetRef::Object(target_id)],
             spell_id,
@@ -4302,6 +4544,56 @@ mod tests {
             );
             // 5 resolutions × 2 (Doubling Season) = 10 Insect tokens.
             assert_eq!(token_ids(&state).len(), 10);
+        }
+
+        // §3.4 + CR 614.1a + CR 707.2 (issue #1511): a mandatory token-count
+        // doubler applies to a `CopyTokenOf` swap collapsed into the copy-prefix
+        // batch — each of the 5 self-copy resolutions creates one copy doubled
+        // to two, for 10 copy tokens. Locks in that routing copy-token creation
+        // through the `CreateToken` replacement pipeline doubles uniformly on
+        // the batched copy path without double-counting.
+        #[test]
+        fn mandatory_token_doubling_batches_and_doubles_copy_prefix() {
+            let mut state = setup();
+            add_lands(&mut state, 6); // 6 lands ⇒ the copy-instead branch fires.
+            let src = add_plain_creature_source(&mut state, "Scout", 1, 1);
+            let sub = copy_instead_sub(src, 6);
+
+            // Doubling Season: mandatory, controller-scoped token-count doubler.
+            let ds_id = create_object(
+                &mut state,
+                CardId(905),
+                PlayerId(0),
+                "Doubling Season".to_string(),
+                Zone::Battlefield,
+            );
+            {
+                let obj = state.objects.get_mut(&ds_id).unwrap();
+                obj.card_types.core_types.push(CoreType::Enchantment);
+                let repl = doubling_season_replacement();
+                Arc::make_mut(&mut obj.base_replacement_definitions).push(repl.clone());
+                obj.replacement_definitions.push(repl);
+            }
+            crate::types::game_state::TriggerIndex::rebuild_from_battlefield(&mut state);
+
+            push_token_triggers(
+                &mut state,
+                src,
+                insect_token_effect(),
+                Some(Box::new(sub)),
+                5,
+            );
+            resolve_to_empty_batched(&mut state);
+            // 5 copy resolutions × 2 (Doubling Season) = 10 "Scout" copy tokens.
+            let copies = state
+                .objects
+                .values()
+                .filter(|o| o.is_token && o.name == "Scout")
+                .count();
+            assert_eq!(
+                copies, 10,
+                "doubler must apply to each batched copy-token resolution (issue #1511)"
+            );
         }
 
         /// Push `n` identical untargeted Token triggers from `source_id`, each
@@ -6651,5 +6943,108 @@ mod tests {
         // entry resolves (mirrors the batched subject-count lifecycle).
         assert_eq!(state.die_result_this_resolution, None);
         assert_eq!(state.current_trigger_match_count, None);
+    }
+
+    /// CR 306.5b + CR 712.14a: A permanent spell cast transformed enters as its
+    /// back face, so the stack resolution path must seed loyalty counters from
+    /// that back face rather than the front-face spell object.
+    #[test]
+    fn cast_transformed_spell_seeds_back_face_loyalty_counters() {
+        let mut state = setup();
+        let spell_id = create_object(
+            &mut state,
+            CardId(623),
+            PlayerId(0),
+            "Front Creature".to_string(),
+            Zone::Stack,
+        );
+        {
+            let obj = state.objects.get_mut(&spell_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.back_face = Some(back_face_data(
+                "Back Planeswalker",
+                CoreType::Planeswalker,
+                Some(6),
+                None,
+            ));
+        }
+        state.stack_paid_facts.insert(
+            spell_id,
+            StackPaidSnapshot {
+                cast_transformed: true,
+                ..Default::default()
+            },
+        );
+        state.stack.push_back(StackEntry {
+            id: spell_id,
+            source_id: spell_id,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(623),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+
+        let mut events = Vec::new();
+        resolve_top(&mut state, &mut events);
+
+        let obj = &state.objects[&spell_id];
+        assert_eq!(obj.zone, Zone::Battlefield);
+        assert!(obj.transformed);
+        assert_eq!(obj.counters.get(&CounterType::Loyalty).copied(), Some(6));
+        assert_eq!(obj.loyalty, Some(6));
+    }
+
+    /// CR 310.4b + CR 712.14a: The same cast-transformed stack path must use the
+    /// back face's printed defense when the resolving back face is a battle.
+    #[test]
+    fn cast_transformed_spell_seeds_back_face_defense_counters() {
+        let mut state = setup();
+        let spell_id = create_object(
+            &mut state,
+            CardId(624),
+            PlayerId(0),
+            "Front Creature".to_string(),
+            Zone::Stack,
+        );
+        {
+            let obj = state.objects.get_mut(&spell_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.back_face = Some(back_face_data(
+                "Back Siege",
+                CoreType::Battle,
+                None,
+                Some(5),
+            ));
+        }
+        state.stack_paid_facts.insert(
+            spell_id,
+            StackPaidSnapshot {
+                cast_transformed: true,
+                ..Default::default()
+            },
+        );
+        state.stack.push_back(StackEntry {
+            id: spell_id,
+            source_id: spell_id,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(624),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+
+        let mut events = Vec::new();
+        resolve_top(&mut state, &mut events);
+
+        let obj = &state.objects[&spell_id];
+        assert_eq!(obj.zone, Zone::Battlefield);
+        assert!(obj.transformed);
+        assert_eq!(obj.counters.get(&CounterType::Defense).copied(), Some(5));
+        assert_eq!(obj.defense, Some(5));
     }
 }

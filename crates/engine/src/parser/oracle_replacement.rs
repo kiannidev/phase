@@ -1,10 +1,11 @@
 use std::str::FromStr;
 
-use crate::parser::oracle_nom::error::OracleError;
+use crate::parser::oracle_nom::error::{oracle_err, OracleError, OracleResult};
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::{char, multispace1};
 use nom::combinator::{all_consuming, eof, opt, peek, value};
+use nom::multi::separated_list1;
 use nom::sequence::{pair, preceded, terminated};
 use nom::Parser;
 
@@ -18,6 +19,7 @@ use super::oracle_nom::bridge::{nom_on_lower, split_once_on_lower};
 use super::oracle_nom::condition::{parse_attached_subject_target_filter, parse_inner_condition};
 use super::oracle_nom::duration::parse_duration;
 use super::oracle_nom::primitives as nom_primitives;
+use super::oracle_nom::target::parse_type_filter_word;
 use super::oracle_quantity::capitalize_first;
 use super::oracle_target::parse_type_phrase;
 use super::oracle_util::{
@@ -29,8 +31,9 @@ use crate::types::ability::{
     Comparator, ContinuousModification, ControllerRef, CopyManaValueLimit, DamageModification,
     DamageRedirectTarget, DamageTargetFilter, DamageTargetPlayerScope, Duration, Effect,
     FilterProp, ManaModification, ManaReplacementScope, PlayerFilter, PreventionAmount,
-    QuantityExpr, QuantityRef, ReplacementCondition, ReplacementDefinition, ReplacementMode,
-    ReplacementPlayerScope, StaticCondition, TargetFilter, TypeFilter, TypedFilter,
+    QuantityExpr, QuantityModification, QuantityRef, ReplacementCondition, ReplacementDefinition,
+    ReplacementMode, ReplacementPlayerScope, StaticCondition, TargetFilter, TypeFilter,
+    TypedFilter,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::mana::{ManaColor, ManaCost, ManaType};
@@ -463,14 +466,19 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
         }
     }
 
+    // --- Global counter-prohibition replacements: Solemnity class ---
+    if let Some(def) = parse_global_player_counter_prohibition(&lower, &text) {
+        return Some(def);
+    }
+    if let Some(def) = parse_global_object_counter_prohibition(&lower, &text) {
+        return Some(def);
+    }
+
     // --- Counter-prohibition replacement: "~ can't have counters put on it." ---
     // CR 614.6 + CR 614.7 + CR 122.1: A self-targeted counter-placement
     // prohibition. The proposed `AddCounter` event never happens
     // (CR 614.6 — "if an event is replaced, it never happens"). Melira's
-    // Keepers class. The Solemnity-class global variant (no player gets
-    // counters anywhere) lifts the SelfRef scope to a wider filter and is
-    // out of scope for this PR — the typed shape (Prevent + valid_card)
-    // composes cleanly for it.
+    // Keepers class.
     if let Some(def) = parse_no_counters_replacement(&norm_lower, &text) {
         return Some(def);
     }
@@ -621,10 +629,11 @@ fn parse_self_enters_pay_cost_replacement(
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         },
     );
 
@@ -1252,6 +1261,17 @@ fn find_copy_verb(norm_lower: &str) -> Option<(&str, &str, bool)> {
     Some((&norm_lower[..pos], &norm_lower[pos + len..], tapped))
 }
 
+/// CR 707.9 / CR 614.1c: whether `lower` contains a copy replacement verb
+/// ("enter as a copy of", "become a copy of", "enter tapped as a copy of").
+/// Used by the Priority 7 dispatcher to gate the copy-replacement first-pass so
+/// static / prevent lines never mis-route into the replacement parsers.
+///
+/// Intentionally takes UN-normalized lowercase: the copy verbs never contain the
+/// card name, so `~`-normalization is irrelevant to this check.
+pub(crate) fn find_copy_verb_present(lower: &str) -> bool {
+    find_copy_verb(lower).is_some()
+}
+
 /// Split the post-"enter as a copy of " remainder into (type_text, suffix, source_zone).
 /// Recognises both the battlefield form ("... on the battlefield, ...") and the
 /// graveyard forms ("... in a graveyard, ...", "... in any graveyard, ..."). The
@@ -1297,7 +1317,13 @@ fn split_on_clone_source_zone(after_copy: &str) -> Option<(&str, &str, Zone)> {
         let suffix = &after_copy[pos..];
         return Some((type_text, suffix, Zone::Battlefield));
     }
-    Some((after_copy, "", Zone::Battlefield))
+    // CR 614.1c: no zone phrase and no "except" clause — the whole post-`copy
+    // of` remainder is the type phrase. Drop the sentence-final period so the
+    // downstream `parse_type_phrase` leftover guard accepts plain
+    // controller-scoped filters like "a creature you control" (Mirror Image)
+    // or "an artifact or creature you control" (Waxen Shapethief), which carry
+    // no zone/except boundary to absorb the trailing punctuation.
+    Some((after_copy.trim_end_matches('.'), "", Zone::Battlefield))
 }
 
 /// Attach `FilterProp::InZone { zone }` to a filter produced by `parse_type_phrase`.
@@ -1768,6 +1794,7 @@ pub(crate) fn rewrite_variable_x_to_cost_x_paid(expr: &mut QuantityExpr) {
         QuantityExpr::Fixed { .. } => {}
         QuantityExpr::DivideRounded { inner, .. }
         | QuantityExpr::Offset { inner, .. }
+        | QuantityExpr::ClampMin { inner, .. }
         | QuantityExpr::Multiply { inner, .. } => rewrite_variable_x_to_cost_x_paid(inner),
         QuantityExpr::Sum { exprs } => {
             for inner in exprs {
@@ -1926,7 +1953,12 @@ fn parse_enters_with_counters(
     // sibling shorthand "counters on it equal to [quantity]", parse the
     // dynamic expression.
     if let Ok((_, (_, qty_text))) = nom_primitives::split_once_on(work_text, "equal to ") {
-        let trimmed = qty_text.trim().trim_end_matches('.');
+        // The quantity phrase never spans a sentence boundary, so isolate the
+        // first sentence before parsing — Slumbering Trudge trails a separate
+        // "If X is 2 or less, it enters tapped." clause after "equal to three
+        // minus X.", which would otherwise leave the quantity parsers a dangling
+        // tail and force the `Fixed { 1 }` fallback (only 1 stun counter).
+        let trimmed = qty_text.split('.').next().unwrap_or(qty_text).trim();
         if let Some(qty_ref) = crate::parser::oracle_quantity::parse_quantity_ref(trimmed) {
             count_expr = QuantityExpr::Ref { qty: qty_ref };
         } else if let Some(qty) = crate::parser::oracle_quantity::parse_cda_quantity(trimmed) {
@@ -1935,11 +1967,24 @@ fn parse_enters_with_counters(
             crate::parser::oracle_quantity::parse_event_context_quantity(trimmed)
         {
             count_expr = qty;
+        } else if let Some((qty, rest_q)) = crate::parser::oracle_util::parse_count_expr(trimmed) {
+            // CR 107.3a: arithmetic over the cost variable ("three minus X").
+            // `parse_count_expr` emits `Variable("X")`; the rewrite below maps it
+            // to the entering object's `CostXPaid`. Require full consumption so a
+            // partial parse never silently truncates the quantity.
+            if rest_q.trim().is_empty() {
+                count_expr = qty;
+            }
         }
     }
     if let Some(qty) = parse_enters_with_where_x_suffix(work_text) {
         count_expr = qty;
     }
+    // CR 614.12: Any `Variable("X")` that survived the dynamic-quantity
+    // overrides above refers to the X paid on the *entering* object's cost, not
+    // a trigger-event source, so rewrite it to `CostXPaid` (idempotent —
+    // already-rewritten `CostXPaid` leaves are untouched).
+    rewrite_variable_x_to_cost_x_paid(&mut count_expr);
 
     let put_counter = build_enters_counter_ability(
         counter_entries.unwrap_or_else(|| vec![(counter_type, count_expr)]),
@@ -2777,13 +2822,14 @@ fn parse_creature_die_exile_replacement(
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 // CR 122.1 + CR 614.1c: enter_with_counters is populated when
                 // the anaphor clause carried a "with N <type> counter(s) on it"
                 // modifier. Empty otherwise.
                 enter_with_counters: anaphor.enter_with_counters,
+                face_down_profile: None,
             },
         );
         // CR 614.6: Trailing clauses (e.g., "and you gain 2 life", "and put a
@@ -3011,10 +3057,11 @@ fn self_die_exile_anaphor_execute(
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: anaphor.enter_with_counters,
+            face_down_profile: None,
         },
     );
     let continuation = anaphor.continuation.original.trim();
@@ -3130,10 +3177,11 @@ fn parse_graveyard_exile_replacement(
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         },
     );
 
@@ -3227,6 +3275,15 @@ fn parse_damage_modification_replacement(
 /// `tag("the next time ")` prefix combinator succeeding, never a string
 /// heuristic. Returns `None` (fall-through) when the prefix or grammar fails.
 pub(crate) fn parse_oneshot_damage_replacement(norm_lower: &str) -> Option<Effect> {
+    // CR 614.9: passive-voice one-shot redirection — "the next N damage that
+    // would be dealt to ~ this turn is dealt to <recipient> instead" (the en-Kor
+    // cycle). This "would be dealt to" (passive, recipient-first) spine is not
+    // covered by the active "the next time [source] would deal" grammar below,
+    // so try it first and fall through on mismatch.
+    if let Some(effect) = parse_oneshot_next_n_damage_to_self_redirect(norm_lower) {
+        return Some(effect);
+    }
+
     // CR 614.1a + CR 514.2: "the next time ... this turn" — a replacement effect
     // ("instead", CR 614.1a) with a "this turn" duration that ends at cleanup
     // (CR 514.2). The one-opportunity consumption is CR 614.5 (see resolver).
@@ -3281,6 +3338,7 @@ pub(crate) fn parse_oneshot_damage_replacement(norm_lower: &str) -> Option<Effec
             target_filter,
             modification: Some(modification),
             redirect_to: None,
+            redirect_amount: None,
             redirect_object_filter: None,
             recipient_object_filter,
         });
@@ -3300,6 +3358,7 @@ pub(crate) fn parse_oneshot_damage_replacement(norm_lower: &str) -> Option<Effec
             target_filter,
             modification: None,
             redirect_to: Some(redirect_to),
+            redirect_amount: None,
             redirect_object_filter,
             recipient_object_filter,
         });
@@ -3325,6 +3384,61 @@ pub(crate) fn parse_oneshot_damage_replacement(norm_lower: &str) -> Option<Effec
     }
 
     None
+}
+
+/// CR 614.9 + CR 614.5: Parse the en-Kor cycle's one-shot redirection —
+/// "the next N damage that would be dealt to ~ this turn is dealt to target
+/// creature you control instead" (Nomads / Lancers / Outrider / Shaman / Spirit
+/// / Warrior en-Kor). The original recipient is the source itself (`~`), encoded
+/// as `recipient_object_filter: SelfRef`: the resolver hosts the shield on the
+/// source with `valid_card: SelfRef` so it fires only on damage to it, and the
+/// targeting layer surfaces no slot for the self recipient. The redirect
+/// recipient is a chosen object target ("target creature you control"). The
+/// amount N is retained as a depletion-style redirection cap so only that much
+/// damage is moved to the chosen recipient.
+fn parse_oneshot_next_n_damage_to_self_redirect(norm_lower: &str) -> Option<Effect> {
+    let (rest, (_, amount, _)) = (
+        tag::<_, _, OracleError<'_>>("the next "),
+        nom_primitives::parse_number,
+        tag::<_, _, OracleError<'_>>(" damage that would be dealt to ~ this turn is dealt to "),
+    )
+        .parse(norm_lower)
+        .ok()?;
+
+    // CR 115.1: redirect recipient — "target creature you control" (every en-Kor
+    // card) or the looser "target creature"; both become a chosen object target.
+    let (rest, redirect_object_filter) = alt((
+        value(
+            inject_controller(
+                TargetFilter::Typed(TypedFilter::creature()),
+                ControllerRef::You,
+            ),
+            tag::<_, _, OracleError<'_>>("target creature you control"),
+        ),
+        value(
+            TargetFilter::Typed(TypedFilter::creature()),
+            tag("target creature"),
+        ),
+    ))
+    .parse(rest)
+    .ok()?;
+
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" instead").parse(rest).ok()?;
+    let (rest, _) = opt(char::<_, OracleError<'_>>('.')).parse(rest).ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+
+    Some(Effect::CreateDamageReplacement {
+        source_filter: None,
+        combat_scope: None,
+        target_filter: None,
+        modification: None,
+        redirect_to: Some(DamageRedirectTarget::ChosenObjectTarget),
+        redirect_amount: Some(PreventionAmount::Next(amount)),
+        redirect_object_filter: Some(redirect_object_filter),
+        recipient_object_filter: Some(TargetFilter::SelfRef),
+    })
 }
 
 /// Split the one-shot body at the "this turn[,]" boundary into the would-deal
@@ -4299,6 +4413,10 @@ fn parse_xorn_subtype_token_replacement(
             .condition(ReplacementCondition::TokenSubtypeMatches {
                 subtypes: vec![canonical_subtype],
             })
+            // CR 614.1a + CR 109.5: "If *you* would create..." scopes the
+            // replacement to the source's controller — it must not fire for
+            // tokens created by other players (issue #1967).
+            .token_owner_scope(ControllerRef::You)
             .additional_token_spec(spec)
             .description(original_text.to_string()),
     )
@@ -4375,6 +4493,10 @@ fn parse_manufactor_ensure_all_token_replacement(
             .condition(ReplacementCondition::TokenSubtypeMatches {
                 subtypes: condition_subtypes,
             })
+            // CR 614.1a + CR 109.5: "If *you* would create..." scopes the
+            // replacement to the source's controller — it must not fire for
+            // tokens created by other players (issue #1967).
+            .token_owner_scope(ControllerRef::You)
             .ensure_token_specs(specs)
             .description(original_text.to_string()),
     )
@@ -4419,7 +4541,7 @@ fn token_description_to_spec(
     token: &crate::parser::oracle_ir::ast::TokenDescription,
 ) -> Option<crate::types::proposed_event::TokenSpec> {
     use crate::types::ability::PtValue;
-    use crate::types::card_type::{CoreType, Supertype};
+    use crate::types::card_type::CoreType;
     use crate::types::proposed_event::TokenSpec;
 
     // Split parsed `types` into core_types vs subtypes by checking CoreType::from_str.
@@ -4461,7 +4583,9 @@ fn token_description_to_spec(
             toughness,
             core_types,
             subtypes,
-            supertypes: Vec::<Supertype>::new(),
+            // CR 205.4a: Carry parsed supertypes (legendary/snow) onto the
+            // appended-token spec rather than dropping them.
+            supertypes: token.supertypes.clone(),
             colors: token.colors.clone(),
             keywords: token.keywords.clone(),
         },
@@ -4534,6 +4658,78 @@ fn parse_counter_replacement(lower: &str, original_text: &str) -> Option<Replace
     }
 
     Some(def)
+}
+
+/// CR 614.17 + CR 614.6 + CR 122.1: Parse "Players can't get counters."
+/// into a global player-counter prohibition. The runtime models the "can't"
+/// event through `ReplacementEvent::AddCounter` with `valid_player` scope so
+/// player-counter effects are suppressed before mutating player state.
+fn parse_global_player_counter_prohibition(
+    lower: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    let mut combinator = all_consuming(terminated(
+        tag::<_, _, OracleError<'_>>("players can't get counters"),
+        opt(tag(".")),
+    ));
+    combinator.parse(lower.trim()).ok()?;
+
+    let mut def = ReplacementDefinition::new(ReplacementEvent::AddCounter)
+        .quantity_modification(QuantityModification::Prevent)
+        .description(original_text.to_string());
+    def.valid_player = Some(ReplacementPlayerScope::AnyPlayer);
+    Some(def)
+}
+
+/// CR 614.17 + CR 614.6 + CR 122.1: Parse global object-counter prohibitions
+/// such as "Counters can't be put on artifacts, creatures, enchantments, or
+/// lands." into an `AddCounter` prevention scoped to the named type list.
+fn parse_global_object_counter_prohibition(
+    lower: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    let mut combinator = all_consuming(terminated(
+        preceded(
+            tag::<_, _, OracleError<'_>>("counters can't be put on "),
+            separated_list1(
+                parse_counter_prohibition_type_separator,
+                parse_counter_prohibition_type,
+            ),
+        ),
+        opt(tag(".")),
+    ));
+    let (_rest, type_filters) = combinator.parse(lower.trim()).ok()?;
+    let type_filter = match type_filters.as_slice() {
+        [single] => single.clone(),
+        _ => TypeFilter::AnyOf(type_filters),
+    };
+
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::AddCounter)
+            .valid_card(attach_zone_to_filter(
+                TargetFilter::Typed(TypedFilter::new(type_filter)),
+                Zone::Battlefield,
+            ))
+            .quantity_modification(QuantityModification::Prevent)
+            .description(original_text.to_string()),
+    )
+}
+
+fn parse_counter_prohibition_type_separator(input: &str) -> OracleResult<'_, &str> {
+    alt((tag(", or "), tag(", "), tag(" or "))).parse(input)
+}
+
+fn parse_counter_prohibition_type(input: &str) -> OracleResult<'_, TypeFilter> {
+    let (rest, type_filter) = parse_type_filter_word(input)?;
+    match type_filter {
+        TypeFilter::Artifact
+        | TypeFilter::Creature
+        | TypeFilter::Enchantment
+        | TypeFilter::Land
+        | TypeFilter::Planeswalker
+        | TypeFilter::Battle => Ok((rest, type_filter)),
+        _ => Err(oracle_err(input)),
+    }
 }
 
 /// CR 122.1a + CR 614.1a: Extract the counter-type token named in a counter
@@ -4878,20 +5074,17 @@ fn parse_damage_prevention_replacement(
         || nom_primitives::scan_contains(working_lower, "deal to you")
     {
         Some(damage_target_controller())
-    } else if nom_primitives::scan_contains(working_lower, "dealt to target creature")
-        || nom_primitives::scan_contains(working_lower, "dealt to ~")
-        || nom_primitives::scan_contains(working_lower, "dealt to and dealt by ~")
-    {
+    } else if nom_primitives::scan_contains(working_lower, "dealt to target creature") {
         Some(DamageTargetFilter::CreatureOnly)
     } else {
         // "prevent all combat damage" with no target → any target
         None
     };
 
-    // CR 301.5 + CR 303.4 + CR 614.1a: Damage prevention scoped to the source's
+    // CR 301.5 + CR 303.4 + CR 615.1a: Damage prevention scoped to the source's
     // attached creature ("equipped creature" / "enchanted creature"). The dedicated
     // `DamageTargetFilter` enum can't express attachment relationships (it covers
-    // only player/creature type axes per CR 614.1a), so route through `valid_card`
+    // only player/creature type axes), so route through `valid_card`
     // — the runtime resolves `EquippedBy`/`EnchantedBy` against the source's own
     // `attached_to` (see `game/filter.rs` `FilterProp::EquippedBy`), correctly
     // scoping the shield to only the attached creature regardless of how many
@@ -4900,17 +5093,25 @@ fn parse_damage_prevention_replacement(
     // any target, which was the Multiclass Baldric / Inviolability / Artifact Ward
     // class of bug.
     let valid_card_filter: Option<TargetFilter> =
-        nom_primitives::scan_at_word_boundaries(working_lower, |input| {
-            preceded(
-                tag::<_, _, OracleError<'_>>("dealt to "),
-                terminated(
-                    parse_attached_subject_target_filter,
-                    alt((value((), eof), value((), multispace1), value((), tag(".")))),
-                ),
-            )
-            .parse(input)
-        })
-        .or_else(|| parse_damage_recipient_valid_card_filter(working_lower));
+        if nom_primitives::scan_contains(working_lower, "dealt to ~")
+            || nom_primitives::scan_contains(working_lower, "dealt to and dealt by ~")
+        {
+            // CR 615.1a: Self-scoped prevention ("If damage would be dealt to ~")
+            // must gate on `valid_card: SelfRef`, not a broad creature damage filter.
+            Some(TargetFilter::SelfRef)
+        } else {
+            nom_primitives::scan_at_word_boundaries(working_lower, |input| {
+                preceded(
+                    tag::<_, _, OracleError<'_>>("dealt to "),
+                    terminated(
+                        parse_attached_subject_target_filter,
+                        alt((value((), eof), value((), multispace1), value((), tag(".")))),
+                    ),
+                )
+                .parse(input)
+            })
+            .or_else(|| parse_damage_recipient_valid_card_filter(working_lower))
+        };
 
     // --- 4. Extract damage source filter ---
     let damage_source_filter = parse_damage_source_filter(working_lower);
@@ -5571,6 +5772,25 @@ mod tests {
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::keywords::Keyword;
 
+    #[test]
+    fn find_copy_verb_present_recognizes_copy_replacement() {
+        // CR 707.9 / CR 614.1c: copy replacement verbs are recognized.
+        assert!(find_copy_verb_present(
+            "you may have ~ enter as a copy of any creature on the battlefield"
+        ));
+        assert!(find_copy_verb_present("become a copy of target creature"));
+        // Static / prevent lines are NOT copy replacements.
+        assert!(!find_copy_verb_present(
+            "prevent all combat damage that would be dealt this turn"
+        ));
+        assert!(!find_copy_verb_present(
+            "if a source you control would deal damage to a permanent or player"
+        ));
+        assert!(!find_copy_verb_present(
+            "prevent all damage that would be dealt this turn unless its controller wins a clash"
+        ));
+    }
+
     /// CR 614.12 + CR 614.1a: Phial of Galadriel — "If you would gain life
     /// while you have 5 or less life, you gain twice that much life instead."
     /// The `while [condition]` clause in the antecedent must lift to a typed
@@ -5992,6 +6212,28 @@ mod tests {
         ));
     }
 
+    /// Anti-Venom self-scoped prevention must use `valid_card: SelfRef`, not `CreatureOnly`.
+    #[test]
+    fn anti_venom_self_prevention_uses_valid_card_self_ref() {
+        for text in [
+            "If damage would be dealt to ~, prevent that damage and put that many +1/+1 counters on him.",
+            "If damage would be dealt to and dealt by ~, prevent that damage and put that many +1/+1 counters on him.",
+        ] {
+            let def = parse_replacement_line(text, "Anti-Venom, Horrifying Healer")
+                .expect("Anti-Venom prevention should parse");
+
+            assert_eq!(
+                def.valid_card,
+                Some(TargetFilter::SelfRef),
+                "self-scoped prevention must gate on SelfRef: {text}"
+            );
+            assert!(
+                def.damage_target_filter.is_none(),
+                "must not use broad CreatureOnly damage_target_filter: {text}"
+            );
+        }
+    }
+
     /// CR 614.1a + CR 615.5 + CR 608.2c: Vigor — "If damage would be dealt to
     /// another creature you control, prevent that damage. Put a +1/+1 counter
     /// on that creature for each 1 damage prevented this way."
@@ -6014,7 +6256,6 @@ mod tests {
     /// 3. The rider count resolves to `QuantityRef::EventContextAmount` (the
     ///    prevented amount), via the existing `for each 1 damage prevented
     ///    this way` post-target suffix path.
-
     #[test]
     fn vigor_event_recipient_filter_and_counter_target_rewrite() {
         let def = parse_replacement_line(
@@ -7118,6 +7359,63 @@ mod tests {
         ));
     }
 
+    /// Issue #1988 — Slumbering Trudge. "This creature enters with a number of
+    /// stun counters on it equal to three minus X. If X is 2 or less, it enters
+    /// tapped." The "three minus X" arithmetic plus the trailing tapped sentence
+    /// previously defeated every quantity parser, so `count` fell back to
+    /// `Fixed { 1 }` (1 stun counter regardless of X). The count must be the
+    /// `Offset { Multiply { -1, CostXPaid }, 3 }` expression so X=0 resolves to
+    /// 3 stun counters (and X>3 clamps to 0 in the resolver).
+    #[test]
+    fn slumbering_trudge_enters_with_three_minus_x_stun_counters() {
+        let def = parse_replacement_line(
+            "This creature enters with a number of stun counters on it equal to \
+             three minus X. If X is 2 or less, it enters tapped.",
+            "Slumbering Trudge",
+        )
+        .unwrap();
+        assert_eq!(def.event, ReplacementEvent::Moved);
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+        let execute = def.execute.as_ref().expect("execute ability");
+        // "it enters tapped" → Tap wrapper with the counter as its sub_ability.
+        assert!(matches!(
+            *execute.effect,
+            Effect::Tap {
+                target: TargetFilter::SelfRef
+            }
+        ));
+        let sub = execute.sub_ability.as_ref().expect("counter sub_ability");
+        match &*sub.effect {
+            Effect::PutCounter {
+                counter_type,
+                count,
+                target,
+            } => {
+                assert_eq!(*counter_type, CounterType::Stun);
+                assert_eq!(*target, TargetFilter::SelfRef);
+                match count {
+                    QuantityExpr::Offset { inner, offset } => {
+                        assert_eq!(*offset, 3);
+                        match inner.as_ref() {
+                            QuantityExpr::Multiply { factor, inner } => {
+                                assert_eq!(*factor, -1);
+                                assert!(matches!(
+                                    inner.as_ref(),
+                                    QuantityExpr::Ref {
+                                        qty: QuantityRef::CostXPaid
+                                    }
+                                ));
+                            }
+                            other => panic!("expected Multiply{{-1, CostXPaid}}, got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected Offset{{.., 3}}, got {other:?}"),
+                }
+            }
+            other => panic!("expected PutCounter, got {other:?}"),
+        }
+    }
+
     #[test]
     fn self_enters_with_counters() {
         let def = parse_replacement_line(
@@ -7360,6 +7658,7 @@ mod tests {
                         zone: ZoneRef::Graveyard,
                         ref card_types,
                         scope: CountScope::Controller,
+                        filter: None,
                     }
                 },
                 target: TargetFilter::SelfRef,
@@ -7490,7 +7789,9 @@ mod tests {
             CounterType::Plus1Plus1,
             CounterType::Keyword(crate::types::keywords::KeywordKind::Flying),
             CounterType::Keyword(crate::types::keywords::KeywordKind::Deathtouch),
-            CounterType::Generic("shield".to_string()),
+            // CR 122.1c: "shield" is now a first-class counter type (issue #1959),
+            // no longer a Generic.
+            CounterType::Shield,
         ];
         for counter in expected {
             assert!(matches!(
@@ -7501,7 +7802,7 @@ mod tests {
                     target: TargetFilter::SelfRef,
                 } if *counter_type == counter
             ));
-            if counter == CounterType::Generic("shield".to_string()) {
+            if counter == CounterType::Shield {
                 assert!(cursor.sub_ability.is_none());
             } else {
                 cursor = cursor.sub_ability.as_deref().expect("next counter");
@@ -8946,6 +9247,96 @@ mod tests {
         }
     }
 
+    /// CR 707.9 + CR 614.1c: Mirror Image / Waxen Shapethief — "enter as a copy
+    /// of a creature you control" with no zone phrase and no except clause. The
+    /// controller-scoped filter must parse despite the sentence-final period
+    /// (previously left as `parse_type_phrase` leftover, dropping the clone).
+    #[test]
+    fn clone_creature_you_control_no_zone_phrase() {
+        let mirror = parse_replacement_line(
+            "You may have this creature enter as a copy of a creature you control.",
+            "Mirror Image",
+        )
+        .expect("Mirror Image clone should parse");
+        assert_eq!(mirror.event, ReplacementEvent::Moved);
+        match &*mirror.execute.as_ref().unwrap().effect {
+            Effect::BecomeCopy { target, .. } => match target {
+                TargetFilter::Typed(tf) => {
+                    assert!(tf.type_filters.contains(&TypeFilter::Creature));
+                    assert_eq!(
+                        tf.controller,
+                        Some(ControllerRef::You),
+                        "filter must be scoped to creatures you control",
+                    );
+                }
+                other => panic!("Expected Typed creature filter, got {other:?}"),
+            },
+            other => panic!("Expected BecomeCopy, got {other:?}"),
+        }
+
+        // Same class with a union filter (Waxen Shapethief) must also parse.
+        let waxen = parse_replacement_line(
+            "You may have this creature enter as a copy of an artifact or creature you control.",
+            "Waxen Shapethief",
+        )
+        .expect("Waxen Shapethief clone should parse");
+        assert_eq!(waxen.event, ReplacementEvent::Moved);
+        assert!(matches!(
+            &*waxen.execute.as_ref().unwrap().effect,
+            Effect::BecomeCopy { .. }
+        ));
+    }
+
+    /// CR 707.9a + CR 702.3: Wall of Stolen Identity — clone except adds Wall
+    /// subtype and defender via the "and has defender" shorthand.
+    #[test]
+    fn clone_wall_of_stolen_identity_except_defender() {
+        let def = parse_replacement_line(
+            "You may have this creature enter as a copy of any creature on the battlefield, \
+             except it's a Wall in addition to its other types and has defender. \
+             When you do, tap the copied creature and it doesn't untap during its controller's \
+             untap step for as long as you control this creature.",
+            "Wall of Stolen Identity",
+        )
+        .unwrap();
+        assert!(matches!(
+            def.mode,
+            ReplacementMode::Optional { decline: None }
+        ));
+        let execute = def.execute.as_ref().unwrap();
+        match &*execute.effect {
+            Effect::BecomeCopy {
+                additional_modifications,
+                ..
+            } => {
+                use crate::types::keywords::Keyword;
+                assert!(
+                    !additional_modifications.is_empty(),
+                    "expected except-clause modifications, got {additional_modifications:?}"
+                );
+                assert!(
+                    additional_modifications.iter().any(|m| {
+                        matches!(m, ContinuousModification::AddSubtype { subtype } if subtype == "Wall")
+                    }),
+                    "expected Wall subtype addition, got {additional_modifications:?}"
+                );
+                assert!(additional_modifications.iter().any(|m| {
+                    matches!(
+                        m,
+                        ContinuousModification::AddKeyword {
+                            keyword: Keyword::Defender
+                        }
+                    )
+                }));
+            }
+            other => panic!("expected BecomeCopy, got {other:?}"),
+        }
+        assert!(
+            execute.sub_ability.is_some(),
+            "When you do reflexive trigger should be sub_ability"
+        );
+    }
+
     #[test]
     fn clone_enchantment() {
         // Estrid's Invocation, Copy Enchantment
@@ -9427,6 +9818,52 @@ mod tests {
                 controller: Some(ControllerRef::You),
                 ..
             })) if type_filters == vec![TypeFilter::Creature]
+        ));
+    }
+
+    #[test]
+    fn solemnity_players_cant_get_counters_replacement() {
+        let def = parse_replacement_line("Players can't get counters.", "Solemnity")
+            .expect("Solemnity player-counter line must parse");
+        assert_eq!(def.event, ReplacementEvent::AddCounter);
+        assert_eq!(
+            def.quantity_modification,
+            Some(QuantityModification::Prevent)
+        );
+        assert_eq!(
+            def.valid_player,
+            Some(ReplacementPlayerScope::AnyPlayer),
+            "Solemnity must apply to every player, not only its controller"
+        );
+    }
+
+    #[test]
+    fn solemnity_permanent_types_cant_get_counters_replacement() {
+        let def = parse_replacement_line(
+            "Counters can't be put on artifacts, creatures, enchantments, or lands.",
+            "Solemnity",
+        )
+        .expect("Solemnity object-counter line must parse");
+        assert_eq!(def.event, ReplacementEvent::AddCounter);
+        assert_eq!(
+            def.quantity_modification,
+            Some(QuantityModification::Prevent)
+        );
+        assert!(matches!(
+            def.valid_card,
+            Some(TargetFilter::Typed(TypedFilter {
+                type_filters,
+                controller: None,
+                properties,
+                ..
+            })) if type_filters == vec![TypeFilter::AnyOf(vec![
+                TypeFilter::Artifact,
+                TypeFilter::Creature,
+                TypeFilter::Enchantment,
+                TypeFilter::Land,
+            ])] && properties == vec![FilterProp::InZone {
+                zone: Zone::Battlefield
+            }]
         ));
     }
 
@@ -10166,6 +10603,14 @@ mod tests {
             }
             other => panic!("Expected TokenSubtypeMatches, got {other:?}"),
         }
+        // CR 614.1a + CR 109.5: "If you would create..." is scoped to the
+        // source's controller, so the replacement must not fire for tokens
+        // created by other players (issue #1967).
+        assert_eq!(
+            def.token_owner_scope,
+            Some(ControllerRef::You),
+            "Xorn 'if you would create' must scope to the controller's tokens"
+        );
         let spec = def
             .additional_token_spec
             .as_ref()
@@ -10207,6 +10652,15 @@ mod tests {
             }
             other => panic!("Expected TokenSubtypeMatches, got {other:?}"),
         }
+
+        // CR 614.1a + CR 109.5: "If you would create..." is scoped to the
+        // source's controller, so the replacement must not fire for tokens
+        // created by other players (issue #1967).
+        assert_eq!(
+            def.token_owner_scope,
+            Some(ControllerRef::You),
+            "Manufactor 'if you would create' must scope to the controller's tokens"
+        );
 
         let specs = def
             .ensure_token_specs
@@ -10513,7 +10967,7 @@ mod snapshot_tests {
         assert!(
             matches!(
                 def.execute.as_deref().map(|a| &*a.effect),
-                Some(crate::types::ability::Effect::WinTheGame)
+                Some(crate::types::ability::Effect::WinTheGame { .. })
             ),
             "execute must be WinTheGame, got {:?}",
             def.execute
@@ -10527,6 +10981,7 @@ mod snapshot_tests {
                                 zone: crate::types::ability::ZoneRef::Library,
                                 ref card_types,
                                 scope: crate::types::ability::CountScope::Controller,
+                                filter: None,
                             },
                     },
                 comparator: Comparator::EQ,
@@ -10590,6 +11045,7 @@ mod snapshot_tests {
             Effect::CreateDamageReplacement {
                 modification: None,
                 redirect_to: Some(DamageRedirectTarget::ChosenObjectTarget),
+                redirect_amount: None,
                 source_filter: Some(TargetFilter::SelfRef),
                 combat_scope: Some(CombatDamageScope::CombatOnly),
                 target_filter: Some(DamageTargetFilter::Player { .. }),
@@ -10604,6 +11060,34 @@ mod snapshot_tests {
     }
 
     #[test]
+    fn oneshot_en_kor_next_n_damage_to_self_redirect() {
+        // The en-Kor cycle (Nomads / Lancers / Outrider / Shaman / Spirit /
+        // Warrior en-Kor): passive "the next N damage that would be dealt to ~"
+        // — the recipient is the source itself — redirected to a chosen creature
+        // you control.
+        let effect = parse_oneshot_damage_replacement(
+            "the next 1 damage that would be dealt to ~ this turn is dealt to target creature you control instead",
+        )
+        .expect("must parse the en-Kor one-shot redirection");
+        match effect {
+            Effect::CreateDamageReplacement {
+                modification: None,
+                redirect_to: Some(DamageRedirectTarget::ChosenObjectTarget),
+                redirect_amount: Some(PreventionAmount::Next(1)),
+                // CR 614.9: the recipient is the source itself (`~`), encoded as
+                // SelfRef so the resolver hosts the shield on the source.
+                recipient_object_filter: Some(TargetFilter::SelfRef),
+                // CR 115.1: "target creature you control" surfaces a redirect slot.
+                redirect_object_filter: Some(TargetFilter::Typed(_)),
+                source_filter: None,
+                combat_scope: None,
+                target_filter: None,
+            } => {}
+            other => panic!("expected en-Kor redirect-to-target, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn oneshot_redirect_to_source_passive_phrasing() {
         // Beacon of Destiny — passive "that damage is dealt to ~ instead".
         let effect = parse_oneshot_damage_replacement(
@@ -10614,6 +11098,7 @@ mod snapshot_tests {
             Effect::CreateDamageReplacement {
                 modification: None,
                 redirect_to: Some(DamageRedirectTarget::SourceObject),
+                redirect_amount: None,
                 source_filter: Some(TargetFilter::ChosenDamageSource),
                 ..
             } => {}
@@ -10632,6 +11117,7 @@ mod snapshot_tests {
             Effect::CreateDamageReplacement {
                 modification: None,
                 redirect_to: Some(DamageRedirectTarget::Controller),
+                redirect_amount: None,
                 source_filter: Some(TargetFilter::ChosenDamageSource),
                 // CR 614.9: "would deal damage to target creature" — the
                 // protected creature is a chosen original-recipient target, not
@@ -10656,6 +11142,7 @@ mod snapshot_tests {
             Effect::CreateDamageReplacement {
                 modification: None,
                 redirect_to: Some(DamageRedirectTarget::Controller),
+                redirect_amount: None,
                 source_filter: Some(TargetFilter::SelfRef),
                 combat_scope: Some(CombatDamageScope::CombatOnly),
                 ..

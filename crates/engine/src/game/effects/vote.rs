@@ -221,7 +221,20 @@ pub fn resolve_tally(
         let per_choice_player_scope = per_choice_effect[idx].player_scope.clone();
         let repeat_for = if per_choice_player_scope.is_some() {
             None
+        } else if per_choice_effect[idx]
+            .effect
+            .count_expr()
+            .is_some_and(QuantityExpr::contains_vote_count)
+        {
+            // CR 111.1 / CR 122.1 + CR 701.38 + CR 608.2c: aggregate-tally body
+            // (Emissary Green). Its count slot is bound to a
+            // `QuantityRef::VoteCount`, so the effect resolves as ONE aggregate
+            // event whose `resolve_ref` sums the full tally — do NOT repeat it
+            // per ballot, which would multiply the tally by itself.
+            None
         } else {
+            // Classic "For each <choice> vote, <effect>" (Tivit / Capital
+            // Punishment): the body has a fixed count and fires once per ballot.
             Some(QuantityExpr::Fixed {
                 value: *votes as i32,
             })
@@ -230,9 +243,11 @@ pub fn resolve_tally(
             effect: (*per_choice_effect[idx].effect).clone(),
             targets: Vec::new(),
             source_id,
+            source_incarnation: None,
             controller,
             original_controller: None,
             scoped_player: None,
+            target_chooser: None,
             kind: per_choice_effect[idx].kind,
             sub_ability: per_choice_effect[idx]
                 .sub_ability
@@ -295,9 +310,11 @@ fn resolved_from_def(
         effect: (*def.effect).clone(),
         targets: Vec::new(),
         source_id,
+        source_incarnation: None,
         controller,
         original_controller: None,
         scoped_player: None,
+        target_chooser: None,
         kind: def.kind,
         sub_ability: def
             .sub_ability
@@ -445,9 +462,11 @@ mod tests {
             },
             targets: vec![],
             source_id: ObjectId(1),
+            source_incarnation: None,
             controller,
             original_controller: None,
             scoped_player: None,
+            target_chooser: None,
             kind: AbilityKind::Spell,
             sub_ability: None,
             else_ability: None,
@@ -536,9 +555,11 @@ mod tests {
             },
             targets: vec![],
             source_id: ObjectId(1),
+            source_incarnation: None,
             controller,
             original_controller: None,
             scoped_player: None,
+            target_chooser: None,
             kind: AbilityKind::Spell,
             sub_ability: None,
             else_ability: None,
@@ -828,9 +849,11 @@ mod tests {
             effect: (*parsed_def.effect).clone(),
             targets: vec![],
             source_id: ObjectId(1),
+            source_incarnation: None,
             controller,
             original_controller: None,
             scoped_player: None,
+            target_chooser: None,
             kind: AbilityKind::Spell,
             sub_ability: None,
             else_ability: None,
@@ -976,9 +999,11 @@ mod tests {
             },
             targets: vec![],
             source_id,
+            source_incarnation: None,
             controller,
             original_controller: None,
             scoped_player: None,
+            target_chooser: None,
             kind: AbilityKind::Spell,
             sub_ability: None,
             else_ability: None,

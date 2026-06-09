@@ -7,8 +7,9 @@ use crate::types::counter::CounterType;
 use crate::types::events::{GameEvent, ManaTapState};
 use crate::types::game_state::{GameState, WaitingFor};
 use crate::types::identifiers::ObjectId;
+use crate::types::keywords::Keyword;
 use crate::types::player::PlayerId;
-use crate::types::proposed_event::ProposedEvent;
+use crate::types::proposed_event::{CounterPlacement, ProposedEvent};
 use crate::types::replacements::ReplacementEvent;
 use crate::types::zones::Zone;
 
@@ -22,8 +23,45 @@ use super::effects::mill::apply_mill_after_replacement;
 use super::effects::scry::apply_scry_after_replacement;
 use super::effects::token::apply_create_token_after_replacement;
 use super::engine::EngineError;
-use super::sacrifice::apply_sacrifice_after_replacement;
+use super::sacrifice::{apply_sacrifice_after_replacement, SacrificeApply};
 use super::zones;
+
+/// CR 614.13a + CR 702.82a/c: matches the broad as-enters shape of a Devour
+/// sacrifice replacement — a `Moved` (ETB-style) event whose post-effect is a
+/// `Sacrifice` over a `Typed`/`Any` scope filter (the chooser-driven "sacrifice
+/// any number of creatures/permanents" pool). This is a structural shape match,
+/// NOT a Devour-specific one: other `Moved + Sacrifice{Typed|Any}` replacements
+/// share it. Used both to suppress the source-as-pre-selected target injection
+/// and as the capture gate for the pre-entry eligible snapshot.
+/// (`ReplacementEvent` is Clone-not-Copy, so we borrow it.)
+pub(crate) fn is_as_enters_sacrifice_scope_replacement(
+    event: Option<&ReplacementEvent>,
+    effect: &Effect,
+) -> bool {
+    matches!(event, Some(ReplacementEvent::Moved))
+        && matches!(
+            effect,
+            Effect::Sacrifice {
+                target: TargetFilter::Typed(_) | TargetFilter::Any,
+                ..
+            }
+        )
+}
+
+/// CR 614.13a + CR 702.82a/c: true if `id`'s self-referential replacement
+/// definitions carry an as-enters Devour-shape sacrifice (see
+/// [`is_as_enters_sacrifice_scope_replacement`]). Capture gate for the
+/// pre-entry eligible snapshot in `deliver_replaced_zone_change`.
+pub(crate) fn object_has_devour_replacement(state: &GameState, id: ObjectId) -> bool {
+    state.objects.get(&id).is_some_and(|obj| {
+        obj.replacement_definitions.iter_all().any(|def| {
+            def.valid_card == Some(TargetFilter::SelfRef)
+                && def.execute.as_ref().is_some_and(|e| {
+                    is_as_enters_sacrifice_scope_replacement(Some(&def.event), &e.effect)
+                })
+        })
+    })
+}
 
 pub(super) fn handle_replacement_choice(
     state: &mut GameState,
@@ -72,7 +110,9 @@ pub(super) fn handle_replacement_choice(
                             );
                         }
                         // CR 614.1c: Apply counters from replacement pipeline.
-                        apply_etb_counters(state, object_id, &enter_with_counters, events);
+                        if !apply_etb_counters(state, object_id, &enter_with_counters, events) {
+                            return Ok(state.waiting_for.clone());
+                        }
                         // CR 614.1c: Apply pending ETB counters from delayed triggers
                         // (e.g., "that creature enters with an additional +1/+1 counter").
                         let pending: Vec<_> = state
@@ -82,7 +122,9 @@ pub(super) fn handle_replacement_choice(
                             .map(|(_, ct, n)| (ct.clone(), *n))
                             .collect();
                         if !pending.is_empty() {
-                            apply_etb_counters(state, object_id, &pending, events);
+                            if !apply_etb_counters(state, object_id, &pending, events) {
+                                return Ok(state.waiting_for.clone());
+                            }
                             state
                                 .pending_etb_counters
                                 .retain(|(oid, _, _)| *oid != object_id);
@@ -126,21 +168,35 @@ pub(super) fn handle_replacement_choice(
                 // CR 122.1: Counter addition accepted after replacement choice (e.g.,
                 // Corpsejack Menace doubler on a prompted counter-placement).
                 ProposedEvent::AddCounter {
-                    actor,
-                    object_id,
-                    counter_type,
-                    count,
-                    ..
-                } => {
-                    effects::counters::apply_counter_addition(
+                    placement, count, ..
+                } => match placement {
+                    CounterPlacement::Object {
+                        actor,
+                        object_id,
+                        counter_type,
+                    } => effects::counters::apply_counter_addition(
                         state,
                         actor,
                         object_id,
                         counter_type,
                         count,
                         events,
-                    );
-                }
+                    ),
+                    CounterPlacement::Player {
+                        player_id,
+                        counter_kind,
+                        ..
+                    } => effects::player_counter::apply_player_counter_addition(
+                        state,
+                        player_id,
+                        counter_kind,
+                        count,
+                        events,
+                    ),
+                    CounterPlacement::Energy { player_id, .. } => {
+                        effects::energy::apply_energy_addition(state, player_id, count, events)
+                    }
+                },
                 // CR 122.1: Counter removal accepted after replacement choice.
                 ProposedEvent::RemoveCounter {
                     object_id,
@@ -220,12 +276,9 @@ pub(super) fn handle_replacement_choice(
                     object_id,
                     ..
                 } => {
-                    zones::move_to_zone(state, object_id, Zone::Graveyard, events);
-                    crate::game::restrictions::record_discard(state, player_id);
-                    events.push(GameEvent::Discarded {
-                        player_id,
-                        object_id,
-                    });
+                    effects::discard::complete_discard_to_graveyard(
+                        state, object_id, player_id, events,
+                    );
                 }
                 // CR 106.3 + CR 106.4: Mana production accepted after replacement choice.
                 // In practice CR 614.5 mana-type replacements don't require a choice and
@@ -244,7 +297,7 @@ pub(super) fn handle_replacement_choice(
                             let unit = crate::types::mana::ManaUnit {
                                 color: mana_type,
                                 source_id,
-                                snow: false,
+                                supertype: None,
                                 source_could_produce_two_or_more_colors: false,
                                 restrictions: Vec::new(),
                                 grants: Vec::new(),
@@ -288,17 +341,25 @@ pub(super) fn handle_replacement_choice(
                         return Ok(state.waiting_for.clone());
                     }
                 }
-                // CR 701.21a + CR 614: Sacrifice accepted after replacement choice —
-                // delegate to the shared helper. Regeneration cannot apply (CR
-                // 701.21a) but Moved replacements on the graveyard transfer still do.
+                // CR 701.21a + CR 614.1: Sacrifice accepted after replacement
+                // choice — delegate to the shared helper. Regeneration cannot
+                // apply (CR 701.21a) but Moved replacements on the inner graveyard
+                // transfer do; if that inner transfer itself needs a choice, the
+                // helper sets `state.waiting_for` and we propagate it back.
                 sacrifice @ ProposedEvent::Sacrifice { .. } => {
-                    apply_sacrifice_after_replacement(state, sacrifice, events);
+                    if let SacrificeApply::NeedsChoice(_) =
+                        apply_sacrifice_after_replacement(state, sacrifice, events)
+                    {
+                        return Ok(state.waiting_for.clone());
+                    }
                 }
                 // CR 111.1 + CR 614.1a: CreateToken accepted after replacement choice
                 // — the `spec` field carries the full self-describing token
                 // characteristics. Delegate to the shared helper.
                 create @ ProposedEvent::CreateToken { .. } => {
-                    apply_create_token_after_replacement(state, create, events);
+                    if !apply_create_token_after_replacement(state, create, events) {
+                        return Ok(state.waiting_for.clone());
+                    }
                 }
                 // CR 703.4q + CR 616.1 / CR 616.1e: EmptyManaPool resume.
                 // The player has chosen one handler ordering; apply the
@@ -377,6 +438,24 @@ pub(super) fn handle_replacement_choice(
             }
 
             if matches!(waiting_for, WaitingFor::Priority { .. })
+                && state.pending_counter_additions.is_some()
+            {
+                effects::counters::drain_pending_counter_additions(state, events);
+                if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                    waiting_for = state.waiting_for.clone();
+                }
+            }
+
+            if matches!(waiting_for, WaitingFor::Priority { .. })
+                && state.pending_copy_token_resolution.is_some()
+            {
+                effects::token_copy::drain_pending_copy_token_resolution(state, events);
+                if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                    waiting_for = state.waiting_for.clone();
+                }
+            }
+
+            if matches!(waiting_for, WaitingFor::Priority { .. })
                 && (state.pending_continuation.is_some()
                     || state.pending_change_zone_iteration.is_some())
             {
@@ -403,11 +482,32 @@ pub(super) fn handle_replacement_choice(
                 && state.pending_phase_transition_progress.is_some()
             {
                 super::turns::drain_pending_phase_transition_progress(state, events);
-                if !matches!(state.waiting_for, WaitingFor::Priority { .. })
-                    && state.pending_phase_transition_progress.is_some()
+                if state.pending_phase_transition_progress.is_some() {
+                    if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                        waiting_for = state.waiting_for.clone();
+                    }
+                } else if state.deferred_step_trigger_resume.is_some()
+                    && matches!(state.waiting_for, WaitingFor::Priority { .. })
                 {
-                    waiting_for = state.waiting_for.clone();
+                    // CR 513.1 + CR 603.3b: A CR 616.1 mana-pool choice can
+                    // defer completion of `enter_phase`. In that case
+                    // `auto_advance` returned before its per-step trigger arm
+                    // ran (it bails while `pending_phase_transition_progress`
+                    // is set). Resume only when that bail happened — not when
+                    // `advance_phase` alone paused the drain (unit tests).
+                    state.deferred_step_trigger_resume = None;
+                    waiting_for = super::turns::auto_advance(state, events);
+                } else {
+                    state.deferred_step_trigger_resume = None;
                 }
+            }
+
+            // CR 601.2h + CR 602.2b + CR 616.1: Resume cast/activation cost payment paused for a
+            // replacement choice during discard or sacrifice cost payment.
+            if matches!(waiting_for, WaitingFor::Priority { .. })
+                && (state.pending_cast.is_some() || state.pending_discard_for_cost.is_some())
+            {
+                waiting_for = super::casting_costs::resume_interrupted_cost_payment(state, events)?;
             }
 
             Ok(waiting_for)
@@ -416,6 +516,18 @@ pub(super) fn handle_replacement_choice(
             super::replacement::replacement_choice_waiting_for(player, state),
         ),
         super::replacement::ReplacementResult::Prevented => {
+            if state.pending_counter_additions.is_some() {
+                state.waiting_for = WaitingFor::Priority {
+                    player: state.active_player,
+                };
+                effects::counters::drain_pending_counter_additions(state, events);
+                if matches!(state.waiting_for, WaitingFor::Priority { .. })
+                    && state.pending_copy_token_resolution.is_some()
+                {
+                    effects::token_copy::drain_pending_copy_token_resolution(state, events);
+                }
+                return Ok(state.waiting_for.clone());
+            }
             if pending_was_counter_move {
                 state.waiting_for = WaitingFor::Priority {
                     player: state.active_player,
@@ -424,6 +536,13 @@ pub(super) fn handle_replacement_choice(
                 if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
                     effects::drain_pending_continuation(state, events);
                 }
+                return Ok(state.waiting_for.clone());
+            }
+            if state.pending_copy_token_resolution.is_some() {
+                state.waiting_for = WaitingFor::Priority {
+                    player: state.active_player,
+                };
+                effects::token_copy::drain_pending_copy_token_resolution(state, events);
                 return Ok(state.waiting_for.clone());
             }
             // CR 608.3e: If the ETB was prevented during spell resolution,
@@ -497,7 +616,9 @@ pub(super) fn handle_copy_target_choice(
             obj.tapped = tapped;
         }
     }
-    apply_etb_counters(state, source_id, &enter_modifiers.counters, events);
+    if !apply_etb_counters(state, source_id, &enter_modifiers.counters, events) {
+        return Ok(state.waiting_for.clone());
+    }
     crate::game::layers::mark_layers_full(state);
     // CR 614.12a + CR 707.9: The battlefield-entry `ZoneChanged` event was
     // captured into `state.deferred_entry_events` when `CopyTargetChoice` was
@@ -599,7 +720,7 @@ pub(super) fn apply_post_replacement_effect(
             state
                 .objects
                 .get(&obj_id)
-                .map(|obj| (obj_id, obj.controller))
+                .map(|obj| (obj_id, super::replacement::replacement_source_player(obj)))
         })
         .unwrap_or((ObjectId(0), state.active_player));
 
@@ -643,14 +764,7 @@ pub(super) fn apply_post_replacement_effect(
     // "sacrifice that many permanents") and Outfitted Jouster (DamageDone:
     // "sacrifice an Equipment") — keep the pre-Devour injection path so their
     // target-as-pre-selected resolution is unchanged.
-    let sacrifice_typed_scope = matches!(event, Some(ReplacementEvent::Moved))
-        && matches!(
-            &*real_work.effect,
-            Effect::Sacrifice {
-                target: TargetFilter::Typed(_) | TargetFilter::Any,
-                ..
-            }
-        );
+    let sacrifice_typed_scope = is_as_enters_sacrifice_scope_replacement(event, &real_work.effect);
     let targets = if sacrifice_typed_scope {
         Vec::new()
     } else {
@@ -919,22 +1033,58 @@ pub(super) fn apply_etb_counters(
     object_id: ObjectId,
     counters: &[(CounterType, u32)],
     events: &mut Vec<GameEvent>,
-) {
+) -> bool {
     let actor = state
         .objects
         .get(&object_id)
         .map(|obj| obj.controller)
         .unwrap_or(PlayerId(0));
-    for (counter_type, count) in counters {
-        super::effects::counters::add_counter_with_replacement(
+    for (index, (counter_type, count)) in counters.iter().enumerate() {
+        if !super::effects::counters::add_counter_with_replacement(
             state,
             actor,
             object_id,
             counter_type.clone(),
             *count,
             events,
-        );
+        ) {
+            let remaining = counters[index + 1..]
+                .iter()
+                .filter(|(_, count)| *count > 0)
+                .map(|(counter_type, count)| {
+                    crate::types::game_state::PendingCounterAddition::Object {
+                        actor,
+                        object_id,
+                        counter_type: counter_type.clone(),
+                        count: *count,
+                    }
+                })
+                .collect();
+            super::effects::counters::stash_pending_counter_additions(
+                state,
+                remaining,
+                crate::types::game_state::PendingEffectResolved::with_post_actions_without_effect(
+                    crate::types::ability::EffectKind::GenericEffect,
+                    object_id,
+                    Vec::new(),
+                ),
+            );
+            return false;
+        }
     }
+    let replacement_choice_for_object = state
+        .pending_replacement
+        .as_ref()
+        .and_then(|pending| pending.proposed.affected_object_id())
+        == Some(object_id);
+    if !replacement_choice_for_object {
+        if let Some(obj) = state.objects.get_mut(&object_id) {
+            if obj.has_keyword(&Keyword::Compleated) {
+                obj.phyrexian_life_paid = 0;
+            }
+        }
+    }
+    true
 }
 
 fn find_copy_targets(
@@ -1028,9 +1178,11 @@ mod tests {
 
         let mut events = Vec::new();
         let proposed = ProposedEvent::AddCounter {
-            actor: PlayerId(0),
-            object_id: target,
-            counter_type: CounterType::Plus1Plus1,
+            placement: CounterPlacement::Object {
+                actor: PlayerId(0),
+                object_id: target,
+                counter_type: CounterType::Plus1Plus1,
+            },
             count: 2,
             applied: std::collections::HashSet::new(),
         };
@@ -1189,10 +1341,11 @@ mod tests {
                         owner_library: false,
                         enter_transformed: false,
                         enters_under: None,
-                        enter_tapped: false,
+                        enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                         enters_attacking: false,
                         up_to: false,
                         enter_with_counters: vec![],
+                        face_down_profile: None,
                     },
                 ))
                 .description("Rest in Peace".to_string()),
@@ -1313,6 +1466,7 @@ mod tests {
             controller_override: None,
             enter_transformed: false,
             applied: std::collections::HashSet::new(),
+            face_down_profile: None,
         };
         let mut events = Vec::new();
         crate::game::sacrifice::apply_sacrifice_after_replacement(&mut state, event, &mut events);
@@ -1369,6 +1523,7 @@ mod tests {
         let proposed = ProposedEvent::CreateToken {
             owner: PlayerId(0),
             spec: Box::new(spec),
+            copy: None,
             enter_tapped: crate::types::proposed_event::EtbTapState::Unspecified,
             count: 1,
             applied: std::collections::HashSet::new(),
@@ -1557,6 +1712,62 @@ mod tests {
         assert!(state.post_replacement_continuation.is_none());
         // Source's controller (P0) lost 2 life.
         assert_eq!(state.players[0].life, initial_life - 2);
+    }
+
+    /// CR 109.4 + CR 108.4a + CR 702.52a: A replacement template resolving
+    /// from a card in a graveyard scopes `Controller` to that card's owner, not
+    /// to stale battlefield control.
+    #[test]
+    fn post_replacement_template_from_graveyard_uses_owner_not_stale_controller() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Dredge Source".to_string(),
+            Zone::Graveyard,
+        );
+        state.objects.get_mut(&source).unwrap().controller = PlayerId(1);
+
+        create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Top Card".to_string(),
+            Zone::Library,
+        );
+        create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Second Card".to_string(),
+            Zone::Library,
+        );
+
+        let template = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Mill {
+                count: QuantityExpr::Fixed { value: 2 },
+                target: TargetFilter::Controller,
+                destination: Zone::Graveyard,
+            },
+        );
+        state.post_replacement_continuation =
+            Some(PostReplacementContinuation::Template(Box::new(template)));
+
+        let mut events = Vec::new();
+        let waiting = apply_pending_post_replacement_effect(
+            &mut state,
+            Some(source),
+            None,
+            None,
+            &mut events,
+        );
+
+        assert!(waiting.is_none(), "Template path resolved without prompt");
+        assert_eq!(state.players[0].library.len(), 0);
+        assert_eq!(state.players[0].graveyard.len(), 3);
+        assert!(state.players[1].graveyard.is_empty());
     }
 
     /// 2026-05-09 audit M4 regression: the unified slot dispatches a
@@ -1815,6 +2026,7 @@ mod tests {
             controller_override: None,
             enter_transformed: false,
             applied: std::collections::HashSet::new(),
+            face_down_profile: None,
         };
         let result = replacement_mod::replace_event(&mut state, proposed, &mut events);
         let ReplacementResult::NeedsChoice(player) = result else {
@@ -1993,6 +2205,7 @@ mod tests {
             controller_override: None,
             enter_transformed: false,
             applied: std::collections::HashSet::new(),
+            face_down_profile: None,
         };
         let result = replacement_mod::replace_event(&mut state, proposed, &mut events);
         let ReplacementResult::Execute(event) = result else {

@@ -1,6 +1,7 @@
 use crate::game::filter;
+use crate::game::replacement::{self, ReplacementResult};
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, Effect, EffectKind, TargetFilter, TargetRef,
+    AbilityCondition, AbilityCost, Effect, EffectKind, ResolvedAbility, TargetFilter, TargetRef,
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
@@ -9,17 +10,19 @@ use crate::types::game_state::{
 use crate::types::identifiers::ObjectId;
 use crate::types::keywords::Keyword;
 use crate::types::mana::ManaCost;
+use crate::types::player::PlayerId;
+use crate::types::proposed_event::ProposedEvent;
 use crate::types::zones::Zone;
 
 use super::casting;
 use super::effects;
 use super::engine::{
-    check_exile_returns, handle_tap_land_for_mana, handle_untap_land_for_mana,
-    resume_pending_continuation_if_priority, EngineError,
+    handle_tap_land_for_mana, handle_untap_land_for_mana, resume_pending_continuation_if_priority,
+    EngineError,
 };
+use super::engine_priority;
 use super::life_costs::{pay_life_as_cost, PayLifeCostResult};
 use super::mana_abilities;
-use super::restrictions;
 use super::zones;
 
 pub(super) fn handle_optional_effect_choice(
@@ -222,9 +225,9 @@ pub(super) fn handle_tribute_choice(
         ));
     };
 
-    if accept {
-        effects::tribute::apply_paid(state, player, source_id, count, events);
-    } else {
+    if accept && !effects::tribute::apply_paid(state, player, source_id, count, events) {
+        return Ok(action_result(events, state.waiting_for.clone()));
+    } else if !accept {
         effects::tribute::apply_declined(state, source_id);
     }
 
@@ -340,6 +343,61 @@ pub(super) fn handle_unless_payment_choose_cost(
     }
 }
 
+fn pay_top_library_exile_cost(
+    state: &mut GameState,
+    player: PlayerId,
+    count: u32,
+    source_id: ObjectId,
+    events: &mut Vec<GameEvent>,
+) -> Result<bool, EngineError> {
+    let library_len = state
+        .players
+        .iter()
+        .find(|p| p.id == player)
+        .map(|p| p.library.len())
+        .ok_or_else(|| EngineError::InvalidAction("Player not found".to_string()))?;
+    if library_len < count as usize {
+        return Ok(false);
+    }
+
+    let top_cards = state
+        .players
+        .iter()
+        .find(|p| p.id == player)
+        .map(|p| {
+            p.library
+                .iter()
+                .copied()
+                .take(count as usize)
+                .collect::<Vec<_>>()
+        })
+        .ok_or_else(|| EngineError::InvalidAction("Player not found".to_string()))?;
+    let mut zone_changes = Vec::with_capacity(top_cards.len());
+
+    for card_id in top_cards {
+        let proposed =
+            ProposedEvent::zone_change(card_id, Zone::Library, Zone::Exile, Some(source_id));
+        match replacement::replace_event(state, proposed, events) {
+            ReplacementResult::Execute(ProposedEvent::ZoneChange { object_id, to, .. }) => {
+                zone_changes.push((object_id, to));
+            }
+            ReplacementResult::Execute(_) | ReplacementResult::Prevented => {
+                return Ok(false);
+            }
+            ReplacementResult::NeedsChoice(_) => {
+                state.pending_replacement = None;
+                return Ok(false);
+            }
+        }
+    }
+
+    for (object_id, to) in zone_changes {
+        zones::move_to_zone(state, object_id, to, events);
+    }
+
+    Ok(true)
+}
+
 pub(super) fn handle_unless_payment(
     state: &mut GameState,
     waiting_for: WaitingFor,
@@ -365,6 +423,7 @@ pub(super) fn handle_unless_payment(
     let poll_cost = cost.clone();
 
     let mut payment_failed = !pay;
+    let mut post_action_event_start = None;
     if pay {
         match cost {
             // CR 118.12: Pay the static mana component of the unless cost.
@@ -432,32 +491,42 @@ pub(super) fn handle_unless_payment(
                     });
                 }
             }
-            // CR 118.12 + CR 701.9: Unless-discard. Defers to the unified
-            // `WardDiscardChoice` waiting state (the name predates the fold
-            // and now covers both ward and counter unless-discard cases).
-            // `count`/`random`/`self_ref` axes from the unified `Discard`
-            // shape are not yet consumed at this site — extending them is
-            // future work tracked alongside the `Balduvian Horde` random-
-            // discard fidelity gap.
+            // CR 118.12a + CR 701.9 + CR 702.24a: Unless-discard. Resolve the
+            // per-counter-scaled count, gate on eligible hand size, and seed the
+            // `remaining` re-prompt loop (one card per round-trip). Defers to the
+            // unified `WardDiscardChoice` waiting state (the name predates the
+            // fold and now covers both ward and counter unless-discard cases).
             AbilityCost::Discard {
-                count: _,
+                count,
                 filter,
-                random: _,
-                self_ref: _,
+                selection: _,
+                self_scope: _,
             } => {
+                let resolved = crate::game::quantity::resolve_quantity_with_targets(
+                    state,
+                    &count,
+                    pending_effect.as_ref(),
+                );
+                let count = u32::try_from(resolved.max(0)).unwrap_or(0);
+
                 let hand_cards = crate::game::casting::find_eligible_discard_targets(
                     state,
                     player,
                     pending_effect.source_id,
                     filter.as_ref(),
                 );
-                if hand_cards.is_empty() {
+                // CR 702.24a: partial payments aren't allowed — if the controller
+                // can't produce the full count, the unless cost is unpayable and
+                // the effect happens.
+                if (hand_cards.len() as u32) < count {
                     payment_failed = true;
                 } else {
                     state.waiting_for = WaitingFor::WardDiscardChoice {
                         player,
                         cards: hand_cards,
                         pending_effect: pending_effect.clone(),
+                        remaining: count,
+                        filter: filter.clone(),
                     };
                     return Ok(action_result(events, state.waiting_for.clone()));
                 }
@@ -500,6 +569,26 @@ pub(super) fn handle_unless_payment(
                         remaining: count,
                     };
                     return Ok(action_result(events, state.waiting_for.clone()));
+                }
+            }
+            // CR 702.24a + CR 701.13: Thought Lash-style cumulative upkeep
+            // pays by exiling the top N cards of the payer's library. This is
+            // deterministic, so it does not need an object-selection prompt.
+            // Partial payments are not allowed; if the library has too few
+            // cards, the unless cost is unpayable and the sacrifice happens.
+            AbilityCost::Exile {
+                count,
+                zone: Some(Zone::Library),
+                filter: None,
+            } => {
+                if !pay_top_library_exile_cost(
+                    state,
+                    player,
+                    count,
+                    pending_effect.source_id,
+                    events,
+                )? {
+                    payment_failed = true;
                 }
             }
             // CR 118.12: Return-to-hand unless cost. `from_zone` defaults to
@@ -626,6 +715,7 @@ pub(super) fn handle_unless_payment(
             | AbilityCost::Loyalty { .. }
             | AbilityCost::PaySpeed { .. }
             | AbilityCost::Exile { .. }
+            | AbilityCost::ExileMaterials { .. }
             | AbilityCost::CollectEvidence { .. }
             | AbilityCost::TapCreatures { .. }
             | AbilityCost::RemoveCounter { .. }
@@ -677,11 +767,12 @@ pub(super) fn handle_unless_payment(
                 }
                 sub_resolved.context = pending_effect.context.clone();
                 sub_resolved.context.optional_effect_performed = true;
-                let previous_trigger_event = state.current_trigger_event.clone();
-                state.current_trigger_event = trigger_event.clone();
-                let result = effects::resolve_ability_chain(state, &sub_resolved, events, 0);
-                state.current_trigger_event = previous_trigger_event;
-                result.map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
+                post_action_event_start = Some(resolve_ability_chain_for_unless_payment(
+                    state,
+                    &sub_resolved,
+                    events,
+                    &trigger_event,
+                )?);
             }
         }
     }
@@ -711,27 +802,45 @@ pub(super) fn handle_unless_payment(
         // when the unless prompt was first surfaced (`effects::mod` strips
         // it before sending the pending effect into `WaitingFor`), so no
         // further stripping is needed here.
-        let previous_trigger_event = state.current_trigger_event.clone();
-        state.current_trigger_event = trigger_event.clone();
-        let result = effects::resolve_ability_chain(state, &ability, events, 0);
-        state.current_trigger_event = previous_trigger_event;
-        result.map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
-
-        // CR 610.3 + #783: The unless-payment resume bypasses
-        // `run_post_action_pipeline` (see the inline-scan note in
-        // engine.rs), so the standard exile-return scan never runs. When the
-        // resolved effect makes a source leave the battlefield — e.g. Static
-        // Prison sacrificing itself via "sacrifice unless you pay {E}" — the
-        // permanent it exiled "until it leaves the battlefield" must return.
-        // Idempotent and event-scoped: a no-op when no source left this way.
-        check_exile_returns(state, events);
+        post_action_event_start = Some(resolve_ability_chain_for_unless_payment(
+            state,
+            &ability,
+            events,
+            &trigger_event,
+        )?);
     }
 
     if matches!(state.waiting_for, WaitingFor::UnlessPayment { .. }) {
         set_active_priority(state);
     }
     resume_pending_continuation_if_priority(state, events)?;
+    if let Some(event_start) = post_action_event_start {
+        let default_wf = state.waiting_for.clone();
+        let wf = engine_priority::run_post_action_pipeline_from(
+            state,
+            events,
+            event_start,
+            &default_wf,
+            false,
+        )?;
+        state.waiting_for = wf;
+    }
     Ok(action_result(events, state.waiting_for.clone()))
+}
+
+fn resolve_ability_chain_for_unless_payment(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+    trigger_event: &Option<GameEvent>,
+) -> Result<usize, EngineError> {
+    let events_before = events.len();
+    let previous_trigger_event = state.current_trigger_event.clone();
+    state.current_trigger_event = trigger_event.clone();
+    let result = effects::resolve_ability_chain(state, ability, events, 0);
+    state.current_trigger_event = previous_trigger_event;
+    result.map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
+    Ok(events_before)
 }
 
 fn clear_echo_due_for_echo_payment(
@@ -887,6 +996,8 @@ pub(super) fn handle_ward_discard_choice(
         player,
         cards: legal_cards,
         pending_effect,
+        remaining,
+        filter,
     } = waiting_for
     else {
         return Err(EngineError::InvalidAction(
@@ -900,12 +1011,28 @@ pub(super) fn handle_ward_discard_choice(
         ));
     }
 
-    zones::move_to_zone(state, chosen[0], Zone::Graveyard, events);
-    restrictions::record_discard(state, player);
-    events.push(GameEvent::Discarded {
-        player_id: player,
-        object_id: chosen[0],
-    });
+    effects::discard::complete_discard_to_graveyard(state, chosen[0], player, events);
+
+    // CR 702.24a: more discards remain — re-derive hand eligibility (the
+    // just-discarded card still keys `state.objects` in the graveyard, so
+    // re-derive from hand rather than filtering by `contains_key`).
+    if remaining > 1 {
+        let hand_cards = crate::game::casting::find_eligible_discard_targets(
+            state,
+            player,
+            pending_effect.source_id,
+            filter.as_ref(),
+        );
+        state.waiting_for = WaitingFor::WardDiscardChoice {
+            player,
+            cards: hand_cards,
+            pending_effect,
+            remaining: remaining - 1,
+            filter,
+        };
+        return Ok(state.waiting_for.clone());
+    }
+
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::from(&pending_effect.effect),
         source_id: pending_effect.source_id,
@@ -1485,8 +1612,8 @@ mod tests {
                 AbilityCost::Discard {
                     count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
                     filter: None,
-                    random: false,
-                    self_ref: false,
+                    selection: crate::types::ability::CardSelectionMode::Chosen,
+                    self_scope: crate::types::ability::DiscardSelfScope::FromHand,
                 },
             ],
             pending_effect: Box::new(pending),

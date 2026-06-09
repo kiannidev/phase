@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate, useLocation } from "react-router";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
@@ -11,7 +11,9 @@ import {
   type SeatKind,
 } from "../../stores/multiplayerStore";
 import { useAiDeckCatalog } from "../../services/aiDeckCatalog";
+import { formatJoinShare } from "../../services/serverDetection";
 import { expandParsedDeck } from "../../services/deckParser";
+import { SelectField } from "../ui/SelectField";
 
 const AI_DIFFICULTIES = ["Easy", "Medium", "Hard", "VeryHard"] as const;
 const RANDOM_DECK: DeckChoice = { type: "Random" };
@@ -123,7 +125,8 @@ function SeatRow({
           )}
           {slot.kind.type === "Ai" && (
             <>
-              <select
+              <SelectField
+                chevronSize="sm"
                 value={slot.kind.data.difficulty}
                 onChange={(e) =>
                   mutate({
@@ -147,8 +150,9 @@ function SeatRow({
                     {t(`menu:aiDifficulty.levels.${difficulty}`)}
                   </option>
                 ))}
-              </select>
-              <select
+              </SelectField>
+              <SelectField
+                chevronSize="sm"
                 value={selectedDeckKey}
                 onChange={(e) =>
                   mutate({
@@ -176,7 +180,7 @@ function SeatRow({
                     {label}
                   </option>
                 ))}
-              </select>
+              </SelectField>
               <button
                 type="button"
                 onClick={() =>
@@ -247,7 +251,22 @@ function SeatRow({
   );
 }
 
+/** Live hosting indicator: a pulsing emerald dot while a room is open and
+ *  waiting, a calm slate dot while still connecting. */
+function StatusDot({ connecting }: { connecting: boolean }) {
+  if (connecting) {
+    return <span className="h-2 w-2 shrink-0 rounded-full bg-slate-400" />;
+  }
+  return (
+    <span className="relative flex h-2 w-2 shrink-0">
+      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+      <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-400" />
+    </span>
+  );
+}
+
 export function HostControlTile() {
+  const [collapsed, setCollapsed] = useState(false);
   const hostGameCode = useMultiplayerStore((s) => s.hostGameCode);
   const hostingStatus = useMultiplayerStore((s) => s.hostingStatus);
   const cancelHosting = useMultiplayerStore((s) => s.cancelHosting);
@@ -259,9 +278,18 @@ export function HostControlTile() {
     (s) => s.startLobbyWithCurrentPlayers,
   );
   const showToast = useMultiplayerStore((s) => s.showToast);
+  const serverInfo = useMultiplayerStore((s) => s.serverInfo);
   const navigate = useNavigate();
   const location = useLocation();
   const { t } = useTranslation();
+
+  // The reachable `<code>@<host>` join string, available only when the server
+  // advertised a public URL (server-run hosting). P2P/broker hosts have no
+  // such URL and share the bare code instead (handled below).
+  const joinShare =
+    hostGameCode && serverInfo?.publicUrl
+      ? formatJoinShare(hostGameCode, serverInfo.publicUrl)
+      : null;
   const aiDeckCatalog = useAiDeckCatalog({
     selectedFormat: hostSession?.formatConfig.format,
     selectedMatchType: hostSession?.matchType,
@@ -293,6 +321,10 @@ export function HostControlTile() {
   const waitingSeats = playerSlots.filter((slot) => slot.kind.type === "WaitingHuman");
   const occupiedSeats = playerSlots.length - waitingSeats.length;
   const canEditSeats = hostingStatus === "waiting";
+  // Live room with open seats → glow the panel to advertise it's waiting for the
+  // table to fill. Drops the moment the room is full (or while still connecting).
+  const awaitingPlayers = hostingStatus === "waiting" && waitingSeats.length > 0;
+  const glow = awaitingPlayers ? " host-awaiting-glow" : "";
 
   useEffect(() => {
     if (!canEditSeats || !haveAnyDeck) return;
@@ -346,28 +378,74 @@ export function HostControlTile() {
     });
   };
 
+  // Position depends on surface. In-game (/game/:id is full-screen, no shell)
+  // keeps the established top-right anchor — clear of the hand. On the menu
+  // shell the top-right holds the chrome cluster and the centered action tiles
+  // sit high, so the tile would cover them (e.g. the Draft card); there it
+  // docks bottom-right instead, clear of both rail and content. The wrapper is
+  // a content-sized, right-edge corner; width lives on the inner panel so the
+  // collapsed pill can shrink to its content.
+  const inGame = location.pathname.startsWith("/game/");
+  const vAnchor = inGame
+    ? "top-[calc(env(safe-area-inset-top)+4.75rem)] sm:top-[calc(env(titlebar-area-height,0px)+0.75rem)]"
+    : "bottom-[calc(env(safe-area-inset-bottom)+4.75rem)] sm:bottom-3";
+  const wrapper = `fixed right-3 z-40 flex justify-end ${vAnchor}`;
+
+  // Collapsed: a status pill (live dot + room code + seat count) that reopens
+  // the full panel on click — keeps the host control out of the way of content.
+  if (collapsed) {
+    return (
+      <div className={wrapper}>
+        <button
+          type="button"
+          onClick={() => setCollapsed(false)}
+          aria-label={t("hostControl.expand")}
+          className={`inline-flex items-center gap-2 rounded-full surface-card border border-hairline px-3 py-2 shadow-panel backdrop-blur-md transition-colors hover:border-hairline-hover${glow}`}
+        >
+          <StatusDot connecting={isConnecting} />
+          {isConnecting ? (
+            <span className="text-xs font-medium text-slate-400">{t("hostControl.connecting")}</span>
+          ) : (
+            <>
+              <span className="font-mono text-xs tracking-wider text-emerald-400">{hostGameCode}</span>
+              {playerSlots.length > 0 && (
+                <span className="text-xs tabular-nums text-slate-400">
+                  {occupiedSeats}/{playerSlots.length}
+                </span>
+              )}
+            </>
+          )}
+          <svg viewBox="0 0 24 24" className="h-3 w-3 fill-current text-slate-500">
+            <path d="M12 8.4 5.4 15l1.4 1.4L12 11.2l5.2 5.2 1.4-1.4z" />
+          </svg>
+        </button>
+      </div>
+    );
+  }
+
   return (
-    <div
-      className="fixed inset-x-3 top-[calc(env(safe-area-inset-top)+4.75rem)] z-40 sm:left-auto sm:right-3 sm:top-[calc(env(titlebar-area-height,0px)+0.75rem)] sm:w-72"
-    >
-      <div className="rounded-xl border border-white/10 bg-black/70 shadow-lg shadow-black/40 backdrop-blur-md">
+    <div className={wrapper}>
+      <div className={`w-[calc(100vw-1.5rem)] max-w-[20rem] surface-card rounded-panel border border-hairline shadow-panel backdrop-blur-md sm:w-72${glow}`}>
         {/* Header */}
-        <div className="flex items-center justify-between border-b border-white/5 px-3 py-2">
+        <div className="flex items-center justify-between gap-2 border-b border-hairline px-3 py-2">
           <button
             type="button"
             onClick={() => {
-              if (location.pathname.startsWith("/game/") && hostGameCode) {
+              if (joinShare) {
+                // Server-run host: copy the reachable `<code>@<host>` join link.
+                void navigator.clipboard?.writeText(joinShare);
+                showToast(t("hostControl.joinLinkCopied"));
+              } else if (location.pathname.startsWith("/game/") && hostGameCode) {
+                // P2P host in-game: the bare code (friends join via direct code).
                 void navigator.clipboard?.writeText(hostGameCode);
               } else {
                 navigate("/multiplayer");
               }
             }}
-            className="flex items-center gap-2 text-xs text-slate-300 transition-colors hover:text-white"
+            title={joinShare ? t("hostControl.copyJoinLink", { joinShare }) : undefined}
+            className="flex min-w-0 items-center gap-2 text-xs text-slate-300 transition-colors hover:text-white"
           >
-            <span className="relative flex h-2 w-2">
-              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
-              <span className="relative inline-flex h-2 w-2 rounded-full bg-emerald-400" />
-            </span>
+            <StatusDot connecting={isConnecting} />
             {isConnecting ? (
               <span className="font-medium text-slate-400">{t("hostControl.connecting")}</span>
             ) : (
@@ -383,20 +461,32 @@ export function HostControlTile() {
               </>
             )}
           </button>
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              cancelHosting();
-              if (location.pathname.startsWith("/game/")) {
-                navigate("/multiplayer");
-              }
-            }}
-            className="text-slate-500 transition-colors hover:text-rose-400"
-            aria-label={t("hostControl.cancelHosting")}
-          >
-            ✕
-          </button>
+          <div className="flex shrink-0 items-center gap-1">
+            <button
+              type="button"
+              onClick={() => setCollapsed(true)}
+              aria-label={t("hostControl.collapse")}
+              className="flex h-6 w-6 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-white/5 hover:text-white"
+            >
+              <svg viewBox="0 0 24 24" className="h-3.5 w-3.5 fill-current">
+                <path d="M12 15.6 5.4 9l1.4-1.4L12 12.8l5.2-5.2L18.6 9z" />
+              </svg>
+            </button>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                cancelHosting();
+                if (location.pathname.startsWith("/game/")) {
+                  navigate("/multiplayer");
+                }
+              }}
+              className="flex h-6 w-6 items-center justify-center rounded-full text-slate-500 transition-colors hover:bg-white/5 hover:text-rose-400"
+              aria-label={t("hostControl.cancelHosting")}
+            >
+              ✕
+            </button>
+          </div>
         </div>
 
         {/* Seat list — read-only in Phase 1 */}
@@ -417,7 +507,7 @@ export function HostControlTile() {
           </div>
         )}
         {canEditSeats && hostSession && (
-          <div className="border-t border-white/5 px-3 py-2">
+          <div className="border-t border-hairline px-3 py-2">
             <div className="mb-2 text-xs uppercase tracking-wide text-slate-500">
               {t("hostControl.seatsOccupied", { occupied: occupiedSeats, total: playerSlots.length })}
             </div>

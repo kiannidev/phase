@@ -14,6 +14,8 @@
 //! attacker-controlled growth at the broker, and reuses the visible-name limits
 //! the Worker already advertises so the two shells agree on name length.
 
+use crate::protocol::DraftLobbyMetadata;
+
 /// Max display-name length, in characters. Matches `DISPLAY_NAME_MAX_LENGTH` in
 /// the Worker's `name-filter.ts`.
 pub const MAX_DISPLAY_NAME_LEN: usize = 20;
@@ -67,9 +69,9 @@ pub fn validate_required_label(field: &str, value: &str, max: usize) -> Result<(
 /// Validate an optional visible label (e.g. room name, optional display name).
 /// `None` and `Some("")`/whitespace are accepted — the broker treats blank
 /// labels as absent — but a present, non-blank label must satisfy the bounds.
-fn validate_optional_label(field: &str, value: &Option<String>, max: usize) -> Result<(), String> {
+fn validate_optional_label(field: &str, value: Option<&str>, max: usize) -> Result<(), String> {
     match value {
-        Some(v) if !v.trim().is_empty() => validate_required_label(field, v, max),
+        Some(value) if !value.trim().is_empty() => validate_required_label(field, value, max),
         _ => Ok(()),
     }
 }
@@ -87,15 +89,135 @@ pub fn validate_token(field: &str, value: &str, max: usize) -> Result<(), String
 }
 
 /// Validate an optional opaque token/identifier string.
-pub fn validate_optional_token(
-    field: &str,
-    value: &Option<String>,
-    max: usize,
-) -> Result<(), String> {
+pub fn validate_optional_token(field: &str, value: Option<&str>, max: usize) -> Result<(), String> {
     match value {
-        Some(v) => validate_token(field, v, max),
+        Some(value) => validate_token(field, value, max),
         None => Ok(()),
     }
+}
+
+pub struct CreateGameSettingsFields<'a> {
+    pub display_name: &'a str,
+    pub password: Option<&'a str>,
+    pub timer_seconds: Option<u32>,
+    pub player_count: u8,
+    pub room_name: Option<&'a str>,
+    pub host_peer_id: Option<&'a str>,
+    pub draft_metadata: Option<&'a DraftLobbyMetadata>,
+}
+
+pub fn validate_create_game_settings_fields(
+    fields: CreateGameSettingsFields<'_>,
+) -> Result<(), String> {
+    validate_required_label("display_name", fields.display_name, MAX_DISPLAY_NAME_LEN)?;
+    validate_optional_label("room_name", fields.room_name, MAX_ROOM_NAME_LEN)?;
+    validate_optional_token("password", fields.password, MAX_PASSWORD_LEN)?;
+    validate_optional_token("host_peer_id", fields.host_peer_id, MAX_TOKEN_LEN)?;
+    if fields.player_count == 0 || fields.player_count > MAX_PLAYER_COUNT {
+        return Err(format!(
+            "player_count must be between 1 and {MAX_PLAYER_COUNT}"
+        ));
+    }
+    if let Some(secs) = fields.timer_seconds {
+        if secs > MAX_TIMER_SECONDS {
+            return Err(format!("timer_seconds must be at most {MAX_TIMER_SECONDS}"));
+        }
+    }
+    if let Some(draft) = fields.draft_metadata {
+        validate_token(
+            "draft_metadata.set_code",
+            &draft.set_code,
+            MAX_DRAFT_SET_CODE_LEN,
+        )?;
+        validate_token(
+            "draft_metadata.draft_kind",
+            &draft.draft_kind,
+            MAX_DRAFT_KIND_LEN,
+        )?;
+        validate_optional_label(
+            "draft_metadata.cube_name",
+            draft.cube_name.as_deref(),
+            MAX_ROOM_NAME_LEN,
+        )?;
+    }
+    Ok(())
+}
+
+pub struct JoinGameWithPasswordFields<'a> {
+    pub game_code: &'a str,
+    pub display_name: &'a str,
+    pub password: Option<&'a str>,
+    pub reservation_token: Option<&'a str>,
+}
+
+pub fn validate_join_game_with_password_fields(
+    fields: JoinGameWithPasswordFields<'_>,
+) -> Result<(), String> {
+    validate_token("game_code", fields.game_code, MAX_GAME_CODE_LEN)?;
+    validate_required_label("display_name", fields.display_name, MAX_DISPLAY_NAME_LEN)?;
+    validate_optional_token("password", fields.password, MAX_PASSWORD_LEN)?;
+    validate_optional_token("reservation_token", fields.reservation_token, MAX_TOKEN_LEN)?;
+    Ok(())
+}
+
+pub struct LookupJoinTargetFields<'a> {
+    pub game_code: &'a str,
+    pub password: Option<&'a str>,
+    pub display_name: Option<&'a str>,
+    pub release_reservation_token: Option<&'a str>,
+}
+
+pub fn validate_lookup_join_target_fields(
+    fields: LookupJoinTargetFields<'_>,
+) -> Result<(), String> {
+    validate_token("game_code", fields.game_code, MAX_GAME_CODE_LEN)?;
+    validate_optional_token("password", fields.password, MAX_PASSWORD_LEN)?;
+    validate_optional_label("display_name", fields.display_name, MAX_DISPLAY_NAME_LEN)?;
+    validate_optional_token(
+        "release_reservation_token",
+        fields.release_reservation_token,
+        MAX_TOKEN_LEN,
+    )?;
+    Ok(())
+}
+
+pub struct UpdateLobbyMetadataFields<'a> {
+    pub game_code: &'a str,
+    pub current_players: u8,
+    pub max_players: u8,
+    pub consumed_reservation_tokens: &'a [String],
+}
+
+pub fn validate_update_lobby_metadata_fields(
+    fields: UpdateLobbyMetadataFields<'_>,
+) -> Result<(), String> {
+    validate_token("game_code", fields.game_code, MAX_GAME_CODE_LEN)?;
+    if fields.max_players == 0 || fields.max_players > MAX_PLAYER_COUNT {
+        return Err(format!(
+            "max_players must be between 1 and {MAX_PLAYER_COUNT}"
+        ));
+    }
+    if fields.current_players > MAX_PLAYER_COUNT {
+        return Err(format!(
+            "current_players must be at most {MAX_PLAYER_COUNT}"
+        ));
+    }
+    if fields.current_players > fields.max_players {
+        return Err("current_players must not exceed max_players".to_string());
+    }
+    if fields.consumed_reservation_tokens.len() > MAX_CONSUMED_TOKENS {
+        return Err(format!(
+            "consumed_reservation_tokens must contain at most {MAX_CONSUMED_TOKENS} entries"
+        ));
+    }
+    for token in fields.consumed_reservation_tokens {
+        validate_token("consumed_reservation_token", token, MAX_TOKEN_LEN)?;
+    }
+    Ok(())
+}
+
+pub fn validate_unregister_lobby_fields(game_code: &str) -> Result<(), String> {
+    validate_token("game_code", game_code, MAX_GAME_CODE_LEN)
 }
 
 /// Validate every client-supplied field of a parsed lobby message against the
@@ -124,37 +246,15 @@ pub fn validate_lobby_message(msg: &crate::protocol::LobbyClientMessage) -> Resu
             draft_metadata,
             ..
         } => {
-            validate_required_label("display_name", display_name, MAX_DISPLAY_NAME_LEN)?;
-            validate_optional_label("room_name", room_name, MAX_ROOM_NAME_LEN)?;
-            validate_optional_token("password", password, MAX_PASSWORD_LEN)?;
-            validate_optional_token("host_peer_id", host_peer_id, MAX_TOKEN_LEN)?;
-            if *player_count == 0 || *player_count > MAX_PLAYER_COUNT {
-                return Err(format!(
-                    "player_count must be between 1 and {MAX_PLAYER_COUNT}"
-                ));
-            }
-            if let Some(secs) = timer_seconds {
-                if *secs > MAX_TIMER_SECONDS {
-                    return Err(format!("timer_seconds must be at most {MAX_TIMER_SECONDS}"));
-                }
-            }
-            if let Some(draft) = draft_metadata {
-                validate_token(
-                    "draft_metadata.set_code",
-                    &draft.set_code,
-                    MAX_DRAFT_SET_CODE_LEN,
-                )?;
-                validate_token(
-                    "draft_metadata.draft_kind",
-                    &draft.draft_kind,
-                    MAX_DRAFT_KIND_LEN,
-                )?;
-                validate_optional_label(
-                    "draft_metadata.cube_name",
-                    &draft.cube_name,
-                    MAX_ROOM_NAME_LEN,
-                )?;
-            }
+            validate_create_game_settings_fields(CreateGameSettingsFields {
+                display_name,
+                password: password.as_deref(),
+                timer_seconds: *timer_seconds,
+                player_count: *player_count,
+                room_name: room_name.as_deref(),
+                host_peer_id: host_peer_id.as_deref(),
+                draft_metadata: draft_metadata.as_ref(),
+            })?;
         }
         M::JoinGameWithPassword {
             game_code,
@@ -163,10 +263,12 @@ pub fn validate_lobby_message(msg: &crate::protocol::LobbyClientMessage) -> Resu
             reservation_token,
             ..
         } => {
-            validate_token("game_code", game_code, MAX_GAME_CODE_LEN)?;
-            validate_required_label("display_name", display_name, MAX_DISPLAY_NAME_LEN)?;
-            validate_optional_token("password", password, MAX_PASSWORD_LEN)?;
-            validate_optional_token("reservation_token", reservation_token, MAX_TOKEN_LEN)?;
+            validate_join_game_with_password_fields(JoinGameWithPasswordFields {
+                game_code,
+                display_name,
+                password: password.as_deref(),
+                reservation_token: reservation_token.as_deref(),
+            })?;
         }
         M::LookupJoinTarget {
             game_code,
@@ -175,14 +277,12 @@ pub fn validate_lobby_message(msg: &crate::protocol::LobbyClientMessage) -> Resu
             release_reservation_token,
             ..
         } => {
-            validate_token("game_code", game_code, MAX_GAME_CODE_LEN)?;
-            validate_optional_token("password", password, MAX_PASSWORD_LEN)?;
-            validate_optional_label("display_name", display_name, MAX_DISPLAY_NAME_LEN)?;
-            validate_optional_token(
-                "release_reservation_token",
-                release_reservation_token,
-                MAX_TOKEN_LEN,
-            )?;
+            validate_lookup_join_target_fields(LookupJoinTargetFields {
+                game_code,
+                password: password.as_deref(),
+                display_name: display_name.as_deref(),
+                release_reservation_token: release_reservation_token.as_deref(),
+            })?;
         }
         M::UpdateLobbyMetadata {
             game_code,
@@ -190,31 +290,15 @@ pub fn validate_lobby_message(msg: &crate::protocol::LobbyClientMessage) -> Resu
             max_players,
             consumed_reservation_tokens,
         } => {
-            validate_token("game_code", game_code, MAX_GAME_CODE_LEN)?;
-            if *max_players == 0 || *max_players > MAX_PLAYER_COUNT {
-                return Err(format!(
-                    "max_players must be between 1 and {MAX_PLAYER_COUNT}"
-                ));
-            }
-            if *current_players > MAX_PLAYER_COUNT {
-                return Err(format!(
-                    "current_players must be at most {MAX_PLAYER_COUNT}"
-                ));
-            }
-            if *current_players > *max_players {
-                return Err("current_players must not exceed max_players".to_string());
-            }
-            if consumed_reservation_tokens.len() > MAX_CONSUMED_TOKENS {
-                return Err(format!(
-                    "consumed_reservation_tokens must contain at most {MAX_CONSUMED_TOKENS} entries"
-                ));
-            }
-            for token in consumed_reservation_tokens {
-                validate_token("consumed_reservation_token", token, MAX_TOKEN_LEN)?;
-            }
+            validate_update_lobby_metadata_fields(UpdateLobbyMetadataFields {
+                game_code,
+                current_players: *current_players,
+                max_players: *max_players,
+                consumed_reservation_tokens,
+            })?;
         }
         M::UnregisterLobby { game_code } => {
-            validate_token("game_code", game_code, MAX_GAME_CODE_LEN)?;
+            validate_unregister_lobby_fields(game_code)?;
         }
         // No client-supplied bounded fields.
         M::SubscribeLobby | M::UnsubscribeLobby | M::Ping { .. } => {}
@@ -283,11 +367,12 @@ mod tests {
 
     #[test]
     fn optional_label_allows_absent_and_blank() {
-        assert!(validate_optional_label("f", &None, MAX_ROOM_NAME_LEN).is_ok());
-        assert!(validate_optional_label("f", &Some(String::new()), MAX_ROOM_NAME_LEN).is_ok());
-        assert!(validate_optional_label("f", &Some("  ".into()), MAX_ROOM_NAME_LEN).is_ok());
-        assert!(validate_optional_label("f", &Some("Room".into()), MAX_ROOM_NAME_LEN).is_ok());
-        assert!(validate_optional_label("f", &Some("r".repeat(41)), MAX_ROOM_NAME_LEN).is_err());
+        assert!(validate_optional_label("f", None, MAX_ROOM_NAME_LEN).is_ok());
+        assert!(validate_optional_label("f", Some(""), MAX_ROOM_NAME_LEN).is_ok());
+        assert!(validate_optional_label("f", Some("  "), MAX_ROOM_NAME_LEN).is_ok());
+        assert!(validate_optional_label("f", Some("Room"), MAX_ROOM_NAME_LEN).is_ok());
+        let long = "r".repeat(41);
+        assert!(validate_optional_label("f", Some(&long), MAX_ROOM_NAME_LEN).is_err());
     }
 
     #[test]

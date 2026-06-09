@@ -49,6 +49,8 @@
     "volume": "Volume"
   },
   "hostControl": {
+    "collapse": "Comprimi",
+    "expand": "Espandi pannello host",
     "seatHost": "Host",
     "seatPlayer": "Giocatore",
     "seatOpen": "Libero",
@@ -69,7 +71,9 @@
     "seatsOccupied": "{{occupied}}/{{total}} posti occupati",
     "startGame": "Avvia partita",
     "startNow": "Avvia ora",
-    "fillWithAi": "Riempi con IA"
+    "fillWithAi": "Riempi con IA",
+    "joinLinkCopied": "Link di accesso copiato",
+    "copyJoinLink": "Copia link di accesso: {{joinShare}}"
   },
   "grantDebug": {
     "heading": "Sandbox: permessi di debug",
@@ -201,6 +205,7 @@
   },
   "diceRoll": {
     "rollingForFirst": "Tiro per stabilire chi inizia",
+    "tieReroll": "Pareggio — si ritira!",
     "versus": "VS",
     "skip": "Tocca per saltare",
     "continue": "Tocca per continuare",

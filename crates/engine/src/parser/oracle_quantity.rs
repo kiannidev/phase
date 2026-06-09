@@ -10,8 +10,8 @@ use std::str::FromStr;
 
 use crate::parser::oracle_nom::error::{OracleError, OracleResult};
 use nom::branch::alt;
-use nom::bytes::complete::{tag, take_until};
-use nom::combinator::{all_consuming, eof, opt, value};
+use nom::bytes::complete::{tag, take_till1, take_until};
+use nom::combinator::{all_consuming, eof, opt, peek, value};
 use nom::multi::separated_list1;
 use nom::sequence::{pair, preceded, terminated};
 use nom::Parser;
@@ -27,9 +27,10 @@ use crate::parser::oracle_effect::parse_controls_permanent_object;
 use crate::parser::oracle_target::{parse_target, parse_type_phrase, parse_type_phrase_with_ctx};
 use crate::parser::oracle_util::merge_or_filters;
 use crate::types::ability::{
-    AggregateFunction, Comparator, ControllerRef, CountScope, DevotionColors, FilterProp,
-    ObjectProperty, ObjectScope, PlayerFilter, PlayerRelation, PlayerScope, QuantityExpr,
-    QuantityRef, TargetFilter, TypeFilter, TypedFilter, ZoneRef,
+    AggregateFunction, AttackScope, AttackSubject, Comparator, ControllerRef, CountScope,
+    DevotionColors, FilterProp, ObjectProperty, ObjectScope, PlayerFilter, PlayerRelation,
+    PlayerScope, QuantityExpr, QuantityRef, RoundingMode, TargetFilter, TypeFilter, TypedFilter,
+    ZoneRef,
 };
 #[cfg(test)]
 use crate::types::counter::CounterType;
@@ -89,6 +90,10 @@ pub(crate) fn parse_quantity_ref_with_context(
     }
 
     // Complex patterns requiring type phrase parsing or counter normalization.
+
+    if let Some(qty) = parse_sacrificed_permanents_this_turn_quantity(trimmed) {
+        return Some(qty);
+    }
 
     // CR 608.2c + CR 122.1: "the number of [kind] counter[s] removed this way"
     // is a dynamic amount from the preceding RemoveCounter effect, not an
@@ -329,7 +334,10 @@ pub(crate) fn parse_quantity_ref_with_context(
         // CR 508.6: "opponents you attacked [this turn]" (Militant Angel).
         if parse_opponents_attacked_clause(rest).is_ok() {
             return Some(QuantityRef::PlayerCount {
-                filter: PlayerFilter::OpponentAttackedThisTurn,
+                filter: PlayerFilter::OpponentAttacked {
+                    subject: AttackSubject::You,
+                    scope: AttackScope::ThisTurn,
+                },
             });
         }
         // CR 109.4 + CR 109.5: "opponents who control <filter>" / "opponents who
@@ -467,6 +475,7 @@ pub(crate) fn canonicalize_quantity_ref(qty: QuantityRef) -> QuantityRef {
         QuantityRef::ZoneCardCount {
             zone: ZoneRef::Hand,
             card_types,
+            filter: None,
             scope: CountScope::Controller,
         } if card_types.is_empty() => QuantityRef::HandSize {
             player: PlayerScope::Controller,
@@ -474,6 +483,7 @@ pub(crate) fn canonicalize_quantity_ref(qty: QuantityRef) -> QuantityRef {
         QuantityRef::ZoneCardCount {
             zone: ZoneRef::Graveyard,
             card_types,
+            filter: None,
             scope: CountScope::Controller,
         } if card_types.is_empty() => QuantityRef::GraveyardSize {
             player: PlayerScope::Controller,
@@ -534,6 +544,42 @@ pub(crate) fn parse_cda_quantity_with_context(
     if let Ok((rest, expr)) = nom_quantity::parse_fraction_rounded(text) {
         if rest.is_empty() {
             return Some(expr);
+        }
+    }
+
+    // CR 107.1a: Fraction over a CDA-recursive inner — "half/third/tenth <inner>,
+    // rounded up/down" where <inner> is any quantity THIS function recognizes but
+    // the general nom grammar above does not (notably the cross-player aggregate
+    // "the highest life total among your opponents" — Malignus). Reuse the shared
+    // divisor / rounding combinators, then recurse on the inner so the fraction
+    // composes over the full CDA quantity grammar (mirrors the "twice [inner]"
+    // recursion below).
+    if let Ok((after_divisor, divisor)) = nom_quantity::parse_fraction_divisor(text) {
+        // Optional "of " ("half of ~"), consumed via the nom combinator per the
+        // parser mandate.
+        let (after_divisor, _) = opt(tag::<_, _, OracleError<'_>>("of "))
+            .parse(after_divisor)
+            .ok()?;
+
+        // `parse_cda_quantity_with_context` returns an `Option` without a nom
+        // remainder, so split the explicit rounding suffix first and recurse on
+        // only the inner CDA grammar. With no suffix, keep the shared
+        // parse_rounding_suffix default of Down.
+        let rounded_inner = pair(
+            take_until::<_, _, OracleError<'_>>(", round"),
+            nom_quantity::parse_explicit_rounding_suffix,
+        )
+        .parse(after_divisor);
+        let (inner_text, rounding) = match rounded_inner {
+            Ok(("", (inner, rounding))) => (inner, rounding),
+            _ => (after_divisor, RoundingMode::Down),
+        };
+        if let Some(inner) = parse_cda_quantity_with_context(inner_text.trim(), ctx) {
+            return Some(QuantityExpr::DivideRounded {
+                inner: Box::new(inner),
+                divisor,
+                rounding,
+            });
         }
     }
 
@@ -651,6 +697,12 @@ pub(crate) fn parse_cda_quantity_with_context(
         return Some(QuantityExpr::Ref { qty });
     }
 
+    if let Ok((rest, expr)) = parse_owned_cards_in_zones_with_property_filter(text) {
+        if rest.is_empty() {
+            return Some(expr);
+        }
+    }
+
     if let Ok((rest, expr)) = parse_owned_cards_in_zones_quantity(text) {
         if rest.is_empty() {
             return Some(expr);
@@ -667,6 +719,7 @@ pub(crate) fn parse_cda_quantity_with_context(
                 zone: ZoneRef::Graveyard,
                 card_types: vec![],
                 scope: CountScope::Opponents,
+                filter: None,
             },
         });
     }
@@ -766,6 +819,132 @@ pub(crate) fn parse_cda_quantity_with_context(
     None
 }
 
+/// CR 701.21a: "the number of permanents you've sacrificed this turn" and typed
+/// variants ("the number of artifacts you've sacrificed this turn").
+fn parse_sacrificed_permanents_this_turn_quantity(text: &str) -> Option<QuantityRef> {
+    let trimmed = text.trim().trim_end_matches('.');
+    let (rest, _) = tag::<_, _, OracleError<'_>>("the number of ")
+        .parse(trimmed)
+        .ok()?;
+    let (rest, filter) = parse_sacrificed_permanents_this_turn_filter(rest)?;
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(QuantityRef::SacrificedThisTurn {
+        player: PlayerScope::Controller,
+        filter,
+    })
+}
+
+fn parse_sacrificed_permanents_this_turn_filter(input: &str) -> Option<(&str, TargetFilter)> {
+    let (suffix_rest, type_text) = take_until::<_, _, OracleError<'_>>(" you")
+        .parse(input)
+        .ok()?;
+    let (rest, _) = (
+        tag::<_, _, OracleError<'_>>(" you"),
+        opt(tag("'ve")),
+        tag(" sacrificed this turn"),
+    )
+        .parse(suffix_rest)
+        .ok()?;
+    if type_text.trim() == "permanents" {
+        return Some((
+            rest,
+            TargetFilter::Typed(TypedFilter {
+                type_filters: vec![TypeFilter::Permanent],
+                ..Default::default()
+            }),
+        ));
+    }
+    let (filter, leftover) = parse_type_phrase(type_text.trim());
+    if !leftover.trim().is_empty() || filter == TargetFilter::Any {
+        return None;
+    }
+    Some((rest, filter))
+}
+
+// CR 604.3: "the total number of cards you own in exile and in your graveyard
+// that are Oozes or are named Slime Against Humanity" — type/name filters trail
+// the zone list rather than preceding "cards".
+fn parse_zone_card_that_are_filter_list(input: &str) -> OracleResult<'_, TargetFilter> {
+    fn parse_named_card_filter(input: &str) -> OracleResult<'_, TargetFilter> {
+        let (rest, _) = tag("named ").parse(input)?;
+        let (rest, name) = alt((
+            terminated(take_until(" or are "), peek(tag(" or are "))),
+            terminated(take_until(" or "), peek(tag(" or "))),
+            take_till1(|c| c == '.' || c == ','),
+        ))
+        .parse(rest)?;
+        Ok((
+            rest,
+            TargetFilter::Typed(TypedFilter::default().properties(vec![FilterProp::Named {
+                name: name.trim().to_string(),
+            }])),
+        ))
+    }
+
+    fn parse_type_card_filter(input: &str) -> OracleResult<'_, TargetFilter> {
+        let (rest, filter) = nom_target::parse_type_filter_word(input)?;
+        Ok((rest, TargetFilter::Typed(TypedFilter::new(filter))))
+    }
+
+    let (mut rest, first) = alt((parse_named_card_filter, parse_type_card_filter)).parse(input)?;
+    let mut filters = vec![first];
+    loop {
+        let Ok((next_rest, _)) =
+            alt((tag::<_, _, OracleError<'_>>(" or are "), tag(" or "))).parse(rest)
+        else {
+            break;
+        };
+        let (after, next) =
+            alt((parse_named_card_filter, parse_type_card_filter)).parse(next_rest)?;
+        filters.push(next);
+        rest = after;
+    }
+    let filter = if filters.len() == 1 {
+        filters.remove(0)
+    } else {
+        TargetFilter::Or { filters }
+    };
+    Ok((rest, filter))
+}
+
+fn parse_owned_cards_in_zones_with_property_filter(
+    input: &str,
+) -> nom::IResult<&str, QuantityExpr, OracleError<'_>> {
+    let (rest, _) = alt((tag("the total number of "), tag("the number of "))).parse(input)?;
+    let (rest, _) = alt((tag("cards"), tag("card"))).parse(rest)?;
+    let (rest, _) = tag(" you own in ").parse(rest)?;
+    let (rest, zones) = separated_list1(
+        alt((tag(" and in "), tag(", and in "), tag(", in "))),
+        preceded(opt(tag("your ")), nom_quantity::parse_zone_ref_singular),
+    )
+    .parse(rest)?;
+    let (rest, _) = tag(" that are ").parse(rest)?;
+    let (rest, filter) = parse_zone_card_that_are_filter_list(rest)?;
+    let (rest, _) = opt(tag(".")).parse(rest)?;
+    let (rest, _) = eof(rest)?;
+
+    let mut exprs: Vec<QuantityExpr> = zones
+        .into_iter()
+        .map(|zone| QuantityExpr::Ref {
+            qty: QuantityRef::ZoneCardCount {
+                zone,
+                card_types: Vec::new(),
+                filter: Some(filter.clone()),
+                scope: CountScope::Owner,
+            },
+        })
+        .collect();
+
+    let expr = if exprs.len() == 1 {
+        exprs.remove(0)
+    } else {
+        QuantityExpr::Sum { exprs }
+    };
+    Ok((rest, expr))
+}
+
 // CR 604.3: Characteristic-defining abilities can define power/toughness using
 // card-count quantities.
 // CR 404.2: Cards in graveyards and exile are scoped by owner, not controller.
@@ -790,6 +969,7 @@ fn parse_owned_cards_in_zones_quantity(
                 zone,
                 card_types: card_types.clone(),
                 scope: CountScope::Owner,
+                filter: None,
             },
         })
         .collect();
@@ -1222,13 +1402,13 @@ pub(crate) fn parse_event_context_quantity(text: &str) -> Option<QuantityExpr> {
     //   - participle adjective + type ("the sacrificed creature's power",
     //     "the destroyed creature's power", "the revealed card's mana value")
     //     → `CostPaidObject` (CR 608.2k cost / trigger-condition referent).
-    //   - bare anaphoric ("that card's mana value", "that creature's power",
-    //     "that spell's mana value", "the creature's toughness") → `Anaphoric`
-    //     (CR 608.2c earlier-instruction referent — Yuriko / Dark Confidant
-    //     issue #511 class).
-    // The participle form is NEVER rewritten by the subject-injection /
-    // "itself" remaps — unlike the bare anaphoric "its" arms above, which emit
-    // `Anaphoric` precisely so they can be remapped.
+    //   - bare demonstrative ("that card's mana value", "that creature's
+    //     power", "that spell's mana value", "the creature's toughness") →
+    //     `Demonstrative` (CR 608.2c earlier-instruction referent — Yuriko /
+    //     Dark Confidant issue #511 class).
+    // Neither the participle nor the demonstrative form is ever rewritten by
+    // the subject-injection / "itself" remaps — unlike the bare pronoun "its"
+    // arms above, which emit `Anaphoric` precisely so they can be remapped.
     if let Some((prefix, suffix)) = lower.split_once("'s ") {
         let suffix = suffix.trim();
         if let Some(scope) = classify_possessive_referent(prefix.trim()) {
@@ -1360,17 +1540,19 @@ fn parse_mana_spent_to_cast_amount(input: &str) -> Option<QuantityRef> {
 ///   source and `effect_context_object` as later fallbacks. Greater Good
 ///   (issue #338) and the cost-referent class depend on this priority.
 ///
-/// - **Bare anaphoric** ("that creature", "that card", "that spell", "the
-///   creature") → [`ObjectScope::Anaphoric`]. CR 608.2c (the "follow
+/// - **Bare demonstrative** ("that creature", "that card", "that spell", "the
+///   creature") → [`ObjectScope::Demonstrative`]. CR 608.2c (the "follow
 ///   instructions in the order written / apply the rules of English to the
 ///   text" anaphora rule) makes the antecedent the *most recent earlier
-///   effect instruction* in the same ability. The runtime `Anaphoric` arm
-///   inverts the slot order accordingly: slot 1 is `effect_context_object`
-///   (the revealed / moved / effect-sacrificed object), then the trigger
-///   source (CR 608.2k trigger-condition referent), then `cost_paid_object`.
-///   This is the Yuriko, the Tiger's Shadow / Dark Confidant class
-///   (issue #511): a reveal earlier in the same ability binds "that card's"
-///   to the revealed card, not to the trigger source.
+///   effect instruction* in the same ability. The runtime `Demonstrative` arm
+///   (shared with `Anaphoric`) inverts the slot order accordingly: slot 1 is
+///   `effect_context_object` (the revealed / moved / effect-sacrificed
+///   object), then the trigger source (CR 608.2k trigger-condition referent),
+///   then `cost_paid_object`. This is the Yuriko, the Tiger's Shadow / Dark
+///   Confidant class (issue #511): a reveal earlier in the same ability binds
+///   "that card's" to the revealed card, not to the trigger source. The
+///   dedicated variant (vs. the pronoun `Anaphoric`) is what keeps the
+///   subject-injection rewrite from clobbering this fixed antecedent.
 ///
 /// Picking the scope at parse time (rather than always emitting one or the
 /// other) lets the runtime consult the right slot priority for each
@@ -1405,14 +1587,18 @@ fn classify_possessive_referent(prefix: &str) -> Option<ObjectScope> {
         return Some(ObjectScope::CostPaidObject);
     }
 
-    // CR 608.2c: bare anaphoric — "that <type>" / "the <type>" with no
-    // participle adjective in between. The type word must be the entire
-    // remainder (no trailing modifiers), which `all_consuming` enforces.
+    // CR 608.2c: bare demonstrative / definite possessive — "that <type>" /
+    // "the <type>" with no participle adjective in between. The type word must
+    // be the entire remainder (no trailing modifiers), which `all_consuming`
+    // enforces. Emits `Demonstrative` (NOT the pronoun `Anaphoric`): the
+    // antecedent is a full noun phrase fixed by the Oracle text, so the
+    // subject-injection rewrite must never rebind it (Creature Bond, Erratic
+    // Explosion). At runtime it resolves identically to `Anaphoric`.
     if nom::combinator::all_consuming(parse_possessive_object_type)
         .parse(rest)
         .is_ok()
     {
-        return Some(ObjectScope::Anaphoric);
+        return Some(ObjectScope::Demonstrative);
     }
 
     None
@@ -1657,10 +1843,10 @@ fn parse_for_each_clause_expr_with_parser(
     Some(QuantityExpr::Sum { exprs })
 }
 
-/// CR 702.23a: "for each [object] beyond the first" composes a
-/// normal object-count quantity with an offset of -1. This preserves the
-/// shared `for each` grammar and keeps "beyond the first" as an expression
-/// modifier rather than adding a leaf-level `QuantityRef` variant.
+/// CR 702.23a + CR 107.1b: "for each [object] beyond the first" composes a
+/// normal object-count quantity with an offset of -1, clamped at zero. This
+/// preserves the shared `for each` grammar and keeps "beyond the first" as an
+/// expression modifier rather than adding a leaf-level `QuantityRef` variant.
 fn parse_for_each_beyond_first_clause_expr_with_parser(
     input: &str,
     parse_clause: impl Fn(&str) -> Option<QuantityRef>,
@@ -1672,11 +1858,15 @@ fn parse_for_each_beyond_first_clause_expr_with_parser(
     .parse(input)
     .ok()?;
     let qty = parse_clause(base_clause)?;
+    let count_minus_one = QuantityExpr::Offset {
+        inner: Box::new(QuantityExpr::Ref { qty }),
+        offset: -1,
+    };
     Some((
         input,
-        QuantityExpr::Offset {
-            inner: Box::new(QuantityExpr::Ref { qty }),
-            offset: -1,
+        QuantityExpr::ClampMin {
+            inner: Box::new(count_minus_one),
+            minimum: 0,
         },
     ))
 }
@@ -1776,7 +1966,11 @@ fn parse_investigated_arm(input: &str) -> nom::IResult<&str, PlayerActionKind, O
 
 /// Parse the clause after "for each" into a QuantityRef.
 pub(crate) fn parse_for_each_clause(clause: &str) -> Option<QuantityRef> {
-    parse_for_each_clause_with_they_controller(clause, ControllerRef::ScopedPlayer)
+    parse_for_each_clause_with_they_controller(
+        clause,
+        ControllerRef::ScopedPlayer,
+        &ParseContext::default(),
+    )
 }
 
 pub(crate) fn parse_for_each_clause_with_context(
@@ -1786,12 +1980,13 @@ pub(crate) fn parse_for_each_clause_with_context(
     let they_controller = ctx
         .third_person_player_controller_ref()
         .unwrap_or(ControllerRef::ScopedPlayer);
-    parse_for_each_clause_with_they_controller(clause, they_controller)
+    parse_for_each_clause_with_they_controller(clause, they_controller, ctx)
 }
 
 fn parse_for_each_clause_with_they_controller(
     clause: &str,
     they_controller: ControllerRef,
+    ctx: &ParseContext,
 ) -> Option<QuantityRef> {
     let clause = clause.trim().trim_end_matches('.');
 
@@ -1801,13 +1996,38 @@ fn parse_for_each_clause_with_they_controller(
 
     if let Ok((rest, qty)) = nom_quantity::parse_for_each_clause_ref_with_context(
         clause,
-        &ParseContext {
-            relative_player_scope: Some(they_controller.clone()),
-            ..Default::default()
-        },
+        &for_each_anaphor_context(ctx, &they_controller),
     ) {
         if rest.is_empty() {
             return Some(qty);
+        }
+    }
+
+    // CR 406.6 + CR 607.1 + CR 614.1c: "[type phrase] card(s) exiled with it/~"
+    // -- a count of the linked-exile set (cards exiled with this source, e.g.
+    // via Delve) restricted to a type phrase. Murktide Regent's ETB counter
+    // "for each instant and sorcery card exiled with it". `ExiledBySource`
+    // reports `extract_in_zone() == Exile`, so the resulting `ObjectCount` scans
+    // the exile zone and `matches_target_filter` intersects the type phrase with
+    // the linked-exile set. Runs after the `nom_quantity` attempt so the bare
+    // "card exiled with it" form keeps its existing `CardsExiledBySource` lower.
+    for exiled_suffix in [" exiled with it", " exiled with ~"] {
+        if let Ok((after, prefix)) = terminated(
+            take_until::<_, _, OracleError<'_>>(exiled_suffix),
+            tag::<_, _, OracleError<'_>>(exiled_suffix),
+        )
+        .parse(clause)
+        {
+            if after.trim().is_empty() {
+                let (type_filter, type_rest) = parse_type_phrase(prefix);
+                if type_rest.trim().is_empty() && !matches!(type_filter, TargetFilter::Any) {
+                    return Some(QuantityRef::ObjectCount {
+                        filter: TargetFilter::And {
+                            filters: vec![type_filter, TargetFilter::ExiledBySource],
+                        },
+                    });
+                }
+            }
         }
     }
 
@@ -1917,7 +2137,10 @@ fn parse_for_each_clause_with_they_controller(
     // CR 508.6: "opponent you attacked this turn".
     if parse_opponents_attacked_clause(clause).is_ok() {
         return Some(QuantityRef::PlayerCount {
-            filter: PlayerFilter::OpponentAttackedThisTurn,
+            filter: PlayerFilter::OpponentAttacked {
+                subject: AttackSubject::You,
+                scope: AttackScope::ThisTurn,
+            },
         });
     }
 
@@ -2072,7 +2295,7 @@ fn parse_for_each_clause_with_they_controller(
     .parse(clause)
     {
         if rest.is_empty() {
-            return Some(QuantityRef::AttackedThisTurn);
+            return Some(QuantityRef::AttackedThisTurn { filter: None });
         }
     }
 
@@ -2088,16 +2311,24 @@ fn parse_for_each_clause_with_they_controller(
     // God and other caster-relative counts are unchanged. CR 608.2c: the controller
     // follows instructions in order, so a per-player-scoped count reads the
     // iterating player.
-    let mut tp_ctx = ParseContext {
-        relative_player_scope: Some(they_controller.clone()),
-        ..Default::default()
-    };
+    let mut tp_ctx = for_each_anaphor_context(ctx, &they_controller);
     let (filter, remainder) = parse_type_phrase_with_ctx(clause, &mut tp_ctx);
     if !matches!(filter, TargetFilter::Any) && remainder.trim().is_empty() {
         return Some(QuantityRef::ObjectCount { filter });
     }
 
     None
+}
+
+fn for_each_anaphor_context(ctx: &ParseContext, they_controller: &ControllerRef) -> ParseContext {
+    ParseContext {
+        relative_player_scope: Some(they_controller.clone()),
+        subject: ctx.subject.clone(),
+        card_name: ctx.card_name.clone(),
+        host_self_reference: ctx.host_self_reference.clone(),
+        current_trigger_index: ctx.current_trigger_index,
+        ..Default::default()
+    }
 }
 
 /// CR 608.2c: Parse the object set named by a "for each [object]"
@@ -2324,6 +2555,30 @@ mod tests {
     }
 
     #[test]
+    fn cda_half_highest_opponent_life_rounded_up() {
+        // Malignus: "half the highest life total among your opponents, rounded up".
+        // The inner is a cross-player life aggregate the general nom grammar does
+        // not reach, so the fraction must recurse into the CDA quantity parser.
+        let expr =
+            parse_cda_quantity("half the highest life total among your opponents, rounded up");
+        assert!(
+            matches!(
+                expr,
+                Some(QuantityExpr::DivideRounded { ref inner, divisor: 2, rounding: RoundingMode::Up })
+                    if matches!(
+                        **inner,
+                        QuantityExpr::Ref {
+                            qty: QuantityRef::LifeTotal {
+                                player: PlayerScope::Opponent { aggregate: AggregateFunction::Max },
+                            },
+                        },
+                    )
+            ),
+            "expected DivideRounded(LifeTotal(Opponent Max), 2, Up), got {expr:?}"
+        );
+    }
+
+    #[test]
     fn for_each_counter_on_self_normalized() {
         let qty = parse_for_each_clause("+1/+1 counter on ~").unwrap();
         match qty {
@@ -2488,7 +2743,7 @@ mod tests {
     }
 
     /// CR 508.6: "the number of opponents you attacked [this turn]" (Militant
-    /// Angel) routes to the dedicated `PlayerCount { OpponentAttackedThisTurn }`.
+    /// Angel) routes to `PlayerCount { OpponentAttacked { You, ThisTurn } }`.
     /// The trailing " this turn" is optional (durations may be stripped
     /// upstream), and the singular "opponent" form hits the same arm.
     #[test]
@@ -2501,33 +2756,39 @@ mod tests {
             assert_eq!(
                 parse_quantity_ref(phrase),
                 Some(QuantityRef::PlayerCount {
-                    filter: PlayerFilter::OpponentAttackedThisTurn,
+                    filter: PlayerFilter::OpponentAttacked {
+                        subject: AttackSubject::You,
+                        scope: AttackScope::ThisTurn,
+                    },
                 }),
-                "phrase {phrase:?} must route to OpponentAttackedThisTurn"
+                "phrase {phrase:?} must route to OpponentAttacked {{ You, ThisTurn }}"
             );
         }
     }
 
     /// CR 508.6: the for-each clause form ("opponent you attacked this turn")
-    /// reaches the same `PlayerCount { OpponentAttackedThisTurn }`.
+    /// reaches the same `PlayerCount { OpponentAttacked { You, ThisTurn } }`.
     #[test]
     fn for_each_opponent_you_attacked_is_player_count() {
         assert_eq!(
             parse_for_each_clause("opponent you attacked this turn"),
             Some(QuantityRef::PlayerCount {
-                filter: PlayerFilter::OpponentAttackedThisTurn,
+                filter: PlayerFilter::OpponentAttacked {
+                    subject: AttackSubject::You,
+                    scope: AttackScope::ThisTurn,
+                },
             }),
         );
     }
 
     /// Collision guard: "creature you attacked WITH this turn" (the source-
-    /// referential attacked-with form) must stay `QuantityRef::AttackedThisTurn`
+    /// referential attacked-with form) must stay `QuantityRef::AttackedThisTurn { filter: None }`
     /// — the " with" subject distinguishes it from the player-population
     /// "opponents you attacked" phrase.
     #[test]
     fn creature_you_attacked_with_this_turn_stays_attacked_this_turn() {
         let qty = parse_for_each_clause("creature you attacked with this turn").unwrap();
-        assert_eq!(qty, QuantityRef::AttackedThisTurn);
+        assert_eq!(qty, QuantityRef::AttackedThisTurn { filter: None });
     }
 
     #[test]
@@ -2546,7 +2807,7 @@ mod tests {
     #[test]
     fn for_each_creature_you_attacked_with_this_turn_counts_attacking_creatures() {
         let qty = parse_for_each_clause("creature you attacked with this turn").unwrap();
-        assert_eq!(qty, QuantityRef::AttackedThisTurn);
+        assert_eq!(qty, QuantityRef::AttackedThisTurn { filter: None });
     }
 
     #[test]
@@ -2664,6 +2925,24 @@ mod tests {
                 panic!("Expected PlayerCount{{ControlsCount(creature+pt)}}, got {other:?}")
             }
         }
+    }
+
+    #[test]
+    fn parse_cda_quantity_permanents_sacrificed_this_turn() {
+        let expr = parse_cda_quantity("the number of permanents you've sacrificed this turn")
+            .expect("should parse");
+        assert_eq!(
+            expr,
+            QuantityExpr::Ref {
+                qty: QuantityRef::SacrificedThisTurn {
+                    player: PlayerScope::Controller,
+                    filter: TargetFilter::Typed(TypedFilter {
+                        type_filters: vec![TypeFilter::Permanent],
+                        ..Default::default()
+                    }),
+                }
+            }
+        );
     }
 
     // A1 "one plus" path: the Offset arm wraps the inner PlayerCount unchanged
@@ -3604,14 +3883,16 @@ mod tests {
         );
     }
 
-    /// CR 608.2c: bare anaphoric "that spell" inside a triggered ability or
+    /// CR 608.2c: bare demonstrative "that spell" inside a triggered ability or
     /// delayed-trigger continuation is an instruction-order referent — it
     /// points at the spell introduced by an earlier instruction in the same
     /// ability (typically a counter / copy / reveal), not at the cost-paid
-    /// object. Slot priority differs from `CostPaidObject`
+    /// object. It selects `ObjectScope::Demonstrative` (the noun-phrase referent,
+    /// distinct from the pronoun "its") so the subject-injection rewrite never
+    /// rebinds it; slot priority differs from `CostPaidObject`
     /// (effect_context_object first vs. cost_paid_object first); see
     /// `classify_possessive_referent` and `resolve_object_mana_value`'s
-    /// `Anaphoric` arm. Mana Drain is the canonical delayed-trigger member of
+    /// `Demonstrative` arm. Mana Drain is the canonical delayed-trigger member of
     /// this class — `snapshot_quantity_ref`
     /// (`game/effects/delayed_trigger.rs`) bakes the resolved value into
     /// `Fixed` at delayed-trigger creation time using the parent's target
@@ -3622,7 +3903,7 @@ mod tests {
             parse_event_context_quantity("that spell's mana value"),
             Some(QuantityExpr::Ref {
                 qty: QuantityRef::ObjectManaValue {
-                    scope: ObjectScope::Anaphoric
+                    scope: ObjectScope::Demonstrative
                 }
             })
         );
@@ -3630,45 +3911,45 @@ mod tests {
 
     /// CR 608.2c — Yuriko, the Tiger's Shadow / Dark Confidant class
     /// (issue #511). A reveal in an earlier instruction binds "that card's
-    /// mana value" to the revealed card. The bare anaphoric prefix "that
-    /// card" must select `ObjectScope::Anaphoric` so the runtime resolver
+    /// mana value" to the revealed card. The bare demonstrative prefix "that
+    /// card" selects `ObjectScope::Demonstrative` so the runtime resolver
     /// reads `effect_context_object` (the revealed card) before the trigger
     /// source (the Ninja that dealt combat damage).
     #[test]
-    fn parse_event_context_possessive_that_card_mana_value_anaphoric() {
+    fn parse_event_context_possessive_that_card_mana_value_demonstrative() {
         assert_eq!(
             parse_event_context_quantity("that card's mana value"),
             Some(QuantityExpr::Ref {
                 qty: QuantityRef::ObjectManaValue {
-                    scope: ObjectScope::Anaphoric
+                    scope: ObjectScope::Demonstrative
                 }
             })
         );
     }
 
-    /// CR 608.2c — bare anaphoric "that permanent" inside a triggered ability
+    /// CR 608.2c — bare demonstrative "that permanent" inside a triggered ability
     /// is an instruction-order referent like "that card" / "that creature".
     #[test]
-    fn parse_event_context_possessive_that_permanent_power_anaphoric() {
+    fn parse_event_context_possessive_that_permanent_power_demonstrative() {
         assert_eq!(
             parse_event_context_quantity("that permanent's power"),
             Some(QuantityExpr::Ref {
                 qty: QuantityRef::Power {
-                    scope: ObjectScope::Anaphoric
+                    scope: ObjectScope::Demonstrative
                 }
             })
         );
     }
 
     /// CR 608.2c — battles are objects and can be referenced by bare
-    /// anaphoric possessives the same way cards, permanents, and spells are.
+    /// demonstrative possessives the same way cards, permanents, and spells are.
     #[test]
-    fn parse_event_context_possessive_that_battle_mana_value_anaphoric() {
+    fn parse_event_context_possessive_that_battle_mana_value_demonstrative() {
         assert_eq!(
             parse_event_context_quantity("that battle's mana value"),
             Some(QuantityExpr::Ref {
                 qty: QuantityRef::ObjectManaValue {
-                    scope: ObjectScope::Anaphoric
+                    scope: ObjectScope::Demonstrative
                 }
             })
         );
@@ -3773,22 +4054,24 @@ mod tests {
         );
     }
 
-    /// CR 608.2c — "that creature" is a bare anaphoric pronoun: it points at
-    /// the most recent earlier-instruction object (a revealed / sacrificed-by-
+    /// CR 608.2c — "that creature" is a bare demonstrative possessive: it points
+    /// at the most recent earlier-instruction object (a revealed / sacrificed-by-
     /// effect / moved permanent), so the parser emits
-    /// `ObjectScope::Anaphoric`. The runtime resolver consults
-    /// `effect_context_object` first, then the trigger source, then
-    /// `cost_paid_object` — the inverse of `CostPaidObject`'s slot order.
-    /// Participle-possessive forms (`the sacrificed creature's toughness`,
-    /// `the destroyed creature's power`) continue to map to `CostPaidObject`
-    /// — see the sibling regression tests below.
+    /// `ObjectScope::Demonstrative` (distinct from the pronoun "its" so the
+    /// subject-injection rewrite never rebinds it — this is what protects
+    /// Creature Bond's "that creature's toughness" from the LKI-toughness fix's
+    /// generalized rebind). The runtime resolver consults `effect_context_object`
+    /// first, then the trigger source, then `cost_paid_object` — the inverse of
+    /// `CostPaidObject`'s slot order. Participle-possessive forms (`the sacrificed
+    /// creature's toughness`, `the destroyed creature's power`) continue to map to
+    /// `CostPaidObject` — see the sibling regression tests below.
     #[test]
-    fn parse_event_context_possessive_that_creature_toughness_anaphoric() {
+    fn parse_event_context_possessive_that_creature_toughness_demonstrative() {
         assert_eq!(
             parse_event_context_quantity("that creature's toughness"),
             Some(QuantityExpr::Ref {
                 qty: QuantityRef::Toughness {
-                    scope: ObjectScope::Anaphoric
+                    scope: ObjectScope::Demonstrative
                 }
             })
         );
@@ -3983,6 +4266,7 @@ mod tests {
                 zone: ZoneRef::Hand,
                 card_types: vec![],
                 scope: CountScope::Controller,
+                filter: None,
             }
         );
     }
@@ -3996,6 +4280,7 @@ mod tests {
                 zone: ZoneRef::Graveyard,
                 card_types: vec![],
                 scope: CountScope::Controller,
+                filter: None,
             }
         );
     }
@@ -4353,6 +4638,7 @@ mod tests {
                         zone,
                         card_types,
                         scope,
+                        filter: None,
                     },
             } => {
                 assert_eq!(zone, ZoneRef::Graveyard);
@@ -4382,6 +4668,7 @@ mod tests {
                         QuantityRef::ZoneCardCount {
                             zone,
                             card_types,
+                            filter: None,
                             scope,
                         },
                 } => {
@@ -4392,6 +4679,93 @@ mod tests {
                 other => panic!("expected ZoneCardCount segment, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn zone_card_filter_list_named_before_type_is_order_independent() {
+        let (_, filter) =
+            parse_zone_card_that_are_filter_list("named Slime Against Humanity or are Oozes")
+                .expect("reversed filter order must parse");
+        assert_slime_against_humanity_filter(&filter);
+    }
+
+    /// Slime Against Humanity: cards-with-filter suffix after zone list.
+    #[test]
+    fn issue_2370_slime_ooze_and_named_card_zone_count() {
+        let result = parse_cda_quantity(
+            "two plus the total number of cards you own in exile and in your graveyard that are Oozes or are named Slime Against Humanity",
+        )
+        .expect("slime quantity must parse");
+        let QuantityExpr::Offset { inner, offset } = result else {
+            panic!("expected Offset of 2 + zone count, got {result:?}");
+        };
+        assert_eq!(offset, 2);
+        let QuantityExpr::Sum { exprs: zones } = *inner else {
+            panic!("expected summed exile+graveyard counts");
+        };
+        assert_eq!(zones.len(), 2);
+        for expr in zones.iter() {
+            match expr {
+                QuantityExpr::Ref {
+                    qty:
+                        QuantityRef::ZoneCardCount {
+                            card_types,
+                            filter: Some(filter),
+                            scope,
+                            ..
+                        },
+                } => {
+                    assert_eq!(scope, &CountScope::Owner);
+                    assert!(card_types.is_empty());
+                    assert_slime_against_humanity_filter(filter);
+                }
+                other => panic!("expected ZoneCardCount, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn issue_2370_named_card_zone_count_is_order_independent() {
+        let result = parse_cda_quantity(
+            "the total number of cards you own in your graveyard that are named Slime Against Humanity or are Oozes",
+        )
+        .expect("named-first slime quantity must parse");
+        let QuantityExpr::Ref {
+            qty:
+                QuantityRef::ZoneCardCount {
+                    zone,
+                    card_types,
+                    filter: Some(filter),
+                    scope,
+                },
+        } = result
+        else {
+            panic!("expected filtered ZoneCardCount, got {result:?}");
+        };
+        assert_eq!(zone, ZoneRef::Graveyard);
+        assert_eq!(scope, CountScope::Owner);
+        assert!(card_types.is_empty());
+        assert_slime_against_humanity_filter(&filter);
+    }
+
+    fn assert_slime_against_humanity_filter(filter: &TargetFilter) {
+        let TargetFilter::Or { filters } = filter else {
+            panic!("expected Or filter, got {filter:?}");
+        };
+        assert!(filters.iter().any(|filter| {
+            matches!(
+                filter,
+                TargetFilter::Typed(TypedFilter { type_filters, .. })
+                    if type_filters.iter().any(|tf| matches!(tf, TypeFilter::Subtype(s) if s == "Ooze"))
+            )
+        }));
+        assert!(filters.iter().any(|filter| {
+            matches!(
+                filter,
+                TargetFilter::Typed(TypedFilter { properties, .. })
+                    if properties.iter().any(|prop| matches!(prop, FilterProp::Named { name } if name == "Slime Against Humanity"))
+            )
+        }));
     }
 
     #[test]
@@ -4524,10 +4898,14 @@ mod tests {
     }
 
     #[test]
-    fn for_each_beyond_the_first_offsets_base_count() {
+    fn for_each_beyond_the_first_clamps_offset_base_count() {
         let result = parse_for_each_clause_expr("creature blocking it beyond the first");
-        let Some(QuantityExpr::Offset { inner, offset }) = result else {
-            panic!("expected Offset, got {result:?}");
+        let Some(QuantityExpr::ClampMin { inner, minimum }) = result else {
+            panic!("expected ClampMin, got {result:?}");
+        };
+        assert_eq!(minimum, 0);
+        let QuantityExpr::Offset { inner, offset } = *inner else {
+            panic!("expected clamped Offset, got {inner:?}");
         };
         assert_eq!(offset, -1);
         match inner.as_ref() {
@@ -5013,6 +5391,32 @@ mod tests {
             },
             other => panic!("expected FilteredTrackedSetSize, got {other:?}"),
         }
+    }
+
+    /// CR 406.6 + CR 614.1c: "for each instant and sorcery card exiled with it"
+    /// (Murktide Regent's Delve ETB counter). The type-phrase prefix intersects
+    /// the linked-exile set; `ExiledBySource.extract_in_zone()` is Exile, so the
+    /// `ObjectCount` scans the exile zone rather than the battlefield default.
+    /// Building-block test: any "<type> exiled with it" for-each count uses this
+    /// path.
+    #[test]
+    fn for_each_typed_card_exiled_with_it_counts_linked_exile() {
+        let qty =
+            parse_for_each_clause("instant and sorcery card exiled with it").expect("must parse");
+        let QuantityRef::ObjectCount { filter } = qty else {
+            panic!("expected ObjectCount, got {qty:?}");
+        };
+        let TargetFilter::And { filters } = filter else {
+            panic!("expected And filter, got {filter:?}");
+        };
+        assert!(
+            filters.contains(&TargetFilter::ExiledBySource),
+            "And must include ExiledBySource: {filters:?}"
+        );
+        assert!(
+            filters.iter().any(|f| matches!(f, TargetFilter::Or { .. })),
+            "instant-and-sorcery type union should be an Or branch: {filters:?}"
+        );
     }
 
     #[test]

@@ -2354,12 +2354,9 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
     if target_relative_clause_owns_suffix(lower.as_str()) {
         return (text, None);
     }
-    // A terminal where-X quantity clause can own "this turn" itself (for example,
+    // Per-turn quantity clauses can own "this turn" themselves (for example,
     // "where X is the number of tokens you created this turn"). In that shape the
     // suffix belongs to the quantity grammar, not to the outer effect duration.
-    if where_x_quantity_clause_owns_this_turn_suffix(lower.as_str()) {
-        return (text, None);
-    }
     for (suffix, duration) in [
         (" this turn", Duration::UntilEndOfTurn),
         (" until end of turn", Duration::UntilEndOfTurn),
@@ -2414,6 +2411,9 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
         ),
     ] {
         if lower.ends_with(suffix) {
+            if suffix == " this turn" && quantity_clause_owns_this_turn_suffix(&lower) {
+                continue;
+            }
             let end = duration_text.len() - suffix.len();
             return (
                 duration_text[..end].trim_end_matches(',').trim(),
@@ -2484,6 +2484,11 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
     (text, None)
 }
 
+fn quantity_clause_owns_this_turn_suffix(lower: &str) -> bool {
+    where_x_quantity_clause_owns_this_turn_suffix(lower)
+        || for_each_quantity_clause_owns_this_turn_suffix(lower)
+}
+
 fn where_x_quantity_clause_owns_this_turn_suffix(lower: &str) -> bool {
     let Ok((where_clause, _)) = preceded(
         take_until::<_, _, OracleError<'_>>("where x is "),
@@ -2502,6 +2507,26 @@ fn where_x_quantity_clause_owns_this_turn_suffix(lower: &str) -> bool {
     };
     let expression_end = quantity_before_this_turn.len() + " this turn".len();
     parse_where_x_quantity_expression(&normalized[..expression_end]).is_some()
+}
+
+fn for_each_quantity_clause_owns_this_turn_suffix(lower: &str) -> bool {
+    let Ok((for_each_clause, _)) = preceded(
+        take_until::<_, _, OracleError<'_>>(" for each "),
+        tag::<_, _, OracleError<'_>>(" for each "),
+    )
+    .parse(lower) else {
+        return false;
+    };
+    let normalized = for_each_clause.trim();
+    let Ok((_, quantity_before_this_turn)) = all_consuming(terminated(
+        take_until::<_, _, OracleError<'_>>(" this turn"),
+        tag::<_, _, OracleError<'_>>(" this turn"),
+    ))
+    .parse(normalized) else {
+        return false;
+    };
+    let expression_end = quantity_before_this_turn.len() + " this turn".len();
+    parse_for_each_clause(&normalized[..expression_end]).is_some()
 }
 
 fn target_relative_clause_owns_suffix(input: &str) -> bool {
@@ -5411,6 +5436,16 @@ mod where_x_tests {
     }
 
     #[test]
+    fn strip_trailing_duration_preserves_life_lost_this_turn_phrase() {
+        use super::strip_trailing_duration;
+
+        let text = "draw a card for each opponent who lost life this turn.";
+        let (stripped, duration) = strip_trailing_duration(text);
+        assert!(duration.is_none());
+        assert_eq!(stripped, text);
+    }
+
+    #[test]
     fn strip_trailing_duration_still_strips_outer_duration_after_where_x_clause() {
         use super::strip_trailing_duration;
 
@@ -5425,6 +5460,15 @@ mod where_x_tests {
             stripped,
             "draw X cards, where X is the life you've lost this turn, then target creature gets +1/+1"
         );
+    }
+
+    #[test]
+    fn strip_trailing_duration_still_strips_genuine_this_turn_duration() {
+        use super::strip_trailing_duration;
+
+        let (stripped, duration) = strip_trailing_duration("that creature gains haste this turn.");
+        assert_eq!(duration, Some(Duration::UntilEndOfTurn));
+        assert_eq!(stripped, "that creature gains haste");
     }
 
     /// The new delegation must NOT shadow `parse_cda_quantity`: "the number of

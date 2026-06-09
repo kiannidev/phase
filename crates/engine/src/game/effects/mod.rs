@@ -5115,9 +5115,9 @@ pub(crate) fn evaluate_condition(
             let type_matches = subject_id
                 .map(|id| {
                     super::printed_cards::object_has_core_type(state, id, *card_type)
-                        || alt_card_types.iter().any(|alt| {
-                            super::printed_cards::object_has_core_type(state, id, *alt)
-                        })
+                        || alt_card_types
+                            .iter()
+                            .any(|alt| super::printed_cards::object_has_core_type(state, id, *alt))
                 })
                 .unwrap_or(false);
             // CR 205.3m: Match the revealed card's subtype against the subtype filter.

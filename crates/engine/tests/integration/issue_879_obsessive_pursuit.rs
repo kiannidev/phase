@@ -7,6 +7,7 @@ use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
+use engine::types::keywords::Keyword;
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
@@ -88,6 +89,10 @@ fn issue_879_obsessive_pursuit_puts_counters_and_lifelink_after_three_sacrifices
         p1p1_counters(&runner, attacker),
         3,
         "Obsessive Pursuit must put X +1/+1 counters where X is sacrifices this turn"
+    );
+    assert!(
+        runner.state().objects[&attacker].has_keyword(&Keyword::Lifelink),
+        "Obsessive Pursuit must grant lifelink when the same X binding is three or more"
     );
 }
 

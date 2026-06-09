@@ -9601,6 +9601,19 @@ fn rewrite_triggering_spell_controller_to_parent_target_controller(effect: &mut 
     });
 }
 
+fn replace_definition_targets_with_parent(def: &mut AbilityDefinition) {
+    replace_target_with_parent(&mut def.effect);
+    if let Some(sub) = def.sub_ability.as_mut() {
+        replace_definition_targets_with_parent(sub);
+    }
+    if let Some(else_branch) = def.else_ability.as_mut() {
+        replace_definition_targets_with_parent(else_branch);
+    }
+    for mode in &mut def.mode_abilities {
+        replace_definition_targets_with_parent(mode);
+    }
+}
+
 /// Replace the target filter on an effect with ParentTarget.
 /// Used for anaphoric "it"/"that creature" references in compound sub-effects.
 fn replace_target_with_parent(effect: &mut Effect) {
@@ -9688,7 +9701,7 @@ fn replace_target_with_parent(effect: &mut Effect) {
             }
         }
         Effect::CreateDelayedTrigger { effect, .. } => {
-            replace_target_with_parent(&mut effect.effect);
+            replace_definition_targets_with_parent(effect);
         }
         _ => {
             // Effects without a target field (Draw, GainLife, etc.) stay as-is.
@@ -42713,6 +42726,51 @@ mod tests {
         assert!(
             delayed_sacrifice_targets_parent(&def),
             "delayed Sacrifice must target ParentTarget (the returned creature), not SelfRef"
+        );
+    }
+
+    #[test]
+    fn replace_target_with_parent_recurses_delayed_trigger_sub_ability() {
+        let mut effect = Effect::CreateDelayedTrigger {
+            condition: DelayedTriggerCondition::AtNextPhase { phase: Phase::End },
+            effect: Box::new(
+                AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                )
+                .sub_ability(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::Sacrifice {
+                        target: TargetFilter::SelfRef,
+                        count: QuantityExpr::Fixed { value: 1 },
+                        min_count: 0,
+                    },
+                )),
+            ),
+            uses_tracked_set: false,
+        };
+
+        replace_target_with_parent(&mut effect);
+
+        let Effect::CreateDelayedTrigger { effect, .. } = effect else {
+            panic!("expected delayed trigger");
+        };
+        let sacrifice = effect
+            .sub_ability
+            .as_ref()
+            .expect("expected delayed trigger sub-ability");
+        assert!(
+            matches!(
+                &*sacrifice.effect,
+                Effect::Sacrifice {
+                    target: TargetFilter::ParentTarget,
+                    ..
+                }
+            ),
+            "delayed trigger sub-ability Sacrifice must target ParentTarget"
         );
     }
 

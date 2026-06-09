@@ -6289,7 +6289,7 @@ mod tests {
     #[test]
     fn issue_2364_block_restriction_limits_blocker_to_flying_attackers() {
         use crate::types::ability::StaticDefinition;
-        use crate::types::statics::{StaticMode, block_only_creatures_with_flying_filter};
+        use crate::types::statics::{block_only_creatures_with_flying_filter, StaticMode};
 
         let mut state = setup();
         let ground_attacker = create_creature(&mut state, PlayerId(0), "Bear", 2, 2);

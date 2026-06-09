@@ -111,6 +111,9 @@ fn with_owner_scope(filter: TargetFilter, controller: ControllerRef) -> TargetFi
         TargetFilter::Not { filter } => TargetFilter::Not {
             filter: Box::new(with_owner_scope(*filter, controller)),
         },
+        TargetFilter::Any => TargetFilter::Typed(
+            TypedFilter::card().properties(vec![FilterProp::Owned { controller }]),
+        ),
         other => TargetFilter::And {
             filters: vec![
                 other,

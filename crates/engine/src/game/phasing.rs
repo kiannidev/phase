@@ -114,6 +114,10 @@ pub fn phase_out_object(
     }
 
     if !phased.is_empty() {
+        // CR 613.1 + CR 702.26b/e: Phasing out changes which continuous
+        // effects apply and which affected sets may include these permanents.
+        // Mark dirty so the next SBA/public-state flush re-derives layers with
+        // phased-out objects excluded.
         crate::game::layers::mark_layers_full(state);
     }
 

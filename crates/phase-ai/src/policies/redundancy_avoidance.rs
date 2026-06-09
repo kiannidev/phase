@@ -929,13 +929,7 @@ fn hand_spell_benefits_from_flash_grant(obj: &engine::game::game_object::GameObj
     if obj.card_types.core_types.contains(&CoreType::Instant) {
         return false;
     }
-    if obj.card_types.core_types.contains(&CoreType::Sorcery) {
-        return true;
-    }
-    if obj.card_types.core_types.contains(&CoreType::Creature) {
-        return !has_flash(obj);
-    }
-    true
+    !has_flash(obj)
 }
 
 /// Issue #1528 — penalise activating Alchemist's Refuge-style flash grants
@@ -1484,6 +1478,47 @@ mod tests {
         assert_eq!(
             delta, 0.0,
             "flash permission should remain viable when a sorcery can use it"
+        );
+    }
+
+    #[test]
+    fn flash_cast_permission_with_already_flash_permanent_penalized() {
+        let mut state = GameState::new_two_player(0);
+        let refuge_id = make_creature_with_ability(
+            &mut state,
+            "Alchemist's Refuge",
+            Effect::GenericEffect {
+                static_abilities: vec![StaticDefinition::new(StaticMode::CastWithKeyword {
+                    keyword: Keyword::Flash,
+                })],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+            },
+        );
+        let artifact = create_object(
+            &mut state,
+            CardId(902),
+            PlayerId(0),
+            "Shimmer Myr".to_string(),
+            Zone::Hand,
+        );
+        let obj = state.objects.get_mut(&artifact).unwrap();
+        obj.card_types.core_types.push(CoreType::Artifact);
+        obj.keywords.push(Keyword::Flash);
+        state.players[0].hand.push_back(artifact);
+
+        let config = AiConfig::default();
+        let ai_ctx = AiContext::empty(&config.weights);
+        let decision = priority_decision();
+        let candidate = activate_candidate(refuge_id);
+        let ctx = mk_ctx(&state, &decision, &candidate, &config, &ai_ctx);
+
+        let PolicyVerdict::Score { delta, .. } = RedundancyAvoidancePolicy.verdict(&ctx) else {
+            panic!("expected Score verdict");
+        };
+        assert_eq!(
+            delta, -2.0,
+            "flash permission should be redundant when the only affected permanent already has flash"
         );
     }
 

@@ -4875,6 +4875,15 @@ pub(super) fn apply_where_x_effect_expression(
             }
             PaymentCost::Mana { .. } | PaymentCost::AbilityCost { .. } => {}
         },
+        Effect::GenericEffect {
+            static_abilities, ..
+        } => {
+            for static_def in static_abilities.iter_mut() {
+                if let Some(condition) = static_def.condition.as_mut() {
+                    apply_where_x_static_condition(condition, where_x_expression);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -5023,6 +5032,27 @@ fn apply_where_x_ability_condition(cond: &mut AbilityCondition, where_x_expressi
         }
         AbilityCondition::ConditionInstead { inner } => {
             apply_where_x_ability_condition(inner, where_x_expression);
+        }
+        _ => {}
+    }
+}
+
+fn apply_where_x_static_condition(
+    condition: &mut StaticCondition,
+    where_x_expression: Option<&str>,
+) {
+    match condition {
+        StaticCondition::QuantityComparison { lhs, rhs, .. } => {
+            *lhs = apply_where_x_quantity_expression(lhs.clone(), where_x_expression);
+            *rhs = apply_where_x_quantity_expression(rhs.clone(), where_x_expression);
+        }
+        StaticCondition::And { conditions } | StaticCondition::Or { conditions } => {
+            for condition in conditions {
+                apply_where_x_static_condition(condition, where_x_expression);
+            }
+        }
+        StaticCondition::Not { condition } => {
+            apply_where_x_static_condition(condition, where_x_expression);
         }
         _ => {}
     }

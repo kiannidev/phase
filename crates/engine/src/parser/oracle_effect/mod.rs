@@ -34637,6 +34637,46 @@ mod tests {
     }
 
     #[test]
+    fn parse_where_x_threshold_static_grant_condition() {
+        let def = parse_effect_chain(
+            "put X +1/+1 counters on target attacking creature, where X is the number of permanents you've sacrificed this turn. If X is three or more, that creature gains lifelink until end of turn.",
+            AbilityKind::Spell,
+        );
+        let grant = def
+            .sub_ability
+            .expect("expected conditional grant continuation");
+        let Effect::GenericEffect {
+            static_abilities, ..
+        } = grant.effect.as_ref()
+        else {
+            panic!("expected GenericEffect grant, got {:?}", grant.effect);
+        };
+        let condition = static_abilities
+            .first()
+            .and_then(|static_def| static_def.condition.as_ref())
+            .expect("lifelink grant must carry static condition");
+        let StaticCondition::QuantityComparison {
+            lhs,
+            comparator,
+            rhs,
+        } = condition
+        else {
+            panic!("expected QuantityComparison condition, got {condition:?}");
+        };
+        assert_eq!(*comparator, Comparator::GE);
+        assert_eq!(*rhs, QuantityExpr::Fixed { value: 3 });
+        assert!(
+            matches!(
+                lhs,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::SacrificedThisTurn { .. }
+                }
+            ),
+            "where-X static grant condition must bind to SacrificedThisTurn, got {lhs:?}"
+        );
+    }
+
+    #[test]
     fn parse_condition_text_non_comparison_returns_none() {
         assert!(parse_condition_text("the creature that is exiled").is_none());
     }

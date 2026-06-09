@@ -4637,7 +4637,7 @@ fn parse_there_exists_compound_zone_condition(input: &str) -> OracleResult<'_, S
                         card_types: first_card_types,
                         scope: scope.clone(),
                         filter: None,
-                    }
+                    },
                     1,
                 ),
                 make_quantity_ge(
@@ -4646,7 +4646,7 @@ fn parse_there_exists_compound_zone_condition(input: &str) -> OracleResult<'_, S
                         card_types: second_card_types,
                         scope,
                         filter: None,
-                    }
+                    },
                     1,
                 ),
             ],

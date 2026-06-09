@@ -9,6 +9,7 @@
 use std::str::FromStr;
 
 use crate::parser::oracle_nom::error::{OracleError, OracleResult};
+use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till1, take_until};
 use nom::combinator::{all_consuming, eof, opt, peek, value};
 use nom::multi::separated_list1;
@@ -855,7 +856,7 @@ fn parse_zone_card_that_are_filter_list(input: &str) -> OracleResult<'_, TargetF
     let filter = if filters.len() == 1 {
         filters.remove(0)
     } else {
-        TargetFilter::AnyOf(filters)
+        TargetFilter::Or { filters }
     };
     Ok((rest, filter))
 }
@@ -4682,8 +4683,8 @@ mod tests {
     }
 
     fn assert_slime_against_humanity_filter(filter: &TargetFilter) {
-        let TargetFilter::AnyOf(filters) = filter else {
-            panic!("expected AnyOf filter, got {filter:?}");
+        let TargetFilter::Or { filters } = filter else {
+            panic!("expected Or filter, got {filter:?}");
         };
         assert!(filters.iter().any(|filter| {
             matches!(

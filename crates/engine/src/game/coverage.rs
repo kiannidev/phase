@@ -1081,7 +1081,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             zone,
             card_types,
             scope,
-            filter: None,
+            filter,
         } => {
             let types = if card_types.is_empty() {
                 "cards".into()
@@ -1093,11 +1093,15 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                     .join("/")
                     + " cards"
             };
-            format!(
+            let base = format!(
                 "{types} in {} {}",
                 fmt_count_scope(scope),
                 fmt_zone_ref(zone)
-            )
+            );
+            match filter {
+                Some(filter) => format!("{base} matching {}", fmt_target(filter)),
+                None => base,
+            }
         }
         QuantityRef::BasicLandTypeCount { controller } => {
             format!(

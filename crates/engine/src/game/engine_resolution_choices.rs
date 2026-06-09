@@ -2285,6 +2285,55 @@ pub(super) fn handle_resolution_choice(
                         super::zones::move_to_library_at_index(state, card_id, Some(0), events);
                     }
                 }
+                // CR 601.2c + CR 115.1: Resolution-time hand/library pick for
+                // `CastFromZone` (Electrodominance, Baral's Expertise).
+                EffectKind::CastFromZone => {
+                    let Some(cont) = state.pending_continuation.take() else {
+                        return Err(EngineError::InvalidAction(
+                            "CastFromZone EffectZoneChoice missing stashed ability".to_string(),
+                        ));
+                    };
+                    let ability = *cont.chain;
+                    let (
+                        without_paying,
+                        cast_transformed,
+                        alt_ability_cost,
+                        constraint,
+                        duration,
+                    ) = match &ability.effect {
+                        Effect::CastFromZone {
+                            without_paying_mana_cost,
+                            cast_transformed,
+                            alt_ability_cost,
+                            constraint,
+                            duration,
+                            ..
+                        } => (
+                            *without_paying_mana_cost,
+                            *cast_transformed,
+                            alt_ability_cost.clone(),
+                            constraint.clone(),
+                            duration.clone(),
+                        ),
+                        _ => {
+                            return Err(EngineError::InvalidAction(
+                                "CastFromZone EffectZoneChoice ability mismatch".to_string(),
+                            ));
+                        }
+                    };
+                    effects::cast_from_zone::grant_lingering_permissions(
+                        &mut *state,
+                        &ability,
+                        &chosen,
+                        without_paying,
+                        cast_transformed,
+                        alt_ability_cost,
+                        constraint,
+                        duration,
+                        events,
+                    )
+                    .map_err(|e| EngineError::InvalidAction(e.to_string()))?;
+                }
                 // CR 701.68a: Place `count_param` -1/-1 counters on the creature
                 // the controller chose. The choice is non-targeted; the pool was
                 // restricted to the controller's creatures in `blight::resolve`,
@@ -2349,6 +2398,7 @@ pub(super) fn handle_resolution_choice(
                     | EffectKind::Tap
                     | EffectKind::Untap
                     | EffectKind::PutAtLibraryPosition
+                    | EffectKind::CastFromZone
             ) && state.pending_continuation.is_some()
             {
                 let tracked = if matches!(effect_kind, EffectKind::Sacrifice) {

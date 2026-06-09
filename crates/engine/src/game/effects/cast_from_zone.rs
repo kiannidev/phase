@@ -1,11 +1,76 @@
 use crate::game::zones;
 use crate::types::ability::{
-    CastingPermission, Duration, Effect, EffectError, EffectKind, ResolvedAbility, TargetRef,
+    CastingPermission, Duration, Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter,
+    TargetRef,
 };
 use crate::types::events::GameEvent;
-use crate::types::game_state::GameState;
+use crate::types::game_state::{GameState, WaitingFor};
+use crate::types::identifiers::ObjectId;
 use crate::types::mana::ManaCost;
 use crate::types::zones::Zone;
+
+/// CR 115.1 + CR 601.2c: "You may cast a spell ... from your hand without paying
+/// its mana cost" (Electrodominance, Baral's Expertise) has no "target" word —
+/// the spell is chosen at resolution from the granting player's private zone via
+/// `EffectZoneChoice`, not stack-time targeting.
+fn open_private_zone_cast_selection(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    target_filter: &TargetFilter,
+    source_zone: Zone,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EffectError> {
+    let ctx = crate::game::filter::FilterContext::from_ability(ability);
+    let eligible: Vec<_> = match source_zone {
+        Zone::Hand => state.players[ability.controller.0 as usize]
+            .hand
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        Zone::Library => state.players[ability.controller.0 as usize]
+            .library
+            .iter()
+            .copied()
+            .collect::<Vec<_>>(),
+        _ => unreachable!(),
+    }
+    .into_iter()
+    .filter(|id| {
+        crate::game::filter::matches_target_filter(state, *id, target_filter, &ctx)
+    })
+    .collect();
+
+    if eligible.is_empty() {
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::CastFromZone,
+            source_id: ability.source_id,
+        });
+        return Ok(());
+    }
+
+    let mut stash = ability.clone();
+    stash.targets.clear();
+    crate::game::effects::append_to_pending_continuation(state, Some(Box::new(stash)));
+    state.waiting_for = WaitingFor::EffectZoneChoice {
+        player: ability.controller,
+        cards: eligible,
+        count: 1,
+        min_count: 1,
+        up_to: false,
+        source_id: ability.source_id,
+        effect_kind: EffectKind::CastFromZone,
+        zone: source_zone,
+        destination: None,
+        enter_tapped: false,
+        enter_transformed: false,
+        enters_under_player: None,
+        enters_attacking: false,
+        owner_library: false,
+        track_exiled_by_source: false,
+        count_param: 0,
+    };
+    Ok(())
+}
 
 /// CR 601.2a + CR 118.9: Cast a card from a zone without paying its mana cost.
 ///
@@ -82,6 +147,17 @@ pub fn resolve(
     }
 
     if target_ids.is_empty() {
+        if let Some(source_zone) = target_filter.extract_in_zone() {
+            if matches!(source_zone, Zone::Hand | Zone::Library) {
+                return open_private_zone_cast_selection(
+                    state,
+                    ability,
+                    target_filter,
+                    source_zone,
+                    events,
+                );
+            }
+        }
         // No targets resolved — nothing to cast.
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::CastFromZone,
@@ -178,7 +254,41 @@ pub fn resolve(
         return Ok(());
     }
 
-    for &obj_id in &target_ids {
+    grant_lingering_permissions(
+        state,
+        ability,
+        &target_ids,
+        without_paying,
+        cast_transformed,
+        alt_ability_cost,
+        constraint,
+        duration,
+        events,
+    )?;
+
+    events.push(GameEvent::EffectResolved {
+        kind: EffectKind::CastFromZone,
+        source_id: ability.source_id,
+    });
+
+    Ok(())
+}
+
+/// CR 118.9: Stamp `ExileWithAltCost` / `ExileWithAltAbilityCost` on resolved
+/// targets. Shared by the direct resolve path and the `EffectZoneChoice` resume
+/// path (Electrodominance hand pick).
+pub(crate) fn grant_lingering_permissions(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    target_ids: &[ObjectId],
+    without_paying: bool,
+    cast_transformed: bool,
+    alt_ability_cost: Option<crate::types::ability::AbilityCost>,
+    constraint: Option<crate::types::ability::CastPermissionConstraint>,
+    duration: Option<Duration>,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EffectError> {
+    for &obj_id in target_ids {
         // CR 601.2a: Impulse-draw and similar grants move non-exile cards to
         // exile before attaching `ExileWithAltCost`. Targeted graveyard grants
         // (Emry, Lurker in the Loch) keep the card in the graveyard and grant
@@ -244,12 +354,6 @@ pub fn resolve(
             }
         }
     }
-
-    events.push(GameEvent::EffectResolved {
-        kind: EffectKind::CastFromZone,
-        source_id: ability.source_id,
-    });
-
     Ok(())
 }
 
@@ -258,8 +362,8 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        CardPlayMode, CastPermissionConstraint, Comparator, Effect, QuantityExpr, TargetFilter,
-        TypeFilter, TypedFilter,
+        CardPlayMode, CastPermissionConstraint, Comparator, ControllerRef, Effect, QuantityExpr,
+        TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::CoreType;
     use crate::types::game_state::{ExileLink, ExileLinkKind};
@@ -593,6 +697,72 @@ mod tests {
             state.objects[&creature].casting_permissions.is_empty(),
             "composed filter must preserve the typed restriction"
         );
+    }
+
+    /// Issue #1313 — Electrodominance's "you may cast a spell with mana value X
+    /// or less from your hand" must open a resolution-time hand pick, not
+    /// silently no-op when `ability.targets` is empty.
+    #[test]
+    fn hand_cast_without_targets_emits_effect_zone_choice() {
+        use crate::types::ability::{
+            CardPlayMode, CastFromZoneDriver, Comparator, FilterProp, TypedFilter,
+        };
+        use crate::types::game_state::WaitingFor;
+
+        let mut state = make_test_state();
+        let cheap = add_card_to_hand(&mut state, PlayerId(0), CardId(501));
+        state.objects.get_mut(&cheap).unwrap().mana_cost = ManaCost::generic(2);
+        let expensive = add_card_to_hand(&mut state, PlayerId(0), CardId(502));
+        state.objects.get_mut(&expensive).unwrap().mana_cost = ManaCost::generic(5);
+
+        let ability = ResolvedAbility::new(
+            Effect::CastFromZone {
+                target: TargetFilter::Typed(
+                    TypedFilter::default()
+                        .with_type(TypeFilter::Card)
+                        .controller(ControllerRef::You)
+                        .properties(vec![
+                            FilterProp::InZone { zone: Zone::Hand },
+                            FilterProp::Cmc {
+                                comparator: Comparator::LE,
+                                value: QuantityExpr::Fixed { value: 3 },
+                            },
+                        ]),
+                ),
+                without_paying_mana_cost: true,
+                mode: CardPlayMode::Cast,
+                cast_transformed: false,
+                alt_ability_cost: None,
+                constraint: None,
+                duration: None,
+                driver: CastFromZoneDriver::LingeringPermission,
+            },
+            vec![],
+            ObjectId(999),
+            PlayerId(0),
+        );
+
+        let mut events = vec![];
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        match &state.waiting_for {
+            WaitingFor::EffectZoneChoice {
+                player,
+                cards,
+                count,
+                effect_kind,
+                zone,
+                ..
+            } => {
+                assert_eq!(*player, PlayerId(0));
+                assert_eq!(*count, 1);
+                assert_eq!(*effect_kind, EffectKind::CastFromZone);
+                assert_eq!(*zone, Zone::Hand);
+                assert!(cards.contains(&cheap));
+                assert!(!cards.contains(&expensive));
+            }
+            other => panic!("expected EffectZoneChoice, got {other:?}"),
+        }
     }
 
     #[test]

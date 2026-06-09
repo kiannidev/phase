@@ -72,6 +72,7 @@ mod inevitable_betrayal_no_mana_cost;
 mod integration_adventure;
 mod integration_bending;
 mod integration_landfall;
+mod issue_2351_aven_interrupter;
 mod issue_709_regression;
 mod jace_wielder_empty_library_win;
 mod json_smoke_test;

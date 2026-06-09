@@ -409,11 +409,13 @@ pub fn resolve_event_context_targets(
 ///    "it" anaphor on top-level LTB triggers — Rancor, Spirit Loop). When
 ///    `ability.targets` is non-empty, `ParentTarget` semantically inherits
 ///    the parent's chosen targets, so fall through to tier 3.
-/// 3. **Event context**: filters like `TriggeringSource`, `DefendingPlayer`,
-///    `AttachedTo` resolve from `state.current_trigger_event` without
-///    requiring player selection (CR 603.7c).
-/// 4. **Pre-selected targets**: the ability's chosen targets from CR 601.2c
-///    casting / CR 603.3d trigger placement.
+/// 3. **Pre-selected targets**: the ability's chosen targets from CR 601.2c
+///    casting / CR 603.3d trigger placement. When non-empty, these override
+///    event-context fallbacks so player-chosen stack targets are not replaced
+///    by the ETB trigger's `ZoneChanged` source (issue #2351).
+/// 4. **Event context**: filters like `TriggeringSource`, `DefendingPlayer`,
+///    `StackSpell` on spell-cast triggers, `AttachedTo` resolve from
+///    `state.current_trigger_event` without requiring player selection (CR 603.7c).
 ///
 /// Returns the targets from the first non-empty tier, owning the result so
 /// callers don't need to branch over which tier resolved.
@@ -468,10 +470,18 @@ pub fn resolved_targets(
     if use_self {
         return vec![TargetRef::Object(ability.source_id)];
     }
+    // CR 601.2c + CR 608.2b: Pre-selected targets take precedence over
+    // event-context resolution when the player chose targets at activation/
+    // trigger placement. Without this ordering, a StackSpell filter on an ETB
+    // trigger would bind to the ZoneChanged source (the creature itself)
+    // instead of the spell the player targeted (issue #2351 — Aven Interrupter).
+    if !ability.targets.is_empty() {
+        return ability.targets.clone();
+    }
     if let Some(target) = resolve_event_context_target(state, target_filter, ability.source_id) {
         return vec![target];
     }
-    ability.targets.clone()
+    vec![]
 }
 
 /// Resolve a `TargetFilter` to object ids for effects that operate over every
@@ -3115,6 +3125,44 @@ mod tests {
         let result = resolved_targets(&ability, &TargetFilter::ParentTarget, &state);
 
         assert_eq!(result, vec![TargetRef::Object(attacker)]);
+    }
+
+    /// CR 601.2c (issue #2351): player-chosen stack targets must not be replaced
+    /// by the ETB trigger's ZoneChanged source when resolving StackSpell.
+    #[test]
+    fn resolved_targets_stack_spell_prefers_chosen_target_over_etb_event() {
+        let mut state = GameState::new_two_player(42);
+        let aven = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Aven Interrupter".to_string(),
+            Zone::Battlefield,
+        );
+        let bolt = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Lightning Bolt".to_string(),
+            Zone::Stack,
+        );
+        state.current_trigger_event = Some(crate::types::events::GameEvent::ZoneChanged {
+            object_id: aven,
+            from: Some(Zone::Stack),
+            to: Zone::Battlefield,
+            record: Box::new(crate::types::game_state::ZoneChangeRecord::test_minimal(
+                aven,
+                Some(Zone::Stack),
+                Zone::Battlefield,
+            )),
+        });
+        let ability = make_resolved_with_targets(vec![TargetRef::Object(bolt)], aven);
+        let result = resolved_targets(&ability, &TargetFilter::StackSpell, &state);
+        assert_eq!(
+            result,
+            vec![TargetRef::Object(bolt)],
+            "chosen stack spell must win over the ETB ZoneChanged source"
+        );
     }
 
     /// CR 601.2c: Tier 3 — when neither self-ref nor event-context applies,

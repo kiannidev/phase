@@ -1,7 +1,7 @@
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till1, take_until};
 use nom::character::complete::{multispace0, multispace1};
-use nom::combinator::{eof, opt, rest, value};
+use nom::combinator::{all_consuming, eof, map, not, opt, rest, value, verify};
 use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
@@ -12,7 +12,7 @@ use super::super::oracle_nom::primitives as nom_primitives;
 use super::super::oracle_nom::quantity as nom_quantity;
 use super::super::oracle_quantity::{
     parse_cda_quantity, parse_cda_quantity_with_context, parse_for_each_clause,
-    parse_for_each_clause_expr,
+    parse_for_each_clause_expr, parse_for_each_clause_expr_with_context,
 };
 use super::super::oracle_target::{
     parse_target, parse_target_with_ctx, parse_that_clause_suffix, parse_type_phrase_with_ctx,
@@ -23,10 +23,11 @@ use crate::parser::oracle_ir::context::ParseContext;
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::parser::oracle_ir::effect_chain::{ClauseIr, EffectChainIr, SpecialClause};
 use crate::types::ability::{
-    AbilityCondition, AbilityDefinition, AbilityKind, Comparator, ControllerRef, DamageSource,
-    DelayedTriggerCondition, Duration, Effect, FilterProp, MultiTargetSpec, PaymentCost,
-    PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef, RoundingMode, StaticCondition,
-    StaticDefinition, SubAbilityLink, TargetChoiceTiming, TargetFilter, TypeFilter, TypedFilter,
+    AbilityCondition, AbilityDefinition, AbilityKind, AttackScope, AttackSubject, Comparator,
+    ControllerRef, DamageSource, DelayedTriggerCondition, Duration, Effect, FilterProp,
+    MultiTargetSpec, ObjectScope, PaymentCost, PlayerFilter, PlayerScope, PtValue, QuantityExpr,
+    QuantityRef, RoundingMode, StaticCondition, StaticDefinition, SubAbilityLink,
+    TargetChoiceTiming, TargetFilter, TypeFilter, TypedFilter,
 };
 use crate::types::counter::CounterType;
 use crate::types::game_state::{DistributionUnit, TargetSelectionConstraint};
@@ -82,6 +83,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
                 // Apply the followup continuation to the defs built so far.
                 if let Some(ref continuation) = clause_ir.followup_continuation {
                     apply_clause_continuation(&mut defs, continuation.clone(), kind);
+                    apply_where_x_to_latest_def(&mut defs, clause_ir.where_x_expression.as_deref());
                 }
                 true
             } else if let Some(ref special) = clause_ir.special {
@@ -213,7 +215,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
                                         ..
                                     } => {
                                         *enters_attacking = true;
-                                        *enter_tapped = true;
+                                        *enter_tapped = crate::types::zones::EtbTapState::Tapped;
                                     }
                                     _ => {}
                                 }
@@ -242,7 +244,8 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
                                             ..
                                         } => {
                                             *enters_attacking = false;
-                                            *enter_tapped = false;
+                                            *enter_tapped =
+                                                crate::types::zones::EtbTapState::Unspecified;
                                         }
                                         _ => {}
                                     }
@@ -348,6 +351,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
         // previous defs before building this clause's def.
         if let Some(ref continuation) = clause_ir.followup_continuation {
             apply_clause_continuation(&mut defs, continuation.clone(), kind);
+            apply_where_x_to_latest_def(&mut defs, clause_ir.where_x_expression.as_deref());
         }
 
         // ── Build AbilityDefinition from ClauseIr ──
@@ -369,6 +373,10 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
         // `parse_target_with_ctx` during chunk parse. `Random` flips the engine
         // off the controller-choice path at target-selection time.
         def.target_selection_mode = clause_ir.target_selection_mode;
+        // CR 601.2c + CR 603.3d: copy the per-clause target chooser captured by
+        // `parse_target_with_ctx` during chunk parse, so a targeted "of their
+        // choice" routes target selection to the scoped (upkeep) player.
+        def.target_chooser = clause_ir.target_chooser.clone();
         let clause_sub = if is_target_only {
             def.sub_ability = clause_ir.parsed.sub_ability.clone();
             None
@@ -587,6 +595,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
         // Apply intrinsic continuation after extending defs with current clause's defs.
         if let Some(ref continuation) = clause_ir.intrinsic_continuation {
             apply_clause_continuation(&mut defs, continuation.clone(), kind);
+            apply_where_x_to_latest_def(&mut defs, clause_ir.where_x_expression.as_deref());
         }
 
         // CR 608.2c: Advance the separating boundary for the next normal-path
@@ -602,7 +611,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
     let kind = ir.kind;
     let chain_rounding = ir.chain_rounding;
 
-    // CR 701.20a vs CR 701.16a: Demote reveal-Dig back to RevealTop when no DigFromAmong
+    // CR 701.20a / CR 701.20e: Demote reveal-Dig back to RevealTop when no DigFromAmong
     // continuation patched it. An unpatched Dig { reveal: true, keep_count: None, filter: Any }
     // is a simple "reveal the top N" with no player selection — it must resolve synchronously
     // (via RevealTop) so that sub_ability chains like RevealedHasCardType evaluate inline.
@@ -614,6 +623,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
             reveal: true,
             destination,
             rest_destination,
+            player,
             ..
         } = &*def.effect
         {
@@ -625,7 +635,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
                 _ => 1,
             };
             *def.effect = Effect::RevealTop {
-                player: TargetFilter::Controller,
+                player: player.clone(),
                 count: count_val,
             };
         }
@@ -789,6 +799,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
     // card's id as the sub-ability's `source_id` (see `effects/mod.rs`
     // forward_result branch), so `Attach::resolve` operates on the correct
     // attaching object.
+    nest_whenever_this_turn_token_cleanup_delayed_trigger(&mut result);
     rewire_result_anchored_subchain(&mut result);
     wire_optional_cast_decline_fallback(&mut result);
     if matches!(&*result.effect, Effect::SearchOutsideGame { .. }) {
@@ -1254,6 +1265,71 @@ pub(super) fn rewrite_parent_target_to_last_created(effect: &mut Effect) {
     }
 }
 
+/// CR 603.7c: Sentence splitting can leave a WheneverEvent delayed trigger's
+/// token-creating inner effect and its end-step cleanup delayed trigger as
+/// sibling `sub_ability` links on the activated ability. Rewire the cleanup
+/// under the token creator so it registers when the WheneverEvent fires, not
+/// at activation time (Dalkovan Encampment, Encore sacrifice riders).
+fn nest_whenever_this_turn_token_cleanup_delayed_trigger(def: &mut AbilityDefinition) {
+    let cleanup_sub = match def.sub_ability.take() {
+        Some(sub) => sub,
+        None => return,
+    };
+
+    let inner = match &mut *def.effect {
+        Effect::CreateDelayedTrigger {
+            condition: DelayedTriggerCondition::WheneverEvent { .. },
+            effect: inner,
+            ..
+        } => inner,
+        _ => {
+            def.sub_ability = Some(cleanup_sub);
+            return;
+        }
+    };
+
+    let is_token_cleanup = matches!(
+        &*cleanup_sub.effect,
+        Effect::CreateDelayedTrigger {
+            condition: DelayedTriggerCondition::AtNextPhase { .. },
+            effect: cleanup_effect,
+            ..
+        } if matches!(
+            &*cleanup_effect.effect,
+            Effect::Sacrifice { .. } | Effect::ChangeZone { .. } | Effect::Destroy { .. }
+        )
+    );
+    if !is_token_cleanup || !is_token_creating_effect(&inner.effect) {
+        def.sub_ability = Some(cleanup_sub);
+        return;
+    }
+
+    let mut cleanup_sub = cleanup_sub;
+    let remaining_sibling_chain = cleanup_sub
+        .sub_ability
+        .as_ref()
+        .is_some_and(|sub| sub.sub_link == SubAbilityLink::SequentialSibling)
+        .then(|| cleanup_sub.sub_ability.take())
+        .flatten();
+    if let Effect::CreateDelayedTrigger {
+        effect: cleanup_effect,
+        ..
+    } = &mut *cleanup_sub.effect
+    {
+        rewrite_parent_target_to_last_created(&mut cleanup_effect.effect);
+    }
+
+    let mut cursor = inner.as_mut();
+    while cursor.sub_ability.is_some() {
+        cursor = cursor
+            .sub_ability
+            .as_mut()
+            .expect("sub_ability checked above");
+    }
+    cursor.sub_ability = Some(cleanup_sub);
+    def.sub_ability = remaining_sibling_chain;
+}
+
 /// CR 705: Post-process parsed ability defs to consolidate coin flip conditional
 /// branches into their parent `FlipCoin` effect.
 ///
@@ -1391,6 +1467,17 @@ pub(super) fn strip_optional_effect_prefix(
             value(
                 (None, Some(PlayerFilter::TriggeringPlayer)),
                 tag("the first player may "),
+            ),
+            // CR 608.2d: "Target opponent may have ~ deal … to them" (Risk Factor).
+            value(
+                (None, Some(PlayerFilter::Opponent)),
+                tag("target opponent may "),
+            ),
+            // CR 608.2d: "That creature's controller may have this artifact deal …"
+            // (Requiem Monolith) — the targeted creature's controller chooses.
+            value(
+                (None, Some(PlayerFilter::ParentObjectTargetController)),
+                tag("that creature's controller may "),
             ),
         ))
         .parse(input)
@@ -1677,7 +1764,7 @@ pub(super) fn strip_each_player_subject(text: &str) -> (Option<PlayerFilter>, St
     // "each player" / "each opponent" restricts the affected set to the players
     // the ability source creature attacked this turn — Angel of Destiny: "each
     // player this creature attacked this turn loses the game". Resolved as the
-    // source-specific `OpponentAttackedBySourceThisTurn`, which excludes the
+    // source-specific `OpponentAttacked { Source, ThisTurn }`, which excludes the
     // controller and avoids widening to players attacked by other creatures.
     // Like the "who controls" clause above, the relative clause MUST be consumed
     // and reflected in the scope; dropping it would over-apply the loss to every
@@ -1690,7 +1777,10 @@ pub(super) fn strip_each_player_subject(text: &str) -> (Option<PlayerFilter>, St
     }) {
         let deconjugated = subject::deconjugate_verb(after_clause);
         return (
-            Some(PlayerFilter::OpponentAttackedBySourceThisTurn),
+            Some(PlayerFilter::OpponentAttacked {
+                subject: AttackSubject::Source,
+                scope: AttackScope::ThisTurn,
+            }),
             deconjugated,
         );
     }
@@ -1729,6 +1819,12 @@ pub(super) fn strip_each_player_subject(text: &str) -> (Option<PlayerFilter>, St
         // for the dispatcher — ordering invariant, not a defensive escape.
         tag("who doesn't"),
         tag("who does not"),
+        // CR 119.3 + CR 701.55a: "each opponent who lost N or more life this
+        // turn faces a villainous choice" is a restricted chooser phrase, not
+        // a normal per-player imperative. Preserve the full subject so the
+        // `ChooseOneOf` parser can emit a PlayerAttribute chooser instead of
+        // broadening the choice to every opponent.
+        tag("who lost"),
     ))
     .parse(rest_lower.as_str())
     .is_ok()
@@ -2253,13 +2349,29 @@ pub(super) fn strip_leading_duration(text: &str) -> Option<(Duration, &str)> {
 }
 
 pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
-    let lower = text.to_lowercase();
+    // Oracle sentences often end with a period before duration stripping runs
+    // (e.g. Shifting Woodland: "... until end of turn. Activate only if ...").
+    let text = text.trim();
+    let duration_text = text.trim_end_matches('.').trim();
+    let lower = duration_text.to_lowercase();
     if target_relative_clause_owns_suffix(lower.as_str()) {
         return (text, None);
     }
+    // Per-turn quantity clauses can own "this turn" themselves (for example,
+    // "where X is the number of tokens you created this turn"). In that shape the
+    // suffix belongs to the quantity grammar, not to the outer effect duration.
     for (suffix, duration) in [
         (" this turn", Duration::UntilEndOfTurn),
         (" until end of turn", Duration::UntilEndOfTurn),
+        // CR 611.2a: "A continuous effect generated by the resolution of a
+        // spell or ability lasts as long as stated by the spell or ability
+        // creating it ... If no duration is stated, it lasts until the end of
+        // the game." A one-shot effect that creates a continuous restriction
+        // worded "... for the rest of the game" (Screaming Nemesis: "can't gain
+        // life for the rest of the game") therefore has no expiry - modeled as
+        // `Duration::Permanent`. CR 119.7 governs the restriction's semantics
+        // for the "can't gain life" case specifically.
+        (" for the rest of the game", Duration::Permanent),
         (
             // CR 514.2: cleanup-pruned next-turn duration.
             " until the end of your next turn",
@@ -2302,8 +2414,64 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
         ),
     ] {
         if lower.ends_with(suffix) {
-            let end = text.len() - suffix.len();
-            return (text[..end].trim_end_matches(',').trim(), Some(duration));
+            if suffix == " this turn" && quantity_clause_owns_this_turn_suffix(&lower) {
+                continue;
+            }
+            let end = duration_text.len() - suffix.len();
+            return (
+                duration_text[..end].trim_end_matches(',').trim(),
+                Some(duration),
+            );
+        }
+    }
+
+    // CR 611.2a: Duration mid-clause before a trailing conjunct, variable
+    // definition, or alternative expiry. End-of-string durations are handled
+    // above. Do NOT treat " unless " as a boundary here — unless-pay parsers
+    // (`try_parse_unless_player_have_deal_damage`, `extract_resolution_unless_pay_modifier`)
+    // own that tail and must see the full phrase.
+    for (phrase, duration) in [
+        (" until end of turn", Duration::UntilEndOfTurn),
+        (" this turn", Duration::UntilEndOfTurn),
+        (" until end of combat", Duration::UntilEndOfCombat),
+        (
+            " until the end of your next turn",
+            Duration::UntilEndOfNextTurnOf {
+                player: PlayerScope::Controller,
+            },
+        ),
+        (
+            " until the end of their next turn",
+            Duration::UntilEndOfNextTurnOf {
+                player: PlayerScope::Controller,
+            },
+        ),
+        (
+            " until their next turn",
+            Duration::UntilNextTurnOf {
+                player: PlayerScope::Controller,
+            },
+        ),
+        (
+            " until your next turn",
+            Duration::UntilNextTurnOf {
+                player: PlayerScope::Controller,
+            },
+        ),
+        (
+            " until ~ leaves the battlefield",
+            Duration::UntilHostLeavesPlay,
+        ),
+        (
+            " until this creature leaves the battlefield",
+            Duration::UntilHostLeavesPlay,
+        ),
+    ] {
+        for delimiter in [", or ", ", where "] {
+            let pattern = format!("{phrase}{delimiter}");
+            if let Some(pos) = lower.find(&pattern) {
+                return (duration_text[..pos].trim_end(), Some(duration));
+            }
         }
     }
 
@@ -2311,7 +2479,7 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
     if let Some(pos) = lower.rfind(" for as long as ") {
         let condition_text = &lower[pos + " for as long as ".len()..];
         if let Some(dur) = parse_for_as_long_as_condition(condition_text) {
-            let stripped = text[..pos].trim_end_matches(',').trim();
+            let stripped = duration_text[..pos].trim_end_matches(',').trim();
             return (stripped, Some(dur));
         }
     }
@@ -2319,12 +2487,57 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
     (text, None)
 }
 
+fn quantity_clause_owns_this_turn_suffix(lower: &str) -> bool {
+    where_x_quantity_clause_owns_this_turn_suffix(lower)
+        || for_each_quantity_clause_owns_this_turn_suffix(lower)
+}
+
+fn where_x_quantity_clause_owns_this_turn_suffix(lower: &str) -> bool {
+    let Ok((where_clause, _)) = preceded(
+        take_until::<_, _, OracleError<'_>>("where x is "),
+        tag::<_, _, OracleError<'_>>("where x is "),
+    )
+    .parse(lower) else {
+        return false;
+    };
+    let normalized = where_clause.trim();
+    let Ok((_, quantity_before_this_turn)) = all_consuming(terminated(
+        take_until::<_, _, OracleError<'_>>(" this turn"),
+        tag::<_, _, OracleError<'_>>(" this turn"),
+    ))
+    .parse(normalized) else {
+        return false;
+    };
+    let expression_end = quantity_before_this_turn.len() + " this turn".len();
+    parse_where_x_quantity_expression(&normalized[..expression_end]).is_some()
+}
+
+fn for_each_quantity_clause_owns_this_turn_suffix(lower: &str) -> bool {
+    let Ok((for_each_clause, _)) = preceded(
+        take_until::<_, _, OracleError<'_>>(" for each "),
+        tag::<_, _, OracleError<'_>>(" for each "),
+    )
+    .parse(lower) else {
+        return false;
+    };
+    let normalized = for_each_clause.trim();
+    let Ok((_, quantity_before_this_turn)) = all_consuming(terminated(
+        take_until::<_, _, OracleError<'_>>(" this turn"),
+        tag::<_, _, OracleError<'_>>(" this turn"),
+    ))
+    .parse(normalized) else {
+        return false;
+    };
+    let expression_end = quantity_before_this_turn.len() + " this turn".len();
+    parse_for_each_clause(&normalized[..expression_end]).is_some()
+}
+
 fn target_relative_clause_owns_suffix(input: &str) -> bool {
     let Ok((relative_clause, _)) = take_until::<_, _, OracleError<'_>>(" that ").parse(input)
     else {
         return false;
     };
-    let Some((_, consumed)) = parse_that_clause_suffix(relative_clause) else {
+    let Some((_, consumed)) = parse_that_clause_suffix(relative_clause, None) else {
         return false;
     };
     let remaining = &relative_clause[consumed..];
@@ -2627,6 +2840,11 @@ fn parse_total_mana_value_target_constraint(text: &str) -> Option<TargetSelectio
 pub(super) fn extract_deal_damage_multi_target(text: &str) -> Option<MultiTargetSpec> {
     let lower = text.to_lowercase();
     let after_each_of = strip_after(&lower, "damage to each of ")?;
+    if let Some((remainder, spec)) = strip_bounded_targets_placeholder(after_each_of) {
+        if remainder.is_empty() {
+            return Some(spec);
+        }
+    }
     let (_, multi_target) = strip_optional_target_prefix(after_each_of);
     multi_target
 }
@@ -2706,6 +2924,11 @@ fn parse_each_of_up_to_damage_target<'a>(
         .ok()?;
     let consumed = lower.len() - after_each_of_lower.len();
     let after_each_of = &target_phrase[consumed..];
+    if let Some((remainder, _)) = strip_bounded_targets_placeholder(after_each_of) {
+        if remainder.is_empty() {
+            return Some((TargetFilter::Any, ""));
+        }
+    }
     let (target_text, multi_target) = strip_optional_target_prefix(after_each_of);
     multi_target.as_ref()?;
     let (target, remainder) = parse_target_with_ctx(target_text, ctx);
@@ -2724,6 +2947,11 @@ fn parse_each_of_up_to_damage_target<'a>(
 /// and collapse the count to a fixed 1 (issue #458).
 const MULTI_TARGET_VERBS: &[&str] = &[
     "exile", "tap", "untap", "goad", "return", "destroy", "choose",
+];
+
+pub(super) const BOUNDED_TARGET_PHRASES: &[(&str, usize, usize)] = &[
+    ("one or two targets", 1, 2),
+    ("one, two, or three targets", 1, 3),
 ];
 
 /// CR 115.1d + CR 601.2c: Strip exact target-count prefix before a targeted
@@ -2760,6 +2988,23 @@ fn parse_exact_target_count_expr(input: &str) -> OracleResult<'_, QuantityExpr> 
         value(QuantityExpr::Fixed { value: 6 }, tag("six ")),
     ))
     .parse(input)
+}
+
+/// CR 115.1d: Bare target-count placeholders after "each of" — "one or two
+/// targets" (Prismari Charm: "deals 1 damage to each of one or two targets").
+/// Returns the unconsumed remainder and a bounded `MultiTargetSpec` with min ≥ 1.
+fn strip_bounded_targets_placeholder(text: &str) -> Option<(&str, MultiTargetSpec)> {
+    let lower = text.to_ascii_lowercase();
+    for &(phrase, min, max) in BOUNDED_TARGET_PHRASES {
+        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(phrase).parse(lower.as_str()) {
+            let consumed = lower.len() - rest.len();
+            return Some((
+                text[consumed..].trim_start(),
+                MultiTargetSpec::fixed(min, max),
+            ));
+        }
+    }
+    None
 }
 
 /// CR 115.1d: Strip optional target-count prefixes before a targeted phrase.
@@ -3124,7 +3369,30 @@ pub(super) fn strip_return_destination_ext_with_remainder(
     for (phrase, zone, transformed, enters_under_you, enter_tapped, enters_attacking) in patterns {
         if let Some(pos) = lower.rfind(phrase) {
             let after_destination = &lower[pos + phrase.len()..];
-            let original_after_destination = &text[pos + phrase.len()..];
+            let (enter_with_counters, counters_offset) =
+                parse_with_counters_suffix_spanned(after_destination);
+            // CR 614.1c: when the "with N <type> counter(s)" clause is lifted
+            // onto `enter_with_counters`, excise it (and any leading " and"
+            // connector) from the returned remainder so the caller does not
+            // re-parse "and with two stun counters …" into a dangling
+            // Unimplemented follow-up clause (Unstoppable Slasher).
+            let original_after_destination = match counters_offset {
+                Some(off) => {
+                    // CR 614.1c: strip a trailing " and" connector left after
+                    // excising the consumed counter clause. Space-anchored
+                    // `strip_suffix(" and")` (not `trim_end_matches("and")`,
+                    // which is not word-anchored and would corrupt a remainder
+                    // ending in "brand"/"island"); mirrors the leading
+                    // `strip_leading_sequence_connector` analogue.
+                    let trimmed = text[pos + phrase.len()..pos + phrase.len() + off].trim_end();
+                    trimmed
+                        // allow-noncombinator: structural cleanup of a trailing " and" connector on an already-sliced remainder, not parsing dispatch
+                        .strip_suffix(" and")
+                        .map(|s| s.trim_end())
+                        .unwrap_or(trimmed)
+                }
+                None => &text[pos + phrase.len()..],
+            };
             return (
                 text[..pos].trim(),
                 Some(ReturnDestination {
@@ -3133,7 +3401,7 @@ pub(super) fn strip_return_destination_ext_with_remainder(
                     enters_under: enters_under_you.then_some(ControllerRef::You),
                     enter_tapped: *enter_tapped,
                     enters_attacking: *enters_attacking,
-                    enter_with_counters: parse_with_counters_suffix(after_destination),
+                    enter_with_counters,
                 }),
                 original_after_destination,
             );
@@ -3270,13 +3538,18 @@ fn parse_leading_command_return_destination(input: &str) -> OracleResult<'_, Ret
 
 /// CR 601.2d: Cap "any number of" target selection to the distribution pool.
 /// Without this, the controller can select more permanents than counters or
-/// damage and the assign step deadlocks (each target must receive at least one).
+/// damage and the assign step deadlocks (each chosen target must receive at
+/// least one). Fixed positive distributions still require at least one target;
+/// "up to" and variable amounts can legally resolve to an empty pool.
 fn multi_target_for_distribute_among(distribution_amount: &QuantityExpr) -> MultiTargetSpec {
     let (inner, is_up_to) = distribution_amount.peel_up_to();
     let min = if is_up_to {
         QuantityExpr::Fixed { value: 0 }
     } else {
-        QuantityExpr::Fixed { value: 1 }
+        match inner {
+            QuantityExpr::Fixed { value } if *value > 0 => QuantityExpr::Fixed { value: 1 },
+            _ => QuantityExpr::Fixed { value: 0 },
+        }
     };
     MultiTargetSpec::bounded_expr(min, inner.clone())
 }
@@ -3342,7 +3615,13 @@ pub(super) fn try_parse_distribute_damage(lower: &str, text: &str) -> Option<Par
         })?;
     let target_text = target_tp.original.trim();
 
-    // CR 115.1d: Detect "any number of" quantifier before the target phrase.
+    // CR 115.1d: Detect the target-count quantifier before the target phrase.
+    // "any number of" is capped by the distribution pool (each chosen target must
+    // receive at least one — CR 601.2d), while "up to N target ..." carries an
+    // explicit printed cap of N independent of the divided amount (Shatterskull
+    // Smashing: "X damage divided ... among up to two target creatures and/or
+    // planeswalkers"). `strip_optional_target_prefix` surfaces the latter as
+    // MultiTargetSpec { min: 0, max: N }.
     let target_lower = target_text.to_lowercase();
     let (stripped_target_text, multi_target) = if let Ok((rest, _)) =
         tag::<_, _, OracleError<'_>>("any number of ").parse(target_lower.as_str())
@@ -3353,7 +3632,7 @@ pub(super) fn try_parse_distribute_damage(lower: &str, text: &str) -> Option<Par
             Some(multi_target_for_distribute_among(&amount)),
         )
     } else {
-        (target_text, None)
+        strip_optional_target_prefix(target_text)
     };
     let (target, _) = parse_target(stripped_target_text);
 
@@ -3569,23 +3848,18 @@ pub(super) fn try_parse_damage_with_remainder<'a>(
             if let Some(qty) = qty {
                 // Route based on target phrase
                 if target_phrase == "itself" {
-                    // CR 608.2k: When target is "itself", an anaphoric "its power"
-                    // means the target's power. Only `Anaphoric` is remapped — an
-                    // explicit possessive ("the sacrificed creature's power",
-                    // `CostPaidObject` per CR 608.2k) keeps its fixed referent.
-                    let qty = match &qty {
-                        QuantityExpr::Ref {
-                            qty:
-                                QuantityRef::Power {
-                                    scope: crate::types::ability::ObjectScope::Anaphoric,
-                                },
-                        } => QuantityExpr::Ref {
-                            qty: QuantityRef::Power {
-                                scope: crate::types::ability::ObjectScope::Target,
-                            },
-                        },
-                        other => other.clone(),
-                    };
+                    // CR 608.2k: When the recipient is "itself", an anaphoric
+                    // "its <characteristic>" means that target's value. Only the
+                    // pronoun `Anaphoric` is rebound (across every per-object
+                    // characteristic) — an explicit possessive ("the sacrificed
+                    // creature's power", `CostPaidObject`) or a demonstrative
+                    // ("that creature's toughness", `Demonstrative`) keeps its
+                    // fixed referent.
+                    let mut qty = qty;
+                    super::rebind_anaphoric_object_scope(
+                        &mut qty,
+                        crate::types::ability::ObjectScope::Target,
+                    );
                     return Some((
                         Effect::DealDamage {
                             amount: qty,
@@ -4008,13 +4282,21 @@ pub(crate) fn try_parse_pump(lower: &str, _text: &str) -> Option<Effect> {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn parse_pump_clause(predicate: &str) -> Option<(PtValue, PtValue, Option<Duration>)> {
+    parse_pump_clause_with_context(predicate, &ParseContext::default())
+}
+
+pub(crate) fn parse_pump_clause_with_context(
+    predicate: &str,
+    ctx: &ParseContext,
+) -> Option<(PtValue, PtValue, Option<Duration>)> {
     let predicate_lower = predicate.to_lowercase();
     let predicate_tp = TextPair::new(predicate, &predicate_lower);
     let (without_where, where_x_expression) = strip_trailing_where_x(predicate_tp);
     // Strip "for each [clause]" suffix before duration extraction.
     let (without_for_each, for_each_qty) =
-        strip_trailing_for_each_clause_expr(without_where.original);
+        strip_trailing_for_each_clause_expr(without_where.original, ctx);
     let (without_duration, duration) = strip_trailing_duration(without_for_each);
     let lower = without_duration.to_lowercase();
 
@@ -4054,11 +4336,14 @@ pub(crate) fn parse_pump_clause(predicate: &str) -> Option<(PtValue, PtValue, Op
 /// Strip a trailing "for each [clause]" from pump text, returning the remaining text
 /// and the parsed QuantityExpr (if any). Handles both "until end of turn for each X"
 /// (duration already stripped) and bare "for each X".
-fn strip_trailing_for_each_clause_expr(text: &str) -> (&str, Option<QuantityExpr>) {
+fn strip_trailing_for_each_clause_expr<'a>(
+    text: &'a str,
+    ctx: &ParseContext,
+) -> (&'a str, Option<QuantityExpr>) {
     let lower = text.to_lowercase();
     if let Some(pos) = lower.rfind(" for each ") {
         let clause_text = lower[pos + " for each ".len()..].trim_end_matches('.');
-        if let Some(quantity) = parse_for_each_clause_expr(clause_text) {
+        if let Some(quantity) = parse_for_each_clause_expr_with_context(clause_text, ctx) {
             return (text[..pos].trim(), Some(quantity));
         }
     }
@@ -4133,7 +4418,17 @@ pub(super) fn compute_sentence_where_x(chunks: &[ClauseChunk]) -> Vec<Option<Str
 pub(crate) fn strip_trailing_where_x<'a>(tp: TextPair<'a>) -> (TextPair<'a>, Option<String>) {
     for needle in [", where x is ", " where x is "] {
         if let Some((before, after)) = tp.split_around(needle) {
-            let expression = after
+            // CR 608.2c: A where-X binding can precede further instructions in the
+            // same resolution ("..., where X is N. Put that card ..."). Truncate on
+            // the TextPair before materializing a String. Examples: Eldritch Evolution
+            // ("... where X is 2 plus the sacrificed creature's mana value. Put ...")
+            // and Halana and Alena, Partners ("... where X is ~'s power. That creature
+            // gains haste ...").
+            let mut after_clause = after;
+            if let Some((clause, _)) = after.split_around(". ") {
+                after_clause = clause;
+            }
+            let expression = after_clause
                 .original
                 .trim()
                 .trim_end_matches('.')
@@ -4251,9 +4546,19 @@ pub(crate) fn parse_where_x_quantity_expression(where_x_expression: &str) -> Opt
             } else {
                 inner
             };
-            return Some(QuantityExpr::Offset {
+            let offset = QuantityExpr::Offset {
                 inner: Box::new(inner),
                 offset: n as i32,
+            };
+            // CR 107.1b: "where X is N minus …" can resolve negative; damage
+            // and other effect-result quantities use zero instead (The Rack).
+            return Some(if sign < 0 {
+                QuantityExpr::ClampMin {
+                    inner: Box::new(offset),
+                    minimum: 0,
+                }
+            } else {
+                offset
             });
         }
     }
@@ -4276,6 +4581,21 @@ pub(crate) fn parse_where_x_quantity_expression(where_x_expression: &str) -> Opt
     if let Some(expr) = parse_cda_quantity(where_x_expression) {
         return Some(expr);
     }
+    // CR 107.3i + CR 115.1: Some where-X definitions spell the count as
+    // "the number of <for-each clause>" where the clause itself may need a
+    // target player ("Islands target opponent controls"). Keep that grammar in
+    // the shared where-X interpreter so every effect family gets the same
+    // `ControllerRef::TargetPlayer` quantity binding.
+    if let Some(expr) = parse_where_x_number_of_for_each_clause(expression_lower.as_str()) {
+        return Some(expr);
+    }
+    // CR 107.3f + CR 113.7: "where X is [printed card name]'s power" refers to the
+    // ability source (Halana and Alena, Partners). Must precede
+    // `parse_event_context_quantity`, which only recognizes anaphoric/participle
+    // possessives.
+    if let Some(expr) = parse_where_x_printed_name_possessive_stat(expression_lower.as_str()) {
+        return Some(expr);
+    }
     // CR 706.2 + CR 706.4: "where X is the result" of a die roll / coin flip
     // binds X to the rolled value via the shared `EventContextAmount` channel
     // (the same one inline "you gain life equal to the result" cards use). This
@@ -4285,6 +4605,64 @@ pub(crate) fn parse_where_x_quantity_expression(where_x_expression: &str) -> Opt
     // `None` for the bare die-result phrase (see `cda_quantity_returns_none_for_the_result`),
     // so this fallback is what binds Ancient Bronze Dragon's "where X is the result".
     crate::parser::oracle_quantity::parse_event_context_quantity(where_x_expression)
+}
+
+/// CR 107.3f + CR 113.7: Printed-name possessive in a where-X binding
+/// ("Halana and Alena's power" → `Power { scope: Source }`). Determiner-led
+/// forms ("the sacrificed creature's power", "~'s power") are rejected here and
+/// handled by `parse_cda_quantity` / `parse_event_context_quantity` upstream.
+fn parse_where_x_printed_name_possessive_stat(expression_lower: &str) -> Option<QuantityExpr> {
+    let blocked_prefix = alt((
+        tag::<_, _, OracleError<'_>>("that "),
+        tag("the "),
+        tag("target "),
+        tag("its "),
+        tag("this "),
+        tag("sacrificed "),
+        tag("discarded "),
+        tag("destroyed "),
+        tag("exiled "),
+        tag("milled "),
+        tag("revealed "),
+        tag("targeted "),
+        tag("entered "),
+        tag("~"),
+    ));
+    let non_empty = |subject: &str| subject.chars().any(|c| !c.is_whitespace());
+    let possessive_stat = alt((
+        map(
+            (
+                verify(take_until::<_, _, OracleError<'_>>("'s power"), non_empty),
+                tag("'s power"),
+            ),
+            |(_, _)| QuantityRef::Power {
+                scope: ObjectScope::Source,
+            },
+        ),
+        map(
+            (
+                verify(
+                    take_until::<_, _, OracleError<'_>>("'s toughness"),
+                    non_empty,
+                ),
+                tag("'s toughness"),
+            ),
+            |(_, _)| QuantityRef::Toughness {
+                scope: ObjectScope::Source,
+            },
+        ),
+    ));
+    let (_, qty) = all_consuming(preceded(not(blocked_prefix), possessive_stat))
+        .parse(expression_lower)
+        .ok()?;
+    Some(QuantityExpr::Ref { qty })
+}
+
+fn parse_where_x_number_of_for_each_clause(expression_lower: &str) -> Option<QuantityExpr> {
+    let (clause, _) = tag::<_, _, OracleError<'_>>("the number of ")
+        .parse(expression_lower)
+        .ok()?;
+    parse_for_each_clause_expr(clause)
 }
 
 fn parse_where_x_cards_named_in_all_graveyards(where_x_expression: &str) -> Option<QuantityExpr> {
@@ -4352,6 +4730,20 @@ pub(super) fn apply_where_x_quantity_expression(
     where_x_expression: Option<&str>,
 ) -> QuantityExpr {
     match value {
+        // CR 107.3i: Generic "X is N or more" condition parsing defaults to
+        // CostXPaid for X-cost spells, but a surrounding "where X is ..." clause
+        // is the more specific binding and must own every X reference in the
+        // ability, including later-sentence rider conditions.
+        QuantityExpr::Ref {
+            qty: QuantityRef::CostXPaid,
+        } if where_x_expression.is_some() => {
+            let expression = where_x_expression.expect("checked is_some above");
+            parse_where_x_quantity_expression(expression).unwrap_or_else(|| QuantityExpr::Ref {
+                qty: QuantityRef::Variable {
+                    name: expression.to_string(),
+                },
+            })
+        }
         QuantityExpr::Ref {
             qty: QuantityRef::Variable { name },
         } if where_x_expression.is_some() && name.eq_ignore_ascii_case("X") => {
@@ -4376,6 +4768,13 @@ pub(super) fn apply_where_x_quantity_expression(
                 where_x_expression,
             )),
             offset,
+        },
+        QuantityExpr::ClampMin { inner, minimum } => QuantityExpr::ClampMin {
+            inner: Box::new(apply_where_x_quantity_expression(
+                *inner,
+                where_x_expression,
+            )),
+            minimum,
         },
         QuantityExpr::Multiply { factor, inner } => QuantityExpr::Multiply {
             factor,
@@ -4417,21 +4816,19 @@ pub(super) fn apply_where_x_effect_expression(
         | Effect::PutCounterAll { count: amount, .. }
         | Effect::Token { count: amount, .. }
         | Effect::Dig { count: amount, .. }
-        // CR 107.3i + CR 109.4 + CR 109.5: "search/seek for up to X …, where X
-        // is …" binds the search count to the defining clause (Oreskos
-        // Explorer: "search your library for up to X Plains cards, where X is
-        // the number of players who control more lands than you"). The count is
-        // an `UpTo` wrapper whose inner `Variable("X")` is rewritten by the
-        // recursion arm; the where-clause population is a control comparison
-        // (CR 109.4) relative to "you" (CR 109.5).
-        | Effect::SearchLibrary { count: amount, .. }
-        | Effect::Seek { count: amount, .. }
         | Effect::ExileTop { count: amount, .. }
         | Effect::Discover {
             mana_value_limit: amount,
         }
         | Effect::Incubate { count: amount } => {
             *amount = apply_where_x_quantity_expression(amount.clone(), where_x_expression);
+        }
+        // CR 107.3i + CR 109.4 + CR 109.5: "search/seek for up to X …, where X
+        // is …" binds the search count (Oreskos Explorer). Eldritch Evolution
+        // binds the filter's `Cmc` bound when X appears in the card filter.
+        Effect::SearchLibrary { filter, count, .. } | Effect::Seek { filter, count, .. } => {
+            *filter = apply_where_x_to_filter(filter.clone(), where_x_expression);
+            *count = apply_where_x_quantity_expression(count.clone(), where_x_expression);
         }
         Effect::Scry { count, .. } => {
             *count = apply_where_x_quantity_expression(count.clone(), where_x_expression);
@@ -4445,9 +4842,18 @@ pub(super) fn apply_where_x_effect_expression(
             *power = apply_where_x_expression(power.clone(), where_x_expression);
             *toughness = apply_where_x_expression(toughness.clone(), where_x_expression);
         }
-        Effect::PreventDamage { amount_dynamic, .. } => {
+        Effect::PreventDamage {
+            amount,
+            amount_dynamic,
+            ..
+        } => {
+            // CR 615.7: "prevent all …" must not inherit a sibling clause's
+            // where-X binding (Arachnogenesis: token count uses where-X;
+            // prevention is blanket).
             if let Some(expr) = where_x_expression {
-                *amount_dynamic = parse_where_x_quantity_expression(expr);
+                if !matches!(amount, crate::types::ability::PreventionAmount::All) {
+                    *amount_dynamic = parse_where_x_quantity_expression(expr);
+                }
             }
         }
         // CR 107.3i + CR 118.1: Resolution-time cost amounts (Life / Speed /
@@ -4469,7 +4875,22 @@ pub(super) fn apply_where_x_effect_expression(
             }
             PaymentCost::Mana { .. } | PaymentCost::AbilityCost { .. } => {}
         },
+        Effect::GenericEffect {
+            static_abilities, ..
+        } => {
+            for static_def in static_abilities.iter_mut() {
+                if let Some(condition) = static_def.condition.as_mut() {
+                    apply_where_x_static_condition(condition, where_x_expression);
+                }
+            }
+        }
         _ => {}
+    }
+}
+
+fn apply_where_x_to_latest_def(defs: &mut [AbilityDefinition], where_x_expression: Option<&str>) {
+    if let Some(def) = defs.last_mut() {
+        apply_where_x_ability_expression(def, where_x_expression);
     }
 }
 
@@ -4616,6 +5037,27 @@ fn apply_where_x_ability_condition(cond: &mut AbilityCondition, where_x_expressi
     }
 }
 
+fn apply_where_x_static_condition(
+    condition: &mut StaticCondition,
+    where_x_expression: Option<&str>,
+) {
+    match condition {
+        StaticCondition::QuantityComparison { lhs, rhs, .. } => {
+            *lhs = apply_where_x_quantity_expression(lhs.clone(), where_x_expression);
+            *rhs = apply_where_x_quantity_expression(rhs.clone(), where_x_expression);
+        }
+        StaticCondition::And { conditions } | StaticCondition::Or { conditions } => {
+            for condition in conditions {
+                apply_where_x_static_condition(condition, where_x_expression);
+            }
+        }
+        StaticCondition::Not { condition } => {
+            apply_where_x_static_condition(condition, where_x_expression);
+        }
+        _ => {}
+    }
+}
+
 fn parse_pt_modifier(text: &str) -> Option<(PtValue, PtValue)> {
     let token = text.trim();
     let slash = token.find('/')?;
@@ -4670,12 +5112,28 @@ fn parse_signed_pt_component(text: &str) -> Option<PtValue> {
 /// pre-trim. The body combinator gates on `tag("with ")` then dispatches to
 /// `parse_counter_suffix_body`.
 pub(crate) fn parse_with_counters_suffix(lower: &str) -> Vec<(CounterType, QuantityExpr)> {
+    parse_with_counters_suffix_spanned(lower).0
+}
+
+/// Like [`parse_with_counters_suffix`], but also reports the byte offset in
+/// `lower` at which the matched `"with N <type> counter(s) [on it]"` clause
+/// begins (the start of the `"with "` token). Callers that need to excise the
+/// consumed counter clause from a larger remainder — e.g.
+/// `strip_return_destination_ext_with_remainder`, so "return it to the
+/// battlefield tapped and with two stun counters under its owner's control"
+/// does not leave a dangling "and with two stun counters …" clause once the
+/// counters are lifted onto `enter_with_counters` (Unstoppable Slasher) — use
+/// this offset to truncate. Returns `None` for the offset when no counter
+/// clause matched.
+pub(crate) fn parse_with_counters_suffix_spanned(
+    lower: &str,
+) -> (Vec<(CounterType, QuantityExpr)>, Option<usize>) {
     nom_primitives::scan_preceded(lower, |i| {
         let (i, _) = tag::<_, _, OracleError<'_>>("with ").parse(i)?;
         parse_counter_suffix_body_combinator(i)
     })
-    .map(|(_, val, _)| vec![val])
-    .unwrap_or_default()
+    .map(|(prefix, val, _)| (vec![val], Some(prefix.len())))
+    .unwrap_or((Vec::new(), None))
 }
 
 /// CR 122.1 + CR 614.1c: Combinator body for "[N|a|an] [additional ]<type>
@@ -4714,7 +5172,12 @@ pub(crate) fn parse_counter_suffix_body_combinator(
     let (rest, _) = tag(" counter").parse(rest)?;
     // Optional plural "s".
     let (rest, _) = nom::combinator::opt(tag::<_, _, OracleError<'_>>("s")).parse(rest)?;
-    let (rest, _) = tag(" on it").parse(rest)?;
+    // CR 614.1c: "on it" is grammatical filler — present in "return it to the
+    // battlefield with two +1/+1 counters on it" but absent when a controller
+    // clause follows ("return it to the battlefield tapped and with two stun
+    // counters under its owner's control", Unstoppable Slasher). Optional so
+    // both shapes lift the counters onto `enter_with_counters`.
+    let (rest, _) = nom::combinator::opt(tag::<_, _, OracleError<'_>>(" on it")).parse(rest)?;
 
     Ok((
         rest,
@@ -4756,8 +5219,46 @@ pub(crate) fn parse_dynamic_counter_suffix_body(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_where_x_quantity_expression;
-    use crate::types::ability::{QuantityExpr, QuantityRef};
+    use super::{
+        nest_whenever_this_turn_token_cleanup_delayed_trigger, parse_where_x_quantity_expression,
+        strip_return_destination_ext_with_remainder, strip_trailing_where_x,
+    };
+    use crate::parser::oracle_util::TextPair;
+    use crate::types::ability::{
+        AbilityDefinition, AbilityKind, DelayedTriggerCondition, Effect, PtValue, QuantityExpr,
+        QuantityRef, TargetFilter, TriggerDefinition,
+    };
+    use crate::types::counter::CounterType;
+    use crate::types::phase::Phase;
+    use crate::types::triggers::TriggerMode;
+    use crate::types::zones::Zone;
+
+    /// CR 614.1c + issue #1498: "return it to the battlefield tapped and with
+    /// two stun counters under its owner's control" (Unstoppable Slasher) must
+    /// lift the stun counters onto `enter_with_counters` and excise the counter
+    /// clause from the returned remainder so no dangling follow-up clause is
+    /// re-parsed. The `" on it"` filler is absent here (a controller clause
+    /// follows the counters), which the optional terminator now tolerates.
+    #[test]
+    fn return_to_battlefield_lifts_stun_counters_without_on_it_filler() {
+        let (target, dest, remainder) = strip_return_destination_ext_with_remainder(
+            "it to the battlefield tapped and with two stun counters under its owner's control",
+        );
+        assert_eq!(target, "it");
+        let dest = dest.expect("expected a battlefield return destination");
+        assert_eq!(dest.zone, Zone::Battlefield);
+        assert!(dest.enter_tapped);
+        assert_eq!(
+            dest.enter_with_counters,
+            vec![(CounterType::Stun, QuantityExpr::Fixed { value: 2 })]
+        );
+        // The counter clause (and its leading " and" connector) is excised, so
+        // nothing dangling remains to be re-parsed as a follow-up clause.
+        assert_eq!(
+            remainder, "",
+            "the counter clause must be excised from the remainder, got {remainder:?}"
+        );
+    }
 
     fn variable_x() -> QuantityExpr {
         QuantityExpr::Ref {
@@ -4765,6 +5266,16 @@ mod tests {
                 name: "X".to_string(),
             },
         }
+    }
+
+    #[test]
+    fn strip_trailing_where_x_stops_at_next_sentence() {
+        let text = "put x +1/+1 counters on another target creature you control, where x is halana and alena's power. that creature gains haste until end of turn.";
+        let lower = text.to_ascii_lowercase();
+        let expr = strip_trailing_where_x(TextPair::new(text, &lower))
+            .1
+            .expect("where-x");
+        assert_eq!(expr, "halana and alena's power");
     }
 
     #[test]
@@ -4783,12 +5294,114 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn token_cleanup_nesting_splits_only_cleanup_node_from_sibling_chain() {
+        let token_creator = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Token {
+                name: "Warrior".to_string(),
+                power: PtValue::Fixed(1),
+                toughness: PtValue::Fixed(1),
+                types: vec!["Creature".to_string(), "Warrior".to_string()],
+                colors: vec![],
+                keywords: vec![],
+                tapped: true,
+                count: QuantityExpr::Fixed { value: 2 },
+                owner: TargetFilter::Controller,
+                attach_to: None,
+                enters_attacking: true,
+                supertypes: vec![],
+                static_abilities: vec![],
+                enter_with_counters: vec![],
+            },
+        );
+        let mut cleanup = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::CreateDelayedTrigger {
+                condition: DelayedTriggerCondition::AtNextPhase { phase: Phase::End },
+                effect: Box::new(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::Sacrifice {
+                        target: TargetFilter::ParentTarget,
+                        count: QuantityExpr::Fixed { value: 2 },
+                        min_count: 0,
+                    },
+                )),
+                uses_tracked_set: false,
+            },
+        );
+        let mut following_sibling = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+        );
+        following_sibling.sub_link = crate::types::ability::SubAbilityLink::SequentialSibling;
+        cleanup.sub_ability = Some(Box::new(following_sibling));
+        let mut outer = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::CreateDelayedTrigger {
+                condition: DelayedTriggerCondition::WheneverEvent {
+                    trigger: Box::new(TriggerDefinition::new(TriggerMode::YouAttack)),
+                },
+                effect: Box::new(token_creator),
+                uses_tracked_set: false,
+            },
+        );
+        outer.sub_ability = Some(Box::new(cleanup));
+
+        nest_whenever_this_turn_token_cleanup_delayed_trigger(&mut outer);
+
+        let Effect::CreateDelayedTrigger { effect: inner, .. } = outer.effect.as_ref() else {
+            panic!("expected outer delayed trigger");
+        };
+        let nested_cleanup = inner
+            .sub_ability
+            .as_deref()
+            .expect("cleanup node must move under token creator");
+        let Effect::CreateDelayedTrigger {
+            effect: cleanup_effect,
+            ..
+        } = nested_cleanup.effect.as_ref()
+        else {
+            panic!("expected nested cleanup delayed trigger");
+        };
+        assert!(
+            nested_cleanup.sub_ability.is_none(),
+            "only the cleanup node should move under the token creator"
+        );
+        assert!(
+            matches!(
+                cleanup_effect.effect.as_ref(),
+                Effect::Sacrifice {
+                    target: TargetFilter::LastCreated,
+                    ..
+                }
+            ),
+            "nested cleanup target must be rewritten to LastCreated"
+        );
+        assert!(
+            matches!(
+                outer
+                    .sub_ability
+                    .as_deref()
+                    .map(|ability| ability.effect.as_ref()),
+                Some(Effect::Draw { .. })
+            ),
+            "sibling effects after the cleanup must remain on the outer ability"
+        );
+    }
 }
 
 #[cfg(test)]
 mod where_x_tests {
     use super::parse_where_x_quantity_expression;
-    use crate::types::ability::{QuantityExpr, QuantityRef};
+    use crate::types::ability::{
+        ControllerRef, Duration, ObjectScope, PlayerScope, QuantityExpr, QuantityRef, TargetFilter,
+        TypeFilter,
+    };
 
     /// CR 706.2 + CR 706.4: "where X is the result" (of a die roll / coin flip)
     /// binds X to the rolled value via `EventContextAmount` — the same channel
@@ -4803,6 +5416,112 @@ mod where_x_tests {
                 qty: QuantityRef::EventContextAmount,
             })
         );
+    }
+
+    #[test]
+    fn where_x_tokens_created_this_turn_binds_typed_quantity() {
+        use crate::types::ability::{FilterProp, PlayerScope, TargetFilter, TypedFilter};
+
+        assert_eq!(
+            parse_where_x_quantity_expression("the number of tokens you created this turn"),
+            Some(QuantityExpr::Ref {
+                qty: QuantityRef::TokensCreatedThisTurn {
+                    player: PlayerScope::Controller,
+                    filter: TargetFilter::Typed(TypedFilter {
+                        type_filters: vec![],
+                        controller: None,
+                        properties: vec![FilterProp::Token],
+                    }),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn where_x_life_lost_this_turn_binds_typed_quantity() {
+        assert_eq!(
+            parse_where_x_quantity_expression("the life you've lost this turn"),
+            Some(QuantityExpr::Ref {
+                qty: QuantityRef::LifeLostThisTurn {
+                    player: PlayerScope::Controller
+                },
+            })
+        );
+    }
+
+    /// Issue #1993: Halana and Alena, Partners — "where X is [name]'s power".
+    #[test]
+    fn where_x_printed_name_possessive_power_is_source() {
+        assert_eq!(
+            parse_where_x_quantity_expression("Halana and Alena's power"),
+            Some(QuantityExpr::Ref {
+                qty: QuantityRef::Power {
+                    scope: ObjectScope::Source,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn strip_trailing_duration_preserves_tokens_created_this_turn_phrase() {
+        use super::strip_trailing_duration;
+
+        let text = "create X 1/1 white Spirit creature tokens with flying, where X is the number of tokens you created this turn.";
+        let (stripped, duration) = strip_trailing_duration(text);
+        assert!(
+            duration.is_none(),
+            "quantity tracker must not become a duration"
+        );
+        assert_eq!(stripped, text);
+    }
+
+    #[test]
+    fn strip_trailing_duration_preserves_where_x_life_lost_this_turn_phrase() {
+        use super::strip_trailing_duration;
+
+        let text = "draw X cards, where X is the life you've lost this turn.";
+        let (stripped, duration) = strip_trailing_duration(text);
+        assert!(
+            duration.is_none(),
+            "quantity tracker must not become a duration"
+        );
+        assert_eq!(stripped, text);
+    }
+
+    #[test]
+    fn strip_trailing_duration_preserves_life_lost_this_turn_phrase() {
+        use super::strip_trailing_duration;
+
+        let text = "draw a card for each opponent who lost life this turn.";
+        let (stripped, duration) = strip_trailing_duration(text);
+        assert!(duration.is_none());
+        assert_eq!(stripped, text);
+    }
+
+    #[test]
+    fn strip_trailing_duration_still_strips_outer_duration_after_where_x_clause() {
+        use super::strip_trailing_duration;
+
+        let text = "draw X cards, where X is the life you've lost this turn, then target creature gets +1/+1 this turn.";
+        let (stripped, duration) = strip_trailing_duration(text);
+        assert_eq!(
+            duration,
+            Some(Duration::UntilEndOfTurn),
+            "outer duration must still be recognized"
+        );
+        assert_eq!(
+            stripped,
+            "draw X cards, where X is the life you've lost this turn, then target creature gets +1/+1"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_duration_still_strips_genuine_this_turn_duration() {
+        use super::strip_trailing_duration;
+
+        let (stripped, duration) = strip_trailing_duration("that creature gains haste this turn.");
+        assert_eq!(duration, Some(Duration::UntilEndOfTurn));
+        assert_eq!(stripped, "that creature gains haste");
     }
 
     /// The new delegation must NOT shadow `parse_cda_quantity`: "the number of
@@ -4832,6 +5551,32 @@ mod where_x_tests {
             }),
             "the number-of phrase must route through parse_cda_quantity, not the \
              event-context delegation"
+        );
+    }
+
+    /// CR 107.3i + CR 115.1: a where-X count may depend on objects controlled
+    /// by a target player. The shared where-X parser owns that count grammar;
+    /// effect-specific parsers only surface the companion target slot.
+    #[test]
+    fn where_x_number_of_target_player_controlled_type_binds_target_player_count() {
+        let parsed =
+            parse_where_x_quantity_expression("the number of Islands target opponent controls");
+        let Some(QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount { filter },
+        }) = parsed
+        else {
+            panic!("expected target-player object count, got {parsed:?}");
+        };
+        let TargetFilter::Typed(typed) = filter else {
+            panic!("expected typed object count filter, got {filter:?}");
+        };
+        assert_eq!(typed.controller, Some(ControllerRef::TargetPlayer));
+        assert!(
+            typed
+                .type_filters
+                .contains(&TypeFilter::Subtype("Island".to_string())),
+            "expected Island subtype in object-count filter, got {:?}",
+            typed.type_filters
         );
     }
 
@@ -4874,6 +5619,18 @@ mod where_x_tests {
                 comparator: Comparator::LE,
                 value: QuantityExpr::Fixed { value: 6 },
             })
+        );
+    }
+
+    #[test]
+    fn strip_trailing_where_x_stops_at_following_sentence() {
+        let (_, expr) = super::strip_trailing_where_x(crate::parser::oracle_util::TextPair::new(
+            "creature card with mana value X or less, where X is 2 plus the sacrificed creature's mana value. Put that card onto the battlefield",
+            "creature card with mana value x or less, where x is 2 plus the sacrificed creature's mana value. put that card onto the battlefield",
+        ));
+        assert_eq!(
+            expr.as_deref(),
+            Some("2 plus the sacrificed creature's mana value")
         );
     }
 

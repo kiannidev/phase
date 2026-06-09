@@ -16,8 +16,11 @@ use super::ability_utils::{
     flatten_targets_in_chain, random_select_targets_for_ability, validate_modal_indices,
     validate_selected_targets_for_ability, TargetSelectionAdvance,
 };
-use super::casting::{emit_targeting_events, pay_ability_cost};
-use super::casting_costs::{cost_has_x, enter_payment_step, finish_pending_cast_cost_or_pay};
+use super::casting::{emit_targeting_events, pay_ability_cost_for_activation};
+use super::casting_costs::{
+    cost_has_x, drain_deferred_triggers_after_stack_object_announcement, enter_payment_step,
+    finish_pending_cast_cost_or_pay,
+};
 use super::engine::EngineError;
 use super::restrictions;
 use super::stack;
@@ -77,6 +80,14 @@ pub(crate) fn handle_select_modes(
     // the additional costs — alternative-cost permissions never waive them.
     let total_cost = compute_modal_total_cost(&pending.cost, &modal, &indices);
     let mut pending = pending;
+    // CR 601.2b + CR 601.2f: Fold the chosen modal mode costs (Spree / Entwine
+    // cost increases, computed against a zero base) into the captured base so
+    // any later post-X cost recompute (`concrete_cost_for_x`) includes them.
+    // Without a captured base (legacy / activated) leave it `None`.
+    if let Some(base) = pending.base_cost.as_ref() {
+        let modal_only = compute_modal_total_cost(&ManaCost::zero(), &modal, &indices);
+        pending.base_cost = Some(restrictions::add_mana_cost(base, &modal_only));
+    }
     if let Some(cost) = escalate_cost_for_selected_modes(state, controller, &pending, indices.len())
     {
         pending.additional_cost_flow = Some(AdditionalCost::Required(cost));
@@ -100,6 +111,7 @@ pub(crate) fn handle_select_modes(
     {
         let mut pending_x =
             PendingCast::new(pending.object_id, pending.card_id, resolved, total_cost);
+        pending_x.base_cost = pending.base_cost.clone();
         pending_x.target_constraints = pending.target_constraints;
         pending_x.casting_variant = pending.casting_variant;
         pending_x.cast_timing_permission = pending.cast_timing_permission;
@@ -174,6 +186,7 @@ pub(crate) fn handle_select_modes(
         )?;
         let mut pending_sel =
             PendingCast::new(pending.object_id, pending.card_id, resolved, total_cost);
+        pending_sel.base_cost = pending.base_cost.clone();
         pending_sel.target_constraints = pending.target_constraints;
         pending_sel.casting_variant = pending.casting_variant;
         pending_sel.origin_zone = pending.origin_zone;
@@ -243,6 +256,7 @@ pub(crate) fn handle_select_targets(
                 ability,
                 pending.cost.clone(),
             );
+            pending_dist.base_cost = pending.base_cost.clone();
             pending_dist.casting_variant = pending.casting_variant;
             pending_dist.distribute = Some(unit.clone());
             pending_dist.origin_zone = pending.origin_zone;
@@ -266,13 +280,16 @@ pub(crate) fn handle_select_targets(
     }
 
     if let Some(ability_index) = pending.activation_ability_index {
-        pay_activation_costs_after_target_selection(
+        if let Some(waiting_for) = pay_activation_costs_after_target_selection(
             state,
             player,
             &pending,
+            ability.clone(),
             ability_index,
             events,
-        )?;
+        )? {
+            return Ok(waiting_for);
+        }
 
         let assigned_targets = flatten_targets_in_chain(&ability);
         emit_targeting_events(state, &assigned_targets, pending.object_id, player, events);
@@ -371,13 +388,16 @@ pub(crate) fn handle_choose_target(
             assign_selected_slots_in_chain(state, &mut ability, &selected_slots)?;
 
             if let Some(ability_index) = pending.activation_ability_index {
-                pay_activation_costs_after_target_selection(
+                if let Some(waiting_for) = pay_activation_costs_after_target_selection(
                     state,
                     player,
                     &pending,
+                    ability.clone(),
                     ability_index,
                     events,
-                )?;
+                )? {
+                    return Ok(waiting_for);
+                }
 
                 let assigned_targets = flatten_targets_in_chain(&ability);
                 emit_targeting_events(state, &assigned_targets, pending.object_id, player, events);
@@ -422,7 +442,11 @@ pub(crate) fn handle_choose_target(
                 );
                 state.priority_passes.clear();
                 state.priority_pass_count = 0;
-                return Ok(WaitingFor::Priority { player });
+                return Ok(drain_deferred_triggers_after_stack_object_announcement(
+                    state,
+                    events,
+                    WaitingFor::Priority { player },
+                ));
             }
 
             let cost = pending.cost.clone();
@@ -435,9 +459,10 @@ fn pay_activation_costs_after_target_selection(
     state: &mut GameState,
     player: PlayerId,
     pending: &PendingCast,
+    mut assigned_ability: ResolvedAbility,
     ability_index: usize,
     events: &mut Vec<GameEvent>,
-) -> Result<(), EngineError> {
+) -> Result<Option<WaitingFor>, EngineError> {
     if !matches!(pending.cost, ManaCost::NoCost) {
         let excluded_sources = pending
             .activation_cost
@@ -464,13 +489,33 @@ fn pay_activation_costs_after_target_selection(
                 player,
                 ability_index,
             );
-        pay_ability_cost(state, player, pending.object_id, activation_cost, events)?;
+        super::casting::stamp_self_ref_discard_cost_paid_object(
+            state,
+            pending.object_id,
+            &mut assigned_ability,
+            activation_cost,
+        );
+        if let super::casting::AbilityCostPaymentOutcome::Paused { remaining_cost } =
+            pay_ability_cost_for_activation(
+                state,
+                player,
+                pending.object_id,
+                activation_cost,
+                events,
+            )?
+        {
+            let mut pending = pending.clone();
+            pending.ability = assigned_ability;
+            pending.activation_cost = remaining_cost;
+            state.pending_cast = Some(Box::new(pending));
+            return Ok(Some(state.waiting_for.clone()));
+        }
         if should_record_loyalty {
             super::planeswalker::record_loyalty_activation(state, pending.object_id, player);
         }
     }
 
-    Ok(())
+    Ok(None)
 }
 
 /// CR 702.172a + CR 601.2f + CR 702.42a: Compose a modal spell's total cost.

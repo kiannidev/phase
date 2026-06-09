@@ -377,10 +377,11 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             },
         )
     }
@@ -512,6 +513,7 @@ mod tests {
                 filter: TargetFilter::Any,
                 rest_destination: None,
                 reveal: false,
+                enter_tapped: false,
             },
         ));
         let deck = vec![entry(face, 4)];
@@ -537,6 +539,7 @@ mod tests {
                 filter: TargetFilter::Any,
                 rest_destination: None,
                 reveal: false,
+                enter_tapped: false,
             },
         ));
         let deck = vec![entry(face, 4)];

@@ -827,10 +827,11 @@ fn test_search_changezone_shuffle_continuation_completes() {
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: true,
+            enter_tapped: engine::types::zones::EtbTapState::Tapped,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         },
         sub_ability: Some(Box::new(shuffle_ability)),
         ..ResolvedAbility::new(
@@ -841,10 +842,11 @@ fn test_search_changezone_shuffle_continuation_completes() {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: true,
+                enter_tapped: engine::types::zones::EtbTapState::Tapped,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             },
             vec![],
             source_id,
@@ -1161,10 +1163,11 @@ fn test_earthbender_ascension_etb_completes_with_landfall() {
             owner_library: false,
             enter_transformed: false,
             enters_under: None,
-            enter_tapped: true,
+            enter_tapped: engine::types::zones::EtbTapState::Tapped,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         },
         sub_ability: Some(Box::new(shuffle_ability)),
         ..ResolvedAbility::new(
@@ -1175,10 +1178,11 @@ fn test_earthbender_ascension_etb_completes_with_landfall() {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: true,
+                enter_tapped: engine::types::zones::EtbTapState::Tapped,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             },
             vec![],
             enchantment_id,
@@ -1842,6 +1846,7 @@ fn earthbend_return_skips_shock_land_pay_life_prompt() {
         controller_override: Some(P0),
         enter_transformed: false,
         applied: std::collections::HashSet::new(),
+        face_down_profile: None,
     };
 
     let mut events = Vec::new();
@@ -1916,6 +1921,7 @@ fn plain_shock_land_etb_still_prompts_for_life_payment() {
         controller_override: None,
         enter_transformed: false,
         applied: std::collections::HashSet::new(),
+        face_down_profile: None,
     };
 
     let mut events = Vec::new();
@@ -1977,10 +1983,11 @@ fn build_earthbend_ability(
             owner_library: false,
             enter_transformed: false,
             enters_under: Some(ControllerRef::You),
-            enter_tapped: true,
+            enter_tapped: engine::types::zones::EtbTapState::Tapped,
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            face_down_profile: None,
         },
     );
 
@@ -2241,7 +2248,8 @@ fn earthbended_land_returns_tapped_after_exile() {
             destination: Zone::Exile,
             target: TargetFilter::SpecificObject { id: land_id },
             enters_under: None,
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
+            face_down_profile: None,
         },
         vec![TargetRef::Object(land_id)],
         exile_source,
@@ -2292,22 +2300,11 @@ fn earthbended_land_returns_tapped_after_exile() {
 /// This is the closest analog to what the user reported in #313.
 #[test]
 fn earthbending_lesson_returned_tapped_after_dies_e2e() {
-    use std::path::Path;
-    use std::sync::OnceLock;
-
-    use engine::database::card_db::CardDatabase;
     use engine::game::engine::apply_as_current;
     use engine::game::scenario_db::GameScenarioDbExt;
     use engine::types::card_type::Supertype;
 
-    fn load_db() -> Option<&'static CardDatabase> {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../client/public/card-data.json");
-        if !path.exists() {
-            return None;
-        }
-        static DB: OnceLock<CardDatabase> = OnceLock::new();
-        Some(DB.get_or_init(|| CardDatabase::from_export(&path).expect("export should load")))
-    }
+    use crate::support::shared_card_db as load_db;
 
     let Some(db) = load_db() else {
         return;
@@ -2486,7 +2483,7 @@ fn earthbend_registers_dies_or_exiled_delayed_trigger_on_target() {
         } => {
             assert_eq!(*destination, Zone::Battlefield);
             assert!(
-                *enter_tapped,
+                enter_tapped.is_tapped(),
                 "Inner ChangeZone must carry enter_tapped=true"
             );
             assert_eq!(

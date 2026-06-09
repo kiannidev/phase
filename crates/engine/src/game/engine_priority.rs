@@ -13,6 +13,19 @@ pub(super) fn run_post_action_pipeline(
     default_wf: &WaitingFor,
     skip_trigger_scan: bool,
 ) -> Result<WaitingFor, EngineError> {
+    run_post_action_pipeline_from(state, events, 0, default_wf, skip_trigger_scan)
+}
+
+/// Run the normal post-action settlement while scanning only events produced at
+/// or after `event_start`. Use for nested resume paths that carry earlier
+/// payment/choice events in the same output buffer.
+pub(super) fn run_post_action_pipeline_from(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+    event_start: usize,
+    default_wf: &WaitingFor,
+    skip_trigger_scan: bool,
+) -> Result<WaitingFor, EngineError> {
     // Capture stack depth before any trigger/SBA processing so we can detect
     // whether new triggered abilities were added during this pipeline pass.
     let stack_before = state.stack.len();
@@ -29,7 +42,7 @@ pub(super) fn run_post_action_pipeline(
     // events that should be deferred have already been moved into
     // `state.deferred_entry_events` for replay by `handle_copy_target_choice`.
     if !skip_trigger_scan {
-        let filtered_events: Vec<_> = events
+        let filtered_events: Vec<_> = events[event_start..]
             .iter()
             .filter(|event| !matches!(event, GameEvent::PhaseChanged { .. }))
             .cloned()
@@ -52,12 +65,29 @@ pub(super) fn run_post_action_pipeline(
     // CR 704.3: SBA/trigger loop. SBAs may generate events (e.g., ZoneChanged for
     // dying creatures) that need trigger processing. Repeat until no new SBAs fire,
     // matching the loop pattern in process_combat_damage_triggers.
-    loop {
+    //
+    // Gate on `Priority`: `process_triggers` may have paused on `OrderTriggers`
+    // or a resolution-choice handler may already own `waiting_for` — running SBAs
+    // in those states would clobber the open prompt (same failure mode as #2420).
+    while matches!(state.waiting_for, WaitingFor::Priority { .. }) {
         let events_before = events.len();
         sba::check_state_based_actions(state, events);
+        if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+            break;
+        }
         if events.len() > events_before {
             let sba_events: Vec<_> = events[events_before..].to_vec();
             triggers::process_triggers(state, &sba_events);
+            // CR 603.3d: SBA-generated zone changes (e.g. lethal damage) may put
+            // death triggers on the stack that need target/mode prompts before the
+            // next SBA pass.
+            if let Some(waiting_for) = begin_pending_trigger_target_selection(state)? {
+                state.waiting_for = waiting_for.clone();
+                return Ok(waiting_for);
+            }
+            if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                break;
+            }
         } else {
             break;
         }

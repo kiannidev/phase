@@ -23189,7 +23189,7 @@ mod tests {
         let prepared = prepare_spell_cast(&state, PlayerId(0), spell)
             .expect("hand CastFromZone permission must allow the spell to be prepared");
 
-        assert_eq!(prepared.mana_cost, ManaCost::zero());
+        assert!(prepared.mana_cost.is_without_paying_mana());
     }
 
     fn add_borrowed_exile_sorcery_with_mana_value(

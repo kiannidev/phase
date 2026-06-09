@@ -4243,8 +4243,29 @@ fn static_pump_and_goaded_emits_both_defs() {
 
 #[test]
 fn static_this_creature_can_block_only_creatures_with_flying() {
+    use crate::types::statics::block_only_creatures_with_flying_filter;
+
     let def = parse_static_line("This creature can block only creatures with flying.").unwrap();
-    assert_eq!(def.mode, StaticMode::BlockRestriction);
+    assert_eq!(
+        def.mode,
+        StaticMode::BlockRestriction {
+            filter: block_only_creatures_with_flying_filter(),
+        }
+    );
+    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+}
+
+#[test]
+fn static_this_token_can_block_only_creatures_with_flying() {
+    use crate::types::statics::block_only_creatures_with_flying_filter;
+
+    let def = parse_static_line("This token can block only creatures with flying.").unwrap();
+    assert_eq!(
+        def.mode,
+        StaticMode::BlockRestriction {
+            filter: block_only_creatures_with_flying_filter(),
+        }
+    );
     assert_eq!(def.affected, Some(TargetFilter::SelfRef));
 }
 

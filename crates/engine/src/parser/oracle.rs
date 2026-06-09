@@ -7493,7 +7493,9 @@ mod tests {
         assert_eq!(r.statics.len(), 1);
         assert_eq!(
             r.statics[0].mode,
-            crate::types::statics::StaticMode::BlockRestriction
+            crate::types::statics::StaticMode::BlockRestriction {
+                filter: crate::types::statics::block_only_creatures_with_flying_filter(),
+            }
         );
     }
 

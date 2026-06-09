@@ -69,10 +69,12 @@ fn issue_1312_prepared_swords_to_plowshares_triggers_lecturing_scornmage() {
     assert_eq!(back.name, "Swords to Plowshares");
 
     runner
-        .act(GameAction::Debug(engine::types::actions::DebugAction::SetPrepared {
-            object_id: emeritus,
-            prepared: true,
-        }))
+        .act(GameAction::Debug(
+            engine::types::actions::DebugAction::SetPrepared {
+                object_id: emeritus,
+                prepared: true,
+            },
+        ))
         .expect("prepare Emeritus for cast");
 
     runner
@@ -95,7 +97,12 @@ fn issue_1312_prepared_swords_to_plowshares_triggers_lecturing_scornmage() {
         .state()
         .stack
         .iter()
-        .find(|entry| matches!(entry.kind, engine::types::game_state::StackEntryKind::Spell { .. }))
+        .find(|entry| {
+            matches!(
+                entry.kind,
+                engine::types::game_state::StackEntryKind::Spell { .. }
+            )
+        })
         .expect("prepared Swords copy must be on the stack after casting");
     let stack_ability = swords_stack_entry
         .ability()

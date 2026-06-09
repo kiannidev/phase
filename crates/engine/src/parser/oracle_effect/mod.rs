@@ -34650,15 +34650,23 @@ mod tests {
             target,
             static_abilities,
             ..
-        } = grant.effect.as_ref()
+        } = &*grant.effect
         else {
             panic!("expected GenericEffect grant, got {:?}", grant.effect);
         };
-        assert_eq!(*target, None);
+        assert_eq!(*target, Some(TargetFilter::ParentTarget));
         let static_def = static_abilities
             .first()
             .expect("lifelink grant must carry a static definition");
-        assert_eq!(static_def.affected, Some(TargetFilter::ParentTarget));
+        assert!(
+            matches!(
+                static_def.affected.as_ref(),
+                Some(TargetFilter::Typed(tf))
+                    if tf.type_filters == [TypeFilter::Creature]
+            ),
+            "chain parser binds 'that creature' to a creature filter, got {:?}",
+            static_def.affected
+        );
         assert!(
             static_def
                 .modifications
@@ -34714,11 +34722,11 @@ mod tests {
             static_abilities,
             target,
             ..
-        } = grant.effect.as_ref()
+        } = &*grant.effect
         else {
             panic!("expected GenericEffect grant, got {:?}", grant.effect);
         };
-        assert!(target.is_none());
+        assert_eq!(*target, Some(TargetFilter::ParentTarget));
         let static_def = static_abilities
             .first()
             .expect("lifelink grant must carry a static definition");

@@ -109,6 +109,8 @@ use crate::types::keywords::Keyword;
 use crate::types::mana::ManaCost;
 use crate::types::phase::Phase;
 use crate::types::replacements::ReplacementEvent;
+#[cfg(test)]
+use crate::types::statics::CastFreeOrigin;
 use crate::types::statics::{ActivationExemption, CastFrequency, StaticMode};
 use crate::types::triggers::TriggerMode;
 use crate::types::zones::Zone;
@@ -26130,6 +26132,74 @@ mod tests {
         assert_eq!(you_filter.controller, Some(ControllerRef::You));
     }
 
+    /// Issue #1526 — Harvest Season: "up to X basic land cards, where X is the
+    /// number of tapped creatures you control" must bind X to an ObjectCount of
+    /// tapped creatures, not swallow the trailing put-step into the variable name.
+    #[test]
+    fn search_harvest_season_where_x_is_tapped_creature_count() {
+        use crate::types::ability::{FilterProp, TypeFilter};
+        let def = parse_effect_chain_with_context(
+            "Search your library for up to X basic land cards, where X is the number of tapped creatures you control, put those cards onto the battlefield tapped, then shuffle.",
+            AbilityKind::Spell,
+            &mut ParseContext::default(),
+        );
+
+        let Effect::SearchLibrary { count, filter, .. } = &*def.effect else {
+            panic!("expected SearchLibrary, got {:?}", def.effect);
+        };
+        let QuantityExpr::UpTo { max } = count else {
+            panic!("expected UpTo count, got {count:?}");
+        };
+        let QuantityExpr::Ref {
+            qty:
+                QuantityRef::ObjectCount {
+                    filter: TargetFilter::Typed(creature_filter),
+                },
+        } = max.as_ref()
+        else {
+            panic!("expected UpTo(ObjectCount(tapped creatures)), got {max:?}");
+        };
+        assert_eq!(creature_filter.type_filters, vec![TypeFilter::Creature]);
+        assert!(
+            creature_filter
+                .properties
+                .iter()
+                .any(|p| matches!(p, FilterProp::Tapped)),
+            "expected tapped filter, got {:?}",
+            creature_filter.properties
+        );
+        assert_eq!(creature_filter.controller, Some(ControllerRef::You));
+        let TargetFilter::Typed(land_filter) = filter else {
+            panic!("expected typed land filter, got {filter:?}");
+        };
+        assert_eq!(land_filter.type_filters, vec![TypeFilter::Land]);
+        assert!(
+            land_filter.properties.iter().any(|p| matches!(
+                p,
+                FilterProp::HasSupertype {
+                    value: Supertype::Basic
+                }
+            )),
+            "expected basic supertype, got {:?}",
+            land_filter.properties
+        );
+        let put = def
+            .sub_ability
+            .as_deref()
+            .expect("Harvest Season must chain ChangeZone put-step");
+        match &*put.effect {
+            Effect::ChangeZone {
+                destination,
+                enter_tapped,
+                ..
+            } => {
+                assert_eq!(*destination, Zone::Battlefield);
+                assert!(enter_tapped.is_tapped());
+            }
+            other => panic!("expected ChangeZone to battlefield, got {other:?}"),
+        }
+    }
+
     #[test]
     fn choose_a_color() {
         let e = parse_effect("Choose a color");
@@ -27471,6 +27541,33 @@ mod tests {
                         .is_some_and(|d| d.contains("Ninjas you control get +1/+1")),
                     "static emblem must retain granted rules text, got {:?}",
                     def.description
+                );
+            }
+            other => panic!("expected CreateEmblem, got {:?}", other),
+        }
+    }
+
+    /// CR 114.1 + CR 601.2b (issue #1355): Tamiyo, Field Researcher's ultimate
+    /// emblem text parses as `CastFromHandFree` static, not `EmblemStatic`.
+    #[test]
+    fn effect_emblem_tamiyo_field_researcher_hand_free_cast() {
+        let e = parse_effect(
+            "You get an emblem with \"You may cast spells from your hand without paying their mana costs.\"",
+        );
+        match e {
+            Effect::CreateEmblem { statics, triggers } => {
+                assert!(triggers.is_empty());
+                assert_eq!(statics.len(), 1);
+                assert!(
+                    matches!(
+                        statics[0].mode,
+                        StaticMode::CastFromHandFree {
+                            frequency: CastFrequency::Unlimited,
+                            origin: CastFreeOrigin::Hand,
+                        }
+                    ),
+                    "expected CastFromHandFree static, got {:?}",
+                    statics[0].mode
                 );
             }
             other => panic!("expected CreateEmblem, got {:?}", other),

@@ -27,16 +27,15 @@ fn floating_mana(generic: usize, white: usize) -> Vec<ManaUnit> {
     pool
 }
 
-fn resolve_targeting_and_stack(
-    runner: &mut engine::game::scenario::GameRunner,
-    target: TargetRef,
-) {
+fn resolve_targeting_and_stack(runner: &mut engine::game::scenario::GameRunner, target: TargetRef) {
     let target = Some(target);
     for _ in 0..80 {
         match runner.state().waiting_for.clone() {
             WaitingFor::TargetSelection { .. } | WaitingFor::TriggerTargetSelection { .. } => {
                 runner
-                    .act(GameAction::ChooseTarget { target: target.clone() })
+                    .act(GameAction::ChooseTarget {
+                        target: target.clone(),
+                    })
                     .expect("choose target");
             }
             WaitingFor::Priority { .. } if !runner.state().stack.is_empty() => {

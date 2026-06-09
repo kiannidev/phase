@@ -62,7 +62,10 @@ fn issue_1526_harvest_season_allows_up_to_tapped_creature_count() {
     let outcome = runner.cast(harvest).resolve();
 
     let WaitingFor::SearchChoice {
-        cards, count, up_to, ..
+        cards,
+        count,
+        up_to,
+        ..
     } = outcome.final_waiting_for()
     else {
         panic!(

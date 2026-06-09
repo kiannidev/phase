@@ -26157,10 +26157,7 @@ mod tests {
         else {
             panic!("expected UpTo(ObjectCount(tapped creatures)), got {max:?}");
         };
-        assert_eq!(
-            creature_filter.type_filters,
-            vec![TypeFilter::Creature]
-        );
+        assert_eq!(creature_filter.type_filters, vec![TypeFilter::Creature]);
         assert!(
             creature_filter
                 .properties

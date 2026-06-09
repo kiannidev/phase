@@ -434,10 +434,11 @@ pub fn resolve_event_context_targets(
 ///    "it" anaphor on top-level LTB triggers — Rancor, Spirit Loop). When
 ///    `ability.targets` is non-empty, `ParentTarget` semantically inherits
 ///    the parent's chosen targets, so fall through to tier 3.
-/// 3. **Pre-selected targets**: the ability's chosen targets from CR 601.2c
-///    casting / CR 603.3d trigger placement. When non-empty, these override
-///    event-context fallbacks so player-chosen stack targets are not replaced
-///    by the ETB trigger's `ZoneChanged` source (issue #2351).
+/// 3. **Pre-selected targets that satisfy this filter**: the ability's chosen
+///    targets from CR 601.2c casting / CR 603.3d trigger placement. Matching
+///    chosen targets override event-context fallbacks so player-chosen stack
+///    targets are not replaced by the ETB trigger's `ZoneChanged` source
+///    (issue #2351).
 /// 4. **Event context**: filters like `TriggeringSource`, `DefendingPlayer`,
 ///    `StackSpell` on spell-cast triggers, `AttachedTo` resolve from
 ///    `state.current_trigger_event` without requiring player selection (CR 603.7c).
@@ -500,13 +501,41 @@ pub fn resolved_targets(
     // trigger placement. Without this ordering, a StackSpell filter on an ETB
     // trigger would bind to the ZoneChanged source (the creature itself)
     // instead of the spell the player targeted (issue #2351 — Aven Interrupter).
-    if !ability.targets.is_empty() {
+    if !ability.targets.is_empty()
+        && ability
+            .targets
+            .iter()
+            .all(|target| target_ref_matches_resolved_filter(state, ability, target_filter, target))
+    {
         return ability.targets.clone();
     }
     if let Some(target) = resolve_event_context_target(state, target_filter, ability.source_id) {
         return vec![target];
     }
     vec![]
+}
+
+fn target_ref_matches_resolved_filter(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    target_filter: &TargetFilter,
+    target: &TargetRef,
+) -> bool {
+    let ctx = super::filter::FilterContext::from_ability(ability);
+    match target {
+        TargetRef::Object(id) if state.stack.iter().any(|entry| entry.id == *id) => {
+            super::filter::matches_stack_target_filter(state, *id, target_filter, &ctx)
+        }
+        TargetRef::Object(id) => {
+            super::filter::matches_target_filter(state, *id, target_filter, &ctx)
+        }
+        TargetRef::Player(player) => super::filter::player_matches_target_filter_in_state(
+            state,
+            target_filter,
+            *player,
+            ctx.source_controller,
+        ),
+    }
 }
 
 /// Resolve a `TargetFilter` to object ids for effects that operate over every
@@ -3384,6 +3413,29 @@ mod tests {
             result,
             vec![TargetRef::Player(PlayerId(0))],
             "DefendingPlayer should resolve to the attacked player"
+        );
+    }
+
+    /// CR 506.2 + CR 608.2c: event-context filters must not consume propagated
+    /// chosen targets that belong to a different effect in the same ability.
+    #[test]
+    fn resolved_targets_event_context_ignores_non_matching_chosen_targets() {
+        use crate::game::combat::{AttackTarget, AttackerInfo};
+        let (mut state, chosen_target, attacker) = setup_with_creatures();
+        let combat = state.combat.get_or_insert_with(Default::default);
+        combat.attackers.push(AttackerInfo::new(
+            attacker,
+            AttackTarget::Player(PlayerId(0)),
+            PlayerId(0),
+        ));
+
+        let ability = make_resolved_with_targets(vec![TargetRef::Object(chosen_target)], attacker);
+        let result = resolved_targets(&ability, &TargetFilter::DefendingPlayer, &state);
+
+        assert_eq!(
+            result,
+            vec![TargetRef::Player(PlayerId(0))],
+            "DefendingPlayer must resolve from combat context, not the propagated chosen target"
         );
     }
 

@@ -90,6 +90,9 @@ fn issue_879_obsessive_pursuit_puts_counters_and_lifelink_after_three_sacrifices
         3,
         "Obsessive Pursuit must put X +1/+1 counters where X is sacrifices this turn"
     );
+
+    let mut events = Vec::new();
+    engine::game::sba::check_state_based_actions(runner.state_mut(), &mut events);
     assert!(
         runner.state().objects[&attacker].has_keyword(&Keyword::Lifelink),
         "Obsessive Pursuit must grant lifelink when the same X binding is three or more"

@@ -710,6 +710,25 @@ pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityConditio
         .parse(rest)
         .map(|(rest, matched)| (rest, matched.is_some()))
         .unwrap_or((rest, false));
+    // CR 608.2c: "if it's a card of the chosen type" (Gathering Stone) — the
+    // chosen creature type can match any card whose type line includes it.
+    if let Ok((after_chosen, _)) =
+        tag::<_, _, OracleError<'_>>("card of the chosen type").parse(rest)
+    {
+        let remainder = remainder_after_optional_comma(after_chosen);
+        let offset = text.len() - remainder.len();
+        return (
+            Some(maybe_negate(
+                AbilityCondition::RevealedHasCardType {
+                    card_types: vec![],
+                    additional_filter: Some(FilterProp::IsChosenCreatureType),
+                    subtype_filter: None,
+                },
+                negated,
+            )),
+            text[offset..].to_string(),
+        );
+    }
     // CR 205.3m: Multi-subtype creature gates ("Kraken, Leviathan, Octopus,
     // or Serpent creature card") must not collapse to bare CoreType::Creature.
     if let Some((subtype_filter, after_type)) = parse_creature_subtype_card_tail(rest) {
@@ -4764,6 +4783,22 @@ mod tests {
             panic!("expected subtype Or filter");
         };
         assert_eq!(filters.len(), 4);
+    }
+
+    /// Issue #1525 — Gathering Stone: "if it's a card of the chosen type".
+    #[test]
+    fn if_its_a_card_of_the_chosen_type_revealed_condition() {
+        let (cond, _) = strip_card_type_conditional(
+            "If it's a card of the chosen type, you may reveal it and put it into your hand.",
+        );
+        assert_eq!(
+            cond,
+            Some(AbilityCondition::RevealedHasCardType {
+                card_types: vec![],
+                additional_filter: Some(FilterProp::IsChosenCreatureType),
+                subtype_filter: None,
+            })
+        );
     }
 
     /// CR 608.2c: Regression guard for the subtype fall-through. parse_type_phrase

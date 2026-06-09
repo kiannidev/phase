@@ -6,8 +6,8 @@ use super::support::*;
 use super::*;
 use crate::types::ability::{
     ActivationRestriction, AggregateFunction, CardTypeSetSource, CountScope, DamageKindFilter,
-    Duration, Effect, ObjectProperty, PlayerScope, PtStat, PtValueScope, SharedQuality,
-    SharedQualityRelation, TypeFilter, ZoneRef,
+    Duration, Effect, ObjectProperty, PlayerScope, PtStat, PtValueScope, QuantityExpr,
+    SharedQuality, SharedQualityRelation, TypeFilter, ZoneRef,
 };
 use crate::types::counter::CounterType;
 use crate::types::keywords::Keyword;
@@ -2136,6 +2136,89 @@ fn static_this_spell_cost_less_if_it_targets_creature_filter() {
     assert_eq!(
         def.active_zones,
         vec![Zone::Hand, Zone::Stack, Zone::Command]
+    );
+}
+
+#[test]
+fn static_this_spell_cost_less_if_it_targets_spell_or_ability_targeting_large_creature() {
+    let def = parse_static_line(
+        "This spell costs {7} less to cast if it targets a spell or ability that targets a creature you control with power 7 or greater.",
+    )
+    .unwrap();
+
+    let StaticMode::ModifyCost {
+        mode: CostModifyMode::Reduce,
+        amount: ManaCost::Cost { generic: 7, .. },
+        ref spell_filter,
+        ..
+    } = def.mode
+    else {
+        panic!("expected ReduceCost");
+    };
+    let filter = spell_filter
+        .as_ref()
+        .expect("expected stack-target-gated spell filter");
+    let TargetFilter::Typed(tf) = filter else {
+        panic!("expected typed spell filter, got {filter:?}");
+    };
+    let self_targets_filter = tf
+        .properties
+        .iter()
+        .find_map(|prop| match prop {
+            FilterProp::Targets { filter } => Some(filter.as_ref()),
+            _ => None,
+        })
+        .expect("expected outer Targets property");
+    let TargetFilter::And { filters } = self_targets_filter else {
+        panic!("expected stack target conjunction, got {self_targets_filter:?}");
+    };
+    assert!(filters.iter().any(|filter| matches!(
+        filter,
+        TargetFilter::Or { filters }
+            if filters.iter().any(|f| matches!(f, TargetFilter::StackSpell))
+                && filters
+                    .iter()
+                    .any(|f| matches!(f, TargetFilter::StackAbility { controller: None }))
+    )));
+    let stack_targets_filter = filters
+        .iter()
+        .find_map(|filter| match filter {
+            TargetFilter::Typed(tf) => tf.properties.iter().find_map(|prop| match prop {
+                FilterProp::Targets { filter } => Some(filter.as_ref()),
+                _ => None,
+            }),
+            _ => None,
+        })
+        .expect("expected nested Targets property");
+    let TargetFilter::Typed(creature_tf) = stack_targets_filter else {
+        panic!("expected typed creature target filter, got {stack_targets_filter:?}");
+    };
+    assert!(creature_tf.type_filters.contains(&TypeFilter::Creature));
+    assert_eq!(creature_tf.controller, Some(ControllerRef::You));
+    assert!(creature_tf.properties.iter().any(|prop| matches!(
+        prop,
+        FilterProp::PtComparison {
+            stat: PtStat::Power,
+            scope: PtValueScope::Current,
+            comparator: Comparator::GE,
+            value: QuantityExpr::Fixed { value: 7 },
+        }
+    )));
+    assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
+    assert_eq!(
+        def.active_zones,
+        vec![Zone::Hand, Zone::Stack, Zone::Command]
+    );
+}
+
+#[test]
+fn static_this_spell_cost_less_if_it_targets_stack_object_fails_closed_on_trailing_text() {
+    assert!(
+        parse_static_line(
+            "This spell costs {7} less to cast if it targets a spell or ability that targets a creature you control with power 7 or greater and toughness 7 or greater.",
+        )
+        .is_none(),
+        "unconsumed nested target text must not become an unconditional cost reduction"
     );
 }
 
@@ -11140,6 +11223,37 @@ fn parser_shape_arcane_adaptation_chosen_type_applies_to_creatures_you_control()
                 .type_filters
                 .iter()
                 .any(|filter| matches!(filter, TypeFilter::Creature)));
+        }
+        other => panic!("Expected Some(Typed filter), got {other:?}"),
+    }
+}
+
+// CR 607.2d + CR 301.7: Lifecraft Engine grants the chosen creature subtype to
+// Vehicle permanents you control — not the Creature card type. The additive-type
+// fallback must not mis-tokenize "the chosen creature type" as AddType(Creature).
+#[test]
+fn parser_shape_lifecraft_engine_vehicle_chosen_creature_type_static() {
+    let def = parse_static_line(
+        "Vehicle creatures you control are the chosen creature type in addition to their other types.",
+    )
+    .unwrap();
+    assert_eq!(def.mode, StaticMode::Continuous);
+    assert!(def.modifications.iter().all(|modification| matches!(
+        modification,
+        ContinuousModification::AddChosenSubtype {
+            kind: ChosenSubtypeKind::CreatureType
+        }
+    )));
+    match &def.affected {
+        Some(TargetFilter::Typed(tf)) => {
+            assert_eq!(tf.controller, Some(ControllerRef::You));
+            assert_eq!(tf.get_subtype(), Some("Vehicle"));
+            assert!(
+                !tf.type_filters
+                    .iter()
+                    .any(|filter| matches!(filter, TypeFilter::Creature)),
+                "Vehicle scope must not require the Creature card type"
+            );
         }
         other => panic!("Expected Some(Typed filter), got {other:?}"),
     }

@@ -2354,11 +2354,10 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
     if target_relative_clause_owns_suffix(lower.as_str()) {
         return (text, None);
     }
-    // CR 603.4: "this turn" on a per-turn quantity tracker ("tokens you created
-    // this turn", "life you gained this turn") is part of the quantity phrase,
-    // not a trailing duration on the effect. Without this guard, Thalisse's
-    // where-X binding loses " this turn" and resolves to 0 at runtime.
-    if quantity_tracking_owns_this_turn_suffix(lower.as_str()) {
+    // A terminal where-X quantity clause can own "this turn" itself (for example,
+    // "where X is the number of tokens you created this turn"). In that shape the
+    // suffix belongs to the quantity grammar, not to the outer effect duration.
+    if where_x_quantity_clause_owns_this_turn_suffix(lower.as_str()) {
         return (text, None);
     }
     for (suffix, duration) in [
@@ -2485,20 +2484,24 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
     (text, None)
 }
 
-fn quantity_tracking_owns_this_turn_suffix(lower: &str) -> bool {
-    const PHRASES: &[&str] = &[
-        " you created this turn",
-        " you've created this turn",
-        " you gained this turn",
-        " you've gained this turn",
-        " you sacrificed this turn",
-        " you've sacrificed this turn",
-        " you cast this turn",
-        " you've cast this turn",
-        " entered the battlefield this turn",
-        " entered the battlefield under your control this turn",
-    ];
-    PHRASES.iter().any(|phrase| lower.contains(phrase))
+fn where_x_quantity_clause_owns_this_turn_suffix(lower: &str) -> bool {
+    let Ok((where_clause, _)) = preceded(
+        take_until::<_, _, OracleError<'_>>("where x is "),
+        tag::<_, _, OracleError<'_>>("where x is "),
+    )
+    .parse(lower) else {
+        return false;
+    };
+    let normalized = where_clause.trim();
+    let Ok((_, quantity_before_this_turn)) = all_consuming(terminated(
+        take_until::<_, _, OracleError<'_>>(" this turn"),
+        tag::<_, _, OracleError<'_>>(" this turn"),
+    ))
+    .parse(normalized) else {
+        return false;
+    };
+    let expression_end = quantity_before_this_turn.len() + " this turn".len();
+    parse_where_x_quantity_expression(&normalized[..expression_end]).is_some()
 }
 
 fn target_relative_clause_owns_suffix(input: &str) -> bool {
@@ -5318,7 +5321,8 @@ mod tests {
 mod where_x_tests {
     use super::parse_where_x_quantity_expression;
     use crate::types::ability::{
-        ControllerRef, ObjectScope, QuantityExpr, QuantityRef, TargetFilter, TypeFilter,
+        ControllerRef, Duration, ObjectScope, PlayerScope, QuantityExpr, QuantityRef, TargetFilter,
+        TypeFilter,
     };
 
     /// CR 706.2 + CR 706.4: "where X is the result" (of a die roll / coin flip)
@@ -5355,6 +5359,18 @@ mod where_x_tests {
         );
     }
 
+    #[test]
+    fn where_x_life_lost_this_turn_binds_typed_quantity() {
+        assert_eq!(
+            parse_where_x_quantity_expression("the life you've lost this turn"),
+            Some(QuantityExpr::Ref {
+                qty: QuantityRef::LifeLostThisTurn {
+                    player: PlayerScope::Controller
+                },
+            })
+        );
+    }
+
     /// Issue #1993: Halana and Alena, Partners — "where X is [name]'s power".
     #[test]
     fn where_x_printed_name_possessive_power_is_source() {
@@ -5378,7 +5394,37 @@ mod where_x_tests {
             duration.is_none(),
             "quantity tracker must not become a duration"
         );
-        assert!(stripped.contains("you created this turn"));
+        assert_eq!(stripped, text);
+    }
+
+    #[test]
+    fn strip_trailing_duration_preserves_where_x_life_lost_this_turn_phrase() {
+        use super::strip_trailing_duration;
+
+        let text = "draw X cards, where X is the life you've lost this turn.";
+        let (stripped, duration) = strip_trailing_duration(text);
+        assert!(
+            duration.is_none(),
+            "quantity tracker must not become a duration"
+        );
+        assert_eq!(stripped, text);
+    }
+
+    #[test]
+    fn strip_trailing_duration_still_strips_outer_duration_after_where_x_clause() {
+        use super::strip_trailing_duration;
+
+        let text = "draw X cards, where X is the life you've lost this turn, then target creature gets +1/+1 this turn.";
+        let (stripped, duration) = strip_trailing_duration(text);
+        assert_eq!(
+            duration,
+            Some(Duration::UntilEndOfTurn),
+            "outer duration must still be recognized"
+        );
+        assert_eq!(
+            stripped,
+            "draw X cards, where X is the life you've lost this turn, then target creature gets +1/+1"
+        );
     }
 
     /// The new delegation must NOT shadow `parse_cda_quantity`: "the number of

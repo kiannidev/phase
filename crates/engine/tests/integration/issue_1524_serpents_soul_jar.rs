@@ -34,10 +34,7 @@ fn issue_1524_soul_jar_exiles_elf_and_offers_cast_from_exile() {
 
     let jar_ability = &runner.state().objects[&jar].abilities[0];
     assert!(
-        matches!(
-            jar_ability.effect.as_ref(),
-            Effect::CastFromZone { .. }
-        ),
+        matches!(jar_ability.effect.as_ref(), Effect::CastFromZone { .. }),
         "activated ability must parse as CastFromZone, got {:?}",
         jar_ability.effect
     );
@@ -46,6 +43,19 @@ fn issue_1524_soul_jar_exiles_elf_and_offers_cast_from_exile() {
             .activation_restrictions
             .contains(&ActivationRestriction::OnlyOnceEachTurn),
         "Once each turn must be an activation restriction"
+    );
+    assert_eq!(
+        jar_ability
+            .activation_restrictions
+            .iter()
+            .filter(|restriction| matches!(restriction, ActivationRestriction::OnlyOnceEachTurn))
+            .count(),
+        1,
+        "Once each turn must be represented exactly once"
+    );
+    assert!(
+        runner.state().objects[&jar].static_abilities.is_empty(),
+        "Soul-Jar's activated permission must not also parse as a static permission"
     );
 
     runner
@@ -89,10 +99,7 @@ fn issue_1524_soul_jar_exiles_elf_and_offers_cast_from_exile() {
     }
 
     assert!(
-        matches!(
-            runner.state().waiting_for,
-            WaitingFor::Priority { .. }
-        ),
+        matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
         "activation should finish at priority, got {:?}",
         runner.state().waiting_for
     );

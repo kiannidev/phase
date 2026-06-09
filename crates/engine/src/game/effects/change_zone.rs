@@ -1477,13 +1477,7 @@ pub fn resolve_all(
     // binds — the initial `origin`/`target` snapshot may have defaulted to the
     // battlefield before `chain_tracked_set_id` was populated (Zimone's
     // Experiment: kept cards live in the library until routed by type).
-    let origin_zones = if matches!(
-        &ability.effect,
-        Effect::ChangeZoneAll {
-            origin: None,
-            ..
-        }
-    ) {
+    let origin_zones = if matches!(&ability.effect, Effect::ChangeZoneAll { origin: None, .. }) {
         if let Some(zone) = tracked_set_member_zone(state, &effective_filter) {
             vec![zone]
         } else if let Some(zone) = tracked_set_member_zone(state, &target_filter) {
@@ -5705,7 +5699,12 @@ mod tests {
             "Bear".to_string(),
             Zone::Library,
         );
-        state.objects.get_mut(&creature).unwrap().card_types.core_types = vec![CoreType::Creature];
+        state
+            .objects
+            .get_mut(&creature)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
 
         let set_id = TrackedSetId(state.next_tracked_set_id);
         state.next_tracked_set_id += 1;

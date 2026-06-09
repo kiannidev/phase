@@ -528,6 +528,11 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
             })
         }
 
+        // Spellbook draft: pick the first card in the list.
+        WaitingFor::SpellbookDraft { options, .. } => options
+            .first()
+            .map(|card| GameAction::SubmitSpellbookDraft { card: card.clone() }),
+
         // Damage source choice: pick the first option.
         WaitingFor::DamageSourceChoice { options, .. } => options
             .first()
@@ -566,6 +571,13 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
         } => Some(GameAction::RippleChoice {
             choice: engine::types::actions::CastChoice::Decline,
         }),
+        // CR 608.2g + CR 601.2: Invoke Calamity's free-cast window — finish the
+        // window (cast nothing) as the conservative default; the candidate
+        // generator still explores casting each eligible spell.
+        WaitingFor::CastOffer {
+            kind: CastOfferKind::FreeCastWindow { .. },
+            ..
+        } => Some(GameAction::FreeCastWindowChoice { selection: None }),
         // CR 107.1c: "repeat this process" — stop as the forced-action default;
         // the candidate generator still explores repeating.
         WaitingFor::RepeatDecision { .. } => {
@@ -2056,7 +2068,7 @@ mod tests {
             p.mana_pool.add(ManaUnit {
                 color,
                 source_id: ObjectId(0),
-                snow: false,
+                supertype: None,
                 source_could_produce_two_or_more_colors: false,
                 restrictions: Vec::new(),
                 grants: vec![],
@@ -3097,7 +3109,7 @@ mod tests {
                         generic: 2,
                     },
                 }],
-                repeatable: true,
+                repeatability: engine::types::ability::AdditionalCostRepeatability::Repeatable,
             },
             times_kicked: 0,
             pending_cast: Box::new(pending),

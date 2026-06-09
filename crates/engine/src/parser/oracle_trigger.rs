@@ -68,6 +68,22 @@ fn filter_references_self(filter: &TargetFilter) -> bool {
     }
 }
 
+/// CR 108.3 + CR 109.5: "Whenever you cast a spell you don't own" — the spell's
+/// owner is an opponent even though its controller on the stack is you.
+fn strip_spell_not_owned_qualifier(payload: &str) -> (&str, bool) {
+    let mut parser = alt((
+        terminated(
+            take_until(" you don't own"),
+            tag::<_, _, OracleError<'_>>(" you don't own"),
+        ),
+        terminated(take_until(" you do not own"), tag(" you do not own")),
+    ));
+    parser
+        .parse(payload)
+        .map(|(body, _)| (body.trim(), true))
+        .unwrap_or((payload, false))
+}
+
 fn with_owner_scope(filter: TargetFilter, controller: ControllerRef) -> TargetFilter {
     match filter {
         TargetFilter::Typed(mut typed) => {
@@ -95,6 +111,9 @@ fn with_owner_scope(filter: TargetFilter, controller: ControllerRef) -> TargetFi
         TargetFilter::Not { filter } => TargetFilter::Not {
             filter: Box::new(with_owner_scope(*filter, controller)),
         },
+        TargetFilter::Any => TargetFilter::Typed(
+            TypedFilter::card().properties(vec![FilterProp::Owned { controller }]),
+        ),
         other => TargetFilter::And {
             filters: vec![
                 other,
@@ -1664,8 +1683,8 @@ fn parse_unless_discard_cost(discard_tail: &str) -> Option<AbilityCost> {
                 return Some(AbilityCost::Discard {
                     count: QuantityExpr::Fixed { value: 1 },
                     filter: None,
-                    random: false,
-                    self_ref: false,
+                    selection: crate::types::ability::CardSelectionMode::Chosen,
+                    self_scope: crate::types::ability::DiscardSelfScope::FromHand,
                 });
             }
         }
@@ -1674,8 +1693,8 @@ fn parse_unless_discard_cost(discard_tail: &str) -> Option<AbilityCost> {
             return Some(AbilityCost::Discard {
                 count: QuantityExpr::Fixed { value: 1 },
                 filter: Some(filter),
-                random: false,
-                self_ref: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
+                self_scope: crate::types::ability::DiscardSelfScope::FromHand,
             });
         }
     }
@@ -1986,8 +2005,8 @@ fn parse_unless_they_discard_cost(input: &str) -> Option<(AbilityCost, &str)> {
                 AbilityCost::Discard {
                     count: QuantityExpr::Fixed { value: 1 },
                     filter: None,
-                    random: false,
-                    self_ref: false,
+                    selection: crate::types::ability::CardSelectionMode::Chosen,
+                    self_scope: crate::types::ability::DiscardSelfScope::FromHand,
                 },
                 after,
             ));
@@ -1999,8 +2018,8 @@ fn parse_unless_they_discard_cost(input: &str) -> Option<(AbilityCost, &str)> {
             AbilityCost::Discard {
                 count: QuantityExpr::Fixed { value: 1 },
                 filter: Some(filter),
-                random: false,
-                self_ref: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
+                self_scope: crate::types::ability::DiscardSelfScope::FromHand,
             },
             after,
         ));
@@ -6280,6 +6299,10 @@ fn try_parse_event(
         },
         DealtCombatDamage,
         DealtDamage,
+        /// CR 120.10 + CR 120.2b: Excess noncombat damage received by the subject.
+        DealtExcessNoncombatDamage,
+        /// CR 120.10: Excess damage (combat or noncombat) received by the subject.
+        DealtExcessDamage,
         BecomesTapped,
         TappedForMana,
         BecomesUntapped,
@@ -6372,6 +6395,24 @@ fn try_parse_event(
             value(
                 SimpleEvent::BecomesTargetSpell { qualifier: None },
                 tag("becomes the target of a spell"),
+            ),
+            // CR 120.10 + CR 120.2b: Excess noncombat damage — precede generic damage arms.
+            value(
+                SimpleEvent::DealtExcessNoncombatDamage,
+                tag("is dealt excess noncombat damage"),
+            ),
+            value(
+                SimpleEvent::DealtExcessNoncombatDamage,
+                tag("are dealt excess noncombat damage"),
+            ),
+            // CR 120.10: Excess damage without combat/noncombat qualifier.
+            value(
+                SimpleEvent::DealtExcessDamage,
+                tag("is dealt excess damage"),
+            ),
+            value(
+                SimpleEvent::DealtExcessDamage,
+                tag("are dealt excess damage"),
             ),
             value(
                 SimpleEvent::DealtCombatDamage,
@@ -6504,6 +6545,17 @@ fn try_parse_event(
             SimpleEvent::DealtCombatDamage => {
                 def.mode = TriggerMode::DamageReceived;
                 def.damage_kind = DamageKindFilter::CombatOnly;
+                set_trigger_subject(&mut def, subject);
+            }
+            // CR 120.10: Any source deals excess damage to permanents matching `subject`.
+            SimpleEvent::DealtExcessDamage => {
+                def.mode = TriggerMode::ExcessDamageAll;
+                set_trigger_subject(&mut def, subject);
+            }
+            // CR 120.10 + CR 120.2b: Noncombat excess damage to `subject`.
+            SimpleEvent::DealtExcessNoncombatDamage => {
+                def.mode = TriggerMode::ExcessDamageAll;
+                def.damage_kind = DamageKindFilter::NoncombatOnly;
                 set_trigger_subject(&mut def, subject);
             }
             SimpleEvent::DealtDamage => {
@@ -7546,7 +7598,7 @@ fn strip_attachment_relative_clause(subject: &str) -> (&str, Option<FilterProp>)
             FilterProp::HasAttachment {
                 kind: AttachmentKind::Aura,
                 controller: Some(ControllerRef::You),
-                exclude_source: false,
+                exclude_source: crate::types::ability::SourceExclusion::Include,
             },
         ),
         (
@@ -7554,7 +7606,7 @@ fn strip_attachment_relative_clause(subject: &str) -> (&str, Option<FilterProp>)
             FilterProp::HasAttachment {
                 kind: AttachmentKind::Aura,
                 controller: Some(ControllerRef::You),
-                exclude_source: false,
+                exclude_source: crate::types::ability::SourceExclusion::Include,
             },
         ),
         (
@@ -7562,7 +7614,7 @@ fn strip_attachment_relative_clause(subject: &str) -> (&str, Option<FilterProp>)
             FilterProp::HasAttachment {
                 kind: AttachmentKind::Equipment,
                 controller: Some(ControllerRef::You),
-                exclude_source: false,
+                exclude_source: crate::types::ability::SourceExclusion::Include,
             },
         ),
         (
@@ -7570,7 +7622,7 @@ fn strip_attachment_relative_clause(subject: &str) -> (&str, Option<FilterProp>)
             FilterProp::HasAttachment {
                 kind: AttachmentKind::Equipment,
                 controller: Some(ControllerRef::You),
-                exclude_source: false,
+                exclude_source: crate::types::ability::SourceExclusion::Include,
             },
         ),
     ];
@@ -8889,6 +8941,7 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
             .map(|(_, (before, _))| before)
             .unwrap_or(after)
             .trim();
+        let (payload, spell_not_owned_by_you) = strip_spell_not_owned_qualifier(payload);
 
         // CR 601.2a: pre-extract the "from <zone>" cast-origin tail BEFORE
         // running the type-phrase parser. `parse_type_phrase`'s
@@ -8922,6 +8975,11 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
             } else {
                 filter
             };
+            let filter = if spell_not_owned_by_you {
+                with_owner_scope(filter, ControllerRef::Opponent)
+            } else {
+                filter
+            };
             def.valid_card = Some(filter);
             return Some((TriggerMode::SpellCast, def));
         }
@@ -8933,13 +8991,18 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
         } else {
             filter
         };
+        let filter = if spell_not_owned_by_you {
+            with_owner_scope(filter, ControllerRef::Opponent)
+        } else {
+            filter
+        };
         let is_meaningful = match &filter {
             TargetFilter::Typed(tf) => tf.has_meaningful_type_constraint(),
             // Or-filters are always meaningful (e.g. "instant or sorcery spell")
             TargetFilter::Or { .. } => true,
             _ => false,
         };
-        if is_meaningful {
+        if is_meaningful || spell_not_owned_by_you {
             def.valid_card = Some(filter);
         }
         return Some((TriggerMode::SpellCast, def));
@@ -11190,11 +11253,11 @@ mod tests {
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
     use crate::types::ability::{
         AbilityCondition, AbilityCost, AbilityKind, AggregateFunction, BounceSelection,
-        CastingPermission, ChosenAttribute, Comparator, ContinuousModification, ControllerRef,
-        CountScope, DamageModification, DamageSource, DelayedTriggerCondition, Duration, Effect,
-        FilterProp, ManaSpendPermission, ObjectScope, PlayerFilter, PlayerScope, PtStat, PtValue,
-        PtValueScope, QuantityExpr, QuantityRef, SharedQuality, TargetFilter, TypeFilter,
-        TypedFilter,
+        CardSelectionMode, CastingPermission, ChosenAttribute, Comparator, ContinuousModification,
+        ControllerRef, CountScope, DamageModification, DamageSource, DelayedTriggerCondition,
+        DiscardSelfScope, Duration, Effect, FilterProp, ManaSpendPermission, ObjectScope,
+        PlayerFilter, PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
+        SharedQuality, TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::counter::{CounterMatch, CounterType};
     use crate::types::game_state::WaitingFor;
@@ -11234,6 +11297,24 @@ mod tests {
                 assert!(!filters.is_empty(), "expected non-empty Or filter");
                 for filter in filters {
                     assert_owned_by_you(filter);
+                }
+            }
+            other => panic!("expected Typed or Or filter, got {other:?}"),
+        }
+    }
+
+    fn assert_owned_by_opponent(filter: &TargetFilter) {
+        match filter {
+            TargetFilter::Typed(typed) => assert!(
+                typed.properties.contains(&FilterProp::Owned {
+                    controller: ControllerRef::Opponent,
+                }),
+                "expected Owned(Opponent) property in {typed:?}"
+            ),
+            TargetFilter::Or { filters } => {
+                assert!(!filters.is_empty(), "expected non-empty Or filter");
+                for filter in filters {
+                    assert_owned_by_opponent(filter);
                 }
             }
             other => panic!("expected Typed or Or filter, got {other:?}"),
@@ -15593,6 +15674,36 @@ mod tests {
     }
 
     #[test]
+    fn trigger_you_cast_spell_you_dont_own() {
+        let def = parse_trigger_line(
+            "Whenever you cast a spell you don't own, put a +1/+1 counter on each creature you control.",
+            "Nita, Forum Conciliator",
+        );
+        assert_eq!(def.mode, TriggerMode::SpellCast);
+        assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+        assert_owned_by_opponent(
+            def.valid_card
+                .as_ref()
+                .expect("spell you don't own must carry valid_card"),
+        );
+    }
+
+    #[test]
+    fn trigger_you_cast_instant_or_sorcery_spell_you_dont_own() {
+        let def = parse_trigger_line(
+            "Whenever you cast an instant or sorcery spell you don't own, draw a card.",
+            "Nita, Forum Conciliator",
+        );
+        assert_eq!(def.mode, TriggerMode::SpellCast);
+        assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+        let valid_card = def
+            .valid_card
+            .as_ref()
+            .expect("instant or sorcery spell you don't own must carry valid_card");
+        assert_owned_by_opponent(valid_card);
+    }
+
+    #[test]
     fn trigger_you_cast_creature_spell() {
         let def = parse_trigger_line(
             "Whenever you cast a creature spell, draw a card.",
@@ -17883,8 +17994,8 @@ mod tests {
                 AbilityCost::Discard {
                     count: QuantityExpr::Fixed { value: 1 },
                     filter: None,
-                    random: false,
-                    self_ref: false
+                    selection: CardSelectionMode::Chosen,
+                    self_scope: DiscardSelfScope::FromHand
                 }
             ),
             "cost should be DiscardCard, got {:?}",
@@ -18712,8 +18823,8 @@ mod tests {
                 AbilityCost::Discard {
                     count: QuantityExpr::Fixed { value: 1 },
                     filter: None,
-                    random: false,
-                    self_ref: false
+                    selection: CardSelectionMode::Chosen,
+                    self_scope: DiscardSelfScope::FromHand
                 }
             ),
             "cost should be DiscardCard, got {:?}",
@@ -18868,8 +18979,8 @@ mod tests {
                 AbilityCost::Discard {
                     count: QuantityExpr::Fixed { value: 1 },
                     filter: None,
-                    random: false,
-                    self_ref: false
+                    selection: CardSelectionMode::Chosen,
+                    self_scope: DiscardSelfScope::FromHand
                 }
             ),
             "cost should be DiscardCard, got {:?}",
@@ -19501,6 +19612,24 @@ mod tests {
                 TypedFilter::default().controller(ControllerRef::Opponent)
             ))
         );
+    }
+
+    #[test]
+    fn trigger_opponents_creatures_dealt_excess_noncombat_damage() {
+        let def = parse_trigger_line(
+            "Whenever one or more creatures your opponents control are dealt excess noncombat damage, create a Treasure token.",
+            "Become Brutes",
+        );
+        assert_eq!(def.mode, TriggerMode::ExcessDamageAll);
+        assert_eq!(def.damage_kind, DamageKindFilter::NoncombatOnly);
+        assert!(def.batched);
+        assert_eq!(
+            def.valid_card,
+            Some(TargetFilter::Typed(
+                TypedFilter::creature().controller(ControllerRef::Opponent)
+            ))
+        );
+        assert_eq!(def.valid_target, None);
     }
 
     #[test]
@@ -20962,7 +21091,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*destination, Zone::Battlefield);
-                assert!(*enter_tapped, "expected enter_tapped");
+                assert!(
+                    enter_tapped.is_tapped(),
+                    "expected enter_tapped.is_tapped()"
+                );
                 assert!(*enters_attacking, "expected enters_attacking");
             }
             other => panic!("expected ChangeZone, got {other:?}"),
@@ -20987,7 +21119,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*destination, Zone::Battlefield);
-                assert!(*enter_tapped);
+                assert!(enter_tapped.is_tapped());
                 assert!(*enters_attacking);
             }
             other => panic!("expected ChangeZone, got {other:?}"),
@@ -21409,7 +21541,7 @@ mod tests {
             Effect::ChangeZone {
                 destination: Zone::Battlefield,
                 enters_under: Some(ControllerRef::You),
-                enter_tapped: true,
+                enter_tapped: crate::types::zones::EtbTapState::Tapped,
                 enters_attacking: true,
                 ..
             } => {} // expected

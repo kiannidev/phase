@@ -645,9 +645,16 @@ pub fn expiration_to_duration(exp: &Expiration) -> ConvResult<Duration> {
         // effect's controller. Player-scoped variants only convert for
         // `SelfPlayer` because the engine resolves `PlayerScope::Controller`
         // against the grantee/controller.
-        Expiration::UntilPlayersNextTurn(p)
-        | Expiration::UntilTheEndOfPlayersNextTurn(p)
-        | Expiration::UntilEndOfNextTurn(p)
+        // CR 514.2: "until the end of [your/their] next turn" — persists through
+        // that entire turn and expires at cleanup (Light Up the Stage, Reckless
+        // Impulse). Distinct from `UntilNextTurnOf`, which expires at the
+        // beginning of the next turn.
+        Expiration::UntilTheEndOfPlayersNextTurn(p) if is_self_player(p) => {
+            Duration::UntilEndOfNextTurnOf {
+                player: PlayerScope::Controller,
+            }
+        }
+        Expiration::UntilPlayersNextTurn(p) | Expiration::UntilEndOfNextTurn(p)
             if is_self_player(p) =>
         {
             Duration::UntilNextTurnOf {
@@ -1072,6 +1079,19 @@ mod tests {
             expiration_to_duration(&Expiration::UntilPlayersNextTurn(Box::new(Player::You)))
                 .unwrap(),
             Duration::UntilNextTurnOf {
+                player: PlayerScope::Controller,
+            }
+        );
+    }
+
+    #[test]
+    fn until_the_end_of_your_next_turn_lowers_to_end_of_next_turn_duration() {
+        assert_eq!(
+            expiration_to_duration(&Expiration::UntilTheEndOfPlayersNextTurn(Box::new(
+                Player::You
+            )))
+            .unwrap(),
+            Duration::UntilEndOfNextTurnOf {
                 player: PlayerScope::Controller,
             }
         );

@@ -5103,6 +5103,7 @@ pub(crate) fn evaluate_condition(
         // pre-fix behavior.
         AbilityCondition::RevealedHasCardType {
             card_type,
+            alt_card_types,
             additional_filter,
             subtype_filter,
         } => {
@@ -5112,7 +5113,12 @@ pub(crate) fn evaluate_condition(
                 .or_else(|| state.last_zone_changed_ids.first())
                 .copied();
             let type_matches = subject_id
-                .map(|id| super::printed_cards::object_has_core_type(state, id, *card_type))
+                .map(|id| {
+                    super::printed_cards::object_has_core_type(state, id, *card_type)
+                        || alt_card_types.iter().any(|alt| {
+                            super::printed_cards::object_has_core_type(state, id, *alt)
+                        })
+                })
                 .unwrap_or(false);
             // CR 205.3m: Match the revealed card's subtype against the subtype filter.
             let subtype_matches = match subtype_filter.as_ref() {
@@ -13479,6 +13485,7 @@ mod tests {
         );
         let land_cond = AbilityCondition::RevealedHasCardType {
             card_type: CoreType::Land,
+            alt_card_types: vec![],
             additional_filter: None,
             subtype_filter: None,
         };
@@ -13579,6 +13586,7 @@ mod tests {
         )
         .condition(AbilityCondition::RevealedHasCardType {
             card_type: CoreType::Land,
+            alt_card_types: vec![],
             additional_filter: None,
             subtype_filter: None,
         });

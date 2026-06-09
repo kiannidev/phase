@@ -646,8 +646,63 @@ pub(super) fn strip_cast_from_zone_conditional(text: &str) -> (Option<AbilityCon
     (None, text.to_string())
 }
 
+fn type_filter_to_core_type(tf: &TypeFilter) -> Option<CoreType> {
+    match tf {
+        TypeFilter::Creature => Some(CoreType::Creature),
+        TypeFilter::Land => Some(CoreType::Land),
+        TypeFilter::Artifact => Some(CoreType::Artifact),
+        TypeFilter::Enchantment => Some(CoreType::Enchantment),
+        TypeFilter::Instant => Some(CoreType::Instant),
+        TypeFilter::Sorcery => Some(CoreType::Sorcery),
+        TypeFilter::Planeswalker => Some(CoreType::Planeswalker),
+        TypeFilter::Battle => Some(CoreType::Battle),
+        _ => None,
+    }
+}
+
+/// CR 608.2c: "If an instant or sorcery card is revealed this way, ..."
+/// (Delver of Secrets class) — gates a sub_ability on the last revealed card's type.
+fn parse_if_revealed_card_type_conditional(
+    text: &str,
+    lower: &str,
+) -> Option<(AbilityCondition, String)> {
+    let (rest, _) = alt((
+        tag::<_, _, OracleError<'_>>("if an "),
+        tag::<_, _, OracleError<'_>>("if a "),
+    ))
+    .parse(lower)
+    .ok()?;
+    let (rest, type_filters) = nom_quantity::parse_type_filter_list(rest).ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" card is revealed this way")
+        .parse(rest)
+        .ok()?;
+    let core_types: Vec<CoreType> = type_filters
+        .iter()
+        .filter_map(type_filter_to_core_type)
+        .collect();
+    if core_types.is_empty() {
+        return None;
+    }
+    let remainder = remainder_after_optional_comma(rest);
+    let offset = text.len().checked_sub(remainder.len())?;
+    let mut alt_types = core_types;
+    let primary = alt_types.remove(0);
+    Some((
+        AbilityCondition::RevealedHasCardType {
+            card_type: primary,
+            alt_card_types: alt_types,
+            additional_filter: None,
+            subtype_filter: None,
+        },
+        text[offset..].to_string(),
+    ))
+}
+
 pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityCondition>, String) {
     let lower = text.to_lowercase();
+    if let Some((condition, remainder)) = parse_if_revealed_card_type_conditional(text, &lower) {
+        return (Some(condition), remainder);
+    }
     let rest = alt((
         tag::<_, _, OracleError<'_>>("if it's a "),
         tag("if it's an "),
@@ -671,6 +726,7 @@ pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityConditio
             Some(maybe_negate(
                 AbilityCondition::RevealedHasCardType {
                     card_type: CoreType::Creature,
+                    alt_card_types: vec![],
                     additional_filter: None,
                     subtype_filter: Some(Box::new(subtype_filter)),
                 },
@@ -725,6 +781,7 @@ pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityConditio
             Some(maybe_negate(
                 AbilityCondition::RevealedHasCardType {
                     card_type,
+                    alt_card_types: vec![],
                     additional_filter,
                     subtype_filter: None,
                 },
@@ -754,6 +811,7 @@ fn parse_its_a_type_condition(condition_text: &str) -> Option<AbilityCondition> 
         return Some(maybe_negate(
             AbilityCondition::RevealedHasCardType {
                 card_type: CoreType::Creature,
+                alt_card_types: vec![],
                 additional_filter: None,
                 subtype_filter: Some(Box::new(subtype_filter)),
             },
@@ -766,6 +824,7 @@ fn parse_its_a_type_condition(condition_text: &str) -> Option<AbilityCondition> 
     Some(maybe_negate(
         AbilityCondition::RevealedHasCardType {
             card_type,
+            alt_card_types: vec![],
             additional_filter: None,
             subtype_filter: None,
         },
@@ -2891,6 +2950,7 @@ pub(super) fn try_nom_condition_as_ability_condition(
                 return Some(maybe_negate(
                     AbilityCondition::RevealedHasCardType {
                         card_type: CoreType::Land,
+                        alt_card_types: vec![],
                         additional_filter: None,
                         subtype_filter: None,
                     },
@@ -2908,6 +2968,7 @@ pub(super) fn try_nom_condition_as_ability_condition(
             return Some(maybe_negate(
                 AbilityCondition::RevealedHasCardType {
                     card_type,
+                    alt_card_types: vec![],
                     additional_filter: None,
                     subtype_filter: None,
                 },
@@ -2919,6 +2980,7 @@ pub(super) fn try_nom_condition_as_ability_condition(
             return Some(maybe_negate(
                 AbilityCondition::RevealedHasCardType {
                     card_type: CoreType::Creature,
+                    alt_card_types: vec![],
                     additional_filter: None,
                     subtype_filter: Some(Box::new(subtype_filter)),
                 },
@@ -4486,6 +4548,24 @@ mod tests {
             ))
         );
         assert_eq!(body, "target player discards three cards.");
+    }
+
+    /// Delver of Secrets: instant/sorcery gate on revealed card.
+    #[test]
+    fn issue_2367_if_instant_or_sorcery_revealed_this_way() {
+        let (cond, body) = strip_card_type_conditional(
+            "If an instant or sorcery card is revealed this way, transform this creature.",
+        );
+        assert_eq!(
+            cond,
+            Some(AbilityCondition::RevealedHasCardType {
+                card_type: CoreType::Instant,
+                alt_card_types: vec![CoreType::Sorcery],
+                additional_filter: None,
+                subtype_filter: None,
+            })
+        );
+        assert_eq!(body, "transform this creature.");
     }
 
     /// CR 608.2c: "permanent" is not a CoreType — strip_card_type_conditional must

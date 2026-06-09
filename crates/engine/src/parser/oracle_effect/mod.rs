@@ -30653,6 +30653,7 @@ mod tests {
             sub.condition,
             Some(AbilityCondition::RevealedHasCardType {
                 card_type: CoreType::Land,
+                alt_card_types: vec![],
                 additional_filter: None,
                 subtype_filter: None,
             })
@@ -30846,6 +30847,7 @@ mod tests {
                 let sub = def.sub_ability.as_deref().unwrap();
                 assert!(sub.condition == Some(AbilityCondition::RevealedHasCardType {
                     card_type: CoreType::Land,
+                    alt_card_types: vec![],
                     additional_filter: None,
                     subtype_filter: None,
                 }));
@@ -30955,6 +30957,7 @@ mod tests {
             Some(AbilityCondition::Not {
                 condition: Box::new(AbilityCondition::RevealedHasCardType {
                     card_type: CoreType::Land,
+                    alt_card_types: vec![],
                     additional_filter: None,
                     subtype_filter: None,
                 }),
@@ -35980,6 +35983,7 @@ mod tests {
             sub.condition,
             Some(AbilityCondition::RevealedHasCardType {
                 card_type: CoreType::Creature,
+                alt_card_types: vec![],
                 additional_filter: Some(FilterProp::IsChosenCreatureType),
                 subtype_filter: None,
             }),
@@ -43584,6 +43588,7 @@ mod snapshot_tests {
             put_land.condition,
             Some(AbilityCondition::RevealedHasCardType {
                 card_type: CoreType::Land,
+                alt_card_types: vec![],
                 additional_filter: None,
                 subtype_filter: None,
             })

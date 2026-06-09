@@ -480,19 +480,19 @@ pub(super) fn handle_replacement_choice(
                     if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
                         waiting_for = state.waiting_for.clone();
                     }
-                } else if state.deferred_step_trigger_resume
+                } else if state.deferred_step_trigger_resume.is_some()
                     && matches!(state.waiting_for, WaitingFor::Priority { .. })
                 {
-                    // CR 513.1a / CR 503.2: A CR 616.1 mana-pool choice can
+                    // CR 513.1 + CR 603.3b: A CR 616.1 mana-pool choice can
                     // defer completion of `enter_phase`. In that case
                     // `auto_advance` returned before its per-step trigger arm
                     // ran (it bails while `pending_phase_transition_progress`
                     // is set). Resume only when that bail happened — not when
                     // `advance_phase` alone paused the drain (unit tests).
-                    state.deferred_step_trigger_resume = false;
+                    state.deferred_step_trigger_resume = None;
                     waiting_for = super::turns::auto_advance(state, events);
                 } else {
-                    state.deferred_step_trigger_resume = false;
+                    state.deferred_step_trigger_resume = None;
                 }
             }
 

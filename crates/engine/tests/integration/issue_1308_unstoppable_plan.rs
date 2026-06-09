@@ -163,7 +163,7 @@ fn unstoppable_plan_untaps_after_cast_from_hand() {
 
 /// When entering the end step pauses on a CR 616.1 empty-mana-pool choice,
 /// `auto_advance` returns before its `Phase::End` arm runs. After the choice
-/// resolves, phase-begin triggers must still fire (CR 513.1a).
+/// resolves, phase-begin triggers must still fire (CR 513.1 + CR 603.3b).
 #[test]
 fn unstoppable_plan_untaps_after_deferred_end_step_entry() {
     let mut scenario = GameScenario::new();

@@ -747,6 +747,7 @@ fn fmt_type_filter(tf: &TypeFilter) -> String {
                 .collect::<Vec<_>>()
                 .join(" or ");
         }
+        TypeFilter::Named(name) => return format!("named {name}"),
     }
     .into()
 }

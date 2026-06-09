@@ -1710,6 +1710,7 @@ fn type_filter_subject_name(tf: &TypeFilter) -> String {
         TypeFilter::Subtype(s) => s.to_ascii_lowercase(),
         TypeFilter::Non(inner) => format!("non-{}", type_filter_subject_name(inner)),
         TypeFilter::AnyOf(_) => "permanent".to_string(),
+        TypeFilter::Named(name) => format!("named {name}"),
     }
 }
 

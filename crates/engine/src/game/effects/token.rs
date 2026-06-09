@@ -1009,7 +1009,8 @@ fn type_filter_core_types(filter: &TypeFilter) -> Option<Vec<CoreType>> {
         | TypeFilter::Card
         | TypeFilter::Any
         | TypeFilter::Non(_)
-        | TypeFilter::Subtype(_) => None,
+        | TypeFilter::Subtype(_)
+        | TypeFilter::Named(_) => None,
     }
 }
 

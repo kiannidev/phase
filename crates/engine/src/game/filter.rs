@@ -1787,6 +1787,7 @@ pub fn type_filter_matches(
         TypeFilter::AnyOf(ref filters) => filters
             .iter()
             .any(|f| type_filter_matches(f, obj, all_creature_types)),
+        TypeFilter::Named(ref name) => obj.name.eq_ignore_ascii_case(name),
     }
 }
 
@@ -1828,6 +1829,7 @@ fn zone_change_record_matches_type_filter(
         TypeFilter::AnyOf(filters) => filters
             .iter()
             .any(|inner| zone_change_record_matches_type_filter(record, inner, all_creature_types)),
+        TypeFilter::Named(name) => record.name.eq_ignore_ascii_case(name),
     }
 }
 
@@ -2320,6 +2322,7 @@ fn spell_record_matches_type_filter(
         TypeFilter::AnyOf(filters) => filters
             .iter()
             .any(|inner| spell_record_matches_type_filter(record, inner, all_creature_types)),
+        TypeFilter::Named(name) => record.name.eq_ignore_ascii_case(name),
     }
 }
 

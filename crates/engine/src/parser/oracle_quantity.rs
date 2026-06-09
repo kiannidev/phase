@@ -691,6 +691,12 @@ pub(crate) fn parse_cda_quantity_with_context(
         return Some(QuantityExpr::Ref { qty });
     }
 
+    if let Ok((rest, expr)) = parse_owned_cards_in_zones_with_property_filter(text) {
+        if rest.is_empty() {
+            return Some(expr);
+        }
+    }
+
     if let Ok((rest, expr)) = parse_owned_cards_in_zones_quantity(text) {
         if rest.is_empty() {
             return Some(expr);
@@ -804,6 +810,78 @@ pub(crate) fn parse_cda_quantity_with_context(
     }
 
     None
+}
+
+// CR 604.3: "the total number of cards you own in exile and in your graveyard
+// that are Oozes or are named Slime Against Humanity" — type/name filters trail
+// the zone list rather than preceding "cards".
+fn parse_zone_card_that_are_filter_list(input: &str) -> OracleResult<'_, Vec<TypeFilter>> {
+    fn parse_named_card_filter(input: &str) -> OracleResult<'_, TypeFilter> {
+        let (rest, name) = preceded(
+            tag("are named "),
+            nom::bytes::complete::take_while1(|c: char| c != '.'),
+        )
+        .parse(input)?;
+        Ok((rest, TypeFilter::Named(name.trim().to_string())))
+    }
+
+    let (mut rest, first) = alt((
+        parse_named_card_filter,
+        nom_target::parse_type_filter_word,
+    ))
+    .parse(input)?;
+    let mut filters = vec![first];
+    loop {
+        if let Ok((next_rest, _)) = tag::<_, _, OracleError<'_>>(" or are named ").parse(rest) {
+            let name = next_rest.trim().trim_end_matches('.');
+            filters.push(TypeFilter::Named(name.to_string()));
+            rest = "";
+            break;
+        } else if let Ok((next_rest, _)) = tag::<_, _, OracleError<'_>>(" or ").parse(rest) {
+            let (after, next) =
+                alt((parse_named_card_filter, nom_target::parse_type_filter_word))
+                    .parse(next_rest)?;
+            filters.push(next);
+            rest = after;
+        } else {
+            break;
+        }
+    }
+    Ok((rest, filters))
+}
+
+fn parse_owned_cards_in_zones_with_property_filter(
+    input: &str,
+) -> nom::IResult<&str, QuantityExpr, OracleError<'_>> {
+    let (rest, _) = alt((tag("the total number of "), tag("the number of "))).parse(input)?;
+    let (rest, _) = alt((tag("cards"), tag("card"))).parse(rest)?;
+    let (rest, _) = tag(" you own in ").parse(rest)?;
+    let (rest, zones) = separated_list1(
+        alt((tag(" and in "), tag(", and in "), tag(", in "))),
+        preceded(opt(tag("your ")), nom_quantity::parse_zone_ref_singular),
+    )
+    .parse(rest)?;
+    let (rest, _) = tag(" that are ").parse(rest)?;
+    let (rest, card_types) = parse_zone_card_that_are_filter_list(rest)?;
+    let (rest, _) = eof(rest)?;
+
+    let mut exprs: Vec<QuantityExpr> = zones
+        .into_iter()
+        .map(|zone| QuantityExpr::Ref {
+            qty: QuantityRef::ZoneCardCount {
+                zone,
+                card_types: card_types.clone(),
+                scope: CountScope::Owner,
+            },
+        })
+        .collect();
+
+    let expr = if exprs.len() == 1 {
+        exprs.remove(0)
+    } else {
+        QuantityExpr::Sum { exprs }
+    };
+    Ok((rest, expr))
 }
 
 // CR 604.3: Characteristic-defining abilities can define power/toughness using
@@ -4515,6 +4593,40 @@ mod tests {
                     assert_eq!(*scope, CountScope::Owner);
                 }
                 other => panic!("expected ZoneCardCount segment, got {other:?}"),
+            }
+        }
+    }
+
+    /// Slime Against Humanity: cards-with-filter suffix after zone list.
+    #[test]
+    fn issue_2370_slime_ooze_and_named_card_zone_count() {
+        let result = parse_cda_quantity(
+            "two plus the total number of cards you own in exile and in your graveyard that are Oozes or are named Slime Against Humanity",
+        )
+        .expect("slime quantity must parse");
+        let QuantityExpr::Offset { inner, offset } = result else {
+            panic!("expected Offset of 2 + zone count, got {result:?}");
+        };
+        assert_eq!(offset, 2);
+        let QuantityExpr::Sum { exprs: zones } = *inner else {
+            panic!("expected summed exile+graveyard counts");
+        };
+        assert_eq!(zones.len(), 2);
+        for expr in zones.iter() {
+            match expr {
+                QuantityExpr::Ref {
+                    qty:
+                        QuantityRef::ZoneCardCount {
+                            card_types,
+                            scope,
+                            ..
+                        },
+                } => {
+                    assert_eq!(scope, &CountScope::Owner);
+                    assert!(card_types.iter().any(|f| matches!(f, TypeFilter::Subtype(s) if s == "Ooze")));
+                    assert!(card_types.iter().any(|f| matches!(f, TypeFilter::Named(name) if name == "Slime Against Humanity")));
+                }
+                other => panic!("expected ZoneCardCount, got {other:?}"),
             }
         }
     }

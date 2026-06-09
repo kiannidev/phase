@@ -10849,6 +10849,11 @@ pub enum AbilityCondition {
     /// for "creature card of the chosen type"). For "if it's a nonland card" patterns,
     /// wrap with `AbilityCondition::Not`.
     RevealedHasCardType {
+        #[serde(
+            default,
+            alias = "card_type",
+            deserialize_with = "deserialize_revealed_card_types_compat"
+        )]
         card_types: Vec<CoreType>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         additional_filter: Option<FilterProp>,
@@ -13642,6 +13647,27 @@ fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
+/// Deserialize either the modern `card_types: [CoreType, ...]` shape or the
+/// legacy single `card_type: CoreType` field on `AbilityCondition::RevealedHasCardType`.
+fn deserialize_revealed_card_types_compat<'de, D>(
+    deserializer: D,
+) -> Result<Vec<CoreType>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    let value = serde_json::Value::deserialize(deserializer)?;
+    match value {
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::Array(_) => {
+            serde_json::from_value::<Vec<CoreType>>(value).map_err(D::Error::custom)
+        }
+        other => serde_json::from_value::<CoreType>(other)
+            .map(|card_type| vec![card_type])
+            .map_err(D::Error::custom),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Legacy on-disk compatibility for `Effect::ChangeZone::enters_under`.
 //
@@ -15042,6 +15068,20 @@ mod tests {
                 enters_attacking: false,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn revealed_has_card_type_legacy_card_type_deserializes_to_card_types() {
+        let json = r#"{"type":"RevealedHasCardType","card_type":"Land"}"#;
+        let condition: AbilityCondition = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            condition,
+            AbilityCondition::RevealedHasCardType {
+                card_types,
+                additional_filter: None,
+                subtype_filter: None,
+            } if card_types == vec![CoreType::Land]
         ));
     }
 

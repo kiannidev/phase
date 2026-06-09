@@ -68,8 +68,8 @@ fn filter_references_self(filter: &TargetFilter) -> bool {
     }
 }
 
-/// CR 109.5: "Whenever you cast a spell you don't own" — the spell's owner is
-/// an opponent even though its controller on the stack is you.
+/// CR 108.3 + CR 109.5: "Whenever you cast a spell you don't own" — the spell's
+/// owner is an opponent even though its controller on the stack is you.
 fn strip_spell_not_owned_qualifier(payload: &str) -> (&str, bool) {
     let mut parser = alt((
         terminated(
@@ -15683,6 +15683,25 @@ mod tests {
                 .as_ref()
                 .expect("spell you don't own must carry valid_card"),
         );
+    }
+
+    #[test]
+    fn trigger_you_cast_instant_or_sorcery_spell_you_dont_own() {
+        let def = parse_trigger_line(
+            "Whenever you cast an instant or sorcery spell you don't own, draw a card.",
+            "Nita, Forum Conciliator",
+        );
+        assert_eq!(def.mode, TriggerMode::SpellCast);
+        assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+        let valid_card = def
+            .valid_card
+            .as_ref()
+            .expect("instant or sorcery spell you don't own must carry valid_card");
+        assert_owned_by_opponent(valid_card);
+        assert!(matches!(
+            valid_card,
+            TargetFilter::Or { filters } if filters.len() == 2
+        ));
     }
 
     #[test]

@@ -1960,10 +1960,6 @@ pub enum TypeFilter {
     /// CR 608.2b: Disjunction — matches if ANY inner filter matches.
     /// "creature or enchantment" → `AnyOf(vec![Creature, Enchantment])`
     AnyOf(Vec<TypeFilter>),
-    /// CR 109.3: Matches cards with the specified name (case-insensitive).
-    /// Used by zone-card-count quantities such as Slime Against Humanity's
-    /// "...that are Oozes or are named Slime Against Humanity".
-    Named(String),
 }
 
 /// Filter for damage type on trigger definitions.
@@ -3407,6 +3403,8 @@ pub enum QuantityRef {
     ZoneCardCount {
         zone: ZoneRef,
         card_types: Vec<TypeFilter>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filter: Option<TargetFilter>,
         scope: CountScope,
     },
     /// CR 305.6: Count distinct basic land types (Plains/Island/Swamp/Mountain/Forest)
@@ -10850,8 +10848,6 @@ pub enum AbilityCondition {
     /// wrap with `AbilityCondition::Not`.
     RevealedHasCardType {
         card_type: CoreType,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        alt_card_types: Vec<CoreType>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         additional_filter: Option<FilterProp>,
         /// CR 205.3m: Optional subtype constraint on the revealed card (e.g.

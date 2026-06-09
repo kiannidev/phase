@@ -287,7 +287,6 @@ fn card_matches_type_filter(card: &CardFace, filter: &TypeFilter) -> bool {
         TypeFilter::AnyOf(filters) => filters
             .iter()
             .any(|inner| card_matches_type_filter(card, inner)),
-        TypeFilter::Named(name) => card.name.eq_ignore_ascii_case(name),
     }
 }
 

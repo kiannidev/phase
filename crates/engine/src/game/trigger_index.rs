@@ -80,8 +80,7 @@ fn narrow_core_type(filter: &Option<TargetFilter>) -> Option<CoreType> {
         | TypeFilter::Any
         | TypeFilter::Non(_)
         | TypeFilter::Subtype(_)
-        | TypeFilter::AnyOf(_)
-        | TypeFilter::Named(_) => None,
+        | TypeFilter::AnyOf(_) => None,
     }
 }
 

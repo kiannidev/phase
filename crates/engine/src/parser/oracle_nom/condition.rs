@@ -2749,6 +2749,7 @@ fn parse_library_empty_condition(input: &str) -> OracleResult<'_, StaticConditio
             QuantityRef::ZoneCardCount {
                 zone: ZoneRef::Library,
                 card_types: Vec::new(),
+                filter: None,
                 scope: CountScope::Controller,
             },
             Comparator::EQ,
@@ -4625,7 +4626,8 @@ fn parse_there_exists_compound_zone_condition(input: &str) -> OracleResult<'_, S
                         zone: zone.clone(),
                         card_types: first_card_types,
                         scope: scope.clone(),
-                    },
+                        filter: None,
+                    }
                     1,
                 ),
                 make_quantity_ge(
@@ -4633,7 +4635,8 @@ fn parse_there_exists_compound_zone_condition(input: &str) -> OracleResult<'_, S
                         zone,
                         card_types: second_card_types,
                         scope,
-                    },
+                        filter: None,
+                    }
                     1,
                 ),
             ],
@@ -4686,6 +4689,7 @@ fn parse_subject_first_zone_count(input: &str) -> OracleResult<'_, StaticConditi
         QuantityRef::ZoneCardCount {
             zone,
             card_types: type_filters,
+            filter: None,
             scope,
         }
     };
@@ -5389,7 +5393,8 @@ mod tests {
                         zone: ZoneRef::Library,
                         card_types: Vec::new(),
                         scope: CountScope::Controller,
-                    },
+                        filter: None,
+                    }
                 },
             },
         );
@@ -5499,7 +5504,8 @@ mod tests {
                         zone: ZoneRef::Library,
                         card_types: Vec::new(),
                         scope: CountScope::Controller,
-                    },
+                        filter: None,
+                    }
                 },
             },
         );
@@ -7291,6 +7297,7 @@ mod tests {
                                 zone: crate::types::ability::ZoneRef::Graveyard,
                                 card_types,
                                 scope: crate::types::ability::CountScope::Controller,
+                                filter: None,
                             },
                     },
                 comparator: Comparator::GE,
@@ -7316,6 +7323,7 @@ mod tests {
                                 zone: crate::types::ability::ZoneRef::Graveyard,
                                 card_types,
                                 scope: crate::types::ability::CountScope::Controller,
+                                filter: None,
                             },
                     },
                 comparator: Comparator::GE,
@@ -7347,6 +7355,7 @@ mod tests {
                                     zone: crate::types::ability::ZoneRef::Graveyard,
                                     card_types,
                                     scope: crate::types::ability::CountScope::Controller,
+                                    filter: None,
                                 },
                         },
                     comparator: Comparator::GE,
@@ -7382,6 +7391,7 @@ mod tests {
                             zone,
                             card_types,
                             scope,
+                            filter: None,
                         },
                 },
             comparator: Comparator::GE,

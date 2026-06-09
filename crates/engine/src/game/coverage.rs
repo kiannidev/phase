@@ -747,7 +747,6 @@ fn fmt_type_filter(tf: &TypeFilter) -> String {
                 .collect::<Vec<_>>()
                 .join(" or ");
         }
-        TypeFilter::Named(name) => return format!("named {name}"),
     }
     .into()
 }
@@ -1081,6 +1080,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             zone,
             card_types,
             scope,
+            filter: None,
         } => {
             let types = if card_types.is_empty() {
                 "cards".into()
@@ -10405,6 +10405,7 @@ mod tests {
                     zone: ZoneRef::Hand,
                     card_types: Vec::new(),
                     scope: CountScope::Controller,
+                    filter: None,
                 },
             },
             defended: None,

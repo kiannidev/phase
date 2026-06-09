@@ -10,8 +10,8 @@ use std::str::FromStr;
 
 use crate::parser::oracle_nom::error::{OracleError, OracleResult};
 use nom::branch::alt;
-use nom::bytes::complete::{tag, take_until};
-use nom::combinator::{all_consuming, eof, opt, value};
+use nom::bytes::complete::{tag, take_till1, take_until};
+use nom::combinator::{all_consuming, eof, opt, peek, value};
 use nom::multi::separated_list1;
 use nom::sequence::{pair, preceded, terminated};
 use nom::Parser;
@@ -471,6 +471,7 @@ pub(crate) fn canonicalize_quantity_ref(qty: QuantityRef) -> QuantityRef {
         QuantityRef::ZoneCardCount {
             zone: ZoneRef::Hand,
             card_types,
+            filter: None,
             scope: CountScope::Controller,
         } if card_types.is_empty() => QuantityRef::HandSize {
             player: PlayerScope::Controller,
@@ -478,6 +479,7 @@ pub(crate) fn canonicalize_quantity_ref(qty: QuantityRef) -> QuantityRef {
         QuantityRef::ZoneCardCount {
             zone: ZoneRef::Graveyard,
             card_types,
+            filter: None,
             scope: CountScope::Controller,
         } if card_types.is_empty() => QuantityRef::GraveyardSize {
             player: PlayerScope::Controller,
@@ -713,6 +715,7 @@ pub(crate) fn parse_cda_quantity_with_context(
                 zone: ZoneRef::Graveyard,
                 card_types: vec![],
                 scope: CountScope::Opponents,
+                filter: None,
             },
         });
     }
@@ -815,35 +818,47 @@ pub(crate) fn parse_cda_quantity_with_context(
 // CR 604.3: "the total number of cards you own in exile and in your graveyard
 // that are Oozes or are named Slime Against Humanity" — type/name filters trail
 // the zone list rather than preceding "cards".
-fn parse_zone_card_that_are_filter_list(input: &str) -> OracleResult<'_, Vec<TypeFilter>> {
-    fn parse_named_card_filter(input: &str) -> OracleResult<'_, TypeFilter> {
-        let (rest, name) = preceded(
-            tag("are named "),
-            nom::bytes::complete::take_while1(|c: char| c != '.'),
-        )
-        .parse(input)?;
-        Ok((rest, TypeFilter::Named(name.trim().to_string())))
+fn parse_zone_card_that_are_filter_list(input: &str) -> OracleResult<'_, TargetFilter> {
+    fn parse_named_card_filter(input: &str) -> OracleResult<'_, TargetFilter> {
+        let (rest, _) = tag("named ").parse(input)?;
+        let (rest, name) = alt((
+            terminated(take_until(" or are "), peek(tag(" or are "))),
+            terminated(take_until(" or "), peek(tag(" or "))),
+            take_till1(|c| c == '.' || c == ','),
+        ))
+        .parse(rest)?;
+        Ok((
+            rest,
+            TargetFilter::Typed(TypedFilter::default().properties(vec![FilterProp::Named {
+                name: name.trim().to_string(),
+            }])),
+        ))
     }
 
-    let (mut rest, first) =
-        alt((parse_named_card_filter, nom_target::parse_type_filter_word)).parse(input)?;
+    fn parse_type_card_filter(input: &str) -> OracleResult<'_, TargetFilter> {
+        let (rest, filter) = nom_target::parse_type_filter_word(input)?;
+        Ok((rest, TargetFilter::Typed(TypedFilter::new(filter))))
+    }
+
+    let (mut rest, first) = alt((parse_named_card_filter, parse_type_card_filter)).parse(input)?;
     let mut filters = vec![first];
     loop {
-        if let Ok((next_rest, _)) = tag::<_, _, OracleError<'_>>(" or are named ").parse(rest) {
-            let name = next_rest.trim().trim_end_matches('.');
-            filters.push(TypeFilter::Named(name.to_string()));
-            rest = "";
+        let Ok((next_rest, _)) =
+            alt((tag::<_, _, OracleError<'_>>(" or are "), tag(" or "))).parse(rest)
+        else {
             break;
-        } else if let Ok((next_rest, _)) = tag::<_, _, OracleError<'_>>(" or ").parse(rest) {
-            let (after, next) = alt((parse_named_card_filter, nom_target::parse_type_filter_word))
-                .parse(next_rest)?;
-            filters.push(next);
-            rest = after;
-        } else {
-            break;
-        }
+        };
+        let (after, next) =
+            alt((parse_named_card_filter, parse_type_card_filter)).parse(next_rest)?;
+        filters.push(next);
+        rest = after;
     }
-    Ok((rest, filters))
+    let filter = if filters.len() == 1 {
+        filters.remove(0)
+    } else {
+        TargetFilter::AnyOf(filters)
+    };
+    Ok((rest, filter))
 }
 
 fn parse_owned_cards_in_zones_with_property_filter(
@@ -858,7 +873,8 @@ fn parse_owned_cards_in_zones_with_property_filter(
     )
     .parse(rest)?;
     let (rest, _) = tag(" that are ").parse(rest)?;
-    let (rest, card_types) = parse_zone_card_that_are_filter_list(rest)?;
+    let (rest, filter) = parse_zone_card_that_are_filter_list(rest)?;
+    let (rest, _) = opt(tag(".")).parse(rest)?;
     let (rest, _) = eof(rest)?;
 
     let mut exprs: Vec<QuantityExpr> = zones
@@ -866,7 +882,8 @@ fn parse_owned_cards_in_zones_with_property_filter(
         .map(|zone| QuantityExpr::Ref {
             qty: QuantityRef::ZoneCardCount {
                 zone,
-                card_types: card_types.clone(),
+                card_types: Vec::new(),
+                filter: Some(filter.clone()),
                 scope: CountScope::Owner,
             },
         })
@@ -904,6 +921,7 @@ fn parse_owned_cards_in_zones_quantity(
                 zone,
                 card_types: card_types.clone(),
                 scope: CountScope::Owner,
+                filter: None,
             },
         })
         .collect();
@@ -4182,6 +4200,7 @@ mod tests {
                 zone: ZoneRef::Hand,
                 card_types: vec![],
                 scope: CountScope::Controller,
+                filter: None,
             }
         );
     }
@@ -4195,6 +4214,7 @@ mod tests {
                 zone: ZoneRef::Graveyard,
                 card_types: vec![],
                 scope: CountScope::Controller,
+                filter: None,
             }
         );
     }
@@ -4552,6 +4572,7 @@ mod tests {
                         zone,
                         card_types,
                         scope,
+                        filter: None,
                     },
             } => {
                 assert_eq!(zone, ZoneRef::Graveyard);
@@ -4581,6 +4602,7 @@ mod tests {
                         QuantityRef::ZoneCardCount {
                             zone,
                             card_types,
+                            filter: None,
                             scope,
                         },
                 } => {
@@ -4613,20 +4635,63 @@ mod tests {
                 QuantityExpr::Ref {
                     qty:
                         QuantityRef::ZoneCardCount {
-                            card_types, scope, ..
+                            card_types,
+                            filter: Some(filter),
+                            scope,
+                            ..
                         },
                 } => {
                     assert_eq!(scope, &CountScope::Owner);
-                    assert!(card_types
-                        .iter()
-                        .any(|f| matches!(f, TypeFilter::Subtype(s) if s == "Ooze")));
-                    assert!(card_types.iter().any(
-                        |f| matches!(f, TypeFilter::Named(name) if name == "Slime Against Humanity")
-                    ));
+                    assert!(card_types.is_empty());
+                    assert_slime_against_humanity_filter(filter);
                 }
                 other => panic!("expected ZoneCardCount, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn issue_2370_named_card_zone_count_is_order_independent() {
+        let result = parse_cda_quantity(
+            "the total number of cards you own in your graveyard that are named Slime Against Humanity or are Oozes",
+        )
+        .expect("named-first slime quantity must parse");
+        let QuantityExpr::Ref {
+            qty:
+                QuantityRef::ZoneCardCount {
+                    zone,
+                    card_types,
+                    filter: Some(filter),
+                    scope,
+                },
+        } = result
+        else {
+            panic!("expected filtered ZoneCardCount, got {result:?}");
+        };
+        assert_eq!(zone, ZoneRef::Graveyard);
+        assert_eq!(scope, CountScope::Owner);
+        assert!(card_types.is_empty());
+        assert_slime_against_humanity_filter(&filter);
+    }
+
+    fn assert_slime_against_humanity_filter(filter: &TargetFilter) {
+        let TargetFilter::AnyOf(filters) = filter else {
+            panic!("expected AnyOf filter, got {filter:?}");
+        };
+        assert!(filters.iter().any(|filter| {
+            matches!(
+                filter,
+                TargetFilter::Typed(TypedFilter { type_filters, .. })
+                    if type_filters.iter().any(|tf| matches!(tf, TypeFilter::Subtype(s) if s == "Ooze"))
+            )
+        }));
+        assert!(filters.iter().any(|filter| {
+            matches!(
+                filter,
+                TargetFilter::Typed(TypedFilter { properties, .. })
+                    if properties.iter().any(|prop| matches!(prop, FilterProp::Named { name } if name == "Slime Against Humanity"))
+            )
+        }));
     }
 
     #[test]

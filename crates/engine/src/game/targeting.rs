@@ -508,7 +508,8 @@ pub fn resolved_targets(
     // event / combat state, even when parent chain propagation populated
     // `ability.targets` with unrelated chosen targets (DefendingPlayer, etc.).
     if is_pure_event_context_filter(target_filter) {
-        if let Some(target) = resolve_event_context_target(state, target_filter, ability.source_id) {
+        if let Some(target) = resolve_event_context_target(state, target_filter, ability.source_id)
+        {
             return vec![target];
         }
     }
@@ -531,9 +532,7 @@ pub fn resolved_targets(
     // pairs — only the object slots must satisfy the resolving filter
     // (Haytham Kenway exile). Without this ordering, a StackSpell filter on
     // an ETB trigger would bind to the ZoneChanged source (issue #2351).
-    if !ability.targets.is_empty()
-        && chosen_targets_satisfy_filter(state, ability, target_filter)
-    {
+    if !ability.targets.is_empty() && chosen_targets_satisfy_filter(state, ability, target_filter) {
         return ability.targets.clone();
     }
     if let Some(target) = resolve_event_context_target(state, target_filter, ability.source_id) {
@@ -577,9 +576,9 @@ fn chosen_targets_satisfy_filter(
         object_targets
     };
     !candidates.is_empty()
-        && candidates.iter().all(|target| {
-            target_ref_matches_resolved_filter(state, ability, target_filter, target)
-        })
+        && candidates
+            .iter()
+            .all(|target| target_ref_matches_resolved_filter(state, ability, target_filter, target))
 }
 
 fn target_ref_matches_resolved_filter(

@@ -695,16 +695,7 @@ pub fn matches_target_filter(
     filter: &TargetFilter,
     ctx: &FilterContext<'_>,
 ) -> bool {
-    filter_inner(
-        state,
-        object_id,
-        filter,
-        ctx.source_id,
-        ctx.source_controller,
-        ctx.ability,
-        ctx.recipient_id,
-        ctx.scoped_iteration_player,
-    )
+    filter_inner(state, object_id, filter, ctx)
 }
 
 /// CR 405.1 + CR 115.9b: Match filters against a spell or ability on the
@@ -1178,11 +1169,7 @@ fn filter_inner(
     state: &GameState,
     object_id: ObjectId,
     filter: &TargetFilter,
-    source_id: ObjectId,
-    source_controller: Option<PlayerId>,
-    ability: Option<&ResolvedAbility>,
-    recipient_id: Option<ObjectId>,
-    scoped_iteration_player: Option<PlayerId>,
+    ctx: &FilterContext<'_>,
 ) -> bool {
     // CR 702.26b: a phased-out permanent is treated as though it does not
     // exist. The only exception the rules allow — "rules and effects that
@@ -1200,11 +1187,11 @@ fn filter_inner(
         obj,
         object_id,
         filter,
-        source_id,
-        source_controller,
-        ability,
-        recipient_id,
-        scoped_iteration_player,
+        ctx.source_id,
+        ctx.source_controller,
+        ctx.ability,
+        ctx.recipient_id,
+        ctx.scoped_iteration_player,
         ControllerLookup::LiveOrLki,
     )
 }
@@ -2615,16 +2602,16 @@ fn aura_can_enchant_referenced_target(
     source: &SourceContext<'_>,
 ) -> bool {
     match target_ref {
-        TargetRef::Object(target_id) => filter_inner(
-            state,
-            *target_id,
-            enchant_filter,
-            aura_id,
-            Some(aura.controller),
-            source.ability,
-            source.recipient_id,
-            None,
-        ),
+        TargetRef::Object(target_id) => {
+            let ctx = FilterContext {
+                source_id: aura_id,
+                source_controller: Some(aura.controller),
+                ability: source.ability,
+                recipient_id: source.recipient_id,
+                scoped_iteration_player: None,
+            };
+            filter_inner(state, *target_id, enchant_filter, &ctx)
+        }
         TargetRef::Player(player_id) => player_matches_target_filter_in_state(
             state,
             enchant_filter,
@@ -3975,24 +3962,26 @@ fn object_shares_quality_with_reference_filter(
             });
     }
 
+    let ctx = FilterContext {
+        source_id: source.id,
+        source_controller: source.controller,
+        ability: source.ability,
+        recipient_id: source.recipient_id,
+        scoped_iteration_player: None,
+    };
     state.objects.keys().copied().any(|reference_id| {
-        filter_inner(
-            state,
-            reference_id,
-            reference_filter,
-            source.id,
-            source.controller,
-            source.ability,
-            source.recipient_id,
-            None,
-        ) && state
-            .objects
-            .get(&reference_id)
-            .is_some_and(|reference_obj| {
-                let values =
-                    object_shared_quality_values(reference_obj, quality, &state.all_creature_types);
-                object_shares_quality_values(obj, quality, &values, &state.all_creature_types)
-            })
+        filter_inner(state, reference_id, reference_filter, &ctx)
+            && state
+                .objects
+                .get(&reference_id)
+                .is_some_and(|reference_obj| {
+                    let values = object_shared_quality_values(
+                        reference_obj,
+                        quality,
+                        &state.all_creature_types,
+                    );
+                    object_shares_quality_values(obj, quality, &values, &state.all_creature_types)
+                })
     })
 }
 

@@ -37,10 +37,7 @@ fn p1p1_counters(runner: &engine::game::scenario::GameRunner, id: ObjectId) -> u
 }
 
 /// Resolve the attack trigger without passing priority through combat.
-fn resolve_attack_trigger(
-    runner: &mut engine::game::scenario::GameRunner,
-    target: ObjectId,
-) {
+fn resolve_attack_trigger(runner: &mut engine::game::scenario::GameRunner, target: ObjectId) {
     for _ in 0..20 {
         match runner.state().waiting_for.clone() {
             WaitingFor::TriggerTargetSelection { .. } | WaitingFor::TargetSelection { .. } => {

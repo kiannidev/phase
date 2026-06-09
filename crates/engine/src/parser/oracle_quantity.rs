@@ -11,7 +11,7 @@ use std::str::FromStr;
 use crate::parser::oracle_nom::error::{OracleError, OracleResult};
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
-use nom::combinator::{all_consuming, eof, opt, value};
+use nom::combinator::{all_consuming, eof, map, opt, value};
 use nom::multi::separated_list1;
 use nom::sequence::{pair, preceded, terminated};
 use nom::Parser;
@@ -816,34 +816,28 @@ pub(crate) fn parse_cda_quantity_with_context(
 // that are Oozes or are named Slime Against Humanity" — type/name filters trail
 // the zone list rather than preceding "cards".
 fn parse_zone_card_that_are_filter_list(input: &str) -> OracleResult<'_, Vec<TypeFilter>> {
-    fn parse_named_card_filter(input: &str) -> OracleResult<'_, TypeFilter> {
-        let (rest, name) = preceded(
-            tag("are named "),
-            nom::bytes::complete::take_while1(|c: char| c != '.'),
-        )
+    fn parse_card_name(input: &str) -> OracleResult<'_, String> {
+        let (rest, name_chars): (&str, Vec<char>) = nom::multi::many1(preceded(
+            nom::combinator::not(alt((tag(" or "), tag(".")))),
+            nom::character::complete::anychar,
+        ))
         .parse(input)?;
-        Ok((rest, TypeFilter::Named(name.trim().to_string())))
+        let name: String = name_chars.into_iter().collect();
+        Ok((rest, name.trim().to_string()))
     }
 
-    let (mut rest, first) =
-        alt((parse_named_card_filter, nom_target::parse_type_filter_word)).parse(input)?;
-    let mut filters = vec![first];
-    loop {
-        if let Ok((next_rest, _)) = tag::<_, _, OracleError<'_>>(" or are named ").parse(rest) {
-            let name = next_rest.trim().trim_end_matches('.');
-            filters.push(TypeFilter::Named(name.to_string()));
-            rest = "";
-            break;
-        } else if let Ok((next_rest, _)) = tag::<_, _, OracleError<'_>>(" or ").parse(rest) {
-            let (after, next) = alt((parse_named_card_filter, nom_target::parse_type_filter_word))
-                .parse(next_rest)?;
-            filters.push(next);
-            rest = after;
-        } else {
-            break;
-        }
+    fn parse_zone_card_filter_segment(input: &str) -> OracleResult<'_, TypeFilter> {
+        alt((
+            map(
+                preceded(alt((tag("are named "), tag("named "))), parse_card_name),
+                TypeFilter::Named,
+            ),
+            preceded(opt(tag("are ")), nom_target::parse_type_filter_word),
+        ))
+        .parse(input)
     }
-    Ok((rest, filters))
+
+    separated_list1(tag(" or "), parse_zone_card_filter_segment).parse(input)
 }
 
 fn parse_owned_cards_in_zones_with_property_filter(
@@ -4591,6 +4585,19 @@ mod tests {
                 other => panic!("expected ZoneCardCount segment, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn zone_card_filter_list_named_before_type_is_order_independent() {
+        let (_, filters) =
+            parse_zone_card_that_are_filter_list("named Slime Against Humanity or are Oozes")
+                .expect("reversed filter order must parse");
+        assert!(filters
+            .iter()
+            .any(|f| matches!(f, TypeFilter::Named(name) if name == "Slime Against Humanity")));
+        assert!(filters
+            .iter()
+            .any(|f| matches!(f, TypeFilter::Subtype(s) if s == "Ooze")));
     }
 
     /// Slime Against Humanity: cards-with-filter suffix after zone list.

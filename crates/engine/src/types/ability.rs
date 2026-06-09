@@ -10850,8 +10850,6 @@ pub enum AbilityCondition {
     /// wrap with `AbilityCondition::Not`.
     RevealedHasCardType {
         card_type: CoreType,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        alt_card_types: Vec<CoreType>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         additional_filter: Option<FilterProp>,
         /// CR 205.3m: Optional subtype constraint on the revealed card (e.g.

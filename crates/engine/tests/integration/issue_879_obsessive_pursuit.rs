@@ -1,5 +1,5 @@
 //! Issue #879 — Obsessive Pursuit attack trigger binds X to sacrifices this
-//! turn, requires X >= 1, and grants lifelink when X >= 3.
+//! turn, still triggers at X = 0, and grants lifelink when X >= 3.
 
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::types::ability::TargetRef;
@@ -88,5 +88,45 @@ fn issue_879_obsessive_pursuit_puts_counters_and_lifelink_after_three_sacrifices
         p1p1_counters(&runner, attacker),
         3,
         "Obsessive Pursuit must put X +1/+1 counters where X is sacrifices this turn"
+    );
+}
+
+#[test]
+fn issue_879_obsessive_pursuit_triggers_with_zero_sacrifices() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let attacker = scenario
+        .add_creature(P0, "Attacker", 2, 2)
+        .from_oracle_text(OBSESSIVE_PURSUIT)
+        .id();
+
+    let mut runner = scenario.build();
+
+    runner.pass_both_players();
+    runner
+        .act(GameAction::DeclareAttackers {
+            attacks: vec![(attacker, AttackTarget::Player(P1))],
+            bands: vec![],
+        })
+        .expect("DeclareAttackers should succeed");
+    if matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
+        runner.pass_both_players();
+    }
+
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::TriggerTargetSelection { .. } | WaitingFor::TargetSelection { .. }
+        ),
+        "Obsessive Pursuit has no intervening-if condition and must target even at X=0, got {:?}",
+        runner.state().waiting_for
+    );
+
+    resolve_trigger_target_and_stack(&mut runner, attacker);
+
+    assert_eq!(
+        p1p1_counters(&runner, attacker),
+        0,
+        "X=0 should resolve after targeting without placing counters"
     );
 }

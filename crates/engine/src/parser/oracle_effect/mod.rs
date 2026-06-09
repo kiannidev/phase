@@ -9622,6 +9622,9 @@ fn replace_target_with_parent(effect: &mut Effect) {
         Effect::Sacrifice { target, .. }
             if target_filter_controller_ref(target)
                 == Some(ControllerRef::ParentTargetController) => {}
+        Effect::Sacrifice { target, .. } if matches!(target, TargetFilter::SelfRef) => {
+            *target = TargetFilter::ParentTarget;
+        }
         Effect::Tap { target }
         | Effect::Untap { target }
         | Effect::Destroy { target, .. }
@@ -9683,6 +9686,9 @@ fn replace_target_with_parent(effect: &mut Effect) {
                     static_def.affected = Some(TargetFilter::ParentTarget);
                 }
             }
+        }
+        Effect::CreateDelayedTrigger { effect, .. } => {
+            replace_target_with_parent(&mut effect.effect);
         }
         _ => {
             // Effects without a target field (Draw, GainLife, etc.) stay as-is.
@@ -42684,6 +42690,29 @@ mod tests {
         assert!(
             delayed_sacrifice,
             "expected a CreateDelayedTrigger with Sacrifice inside in the parsed chain"
+        );
+
+        fn delayed_sacrifice_targets_parent(def: &AbilityDefinition) -> bool {
+            match &*def.effect {
+                Effect::CreateDelayedTrigger { effect, .. } => match &*effect.effect {
+                    Effect::Sacrifice {
+                        target: TargetFilter::ParentTarget,
+                        ..
+                    } => true,
+                    other => delayed_sacrifice_targets_parent(&AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        other.clone(),
+                    )),
+                },
+                _ => def
+                    .sub_ability
+                    .as_deref()
+                    .is_some_and(delayed_sacrifice_targets_parent),
+            }
+        }
+        assert!(
+            delayed_sacrifice_targets_parent(&def),
+            "delayed Sacrifice must target ParentTarget (the returned creature), not SelfRef"
         );
     }
 

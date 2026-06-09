@@ -2,7 +2,7 @@ use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till1, take_until};
 use nom::character::complete::{multispace0, multispace1};
 use nom::combinator::{all_consuming, eof, map, not, opt, rest, value, verify};
-use nom::sequence::{preceded, terminated};
+use nom::sequence::{preceded, terminated, tuple};
 use nom::Parser;
 
 use super::super::oracle_nom::bridge::{nom_on_lower, split_once_on_lower};
@@ -2354,13 +2354,9 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
     if target_relative_clause_owns_suffix(lower.as_str()) {
         return (text, None);
     }
-    // CR 603.4: "this turn" on a per-turn quantity tracker ("tokens you created
-    // this turn", "life you gained this turn") is part of the quantity phrase,
-    // not a trailing duration on the effect. Without this guard, Thalisse's
-    // where-X binding loses " this turn" and resolves to 0 at runtime.
-    if quantity_tracking_owns_this_turn_suffix(lower.as_str()) {
-        return (text, None);
-    }
+    // Per-turn quantity trackers end in " this turn" as part of the quantity
+    // phrase ("tokens you created this turn"), not as an UntilEndOfTurn duration.
+    // Only skip stripping when the suffix is structurally a tracker tail.
     for (suffix, duration) in [
         (" this turn", Duration::UntilEndOfTurn),
         (" until end of turn", Duration::UntilEndOfTurn),
@@ -2415,6 +2411,9 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
         ),
     ] {
         if lower.ends_with(suffix) {
+            if suffix == " this turn" && trailing_this_turn_is_quantity_tracker(&lower) {
+                continue;
+            }
             let end = duration_text.len() - suffix.len();
             return (
                 duration_text[..end].trim_end_matches(',').trim(),
@@ -2485,20 +2484,124 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
     (text, None)
 }
 
-fn quantity_tracking_owns_this_turn_suffix(lower: &str) -> bool {
-    const PHRASES: &[&str] = &[
-        " you created this turn",
-        " you've created this turn",
-        " you gained this turn",
-        " you've gained this turn",
-        " you sacrificed this turn",
-        " you've sacrificed this turn",
-        " you cast this turn",
-        " you've cast this turn",
-        " entered the battlefield this turn",
-        " entered the battlefield under your control this turn",
-    ];
-    PHRASES.iter().any(|phrase| lower.contains(phrase))
+/// True when a trailing `" this turn"` suffix is part of a per-turn quantity
+/// tracker phrase, not an `UntilEndOfTurn` duration on the effect.
+fn trailing_this_turn_is_quantity_tracker(lower: &str) -> bool {
+    const SUFFIX: &str = " this turn";
+    if !lower.ends_with(SUFFIX) {
+        return false;
+    }
+    let head = lower[..lower.len() - SUFFIX.len()].trim_end();
+    parse_per_turn_quantity_tracker_tail(head).is_ok()
+}
+
+/// Past-tense per-turn quantity tracker tails. Composed with `take_until` so
+/// each arm matches the tracker verb phrase at the end of the clause head.
+fn parse_per_turn_quantity_tracker_tail(head: &str) -> OracleResult<'_, ()> {
+    alt((
+        value(
+            (),
+            preceded(
+                take_until(" you created"),
+                tuple((tag(" you"), opt(tag("'ve")), tag(" created"))),
+            ),
+        ),
+        value(
+            (),
+            preceded(
+                take_until(" you gained"),
+                tuple((tag(" you"), opt(tag("'ve")), tag(" gained"))),
+            ),
+        ),
+        value(
+            (),
+            preceded(
+                take_until(" you sacrificed"),
+                tuple((tag(" you"), opt(tag("'ve")), tag(" sacrificed"))),
+            ),
+        ),
+        value(
+            (),
+            preceded(
+                take_until(" you cast"),
+                tuple((tag(" you"), opt(tag("'ve")), tag(" cast"))),
+            ),
+        ),
+        value(
+            (),
+            preceded(
+                take_until(" you lost"),
+                tuple((tag(" you"), opt(tag("'ve")), tag(" lost"))),
+            ),
+        ),
+        value(
+            (),
+            preceded(
+                take_until(" you discarded"),
+                tuple((tag(" you"), opt(tag("'ve")), tag(" discarded"))),
+            ),
+        ),
+        value(
+            (),
+            preceded(
+                take_until(" you attacked with"),
+                tuple((tag(" you"), opt(tag("'ve")), tag(" attacked with"))),
+            ),
+        ),
+        value(
+            (),
+            preceded(take_until(" you attacked"), tag(" you attacked")),
+        ),
+        value(
+            (),
+            preceded(
+                take_until(" opponents you attacked"),
+                tag(" opponents you attacked"),
+            ),
+        ),
+        value(
+            (),
+            preceded(take_until(" who lost life"), tag(" who lost life")),
+        ),
+        value(
+            (),
+            preceded(take_until(" who gained life"), tag(" who gained life")),
+        ),
+        value(
+            (),
+            preceded(
+                take_until(" were dealt combat damage"),
+                tag(" were dealt combat damage"),
+            ),
+        ),
+        value(
+            (),
+            preceded(
+                take_until(" was dealt combat damage"),
+                tag(" was dealt combat damage"),
+            ),
+        ),
+        value(
+            (),
+            preceded(
+                take_until(" entered the battlefield under your control"),
+                tag(" entered the battlefield under your control"),
+            ),
+        ),
+        value(
+            (),
+            preceded(
+                take_until(" entered the battlefield"),
+                tag(" entered the battlefield"),
+            ),
+        ),
+        value(
+            (),
+            preceded(take_until(" entered this turn"), tag(" entered this turn")),
+        ),
+        value((), preceded(take_until(" have lost"), tag(" have lost"))),
+    ))
+    .parse(head)
 }
 
 fn target_relative_clause_owns_suffix(input: &str) -> bool {
@@ -5378,7 +5481,27 @@ mod where_x_tests {
             duration.is_none(),
             "quantity tracker must not become a duration"
         );
-        assert!(stripped.contains("you created this turn"));
+        assert_eq!(stripped, text);
+    }
+
+    #[test]
+    fn strip_trailing_duration_preserves_life_lost_this_turn_phrase() {
+        use super::strip_trailing_duration;
+
+        let text = "draw a card for each opponent who lost life this turn.";
+        let (stripped, duration) = strip_trailing_duration(text);
+        assert!(duration.is_none());
+        assert_eq!(stripped, text);
+    }
+
+    #[test]
+    fn strip_trailing_duration_still_strips_genuine_this_turn_duration() {
+        use super::strip_trailing_duration;
+        use crate::types::ability::Duration;
+
+        let (stripped, duration) = strip_trailing_duration("that creature gains haste this turn.");
+        assert_eq!(duration, Some(Duration::UntilEndOfTurn));
+        assert_eq!(stripped, "that creature gains haste");
     }
 
     /// The new delegation must NOT shadow `parse_cda_quantity`: "the number of

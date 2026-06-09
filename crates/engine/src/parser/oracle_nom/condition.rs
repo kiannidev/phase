@@ -887,6 +887,14 @@ fn parse_source_is_monstrous(input: &str) -> OracleResult<'_, StaticCondition> {
     value(StaticCondition::SourceIsMonstrous, tag("is monstrous")).parse(rest)
 }
 
+/// CR 702.171b: Parse "<subject> is saddled" → SourceIsSaddled.
+/// Affirmative only — Saddle has no negated Oracle idiom; "as long as ~ is not
+/// saddled" would compose `Not { SourceIsSaddled }` but no current card prints it.
+fn parse_source_is_saddled(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = parse_source_subject(input)?;
+    value(StaticCondition::SourceIsSaddled, tag("is saddled")).parse(rest)
+}
+
 /// CR 301.5 + CR 303.4: Parse "<subject> is attached to a creature" → SourceAttachedToCreature.
 fn parse_source_attached_to_creature(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = parse_source_subject(input)?;
@@ -911,6 +919,8 @@ fn parse_source_state_conditions(input: &str) -> OracleResult<'_, StaticConditio
         parse_source_is_equipped,
         // CR 701.37: "~ is monstrous" / "this creature is monstrous" / etc.
         parse_source_is_monstrous,
+        // CR 702.171b: "~ is saddled" / "this creature is saddled" / etc.
+        parse_source_is_saddled,
         // CR 301.5 + CR 303.4: "~ is attached to a creature" / "this equipment is attached to a creature".
         // Must precede `parse_source_is_type` so the specific "is attached to a creature"
         // predicate wins over generic "is <type>" dispatch.
@@ -2749,6 +2759,7 @@ fn parse_library_empty_condition(input: &str) -> OracleResult<'_, StaticConditio
             QuantityRef::ZoneCardCount {
                 zone: ZoneRef::Library,
                 card_types: Vec::new(),
+                filter: None,
                 scope: CountScope::Controller,
             },
             Comparator::EQ,
@@ -4625,6 +4636,7 @@ fn parse_there_exists_compound_zone_condition(input: &str) -> OracleResult<'_, S
                         zone: zone.clone(),
                         card_types: first_card_types,
                         scope: scope.clone(),
+                        filter: None,
                     },
                     1,
                 ),
@@ -4633,6 +4645,7 @@ fn parse_there_exists_compound_zone_condition(input: &str) -> OracleResult<'_, S
                         zone,
                         card_types: second_card_types,
                         scope,
+                        filter: None,
                     },
                     1,
                 ),
@@ -4686,6 +4699,7 @@ fn parse_subject_first_zone_count(input: &str) -> OracleResult<'_, StaticConditi
         QuantityRef::ZoneCardCount {
             zone,
             card_types: type_filters,
+            filter: None,
             scope,
         }
     };
@@ -5389,7 +5403,8 @@ mod tests {
                         zone: ZoneRef::Library,
                         card_types: Vec::new(),
                         scope: CountScope::Controller,
-                    },
+                        filter: None,
+                    }
                 },
             },
         );
@@ -5499,7 +5514,8 @@ mod tests {
                         zone: ZoneRef::Library,
                         card_types: Vec::new(),
                         scope: CountScope::Controller,
-                    },
+                        filter: None,
+                    }
                 },
             },
         );
@@ -5563,6 +5579,14 @@ mod tests {
         let (rest, c) = parse_condition("as long as ~ is tapped").unwrap();
         assert_eq!(rest, "");
         assert!(matches!(c, StaticCondition::SourceIsTapped));
+    }
+
+    // CR 702.171b: "as long as ~ is saddled" → SourceIsSaddled.
+    #[test]
+    fn test_parse_condition_as_long_as_saddled() {
+        let (rest, c) = parse_condition("as long as ~ is saddled").unwrap();
+        assert_eq!(rest, "");
+        assert!(matches!(c, StaticCondition::SourceIsSaddled));
     }
 
     #[test]
@@ -7291,6 +7315,7 @@ mod tests {
                                 zone: crate::types::ability::ZoneRef::Graveyard,
                                 card_types,
                                 scope: crate::types::ability::CountScope::Controller,
+                                filter: None,
                             },
                     },
                 comparator: Comparator::GE,
@@ -7316,6 +7341,7 @@ mod tests {
                                 zone: crate::types::ability::ZoneRef::Graveyard,
                                 card_types,
                                 scope: crate::types::ability::CountScope::Controller,
+                                filter: None,
                             },
                     },
                 comparator: Comparator::GE,
@@ -7347,6 +7373,7 @@ mod tests {
                                     zone: crate::types::ability::ZoneRef::Graveyard,
                                     card_types,
                                     scope: crate::types::ability::CountScope::Controller,
+                                    filter: None,
                                 },
                         },
                     comparator: Comparator::GE,
@@ -7382,6 +7409,7 @@ mod tests {
                             zone,
                             card_types,
                             scope,
+                            filter: None,
                         },
                 },
             comparator: Comparator::GE,

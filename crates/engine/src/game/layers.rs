@@ -3,8 +3,14 @@ use std::sync::Arc;
 
 use crate::database::synthesis::KeywordTriggerInstaller;
 use crate::game::arithmetic::saturating_pt_add;
+use crate::game::conditions::{
+    counter_condition_matches, eval_chosen_label_is, eval_class_level_ge, eval_has_city_blessing,
+    eval_is_monarch, eval_no_monarch, eval_source_entered_this_turn, eval_source_in_zone,
+    eval_source_is_attacking, eval_source_is_tapped_on_battlefield,
+};
 use crate::game::devotion::count_devotion;
 use crate::game::filter::{matches_target_filter, FilterContext};
+use crate::game::game_object::DisplaySource;
 use crate::game::printed_cards::{apply_copiable_values, intrinsic_copiable_values};
 use crate::game::quantity::{filter_uses_recipient, quantity_expr_uses_recipient, QuantityContext};
 use crate::game::speed::{effective_speed, has_max_speed};
@@ -18,7 +24,7 @@ use crate::types::attribution::EffectRef;
 use crate::types::card_type::{
     is_land_subtype, noncreature_subtype_set, CoreType, SubtypeSet, Supertype,
 };
-use crate::types::counter::{has_positive_counters, CounterMatch, CounterType};
+use crate::types::counter::{has_positive_counters, CounterType};
 use crate::types::game_state::{DayNight, GameState, LayersDirty, StaticGateKey};
 use crate::types::identifiers::ObjectId;
 use crate::types::keywords::Keyword;
@@ -791,11 +797,7 @@ fn evaluate_condition_with_context(
         // matches the anchor word. The comparison is case-insensitive so a
         // capitalised anchor word ("Jeskai") matches a label persisted in
         // any canonicalisation. Mirrors `ChosenColorIs`'s lookup pattern.
-        StaticCondition::ChosenLabelIs { label } => state
-            .objects
-            .get(&source_id)
-            .and_then(|obj| obj.chosen_label())
-            .is_some_and(|chosen| chosen.eq_ignore_ascii_case(label)),
+        StaticCondition::ChosenLabelIs { label } => eval_chosen_label_is(state, source_id, label),
         StaticCondition::QuantityComparison {
             lhs,
             comparator,
@@ -875,12 +877,10 @@ fn evaluate_condition_with_context(
                 )
             })
             .unwrap_or(false),
-        // CR 716.3: Level abilities are active at or above the specified level.
-        StaticCondition::ClassLevelGE { level } => state
-            .objects
-            .get(&source_id)
-            .and_then(|obj| obj.class_level)
-            .is_some_and(|current| current >= *level),
+        // CR 716.2a + CR 716.3: Level abilities are active at or above the specified
+        // level. No battlefield zone guard here — the functioning-abilities machinery
+        // already constrains source availability before this static is evaluated.
+        StaticCondition::ClassLevelGE { level } => eval_class_level_ge(state, source_id, *level),
         StaticCondition::Unrecognized { .. } => true,
         StaticCondition::DuringYourTurn => state.active_player == controller,
         // CR 103.1: True when the scoped player took the first turn of the
@@ -892,10 +892,7 @@ fn evaluate_condition_with_context(
             crate::game::restrictions::spell_cast_with_variant_this_turn(state, variant)
         }
         // CR 400.7: True when the source permanent entered the battlefield this turn.
-        StaticCondition::SourceEnteredThisTurn => state
-            .objects
-            .get(&source_id)
-            .is_some_and(|obj| obj.entered_battlefield_turn == Some(state.turn_number)),
+        StaticCondition::SourceEnteredThisTurn => eval_source_entered_this_turn(state, source_id),
         // CR 701.54a: True when this creature is the ring-bearer for its controller.
         StaticCondition::IsRingBearer => {
             super::effects::ring::is_current_ring_bearer(state, controller, source_id)
@@ -904,17 +901,11 @@ fn evaluate_condition_with_context(
         StaticCondition::RingLevelAtLeast { level } => {
             state.ring_level.get(&controller).copied().unwrap_or(0) >= *level
         }
-        // CR 611.2b + CR 110.5d: True only when the source is a tapped permanent.
-        // CR 110.5d: cards not on the battlefield are neither tapped nor untapped,
-        // regardless of their physical state — so a source that has left the
-        // battlefield (e.g. Callous Oppressor dying while tapped) fails this
-        // predicate and any `ForAsLongAs { SourceIsTapped }` continuous effect
-        // (gain-control, etc.) ends. Mirrors the battlefield-presence guard the
-        // `UntilHostLeavesPlay` arm of `gather_transient_continuous_effects` uses.
-        StaticCondition::SourceIsTapped => state
-            .objects
-            .get(&source_id)
-            .is_some_and(|obj| obj.zone == crate::types::zones::Zone::Battlefield && obj.tapped),
+        // CR 611.2b + CR 110.5d: require battlefield — cards not on the battlefield are
+        // neither tapped nor untapped. A source that has left the battlefield (e.g.
+        // Callous Oppressor dying while tapped) fails this predicate and any
+        // `ForAsLongAs { SourceIsTapped }` continuous effect (gain-control, etc.) ends.
+        StaticCondition::SourceIsTapped => eval_source_is_tapped_on_battlefield(state, source_id),
         // CR 702.62a + CR 611.2b: True when the source object's current controller
         // equals the stored player. Drives the Suspend haste duration: when a
         // suspended creature spell resolves, a transient continuous effect with
@@ -954,10 +945,7 @@ fn evaluate_condition_with_context(
                     .contains(&crate::types::card_type::CoreType::Creature)
             }),
         // CR 113.6b: True when the source card is in the specified zone.
-        StaticCondition::SourceInZone { zone } => state
-            .objects
-            .get(&source_id)
-            .is_some_and(|obj| obj.zone == *zone),
+        StaticCondition::SourceInZone { zone } => eval_source_in_zone(state, source_id, *zone),
         // CR 708.2 + CR 707.2: True when the creature this Aura/Equipment is attached to
         // is face-down. Traverses `attached_to` to the target object and reads its
         // `face_down` status (false if source is not attached, or attached to a
@@ -1009,10 +997,7 @@ fn evaluate_condition_with_context(
                     .is_some_and(|a| a.object_id == source_id)
         }),
         // CR 508.1k: Source creature is currently an attacker.
-        StaticCondition::SourceIsAttacking => state
-            .combat
-            .as_ref()
-            .is_some_and(|combat| combat.attackers.iter().any(|a| a.object_id == source_id)),
+        StaticCondition::SourceIsAttacking => eval_source_is_attacking(state, source_id),
         // CR 509.1g: Source creature is currently a blocker.
         StaticCondition::SourceIsBlocking => state
             .combat
@@ -1027,11 +1012,11 @@ fn evaluate_condition_with_context(
                 .is_some_and(|a| a.blocked)
         }),
         // CR 725.1: True when the controller is the monarch.
-        StaticCondition::IsMonarch => state.monarch == Some(controller),
+        StaticCondition::IsMonarch => eval_is_monarch(state, controller),
         // CR 725.1: True when no player holds the monarch designation.
-        StaticCondition::NoMonarch => state.monarch.is_none(),
+        StaticCondition::NoMonarch => eval_no_monarch(state),
         // CR 702.131a: True when the controller has the city's blessing.
-        StaticCondition::HasCityBlessing => state.city_blessing.contains(&controller),
+        StaticCondition::HasCityBlessing => eval_has_city_blessing(state, controller),
         StaticCondition::OpponentPoisonAtLeast { count } => state
             .players
             .iter()
@@ -1070,19 +1055,6 @@ fn evaluate_condition_with_context(
             }
         },
     }
-}
-
-fn counter_condition_matches(
-    obj: &crate::game::game_object::GameObject,
-    counters: &CounterMatch,
-    minimum: u32,
-    maximum: Option<u32>,
-) -> bool {
-    let count: u32 = match counters {
-        CounterMatch::Any => obj.counters.values().sum(),
-        CounterMatch::OfType(ct) => obj.counters.get(ct).copied().unwrap_or(0),
-    };
-    count >= minimum && maximum.is_none_or(|max| count <= max)
 }
 
 /// Test-only wrapper to expose `evaluate_condition` for unit tests in other modules.
@@ -1201,6 +1173,28 @@ pub fn evaluate_layers(state: &mut GameState) {
             // re-applies the copied source's `printed_ref` below for objects
             // under a copy effect, so a temporary copy's art reverts on expiry.
             obj.printed_ref = obj.base_printed_ref.clone();
+            // Reset display routing to the object's own derived baseline so a
+            // copy effect's override (set by `CopyValues` below) reverts on
+            // expiry. Display routing is derived state, not a copiable value
+            // (CR 707.2): a true token — created by a token-making effect
+            // (CR 111.1), so carrying no printed identity — routes to the token
+            // art database; everything else (a real card, or a token-copy *of a
+            // real card*, which carries `base_printed_ref`) routes to the card
+            // database. Deriving here (rather than storing a `base_display_source`)
+            // keeps tokens in pre-existing saved states correct on load.
+            obj.display_source = if obj.is_token && obj.base_printed_ref.is_none() {
+                DisplaySource::Token
+            } else {
+                DisplaySource::Card
+            };
+            // A nontoken never has its own token-art pointer, so clear it to its
+            // baseline (`None`); a copy-of-token effect re-applies the source
+            // token's `token_image_ref` below while active. A true token keeps
+            // its own pointer (its baseline), which the copy layer overrides only
+            // while it is copying another object.
+            if !obj.is_token {
+                obj.token_image_ref = None;
+            }
             // CR 613.1b: Reset controller to the object's base controller;
             // Layer 2 re-applies continuous control-changing effects.
             obj.controller = obj.base_controller.unwrap_or(obj.owner);
@@ -3333,13 +3327,22 @@ fn apply_continuous_effect_filtered(
         match &effect.modification {
             ContinuousModification::CopyValues {
                 values,
+                display_source,
                 printed_ref,
+                token_image_ref,
             } => {
                 apply_copiable_values(obj, values);
-                // Display identity follows the copy: override the baseline
+                // Display routing follows the copy: override the baseline
                 // restored by the layer reset so the copy renders the source's
                 // art. Reverts automatically when the copy effect expires.
+                // CR 111.1 + CR 707.2: for a copy of a true token, the source's
+                // `display_source = Token` + `token_image_ref` carry the art (the
+                // copied name has no real-card printing); for a printed source,
+                // `display_source = Card` + `printed_ref`. None are copiable
+                // values — purely display routing.
+                obj.display_source = *display_source;
                 obj.printed_ref = printed_ref.clone();
+                obj.token_image_ref = token_image_ref.clone();
             }
             // CR 707.9b + CR 707.2: Name override is a copiable-value override
             // applied at Layer 1 after the base CopyValues (ordered by timestamp
@@ -10526,7 +10529,9 @@ mod tests {
             TargetFilter::SpecificObject { id: target },
             vec![ContinuousModification::CopyValues {
                 values: Box::new(copy_values),
+                display_source: crate::game::game_object::DisplaySource::Card,
                 printed_ref: None,
+                token_image_ref: None,
             }],
             None,
         );

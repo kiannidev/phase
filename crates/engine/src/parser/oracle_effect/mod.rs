@@ -91,12 +91,13 @@ use crate::types::ability::{
     ChooseFromZoneConstraint, Chooser, CombatDamageScope, Comparator, ConjureCard,
     ContinuousModification, ControllerRef, DamageModification, DamageSource,
     DelayedTriggerCondition, DoubleTarget, Duration, Effect, FilterProp, GameRestriction,
-    IterationKindBinding, ManaProduction, ManaSpendPermission, MultiTargetSpec, ObjectProperty,
-    ObjectScope, PaymentCost, PlayerFilter, PlayerRelation, PlayerScope, PreventionAmount,
-    PreventionScope, ProhibitedActivity, QuantityExpr, QuantityRef, ReplacementDefinition,
-    RestrictionExpiry, RestrictionPlayerScope, RoundingMode, StaticCondition, StaticDefinition,
-    StepSkipTarget, SubAbilityLink, TargetFilter, TargetSelectionMode, TriggerCondition,
-    TriggerDefinition, TypeFilter, TypedFilter, UnlessPayModifier, UntilCondition, ZoneOwner,
+    IntensityScope, IterationKindBinding, ManaProduction, ManaSpendPermission, MultiTargetSpec,
+    ObjectProperty, ObjectScope, PaymentCost, PlayerFilter, PlayerRelation, PlayerScope,
+    PreventionAmount, PreventionScope, ProhibitedActivity, QuantityExpr, QuantityRef,
+    ReplacementDefinition, RestrictionExpiry, RestrictionPlayerScope, RoundingMode,
+    StaticCondition, StaticDefinition, StepSkipTarget, SubAbilityLink, TargetFilter,
+    TargetSelectionMode, TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter,
+    UnlessPayModifier, UntilCondition, ZoneOwner,
 };
 #[cfg(test)]
 use crate::types::ability::{AttackScope, AttackSubject};
@@ -4360,6 +4361,16 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
         return redirected;
     }
 
+    // Digital-only Alchemy: "[scope] intensif[y/ies] by N" - the Intensify action.
+    if let Some(effect) = try_parse_intensify(tp) {
+        return parsed_clause(effect);
+    }
+
+    // Digital-only Alchemy: "draft a card from [X]'s spellbook [+ destination]".
+    if let Some(effect) = try_parse_spellbook_draft(tp) {
+        return parsed_clause(effect);
+    }
+
     // Digital-only: "conjure a card named X into/onto zone" — Conjure keyword action.
     if let Some(effect) = try_parse_conjure(tp) {
         return parsed_clause(effect);
@@ -4367,6 +4378,185 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
 
     let ast = parse_clause_ast(text, ctx);
     lower_clause_ast(ast, ctx)
+}
+
+/// Digital-only Alchemy keyword action: parse "intensify" clauses into
+/// `Effect::Intensify`. The scope comes from the subject:
+/// * self ("~ / this creature / this artifact / ... / it intensifies [by N]") ->
+///   [`IntensityScope::Source`];
+/// * "cards you own named [self] intensify [by N]" -> [`IntensityScope::OwnedSameName`];
+/// * "all [subtype] cards you own intensify [by N]" -> [`IntensityScope::OwnedSubtype`].
+///
+/// The amount defaults to 1 when "by N" is absent. The clause tail must be fully
+/// consumed (bare or with a sentence period) so unmodeled variants fall through
+/// to `Unimplemented` instead of silently dropping riders.
+fn try_parse_intensify(tp: TextPair) -> Option<Effect> {
+    fn tail_done(tail: &str) -> bool {
+        tail.is_empty() || tail == "."
+    }
+
+    fn verb_and_amount(rest: &str) -> Option<(QuantityExpr, &str)> {
+        let (rest, _) = alt((
+            tag::<_, _, OracleError<'_>>("intensifies"),
+            tag::<_, _, OracleError<'_>>("intensify"),
+        ))
+        .parse(rest)
+        .ok()?;
+
+        if let Ok((rest, (_, n))) = (
+            tag::<_, _, OracleError<'_>>(" by "),
+            nom_primitives::parse_number,
+        )
+            .parse(rest)
+        {
+            return Some((QuantityExpr::Fixed { value: n as i32 }, rest));
+        }
+
+        if let Ok((after, _)) = tag::<_, _, OracleError<'_>>(" by x").parse(rest) {
+            if after.is_empty()
+                || after == "."
+                || tag::<_, _, OracleError<'_>>(", where x is ")
+                    .parse(after)
+                    .is_ok()
+            {
+                return Some((
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::Variable {
+                            name: "X".to_string(),
+                        },
+                    },
+                    "",
+                ));
+            }
+            return None;
+        }
+
+        Some((QuantityExpr::Fixed { value: 1 }, rest))
+    }
+
+    let lower = tp.lower;
+
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("cards you own named ").parse(lower) {
+        let (rest, _) = take_until::<_, _, OracleError<'_>>("intensif")
+            .parse(rest)
+            .ok()?;
+        let (amount, rest) = verb_and_amount(rest)?;
+        return tail_done(rest).then_some(Effect::Intensify {
+            scope: IntensityScope::OwnedSameName,
+            amount,
+        });
+    }
+
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("all ").parse(lower) {
+        if let Ok((after, subtype_lower)) =
+            take_until::<_, _, OracleError<'_>>(" cards you own intensif").parse(rest)
+        {
+            let (after, _) = tag::<_, _, OracleError<'_>>(" cards you own ")
+                .parse(after)
+                .ok()?;
+            let (amount, after) = verb_and_amount(after)?;
+            if tail_done(after) {
+                return Some(Effect::Intensify {
+                    scope: IntensityScope::OwnedSubtype {
+                        subtype: crate::parser::oracle_quantity::capitalize_first(
+                            subtype_lower.trim(),
+                        ),
+                    },
+                    amount,
+                });
+            }
+            return None;
+        }
+    }
+
+    let after_subject = [
+        "~ ",
+        "it ",
+        "this creature ",
+        "this artifact ",
+        "this enchantment ",
+        "this equipment ",
+        "this card ",
+    ]
+    .iter()
+    .find_map(|subject| {
+        tag::<_, _, OracleError<'_>>(*subject)
+            .parse(lower)
+            .ok()
+            .map(|(rest, _)| rest)
+    })?;
+    let (amount, rest) = verb_and_amount(after_subject)?;
+    tail_done(rest).then_some(Effect::Intensify {
+        scope: IntensityScope::Source,
+        amount,
+    })
+}
+
+/// Digital-only Alchemy keyword action: parse "draft a card from [X]'s spellbook"
+/// with its destination. The source name between "from " and "spellbook" is the
+/// card's own name (or "this creature/artifact/…") and is irrelevant to the
+/// effect — the resolver reads the spellbook list from the source object.
+///
+/// To avoid silently dropping unmodeled riders (which the coverage tooling
+/// counts as swallowed clauses), the clause tail must be **fully consumed**:
+/// the bare draft goes to the hand; "and put it onto the battlefield[ tapped]"
+/// goes to the battlefield (honouring the tapped rider); "and exile it" goes to
+/// exile. Anything else — "and exile it face down", "twice, then …", or a
+/// trailing "then …" continuation not split off by the effect chain — returns
+/// `None` so the card falls through to `Unimplemented` rather than parsing to a
+/// subtly wrong effect.
+fn try_parse_spellbook_draft(tp: TextPair) -> Option<Effect> {
+    /// The clause tail is fully consumed when nothing (or just a sentence
+    /// period) remains.
+    fn tail_done(tail: &str) -> bool {
+        tail.is_empty() || tail == "."
+    }
+
+    let (rest, _) = tag::<_, _, OracleError<'_>>("draft a card from ")
+        .parse(tp.lower)
+        .ok()?;
+    // Consume the (irrelevant) source-card name up to "spellbook".
+    let (after_book, _src) = take_until::<_, _, OracleError<'_>>("spellbook")
+        .parse(rest)
+        .ok()?;
+    let (after_book, _) = tag::<_, _, OracleError<'_>>("spellbook")
+        .parse(after_book)
+        .ok()?;
+
+    // Default: a bare "draft a card from X's spellbook" creates it in hand.
+    if tail_done(after_book) {
+        return Some(Effect::DraftFromSpellbook {
+            destination: Zone::Hand,
+            tapped: false,
+        });
+    }
+
+    // "… and put it onto the battlefield[ tapped]".
+    if let Ok((tail, _)) =
+        tag::<_, _, OracleError<'_>>(" and put it onto the battlefield").parse(after_book)
+    {
+        let (tail, tapped) = match tag::<_, _, OracleError<'_>>(" tapped").parse(tail) {
+            Ok((tail, _)) => (tail, true),
+            Err(_) => (tail, false),
+        };
+        return tail_done(tail).then_some(Effect::DraftFromSpellbook {
+            destination: Zone::Battlefield,
+            tapped,
+        });
+    }
+
+    // "… and exile it" — but not "and exile it face down" (face-down exile is
+    // not modeled yet), which leaves an unconsumed tail and is rejected.
+    if let Ok((tail, _)) = tag::<_, _, OracleError<'_>>(" and exile it").parse(after_book) {
+        return tail_done(tail).then_some(Effect::DraftFromSpellbook {
+            destination: Zone::Exile,
+            tapped: false,
+        });
+    }
+
+    // Unmodeled tail ("twice, then …", a trailing chained clause, …) — leave it
+    // to `Unimplemented` rather than dropping the rider.
+    None
 }
 
 /// Digital-only keyword action: Parse "conjure [quantity] card(s) named {Name} into/onto {zone}"
@@ -11245,6 +11435,178 @@ fn try_parse_cast_as_though_flash_permission(tp: TextPair<'_>) -> Option<ParsedE
     }))
 }
 
+/// CR 608.2g + CR 601.2 + CR 118.9 + CR 202.3: Parse the free-cast window class —
+/// "you may cast up to N [instant and/or sorcery] spells [with total mana value
+/// M or less] from your graveyard and/or hand without paying their mana costs".
+///
+/// Lowers to `Effect::FreeCastFromZones`, the interactive multi-cast window with
+/// a shared running-MV budget. The separate "If those spells would be put into
+/// your graveyard, exile them instead" rider (CR 614.1a) is absorbed by
+/// `parse_effect_chain_ir` so this parser stays at the per-clause seam.
+///
+/// Built from composed nom combinators: a fixed "you may cast up to " / "cast up
+/// to " prefix, `parse_number` for the count, an `alt()` over the candidate type
+/// phrase, an optional "with total mana value M or less" budget, and the
+/// graveyard-and/or-hand zone tail. Distinct from `try_parse_cast_effect` (which
+/// grants a `CastFromZone` permission on a single targeted/anaphoric card).
+fn try_parse_free_cast_from_zones(lower: &str) -> Option<Effect> {
+    type E<'a> = OracleError<'a>;
+
+    // CR 601.2: "[you may] cast up to N " — fixed prefix + count. The chain
+    // parser strips a leading optional "you may" before imperative dispatch, so
+    // the per-clause parser accepts both the printed and stripped forms here.
+    let (rest, _) = alt((tag::<_, _, E>("you may cast up to "), tag("cast up to ")))
+        .parse(lower)
+        .ok()?;
+    let (rest, count) = nom_primitives::parse_number.parse(rest).ok()?;
+    let count = count as u8;
+    // `parse_number` leaves the trailing word boundary; consume the space
+    // before the candidate type phrase.
+    let (rest, _) = tag::<_, _, E>(" ").parse(rest).ok()?;
+
+    // CR 601.2a: candidate type phrase. Compose the union over the published
+    // surface forms ("instant and/or sorcery", "instant or sorcery") plus the
+    // single-type variants, so the class covers more than Invoke Calamity.
+    let (rest, filter) = parse_free_cast_candidate_filter(rest)?;
+
+    // CR 601.2a: " spell"/" spells" noun, then the optional MV budget.
+    let rest = alt((
+        tag::<_, _, E>(" spells"),
+        tag(" spell"),
+        tag(" cards"),
+        tag(" card"),
+    ))
+    .parse(rest)
+    .map(|(r, _)| r)
+    .unwrap_or(rest);
+
+    // CR 202.3: optional "with total mana value M or less" running-total budget.
+    let (rest, max_total_mv) = match tag::<_, _, E>(" with total mana value ").parse(rest) {
+        Ok((after, _)) => {
+            let (after, (comparator, value)) =
+                search::parse_total_mana_value_comparator(after).ok()?;
+            // CR 202.3: only the "or less" (LE) budget form is meaningful for a
+            // free-cast cap; reject the "or greater" shape rather than mis-parse.
+            if comparator != Comparator::LE {
+                return None;
+            }
+            (after, Some(value.max(0) as u32))
+        }
+        Err(_) => (rest, None),
+    };
+
+    // CR 601.2a: zone tail — "from your graveyard and/or hand" (either order) or
+    // a single-zone variant. Parse the zone set from the remainder.
+    let zones = parse_free_cast_zone_tail(rest)?;
+
+    // CR 118.9: `Effect::FreeCastFromZones` is a *free* cast — only lower a
+    // "cast up to N ... from graveyard/hand" clause to it when the spell actually
+    // grants the cast without its mana cost. A hypothetical pay-required
+    // "cast up to N from your graveyard" (the controller still pays) must NOT be
+    // treated as free, so require the "without paying their mana cost(s)" clause
+    // (singular for a single-cast variant, plural for "up to N") in this clause.
+    if !nom_primitives::scan_contains(rest, "without paying their mana cost")
+        && !nom_primitives::scan_contains(rest, "without paying its mana cost")
+    {
+        return None;
+    }
+
+    Some(Effect::FreeCastFromZones {
+        count,
+        max_total_mv,
+        filter,
+        zones,
+        exile_instead_of_graveyard: false,
+    })
+}
+
+/// CR 601.2a: Candidate filter for the free-cast window — the spell types the
+/// controller may cast this way. A single `alt()` composes the union surface
+/// forms (longest-first so the two-type unions win over the single types) so the
+/// class is not Invoke-Calamity-only.
+fn parse_free_cast_candidate_filter(input: &str) -> Option<(&str, TargetFilter)> {
+    type E<'a> = OracleError<'a>;
+    let instant = || TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant));
+    let sorcery = || TargetFilter::Typed(TypedFilter::new(TypeFilter::Sorcery));
+    let both = || TargetFilter::Or {
+        filters: vec![instant(), sorcery()],
+    };
+
+    alt((
+        value(both(), tag::<_, _, E>("instant and/or sorcery")),
+        value(both(), tag("instant or sorcery")),
+        value(both(), tag("sorcery and/or instant")),
+        value(both(), tag("sorcery or instant")),
+        value(instant(), tag("instant")),
+        value(sorcery(), tag("sorcery")),
+    ))
+    .parse(input)
+    .ok()
+}
+
+/// CR 601.2a: Parse the "from <zones>" tail of a free-cast window, returning the
+/// controller-owned zones to draw candidates from. Accepts the graveyard/hand
+/// union in either order plus the single-zone variants.
+fn parse_free_cast_zone_tail(input: &str) -> Option<Vec<Zone>> {
+    type E<'a> = OracleError<'a>;
+
+    let (rest, _) = tag::<_, _, E>(" from your ").parse(input).ok()?;
+    let (rest, first) = parse_free_cast_zone_word(rest).ok()?;
+    let (_, second) = opt(preceded(
+        alt((tag::<_, _, E>(" and/or "), tag(" or "))),
+        preceded(opt(tag("your ")), parse_free_cast_zone_word),
+    ))
+    .parse(rest)
+    .ok()?;
+
+    if matches!(
+        (&first, second.as_ref()),
+        (Zone::Graveyard, Some(Zone::Hand)) | (Zone::Hand, Some(Zone::Graveyard))
+    ) {
+        return Some(vec![Zone::Graveyard, Zone::Hand]);
+    }
+
+    let mut zones = vec![first];
+    if let Some(zone) = second {
+        if !zones.contains(&zone) {
+            zones.push(zone);
+        }
+    }
+    Some(zones)
+}
+
+fn parse_free_cast_zone_word(input: &str) -> OracleResult<'_, Zone> {
+    alt((
+        value(Zone::Graveyard, tag("graveyard")),
+        value(Zone::Hand, tag("hand")),
+    ))
+    .parse(input)
+}
+
+/// CR 614.1a: "If those spells would be put into your graveyard, exile them
+/// instead" is not a standalone effect. It modifies the preceding free-cast
+/// window so each spell cast through that window receives the replacement rider.
+fn is_free_cast_exile_instead_rider(input: &str) -> bool {
+    type E<'a> = OracleError<'a>;
+
+    all_consuming((
+        tag::<_, _, E>("if "),
+        alt((
+            tag("those spells"),
+            tag("those cards"),
+            tag("that spell"),
+            tag("that card"),
+            tag("it"),
+        )),
+        tag(" would be put into your graveyard, exile "),
+        alt((tag("them"), tag("it"))),
+        tag(" instead"),
+        opt(tag(".")),
+    ))
+    .parse(input)
+    .is_ok()
+}
+
 /// 1. Anaphoric — "cast it", "cast that spell", "cast those cards" — target is
 ///    `ParentTarget` (refers to the cards exiled / chosen by a prior effect).
 /// 2. Constrained — "cast a [type-phrase] [from <zone>] [with mana value <bound>]
@@ -11820,6 +12182,13 @@ fn parse_imperative_effect_inner(tp: TextPair, ctx: &mut ParseContext) -> Parsed
     // cast parser so it lowers to `Effect::SearchOutsideGame` instead of a
     // `CastFromZone` that would target an in-game permanent (issue #1976).
     if let Some(effect) = imperative::try_parse_play_from_outside_game(tp.lower, ctx) {
+        return parsed_clause(effect);
+    }
+
+    // CR 608.2g + CR 601.2 + CR 118.9: "you may cast up to N ... without paying"
+    // opens an interactive free-cast window, not a standing CastFromZone permission.
+    // Keep this at the normal per-clause cast seam, before the generic cast parser.
+    if let Some(effect) = try_parse_free_cast_from_zones(tp.lower) {
         return parsed_clause(effect);
     }
 
@@ -13914,12 +14283,15 @@ fn try_parse_return_target_and_same_name_from_your_graveyard(
 /// pass walks the `sub_ability` chain and rewrites `ChangeSpeed →
 /// Unimplemented(floor sentence)` into a single floored `ChangeSpeed`.
 pub(crate) fn fold_speed_floor_sentences(def: &mut AbilityDefinition) {
-    /// Parse "this effect can't reduce <their|its> speed below N" → N.
+    /// Parse "[this effect ]can't reduce <their|its> speed below N" → N.
     fn parse_floor_sentence(text: &str) -> Option<u8> {
         let lower = text.to_lowercase();
         let lower = lower.trim_end_matches('.').trim();
-        let (rest, _) = tag::<_, _, OracleError<'_>>("this effect can't reduce ")
+        let (rest, _) = opt(tag::<_, _, OracleError<'_>>("this effect "))
             .parse(lower)
+            .ok()?;
+        let (rest, _) = tag::<_, _, OracleError<'_>>("can't reduce ")
+            .parse(rest)
             .ok()?;
         let (rest, _) = alt((
             tag::<_, _, OracleError<'_>>("their speed below "),
@@ -14553,6 +14925,22 @@ pub(crate) fn parse_effect_chain_ir(
                     target_chooser: None,
                 });
                 continue;
+            }
+        }
+
+        if is_free_cast_exile_instead_rider(rider_lower.trim_end_matches('.').trim()) {
+            if let Some(previous) = clauses.iter_mut().rev().find(|clause| {
+                !clause.absorbed_by_followup
+                    && matches!(&clause.parsed.effect, Effect::FreeCastFromZones { .. })
+            }) {
+                if let Effect::FreeCastFromZones {
+                    exile_instead_of_graveyard,
+                    ..
+                } = &mut previous.parsed.effect
+                {
+                    *exile_instead_of_graveyard = true;
+                    continue;
+                }
             }
         }
 
@@ -15763,6 +16151,16 @@ pub(crate) fn parse_effect_chain_ir(
         {
             rewrite_cost_paid_object_quantities(&mut clause.effect);
         }
+        // CR 608.2g + CR 601.2: The "may" in a free-cast window belongs to the
+        // interactive CastOffer itself ("up to N" includes choosing zero casts),
+        // not to the generic OptionalEffectChoice wrapper around the whole
+        // effect. Keep the actor context derived from the printed "you may", but
+        // lower the effect as mandatory so resolution opens the FreeCastWindow.
+        let is_optional = if matches!(&clause.effect, Effect::FreeCastFromZones { .. }) {
+            false
+        } else {
+            is_optional
+        };
 
         // CR 608.2e: "Instead" overrides — marker for lowering to attach as
         // sub_ability on the previous def.
@@ -17094,7 +17492,9 @@ fn infer_origin_zone(lower: &str) -> Option<Zone> {
         Some(Zone::Exile)
     } else if contains_possessive(lower, "from", "hand") {
         Some(Zone::Hand)
-    } else if contains_possessive(lower, "from", "library") {
+    } else if scan_contains_phrase(lower, "from the top of your library")
+        || contains_possessive(lower, "from", "library")
+    {
         Some(Zone::Library)
     } else if scan_contains_phrase(lower, "graveyard") && !scan_contains_phrase(lower, "from") {
         // CR 404.1: Possessive graveyard references without "from" — e.g.,
@@ -17137,7 +17537,10 @@ fn origin_is_your_zone(lower: &str, zone: Zone) -> bool {
     match zone {
         Zone::Graveyard => scan_contains_phrase(lower, "from your graveyard"),
         Zone::Hand => scan_contains_phrase(lower, "from your hand"),
-        Zone::Library => scan_contains_phrase(lower, "from your library"),
+        Zone::Library => {
+            scan_contains_phrase(lower, "from your library")
+                || scan_contains_phrase(lower, "from the top of your library")
+        }
         Zone::Exile => scan_contains_phrase(lower, "from your exile"),
         _ => false,
     }
@@ -17388,6 +17791,35 @@ mod tests {
     use crate::types::keywords::Keyword;
     use crate::types::mana::{ManaColor, ManaExpiry};
     use crate::types::player::PlayerCounterKind;
+
+    #[test]
+    fn infer_origin_zone_handles_top_of_your_library() {
+        assert_eq!(
+            infer_origin_zone("exile target card from the top of your library"),
+            Some(Zone::Library)
+        );
+    }
+
+    #[test]
+    fn inferred_top_of_your_library_origin_adds_owner_constraint() {
+        let filter = add_inferred_origin_constraints_to_target(
+            TargetFilter::Typed(TypedFilter::card()),
+            Some(Zone::Library),
+            "exile target card from the top of your library",
+        );
+
+        match filter {
+            TargetFilter::Typed(typed) => {
+                assert!(typed.properties.contains(&FilterProp::InZone {
+                    zone: Zone::Library
+                }));
+                assert!(typed.properties.contains(&FilterProp::Owned {
+                    controller: ControllerRef::You
+                }));
+            }
+            other => panic!("expected typed filter, got {other:?}"),
+        }
+    }
 
     fn target_filter_contains_nonland(filter: &TargetFilter) -> bool {
         match filter {
@@ -24358,6 +24790,56 @@ mod tests {
         }
     }
 
+    /// CR 509.1b + CR 613.4b: Atomic Microsizer — anaphoric subject with a
+    /// restriction conjunct and a trailing "has base power and toughness" conjunct
+    /// must stay one GenericEffect (sequence splitter recognizes "has" as well as
+    /// "have").
+    #[test]
+    fn that_creature_cant_be_blocked_and_has_base_pt_parses_as_single_generic_effect() {
+        let def = parse_effect_chain(
+            "That creature can't be blocked this turn and has base power and toughness 1/1 until end of turn",
+            AbilityKind::Spell,
+        );
+        assert!(
+            def.sub_ability.is_none(),
+            "must parse as a single clause, not split into sub_ability: {:?}",
+            def.sub_ability
+        );
+        match &*def.effect {
+            Effect::GenericEffect {
+                static_abilities,
+                duration,
+                ..
+            } => {
+                assert_eq!(*duration, Some(Duration::UntilEndOfTurn));
+                let mods: Vec<_> = static_abilities
+                    .iter()
+                    .flat_map(|s| s.modifications.iter())
+                    .collect();
+                assert!(
+                    mods.iter().any(|m| matches!(
+                        m,
+                        ContinuousModification::AddStaticMode {
+                            mode: StaticMode::CantBeBlocked
+                        }
+                    )),
+                    "must contain CantBeBlocked: {mods:?}"
+                );
+                assert!(
+                    mods.iter()
+                        .any(|m| matches!(m, ContinuousModification::SetPower { value: 1 })),
+                    "must contain SetPower(1): {mods:?}"
+                );
+                assert!(
+                    mods.iter()
+                        .any(|m| matches!(m, ContinuousModification::SetToughness { value: 1 })),
+                    "must contain SetToughness(1): {mods:?}"
+                );
+            }
+            other => panic!("expected single GenericEffect, got {other:?}"),
+        }
+    }
+
     /// Regression: a gain-keyword clause with no combat-requirement conjunct
     /// still parses as one `GenericEffect` with the duration recovered.
     #[test]
@@ -29633,6 +30115,90 @@ mod tests {
         assert!(
             def.sub_ability.is_some(),
             "discard continuation should remain attached"
+        );
+    }
+
+    #[test]
+    fn parse_reveal_a_card_from_your_hand_sets_any_card_filter() {
+        let def = parse_effect_chain("Reveal a card from your hand.", AbilityKind::Spell);
+
+        let Effect::RevealHand {
+            target,
+            card_filter,
+            ..
+        } = &*def.effect
+        else {
+            panic!("Expected RevealHand, got {:?}", def.effect);
+        };
+        assert_eq!(*target, TargetFilter::Controller);
+        assert_eq!(
+            *card_filter,
+            TargetFilter::Any,
+            "singular hand reveal must let the player choose any hand card"
+        );
+    }
+
+    #[test]
+    fn parse_reveal_a_card_from_target_opponents_hand_preserves_hand_owner() {
+        let def = parse_effect_chain(
+            "Reveal a card from target opponent's hand.",
+            AbilityKind::Spell,
+        );
+
+        let Effect::RevealHand {
+            target,
+            card_filter,
+            ..
+        } = &*def.effect
+        else {
+            panic!("Expected RevealHand, got {:?}", def.effect);
+        };
+        assert!(matches!(
+            target,
+            TargetFilter::Typed(tf)
+                if tf.controller == Some(crate::types::ability::ControllerRef::Opponent)
+        ));
+        assert_eq!(*card_filter, TargetFilter::Any);
+    }
+
+    #[test]
+    fn parse_eladamri_hand_mode_reveal_sets_any_card_filter() {
+        let def = parse_effect_chain(
+            "Reveal a card from your hand. If it's a creature card, you may put it onto the battlefield.",
+            AbilityKind::Activated,
+        );
+
+        let Effect::RevealHand {
+            target,
+            card_filter,
+            ..
+        } = &*def.effect
+        else {
+            panic!("Expected RevealHand, got {:?}", def.effect);
+        };
+        assert_eq!(*target, TargetFilter::Controller);
+        assert_eq!(*card_filter, TargetFilter::Any);
+    }
+
+    #[test]
+    fn parse_reveal_creature_card_from_your_hand_sets_creature_filter() {
+        let def = parse_effect_chain("Reveal a creature card from your hand.", AbilityKind::Spell);
+
+        let Effect::RevealHand {
+            target,
+            card_filter,
+            ..
+        } = &*def.effect
+        else {
+            panic!("Expected RevealHand, got {:?}", def.effect);
+        };
+        assert_eq!(*target, TargetFilter::Controller);
+        assert!(
+            matches!(
+                card_filter,
+                TargetFilter::Typed(tf) if tf.type_filters.contains(&TypeFilter::Creature)
+            ),
+            "typed singular hand reveal must preserve the card filter, got {card_filter:?}"
         );
     }
 
@@ -37641,6 +38207,50 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn intensify_parser_maps_source_and_owned_scopes() {
+        let e = parse_effect("This creature intensifies by 2.");
+        assert!(matches!(
+            e,
+            Effect::Intensify {
+                scope: IntensityScope::Source,
+                amount: QuantityExpr::Fixed { value: 2 },
+            }
+        ));
+
+        let e = parse_effect("Cards you own named Arek intensify.");
+        assert!(matches!(
+            e,
+            Effect::Intensify {
+                scope: IntensityScope::OwnedSameName,
+                amount: QuantityExpr::Fixed { value: 1 },
+            }
+        ));
+
+        let e = parse_effect("All Chorus cards you own intensify by 3.");
+        assert!(matches!(
+            e,
+            Effect::Intensify {
+                scope: IntensityScope::OwnedSubtype { ref subtype },
+                amount: QuantityExpr::Fixed { value: 3 },
+            } if subtype == "Chorus"
+        ));
+    }
+
+    #[test]
+    fn intensify_parser_preserves_variable_x_amount() {
+        let e = parse_effect("This Equipment intensifies by X, where X is that creature's power.");
+        assert!(matches!(
+            e,
+            Effect::Intensify {
+                scope: IntensityScope::Source,
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::Variable { ref name },
+                },
+            } if name == "X"
+        ));
+    }
+
     // ── Conjure tests ──────────────────────────────────────────────────
 
     #[test]
@@ -42775,6 +43385,40 @@ mod tests {
                 }
             )),
             "\"they own\" must scope ownership to the iterating player, got {typed:#?}",
+        );
+    }
+
+    #[test]
+    fn each_player_gains_control_of_creatures_they_own_parses_with_ownership() {
+        // Issue #2399: Homeward Path - verify ownership filter is applied to GainControl
+        let def = parse_effect_chain(
+            "Each player gains control of all creatures they own.",
+            AbilityKind::Activated,
+        );
+
+        // Should have player_scope: All for "Each player"
+        assert_eq!(def.player_scope, Some(PlayerFilter::All));
+
+        // The effect should be GainControl with target filter including ownership
+        let Effect::GainControl { target } = &*def.effect else {
+            panic!("expected GainControl, got {:#?}", def.effect);
+        };
+
+        // Target should be Typed filter with ownership property
+        let TargetFilter::Typed(typed) = target else {
+            panic!("expected Typed filter, got {:#?}", target);
+        };
+
+        // Verify ownership filter is present
+        assert!(
+            typed.properties.iter().any(|prop| matches!(
+                prop,
+                FilterProp::Owned {
+                    controller: ControllerRef::ScopedPlayer
+                }
+            )),
+            "\"they own\" must add ownership filter to GainControl target, got {:#?}",
+            typed
         );
     }
 }

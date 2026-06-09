@@ -148,6 +148,7 @@ pub fn apply_card_face_to_object(obj: &mut GameObject, card_face: &CardFace) {
     // this each pass (see `game_object::base_printed_ref`).
     obj.base_printed_ref = obj.printed_ref.clone();
     obj.source_related_token_ids = card_face.metadata.related_token_ids.clone();
+    obj.spellbook = card_face.metadata.spellbook.clone();
     obj.modal = card_face.modal.clone();
     obj.additional_cost = card_face.additional_cost.clone();
     obj.strive_cost = card_face.strive_cost.clone();
@@ -169,6 +170,19 @@ pub fn apply_card_face_to_object(obj: &mut GameObject, card_face: &CardFace) {
     // CR 716.3: Each Class enchantment enters the battlefield at level 1.
     if !was_initialized && card_face.card_type.subtypes.iter().any(|s| s == "Class") {
         obj.class_level = Some(1);
+    }
+
+    // Digital-only Alchemy: stamp "Starting intensity N" onto the object. Gated
+    // on `intensity == 0` (not `!was_initialized`) so a DFC whose starting
+    // intensity lives on the back face still picks it up on transform, while
+    // re-stamping a card that has already accumulated intensity never resets it.
+    if obj.intensity == 0 {
+        if let Some(n) = card_face.keywords.iter().find_map(|k| match k {
+            crate::types::keywords::Keyword::StartingIntensity(n) => Some(*n),
+            _ => None,
+        }) {
+            obj.intensity = n;
+        }
     }
 
     // CR 306.5c + CR 310.4c: Rehydration must not clobber live counter-tracked
@@ -427,6 +441,9 @@ fn collect_conjure_names_from_face(face: &CardFace, out: &mut Vec<String>) {
     for replacement in &face.replacements {
         walk_replacement(replacement, out);
     }
+    // Alchemy spellbook: every card a spellbook draft can produce must be in the
+    // registry to be instantiable by the conjure path.
+    out.extend(face.metadata.spellbook.iter().cloned());
 }
 
 fn walk_ability_def(def: &AbilityDefinition, out: &mut Vec<String>) {
@@ -602,11 +619,17 @@ fn walk_cost(cost: &AbilityCost, out: &mut Vec<String>) {
 /// those cases — extend it whenever a carrier is added.
 fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
     match effect {
+        Effect::Intensify { .. } => {}
         Effect::Conjure { cards, .. } => {
             for conjure_card in cards {
                 out.push(conjure_card.name.clone());
             }
         }
+        // A spellbook draft conjures the chosen card, but the list lives on the
+        // card face (`metadata.spellbook`), not in the effect — the registry
+        // seed collects it directly from the face (see
+        // `collect_conjure_names_from_face`), so nothing to gather here.
+        Effect::DraftFromSpellbook { .. } => {}
         // Nested-ability carriers — descend.
         Effect::Vote {
             per_choice_effect, ..
@@ -790,6 +813,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::AddPendingETBCounters { .. }
         | Effect::PayCost { .. }
         | Effect::CastFromZone { .. }
+        | Effect::FreeCastFromZones { .. }
         | Effect::PreventDamage { .. }
         | Effect::LoseTheGame { .. }
         | Effect::WinTheGame { .. }

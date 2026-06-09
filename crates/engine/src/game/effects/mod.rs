@@ -1,6 +1,9 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
+use crate::game::conditions::{
+    eval_has_city_blessing, eval_is_monarch, eval_source_entered_this_turn, eval_source_is_tapped,
+};
 use crate::game::filter;
 use crate::game::speed::has_max_speed;
 use crate::types::ability::{
@@ -19,6 +22,7 @@ use crate::types::game_state::{
 use crate::types::identifiers::{ObjectId, TrackedSetId};
 use crate::types::mana::ManaCost;
 use crate::types::player::{Player, PlayerId};
+use crate::types::zones::Zone;
 
 pub mod adapt;
 pub mod add_restriction;
@@ -82,6 +86,8 @@ pub mod epic;
 #[path = "epic_tests.rs"]
 mod epic_tests;
 pub mod exchange_control;
+// Tests for `intensify` live in a sibling file (declared here, not in
+// `intensify.rs`, so `intensify.rs` stays implementation-only).
 pub mod exchange_life;
 pub mod exile_from_top_until;
 pub mod exile_top;
@@ -93,6 +99,7 @@ pub mod flip_coin;
 pub mod forage;
 pub mod force_attack;
 pub mod force_block;
+pub mod free_cast_from_zones;
 pub mod gain_control;
 pub mod gift_delivery;
 pub mod goad;
@@ -100,6 +107,10 @@ pub mod grant_extra_loyalty_activations;
 pub mod grant_permission;
 pub mod hideaway;
 pub mod incubate;
+pub mod intensify;
+#[cfg(test)]
+#[path = "intensify_tests.rs"]
+mod intensify_tests;
 pub mod investigate;
 pub mod learn;
 pub mod life;
@@ -150,6 +161,12 @@ pub mod skip_next_turn;
 pub mod solve_case;
 pub mod specialize;
 pub mod speed_effects;
+pub mod spellbook;
+// Tests for `spellbook` live in a sibling file (declared here, not in
+// `spellbook.rs`, so `spellbook.rs` stays implementation-only).
+#[cfg(test)]
+#[path = "spellbook_tests.rs"]
+mod spellbook_tests;
 pub mod surveil;
 pub mod suspect;
 pub mod switch_pt;
@@ -1000,6 +1017,13 @@ fn waits_for_resolution_choice(waiting_for: &WaitingFor) -> bool {
                 kind: CastOfferKind::Cascade { .. },
                 ..
             }
+            // CR 608.2g + CR 608.2c: Invoke Calamity's free-cast window pauses
+            // resolution; its "Exile ~" sub-ability must run only after the
+            // window finishes, so stash it as a continuation here.
+            | WaitingFor::CastOffer {
+                kind: CastOfferKind::FreeCastWindow { .. },
+                ..
+            }
             | WaitingFor::TopOrBottomChoice { .. }
             | WaitingFor::ProliferateChoice { .. }
             | WaitingFor::TimeTravelChoice { .. }
@@ -1020,6 +1044,9 @@ fn waits_for_resolution_choice(waiting_for: &WaitingFor) -> bool {
             | WaitingFor::DrawnThisTurnTopdeckChoice { .. }
             | WaitingFor::CategoryChoice { .. }
             | WaitingFor::LearnChoice { .. }
+            // Digital-only Alchemy spellbook choice pauses resolution; stash
+            // the printed tail until SubmitSpellbookDraft resumes the chain.
+            | WaitingFor::SpellbookDraft { .. }
             | WaitingFor::PopulateChoice { .. }
     )
 }
@@ -1961,6 +1988,7 @@ pub fn resolve_effect(
         Effect::CreateEmblem { .. } => create_emblem::resolve(state, ability, events),
         Effect::PayCost { .. } => pay::resolve(state, ability, events),
         Effect::CastFromZone { .. } => cast_from_zone::resolve(state, ability, events),
+        Effect::FreeCastFromZones { .. } => free_cast_from_zones::resolve(state, ability, events),
         Effect::PreventDamage { .. } => prevent_damage::resolve(state, ability, events),
         Effect::CreateDamageReplacement { .. } => {
             create_damage_replacement::resolve(state, ability, events)
@@ -2063,6 +2091,8 @@ pub fn resolve_effect(
         }
         Effect::ProcessRadCounters => rad_counters::resolve(state, ability, events),
         Effect::Conjure { .. } => conjure::resolve(state, ability, events),
+        Effect::Intensify { .. } => intensify::resolve(state, ability, events),
+        Effect::DraftFromSpellbook { .. } => spellbook::resolve(state, ability, events),
         Effect::ChooseOneOf { .. } => choose_one_of::resolve(state, ability, events),
         Effect::Unimplemented { name, .. } => {
             // Log warning and return Ok (no-op) for unimplemented effects
@@ -3299,10 +3329,11 @@ pub fn resolve_ability_chain(
     // and activated abilities lack an `ability_index` stamp and skip this hook.
     if depth == 0 {
         if let Some(idx) = ability.ability_index {
-            *state
+            let count = state
                 .ability_resolutions_this_turn
                 .entry((ability.source_id, idx))
-                .or_insert(0) += 1;
+                .or_insert(0);
+            *count += 1;
         }
     }
 
@@ -4617,17 +4648,39 @@ fn resolve_chain_body(
                     // Predicate is `next.sub_link` (the sibling's link to the gated
                     // sub), NOT `sub.sub_link` (the gated sub's link to its parent =
                     // ContinuationStep).
-                    if next.sub_link == SubAbilityLink::SequentialSibling {
-                        let mut next_resolved = next.as_ref().clone();
-                        if next_resolved.targets.is_empty() && !ability.targets.is_empty() {
-                            next_resolved.targets = ability.targets.clone();
+                    //
+                    // For multi-branch chains like Omnath (n=1, n=2, n=3), find the
+                    // next SequentialSibling whose condition can actually resolve.
+                    // A false no-op sibling is skipped, but once a live sibling is
+                    // selected, its own chain is resolved by `resolve_ability_chain`;
+                    // continuing this outer walk would double-resolve later siblings.
+                    let mut current = Some(next);
+                    while let Some(ref sibling) = current {
+                        if sibling.sub_link == SubAbilityLink::SequentialSibling {
+                            let mut sibling_resolved = sibling.as_ref().clone();
+                            if sibling_resolved.targets.is_empty() && !ability.targets.is_empty() {
+                                sibling_resolved.targets = ability.targets.clone();
+                            }
+                            apply_parent_chain_context(
+                                &mut sibling_resolved,
+                                ability,
+                                effect_context_object.as_ref(),
+                            );
+                            if sibling_resolved
+                                .condition
+                                .as_ref()
+                                .is_some_and(|condition| {
+                                    !evaluate_condition(condition, state, &sibling_resolved)
+                                        && sibling_resolved.else_ability.is_none()
+                                })
+                            {
+                                current = sibling.sub_ability.as_ref();
+                                continue;
+                            }
+                            resolve_ability_chain(state, &sibling_resolved, events, depth + 1)?;
+                            break;
                         }
-                        apply_parent_chain_context(
-                            &mut next_resolved,
-                            ability,
-                            effect_context_object.as_ref(),
-                        );
-                        resolve_ability_chain(state, &next_resolved, events, depth + 1)?;
+                        current = sibling.sub_ability.as_ref();
                     }
                 }
                 return Ok(());
@@ -5099,13 +5152,11 @@ pub(crate) fn evaluate_condition(
             };
             type_matches && subtype_matches && filter_matches
         }
-        // CR 400.7 + CR 608.2c: source permanent entered the battlefield this turn.
+        // CR 400.7: source permanent entered the battlefield this turn.
         // For the "unless ~ entered this turn" sense, wrap with `Not`.
-        AbilityCondition::SourceEnteredThisTurn => state
-            .objects
-            .get(&ability.source_id)
-            .map(|obj| obj.entered_battlefield_turn == Some(state.turn_number))
-            .unwrap_or(false),
+        AbilityCondition::SourceEnteredThisTurn => {
+            eval_source_entered_this_turn(state, ability.source_id)
+        }
         // CR 702.49 + CR 702.190a + CR 603.4: "if its sneak/ninjutsu cost was paid"
         AbilityCondition::CastVariantPaid { variant } => state
             .objects
@@ -5174,10 +5225,10 @@ pub(crate) fn evaluate_condition(
         AbilityCondition::SpellCastWithVariantThisTurn { variant } => {
             crate::game::restrictions::spell_cast_with_variant_this_turn(state, variant)
         }
-        AbilityCondition::IsMonarch => state.monarch == Some(ability.controller),
+        AbilityCondition::IsMonarch => eval_is_monarch(state, ability.controller),
         // CR 702.131c: The city's blessing is a player designation that effects
         // can identify.
-        AbilityCondition::HasCityBlessing => state.city_blessing.contains(&ability.controller),
+        AbilityCondition::HasCityBlessing => eval_has_city_blessing(state, ability.controller),
         // "Instead" override conditions — return pure boolean value.
         // Terminal control flow (early return from resolve_ability_chain) is the caller's
         // responsibility in the sub-ability context.
@@ -5348,11 +5399,9 @@ pub(crate) fn evaluate_condition(
             }
         }
         // CR 611.2b: "if this creature/permanent is tapped" — check source object.
-        // For the untapped sense, wrap with `Not`.
-        AbilityCondition::SourceIsTapped => state
-            .objects
-            .get(&ability.source_id)
-            .is_some_and(|obj| obj.tapped),
+        // For the untapped sense, wrap with `Not`. No battlefield zone guard
+        // (ability conditions; zone constrained by functioning-abilities path).
+        AbilityCondition::SourceIsTapped => eval_source_is_tapped(state, ability.source_id),
         // CR 608.2c: General "instead" — delegate to the wrapped inner condition.
         // The "instead" semantics are handled by the swap/guard in resolve_ability_chain.
         AbilityCondition::ConditionInstead { inner } => evaluate_condition(inner, state, ability),
@@ -5630,6 +5679,17 @@ fn expand_per_counter(base: &AbilityCost, n: u32) -> AbilityCost {
             filter: filter.clone(),
             random: *random,
             self_ref: *self_ref,
+        },
+        // CR 702.24a: Thought Lash-style cumulative upkeep scales the number
+        // of top-library cards exiled by the number of age counters.
+        AbilityCost::Exile {
+            count,
+            zone: Some(Zone::Library),
+            filter: None,
+        } => AbilityCost::Exile {
+            count: count.saturating_mul(n),
+            zone: Some(Zone::Library),
+            filter: None,
         },
         // YAGNI fallback: no current cumulative-upkeep card uses these
         // base variants. If a future mechanic does, the
@@ -6827,6 +6887,26 @@ mod tests {
         assert_eq!(filter, Some(TargetFilter::SelfRef));
         assert!(!random);
         assert!(self_ref);
+    }
+
+    #[test]
+    fn expand_per_counter_top_library_exile_scales_count() {
+        let base = AbilityCost::Exile {
+            count: 1,
+            zone: Some(Zone::Library),
+            filter: None,
+        };
+
+        let expanded = expand_per_counter(&base, 3);
+
+        assert_eq!(
+            expanded,
+            AbilityCost::Exile {
+                count: 3,
+                zone: Some(Zone::Library),
+                filter: None,
+            }
+        );
     }
 
     #[test]
@@ -13956,6 +14036,174 @@ mod tests {
             state.ability_resolutions_this_turn[&(source_id, 0)],
             2,
             "counter must be bumped exactly once per top-level resolution"
+        );
+    }
+
+    /// Test Omnath-style chain: three SequentialSibling sub-abilities gated on
+    /// n=1, n=2, n=3. Each resolution should fire exactly one branch.
+    #[test]
+    fn nth_resolution_omnath_three_branch_chain() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = ObjectId(1);
+
+        // Branch 3: lose 4 life (as damage proxy), gated on n=3 (SequentialSibling).
+        let mut branch3 = ResolvedAbility::new(
+            Effect::LoseLife {
+                amount: QuantityExpr::Fixed { value: 4 },
+                target: Some(TargetFilter::Controller),
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        branch3.condition = Some(AbilityCondition::NthResolutionThisTurn { n: 3 });
+        branch3.sub_link = SubAbilityLink::SequentialSibling;
+        assert!(branch3.ability_index.is_none());
+
+        // Branch 2: lose 2 life (as mana proxy), gated on n=2 (SequentialSibling).
+        let mut branch2 = ResolvedAbility::new(
+            Effect::LoseLife {
+                amount: QuantityExpr::Fixed { value: 2 },
+                target: Some(TargetFilter::Controller),
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        branch2.condition = Some(AbilityCondition::NthResolutionThisTurn { n: 2 });
+        branch2.sub_link = SubAbilityLink::SequentialSibling;
+        branch2.sub_ability = Some(Box::new(branch3));
+        assert!(branch2.ability_index.is_none());
+
+        // Branch 1: gain 4 life, gated on n=1 (SequentialSibling).
+        let mut branch1 = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 4 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        branch1.condition = Some(AbilityCondition::NthResolutionThisTurn { n: 1 });
+        branch1.sub_link = SubAbilityLink::SequentialSibling;
+        branch1.sub_ability = Some(Box::new(branch2));
+        assert!(branch1.ability_index.is_none());
+
+        // Top-level: gain 1 life (no-op proxy), chains to the three branches.
+        let mut ability = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        )
+        .sub_ability(branch1);
+        ability.ability_index = Some(0);
+
+        let start_life = state.players[0].life;
+        let mut events = Vec::new();
+
+        // Resolution 1: only n=1 branch should fire (+4 life).
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        assert_eq!(
+            state.players[0].life,
+            start_life + 1 + 4,
+            "1st resolution: top-level (+1) and n=1 branch (+4) should fire"
+        );
+
+        // Resolution 2: only n=2 branch should fire (lose 2 life).
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        assert_eq!(
+            state.players[0].life,
+            start_life + 1 + 4 + 1 - 2,
+            "2nd resolution: top-level (+1) and n=2 branch (-2) should fire"
+        );
+
+        // Resolution 3: only n=3 branch should fire (lose 4 life).
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        assert_eq!(
+            state.players[0].life,
+            start_life + 1 + 4 + 1 - 2 + 1 - 4,
+            "3rd resolution: top-level (+1) and n=3 branch (-4) should fire"
+        );
+
+        // Counter must be exactly 3.
+        assert_eq!(
+            state.ability_resolutions_this_turn[&(source_id, 0)],
+            3,
+            "counter must be bumped exactly once per top-level resolution"
+        );
+    }
+
+    #[test]
+    fn sequential_sibling_failure_walk_resolves_selected_chain_once() {
+        let mut state = GameState::new_two_player(42);
+        let source_id = ObjectId(1);
+
+        // Branch 3 is also true on the first resolution. It should resolve once
+        // as branch 2's child, not a second time from the failure-path sibling walk.
+        let mut branch3 = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 4 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        branch3.condition = Some(AbilityCondition::NthResolutionThisTurn { n: 1 });
+        branch3.sub_link = SubAbilityLink::SequentialSibling;
+
+        let mut branch2 = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 2 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        branch2.condition = Some(AbilityCondition::NthResolutionThisTurn { n: 1 });
+        branch2.sub_link = SubAbilityLink::SequentialSibling;
+        branch2.sub_ability = Some(Box::new(branch3));
+
+        let mut branch1 = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 100 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        branch1.condition = Some(AbilityCondition::NthResolutionThisTurn { n: 2 });
+        branch1.sub_link = SubAbilityLink::SequentialSibling;
+        branch1.sub_ability = Some(Box::new(branch2));
+
+        let mut ability = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        )
+        .sub_ability(branch1);
+        ability.ability_index = Some(0);
+
+        let start_life = state.players[0].life;
+        let mut events = Vec::new();
+
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        assert_eq!(
+            state.players[0].life,
+            start_life + 1 + 2 + 4,
+            "branch 3 must not be double-resolved by the failure-path sibling walk"
         );
     }
 

@@ -5406,6 +5406,34 @@ fn continuous_mods_grant_keyword_and_cant_be_blocked() {
     );
 }
 
+/// CR 509.1b + CR 613.4b: Atomic Microsizer — evasion restriction and base P/T
+/// set must parse from one compound predicate.
+#[test]
+fn continuous_mods_cant_be_blocked_and_has_base_pt() {
+    let mods = parse_continuous_modifications(
+        "can't be blocked this turn and has base power and toughness 1/1 until end of turn",
+    );
+    assert!(
+        mods.iter().any(|m| matches!(
+            m,
+            ContinuousModification::AddStaticMode {
+                mode: StaticMode::CantBeBlocked
+            }
+        )),
+        "missing CantBeBlocked grant in {mods:?}"
+    );
+    assert!(
+        mods.iter()
+            .any(|m| matches!(m, ContinuousModification::SetPower { value: 1 })),
+        "missing SetPower(1) in {mods:?}"
+    );
+    assert!(
+        mods.iter()
+            .any(|m| matches!(m, ContinuousModification::SetToughness { value: 1 })),
+        "missing SetToughness(1) in {mods:?}"
+    );
+}
+
 /// Extract the subtype string from a single-subtype `IsPresent` filter, for
 /// asserting per-subtype conditional keyword grants.
 fn is_present_subtype(cond: &StaticCondition) -> Option<String> {
@@ -14443,11 +14471,9 @@ fn static_selfref_cant_be_blocked_except_by_disjunction_top_level() {
 /// CR 702.29e + CR 113.6b: Homing Sliver's top-level static grants Typecycling
 /// to all Sliver cards in their owner's hand. This asserts the PARSE is correct
 /// (affected = Typed(Subtype:Sliver) in the Hand zone; modification =
-/// AddKeyword(Typecycling { cost {3}, subtype "Sliver" })). NOTE: a deferred
-/// RUNTIME gap remains — `synthesize_cycling` reads intrinsic printed keywords
-/// only, so a Typecycling keyword GRANTED at runtime is on the recipient's
-/// keyword set but is not synthesized into an activatable ability. See the
-/// doc comment at `database/synthesis.rs::synthesize_cycling`.
+/// AddKeyword(Typecycling { cost {3}, subtype "Sliver" })). Runtime-granted
+/// cycling abilities are surfaced by `game::casting` from the effective
+/// off-zone keyword set.
 #[test]
 fn static_homing_sliver_grants_typecycling_to_slivers_in_hand() {
     // Real Oracle text. The "Each <type> in each player's hand has <keyword>"

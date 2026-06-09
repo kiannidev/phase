@@ -968,6 +968,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             None => format!("counters on {}", fmt_target(filter)),
         },
         QuantityRef::Variable { name } => name.clone(),
+        QuantityRef::Intensity { .. } => "intensity".into(),
         QuantityRef::Power { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
                 "self power".into()
@@ -1700,6 +1701,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         }
         // CR 702.50a: EpicCopy's parameters live in its snapshotted ability.
         Effect::EpicCopy { .. } => {}
+        Effect::Intensify { .. } => {}
         Effect::DestroyAll { target, .. }
         | Effect::TapAll { target }
         | Effect::UntapAll { target }
@@ -2099,6 +2101,30 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             d.push(("target".into(), fmt_target(target)));
             if *without_paying_mana_cost {
                 d.push(("free cast".into(), "yes".into()));
+            }
+        }
+        Effect::FreeCastFromZones {
+            count,
+            max_total_mv,
+            filter,
+            zones,
+            exile_instead_of_graveyard,
+        } => {
+            d.push(("count".into(), count.to_string()));
+            if let Some(mv) = max_total_mv {
+                d.push(("total mana value".into(), mv.to_string()));
+            }
+            d.push(("filter".into(), fmt_target(filter)));
+            d.push((
+                "zones".into(),
+                zones
+                    .iter()
+                    .map(|z| format!("{z:?}"))
+                    .collect::<Vec<_>>()
+                    .join("/"),
+            ));
+            if *exile_instead_of_graveyard {
+                d.push(("exile instead of graveyard".into(), "yes".into()));
             }
         }
         Effect::RollDie {
@@ -2508,6 +2534,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         | Effect::Incubate { .. }
         | Effect::TimeTravel
         | Effect::Conjure { .. }
+        | Effect::DraftFromSpellbook { .. }
         | Effect::AddPendingETBCounters { .. }
         | Effect::ChooseAndSacrificeRest { .. }
         | Effect::ChooseOneOf { .. }
@@ -5336,6 +5363,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         QuantityRef::ObjectCountBySharedQuality { .. } => ("ObjectCountBySharedQuality", Handled),
         QuantityRef::PlayerCount { .. } => ("PlayerCount", Handled),
         QuantityRef::CountersOn { .. } => ("CountersOn", Handled),
+        QuantityRef::Intensity { .. } => ("Intensity", Handled),
         QuantityRef::CountersOnObjects { .. } => ("CountersOnObjects", Handled),
         QuantityRef::Variable { .. } => ("Variable", Handled),
         QuantityRef::Power { scope } => match scope {
@@ -9984,14 +10012,14 @@ mod tests {
 
     #[test]
     fn unsupported_cumulative_upkeep_cost_counts_as_keyword_gap() {
-        // CR 702.24a: Exile-base cumulative upkeep is still unsupported by the
-        // unless-payment pipeline (Discard became supported once the per-counter
-        // discard payment chain landed), so it remains a coverage gap.
+        // CR 702.24a: arbitrary exile-base cumulative upkeep still needs
+        // interactive object selection before it can enter the unless-payment
+        // pipeline. Thought Lash-style top-library exile is covered separately.
         let mut face = make_face();
         face.keywords
             .push(Keyword::CumulativeUpkeep(AbilityCost::Exile {
                 count: 1,
-                zone: None,
+                zone: Some(Zone::Graveyard),
                 filter: None,
             }));
 
@@ -10006,6 +10034,26 @@ mod tests {
             .find(|item| item.category == ParseCategory::Keyword)
             .expect("keyword parse item");
         assert!(!keyword.supported);
+    }
+
+    #[test]
+    fn top_library_exile_cumulative_upkeep_has_no_keyword_gap() {
+        let mut face = make_face();
+        face.keywords
+            .push(Keyword::CumulativeUpkeep(AbilityCost::Exile {
+                count: 1,
+                zone: Some(Zone::Library),
+                filter: None,
+            }));
+
+        assert!(card_face_gaps(&face).is_empty());
+
+        let parse_details = build_parse_details_for_face(&face);
+        let keyword = parse_details
+            .iter()
+            .find(|item| item.category == ParseCategory::Keyword)
+            .expect("keyword parse item");
+        assert!(keyword.supported);
     }
 
     #[test]

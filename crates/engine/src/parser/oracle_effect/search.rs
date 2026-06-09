@@ -2821,6 +2821,22 @@ mod tests {
     }
 
     #[test]
+    fn zone_pair_split_lowers_to_exile_and_library_bottom() {
+        let details = parse_search_library_details(
+            "search your library for two cards. put one into exile and the other on the bottom of your library. then shuffle",
+            &mut ParseContext::default(),
+        );
+        let split = details
+            .split
+            .expect("zone-pair split must populate a SearchDestinationSplit");
+        assert_eq!(split.primary_destination, Zone::Exile);
+        assert_eq!(split.primary_count, 1);
+        assert!(!split.primary_enter_tapped.is_tapped());
+        assert_eq!(split.rest_destination, Zone::Library);
+        assert_eq!(details.count, QuantityExpr::Fixed { value: 2 });
+    }
+
+    #[test]
     fn single_zone_search_has_no_split() {
         // A plain tutor must NOT be misread as a split.
         let details = parse_search_library_details(

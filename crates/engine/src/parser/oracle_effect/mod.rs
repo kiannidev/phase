@@ -34705,6 +34705,8 @@ mod tests {
         let trigger = parsed.triggers.first().expect("expected attack trigger");
         let grant = trigger
             .execute
+            .as_deref()
+            .expect("expected trigger execute ability")
             .sub_ability
             .as_deref()
             .expect("expected conditional lifelink continuation");
@@ -34716,7 +34718,7 @@ mod tests {
         else {
             panic!("expected GenericEffect grant, got {:?}", grant.effect);
         };
-        assert_eq!(*target, None);
+        assert_eq!(target, None);
         let static_def = static_abilities
             .first()
             .expect("lifelink grant must carry a static definition");

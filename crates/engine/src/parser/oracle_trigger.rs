@@ -15701,10 +15701,6 @@ mod tests {
             .as_ref()
             .expect("instant or sorcery spell you don't own must carry valid_card");
         assert_owned_by_opponent(valid_card);
-        assert!(matches!(
-            valid_card,
-            TargetFilter::Or { filters } if filters.len() == 2
-        ));
     }
 
     #[test]

@@ -504,10 +504,17 @@ pub fn resolved_targets(
     if use_self {
         return vec![TargetRef::Object(ability.source_id)];
     }
-    // CR 608.2c: ParentTarget / ParentTargetSlot inherit the full propagated
-    // target list from the parent ability. StackSpell uses player-chosen targets
-    // at ETB (issue #2351). Slot indexing for ParentTargetSlot happens in
-    // `effect_object_targets`; do not gate these on per-target filter matching.
+    // CR 603.7c: Pure event-context filters always resolve from the trigger
+    // event / combat state, even when parent chain propagation populated
+    // `ability.targets` with unrelated chosen targets (DefendingPlayer, etc.).
+    if is_pure_event_context_filter(target_filter) {
+        if let Some(target) = resolve_event_context_target(state, target_filter, ability.source_id) {
+            return vec![target];
+        }
+    }
+    // CR 608.2c: ParentTarget / ParentTargetSlot inherit propagated targets;
+    // StackSpell uses player-chosen stack targets at ETB (issue #2351).
+    // Slot indexing for ParentTargetSlot happens in `effect_object_targets`.
     if !ability.targets.is_empty()
         && matches!(
             target_filter,
@@ -520,23 +527,59 @@ pub fn resolved_targets(
     }
     // CR 601.2c + CR 608.2b: Pre-selected targets take precedence over
     // event-context resolution when the player chose targets at activation/
-    // trigger placement. Without this ordering, a StackSpell filter on an ETB
-    // trigger would bind to the ZoneChanged source (the creature itself)
-    // instead of the spell the player targeted (issue #2351 — Aven Interrupter).
-    // Only trust propagated targets when every chosen target still matches the
-    // resolving filter (prevents ETB self-binding on unrelated filters).
+    // trigger placement. Per-opponent fanout stores `[Player, Object, …]`
+    // pairs — only the object slots must satisfy the resolving filter
+    // (Haytham Kenway exile). Without this ordering, a StackSpell filter on
+    // an ETB trigger would bind to the ZoneChanged source (issue #2351).
     if !ability.targets.is_empty()
-        && ability
-            .targets
-            .iter()
-            .all(|target| target_ref_matches_resolved_filter(state, ability, target_filter, target))
+        && chosen_targets_satisfy_filter(state, ability, target_filter)
     {
         return ability.targets.clone();
     }
     if let Some(target) = resolve_event_context_target(state, target_filter, ability.source_id) {
         return vec![target];
     }
-    vec![]
+    ability.targets.clone()
+}
+
+fn is_pure_event_context_filter(target_filter: &TargetFilter) -> bool {
+    matches!(
+        target_filter,
+        TargetFilter::TriggeringSpellController
+            | TargetFilter::TriggeringSpellOwner
+            | TargetFilter::TriggeringPlayer
+            | TargetFilter::TriggeringSource
+            | TargetFilter::DefendingPlayer
+            | TargetFilter::AttachedTo
+            | TargetFilter::ParentTargetController
+            | TargetFilter::ParentTargetOwner
+            | TargetFilter::PostReplacementSourceController
+            | TargetFilter::PostReplacementDamageTarget
+    )
+}
+
+/// True when every object target (or every target if there are no object
+/// targets) satisfies the resolving filter. Player targets in per-opponent
+/// fanout pairs are ignored for Typed filters.
+fn chosen_targets_satisfy_filter(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    target_filter: &TargetFilter,
+) -> bool {
+    let object_targets: Vec<&TargetRef> = ability
+        .targets
+        .iter()
+        .filter(|t| matches!(t, TargetRef::Object(_)))
+        .collect();
+    let candidates = if object_targets.is_empty() {
+        ability.targets.iter().collect::<Vec<_>>()
+    } else {
+        object_targets
+    };
+    !candidates.is_empty()
+        && candidates.iter().all(|target| {
+            target_ref_matches_resolved_filter(state, ability, target_filter, target)
+        })
 }
 
 fn target_ref_matches_resolved_filter(

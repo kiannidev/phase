@@ -110,9 +110,9 @@ export class WebSocketAdapter implements EngineAdapter {
   private pendingReject: ((error: Error) => void) | null = null;
   private initResolve: (() => void) | null = null;
   private initReject: ((error: Error) => void) | null = null;
-  /** Starting-player contest DieRolled batch captured from the initial
-   *  GameStarted message, handed back by `initializeGame()` so the dice overlay
-   *  animates it. Empty on reconnects (the server drains it after first send). */
+  /** Starting-player contest event captured from the initial GameStarted
+   *  message, handed back by `initializeGame()` so the dice overlay animates it.
+   *  Empty on reconnects (the server drains it after first send). */
   private initStartEvents: GameEvent[] = [];
   private listeners: WsAdapterEventListener[] = [];
   private reconnectAttempt = 0;
@@ -143,7 +143,7 @@ export class WebSocketAdapter implements EngineAdapter {
 
   constructor(
     private readonly serverUrl: string,
-    private readonly mode: "host" | "join",
+    private readonly mode: "host" | "join" | "spectate",
     private readonly deckData: DeckData,
     private readonly joinGameCode?: string,
     private readonly joinPassword?: string,
@@ -203,16 +203,18 @@ export class WebSocketAdapter implements EngineAdapter {
       const setupFrame =
         this.mode === "host"
           ? { type: "CreateGame", data: { deck: this.deckData } }
-          : {
-              type: "JoinGameWithPassword",
-              data: {
-                game_code: this.joinGameCode!,
-                deck: this.deckData,
-                display_name: this.displayName,
-                password: this.joinPassword ?? null,
-                reservation_token: this.reservationToken ?? null,
-              },
-            };
+          : this.mode === "spectate"
+            ? { type: "SpectatorJoin", data: { game_code: this.joinGameCode! } }
+            : {
+                type: "JoinGameWithPassword",
+                data: {
+                  game_code: this.joinGameCode!,
+                  deck: this.deckData,
+                  display_name: this.displayName,
+                  password: this.joinPassword ?? null,
+                  reservation_token: this.reservationToken ?? null,
+                },
+              };
 
       this.attachSocket(setupFrame).catch(() => {
         // `attachSocket` emits reject via initReject; swallow the
@@ -596,10 +598,10 @@ export class WebSocketAdapter implements EngineAdapter {
         };
         // Joiners receive their player_token here (hosts get it via GameCreated).
         // Set _gameCode from joinGameCode if not already set (host sets it via GameCreated).
+        if (!this._gameCode && this.joinGameCode) {
+          this._gameCode = this.joinGameCode;
+        }
         if (data.player_token) {
-          if (!this._gameCode && this.joinGameCode) {
-            this._gameCode = this.joinGameCode;
-          }
           this.playerToken = data.player_token;
           this.emit({ type: "sessionChanged", session: this.currentSession() });
         }
@@ -613,11 +615,10 @@ export class WebSocketAdapter implements EngineAdapter {
           ...(playerNames === undefined ? {} : { playerNames }),
         });
         if (this.initResolve) {
-          // CR 103.1: the server sends the starting-player contest DieRolled
-          // batch only on the initial GameStarted (drained server-side, so
-          // reconnects carry none). Stash it for initializeGame() to return,
-          // routing it through the same gameStore.initGame contest path as
-          // local games.
+          // CR 103.1: the server sends the StartingPlayerContest event only on
+          // the initial GameStarted (drained server-side, so reconnects carry
+          // none). Stash it for initializeGame() to return, routing it through
+          // the same gameStore.initGame contest path as local games.
           this.initStartEvents = data.events ?? [];
           this.initResolve();
           this.initResolve = null;

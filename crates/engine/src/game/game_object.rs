@@ -10,9 +10,9 @@ use crate::types::ability::{
 };
 use crate::types::card::{LayoutKind, PrintedCardRef, TokenImageRef};
 use crate::types::card_type::{CardType, CoreType};
-use crate::types::counter::CounterType;
+use crate::types::counter::{counter_map_serde, CounterType};
 use crate::types::definitions::Definitions;
-use crate::types::game_state::LKISnapshot;
+use crate::types::game_state::{AttackDeclarationRecord, GameState, LKISnapshot};
 use crate::types::identifiers::{CardId, ObjectId};
 use crate::types::keywords::{Keyword, KeywordKind};
 use crate::types::mana::{ColoredManaCount, ManaColor, ManaCost, ManaPip};
@@ -64,6 +64,37 @@ pub struct PreparedState;
 /// Parallels `PreparedState` — empty struct in `Option` instead of bare `bool`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct BestowFormState;
+
+/// CR 702.140a-c: Mutate form marker — `Some(_)` while this object is a
+/// mutating creature spell on the stack (cast for its mutate cost). Parallels
+/// `BestowFormState`: an empty typed marker (not a bool) set when the mutate
+/// cost is paid (`apply_mutate_form`) and cleared by `revert_mutate_form` when
+/// the spell's target is illegal at resolution (CR 702.140b) so the spell
+/// resolves as a plain creature spell. It does NOT persist onto the merged
+/// permanent — the merge identity lives in `GameObject::merged_components`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MutateFormState;
+
+/// CR 702.160a: Prototype form marker — `Some(_)` means this object was cast
+/// prototyped and should use the secondary power, toughness, and mana cost
+/// characteristics while it is a spell or permanent on the battlefield.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrototypeFormState {
+    pub mana_cost: ManaCost,
+    pub power: i32,
+    pub toughness: i32,
+    pub colors: Vec<ManaColor>,
+}
+
+/// Oathbreaker RC: command-zone role marker for a signature spell.
+///
+/// A signature spell is an instant or sorcery that starts in the command zone,
+/// uses commander-tax accounting, may be cast only while its owner's
+/// Oathbreaker is controlled on the battlefield, and gets the same zone-return
+/// treatment as other command-zone leaders. Stored as a typed marker to avoid
+/// proliferating bare role booleans on `GameObject`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SignatureSpellState;
 
 /// CR 702.148a-b + CR 612: Cleave form marker — `Some(_)` while this object's
 /// cleave text-changing effect is live (the spell was cast for its cleave cost
@@ -257,6 +288,22 @@ pub struct RoomUnlockOutcome {
     pub fully_unlocked: bool,
 }
 
+/// CR 114: Display-only provenance for an emblem — the name and printed-card
+/// reference of the source that created it (e.g. the planeswalker whose
+/// ultimate ability made the emblem). This is deliberately NOT the emblem's
+/// own `printed_ref`: an emblem is neither a card nor a permanent (CR 114.5),
+/// and setting `printed_ref` would make the layer system treat the emblem as
+/// represented by that card and leak its types/P-T/abilities. This field is
+/// purely presentational — the client uses it to render the emblem as a small
+/// chip bearing the source's art crop and a "from <name>" label, mirroring
+/// MTG Arena's emblem display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmblemSource {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub printed_ref: Option<PrintedCardRef>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameObject {
     pub id: ObjectId,
@@ -303,7 +350,16 @@ pub struct GameObject {
     pub pair_controller: Option<PlayerId>,
 
     // Counters
+    #[serde(with = "counter_map_serde")]
     pub counters: HashMap<CounterType, u32>,
+
+    /// Alchemy Intensity — a per-card escalating value (digital-only, no CR
+    /// entry). Initialized from the card's "Starting intensity N" at first
+    /// characteristic application and incremented by `Effect::Intensify`. Like
+    /// `counters`, it persists across zone changes (the object keeps its id), so
+    /// a card's intensity follows it through hand/library/stack/battlefield.
+    #[serde(default)]
+    pub intensity: u32,
 
     // Characteristics
     pub name: String,
@@ -356,8 +412,22 @@ pub struct GameObject {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_related_token_ids: Vec<String>,
 
+    /// Alchemy spellbook — the fixed list of card names this object can draft
+    /// from, copied from `CardFace::metadata.spellbook`. Read by the
+    /// `DraftFromSpellbook` resolver to present the choice.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spellbook: Vec<String>,
+
     // Back face data for double-faced cards (DFCs)
     pub back_face: Option<BackFaceData>,
+
+    /// Digital-only Specialize: specialized faces keyed by added color pip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specialize_faces: Option<super::specialize::SpecializeFaceMap>,
+
+    /// Digital-only Specialize: set after specializing; prevents re-specializing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub specialized_color: Option<ManaColor>,
 
     // Base characteristics (for layer system)
     pub base_power: Option<i32>,
@@ -410,6 +480,15 @@ pub struct GameObject {
     // counter). Used for "entered this turn" triggers and `EnteredThisTurn`
     // filters — NOT for summoning-sickness (see `summoning_sick`).
     pub entered_battlefield_turn: Option<u32>,
+
+    // CR 702.187b: Global turn on which this card was put into a graveyard as a
+    // result of a discard. Used by the Mayhem keyword's "as long as you
+    // discarded this card this turn" gate. Compared against the current turn
+    // number at query time, so it auto-expires when the turn advances; reset to
+    // `None` whenever the object changes zones (a card that leaves the graveyard
+    // and returns is a new object that was not discarded).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discarded_turn: Option<u32>,
 
     /// CR 302.6: Summoning-sickness state flag. True when this permanent has
     /// NOT been continuously under its controller's control since that player's
@@ -488,6 +567,36 @@ pub struct GameObject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bestow_form: Option<BestowFormState>,
 
+    /// CR 702.160a: `Some(_)` while this object was cast prototyped. The
+    /// layer system uses the stored secondary characteristics whenever the
+    /// object is a creature; normal casts leave this unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prototype_form: Option<PrototypeFormState>,
+
+    /// CR 702.140a-c: `Some(_)` while this object is a mutating creature spell on
+    /// the stack (cast for its mutate cost). Set by `apply_mutate_form`; cleared
+    /// by `revert_mutate_form` when the target is illegal at resolution
+    /// (CR 702.140b). Does not persist onto the merged permanent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutate_form: Option<MutateFormState>,
+
+    /// CR 730.2 + CR 702.140c: The ordered list of card/token `ObjectId`s that
+    /// represent this merged permanent. EMPTY for non-merged objects. Convention:
+    /// element `[0]` is the TOPMOST component (supplies copiable characteristics
+    /// per CR 730.2a); later elements are progressively lower in the stack. The
+    /// merged permanent itself always keeps the original target creature's
+    /// `ObjectId` (CR 730.2c continuity) regardless of which component is topmost.
+    /// Each component retains its ORIGINAL owner so CR 730.3 routes each to the
+    /// correct player's zone when the merged permanent leaves the battlefield.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_components: Vec<ObjectId>,
+
+    /// CR 730.2a + CR 702.140e: Stable id of the layer-1 copy effect that
+    /// represents this merged permanent's topmost copiable values plus component
+    /// ability union. `None` for non-merged objects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub merge_layer_effect_id: Option<u64>,
+
     /// CR 702.148a-b + CR 612: `Some(_)` while this object's cleave
     /// text-changing effect is live (the spell was cast for its cleave cost).
     /// Carries the printed-form ability snapshot captured before the swap so the
@@ -544,6 +653,9 @@ pub struct GameObject {
     // Commander: whether this object is a commander card
     #[serde(default)]
     pub is_commander: bool,
+    /// Oathbreaker RC: command-zone signature-spell role.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_spell: Option<SignatureSpellState>,
 
     /// CR 903.8: Commander tax — pre-computed {2} per previous cast from command zone.
     /// Display-only: computed by `derive_display_state()`.
@@ -559,9 +671,25 @@ pub struct GameObject {
     #[serde(default)]
     pub is_emblem: bool,
 
+    /// CR 114: Display-only provenance of the source that created this emblem
+    /// (planeswalker, spell, etc.). Populated at creation in `create_emblem`;
+    /// `None` for every non-emblem object. See [`EmblemSource`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emblem_source: Option<EmblemSource>,
+
     /// CR 111.1: Whether this object is a token (not a card).
     #[serde(default)]
     pub is_token: bool,
+
+    /// CR 707.10 + CR 707.12a: Whether this object is a COPY of a card or spell
+    /// and is therefore NOT "represented by a card". Set by copy-creation effects
+    /// that keep `is_token = false` (notably `Effect::CastCopyOfCard`, used by
+    /// Mizzix's Mastery and Cipher's recast); token copies are marked via
+    /// `is_token` instead. Read through [`GameObject::is_represented_by_a_card`]
+    /// by abilities gated on "if this spell is represented by a card" (e.g.
+    /// Cipher's encode-on-resolution, CR 702.99a).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_copy: bool,
 
     /// Image-lookup routing hint for the display layer. See `DisplaySource`
     /// for the rationale. Independent of `is_token` — a token-copy of a
@@ -680,6 +808,17 @@ pub struct GameObject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_from_zone: Option<Zone>,
 
+    /// CR 614.1a + CR 608.2n: When true, this spell is exiled instead of being
+    /// put into its owner's graveyard any time it would leave the stack
+    /// ("if those spells would be put into your graveyard, exile them instead").
+    /// Set on a spell cast via `Effect::FreeCastFromZones` with the exile rider
+    /// (Invoke Calamity); read by the stack-resolution router. Unlike the
+    /// keyword-driven `CastingVariant` exile riders, this is a per-object marker
+    /// so it survives the during-resolution cast finalize regardless of the
+    /// spell's origin zone or casting variant.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exile_from_stack_instead_of_graveyard: bool,
+
     /// CR 305.1 + CR 603.4: Transient field tracking the zone a land was played
     /// from. Consumed by ETB trigger processing for conditions like "without
     /// being played"; permanents put onto the battlefield by effects leave this
@@ -715,6 +854,15 @@ pub struct GameObject {
     #[serde(default, skip_serializing_if = "is_zero_u32_field")]
     pub mana_spent_to_cast_amount: u32,
 
+    /// CR 702.150a: Number of this object's Phyrexian mana symbols that the
+    /// caster chose to pay with **life** (2 life each). Set at cast finalization
+    /// from the `ShardChoice::PayLife` selections; read when the object enters as
+    /// a planeswalker with `Keyword::Compleated` to reduce its entering loyalty by
+    /// two per symbol. Like `mana_spent_to_cast_amount`, this is a historical cast
+    /// fact that persists through resolution; initialized to 0 by `GameObject::new`.
+    #[serde(default, skip_serializing_if = "is_zero_u32_field")]
+    pub phyrexian_life_paid: u32,
+
     /// CR 106.3 + CR 601.2h: Source snapshots for each mana spent to cast this
     /// object. One entry per spent mana lets source-qualified dynamic quantities
     /// count "mana from a Cave/Treasure/artifact source" without depending on
@@ -730,6 +878,22 @@ pub struct GameObject {
 }
 
 impl GameObject {
+    /// Oathbreaker RC: true for the command-zone signature spell role.
+    pub fn is_signature_spell(&self) -> bool {
+        self.signature_spell.is_some()
+    }
+
+    /// Oathbreaker RC: mark this command-zone object as a signature spell.
+    pub fn mark_signature_spell(&mut self) {
+        self.signature_spell = Some(SignatureSpellState);
+    }
+
+    /// CR 903 + Oathbreaker RC: command-zone cards that use commander tax and
+    /// zone-return handling.
+    pub fn uses_command_zone_rules(&self) -> bool {
+        self.is_commander || self.is_signature_spell()
+    }
+
     /// CR 603.10 + CR 400.7: Snapshot this object's public characteristics
     /// for a zone-change event. The record captures state *at the moment of
     /// the move* so zone-change trigger filters and past-tense conditions
@@ -757,7 +921,10 @@ impl GameObject {
             base_power: self.base_power,
             base_toughness: self.base_toughness,
             colors: self.color.clone(),
-            mana_value: self.mana_cost.mana_value(),
+            // CR 202.3e: While on the stack, X equals the announced value, not 0.
+            mana_value: self
+                .mana_cost
+                .mana_value_with_x(self.zone, self.cost_x_paid),
             controller: self.controller,
             owner: self.owner,
             from_zone: from,
@@ -786,6 +953,9 @@ impl GameObject {
         }
         if self.base_loyalty.is_none() && self.loyalty.is_some() {
             self.base_loyalty = self.loyalty;
+        }
+        if self.base_name.is_empty() && !self.name.is_empty() {
+            self.base_name = self.name.clone();
         }
         if self.base_card_types == CardType::default() && self.card_types != CardType::default() {
             self.base_card_types = self.card_types.clone();
@@ -842,6 +1012,7 @@ impl GameObject {
             paired_with: None,
             pair_controller: None,
             counters: HashMap::new(),
+            intensity: 0,
             name: name.clone(),
             power: None,
             toughness: None,
@@ -862,7 +1033,10 @@ impl GameObject {
             base_printed_ref: None,
             token_image_ref: None,
             source_related_token_ids: Vec::new(),
+            spellbook: Vec::new(),
             back_face: None,
+            specialize_faces: None,
+            specialized_color: None,
             base_power: None,
             base_toughness: None,
             base_name: name.clone(),
@@ -879,6 +1053,7 @@ impl GameObject {
             base_characteristics_initialized: false,
             timestamp: 0,
             entered_battlefield_turn: None,
+            discarded_turn: None,
             summoning_sick: false,
             echo_due: false,
             cast_variant_paid: None,
@@ -889,6 +1064,10 @@ impl GameObject {
             additional_cost_payment_count: 0,
             convoked_creatures: Vec::new(),
             bestow_form: None,
+            prototype_form: None,
+            mutate_form: None,
+            merged_components: Vec::new(),
+            merge_layer_effect_id: None,
             cleave_form: None,
             cleave_variant: None,
             unimplemented_mechanics: Vec::new(),
@@ -899,10 +1078,13 @@ impl GameObject {
             available_mana_pips: Vec::new(),
             loyalty_activations_this_turn: 0,
             is_commander: false,
+            signature_spell: None,
             commander_tax: None,
             is_renowned: false,
             is_emblem: false,
+            emblem_source: None,
             is_token: false,
+            is_copy: false,
             display_source: DisplaySource::Card,
             modal: None,
             additional_cost: None,
@@ -925,18 +1107,19 @@ impl GameObject {
             room_unlocks: None,
             class_level: None,
             cast_from_zone: None,
+            exile_from_stack_instead_of_graveyard: false,
             played_from_zone: None,
             mana_spent_to_cast: false,
             colors_spent_to_cast: ColoredManaCount::default(),
             mana_spent_to_cast_amount: 0,
+            phyrexian_life_paid: 0,
             mana_spent_source_snapshots: Vec::new(),
             phase_status: PhaseStatus::PhasedIn,
         }
     }
 
-    /// CR 106.3 + CR 601.2h: Capture the public source characteristics needed
-    /// by source-qualified "mana spent to cast" effects.
-    pub fn snapshot_for_mana_spent(&self) -> LKISnapshot {
+    /// Capture public object characteristics for event-time look-back queries.
+    pub fn snapshot_public_characteristics(&self) -> LKISnapshot {
         LKISnapshot {
             name: self.name.clone(),
             power: self.power,
@@ -955,6 +1138,24 @@ impl GameObject {
             colors: self.color.clone(),
             chosen_attributes: self.chosen_attributes.clone(),
             counters: self.counters.clone(),
+        }
+    }
+
+    /// CR 106.3 + CR 601.2h: Capture the public source characteristics needed
+    /// by source-qualified "mana spent to cast" effects.
+    pub fn snapshot_for_mana_spent(&self) -> LKISnapshot {
+        self.snapshot_public_characteristics()
+    }
+
+    /// CR 508.1a: Capture the public characteristics of a creature when it is
+    /// declared as an attacker, so later "attacked with <quality> this turn"
+    /// queries do not depend on the attacker still existing.
+    pub fn snapshot_for_attack_declaration(&self, object_id: ObjectId) -> AttackDeclarationRecord {
+        AttackDeclarationRecord {
+            object_id,
+            lki: self.snapshot_public_characteristics(),
+            is_token: self.is_token,
+            is_commander: self.is_commander,
         }
     }
 
@@ -1024,6 +1225,34 @@ impl GameObject {
         }
     }
 
+    /// CR 613.1 + CR 400.7: Revert layer-derived characteristics to the object's
+    /// printed baseline. Mirrors the per-object reset in `evaluate_layers` Step 1
+    /// (layers.rs) but runs at zone-exit time so off-battlefield objects — e.g. a
+    /// Vesuva copy sacrificed to the legend rule — do not retain copied name, types,
+    /// or abilities in the graveyard after copy effects are pruned.
+    pub fn revert_layered_characteristics_to_base(&mut self) {
+        self.sync_missing_base_characteristics();
+        self.name = self.base_name.clone();
+        self.power = self.base_power;
+        self.toughness = self.base_toughness;
+        self.loyalty = self.base_loyalty;
+        // CR 310.4a + CR 400.7: Battle defense reverts to printed baseline off the battlefield.
+        self.defense = self.base_defense;
+        self.card_types = self.base_card_types.clone();
+        self.mana_cost = self.base_mana_cost.clone();
+        self.keywords = self.base_keywords.clone();
+        self.abilities = Arc::clone(&self.base_abilities);
+        self.trigger_definitions = Arc::clone(&self.base_trigger_definitions).into();
+        self.replacement_definitions = Arc::clone(&self.base_replacement_definitions).into();
+        self.static_definitions = Arc::clone(&self.base_static_definitions).into();
+        self.color = self.base_color.clone();
+        self.printed_ref = self.base_printed_ref.clone();
+        self.controller = self.base_controller.unwrap_or(self.owner);
+        self.assigns_damage_from_toughness = false;
+        self.assigns_damage_as_though_unblocked = false;
+        self.assigns_no_combat_damage = false;
+    }
+
     /// CR 400.7: Clear battlefield-only designations when a permanent leaves the battlefield.
     /// Separate from entry reset because some state (counters, transform) is already handled
     /// by `apply_zone_exit_cleanup` in zones.rs.
@@ -1037,6 +1266,10 @@ impl GameObject {
         // CR 701.60a / CR 702.112b: Suspect and renowned are battlefield designations.
         self.is_suspected = false;
         self.is_renowned = false;
+        // CR 400.7 + CR 702.150a: Compleated's life-payment count belongs to
+        // the cast that created this permanent. Once it leaves the battlefield,
+        // a later entry has no memory of that payment.
+        self.phyrexian_life_paid = 0;
         // CR 702.171b: Saddled clears when the Mount leaves the battlefield.
         self.is_saddled = false;
         // CR 702.xxx: Prepared (Strixhaven) is a battlefield-only designation —
@@ -1069,6 +1302,17 @@ impl GameObject {
         // stuck in Aura form because the revert block would skip it. The
         // SBA path (CR 702.103f override) handles the in-place battlefield
         // revert explicitly.
+        // CR 730.3: A merged permanent's components are split into their owners'
+        // zones by `merge::split_merged_permanent_on_leave` at the battlefield-
+        // exit seam, BEFORE this reset runs on the surviving object. The merge
+        // identity is battlefield-scoped (CR 400.7), so clear it here so a
+        // re-entering object is not stuck carrying stale component ids. `mutate_form`
+        // (stack-only, paralleling `bestow_form`) is intentionally NOT cleared here.
+        self.merged_components.clear();
+        // CR 730.3 + CR 400.7: merge copy effects are battlefield-scoped and are
+        // pruned at the battlefield-exit seam before this reset. Clear the stored
+        // id so a re-entering object cannot point at a stale transient effect.
+        self.merge_layer_effect_id = None;
         self.room_unlocks = None;
     }
 
@@ -1175,10 +1419,28 @@ impl GameObject {
         if !self.card_types.core_types.contains(&CoreType::Battle) {
             return None;
         }
+        self.chosen_player()
+    }
+
+    /// CR 613.1: The player persisted on this permanent via
+    /// `ChosenAttribute::Player` — the player chosen by an "as ~ enters the
+    /// battlefield, choose a player" replacement. Single authority for the
+    /// durable chosen player: used by `protector` (Battles) and by the
+    /// `SourceChosenPlayer` controller-ref / player-scope for CDAs such as
+    /// Sewer Nemesis and Skyshroud War Beast.
+    pub fn chosen_player(&self) -> Option<PlayerId> {
         self.chosen_attributes.iter().find_map(|a| match a {
             ChosenAttribute::Player(p) => Some(*p),
             _ => None,
         })
+    }
+
+    /// CR 111.1 + CR 707.10 + CR 707.12a: Whether this object is "represented by
+    /// a card" — i.e. a real card, not a token (CR 111.1) and not a copy
+    /// (CR 707.10/707.12a). Abilities that act "if this spell is represented by a
+    /// card" (Cipher's encode-on-resolution, CR 702.99a) gate on this.
+    pub fn is_represented_by_a_card(&self) -> bool {
+        !self.is_token && !self.is_copy
     }
 
     /// CR 714.1: Returns the final chapter number for a Saga, or None if not a Saga.
@@ -1238,6 +1500,25 @@ impl GameObject {
 /// Serde helper: skip serialization when a `u32` field is zero.
 fn is_zero_u32_field(n: &u32) -> bool {
     *n == 0
+}
+
+/// CR 607.2d + CR 608.2c: Resolve "the chosen player" from the source's
+/// linked persisted choice. Triggered abilities may resolve after the source
+/// left the battlefield; in that case the LKI cache carries the source choices
+/// as they last existed in the public zone.
+pub(crate) fn source_chosen_player(state: &GameState, source_id: ObjectId) -> Option<PlayerId> {
+    state
+        .objects
+        .get(&source_id)
+        .and_then(GameObject::chosen_player)
+        .or_else(|| {
+            state.lki_cache.get(&source_id).and_then(|lki| {
+                lki.chosen_attributes.iter().find_map(|attr| match attr {
+                    ChosenAttribute::Player(player) => Some(*player),
+                    _ => None,
+                })
+            })
+        })
 }
 
 #[cfg(test)]

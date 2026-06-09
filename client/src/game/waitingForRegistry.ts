@@ -46,6 +46,11 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "AbilityModeChoice",
     "ModalFaceChoice",
     "AlternativeCastChoice",
+    "SpliceOffer",
+    // CR 702.140c + CR 730.2a: mutate top/bottom merge choice (MutateMergeChoiceModal).
+    "MutateMergeChoice",
+    // CR 702.99a: cipher encode-on-resolve choice (CipherEncodeChoiceModal).
+    "CipherEncodeChoice",
     "CastingVariantChoice",
     "ChoosePermanentTypeSlot",
     // CR 118.3 + CR 601.2b + CR 605.3b: unified cost-payment selection
@@ -60,8 +65,8 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     // unified special-cast offer (Adventure / Miracle / Madness / Cascade /
     // Discover / Paradigm); dispatches on `data.kind.type`.
     "CastOffer",
-    // Note: `PopulateChoice` is intentionally NOT registered — it has no
-    // renderer anywhere in client/src/, so the safety-net modal must fire for it.
+    // CR 701.36a: choose a creature token to copy (board click via TargetingOverlay).
+    "PopulateChoice",
     // Mana abilities (cost-selection prompts now route through PayCost above).
     "PayManaAbilityMana",
     "ChooseManaColor",
@@ -69,6 +74,9 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "DeclareAttackers",
     "DeclareBlockers",
     "AssignCombatDamage",
+    // CR 702.22k: active player divides a banded blocker's combat damage
+    // (BlockerDamageAssignmentModal, rendered via CardChoiceModal).
+    "AssignBlockerDamage",
     "CombatTaxPayment",
     // Triggers / resolution-time choices
     "OrderTriggers",
@@ -76,6 +84,10 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "CopyTargetChoice",
     "CopyRetarget",
     "ExploreChoice",
+    // CR 303.4 + CR 115.1: return-as-Aura / non-spell Aura entry host pick.
+    // Resolved on the board (object hosts) or via player HUD glow (Curse /
+    // enchant-player Auras) — see TargetingOverlay + PlayerHud/OpponentHud.
+    "ReturnAsAuraTarget",
     "EquipTarget",
     "CrewVehicle",
     "StationTarget",
@@ -95,11 +107,13 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "EffectZoneChoice",
     "DrawnThisTurnTopdeckChoice",
     "LearnChoice",
+    "SpellbookDraft",
     "ManifestDreadChoice",
     "ClashChooseOpponent",
     "ClashCardPlacement",
     "TopOrBottomChoice",
     "ProliferateChoice",
+    "TimeTravelChoice",
     "ChooseObjectsSelection",
     "CategoryChoice",
     "DistributeAmong",
@@ -126,6 +140,7 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "ChooseRingBearer",
     "ChooseDungeon",
     "ChooseDungeonRoom",
+    "SpecializeColor",
     "ChooseLegend",
     "CommanderZoneChoice",
     "BattleProtectorChoice",

@@ -228,6 +228,59 @@ describe("TargetingOverlay", () => {
     });
   });
 
+  it("informs the player when the target slot is a spell on the stack", () => {
+    const dispatch = vi.fn().mockResolvedValue([]);
+    const stackSpellTarget = buildGameObjectWithCoreTypes(["Instant"], {
+      id: 8,
+      card_id: 8,
+      name: "Lightning Bolt",
+      zone: "Stack",
+    });
+
+    const counterspell = buildGameObjectWithCoreTypes(["Instant"], {
+      id: 9,
+      card_id: 9,
+      name: "Counterspell",
+      zone: "Stack",
+    });
+
+    const gameState = createGameState({
+      objects: {
+        "8": stackSpellTarget,
+        "9": counterspell,
+      },
+      waiting_for: {
+        type: "TargetSelection",
+        data: {
+          player: 0,
+          pending_cast: {
+            object_id: 9,
+            card_id: 9,
+            ability: { targets: [] },
+            cost: { type: "NoCost" },
+          },
+          target_slots: [{
+            legal_targets: [{ Object: 8 }],
+            optional: false,
+          }],
+          selection: { current_slot: 0, current_legal_targets: [{ Object: 8 }] },
+        },
+      },
+    });
+
+    act(() => {
+      useGameStore.setState({
+        gameState,
+        waitingFor: gameState.waiting_for,
+        dispatch,
+      });
+    });
+
+    render(<TargetingOverlay />);
+
+    expect(screen.getByText("a spell")).toBeInTheDocument();
+  });
+
   it("informs the player when the target slot is up to one nonland permanent", () => {
     const dispatch = vi.fn().mockResolvedValue([]);
     const nonLandTarget = buildGameObject({
@@ -405,6 +458,30 @@ describe("TargetingOverlay", () => {
 
     expect(
       screen.getByText("Deal 2 damage to any target. — a player"),
+    ).toBeInTheDocument();
+  });
+
+  it("renders the populate creature-token prompt", () => {
+    const dispatch = vi.fn().mockResolvedValue([]);
+    const gameState = createGameState({
+      waiting_for: {
+        type: "PopulateChoice",
+        data: { player: 0, source_id: 1, valid_tokens: [10, 11] },
+      },
+    });
+
+    act(() => {
+      useGameStore.setState({
+        gameState,
+        waitingFor: gameState.waiting_for,
+        dispatch,
+      });
+    });
+
+    render(<TargetingOverlay />);
+
+    expect(
+      screen.getByText("Choose a creature token to populate"),
     ).toBeInTheDocument();
   });
 

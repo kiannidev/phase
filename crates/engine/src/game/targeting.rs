@@ -504,11 +504,27 @@ pub fn resolved_targets(
     if use_self {
         return vec![TargetRef::Object(ability.source_id)];
     }
+    // CR 608.2c: ParentTarget / ParentTargetSlot inherit the full propagated
+    // target list from the parent ability. StackSpell uses player-chosen targets
+    // at ETB (issue #2351). Slot indexing for ParentTargetSlot happens in
+    // `effect_object_targets`; do not gate these on per-target filter matching.
+    if !ability.targets.is_empty()
+        && matches!(
+            target_filter,
+            TargetFilter::ParentTarget
+                | TargetFilter::ParentTargetSlot { .. }
+                | TargetFilter::StackSpell
+        )
+    {
+        return ability.targets.clone();
+    }
     // CR 601.2c + CR 608.2b: Pre-selected targets take precedence over
     // event-context resolution when the player chose targets at activation/
     // trigger placement. Without this ordering, a StackSpell filter on an ETB
     // trigger would bind to the ZoneChanged source (the creature itself)
     // instead of the spell the player targeted (issue #2351 — Aven Interrupter).
+    // Only trust propagated targets when every chosen target still matches the
+    // resolving filter (prevents ETB self-binding on unrelated filters).
     if !ability.targets.is_empty()
         && ability
             .targets

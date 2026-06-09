@@ -54,7 +54,10 @@ fn issue_1524_soul_jar_exiles_elf_and_offers_cast_from_exile() {
         "Once each turn must be represented exactly once"
     );
     assert!(
-        runner.state().objects[&jar].static_abilities.is_empty(),
+        runner.state().objects[&jar]
+            .base_static_definitions
+            .is_empty()
+            && runner.state().objects[&jar].static_definitions.is_empty(),
         "Soul-Jar's activated permission must not also parse as a static permission"
     );
 

@@ -56,9 +56,11 @@ pub(crate) fn lower_rule_static(
             .affected(affected)
             .description(description.to_string()),
         RuleStaticPredicate::BlockOnlyCreaturesWithFlying => {
-            StaticDefinition::new(StaticMode::BlockRestriction)
-                .affected(affected)
-                .description(description.to_string())
+            StaticDefinition::new(StaticMode::BlockRestriction {
+                filter: crate::types::statics::block_only_creatures_with_flying_filter(),
+            })
+            .affected(affected)
+            .description(description.to_string())
         }
         RuleStaticPredicate::Shroud if rule_static_affected_is_player_scope(&affected) => {
             StaticDefinition::new(StaticMode::Shroud)

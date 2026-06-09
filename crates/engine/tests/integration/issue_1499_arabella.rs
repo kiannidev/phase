@@ -5,8 +5,8 @@
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::types::ability::{
     AbilityDefinition, AbilityKind, Comparator, ControllerRef, Effect, FilterProp, PlayerFilter,
-    PtStat, PtValueScope, QuantityExpr, QuantityRef, TargetFilter, TriggerDefinition, TypedFilter,
-    TypeFilter,
+    PtStat, PtValueScope, QuantityExpr, QuantityRef, TargetFilter, TriggerDefinition, TypeFilter,
+    TypedFilter,
 };
 use engine::types::phase::Phase;
 use engine::types::triggers::TriggerMode;
@@ -29,13 +29,22 @@ fn arabella_attack_trigger() -> TriggerDefinition {
         },
     };
     TriggerDefinition::new(TriggerMode::Attacks)
-        .execute(AbilityDefinition::new(
-            AbilityKind::Spell,
-            Effect::DamageEachPlayer {
-                amount: x,
-                player_filter: PlayerFilter::Opponent,
-            },
-        ))
+        .execute(
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::DamageEachPlayer {
+                    amount: x.clone(),
+                    player_filter: PlayerFilter::Opponent,
+                },
+            )
+            .sub_ability(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::GainLife {
+                    amount: x,
+                    player: TargetFilter::Controller,
+                },
+            )),
+        )
         .valid_card(TargetFilter::SelfRef)
 }
 
@@ -55,6 +64,7 @@ fn issue_1499_arabella_attack_deals_x_and_gains_x() {
     let mut runner = scenario.build();
 
     let p1_life_before = runner.life(P1);
+    let p0_life_before = runner.life(P0);
 
     run_combat(&mut runner, vec![arabella], vec![]);
     runner.advance_until_stack_empty();
@@ -69,5 +79,10 @@ fn issue_1499_arabella_attack_deals_x_and_gains_x() {
         runner.life(P1),
         p1_life_before - 3,
         "DamageEachPlayer must deal 3 to each opponent"
+    );
+    assert_eq!(
+        runner.life(P0),
+        p0_life_before + 3,
+        "Arabella's second sentence must gain the controller 3 life"
     );
 }

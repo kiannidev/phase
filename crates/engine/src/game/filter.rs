@@ -581,6 +581,10 @@ fn scoped_player_or_controller(
     source_controller: Option<PlayerId>,
     scoped_iteration_player: Option<PlayerId>,
 ) -> Option<PlayerId> {
+    // CR 109.5 + CR 120.3: `ControllerRef::ScopedPlayer` first uses an
+    // ability-scoped binding, then the per-player binding from
+    // DamageEachPlayer quantity resolution; `source_controller` remains the
+    // fallback for "you"/"your" when no scoped player is active.
     ability
         .and_then(|a| a.scoped_player)
         .or(scoped_iteration_player)
@@ -783,15 +787,13 @@ fn stack_entry_controller_matches(
         Some(ControllerRef::Opponent) => ctx
             .source_controller
             .is_some_and(|controller| controller != entry_controller),
-        Some(ControllerRef::ScopedPlayer) => {
-            scoped_player_or_controller(
-                state,
-                ctx.ability,
-                ctx.source_controller,
-                ctx.scoped_iteration_player,
-            )
-            .is_some_and(|pid| pid == entry_controller)
-        }
+        Some(ControllerRef::ScopedPlayer) => scoped_player_or_controller(
+            state,
+            ctx.ability,
+            ctx.source_controller,
+            ctx.scoped_iteration_player,
+        )
+        .is_some_and(|pid| pid == entry_controller),
         Some(ControllerRef::TargetPlayer) => ctx
             .ability
             .and_then(|ability| {
@@ -1610,12 +1612,7 @@ fn zone_change_filter_inner(
                         return false;
                     }
                     ControllerRef::ScopedPlayer => {
-                        match scoped_player_or_controller(
-                            state,
-                            ability,
-                            source_controller,
-                            None,
-                        ) {
+                        match scoped_player_or_controller(state, ability, source_controller, None) {
                             Some(pid) if pid == record.controller => {}
                             _ => return false,
                         }

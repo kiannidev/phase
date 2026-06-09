@@ -918,6 +918,8 @@ pub(crate) fn resolve_quantity_scoped(
     source_id: ObjectId,
     scope_player: PlayerId,
 ) -> i32 {
+    // CR 109.5: "you"/"your" in the quantity remain bound to the ability's
+    // controller, not to the current DamageEachPlayer recipient.
     let ability_controller = state
         .objects
         .get(&source_id)
@@ -1050,6 +1052,8 @@ fn resolve_ref(
         ),
         None => {
             let mut fc = FilterContext::from_source_with_controller(source_id, controller);
+            // CR 120.3: DamageEachPlayer binds ControllerRef::ScopedPlayer to
+            // the current recipient while ControllerRef::You stays on `controller`.
             fc.scoped_iteration_player = ctx.scoped_player;
             fc
         }

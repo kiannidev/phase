@@ -1570,6 +1570,13 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
                     if let Some(prompt) = ordering_prompt {
                         return prompt;
                     }
+                    // CR 603.3: A begin-combat trigger awaiting target selection
+                    // (or with deferred siblings) sets `pending_trigger` /
+                    // `deferred_triggers` and `waiting_for` during
+                    // `process_triggers`. Do not overwrite with Priority.
+                    if state.pending_trigger.is_some() || !state.deferred_triggers.is_empty() {
+                        return state.waiting_for.clone();
+                    }
                     return WaitingFor::Priority {
                         player: state.active_player,
                     };

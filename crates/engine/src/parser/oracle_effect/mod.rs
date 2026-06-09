@@ -34718,7 +34718,7 @@ mod tests {
         else {
             panic!("expected GenericEffect grant, got {:?}", grant.effect);
         };
-        assert_eq!(target, None);
+        assert!(target.is_none());
         let static_def = static_abilities
             .first()
             .expect("lifelink grant must carry a static definition");

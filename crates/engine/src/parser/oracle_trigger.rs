@@ -27030,7 +27030,7 @@ mod snapshot_tests {
     #[test]
     fn trigger_compound_enters_and_upkeep_splits() {
         let defs = parse_trigger_lines_at_index(
-            "When this artifact enters and at the beginning of your upkeep, look at the top card of your library.",
+            "When this artifact enters and at the beginning of your upkeep, look at the top card of your library. If it's a card of the chosen type, you may reveal it and put it into your hand.",
             "Gathering Stone",
             None,
             &mut ParseContext::default(),
@@ -27050,6 +27050,31 @@ mod snapshot_tests {
             "second half should be upkeep phase, got {:?}",
             defs[1].mode
         );
+        let expected_condition = Some(AbilityCondition::RevealedHasCardType {
+            card_types: vec![],
+            additional_filter: Some(FilterProp::IsChosenCreatureType),
+            subtype_filter: None,
+        });
+        for (idx, def) in defs.iter().enumerate() {
+            let execute = def
+                .execute
+                .as_deref()
+                .unwrap_or_else(|| panic!("trigger {idx} should keep the shared effect"));
+            assert!(
+                matches!(&*execute.effect, Effect::Dig { .. }),
+                "trigger {idx} should look at the top card, got {:?}",
+                execute.effect
+            );
+            let reveal = execute
+                .sub_ability
+                .as_deref()
+                .unwrap_or_else(|| panic!("trigger {idx} should keep the chosen-type reveal gate"));
+            assert_eq!(
+                reveal.condition,
+                expected_condition.clone(),
+                "trigger {idx} should keep the chosen-type gate"
+            );
+        }
     }
 
     #[test]

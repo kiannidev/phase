@@ -760,10 +760,23 @@ pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityConditio
     // "permanent card" → TargetFilter::Typed(TypeFilter::Permanent) — and gate on it
     // with TargetMatchesFilter (the same condition variant the sibling MV arms use).
     if type_word == "permanent" {
-        let (filter, leftover) = crate::parser::oracle_target::parse_type_phrase("permanent card");
+        let (mut filter, leftover) =
+            crate::parser::oracle_target::parse_type_phrase("permanent card");
         if !matches!(filter, TargetFilter::Any) && leftover.trim().is_empty() {
-            // allow-noncombinator: structural separator after parsed clause
-            let remainder = after_type.strip_prefix(", ").unwrap_or(after_type);
+            let (after_type, chosen_type) = if let Ok((rest_after_chosen, _)) =
+                tag::<_, _, OracleError<'_>>(" of the chosen type").parse(after_type)
+            {
+                (rest_after_chosen, true)
+            } else {
+                (after_type, false)
+            };
+            if chosen_type {
+                let TargetFilter::Typed(typed) = &mut filter else {
+                    return (None, text.to_string());
+                };
+                typed.properties.push(FilterProp::IsChosenCreatureType);
+            }
+            let remainder = remainder_after_optional_comma(after_type);
             let offset = text.len() - remainder.len();
             return (
                 Some(maybe_negate(
@@ -4593,6 +4606,31 @@ mod tests {
             tf.type_filters.contains(&TypeFilter::Permanent),
             "expected Permanent type filter, got {:?}",
             tf.type_filters
+        );
+        assert_eq!(body, "draw a card.");
+    }
+
+    #[test]
+    fn strip_card_type_conditional_permanent_of_chosen_type() {
+        let (cond, body) = strip_card_type_conditional(
+            "If it's a permanent card of the chosen type, draw a card.",
+        );
+        let Some(AbilityCondition::TargetMatchesFilter { filter, use_lki }) = cond else {
+            panic!("expected TargetMatchesFilter for permanent chosen type, got {cond:?}");
+        };
+        assert!(!use_lki, "present-tense 'it's a' check must not use LKI");
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected Typed filter for permanent chosen type");
+        };
+        assert!(
+            tf.type_filters.contains(&TypeFilter::Permanent),
+            "expected Permanent type filter, got {:?}",
+            tf.type_filters
+        );
+        assert!(
+            tf.properties.contains(&FilterProp::IsChosenCreatureType),
+            "expected chosen-type property, got {:?}",
+            tf.properties
         );
         assert_eq!(body, "draw a card.");
     }

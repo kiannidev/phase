@@ -378,47 +378,6 @@ fn rewrite_cost_x_in_ability(def: &mut crate::types::ability::AbilityDefinition)
 /// most recent cast, and `cost_x_paid` is stamped on the object by
 /// `finalize_cast`. SelfRef/self-inclusive compound ETBs ("when ~ enters",
 /// "when ~ or another creature enters") route through this rewrite.
-fn put_counter_count_from_ability(ability: &AbilityDefinition) -> Option<QuantityExpr> {
-    if let Effect::PutCounter { count, .. } = ability.effect.as_ref() {
-        return Some(count.clone());
-    }
-    ability
-        .sub_ability
-        .as_deref()
-        .and_then(put_counter_count_from_ability)
-}
-
-/// CR 603.4 + CR 701.21a: YouAttack triggers that put X counters where X is the
-/// number of permanents sacrificed this turn only matter when X >= 1.
-fn attach_where_x_attack_intervening_if(def: &mut TriggerDefinition) {
-    if def.mode != TriggerMode::YouAttack {
-        return;
-    }
-    let Some(execute) = def.execute.as_deref() else {
-        return;
-    };
-    let Some(lhs) = put_counter_count_from_ability(execute) else {
-        return;
-    };
-    let QuantityExpr::Ref {
-        qty: QuantityRef::SacrificedThisTurn { .. },
-    } = lhs
-    else {
-        return;
-    };
-    let intervening = TriggerCondition::QuantityComparison {
-        lhs,
-        comparator: Comparator::GE,
-        rhs: QuantityExpr::Fixed { value: 1 },
-    };
-    def.condition = Some(match def.condition.take() {
-        Some(existing) => TriggerCondition::And {
-            conditions: vec![existing, intervening],
-        },
-        None => intervening,
-    });
-}
-
 fn trigger_should_rewrite_cost_x(def: &TriggerDefinition) -> bool {
     if def.mode != TriggerMode::ChangesZone {
         return false;
@@ -1077,8 +1036,6 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
             rewrite_cost_x_in_ability(execute);
         }
     }
-
-    attach_where_x_attack_intervening_if(&mut def);
 
     // CR 608.2k + CR 603.7c: For event-source-bearing trigger modes, the "that
     // card / that creature / that permanent" anaphor in the effect body

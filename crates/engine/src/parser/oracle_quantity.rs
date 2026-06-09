@@ -13,7 +13,7 @@ use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::combinator::{all_consuming, eof, opt, value};
 use nom::multi::separated_list1;
-use nom::sequence::{pair, preceded, terminated};
+use nom::sequence::{pair, preceded, terminated, tuple};
 use nom::Parser;
 
 use super::oracle_ir::context::ParseContext;
@@ -828,30 +828,25 @@ fn parse_sacrificed_permanents_this_turn_quantity(text: &str) -> Option<Quantity
 }
 
 fn parse_sacrificed_permanents_this_turn_filter(input: &str) -> Option<(&str, TargetFilter)> {
-    if let Ok((rest, filter)) = alt((
-        value(
-            TargetFilter::Typed(TypedFilter {
-                type_filters: vec![TypeFilter::Permanent],
-                ..Default::default()
-            }),
-            tag::<_, _, OracleError<'_>>("permanents you've sacrificed this turn"),
-        ),
-        value(
-            TargetFilter::Typed(TypedFilter {
-                type_filters: vec![TypeFilter::Permanent],
-                ..Default::default()
-            }),
-            tag("permanents you sacrificed this turn"),
-        ),
+    let (suffix_rest, type_text) = take_until::<_, _, OracleError<'_>>(" you")
+        .parse(input)
+        .ok()?;
+    let (rest, _) = tuple((
+        tag::<_, _, OracleError<'_>>(" you"),
+        opt(tag("'ve")),
+        tag(" sacrificed this turn"),
     ))
-    .parse(input)
-    {
-        return Some((rest, filter));
+    .parse(suffix_rest)
+    .ok()?;
+    if type_text.trim() == "permanents" {
+        return Some((
+            rest,
+            TargetFilter::Typed(TypedFilter {
+                type_filters: vec![TypeFilter::Permanent],
+                ..Default::default()
+            }),
+        ));
     }
-
-    let (type_text, rest) = input
-        .split_once(" you've sacrificed this turn")
-        .or_else(|| input.split_once(" you sacrificed this turn"))?;
     let (filter, leftover) = parse_type_phrase(type_text.trim());
     if !leftover.trim().is_empty() || filter == TargetFilter::Any {
         return None;

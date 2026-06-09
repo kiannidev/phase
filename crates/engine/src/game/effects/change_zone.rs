@@ -1473,6 +1473,28 @@ pub fn resolve_all(
     let effective_filter =
         crate::game::targeting::resolve_tracked_set_sentinel(state, effective_filter);
 
+    // CR 701.17c + CR 603.7: Re-derive scan zones after the tracked-set sentinel
+    // binds — the initial `origin`/`target` snapshot may have defaulted to the
+    // battlefield before `chain_tracked_set_id` was populated (Zimone's
+    // Experiment: kept cards live in the library until routed by type).
+    let origin_zones = if matches!(
+        &ability.effect,
+        Effect::ChangeZoneAll {
+            origin: None,
+            ..
+        }
+    ) {
+        if let Some(zone) = tracked_set_member_zone(state, &effective_filter) {
+            vec![zone]
+        } else if let Some(zone) = tracked_set_member_zone(state, &target_filter) {
+            vec![zone]
+        } else {
+            origin_zones
+        }
+    } else {
+        origin_zones
+    };
+
     let track_exiled_by_source =
         crate::game::exile_links::should_track_exiled_by_source(state, ability.source_id, ability);
 
@@ -5661,6 +5683,64 @@ mod tests {
             Zone::Battlefield,
             "Exiled creature must return to the battlefield when TrackedSetId(0) is resolved"
         );
+    }
+
+    /// Zimone's Experiment: tracked-set routing must scan the members' actual zone
+    /// (library) when `origin` is None (issue #2368).
+    #[test]
+    fn issue_2368_tracked_set_filtered_scans_library_when_origin_none() {
+        let mut state = GameState::new_two_player(42);
+        let land = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Forest".to_string(),
+            Zone::Library,
+        );
+        state.objects.get_mut(&land).unwrap().card_types.core_types = vec![CoreType::Land];
+        let creature = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Bear".to_string(),
+            Zone::Library,
+        );
+        state.objects.get_mut(&creature).unwrap().card_types.core_types = vec![CoreType::Creature];
+
+        let set_id = TrackedSetId(state.next_tracked_set_id);
+        state.next_tracked_set_id += 1;
+        state
+            .tracked_object_sets
+            .insert(set_id, vec![land, creature]);
+        state.chain_tracked_set_id = Some(set_id);
+
+        let land_filter = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Land],
+            controller: None,
+            properties: vec![],
+        });
+        let ability = ResolvedAbility::new(
+            Effect::ChangeZoneAll {
+                origin: None,
+                destination: Zone::Battlefield,
+                target: TargetFilter::TrackedSetFiltered {
+                    id: TrackedSetId(0),
+                    filter: Box::new(land_filter),
+                },
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Tapped,
+                face_down_profile: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve_all(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.objects[&land].zone, Zone::Battlefield);
+        assert!(state.objects[&land].tapped);
+        assert_eq!(state.objects[&creature].zone, Zone::Library);
     }
 
     /// CR 708.2a + CR 708.3 + CR 110.2a: Cyber-Controller's mass put-step — "Put

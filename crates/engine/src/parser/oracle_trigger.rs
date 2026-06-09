@@ -68,6 +68,18 @@ fn filter_references_self(filter: &TargetFilter) -> bool {
     }
 }
 
+/// CR 109.5: "Whenever you cast a spell you don't own" — the spell's owner is
+/// an opponent even though its controller on the stack is you.
+fn strip_spell_not_owned_qualifier(payload: &str) -> (&str, bool) {
+    const SUFFIXES: &[&str] = &[" you don't own", " you do not own"];
+    for suffix in SUFFIXES {
+        if let Some(stripped) = payload.strip_suffix(suffix) {
+            return (stripped.trim(), true);
+        }
+    }
+    (payload, false)
+}
+
 fn with_owner_scope(filter: TargetFilter, controller: ControllerRef) -> TargetFilter {
     match filter {
         TargetFilter::Typed(mut typed) => {
@@ -8922,6 +8934,7 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
             .map(|(_, (before, _))| before)
             .unwrap_or(after)
             .trim();
+        let (payload, spell_not_owned_by_you) = strip_spell_not_owned_qualifier(payload);
 
         // CR 601.2a: pre-extract the "from <zone>" cast-origin tail BEFORE
         // running the type-phrase parser. `parse_type_phrase`'s
@@ -8955,6 +8968,11 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
             } else {
                 filter
             };
+            let filter = if spell_not_owned_by_you {
+                with_owner_scope(filter, ControllerRef::Opponent)
+            } else {
+                filter
+            };
             def.valid_card = Some(filter);
             return Some((TriggerMode::SpellCast, def));
         }
@@ -8966,13 +8984,18 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
         } else {
             filter
         };
+        let filter = if spell_not_owned_by_you {
+            with_owner_scope(filter, ControllerRef::Opponent)
+        } else {
+            filter
+        };
         let is_meaningful = match &filter {
             TargetFilter::Typed(tf) => tf.has_meaningful_type_constraint(),
             // Or-filters are always meaningful (e.g. "instant or sorcery spell")
             TargetFilter::Or { .. } => true,
             _ => false,
         };
-        if is_meaningful {
+        if is_meaningful || spell_not_owned_by_you {
             def.valid_card = Some(filter);
         }
         return Some((TriggerMode::SpellCast, def));
@@ -11267,6 +11290,24 @@ mod tests {
                 assert!(!filters.is_empty(), "expected non-empty Or filter");
                 for filter in filters {
                     assert_owned_by_you(filter);
+                }
+            }
+            other => panic!("expected Typed or Or filter, got {other:?}"),
+        }
+    }
+
+    fn assert_owned_by_opponent(filter: &TargetFilter) {
+        match filter {
+            TargetFilter::Typed(typed) => assert!(
+                typed.properties.contains(&FilterProp::Owned {
+                    controller: ControllerRef::Opponent,
+                }),
+                "expected Owned(Opponent) property in {typed:?}"
+            ),
+            TargetFilter::Or { filters } => {
+                assert!(!filters.is_empty(), "expected non-empty Or filter");
+                for filter in filters {
+                    assert_owned_by_opponent(filter);
                 }
             }
             other => panic!("expected Typed or Or filter, got {other:?}"),
@@ -15623,6 +15664,21 @@ mod tests {
         );
         // Must restrict to controller's spells
         assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+    }
+
+    #[test]
+    fn trigger_you_cast_spell_you_dont_own() {
+        let def = parse_trigger_line(
+            "Whenever you cast a spell you don't own, put a +1/+1 counter on each creature you control.",
+            "Nita, Forum Conciliator",
+        );
+        assert_eq!(def.mode, TriggerMode::SpellCast);
+        assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+        assert_owned_by_opponent(
+            def.valid_card
+                .as_ref()
+                .expect("spell you don't own must carry valid_card"),
+        );
     }
 
     #[test]

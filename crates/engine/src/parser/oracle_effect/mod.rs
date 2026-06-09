@@ -17852,6 +17852,7 @@ fn extract_effect_verb(effect: &Effect) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::parse_oracle_text;
     use crate::types::ability::{
         AbilityCondition, AggregateFunction, BounceSelection, CardTypeSetSource, CastVariantPaid,
         ChoiceType, ChosenSubtypeKind, CombatRelation, CombatRelationSubject, Comparator,

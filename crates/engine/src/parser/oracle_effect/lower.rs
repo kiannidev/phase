@@ -2257,6 +2257,13 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
     if target_relative_clause_owns_suffix(lower.as_str()) {
         return (text, None);
     }
+    // CR 603.4: "this turn" on a per-turn quantity tracker ("tokens you created
+    // this turn", "life you gained this turn") is part of the quantity phrase,
+    // not a trailing duration on the effect. Without this guard, Thalisse's
+    // where-X binding loses " this turn" and resolves to 0 at runtime.
+    if quantity_tracking_owns_this_turn_suffix(lower.as_str()) {
+        return (text, None);
+    }
     for (suffix, duration) in [
         (" this turn", Duration::UntilEndOfTurn),
         (" until end of turn", Duration::UntilEndOfTurn),
@@ -2317,6 +2324,22 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
     }
 
     (text, None)
+}
+
+fn quantity_tracking_owns_this_turn_suffix(lower: &str) -> bool {
+    const PHRASES: &[&str] = &[
+        " you created this turn",
+        " you've created this turn",
+        " you gained this turn",
+        " you've gained this turn",
+        " you sacrificed this turn",
+        " you've sacrificed this turn",
+        " you cast this turn",
+        " you've cast this turn",
+        " entered the battlefield this turn",
+        " entered the battlefield under your control this turn",
+    ];
+    PHRASES.iter().any(|phrase| lower.contains(phrase))
 }
 
 fn target_relative_clause_owns_suffix(input: &str) -> bool {
@@ -4803,6 +4826,38 @@ mod where_x_tests {
                 qty: QuantityRef::EventContextAmount,
             })
         );
+    }
+
+    #[test]
+    fn where_x_tokens_created_this_turn_binds_typed_quantity() {
+        use crate::types::ability::{FilterProp, PlayerScope, TargetFilter, TypedFilter};
+
+        assert_eq!(
+            parse_where_x_quantity_expression("the number of tokens you created this turn"),
+            Some(QuantityExpr::Ref {
+                qty: QuantityRef::TokensCreatedThisTurn {
+                    player: PlayerScope::Controller,
+                    filter: TargetFilter::Typed(TypedFilter {
+                        type_filters: vec![],
+                        controller: None,
+                        properties: vec![FilterProp::Token],
+                    }),
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn strip_trailing_duration_preserves_tokens_created_this_turn_phrase() {
+        use super::strip_trailing_duration;
+
+        let text = "create X 1/1 white Spirit creature tokens with flying, where X is the number of tokens you created this turn.";
+        let (stripped, duration) = strip_trailing_duration(text);
+        assert!(
+            duration.is_none(),
+            "quantity tracker must not become a duration"
+        );
+        assert!(stripped.contains("you created this turn"));
     }
 
     /// The new delegation must NOT shadow `parse_cda_quantity`: "the number of

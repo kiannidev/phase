@@ -662,20 +662,18 @@ fn type_filter_to_core_type(tf: &TypeFilter) -> Option<CoreType> {
 
 /// CR 608.2c: "If an instant or sorcery card is revealed this way, ..."
 /// (Delver of Secrets class) — gates a sub_ability on the last revealed card's type.
-fn parse_if_revealed_card_type_conditional(
-    text: &str,
-    lower: &str,
-) -> Option<(AbilityCondition, String)> {
-    let (rest, _) = alt((
-        tag::<_, _, OracleError<'_>>("if an "),
-        tag::<_, _, OracleError<'_>>("if a "),
-    ))
-    .parse(lower)
-    .ok()?;
-    let (rest, type_filters) = nom_quantity::parse_type_filter_list(rest).ok()?;
-    let (rest, _) = tag::<_, _, OracleError<'_>>(" card is revealed this way")
-        .parse(rest)
-        .ok()?;
+fn parse_if_revealed_card_type_conditional(text: &str) -> Option<(AbilityCondition, String)> {
+    let lower = text.to_lowercase();
+    let (type_filters, remainder) = nom_on_lower(text, &lower, |input| {
+        let (rest, _) = alt((
+            tag::<_, _, OracleError<'_>>("if an "),
+            tag::<_, _, OracleError<'_>>("if a "),
+        ))
+        .parse(input)?;
+        let (rest, type_filters) = nom_quantity::parse_type_filter_list(rest)?;
+        let (rest, _) = tag::<_, _, OracleError<'_>>(" card is revealed this way").parse(rest)?;
+        Ok((rest, type_filters))
+    })?;
     let core_types: Vec<CoreType> = type_filters
         .iter()
         .filter_map(type_filter_to_core_type)
@@ -683,8 +681,6 @@ fn parse_if_revealed_card_type_conditional(
     if core_types.is_empty() {
         return None;
     }
-    let remainder = remainder_after_optional_comma(rest);
-    let offset = text.len().checked_sub(remainder.len())?;
     let mut alt_types = core_types;
     let primary = alt_types.remove(0);
     Some((
@@ -694,15 +690,15 @@ fn parse_if_revealed_card_type_conditional(
             additional_filter: None,
             subtype_filter: None,
         },
-        text[offset..].to_string(),
+        remainder_after_optional_comma(remainder).to_string(),
     ))
 }
 
 pub(super) fn strip_card_type_conditional(text: &str) -> (Option<AbilityCondition>, String) {
-    let lower = text.to_lowercase();
-    if let Some((condition, remainder)) = parse_if_revealed_card_type_conditional(text, &lower) {
+    if let Some((condition, remainder)) = parse_if_revealed_card_type_conditional(text) {
         return (Some(condition), remainder);
     }
+    let lower = text.to_lowercase();
     let rest = alt((
         tag::<_, _, OracleError<'_>>("if it's a "),
         tag("if it's an "),

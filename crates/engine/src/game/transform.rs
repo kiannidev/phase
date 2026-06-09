@@ -41,16 +41,17 @@ pub fn transform_permanent(
 
     let obj = state.objects.get_mut(&object_id).unwrap();
 
-    // CR 701.27e: An effect that instructs a player to transform a permanent
-    // that is already transformed leaves it transformed.
     if obj.transformed {
-        return Ok(());
+        let current_back = snapshot_object_face(obj);
+        apply_back_face_to_object(obj, back_face);
+        obj.back_face = Some(current_back);
+        obj.transformed = false;
+    } else {
+        let current_front = snapshot_object_face(obj);
+        apply_back_face_to_object(obj, back_face);
+        obj.back_face = Some(current_front);
+        obj.transformed = true;
     }
-
-    let current_front = snapshot_object_face(obj);
-    apply_back_face_to_object(obj, back_face);
-    obj.back_face = Some(current_front);
-    obj.transformed = true;
 
     crate::game::layers::mark_layers_full(state);
 
@@ -171,28 +172,12 @@ mod tests {
         let mut events = Vec::new();
 
         transform_permanent(&mut state, id, &mut events).unwrap();
-        // CR 701.27e: a second transform instruction on an already-transformed
-        // permanent is a no-op (Harmonic Prodigy / Delver class).
         transform_permanent(&mut state, id, &mut events).unwrap();
 
         let obj = &state.objects[&id];
-        assert!(obj.transformed);
-        assert_eq!(obj.name, "Werewolf Back");
-        assert_eq!(events.len(), 1);
-    }
-
-    #[test]
-    fn issue_2367_second_transform_on_back_face_is_noop() {
-        let mut state = GameState::new_two_player(42);
-        let id = setup_dfc(&mut state);
-        let mut events = Vec::new();
-
-        transform_permanent(&mut state, id, &mut events).unwrap();
-        transform_permanent(&mut state, id, &mut events).unwrap();
-
-        assert!(state.objects[&id].transformed);
-        assert_eq!(state.objects[&id].name, "Werewolf Back");
-        assert_eq!(events.len(), 1);
+        assert!(!obj.transformed);
+        assert_eq!(obj.name, "Werewolf Front");
+        assert_eq!(events.len(), 2);
     }
 
     #[test]

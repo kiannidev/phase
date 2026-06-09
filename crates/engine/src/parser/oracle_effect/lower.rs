@@ -4428,6 +4428,14 @@ pub(crate) fn strip_trailing_where_x<'a>(tp: TextPair<'a>) -> (TextPair<'a>, Opt
             if let Some((clause, _)) = after.split_around(". ") {
                 after_clause = clause;
             }
+            // CR 608.2c: Harvest Season — "... where X is N, put those cards ..."
+            // shares one sentence; truncate before imperative search-result tails.
+            for needle in [", put ", ", reveal ", ", and put ", ", and reveal "] {
+                if let Some((clause, _)) = after_clause.split_around(needle) {
+                    after_clause = clause;
+                    break;
+                }
+            }
             let expression = after_clause
                 .original
                 .trim()

@@ -9415,11 +9415,16 @@ fn can_feasibly_pay_mana_cost_without_x(
         crate::types::mana::ManaCost::Cost { shards, generic } => (shards, *generic),
     };
 
-    // CR 117.1: Colored-shard feasibility under non-tap mana sources is
-    // deferred (see issue #1234 — Phyrexian Altar, Lion's Eye Diamond, etc.).
-    // Pure-generic residual is sufficient for the principal repro (KCI
-    // sacrificing artifacts for `{C}{C}`).
-    if !residual_shards.is_empty() {
+    // CR 117.1d + CR 601.2g: Colored-shard feasibility under non-tap mana
+    // sources (issue #583: Vivi Ornitier {0} combination mana; extends #1234).
+    if !residual_shards.is_empty()
+        && !super::mana_sources::can_cover_shards_with_activatable_mana(
+            state,
+            player,
+            source_id,
+            residual_shards,
+        )
+    {
         return false;
     }
     if residual_generic == 0 {

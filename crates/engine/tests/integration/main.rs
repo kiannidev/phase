@@ -126,6 +126,7 @@ mod issue_2431_ultima_tap_land_for_c;
 mod issue_2435_traumatic_critique;
 mod issue_2439_wayta_trigger_doubling;
 mod issue_580_solitude_evoke_prompt;
+mod issue_583_vivi_ornitier_mana_source;
 mod issue_709_regression;
 mod issue_860_luminarch_aspirant;
 mod issue_879_obsessive_pursuit;

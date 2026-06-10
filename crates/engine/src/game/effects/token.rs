@@ -2377,8 +2377,9 @@ fn predefined_role_token_spec(name: &str) -> Option<RoleSpec> {
 /// the layer pass rebuilds live from base on each pass, but several code
 /// paths (SBAs, action enumeration) consult the live set directly between
 /// passes so keeping them in sync here avoids a one-frame lag.
-/// CR 111.10: Grant catalog `rules_text` when token creation resolved a
-/// `token_image_ref` preset (e.g. SOS Pest attack life gain).
+/// CR 111.4 + CR 707.2a: Grant catalog `rules_text` when token creation resolved
+/// a `token_image_ref` preset whose abilities are not already covered by the
+/// predefined path (e.g. SOS Pest attack life gain).
 pub(super) fn inject_catalog_token_abilities(
     state: &mut GameState,
     obj_id: crate::types::identifiers::ObjectId,
@@ -2391,6 +2392,15 @@ pub(super) fn inject_catalog_token_abilities(
     }) else {
         return;
     };
+    // CR 111.10 + CR 707.2a: Predefined-artifact presets already receive their
+    // abilities from `inject_predefined_token_abilities`; re-deriving from
+    // rules_text would double-grant the same sacrifice/mana ability.
+    if matches!(
+        preset.category,
+        crate::game::token_presets::TokenCategory::PredefinedArtifact { .. }
+    ) {
+        return;
+    }
     let Some(rules_text) = preset.rules_text.as_deref().filter(|text| !text.is_empty()) else {
         return;
     };
@@ -2398,12 +2408,41 @@ pub(super) fn inject_catalog_token_abilities(
     if modifications.is_empty() {
         return;
     }
-    let static_def = crate::types::ability::StaticDefinition::continuous()
-        .affected(crate::types::ability::TargetFilter::SelfRef)
-        .modifications(modifications)
-        .description(rules_text.to_string());
-    Arc::make_mut(&mut obj.base_static_definitions).push(static_def.clone());
-    obj.static_definitions.push(static_def);
+
+    let mut static_mods = Vec::new();
+    let mut triggers = Vec::new();
+    let mut abilities = Vec::new();
+    let mut keywords = Vec::new();
+    for modification in modifications {
+        match modification {
+            ContinuousModification::GrantTrigger { trigger } => triggers.push(*trigger),
+            ContinuousModification::AddKeyword { keyword } => keywords.push(keyword),
+            ContinuousModification::GrantAbility { definition } => abilities.push(*definition),
+            other => static_mods.push(other),
+        }
+    }
+
+    if !static_mods.is_empty() {
+        let static_def = StaticDefinition::continuous()
+            .affected(TargetFilter::SelfRef)
+            .modifications(static_mods)
+            .description(rules_text.to_string());
+        Arc::make_mut(&mut obj.base_static_definitions).push(static_def.clone());
+        obj.static_definitions.push(static_def);
+    }
+    if !triggers.is_empty() {
+        Arc::make_mut(&mut obj.base_trigger_definitions).extend(triggers.iter().cloned());
+        for trigger in triggers {
+            obj.trigger_definitions.push(trigger);
+        }
+    }
+    if !abilities.is_empty() {
+        Arc::make_mut(&mut obj.abilities).extend(abilities.iter().cloned());
+        Arc::make_mut(&mut obj.base_abilities).extend(abilities);
+    }
+    if !keywords.is_empty() {
+        obj.keywords.extend(keywords);
+    }
     if obj.token_rules_text.is_none() {
         obj.token_rules_text = Some(rules_text.to_string());
     }
@@ -3608,16 +3647,84 @@ mod tests {
         }
         inject_catalog_token_abilities(&mut state, obj_id);
         let obj = &state.objects[&obj_id];
-        assert!(
-            obj.static_definitions.iter_all().any(|s| s
-                .modifications
-                .iter()
-                .any(|m| matches!(m, ContinuousModification::GrantTrigger { .. }))),
-            "catalog rules_text must grant the attacks life trigger"
+        assert_eq!(
+            obj.trigger_definitions.len(),
+            1,
+            "catalog rules_text must install the attacks life trigger intrinsically"
         );
+        assert_eq!(obj.trigger_definitions[0].mode, TriggerMode::Attacks);
         assert_eq!(
             obj.token_rules_text.as_deref(),
             Some("Whenever this token attacks, you gain 1 life.")
+        );
+    }
+
+    #[test]
+    fn predefined_treasure_create_token_pipeline_has_exactly_one_mana_ability() {
+        use crate::types::proposed_event::TokenCharacteristics;
+        use std::collections::HashSet;
+
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(99),
+            PlayerId(0),
+            "Rapacious Dragon".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .source_related_token_ids
+            .push("0060ce13-67e2-5607-a29b-721c743e6770".to_string());
+        let spec = TokenSpec {
+            characteristics: TokenCharacteristics {
+                display_name: "Treasure".to_string(),
+                power: None,
+                toughness: None,
+                core_types: vec![CoreType::Artifact],
+                subtypes: vec!["Treasure".to_string()],
+                supertypes: vec![],
+                colors: vec![],
+                keywords: vec![],
+            },
+            script_name: "Treasure".to_string(),
+            static_abilities: vec![],
+            enter_with_counters: vec![],
+            tapped: false,
+            enters_attacking: false,
+            sacrifice_at: None,
+            source_id: source,
+            controller: PlayerId(0),
+            attach_to: None,
+        };
+        let event = ProposedEvent::CreateToken {
+            owner: PlayerId(0),
+            spec: Box::new(spec),
+            copy: None,
+            enter_tapped: crate::types::proposed_event::EtbTapState::Unspecified,
+            count: 1,
+            applied: HashSet::new(),
+        };
+        let mut events = vec![];
+        apply_create_token_after_replacement(&mut state, event, &mut events);
+
+        let treasure_id = state.last_created_token_ids[0];
+        let obj = &state.objects[&treasure_id];
+        assert!(
+            obj.token_image_ref.is_some(),
+            "Treasure creation must resolve a catalog preset image ref"
+        );
+        assert_eq!(
+            obj.abilities.len(),
+            1,
+            "predefined Treasure must carry exactly one sacrifice-for-mana ability"
+        );
+        assert!(matches!(*obj.abilities[0].effect, Effect::Mana { .. }));
+        assert!(
+            obj.trigger_definitions.is_empty(),
+            "catalog injection must not double-grant predefined Treasure triggers"
         );
     }
 

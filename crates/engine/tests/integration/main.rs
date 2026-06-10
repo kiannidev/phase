@@ -136,6 +136,7 @@ mod issue_580_solitude_evoke_prompt;
 mod issue_583_vivi_ornitier_mana_source;
 mod issue_709_regression;
 mod issue_860_luminarch_aspirant;
+mod issue_874_nadiers_nightblade_token_leaves;
 mod issue_879_obsessive_pursuit;
 mod issue_924_offspring;
 mod jace_wielder_empty_library_win;

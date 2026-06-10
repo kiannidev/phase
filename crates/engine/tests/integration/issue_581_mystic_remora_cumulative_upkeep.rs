@@ -1,7 +1,10 @@
-//! Regression (issue #581): Mystic Remora must add an age counter at upkeep and
-//! prompt its controller to pay cumulative upkeep {1} per age counter.
+//! Regression (issue #581): Mystic Remora cumulative upkeep must fire after
+//! resolving a cast through the stack and after card-db rehydration rebuilds
+//! a stale trigger index.
 
+use engine::game::rehydrate_game_from_card_db;
 use engine::game::scenario::GameScenario;
+use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::ability::AbilityCost;
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
@@ -13,9 +16,9 @@ use engine::types::player::PlayerId;
 use engine::types::triggers::TriggerMode;
 use engine::types::zones::Zone;
 
-const P0: PlayerId = PlayerId(0);
+use crate::support::shared_card_db as load_db;
 
-const MYSTIC_REMORA_ORACLE: &str = "Cumulative upkeep {1} (At the beginning of your upkeep, put an age counter on this permanent, then sacrifice it unless you pay its upkeep cost for each age counter on it.)\nWhenever an opponent casts a noncreature spell, you may draw a card unless that player pays {4}.";
+const P0: PlayerId = PlayerId(0);
 
 fn floating_colorless(n: usize) -> Vec<ManaUnit> {
     (0..n)
@@ -23,20 +26,26 @@ fn floating_colorless(n: usize) -> Vec<ManaUnit> {
         .collect()
 }
 
-fn setup_at_unless_prompt() -> (engine::game::scenario::GameRunner, ObjectId) {
-    let mut scenario = GameScenario::new();
-    scenario.at_phase(Phase::Untap);
+fn add_mana(runner: &mut engine::game::scenario::GameRunner, mana: &[ManaType]) {
+    let dummy = ObjectId(0);
+    let pool = &mut runner
+        .state_mut()
+        .players
+        .iter_mut()
+        .find(|p| p.id == P0)
+        .unwrap()
+        .mana_pool;
+    for m in mana {
+        pool.add(ManaUnit::new(*m, dummy, false, vec![]));
+    }
+}
 
-    let remora = scenario
-        .add_creature_from_oracle(P0, "Mystic Remora", 0, 0, MYSTIC_REMORA_ORACLE)
-        .as_artifact()
-        .id();
-
-    let mut runner = scenario.build();
-
+fn assert_has_cumulative_upkeep_trigger(
+    state: &engine::types::game_state::GameState,
+    remora: ObjectId,
+) {
     assert!(
-        runner
-            .state()
+        state
             .objects
             .get(&remora)
             .unwrap()
@@ -46,16 +55,13 @@ fn setup_at_unless_prompt() -> (engine::game::scenario::GameRunner, ObjectId) {
             .any(|t| matches!(t.mode, TriggerMode::PayCumulativeUpkeep)),
         "Mystic Remora must carry a synthesized cumulative-upkeep trigger"
     );
-
-    runner.advance_to_upkeep();
-    runner.resolve_top();
-    (runner, remora)
 }
 
-#[test]
-fn issue_581_mystic_remora_upkeep_adds_age_counter_and_prompts_payment() {
-    let (mut runner, remora) = setup_at_unless_prompt();
-
+fn assert_upkeep_unless_prompt(
+    runner: &engine::game::scenario::GameRunner,
+    remora: ObjectId,
+    expected_generic: u32,
+) {
     assert_eq!(
         runner.state().objects[&remora]
             .counters
@@ -71,13 +77,53 @@ fn issue_581_mystic_remora_upkeep_adds_age_counter_and_prompts_payment() {
             assert_eq!(
                 cost,
                 &AbilityCost::Mana {
-                    cost: ManaCost::generic(1)
+                    cost: ManaCost::generic(expected_generic)
                 },
-                "one age counter × cumulative upkeep {{1}} = {{1}}"
+                "age counter count × cumulative upkeep {{1}}"
             );
         }
         other => panic!("expected UnlessPayment for Mystic Remora upkeep, got {other:?}"),
     }
+}
+
+fn advance_to_upkeep_prompt(runner: &mut engine::game::scenario::GameRunner) {
+    runner.advance_to_upkeep();
+    runner.resolve_top();
+}
+
+#[test]
+fn cast_pipeline_upkeep_adds_age_counter_and_prompts_payment() {
+    let Some(db) = load_db() else {
+        return;
+    };
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let remora = scenario.add_real_card(P0, "Mystic Remora", Zone::Hand, &db);
+    let mut runner = scenario.build();
+
+    add_mana(&mut runner, &[ManaType::Blue]);
+    runner.cast(remora).resolve();
+
+    let remora_bf = runner
+        .state()
+        .objects
+        .get(&remora)
+        .expect("cast Mystic Remora")
+        .zone;
+    assert_eq!(remora_bf, Zone::Battlefield);
+    assert_has_cumulative_upkeep_trigger(runner.state(), remora);
+
+    // Cast in turn 1 main — cumulative upkeep first fires on turn 2 upkeep (CR 702.24).
+    runner.state_mut().turn_number = 2;
+    runner.state_mut().phase = Phase::Untap;
+    runner.state_mut().active_player = P0;
+    runner.state_mut().priority_player = P0;
+    runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
+    runner.state_mut().stack.clear();
+
+    advance_to_upkeep_prompt(&mut runner);
+    assert_upkeep_unless_prompt(&runner, remora, 1);
 
     runner
         .state_mut()
@@ -97,4 +143,27 @@ fn issue_581_mystic_remora_upkeep_adds_age_counter_and_prompts_payment() {
         Zone::Battlefield,
         "paying cumulative upkeep must keep Mystic Remora on the battlefield"
     );
+}
+
+#[test]
+fn rehydrate_rebuilds_cumulative_upkeep_trigger_index() {
+    let Some(db) = load_db() else {
+        return;
+    };
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::Untap);
+    let remora = scenario.add_real_card(P0, "Mystic Remora", Zone::Battlefield, &db);
+    let mut runner = scenario.build();
+
+    assert_has_cumulative_upkeep_trigger(runner.state(), remora);
+
+    // Simulate a stale derived index after an in-place card-db reload: object
+    // definitions are intact but upkeep would not consult without rebuild.
+    runner.state_mut().trigger_index.remove(remora);
+
+    rehydrate_game_from_card_db(runner.state_mut(), &db);
+
+    advance_to_upkeep_prompt(&mut runner);
+    assert_upkeep_unless_prompt(&runner, remora, 1);
 }

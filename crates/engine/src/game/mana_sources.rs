@@ -19,7 +19,10 @@ use crate::types::ability::{
 use crate::types::card_type::CoreType;
 use crate::types::game_state::GameState;
 use crate::types::identifiers::ObjectId;
-use crate::types::mana::{ManaColor, ManaCostShard, ManaPip, ManaRestriction, ManaType};
+use crate::types::ability::ManaSpendRestriction;
+use crate::types::mana::{
+    ManaColor, ManaCostShard, ManaPip, ManaRestriction, ManaType, PaymentContext,
+};
 use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
 use crate::types::TriggerMode;
@@ -759,10 +762,25 @@ pub fn max_mana_yield(state: &GameState, object_id: ObjectId, controller: Player
 // CR 601.2g: After total cost is determined, the player has a chance to
 // activate mana abilities before paying. Affordability must reflect what the
 // player COULD pay manually, not only what the engine could auto-tap.
+fn mana_ability_allowed_for_payment(
+    restrictions: &[ManaSpendRestriction],
+    state: &GameState,
+    object_id: ObjectId,
+    payment_context: Option<&PaymentContext<'_>>,
+) -> bool {
+    let Some(ctx) = payment_context else {
+        return true;
+    };
+    super::effects::mana::resolve_restrictions(restrictions, state, object_id)
+        .iter()
+        .all(|restriction| restriction.allows(ctx))
+}
+
 pub(crate) fn feasible_mana_capacity(
     state: &GameState,
     object_id: ObjectId,
     controller: PlayerId,
+    payment_context: Option<&PaymentContext<'_>>,
 ) -> u32 {
     let Some(obj) = state.objects.get(&object_id) else {
         return 0;
@@ -793,7 +811,20 @@ pub(crate) fn feasible_mana_capacity(
             }
             // CR 604: Static activation restrictions ("only during your
             // upkeep", etc.) must hold — mirrors `is_active_tap_mana_ability`.
-            activation_condition_satisfied(state, controller, object_id, *idx, ability)
+            if !activation_condition_satisfied(state, controller, object_id, *idx, ability) {
+                return false;
+            }
+            // CR 106.6: Restricted mana only counts toward this spell when
+            // the restriction permits it (issue #2011: Eldrazi Temple).
+            match &*ability.effect {
+                Effect::Mana { restrictions, .. } => mana_ability_allowed_for_payment(
+                    restrictions,
+                    state,
+                    object_id,
+                    payment_context,
+                ),
+                _ => false,
+            }
         })
         .filter_map(|(_, ability)| match &*ability.effect {
             Effect::Mana { produced, .. } => {
@@ -841,17 +872,121 @@ pub(crate) fn feasible_mana_capacity(
 /// CR 117.1d + CR 601.2g: One activation's producible mana shape for the
 /// castability gate's colored-shard coverage check (issue #583 / #1234).
 #[derive(Debug, Clone)]
-enum ActivatableManaProfile {
+enum ActivatableManaProfileKind {
     Exact(Vec<ManaType>),
     AnyOneColor { count: u32, options: Vec<ManaType> },
     AnyCombination { count: u32, options: Vec<ManaType> },
     CombinationChoices(Vec<Vec<ManaType>>),
 }
 
+#[derive(Debug, Clone)]
+struct ActivatableManaProfile {
+    object_id: ObjectId,
+    kind: ActivatableManaProfileKind,
+}
+
+fn resolved_production_count(
+    produced: &ManaProduction,
+    state: &GameState,
+    resolved: &crate::types::ability::ResolvedAbility,
+) -> u32 {
+    super::effects::mana::resolve_mana_types_for_ability(produced, state, resolved).len() as u32
+}
+
+fn profile_kind_from_production(
+    state: &GameState,
+    object_id: ObjectId,
+    controller: PlayerId,
+    produced: &ManaProduction,
+    resolved: &crate::types::ability::ResolvedAbility,
+) -> Option<ActivatableManaProfileKind> {
+    match produced {
+        ManaProduction::ChoiceAmongCombinations { options } => Some(
+            ActivatableManaProfileKind::CombinationChoices(
+                options
+                    .iter()
+                    .map(|combo| combo.iter().map(mana_color_to_type).collect())
+                    .collect(),
+            ),
+        ),
+        ManaProduction::AnyOneColor { color_options, .. } => Some(
+            ActivatableManaProfileKind::AnyOneColor {
+                count: resolved_production_count(produced, state, resolved),
+                options: color_options.iter().map(mana_color_to_type).collect(),
+            },
+        ),
+        ManaProduction::AnyCombination { color_options, .. } => Some(
+            ActivatableManaProfileKind::AnyCombination {
+                count: resolved_production_count(produced, state, resolved),
+                options: color_options.iter().map(mana_color_to_type).collect(),
+            },
+        ),
+        ManaProduction::ChosenColor {
+            fixed_alternative, ..
+        } => {
+            let count = resolved_production_count(produced, state, resolved);
+            let mut options = state
+                .objects
+                .get(&object_id)
+                .and_then(|obj| obj.chosen_color())
+                .map(|color| vec![mana_color_to_type(&color)])
+                .unwrap_or_default();
+            if options.is_empty() {
+                return None;
+            }
+            if let Some(alt) = fixed_alternative {
+                let alt_type = mana_color_to_type(alt);
+                if !options.contains(&alt_type) {
+                    options.push(alt_type);
+                }
+            }
+            if count <= 1 && options.len() == 1 {
+                Some(ActivatableManaProfileKind::Exact(options))
+            } else {
+                Some(ActivatableManaProfileKind::AnyOneColor { count, options })
+            }
+        }
+        ManaProduction::OpponentLandColors { .. }
+        | ManaProduction::AnyTypeProduceableBy { .. }
+        | ManaProduction::ChoiceAmongExiledColors { .. }
+        | ManaProduction::AnyInCommandersColorIdentity { .. }
+        | ManaProduction::AnyOneColorAmongPermanents { .. } => {
+            let options = mana_options_from_production(state, controller, object_id, produced);
+            if options.is_empty() {
+                return None;
+            }
+            Some(ActivatableManaProfileKind::AnyOneColor {
+                count: resolved_production_count(produced, state, resolved),
+                options,
+            })
+        }
+        ManaProduction::DistinctColorsAmongPermanents { .. } => {
+            let types =
+                super::effects::mana::resolve_mana_types_for_ability(produced, state, resolved);
+            if types.is_empty() {
+                None
+            } else {
+                Some(ActivatableManaProfileKind::Exact(types))
+            }
+        }
+        ManaProduction::TriggerEventManaType => None,
+        _ => {
+            let types =
+                super::effects::mana::resolve_mana_types_for_ability(produced, state, resolved);
+            if types.is_empty() {
+                None
+            } else {
+                Some(ActivatableManaProfileKind::Exact(types))
+            }
+        }
+    }
+}
+
 fn activatable_mana_profiles_for_object(
     state: &GameState,
     object_id: ObjectId,
     controller: PlayerId,
+    payment_context: Option<&PaymentContext<'_>>,
 ) -> Vec<ActivatableManaProfile> {
     let Some(obj) = state.objects.get(&object_id) else {
         return Vec::new();
@@ -875,47 +1010,21 @@ fn activatable_mana_profiles_for_object(
             if !activation_condition_satisfied(state, controller, object_id, idx, ability) {
                 return None;
             }
-            let Effect::Mana { produced, .. } = &*ability.effect else {
+            let Effect::Mana {
+                produced,
+                restrictions,
+                ..
+            } = &*ability.effect
+            else {
                 return None;
             };
+            if !mana_ability_allowed_for_payment(restrictions, state, object_id, payment_context) {
+                return None;
+            }
             let resolved =
                 super::ability_utils::build_resolved_from_def(ability, object_id, controller);
-            Some(match produced {
-                ManaProduction::ChoiceAmongCombinations { options } => {
-                    ActivatableManaProfile::CombinationChoices(
-                        options
-                            .iter()
-                            .map(|combo| combo.iter().map(mana_color_to_type).collect())
-                            .collect(),
-                    )
-                }
-                ManaProduction::AnyOneColor {
-                    count: _,
-                    color_options,
-                    ..
-                } => ActivatableManaProfile::AnyOneColor {
-                    count: super::effects::mana::resolve_mana_types_for_ability(
-                        produced, state, &resolved,
-                    )
-                    .len() as u32,
-                    options: color_options.iter().map(mana_color_to_type).collect(),
-                },
-                ManaProduction::AnyCombination {
-                    count: _,
-                    color_options,
-                } => ActivatableManaProfile::AnyCombination {
-                    count: super::effects::mana::resolve_mana_types_for_ability(
-                        produced, state, &resolved,
-                    )
-                    .len() as u32,
-                    options: color_options.iter().map(mana_color_to_type).collect(),
-                },
-                _ => ActivatableManaProfile::Exact(
-                    super::effects::mana::resolve_mana_types_for_ability(
-                        produced, state, &resolved,
-                    ),
-                ),
-            })
+            profile_kind_from_production(state, object_id, controller, produced, &resolved)
+                .map(|kind| ActivatableManaProfile { object_id, kind })
         })
         .collect()
 }
@@ -924,12 +1033,15 @@ fn collect_activatable_mana_profiles(
     state: &GameState,
     player: PlayerId,
     exclude: Option<ObjectId>,
+    payment_context: Option<&PaymentContext<'_>>,
 ) -> Vec<ActivatableManaProfile> {
     state
         .battlefield
         .iter()
         .filter(|id| Some(**id) != exclude)
-        .flat_map(|&id| activatable_mana_profiles_for_object(state, id, player))
+        .flat_map(|&id| {
+            activatable_mana_profiles_for_object(state, id, player, payment_context)
+        })
         .collect()
 }
 
@@ -951,112 +1063,143 @@ fn shard_payment_options(shard: ManaCostShard) -> Option<Vec<ManaType>> {
     })
 }
 
-fn can_profiles_cover_shards(
-    profiles: &[ActivatableManaProfile],
-    shards: &[ManaCostShard],
-) -> bool {
-    let requirements: Vec<Vec<ManaType>> = shards
-        .iter()
-        .filter_map(|shard| shard_payment_options(*shard))
-        .collect();
-    if requirements.len() != shards.len() {
-        return false;
+fn group_profiles_by_object(
+    profiles: Vec<ActivatableManaProfile>,
+) -> Vec<(ObjectId, Vec<ActivatableManaProfileKind>)> {
+    use std::collections::HashMap;
+    let mut grouped: HashMap<ObjectId, Vec<ActivatableManaProfileKind>> = HashMap::new();
+    for profile in profiles {
+        grouped
+            .entry(profile.object_id)
+            .or_default()
+            .push(profile.kind);
     }
-    can_profiles_cover_requirements(profiles, &requirements)
+    grouped.into_iter().collect()
 }
 
-fn can_profiles_cover_requirements(
-    profiles: &[ActivatableManaProfile],
+fn apply_profile_kind(
+    profile: &ActivatableManaProfileKind,
     requirements: &[Vec<ManaType>],
-) -> bool {
-    if requirements.is_empty() {
-        return true;
-    }
-    if profiles.is_empty() {
-        return false;
-    }
-    let (head, tail) = profiles.split_first().expect("non-empty profiles");
-    can_profiles_cover_requirements(tail, requirements)
-        || apply_profile_to_requirements(head, requirements, tail)
-}
-
-fn apply_profile_to_requirements(
-    profile: &ActivatableManaProfile,
-    requirements: &[Vec<ManaType>],
-    remaining_profiles: &[ActivatableManaProfile],
-) -> bool {
+) -> Option<(Vec<Vec<ManaType>>, u32)> {
     match profile {
-        ActivatableManaProfile::Exact(types) => {
-            let mut remaining: Vec<Vec<ManaType>> = requirements.to_vec();
+        ActivatableManaProfileKind::Exact(types) => {
+            let mut remaining = requirements.to_vec();
             for mana_type in types {
-                if let Some(pos) = remaining.iter().position(|opts| opts.contains(mana_type)) {
-                    remaining.remove(pos);
-                }
+                let pos = remaining.iter().position(|opts| opts.contains(mana_type))?;
+                remaining.remove(pos);
             }
-            can_profiles_cover_requirements(remaining_profiles, &remaining)
+            Some((remaining, types.len() as u32))
         }
-        ActivatableManaProfile::AnyOneColor { count, options } => options.iter().any(|&color| {
-            combination_assign(
-                *count,
-                std::slice::from_ref(&color),
-                requirements,
-                remaining_profiles,
-            )
-        }),
-        ActivatableManaProfile::AnyCombination { count, options } => {
-            combination_assign(*count, options, requirements, remaining_profiles)
+        ActivatableManaProfileKind::AnyOneColor { count, options } => options
+            .iter()
+            .find_map(|&color| combination_assign(*count, std::slice::from_ref(&color), requirements)),
+        ActivatableManaProfileKind::AnyCombination { count, options } => {
+            combination_assign(*count, options, requirements)
         }
-        ActivatableManaProfile::CombinationChoices(choices) => choices.iter().any(|choice| {
-            apply_profile_to_requirements(
-                &ActivatableManaProfile::Exact(choice.clone()),
-                requirements,
-                remaining_profiles,
-            )
+        ActivatableManaProfileKind::CombinationChoices(choices) => choices.iter().find_map(|choice| {
+            apply_profile_kind(&ActivatableManaProfileKind::Exact(choice.clone()), requirements)
         }),
     }
+}
+
+fn assign_profiles_to_requirements(
+    objects: &[(ObjectId, Vec<ActivatableManaProfileKind>)],
+    object_index: usize,
+    requirements: Vec<Vec<ManaType>>,
+) -> Option<u32> {
+    if requirements.is_empty() {
+        return Some(0);
+    }
+    if object_index >= objects.len() {
+        return None;
+    }
+    if let Some(consumed) = assign_profiles_to_requirements(
+        objects,
+        object_index + 1,
+        requirements.clone(),
+    ) {
+        return Some(consumed);
+    }
+    for profile in &objects[object_index].1 {
+        if let Some((remaining, consumed)) = apply_profile_kind(profile, &requirements) {
+            if let Some(rest) =
+                assign_profiles_to_requirements(objects, object_index + 1, remaining)
+            {
+                return Some(consumed + rest);
+            }
+        }
+    }
+    None
 }
 
 fn combination_assign(
     count: u32,
     options: &[ManaType],
     requirements: &[Vec<ManaType>],
-    remaining_profiles: &[ActivatableManaProfile],
-) -> bool {
-    if requirements.is_empty() {
-        return can_profiles_cover_requirements(remaining_profiles, requirements);
-    }
+) -> Option<(Vec<Vec<ManaType>>, u32)> {
     if count == 0 {
-        return false;
+        return if requirements.is_empty() {
+            Some((Vec::new(), 0))
+        } else {
+            None
+        };
+    }
+    if requirements.is_empty() {
+        return None;
     }
     for (index, payment_options) in requirements.iter().enumerate() {
         for &color in payment_options {
             if !options.contains(&color) {
                 continue;
             }
-            let mut next_requirements: Vec<Vec<ManaType>> = requirements.to_vec();
+            let mut next_requirements = requirements.to_vec();
             next_requirements.remove(index);
-            if combination_assign(count - 1, options, &next_requirements, remaining_profiles) {
-                return true;
+            if let Some((remaining, inner)) =
+                combination_assign(count - 1, options, &next_requirements)
+            {
+                return Some((remaining, 1 + inner));
             }
         }
     }
-    false
+    None
 }
 
-/// CR 117.1d + CR 601.2g: Whether residual colored mana shards could be paid
-/// by activating currently legal mana abilities (non-tap sources like Vivi
-/// Ornitier's {0} power-scaled combination mana, Lion's Eye Diamond, etc.).
+fn assign_profiles_to_shards(
+    profiles: &[ActivatableManaProfile],
+    shards: &[ManaCostShard],
+) -> Option<u32> {
+    let requirements: Vec<Vec<ManaType>> = shards
+        .iter()
+        .filter_map(|shard| shard_payment_options(*shard))
+        .collect();
+    if requirements.len() != shards.len() {
+        return None;
+    }
+    let grouped = group_profiles_by_object(profiles.to_vec());
+    assign_profiles_to_requirements(&grouped, 0, requirements)
+}
+
+/// CR 117.1d + CR 601.2g: Whether residual mana shards could be paid by
+/// activating currently legal mana abilities (non-tap sources like Vivi
+/// Ornitier's {0} combination mana, Lion's Eye Diamond, etc.).
+///
+/// Returns `(covered, consumed_pips)` where `consumed_pips` is the total mana
+/// produced by activations used for shard coverage — callers must subtract
+/// this from generic capacity to avoid double-counting one activation.
 pub(crate) fn can_cover_shards_with_activatable_mana(
     state: &GameState,
     player: PlayerId,
     exclude: Option<ObjectId>,
+    payment_context: Option<&PaymentContext<'_>>,
     shards: &[ManaCostShard],
-) -> bool {
+) -> (bool, u32) {
     if shards.is_empty() {
-        return true;
+        return (true, 0);
     }
-    let profiles = collect_activatable_mana_profiles(state, player, exclude);
-    can_profiles_cover_shards(&profiles, shards)
+    let profiles = collect_activatable_mana_profiles(state, player, exclude, payment_context);
+    assign_profiles_to_shards(&profiles, shards)
+        .map(|consumed| (true, consumed))
+        .unwrap_or((false, 0))
 }
 
 fn land_mana_options(

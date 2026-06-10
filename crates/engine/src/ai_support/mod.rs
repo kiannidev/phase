@@ -646,9 +646,6 @@ fn auto_passes_initial_priority_by_default(state: &GameState) -> bool {
 /// (`SimulationFilter`) rejects the Auto-mode `CastSpell` candidate (issue #562,
 /// #583). Frontends surface these via `spell_costs` + manual cast dispatch.
 fn has_feasibly_castable_spell(state: &GameState, player: PlayerId) -> bool {
-    if crate::game::keywords::stack_has_split_second(state) {
-        return false;
-    }
     crate::game::casting::spell_objects_available_to_cast(state, player)
         .iter()
         .any(|&object_id| crate::game::casting::can_cast_object_now(state, player, object_id))

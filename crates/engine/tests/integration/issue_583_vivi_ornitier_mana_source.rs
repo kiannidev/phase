@@ -108,6 +108,26 @@ fn vivi_combination_mana_makes_colored_spell_castable_without_other_sources() {
 }
 
 #[test]
+fn vivi_power_two_does_not_cover_colored_shards_plus_generic() {
+    let mut state = GameState::new_two_player(583);
+    setup_priority(&mut state);
+    add_vivi(&mut state, 2);
+    let spell = add_hand_spell(
+        &mut state,
+        CardId(5833),
+        ManaCost::Cost {
+            shards: vec![ManaCostShard::Blue, ManaCostShard::Red],
+            generic: 1,
+        },
+    );
+
+    assert!(
+        !can_cast_object_now(&state, P0, spell),
+        "one Vivi activation produces two mana total and cannot also pay {{1}}"
+    );
+}
+
+#[test]
 fn vivi_single_blue_shard_castable_at_power_one() {
     let mut state = GameState::new_two_player(583);
     setup_priority(&mut state);

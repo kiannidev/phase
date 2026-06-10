@@ -1204,6 +1204,10 @@ pub fn rehydrate_game_from_card_db(state: &mut GameState, db: &CardDatabase) {
 
     if changed_battlefield {
         crate::game::layers::mark_layers_full(state);
+        // CR 603.6a: `apply_card_face_to_object` may replace
+        // `trigger_definitions` without touching the derived index. Rebuild so
+        // upkeep triggers (e.g. Mystic Remora cumulative upkeep) stay indexed.
+        crate::types::game_state::TriggerIndex::rebuild_from_battlefield(state);
     }
 
     if changed_any || state.layers_dirty.is_dirty() {

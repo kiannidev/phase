@@ -74,6 +74,20 @@ impl GameScenarioDbExt for GameScenario {
             obj.entered_battlefield_turn = Some(entered_turn);
             // Pre-existing permanent — see `scenario::add_creature`.
             obj.summoning_sick = false;
+
+            // CR 603.6a: `create_object_from_card_face` registers the index
+            // before the face is applied; re-index after the move so printed
+            // triggers (cumulative upkeep, etc.) are indexed.
+            let registration = self.state.objects.get(&id).map(|obj| {
+                let defs: smallvec::SmallVec<[crate::types::ability::TriggerDefinition; 4]> =
+                    obj.trigger_definitions.as_slice().iter().cloned().collect();
+                let synthetic = crate::game::trigger_index::has_synthetic_keyword_trigger_for(obj);
+                (defs, synthetic)
+            });
+            if let Some((defs, synthetic)) = registration {
+                self.state.trigger_index.remove(id);
+                self.state.trigger_index.add(id, &defs, synthetic);
+            }
         }
 
         id

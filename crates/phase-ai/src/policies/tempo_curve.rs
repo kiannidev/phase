@@ -9,6 +9,7 @@ use super::strategy_helpers::is_own_main_phase;
 use crate::deck_profile::DeckArchetype;
 use crate::features::DeckFeatures;
 use crate::zone_eval;
+#[cfg(test)]
 use engine::types::game_state::CastPaymentMode;
 
 /// Rewards playing spells on-curve (matching mana value to available mana),

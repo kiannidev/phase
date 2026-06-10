@@ -8,10 +8,30 @@ export function applySpellPaymentPreference(action: GameAction): GameAction {
 
   switch (action.type) {
     case "CastSpell":
+      return {
+        ...action,
+        data: { ...action.data, payment_mode: MANUAL_CAST_PAYMENT_MODE },
+      };
     case "CastSpellForFree":
+      return {
+        ...action,
+        data: { ...action.data, payment_mode: MANUAL_CAST_PAYMENT_MODE },
+      };
     case "CastSpellAsMiracle":
+      return {
+        ...action,
+        data: { ...action.data, payment_mode: MANUAL_CAST_PAYMENT_MODE },
+      };
     case "CastSpellAsMadness":
+      return {
+        ...action,
+        data: { ...action.data, payment_mode: MANUAL_CAST_PAYMENT_MODE },
+      };
     case "CastSpellAsSneak":
+      return {
+        ...action,
+        data: { ...action.data, payment_mode: MANUAL_CAST_PAYMENT_MODE },
+      };
     case "CastSpellAsWebSlinging":
       return {
         ...action,

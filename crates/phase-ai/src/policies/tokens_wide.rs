@@ -17,6 +17,7 @@ use crate::features::tokens_wide::{
     is_mass_pump_parts, is_token_generator_parts, COMMITMENT_FLOOR, WIDE_ATTACK_FLOOR,
 };
 use crate::features::DeckFeatures;
+#[cfg(test)]
 use engine::types::game_state::CastPaymentMode;
 
 pub struct TokensWidePolicy;

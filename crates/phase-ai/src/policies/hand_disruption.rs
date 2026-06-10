@@ -15,6 +15,8 @@ use super::activation::turn_only;
 use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
 use super::strategy_helpers::best_proactive_cast_score;
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
 
 pub struct HandDisruptionPolicy;
 

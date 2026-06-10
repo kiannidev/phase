@@ -6800,7 +6800,7 @@ mod tests {
                 card_id: CardId(9101),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -6883,7 +6883,7 @@ mod tests {
                     card_id: CardId(9111),
                     targets: vec![],
 
-                    payment_mode: CastPaymentMode::Auto,
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto,
                 },
             )
             .is_err(),
@@ -6936,7 +6936,7 @@ mod tests {
                 card_id: CardId(9120),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -6996,7 +6996,7 @@ mod tests {
                 card_id: CardId(9121),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -7070,7 +7070,7 @@ mod tests {
                 card_id: CardId(9130),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -7158,7 +7158,7 @@ mod tests {
                 card_id,
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -7260,7 +7260,7 @@ mod tests {
                 card_id: CardId(9171),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -7378,7 +7378,7 @@ mod tests {
                 card_id: CardId(9153),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -7498,7 +7498,7 @@ mod tests {
                 card_id: CardId(9162),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -9657,7 +9657,7 @@ mod tests {
                 card_id: CardId(10),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -9732,7 +9732,7 @@ mod tests {
                 card_id: CardId(10),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -9828,7 +9828,7 @@ mod tests {
                 card_id: CardId(10),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -9913,7 +9913,7 @@ mod tests {
                 card_id: CardId(10),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -10036,7 +10036,7 @@ mod tests {
                 card_id: disciple_card_id,
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -10659,7 +10659,7 @@ mod tests {
                 card_id: CardId(10),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -10758,7 +10758,7 @@ mod tests {
                 card_id: CardId(10),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -10824,7 +10824,7 @@ mod tests {
                 card_id: CardId(10),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -10887,7 +10887,7 @@ mod tests {
                 card_id: CardId(30),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -10932,7 +10932,7 @@ mod tests {
                 card_id: CardId(40),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -11020,7 +11020,7 @@ mod tests {
                 card_id: CardId(60),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -11083,7 +11083,7 @@ mod tests {
                 card_id: CardId(10),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -12669,7 +12669,7 @@ mod tests {
                 card_id: CardId(10),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         );
 
@@ -15605,7 +15605,7 @@ mod phase_trigger_regression_tests {
                 card_id: CardId(302),
                 targets: Vec::new(),
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -15731,7 +15731,7 @@ mod phase_trigger_regression_tests {
                 card_id: CardId(502),
                 targets: Vec::new(),
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -22505,7 +22505,7 @@ mod mdfc_land_tests {
                 card_id: CardId(100),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -22685,7 +22685,7 @@ mod mdfc_land_tests {
                 card_id,
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();

@@ -16390,7 +16390,7 @@ pub mod tests {
                 card_id: spell_card_id,
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             })
             .expect("casting Sowing Mycospawn must be accepted");
 
@@ -16417,7 +16417,7 @@ pub mod tests {
                 card_id: spell_card_id,
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             })
             .expect("casting Sowing Mycospawn must be accepted");
 
@@ -16546,7 +16546,7 @@ pub mod tests {
                 card_id: spell_card_id,
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             })
             .expect("casting Goblin Bushwhacker must be accepted");
 
@@ -16587,7 +16587,7 @@ pub mod tests {
                 card_id: spell_card_id,
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             })
             .expect("casting Goblin Bushwhacker must be accepted");
 

@@ -24,6 +24,8 @@ use crate::features::spellslinger_prowess::{
     is_low_curve_spell_parts, is_nth_spell_payoff_parts, COMMITMENT_FLOOR,
 };
 use crate::features::DeckFeatures;
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
 
 pub struct SpellslingerCastingPolicy;
 

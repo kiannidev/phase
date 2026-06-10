@@ -13,6 +13,8 @@ use crate::cast_facts::{
 };
 use crate::config::{AiConfig, PolicyPenalties};
 use crate::eval::{strategic_intent, StrategicIntent};
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
 
 pub struct PolicyContext<'a> {
     pub state: &'a GameState,

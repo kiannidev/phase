@@ -2195,7 +2195,7 @@ mod tests {
                 card_id: CardId(10),
                 targets: Vec::new(),
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         ];
 

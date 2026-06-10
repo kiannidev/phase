@@ -15,6 +15,7 @@ use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
 use crate::features::control::{is_sweeper_parts, COMMITMENT_FLOOR};
 use crate::features::DeckFeatures;
+#[cfg(test)]
 use engine::types::game_state::CastPaymentMode;
 
 /// Opponent creature threshold — at this count a sweeper is "timely".

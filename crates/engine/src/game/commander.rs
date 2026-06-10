@@ -1138,7 +1138,7 @@ mod tests {
             card_id,
             targets: Vec::new(),
 
-            payment_mode: CastPaymentMode::Auto,
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
         };
         let result = apply_as_current(&mut state, cast).expect("announce commander cast");
         match &result.waiting_for {
@@ -1240,7 +1240,7 @@ mod tests {
             card_id,
             targets: Vec::new(),
 
-            payment_mode: CastPaymentMode::Auto,
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
         };
         let result = apply_as_current(&mut state, cast).expect("announce commander cast");
         assert!(matches!(

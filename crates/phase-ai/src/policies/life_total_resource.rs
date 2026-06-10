@@ -12,6 +12,7 @@ use super::activation::arch_times_turn;
 use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
 use crate::deck_profile::DeckArchetype;
+#[cfg(test)]
 use engine::types::game_state::CastPaymentMode;
 
 pub struct LifeTotalResourcePolicy;

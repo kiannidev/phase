@@ -1349,7 +1349,7 @@ mod tests {
             card_id: CardId(1),
             targets: vec![ObjectId(10), ObjectId(20)],
 
-            payment_mode: CastPaymentMode::Auto,
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
         };
         let json = serde_json::to_value(&action).unwrap();
         assert_eq!(json["type"], "CastSpell");
@@ -1436,7 +1436,7 @@ mod tests {
                     card_id: cid,
                     targets: vec![],
 
-                    payment_mode: CastPaymentMode::Auto,
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto,
                 },
                 Some(oid),
             ),
@@ -1467,7 +1467,7 @@ mod tests {
                     card_id: cid,
                     creature_to_return: ObjectId(99),
 
-                    payment_mode: CastPaymentMode::Auto,
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto,
                 },
                 Some(oid),
             ),

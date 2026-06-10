@@ -34,6 +34,8 @@ use super::effect_classify::{
 };
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
 use crate::features::DeckFeatures;
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
 use engine::types::game_state::GameState;
 use engine::types::player::PlayerId;
 

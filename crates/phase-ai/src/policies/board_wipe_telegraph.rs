@@ -13,6 +13,8 @@ use crate::config::ThreatAwareness;
 use crate::deck_profile::DeckArchetype;
 use crate::features::DeckFeatures;
 use crate::threat_profile::castable_probabilities;
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
 
 pub struct BoardWipeTelegraphPolicy;
 

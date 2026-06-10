@@ -20,6 +20,8 @@ use crate::features::aggro_pressure::{
     is_low_curve_creature_parts, AGGRO_COMMITMENT_FLOOR,
 };
 use crate::features::DeckFeatures;
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
 
 /// Opponent life total threshold for burn-finisher bonus. CR 120.3.
 const BURN_FINISHER_LIFE_THRESHOLD: i32 = 6;

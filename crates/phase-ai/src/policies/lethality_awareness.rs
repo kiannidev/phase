@@ -8,6 +8,7 @@ use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, Tacti
 use super::strategy_helpers::{is_own_main_phase, opponent_lethal_damage};
 use crate::deck_profile::DeckArchetype;
 use crate::features::DeckFeatures;
+#[cfg(test)]
 use engine::types::game_state::CastPaymentMode;
 
 pub struct LethalityAwarenessPolicy;

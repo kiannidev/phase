@@ -17,6 +17,8 @@ use super::effect_classify::{extract_target_filter, targets_creatures_only};
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
 use super::stack_awareness::assess_spell_impact;
 use super::strategy_helpers::{targetable_threat_value, untapped_opponent_blocker_value};
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
 
 pub struct EffectTimingPolicy;
 

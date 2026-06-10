@@ -7,6 +7,7 @@ use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
 use crate::deck_profile::DeckArchetype;
 use crate::features::DeckFeatures;
+#[cfg(test)]
 use engine::types::game_state::CastPaymentMode;
 
 pub struct CardAdvantagePolicy;

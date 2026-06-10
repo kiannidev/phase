@@ -11042,7 +11042,7 @@ mod fabricate_runtime_tests {
                 card_id: next_card,
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -23901,7 +23901,7 @@ mod champion_runtime_tests {
                 card_id,
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();

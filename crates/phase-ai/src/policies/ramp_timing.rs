@@ -21,6 +21,8 @@ use crate::features::mana_ramp::{
     chain_has_mana_effect, is_land_fetch_spell_parts, is_ritual_parts,
 };
 use crate::features::DeckFeatures;
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
 
 /// Minimum commitment required to activate this policy at all.
 const COMMITMENT_FLOOR: f32 = 0.1;

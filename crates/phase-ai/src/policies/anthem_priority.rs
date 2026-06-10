@@ -16,6 +16,7 @@ use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
 use crate::features::tokens_wide::{is_anthem_parts, ANTHEM_TIMELY_BOARD_FLOOR, COMMITMENT_FLOOR};
 use crate::features::DeckFeatures;
+#[cfg(test)]
 use engine::types::game_state::CastPaymentMode;
 
 pub struct AnthemPriorityPolicy;

@@ -5,6 +5,7 @@ use engine::game::combat::{AttackTarget, AttackerInfo, CombatState};
 use engine::game::engine::apply_as_current;
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::types::ability::{Effect, QuantityExpr, ResolvedAbility, TargetFilter, TargetRef};
+use engine::types::game_state::CastPaymentMode;
 use engine::types::game_state::{
     StackEntry, StackEntryKind, TargetSelectionProgress, TargetSelectionSlot, WaitingFor,
 };

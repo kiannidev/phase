@@ -4558,7 +4558,7 @@ mod tests {
                 card_id: CardId(903),
                 targets: vec![],
 
-                payment_mode: CastPaymentMode::Auto,
+                payment_mode: crate::types::game_state::CastPaymentMode::Auto,
             },
         )
         .unwrap();

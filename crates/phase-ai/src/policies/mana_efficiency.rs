@@ -12,6 +12,7 @@ use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, Tacti
 use crate::deck_profile::DeckArchetype;
 use crate::features::DeckFeatures;
 use crate::zone_eval;
+use engine::types::game_state::CastPaymentMode;
 
 pub struct ManaEfficiencyPolicy;
 
@@ -163,6 +164,8 @@ mod tests {
                 object_id,
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(player),

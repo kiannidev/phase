@@ -15460,6 +15460,8 @@ mod tests {
                 object_id: obj_id,
                 card_id: CardId(900),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -15561,6 +15563,8 @@ mod tests {
                 object_id: obj_id,
                 card_id: CardId(901),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -15635,6 +15639,8 @@ mod tests {
                 object_id: obj_id,
                 card_id: CardId(903),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -15745,6 +15751,8 @@ mod tests {
                 object_id: obj_id,
                 card_id: CardId(922),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -15865,6 +15873,8 @@ mod tests {
                 object_id: obj_id,
                 card_id: CardId(934),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -15988,6 +15998,8 @@ mod tests {
                 object_id: obj_id,
                 card_id: CardId(906),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -16242,6 +16254,8 @@ mod tests {
                 object_id: obj_id,
                 card_id: CardId(905),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -16296,6 +16310,8 @@ mod tests {
                 object_id: obj_id,
                 card_id: CardId(906),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -19460,6 +19476,8 @@ mod tests {
                 object_id: obj_id,
                 card_id: CardId(960),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -19582,6 +19600,8 @@ mod tests {
                     object_id: spell,
                     card_id: CardId(960),
                     targets: vec![],
+
+                    payment_mode: CastPaymentMode::Auto,
                 },
             )
             .unwrap();
@@ -20015,6 +20035,8 @@ mod tests {
                 object_id: obj_id,
                 card_id: CardId(904),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -20068,6 +20090,8 @@ mod tests {
                 object_id: obj_id,
                 card_id: CardId(905),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         );
 
@@ -20127,6 +20151,8 @@ mod tests {
                 object_id: obj_id,
                 card_id: CardId(902),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -22516,6 +22542,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(8101),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -22727,6 +22755,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(9301),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -22792,6 +22822,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(9101),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -22912,6 +22944,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(9402),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -23735,6 +23769,8 @@ mod tests {
                 object_id: manamorphose,
                 card_id: CardId(263),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .expect("manamorphose should be castable from exile");
@@ -23844,6 +23880,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(29),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -25077,6 +25115,8 @@ mod tests {
                 object_id: obj_id,
                 card_id: CardId(10),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -25138,6 +25178,8 @@ mod tests {
                 object_id: obj_id,
                 card_id: CardId(10),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -25226,6 +25268,8 @@ mod tests {
                 object_id: obj_id,
                 card_id: CardId(60),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -25288,6 +25332,8 @@ mod tests {
                 object_id: obj_id,
                 card_id: CardId(62),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -25384,6 +25430,8 @@ mod tests {
                 object_id: obj_id,
                 card_id: CardId(62),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -25460,6 +25508,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(64),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -25546,6 +25596,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(67),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -25694,6 +25746,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(71),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -25776,6 +25830,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(65),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .unwrap();
@@ -30680,6 +30736,8 @@ mod tests {
                 object_id: spell,
                 card_id,
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .expect("casting a spell with multiple graveyard variants should prompt");
@@ -31291,6 +31349,8 @@ mod tests {
                 object_id: echo_id,
                 card_id: echo_card_id,
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .expect("Echo of Eons should cast via flashback");
@@ -31462,6 +31522,8 @@ mod tests {
                 object_id: obj_id,
                 card_id,
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .expect("zero-cost Disturb card should cast from graveyard");
@@ -33228,6 +33290,8 @@ mod tests {
             object_id: spell,
             card_id: CardId(0x9117),
             targets: Vec::new(),
+
+            payment_mode: CastPaymentMode::Auto,
         };
         let result = apply_as_current(&mut state, cast).expect("announce cast");
         match &result.waiting_for {
@@ -33326,6 +33390,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(0xC0DE),
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .expect("announce cast");
@@ -33375,6 +33441,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(0xC0DE),
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .expect("announce cast");
@@ -33527,6 +33595,8 @@ mod tests {
             object_id: spell,
             card_id: CardId(0x9117),
             targets: Vec::new(),
+
+            payment_mode: CastPaymentMode::Auto,
         };
         let result = apply_as_current(&mut state, cast).expect("announce cast");
         match &result.waiting_for {
@@ -33580,6 +33650,8 @@ mod tests {
             object_id: spell,
             card_id: CardId(0x9117),
             targets: Vec::new(),
+
+            payment_mode: CastPaymentMode::Auto,
         };
         let result = apply_as_current(&mut state, cast).expect("announce cast");
         match &result.waiting_for {
@@ -33714,6 +33786,8 @@ mod tests {
             object_id: spell,
             card_id: CardId(0x9117),
             targets: Vec::new(),
+
+            payment_mode: CastPaymentMode::Auto,
         };
         let result = apply_as_current(&mut state, cast).expect("announce cast");
         match &result.waiting_for {
@@ -33760,6 +33834,8 @@ mod tests {
             object_id: spell,
             card_id: CardId(0x9117),
             targets: Vec::new(),
+
+            payment_mode: CastPaymentMode::Auto,
         };
         let _ = apply_as_current(&mut state, cast).expect("announce cast");
         let submit = GameAction::SubmitPhyrexianChoices {
@@ -33793,6 +33869,8 @@ mod tests {
             object_id: spell,
             card_id: CardId(0x9117),
             targets: Vec::new(),
+
+            payment_mode: CastPaymentMode::Auto,
         };
         let _ = apply_as_current(&mut state, cast).expect("announce cast");
         let submit = GameAction::SubmitPhyrexianChoices {
@@ -34126,7 +34204,8 @@ mod tests {
                     hand_object,
                     card_id: cid,
                     creature_to_return,
-                } if *hand_object == sneak_card_id
+
+                    payment_mode: CastPaymentMode::Auto,} if *hand_object == sneak_card_id
                     && *cid == card_id
                     && *creature_to_return == attacker_id
             )
@@ -34388,6 +34467,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(0x9595),
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             };
             let result = apply_as_current(&mut state, cast)
                 .expect("CR 107.4f: K'rrik {B} cast announcement must succeed");
@@ -34601,6 +34682,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(0x9595),
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             };
             let result = apply_as_current(&mut state, cast)
                 .expect("CR 107.4f: {2/B} promoted under K'rrik must announce");
@@ -40380,6 +40463,8 @@ mod tests {
                 object_id: spell,
                 card_id: CardId(950),
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .expect("cast enters ChooseXValue");
@@ -41190,6 +41275,8 @@ mod tests {
                 object_id: exiled,
                 card_id,
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             },
         )
         .expect("linked exiled spell should cast through the public action");

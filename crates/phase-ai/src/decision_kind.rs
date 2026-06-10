@@ -184,6 +184,8 @@ mod tests {
             object_id: ObjectId(0),
             card_id: CardId(0),
             targets: Vec::new(),
+
+            payment_mode: CastPaymentMode::Auto,
         };
 
         // Mulligan routing.

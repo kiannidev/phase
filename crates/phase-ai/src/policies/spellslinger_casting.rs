@@ -264,6 +264,8 @@ mod tests {
                 object_id,
                 card_id: CardId(object_id.0),
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(AI),

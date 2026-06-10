@@ -15,6 +15,7 @@ use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
 use crate::features::control::{is_sweeper_parts, COMMITMENT_FLOOR};
 use crate::features::DeckFeatures;
+use engine::types::game_state::CastPaymentMode;
 
 /// Opponent creature threshold — at this count a sweeper is "timely".
 const SWEEPER_TIMELY_THRESHOLD: u32 = 3;
@@ -152,6 +153,8 @@ mod tests {
                 object_id,
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(AI),

@@ -662,6 +662,8 @@ mod tests {
                 object_id: growth,
                 card_id: state.objects.get(&growth).unwrap().card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(P0),
@@ -718,6 +720,8 @@ mod tests {
                 object_id: growth,
                 card_id: state.objects.get(&growth).unwrap().card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(P0),

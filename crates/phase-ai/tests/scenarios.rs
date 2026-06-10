@@ -302,6 +302,8 @@ fn scenario_very_hard_wasm_uses_giant_growth_to_win_combat() {
             object_id: growth,
             card_id: runner.state().objects[&growth].card_id,
             targets: Vec::new(),
+
+            payment_mode: CastPaymentMode::Auto,
         })
     );
 }

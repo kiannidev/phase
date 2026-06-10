@@ -472,6 +472,8 @@ mod tests {
                 object_id: tutor,
                 card_id: CardId(10),
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(PlayerId(0)),

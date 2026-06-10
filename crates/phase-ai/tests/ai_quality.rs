@@ -360,6 +360,8 @@ fn casts_creature_when_mana_available() {
             object_id: harvester,
             card_id: runner.state().objects[&harvester].card_id,
             targets: Vec::new(),
+
+            payment_mode: CastPaymentMode::Auto,
         },
         "Should cast creature with strong ETB"
     );

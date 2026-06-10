@@ -369,6 +369,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id: CardId(1),
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(PlayerId(0)),
@@ -412,6 +414,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id: CardId(1),
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(PlayerId(0)),
@@ -454,6 +458,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id: CardId(1),
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(PlayerId(0)),

@@ -289,6 +289,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -313,6 +315,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -343,6 +347,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -396,6 +402,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -426,6 +434,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -447,6 +457,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -458,6 +470,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -490,6 +504,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -521,6 +537,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -552,6 +570,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -604,6 +624,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id: vanilla,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -613,6 +635,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id: etb,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );
@@ -645,6 +669,8 @@ mod tests {
                 object_id: ObjectId(0),
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             PlayerId(0),
         );

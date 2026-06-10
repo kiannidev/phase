@@ -5018,9 +5018,10 @@ fn parse_opponent_comparison_conditions(input: &str) -> OracleResult<'_, StaticC
         }
     }
 
-    // CR 109.4: "an opponent controls more [type] than you" — existential over
-    // opponents (at least one opponent strictly exceeds your count), not an
-    // aggregate of all opponent permanents. Weathered Wayfarer, Tithe, etc.
+    // CR 109.4 + CR 109.5: "an opponent controls more [type] than you" —
+    // existential over opponents (at least one opponent strictly exceeds your
+    // count; "you" = the ability's controller), not an aggregate of all
+    // opponent permanents. Weathered Wayfarer, Land Tax.
     if let Ok((rest2, _)) = tag::<_, _, OracleError<'_>>("controls more ").parse(rest) {
         if let Ok((rest3, type_text)) =
             take_until::<_, _, OracleError<'_>>(" than you").parse(rest2)

@@ -9,7 +9,6 @@
 
 use engine::game::scenario::{GameScenario, P0};
 use engine::types::ability::StaticDefinition;
-use engine::types::statics::StaticMode;
 use engine::types::actions::{AlternativeCastDecision, GameAction};
 use engine::types::card_type::CoreType;
 use engine::types::game_state::{AlternativeCastKeyword, WaitingFor};
@@ -17,6 +16,7 @@ use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
+use engine::types::statics::StaticMode;
 
 fn add_mana(runner: &mut engine::game::scenario::GameRunner, red: u32, colorless: u32) {
     let dummy = ObjectId(0);

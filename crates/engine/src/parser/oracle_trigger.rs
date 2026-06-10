@@ -3248,7 +3248,7 @@ fn try_extract_that_players_turn(
         opt(tag(" not")),
         alt((
             tag(" that player's turn"),
-            // CR 603.2b: Glademuse — "if it's not their turn" (pronoun = triggering player).
+            // CR 603.4: Glademuse — "if it's not their turn" (pronoun = triggering player).
             tag(" their turn"),
         )),
     )

@@ -80,14 +80,7 @@ fn gain_control_object_targets(
         return vec![ability.source_id];
     }
 
-    let chosen_objects: Vec<ObjectId> = ability
-        .targets
-        .iter()
-        .filter_map(|target| match target {
-            TargetRef::Object(id) => Some(*id),
-            TargetRef::Player(_) => None,
-        })
-        .collect();
+    let chosen_objects = super::effect_object_targets(filter, &ability.targets);
 
     if !chosen_objects.is_empty() {
         return chosen_objects;

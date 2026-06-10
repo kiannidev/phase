@@ -2114,24 +2114,34 @@ fn parse_unless_sacrifice_filter(rest: &str) -> Option<AbilityCost> {
     }
 
     // CR 118.12: "any number of [filter] with total power N or greater"
-    if let Some(after_any) = trimmed.strip_prefix("any number of ") {
-        if let Some((filter_text, power_tail)) = after_any.split_once(" with total power ") {
-            let threshold = power_tail
-                .strip_suffix(" or greater")
-                .or_else(|| power_tail.strip_suffix(" or more"))
-                .and_then(|n| n.trim().parse::<i32>().ok())?;
-            if filter_text.is_empty() {
-                return None;
+    if let Ok((power_tail, filter_text)) = preceded(
+        tag::<_, _, OracleError<'_>>("any number of "),
+        terminated(take_until(" with total power "), tag(" with total power ")),
+    )
+    .parse(trimmed)
+    {
+        if let Ok((_, threshold)) = alt((
+            terminated(
+                nom_primitives::parse_number,
+                tag::<_, _, OracleError<'_>>(" or greater"),
+            ),
+            terminated(
+                nom_primitives::parse_number,
+                tag::<_, _, OracleError<'_>>(" or more"),
+            ),
+        ))
+        .parse(power_tail.trim())
+        {
+            if !filter_text.is_empty() {
+                let target_phrase = format!("target {}", filter_text.trim());
+                let (filter, remainder) = super::oracle_target::parse_target(&target_phrase);
+                if !matches!(filter, TargetFilter::Any) && remainder.trim().is_empty() {
+                    return Some(AbilityCost::SacrificePowerThreshold {
+                        target: filter,
+                        min_total_power: threshold as i32,
+                    });
+                }
             }
-            let target_phrase = format!("target {}", filter_text.trim());
-            let (filter, remainder) = super::oracle_target::parse_target(&target_phrase);
-            if matches!(filter, TargetFilter::Any) || !remainder.trim().is_empty() {
-                return None;
-            }
-            return Some(AbilityCost::SacrificePowerThreshold {
-                target: filter,
-                min_total_power: threshold,
-            });
         }
     }
 

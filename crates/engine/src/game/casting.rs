@@ -2781,10 +2781,10 @@ fn casting_variant_candidates(
 
     // CR 702.109a: Dash is an opt-in alternative cost from hand; surface it as a
     // candidate so the gate offers it (and so it is reachable when the printed
-    // cost is unaffordable).
+    // cost is unaffordable). Read the *effective* spell keywords so a Dash cost
+    // granted by a static (CR 604.1) is honored, not just printed Dash.
     if obj.zone == Zone::Hand
-        && obj
-            .keywords
+        && effective_spell_keywords(state, player, object_id)
             .iter()
             .any(|k| matches!(k, crate::types::keywords::Keyword::Dash(_)))
     {
@@ -3060,12 +3060,16 @@ fn prepare_spell_cast_with_variant_override_inner(
     };
 
     // CR 702.109a: Dash — when casting from hand with Keyword::Dash, the dash
-    // mana cost replaces the printed cost (opt-in via `variant_override`).
+    // mana cost replaces the printed cost (opt-in via `variant_override`). Read
+    // the *effective* spell keywords so a Dash cost granted by a static
+    // (CR 604.1) is honored, not just printed Dash.
     let dash_cost = if obj.zone == Zone::Hand {
-        obj.keywords.iter().find_map(|k| match k {
-            crate::types::keywords::Keyword::Dash(cost) => Some(cost.clone()),
-            _ => None,
-        })
+        effective_spell_keywords(state, player, object_id)
+            .iter()
+            .find_map(|k| match k {
+                crate::types::keywords::Keyword::Dash(cost) => Some(cost.clone()),
+                _ => None,
+            })
     } else {
         None
     };
@@ -7147,10 +7151,13 @@ pub fn handle_cast_spell_with_payment_mode(
     // affordable, present the choice; auto-route when only dash is payable.
     if let Some(obj) = state.objects.get(&object_id) {
         if obj.zone == Zone::Hand {
-            if let Some(dash_cost) = obj.keywords.iter().find_map(|k| match k {
-                crate::types::keywords::Keyword::Dash(cost) => Some(cost.clone()),
-                _ => None,
-            }) {
+            if let Some(dash_cost) = effective_spell_keywords(state, player, object_id)
+                .iter()
+                .find_map(|k| match k {
+                    crate::types::keywords::Keyword::Dash(cost) => Some(cost.clone()),
+                    _ => None,
+                })
+            {
                 // CR 601.2f: affordability and displayed costs reflect active
                 // cost modifiers, applied to both the printed and dash costs.
                 let normal_cost =

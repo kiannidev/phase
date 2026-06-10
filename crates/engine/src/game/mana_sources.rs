@@ -1140,14 +1140,14 @@ fn combination_assign(
     options: &[ManaType],
     requirements: &[Vec<ManaType>],
 ) -> Option<(Vec<Vec<ManaType>>, u32)> {
-    if count == 0 {
-        return if requirements.is_empty() {
-            Some((Vec::new(), 0))
-        } else {
-            None
-        };
-    }
     if requirements.is_empty() {
+        // All shards are covered; any leftover `count` is simply surplus mana
+        // the player never produces (or lets drain). Rejecting over-production
+        // here would falsely mark e.g. a power-3 combination source as unable
+        // to pay a two-shard cost.
+        return Some((Vec::new(), 0));
+    }
+    if count == 0 {
         return None;
     }
     for (index, payment_options) in requirements.iter().enumerate() {

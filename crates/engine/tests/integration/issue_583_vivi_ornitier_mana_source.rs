@@ -128,6 +128,26 @@ fn vivi_power_two_does_not_cover_colored_shards_plus_generic() {
 }
 
 #[test]
+fn vivi_power_three_surplus_still_covers_two_shards() {
+    let mut state = GameState::new_two_player(583);
+    setup_priority(&mut state);
+    add_vivi(&mut state, 3);
+    let spell = add_hand_spell(
+        &mut state,
+        CardId(5834),
+        ManaCost::Cost {
+            shards: vec![ManaCostShard::Blue, ManaCostShard::Red],
+            generic: 0,
+        },
+    );
+
+    assert!(
+        can_cast_object_now(&state, P0, spell),
+        "Vivi power 3 over-produces for {{U}}{{R}} — surplus mana must not make the spell uncastable"
+    );
+}
+
+#[test]
 fn vivi_single_blue_shard_castable_at_power_one() {
     let mut state = GameState::new_two_player(583);
     setup_priority(&mut state);

@@ -773,6 +773,7 @@ pub(crate) fn apply_create_token_after_replacement_with_created_ids(
 
         // CR 111.10: Inject predefined abilities for known token subtypes.
         inject_predefined_token_abilities(state, obj_id);
+        inject_catalog_token_abilities(state, obj_id);
         // Battlefield entry: request an incremental layer re-derive for just this
         // token. `flush_layers` escalates to a full pass if the token sources a
         // continuous effect / carries counters / etc., or if any active effect
@@ -2376,6 +2377,45 @@ fn predefined_role_token_spec(name: &str) -> Option<RoleSpec> {
 /// the layer pass rebuilds live from base on each pass, but several code
 /// paths (SBAs, action enumeration) consult the live set directly between
 /// passes so keeping them in sync here avoids a one-frame lag.
+/// CR 111.10: Grant catalog `rules_text` when token creation resolved a
+/// `token_image_ref` preset (e.g. SOS Pest attack life gain).
+pub(super) fn inject_catalog_token_abilities(
+    state: &mut GameState,
+    obj_id: crate::types::identifiers::ObjectId,
+) {
+    let Some(preset_id) = state
+        .objects
+        .get(&obj_id)
+        .and_then(|obj| obj.token_image_ref.as_ref())
+        .map(|image_ref| image_ref.preset_id.as_str())
+    else {
+        return;
+    };
+    let Some(preset) = crate::game::token_presets::known_token_preset_by_id(preset_id) else {
+        return;
+    };
+    let Some(rules_text) = preset.rules_text.as_deref().filter(|text| !text.is_empty()) else {
+        return;
+    };
+    let modifications =
+        crate::parser::oracle_static::classify_quoted_inner(rules_text);
+    if modifications.is_empty() {
+        return;
+    }
+    let static_def = crate::types::ability::StaticDefinition::continuous()
+        .affected(crate::types::ability::TargetFilter::SelfRef)
+        .modifications(modifications)
+        .description(rules_text.to_string());
+    let Some(obj) = state.objects.get_mut(&obj_id) else {
+        return;
+    };
+    Arc::make_mut(&mut obj.base_static_definitions).push(static_def.clone());
+    obj.static_definitions.push(static_def);
+    if obj.token_rules_text.is_none() {
+        obj.token_rules_text = Some(rules_text.to_string());
+    }
+}
+
 pub(super) fn inject_predefined_token_abilities(
     state: &mut GameState,
     obj_id: crate::types::identifiers::ObjectId,
@@ -3550,6 +3590,41 @@ mod tests {
                 .unwrap_or(0),
             1,
             "Writhing Chrysalis sacrifice trigger should resolve to a +1/+1 counter"
+        );
+    }
+
+    #[test]
+    fn catalog_pest_preset_grants_attack_life_trigger() {
+        let preset = crate::game::token_presets::known_token_preset_by_id(
+            "00a0801d-0212-5890-8957-3cde30f382f9",
+        )
+        .expect("SOS Pest preset");
+
+        let mut state = GameState::new(crate::types::format::FormatConfig::standard(), 2, 42);
+        let obj_id = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Pest".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&obj_id).unwrap();
+            obj.is_token = true;
+            obj.token_image_ref = preset.token_image_ref.clone();
+        }
+        inject_catalog_token_abilities(&mut state, obj_id);
+        let obj = &state.objects[&obj_id];
+        assert!(
+            obj.static_definitions.iter_all().any(|s| s
+                .modifications
+                .iter()
+                .any(|m| matches!(m, ContinuousModification::GrantTrigger { .. }))),
+            "catalog rules_text must grant the attacks life trigger"
+        );
+        assert_eq!(
+            obj.token_rules_text.as_deref(),
+            Some("Whenever this token attacks, you gain 1 life.")
         );
     }
 

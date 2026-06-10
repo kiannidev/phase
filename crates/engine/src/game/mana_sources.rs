@@ -13,13 +13,13 @@
 //! inline resolution — which is why any irreversible sub-effect (damage,
 //! life loss, sacrifice) disqualifies a source from UI-level undo.
 
+use crate::types::ability::ManaSpendRestriction;
 use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, Effect, ManaProduction, QuantityExpr, TargetFilter,
 };
 use crate::types::card_type::CoreType;
 use crate::types::game_state::GameState;
 use crate::types::identifiers::ObjectId;
-use crate::types::ability::ManaSpendRestriction;
 use crate::types::mana::{
     ManaColor, ManaCostShard, ManaPip, ManaRestriction, ManaType, PaymentContext,
 };
@@ -901,26 +901,26 @@ fn profile_kind_from_production(
     resolved: &crate::types::ability::ResolvedAbility,
 ) -> Option<ActivatableManaProfileKind> {
     match produced {
-        ManaProduction::ChoiceAmongCombinations { options } => Some(
-            ActivatableManaProfileKind::CombinationChoices(
+        ManaProduction::ChoiceAmongCombinations { options } => {
+            Some(ActivatableManaProfileKind::CombinationChoices(
                 options
                     .iter()
                     .map(|combo| combo.iter().map(mana_color_to_type).collect())
                     .collect(),
-            ),
-        ),
-        ManaProduction::AnyOneColor { color_options, .. } => Some(
-            ActivatableManaProfileKind::AnyOneColor {
+            ))
+        }
+        ManaProduction::AnyOneColor { color_options, .. } => {
+            Some(ActivatableManaProfileKind::AnyOneColor {
                 count: resolved_production_count(produced, state, resolved),
                 options: color_options.iter().map(mana_color_to_type).collect(),
-            },
-        ),
-        ManaProduction::AnyCombination { color_options, .. } => Some(
-            ActivatableManaProfileKind::AnyCombination {
+            })
+        }
+        ManaProduction::AnyCombination { color_options, .. } => {
+            Some(ActivatableManaProfileKind::AnyCombination {
                 count: resolved_production_count(produced, state, resolved),
                 options: color_options.iter().map(mana_color_to_type).collect(),
-            },
-        ),
+            })
+        }
         ManaProduction::ChosenColor {
             fixed_alternative, ..
         } => {
@@ -1039,9 +1039,7 @@ fn collect_activatable_mana_profiles(
         .battlefield
         .iter()
         .filter(|id| Some(**id) != exclude)
-        .flat_map(|&id| {
-            activatable_mana_profiles_for_object(state, id, player, payment_context)
-        })
+        .flat_map(|&id| activatable_mana_profiles_for_object(state, id, player, payment_context))
         .collect()
 }
 
@@ -1090,15 +1088,22 @@ fn apply_profile_kind(
             }
             Some((remaining, types.len() as u32))
         }
-        ActivatableManaProfileKind::AnyOneColor { count, options } => options
-            .iter()
-            .find_map(|&color| combination_assign(*count, std::slice::from_ref(&color), requirements)),
+        ActivatableManaProfileKind::AnyOneColor { count, options } => {
+            options.iter().find_map(|&color| {
+                combination_assign(*count, std::slice::from_ref(&color), requirements)
+            })
+        }
         ActivatableManaProfileKind::AnyCombination { count, options } => {
             combination_assign(*count, options, requirements)
         }
-        ActivatableManaProfileKind::CombinationChoices(choices) => choices.iter().find_map(|choice| {
-            apply_profile_kind(&ActivatableManaProfileKind::Exact(choice.clone()), requirements)
-        }),
+        ActivatableManaProfileKind::CombinationChoices(choices) => {
+            choices.iter().find_map(|choice| {
+                apply_profile_kind(
+                    &ActivatableManaProfileKind::Exact(choice.clone()),
+                    requirements,
+                )
+            })
+        }
     }
 }
 
@@ -1113,11 +1118,9 @@ fn assign_profiles_to_requirements(
     if object_index >= objects.len() {
         return None;
     }
-    if let Some(consumed) = assign_profiles_to_requirements(
-        objects,
-        object_index + 1,
-        requirements.clone(),
-    ) {
+    if let Some(consumed) =
+        assign_profiles_to_requirements(objects, object_index + 1, requirements.clone())
+    {
         return Some(consumed);
     }
     for profile in &objects[object_index].1 {

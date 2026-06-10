@@ -5028,12 +5028,7 @@ fn parse_opponent_comparison_conditions(input: &str) -> OracleResult<'_, StaticC
         {
             let (rest3, _) = tag(" than you").parse(rest3)?;
             let (type_filter, _) = parse_type_phrase(type_text.trim());
-            let you_filter = match &type_filter {
-                TargetFilter::Typed(tf) => {
-                    TargetFilter::Typed(tf.clone().controller(ControllerRef::You))
-                }
-                other => other.clone(),
-            };
+            let you_filter = inject_controller_you(type_filter.clone());
             return Ok((
                 rest3,
                 StaticCondition::QuantityComparison {

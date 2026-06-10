@@ -99,7 +99,7 @@ fn cast_pipeline_upkeep_adds_age_counter_and_prompts_payment() {
 
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    let remora = scenario.add_real_card(P0, "Mystic Remora", Zone::Hand, &db);
+    let remora = scenario.add_real_card(P0, "Mystic Remora", Zone::Hand, db);
     let mut runner = scenario.build();
 
     add_mana(&mut runner, &[ManaType::Blue]);
@@ -153,7 +153,7 @@ fn rehydrate_rebuilds_cumulative_upkeep_trigger_index() {
 
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::Untap);
-    let remora = scenario.add_real_card(P0, "Mystic Remora", Zone::Battlefield, &db);
+    let remora = scenario.add_real_card(P0, "Mystic Remora", Zone::Battlefield, db);
     let mut runner = scenario.build();
 
     assert_has_cumulative_upkeep_trigger(runner.state(), remora);
@@ -162,7 +162,7 @@ fn rehydrate_rebuilds_cumulative_upkeep_trigger_index() {
     // definitions are intact but upkeep would not consult without rebuild.
     runner.state_mut().trigger_index.remove(remora);
 
-    rehydrate_game_from_card_db(runner.state_mut(), &db);
+    rehydrate_game_from_card_db(runner.state_mut(), db);
 
     advance_to_upkeep_prompt(&mut runner);
     assert_upkeep_unless_prompt(&runner, remora, 1);

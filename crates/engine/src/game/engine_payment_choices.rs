@@ -622,6 +622,7 @@ pub(super) fn handle_unless_payment(
                 target: ref filter,
                 min_total_power: threshold,
             } => {
+                // CR 118.12: If the player cannot meet the power threshold, the payment fails automatically.
                 let eligible = eligible_unless_sacrifice_permanents(
                     state,
                     player,
@@ -1159,28 +1160,14 @@ fn sacrifice_pool_can_meet_power_threshold(
     eligible: &[ObjectId],
     threshold: i32,
 ) -> bool {
-    let powers: Vec<i32> = eligible
+    // CR 118.12: The maximum power obtainable from any subset is the sum of all positive powers.
+    let total_positive_power: i32 = eligible
         .iter()
         .filter_map(|id| state.objects.get(id))
         .map(|obj| obj.power.unwrap_or(0))
-        .collect();
-    if powers.is_empty() {
-        return false;
-    }
-    if powers.iter().any(|&p| p >= threshold) {
-        return true;
-    }
-    let n = powers.len().min(20);
-    for mask in 1u32..(1u32 << n) {
-        let sum: i32 = (0..n)
-            .filter(|i| mask & (1 << i) != 0)
-            .map(|i| powers[i])
-            .sum();
-        if sum >= threshold {
-            return true;
-        }
-    }
-    false
+        .filter(|&p| p > 0)
+        .sum();
+    total_positive_power >= threshold
 }
 
 fn selected_sacrifice_total_power(state: &GameState, chosen: &[ObjectId]) -> i32 {
@@ -1211,9 +1198,20 @@ pub(super) fn handle_ward_sacrifice_choice(
     };
 
     if let Some(threshold) = min_total_power {
+        // CR 118.12: Validate that the chosen permanents are unique and meet the required power threshold.
         if chosen.is_empty() || chosen.iter().any(|id| !permanents.contains(id)) {
             return Err(EngineError::InvalidAction(
                 "Must select one or more eligible permanents to sacrifice".to_string(),
+            ));
+        }
+        if chosen.len()
+            != chosen
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+        {
+            return Err(EngineError::InvalidAction(
+                "Duplicate selections are not allowed".to_string(),
             ));
         }
         if selected_sacrifice_total_power(state, &chosen) < threshold {

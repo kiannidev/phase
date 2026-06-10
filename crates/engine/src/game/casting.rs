@@ -2807,10 +2807,11 @@ fn casting_variant_candidates(
 
     // CR 702.137a: Spectacle is an opt-in alternative cost from hand, available
     // only if an opponent lost life this turn (a static ability functioning on
-    // the stack). Surface the candidate only while that condition holds.
+    // the stack). Surface the candidate only while that condition holds. Read
+    // the *effective* spell keywords so a Spectacle cost granted by a static
+    // (CR 604.1) is honored, not just printed Spectacle.
     if obj.zone == Zone::Hand
-        && obj
-            .keywords
+        && effective_spell_keywords(state, player, object_id)
             .iter()
             .any(|k| matches!(k, crate::types::keywords::Keyword::Spectacle(_)))
         && an_opponent_lost_life_this_turn(state, player)
@@ -3092,12 +3093,16 @@ fn prepare_spell_cast_with_variant_override_inner(
 
     // CR 702.137a: Spectacle — when casting from hand with Keyword::Spectacle, the
     // spectacle mana cost replaces the printed cost (opt-in via `variant_override`,
-    // gated on an opponent having lost life this turn at offer time).
+    // gated on an opponent having lost life this turn at offer time). Read the
+    // *effective* spell keywords so a Spectacle cost granted by a static
+    // (CR 604.1) is honored, not just printed Spectacle.
     let spectacle_cost = if obj.zone == Zone::Hand {
-        obj.keywords.iter().find_map(|k| match k {
-            crate::types::keywords::Keyword::Spectacle(cost) => Some(cost.clone()),
-            _ => None,
-        })
+        effective_spell_keywords(state, player, object_id)
+            .iter()
+            .find_map(|k| match k {
+                crate::types::keywords::Keyword::Spectacle(cost) => Some(cost.clone()),
+                _ => None,
+            })
     } else {
         None
     };

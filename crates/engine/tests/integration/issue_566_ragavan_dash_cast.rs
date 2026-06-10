@@ -8,6 +8,8 @@
 //! https://github.com/phase-rs/phase/issues/566
 
 use engine::game::scenario::{GameScenario, P0};
+use engine::types::ability::StaticDefinition;
+use engine::types::statics::StaticMode;
 use engine::types::actions::{AlternativeCastDecision, GameAction};
 use engine::types::card_type::CoreType;
 use engine::types::game_state::{AlternativeCastKeyword, WaitingFor};
@@ -114,5 +116,71 @@ fn ragavan_dash_choice_casts_creature_onto_battlefield() {
     assert!(
         obj.keywords.iter().any(|k| matches!(k, Keyword::Haste)),
         "dash resolution must grant haste"
+    );
+}
+
+/// Discriminating coverage for the actual #566 fix: Dash granted by a
+/// `StaticMode::CastWithKeyword` static (CR 604.1), with NO printed Dash in
+/// `obj.keywords`, must still surface `AlternativeCastChoice(Dash)`. The
+/// pre-fix code read `obj.keywords` directly, so this test fails on
+/// origin/main and passes only with the `effective_spell_keywords` routing.
+#[test]
+fn granted_dash_from_static_offers_dash_choice() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    // Grantor on P0's battlefield; its CastWithKeyword{Dash} static is attached
+    // below (no real card grants Dash, so the static is set synthetically —
+    // mirroring the WebSlinging fixture in derived_views.rs).
+    let grantor = scenario.add_creature(P0, "Dash Grantor", 2, 2).id();
+
+    // A creature in hand WITHOUT printed Dash.
+    let bear = scenario
+        .add_creature_to_hand(P0, "Vanilla Bear", 2, 1)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Red],
+            generic: 0,
+        })
+        .id();
+
+    let mut runner = scenario.build();
+    let card_id = runner.state().objects[&bear].card_id;
+
+    // CR 604.1: grant Dash {1}{R} to spells via a battlefield static. No
+    // `affected` filter = applies to every spell; the granted-keyword merge in
+    // `effective_spell_keywords` is the seam this test pins.
+    let def = StaticDefinition::new(StaticMode::CastWithKeyword {
+        keyword: Keyword::Dash(ManaCost::Cost {
+            shards: vec![ManaCostShard::Red],
+            generic: 1,
+        }),
+    });
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&grantor)
+        .unwrap()
+        .static_definitions = vec![def].into();
+
+    add_mana(&mut runner, 1, 1);
+
+    let result = runner
+        .act(GameAction::CastSpell {
+            object_id: bear,
+            card_id,
+            targets: vec![],
+        })
+        .expect("cast creature with granted dash");
+
+    assert!(
+        matches!(
+            result.waiting_for,
+            WaitingFor::AlternativeCastChoice {
+                keyword: AlternativeCastKeyword::Dash,
+                ..
+            }
+        ),
+        "statics-granted Dash must surface AlternativeCastChoice(Dash), got {:?}",
+        result.waiting_for
     );
 }

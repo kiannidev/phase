@@ -112,21 +112,23 @@ fn first_sliver_grants_cascade_to_sliver_spells_cast_from_hand() {
         }
     }
 
+    assert!(
+        runner.state().stack.iter().any(|entry| {
+            matches!(
+                &entry.kind,
+                StackEntryKind::TriggeredAbility { ability, .. }
+                    if matches!(ability.effect, Effect::Cascade)
+            )
+        }),
+        "granted cascade must be on the stack before resolution (stack={:?})",
+        runner.state().stack
+    );
+
     runner.advance_until_stack_empty();
 
-    let saw_cascade_trigger = runner.state().stack.iter().any(|entry| {
-        matches!(
-            &entry.kind,
-            StackEntryKind::TriggeredAbility { ability, .. }
-                if matches!(ability.effect, Effect::Cascade)
-        )
-    });
     let exile_after = exile_count(runner.state(), P0);
-
     assert!(
-        saw_cascade_trigger || exile_after > exile_before,
-        "casting a Sliver spell with The First Sliver on the battlefield must trigger cascade \
-         (exile before={exile_before}, after={exile_after}, stack={:?})",
-        runner.state().stack
+        exile_after > exile_before,
+        "cascade must exile at least one library card (before={exile_before}, after={exile_after})"
     );
 }

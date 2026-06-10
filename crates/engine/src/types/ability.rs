@@ -5152,6 +5152,12 @@ pub enum AbilityCost {
         #[serde(default = "default_one")]
         count: u32,
     },
+    /// CR 118.12: Sacrifice any number of permanents matching `target` whose
+    /// combined power is at least `min_total_power` (Phyrexian Dreadnought).
+    SacrificePowerThreshold {
+        target: TargetFilter,
+        min_total_power: i32,
+    },
     /// CR 119.4: Pay life as an activation or additional cost. `amount` is a
     /// `QuantityExpr` so dynamic references (e.g.
     /// `QuantityRef::ColorsInCommandersColorIdentity` for War Room's "pay life
@@ -5401,7 +5407,9 @@ impl AbilityCost {
             AbilityCost::Tap => vec![CostCategory::TapsSelf],
             AbilityCost::Untap => vec![CostCategory::UntapsSelf],
             AbilityCost::Loyalty { .. } => vec![CostCategory::PaysLoyalty],
-            AbilityCost::Sacrifice { .. } => vec![CostCategory::SacrificesPermanent],
+            AbilityCost::Sacrifice { .. } | AbilityCost::SacrificePowerThreshold { .. } => {
+                vec![CostCategory::SacrificesPermanent]
+            }
             AbilityCost::PayLife { .. } => vec![CostCategory::PaysLife],
             AbilityCost::Discard { .. } => vec![CostCategory::Discards],
             AbilityCost::Exile { .. } => vec![CostCategory::ExilesCards],
@@ -5499,6 +5507,7 @@ impl AbilityCost {
             | AbilityCost::Untap
             | AbilityCost::Loyalty { .. }
             | AbilityCost::Sacrifice { .. }
+            | AbilityCost::SacrificePowerThreshold { .. }
             | AbilityCost::PayLife { .. }
             | AbilityCost::Exile { .. }
             // CR 702.167a: Craft's materials exile OTHER objects; the source's

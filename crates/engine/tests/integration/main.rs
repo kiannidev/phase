@@ -138,6 +138,7 @@ mod issue_583_vivi_ornitier_mana_source;
 mod issue_709_regression;
 mod issue_859_weathered_wayfarer;
 mod issue_860_luminarch_aspirant;
+mod issue_864_phyrexian_dreadnought;
 mod issue_868_szarekh_attack_trigger;
 mod issue_874_nadiers_nightblade_token_leaves;
 mod issue_879_obsessive_pursuit;

@@ -728,6 +728,7 @@ fn pay_ability_cost_inner(
         | AbilityCost::Blight { .. }
         | AbilityCost::Reveal { .. }
         | AbilityCost::Behold { .. }
+        | AbilityCost::SacrificePowerThreshold { .. } => {}
         | AbilityCost::NinjutsuFamily { .. } => {
             // At Activation these shapes are intercepted by the interactive
             // WaitingFor detours before payment is invoked, so passing through

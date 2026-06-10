@@ -599,28 +599,12 @@ pub(super) fn handle_unless_payment(
                 count,
                 target: ref filter,
             } => {
-                let sac_source = pending_effect.source_id;
-                let ctx = crate::game::filter::FilterContext::from_source_with_controller(
-                    sac_source, player,
+                let eligible = eligible_unless_sacrifice_permanents(
+                    state,
+                    player,
+                    pending_effect.source_id,
+                    filter,
                 );
-                let eligible: Vec<ObjectId> = state
-                    .battlefield
-                    .iter()
-                    .filter(|id| {
-                        state
-                            .objects
-                            .get(id)
-                            .map(|obj| {
-                                obj.controller == player
-                                    && !obj.is_emblem
-                                    && crate::game::filter::matches_target_filter(
-                                        state, **id, filter, &ctx,
-                                    )
-                            })
-                            .unwrap_or(false)
-                    })
-                    .copied()
-                    .collect();
                 if eligible.len() < count as usize {
                     payment_failed = true;
                 } else {
@@ -629,6 +613,30 @@ pub(super) fn handle_unless_payment(
                         permanents: eligible,
                         pending_effect: pending_effect.clone(),
                         remaining: count,
+                        min_total_power: None,
+                    };
+                    return Ok(action_result(events, state.waiting_for.clone()));
+                }
+            }
+            AbilityCost::SacrificePowerThreshold {
+                target: ref filter,
+                min_total_power: threshold,
+            } => {
+                let eligible = eligible_unless_sacrifice_permanents(
+                    state,
+                    player,
+                    pending_effect.source_id,
+                    filter,
+                );
+                if !sacrifice_pool_can_meet_power_threshold(state, &eligible, threshold) {
+                    payment_failed = true;
+                } else {
+                    state.waiting_for = WaitingFor::WardSacrificeChoice {
+                        player,
+                        permanents: eligible,
+                        pending_effect: pending_effect.clone(),
+                        remaining: 0,
+                        min_total_power: Some(threshold),
                     };
                     return Ok(action_result(events, state.waiting_for.clone()));
                 }
@@ -1121,6 +1129,68 @@ pub(super) fn handle_ward_discard_choice(
     Ok(state.waiting_for.clone())
 }
 
+fn eligible_unless_sacrifice_permanents(
+    state: &GameState,
+    player: PlayerId,
+    sac_source: ObjectId,
+    filter: &TargetFilter,
+) -> Vec<ObjectId> {
+    let ctx = crate::game::filter::FilterContext::from_source_with_controller(sac_source, player);
+    state
+        .battlefield
+        .iter()
+        .filter(|id| {
+            state
+                .objects
+                .get(id)
+                .map(|obj| {
+                    obj.controller == player
+                        && !obj.is_emblem
+                        && crate::game::filter::matches_target_filter(state, **id, filter, &ctx)
+                })
+                .unwrap_or(false)
+        })
+        .copied()
+        .collect()
+}
+
+fn sacrifice_pool_can_meet_power_threshold(
+    state: &GameState,
+    eligible: &[ObjectId],
+    threshold: i32,
+) -> bool {
+    let powers: Vec<i32> = eligible
+        .iter()
+        .filter_map(|id| state.objects.get(id))
+        .map(|obj| obj.power.unwrap_or(0))
+        .collect();
+    if powers.is_empty() {
+        return false;
+    }
+    if powers.iter().any(|&p| p >= threshold) {
+        return true;
+    }
+    let n = powers.len().min(20);
+    for mask in 1u32..(1u32 << n) {
+        let sum: i32 = (0..n)
+            .filter(|i| mask & (1 << i) != 0)
+            .map(|i| powers[i])
+            .sum();
+        if sum >= threshold {
+            return true;
+        }
+    }
+    false
+}
+
+fn selected_sacrifice_total_power(state: &GameState, chosen: &[ObjectId]) -> i32 {
+    chosen
+        .iter()
+        .filter_map(|id| state.objects.get(id))
+        .map(|obj| obj.power.unwrap_or(0))
+        .sum()
+}
+
 pub(super) fn handle_ward_sacrifice_choice(
     state: &mut GameState,
     waiting_for: WaitingFor,
@@ -1132,6 +1202,7 @@ pub(super) fn handle_ward_sacrifice_choice(
         permanents,
         pending_effect,
         remaining,
+        min_total_power,
     } = waiting_for
     else {
         return Err(EngineError::InvalidAction(
@@ -1139,34 +1210,51 @@ pub(super) fn handle_ward_sacrifice_choice(
         ));
     };
 
-    if chosen.len() != 1 || !permanents.contains(&chosen[0]) {
-        return Err(EngineError::InvalidAction(
-            "Must select exactly one permanent to sacrifice".to_string(),
-        ));
-    }
+    if let Some(threshold) = min_total_power {
+        if chosen.is_empty() || chosen.iter().any(|id| !permanents.contains(id)) {
+            return Err(EngineError::InvalidAction(
+                "Must select one or more eligible permanents to sacrifice".to_string(),
+            ));
+        }
+        if selected_sacrifice_total_power(state, &chosen) < threshold {
+            return Err(EngineError::InvalidAction(format!(
+                "Selected permanents' total power must be at least {threshold}"
+            )));
+        }
+        for id in &chosen {
+            crate::game::sacrifice::sacrifice_permanent(state, *id, player, events)?;
+        }
+    } else {
+        if chosen.len() != 1 || !permanents.contains(&chosen[0]) {
+            return Err(EngineError::InvalidAction(
+                "Must select exactly one permanent to sacrifice".to_string(),
+            ));
+        }
 
-    // CR 603.10a + CR 118.8: NOTE — sequential Ward multi-sacrifice is a separate
-    // co-departed gap. Each Ward sacrifice is taken in its own action's `events`
-    // (one permanent per round-trip, re-prompting for `remaining - 1`), so the
-    // permanents paying one Ward cost are never stamped as a simultaneous departure
-    // group; the `handle_sacrifice_for_cost` co-departed stamp does not apply here.
-    // A co-departing observer therefore under-observes. Closing this would batch all
-    // Ward sacrifices into one action (like `handle_sacrifice_for_cost`) — out of scope.
-    crate::game::sacrifice::sacrifice_permanent(state, chosen[0], player, events)?;
+        // CR 603.10a + CR 118.8: NOTE — sequential Ward multi-sacrifice is a separate
+        // co-departed gap. Each Ward sacrifice is taken in its own action's `events`
+        // (one permanent per round-trip, re-prompting for `remaining - 1`), so the
+        // permanents paying one Ward cost are never stamped as a simultaneous departure
+        // group; the `handle_sacrifice_for_cost` co-departed stamp does not apply here.
+        // A co-departing observer therefore under-observes. Closing this would batch all
+        // Ward sacrifices into one action (like `handle_sacrifice_for_cost`) — out of scope.
+        crate::game::sacrifice::sacrifice_permanent(state, chosen[0], player, events)?;
 
-    // If more sacrifices remain, re-prompt with updated eligible permanents
-    if remaining > 1 {
-        let eligible: Vec<ObjectId> = permanents
-            .into_iter()
-            .filter(|&id| id != chosen[0] && state.objects.contains_key(&id))
-            .collect();
-        state.waiting_for = WaitingFor::WardSacrificeChoice {
-            player,
-            permanents: eligible,
-            pending_effect,
-            remaining: remaining - 1,
-        };
-        return Ok(state.waiting_for.clone());
+        // If more sacrifices remain, re-prompt with updated eligible permanents
+        if remaining > 1 {
+            let eligible: Vec<ObjectId> = permanents
+                .into_iter()
+                .filter(|&id| id != chosen[0] && state.objects.contains_key(&id))
+                .collect();
+            state.waiting_for = WaitingFor::WardSacrificeChoice {
+                player,
+                permanents: eligible,
+                pending_effect,
+                remaining: remaining - 1,
+                min_total_power: None,
+            };
+            return Ok(state.waiting_for.clone());
+        }
     }
 
     events.push(GameEvent::EffectResolved {

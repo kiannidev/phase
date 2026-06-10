@@ -350,6 +350,7 @@ fn can_pay_resolution_ability_cost(
         | AbilityCost::Unattach
         | AbilityCost::Loyalty { .. }
         | AbilityCost::Sacrifice { .. }
+        | AbilityCost::SacrificePowerThreshold { .. }
         | AbilityCost::Exile { .. }
         | AbilityCost::ExileMaterials { .. }
         | AbilityCost::CollectEvidence { .. }

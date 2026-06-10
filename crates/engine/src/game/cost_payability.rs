@@ -251,6 +251,32 @@ impl AbilityCost {
                 let (min_count, _) = super::casting::sacrifice_cost_bounds(*count, eligible.len());
                 eligible.len() >= min_count
             }
+            AbilityCost::SacrificePowerThreshold {
+                target,
+                min_total_power,
+            } => {
+                let eligible =
+                    super::casting::find_eligible_sacrifice_targets(state, player, source, target);
+                let powers: Vec<i32> = eligible
+                    .iter()
+                    .filter_map(|id| state.objects.get(id))
+                    .map(|obj| obj.power.unwrap_or(0))
+                    .collect();
+                if powers.is_empty() {
+                    return false;
+                }
+                if powers.iter().any(|&p| p >= *min_total_power) {
+                    return true;
+                }
+                let n = powers.len().min(20);
+                (1u32..(1u32 << n)).any(|mask| {
+                    (0..n)
+                        .filter(|i| mask & (1 << i) != 0)
+                        .map(|i| powers[i])
+                        .sum::<i32>()
+                        >= *min_total_power
+                })
+            }
             // CR 119.4 + CR 119.8 + CR 903.4: Life cost is payable iff life >= amount
             // and "can't lose life" locks do not apply. `amount` is a QuantityExpr
             // so dynamic refs (e.g. commander color identity count) resolve at

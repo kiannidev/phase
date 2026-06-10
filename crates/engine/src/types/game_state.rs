@@ -3345,6 +3345,11 @@ pub enum WaitingFor {
         /// Number of permanents remaining to sacrifice (for "sacrifice two permanents" etc.)
         #[serde(default = "default_remaining_one")]
         remaining: u32,
+        /// CR 118.12: Multi-select sacrifice whose combined power must meet this
+        /// threshold. `None` = pick exactly one per round-trip until `remaining`
+        /// reaches zero.
+        #[serde(default)]
+        min_total_power: Option<i32>,
     },
     /// CR 118.12: Player must choose permanent(s) to return to hand as unless cost.
     UnlessBounceChoice {

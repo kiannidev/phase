@@ -608,6 +608,7 @@ fn walk_cost(cost: &AbilityCost, out: &mut Vec<String>) {
         | AbilityCost::Untap
         | AbilityCost::Loyalty { .. }
         | AbilityCost::Sacrifice { .. }
+        | AbilityCost::SacrificePowerThreshold { .. }
         | AbilityCost::PayLife { .. }
         | AbilityCost::Discard { .. }
         | AbilityCost::Exile { .. }

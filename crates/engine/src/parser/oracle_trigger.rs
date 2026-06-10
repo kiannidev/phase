@@ -2104,12 +2104,35 @@ fn unless_branch_boundary(input: &str) -> usize {
 /// Expects lowercased text. Accepts:
 /// - `a creature` / `an artifact` / `a [type] you control`
 /// - `two creatures` / `three lands`
+/// - `any number of creatures with total power 12 or greater`
 /// - terminal sentence punctuation
 fn parse_unless_sacrifice_filter(rest: &str) -> Option<AbilityCost> {
     // Trim trailing sentence punctuation so it doesn't leak into parse_target.
     let trimmed = rest.trim().trim_end_matches('.').trim();
     if trimmed.is_empty() {
         return None;
+    }
+
+    // CR 118.12: "any number of [filter] with total power N or greater"
+    if let Some(after_any) = trimmed.strip_prefix("any number of ") {
+        if let Some((filter_text, power_tail)) = after_any.split_once(" with total power ") {
+            let threshold = power_tail
+                .strip_suffix(" or greater")
+                .or_else(|| power_tail.strip_suffix(" or more"))
+                .and_then(|n| n.trim().parse::<i32>().ok())?;
+            if filter_text.is_empty() {
+                return None;
+            }
+            let target_phrase = format!("target {}", filter_text.trim());
+            let (filter, remainder) = super::oracle_target::parse_target(&target_phrase);
+            if matches!(filter, TargetFilter::Any) || !remainder.trim().is_empty() {
+                return None;
+            }
+            return Some(AbilityCost::SacrificePowerThreshold {
+                target: filter,
+                min_total_power: threshold,
+            });
+        }
     }
 
     // Extract count: leading numeric word > 1 keeps as count, otherwise count=1.
@@ -18303,6 +18326,44 @@ mod tests {
                 }
             }
             other => panic!("cost should be Sacrifice, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn trigger_unless_you_sacrifice_power_threshold() {
+        let def = parse_trigger_line(
+            "When this creature enters, sacrifice it unless you sacrifice any number of creatures with total power 12 or greater.",
+            "Phyrexian Dreadnought",
+        );
+        let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
+        assert_eq!(unless_pay.payer, TargetFilter::Controller);
+        match &unless_pay.cost {
+            AbilityCost::SacrificePowerThreshold {
+                target,
+                min_total_power,
+            } => {
+                assert_eq!(*min_total_power, 12);
+                match target {
+                    TargetFilter::Typed(typed) => {
+                        assert!(
+                            typed
+                                .type_filters
+                                .iter()
+                                .any(|t| matches!(t, TypeFilter::Creature)),
+                            "filter should include Creature, got {:?}",
+                            typed.type_filters,
+                        );
+                    }
+                    other => panic!("expected Typed filter, got {:?}", other),
+                }
+            }
+            other => panic!("cost should be SacrificePowerThreshold, got {:?}", other),
+        }
+        match def.execute.as_ref().expect("execute").effect.as_ref() {
+            Effect::Sacrifice { target, .. } => {
+                assert_eq!(*target, TargetFilter::SelfRef);
+            }
+            other => panic!("primary ETB effect should sacrifice self, got {:?}", other),
         }
     }
 

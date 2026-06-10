@@ -24035,6 +24035,25 @@ mod tests {
     }
 
     #[test]
+    fn breena_attaches_defending_life_intervening_if() {
+        // Issue #865: attack trigger gated on defending opponent life.
+        let def = parse_trigger_line(
+            "Whenever a player attacks one of your opponents, if that opponent has more life than another of your opponents, that attacking player draws a card and you put two +1/+1 counters on a creature you control.",
+            "Breena, the Demagogue",
+        );
+        assert_eq!(def.mode, TriggerMode::Attacks);
+        match def.condition {
+            Some(TriggerCondition::QuantityComparison {
+                comparator: Comparator::GT,
+                ..
+            }) => {}
+            other => panic!(
+                "Breena must gate on defending player life exceeding another opponent, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
     fn glademuse_attaches_not_their_turn_intervening_if() {
         // Issue #873: "their" refers to the casting player, same as "that player's".
         let def = parse_trigger_line(

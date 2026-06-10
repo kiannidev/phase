@@ -96,15 +96,31 @@ fn birthing_ritual_end_step_trigger_skipped_without_other_creature() {
 
     let mut runner = scenario.build();
     reach_active_players_end_step(&mut runner);
-    runner.advance_until_stack_empty();
 
-    assert!(
-        !runner.state().stack.iter().any(|entry| {
+    // Observe at the end-step priority window WITHOUT draining the stack —
+    // after `advance_until_stack_empty()` the stack is empty whether or not
+    // the trigger ever fired, which made the original form of this assertion
+    // vacuous (it passed even with the intervening-if satisfied).
+    let trigger_stack_entries = runner
+        .state()
+        .stack
+        .iter()
+        .filter(|entry| {
             matches!(
                 &entry.kind,
                 StackEntryKind::TriggeredAbility { source_id, .. } if *source_id == ritual
             )
-        }),
-        "without another creature, Birthing Ritual's intervening-if must suppress the trigger"
+        })
+        .count();
+
+    assert_eq!(
+        runner.state().phase,
+        Phase::End,
+        "scenario should reach the active player's end step"
+    );
+    assert_eq!(
+        trigger_stack_entries, 0,
+        "without another creature, Birthing Ritual's intervening-if (CR 603.4) must suppress the trigger; stack = {:?}",
+        runner.state().stack
     );
 }

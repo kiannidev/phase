@@ -253,18 +253,22 @@ impl AbilityCost {
             }
             AbilityCost::SacrificePowerThreshold {
                 target,
-                min_total_power,
+                stat,
+                comparator,
+                value,
             } => {
-                // CR 118.12: Verify if the total power of eligible sacrifice targets can meet the threshold.
+                // CR 701.21: Verify the eligible pool can meet the aggregate constraint.
                 let eligible =
                     super::casting::find_eligible_sacrifice_targets(state, player, source, target);
-                let total_positive_power: i32 = eligible
-                    .iter()
-                    .filter_map(|id| state.objects.get(id))
-                    .map(|obj| obj.power.unwrap_or(0))
-                    .filter(|&p| p > 0)
-                    .sum();
-                total_positive_power >= *min_total_power
+                let total_positive_power: i32 = match stat {
+                    crate::types::ability::SacrificeAggregateStat::TotalPower => eligible
+                        .iter()
+                        .filter_map(|id| state.objects.get(id))
+                        .map(|obj| obj.power.unwrap_or(0))
+                        .filter(|&p| p > 0)
+                        .sum(),
+                };
+                comparator.evaluate(total_positive_power, *value)
             }
             // CR 119.4 + CR 119.8 + CR 903.4: Life cost is payable iff life >= amount
             // and "can't lose life" locks do not apply. `amount` is a QuantityExpr

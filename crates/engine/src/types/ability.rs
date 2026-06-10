@@ -5124,6 +5124,12 @@ pub enum CounterCostSelection {
     AmongObjects,
 }
 
+/// CR 701.21: Aggregate statistic for a sacrifice-cost selection constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SacrificeAggregateStat {
+    TotalPower,
+}
+
 /// Cost to activate an ability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -5152,11 +5158,13 @@ pub enum AbilityCost {
         #[serde(default = "default_one")]
         count: u32,
     },
-    /// CR 118.12: Sacrifice any number of permanents matching `target` whose
-    /// combined power is at least `min_total_power` (Phyrexian Dreadnought).
+    /// CR 701.21: Sacrifice any number of permanents matching `target` subject
+    /// to an aggregate constraint over the chosen set (Phyrexian Dreadnought).
     SacrificePowerThreshold {
         target: TargetFilter,
-        min_total_power: i32,
+        stat: SacrificeAggregateStat,
+        comparator: Comparator,
+        value: i32,
     },
     /// CR 119.4: Pay life as an activation or additional cost. `amount` is a
     /// `QuantityExpr` so dynamic references (e.g.

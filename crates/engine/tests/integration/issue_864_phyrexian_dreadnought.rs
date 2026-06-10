@@ -120,7 +120,9 @@ fn phyrexian_dreadnought_parsed_etb_carries_power_threshold_unless_cost() {
     assert!(matches!(
         unless_pay.cost,
         AbilityCost::SacrificePowerThreshold {
-            min_total_power: 12,
+            stat: engine::types::ability::SacrificeAggregateStat::TotalPower,
+            comparator: engine::types::ability::Comparator::GE,
+            value: 12,
             ..
         }
     ));

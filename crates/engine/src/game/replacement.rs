@@ -400,8 +400,13 @@ fn replacement_cost_description(cost: &AbilityCost) -> String {
             }
         }
         AbilityCost::SacrificePowerThreshold {
-            min_total_power, ..
-        } => format!("Sacrifice creatures with total power {min_total_power} or greater"),
+            stat: crate::types::ability::SacrificeAggregateStat::TotalPower,
+            comparator,
+            value,
+            ..
+        } => format!(
+            "Sacrifice creatures with total power {value} ({comparator:?} constraint)"
+        ),
         AbilityCost::Discard { .. } => "Discard a card".to_string(),
         // CR 702.24a: Delegate the label to the base cost so a "for each
         // counter" wrapper inherits its base's prompt phrasing (e.g.,

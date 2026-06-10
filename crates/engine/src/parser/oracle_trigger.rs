@@ -37,9 +37,9 @@ use crate::types::ability::{
     AttackersDeclaredCountSubject, CastManaObjectScope, CastManaSpentMetric, CastVariantPaid,
     CoinFlipResult, Comparator, ControllerRef, CounterTriggerFilter, DamageKindFilter,
     DestinationConstraint, Effect, FilterProp, ObjectScope, OriginConstraint, PlayerFilter,
-    PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, RenownSubject, StaticCondition,
-    TargetFilter, TriggerCondition, TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter,
-    UnlessPayModifier, ZoneChangeClause,
+    PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, RenownSubject,
+    SacrificeAggregateStat, StaticCondition, TargetFilter, TriggerCondition, TriggerConstraint,
+    TriggerDefinition, TypeFilter, TypedFilter, UnlessPayModifier, ZoneChangeClause,
 };
 #[cfg(test)]
 use crate::types::ability::{AttackScope, AttackSubject, EffectScope, TapStateChange};
@@ -2138,7 +2138,9 @@ fn parse_unless_sacrifice_filter(rest: &str) -> Option<AbilityCost> {
                 if !matches!(filter, TargetFilter::Any) && remainder.trim().is_empty() {
                     return Some(AbilityCost::SacrificePowerThreshold {
                         target: filter,
-                        min_total_power: threshold as i32,
+                        stat: SacrificeAggregateStat::TotalPower,
+                        comparator: Comparator::GE,
+                        value: threshold as i32,
                     });
                 }
             }
@@ -18350,23 +18352,22 @@ mod tests {
         match &unless_pay.cost {
             AbilityCost::SacrificePowerThreshold {
                 target,
-                min_total_power,
-            } => {
-                assert_eq!(*min_total_power, 12);
-                match target {
-                    TargetFilter::Typed(typed) => {
-                        assert!(
-                            typed
-                                .type_filters
-                                .iter()
-                                .any(|t| matches!(t, TypeFilter::Creature)),
-                            "filter should include Creature, got {:?}",
-                            typed.type_filters,
-                        );
-                    }
-                    other => panic!("expected Typed filter, got {:?}", other),
+                stat: SacrificeAggregateStat::TotalPower,
+                comparator: Comparator::GE,
+                value: 12,
+            } => match target {
+                TargetFilter::Typed(typed) => {
+                    assert!(
+                        typed
+                            .type_filters
+                            .iter()
+                            .any(|t| matches!(t, TypeFilter::Creature)),
+                        "filter should include Creature, got {:?}",
+                        typed.type_filters,
+                    );
                 }
-            }
+                other => panic!("expected Typed filter, got {:?}", other),
+            },
             other => panic!("cost should be SacrificePowerThreshold, got {:?}", other),
         }
         match def.execute.as_ref().expect("execute").effect.as_ref() {

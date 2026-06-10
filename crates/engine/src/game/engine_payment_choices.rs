@@ -620,16 +620,25 @@ pub(super) fn handle_unless_payment(
             }
             AbilityCost::SacrificePowerThreshold {
                 target: ref filter,
-                min_total_power: threshold,
+                stat,
+                comparator,
+                value,
             } => {
-                // CR 118.12: If the player cannot meet the power threshold, the payment fails automatically.
+                // CR 118.12a: Unless-sacrifice with an aggregate constraint fails
+                // automatically when the pool cannot satisfy it.
                 let eligible = eligible_unless_sacrifice_permanents(
                     state,
                     player,
                     pending_effect.source_id,
                     filter,
                 );
-                if !sacrifice_pool_can_meet_power_threshold(state, &eligible, threshold) {
+                if !sacrifice_pool_meets_aggregate_constraint(
+                    state,
+                    &eligible,
+                    stat,
+                    comparator,
+                    value,
+                ) {
                     payment_failed = true;
                 } else {
                     state.waiting_for = WaitingFor::WardSacrificeChoice {
@@ -637,7 +646,14 @@ pub(super) fn handle_unless_payment(
                         permanents: eligible,
                         pending_effect: pending_effect.clone(),
                         remaining: 0,
-                        min_total_power: Some(threshold),
+                        min_total_power: matches!(
+                            (stat, comparator),
+                            (
+                                crate::types::ability::SacrificeAggregateStat::TotalPower,
+                                crate::types::ability::Comparator::GE
+                            )
+                        )
+                        .then_some(value),
                     };
                     return Ok(action_result(events, state.waiting_for.clone()));
                 }
@@ -1155,19 +1171,23 @@ fn eligible_unless_sacrifice_permanents(
         .collect()
 }
 
-fn sacrifice_pool_can_meet_power_threshold(
+fn sacrifice_pool_meets_aggregate_constraint(
     state: &GameState,
     eligible: &[ObjectId],
-    threshold: i32,
+    stat: crate::types::ability::SacrificeAggregateStat,
+    comparator: crate::types::ability::Comparator,
+    value: i32,
 ) -> bool {
-    // CR 118.12: The maximum power obtainable from any subset is the sum of all positive powers.
-    let total_positive_power: i32 = eligible
-        .iter()
-        .filter_map(|id| state.objects.get(id))
-        .map(|obj| obj.power.unwrap_or(0))
-        .filter(|&p| p > 0)
-        .sum();
-    total_positive_power >= threshold
+    // CR 701.21: The maximum power obtainable from any subset is the sum of all positive powers.
+    let total_positive_power: i32 = match stat {
+        crate::types::ability::SacrificeAggregateStat::TotalPower => eligible
+            .iter()
+            .filter_map(|id| state.objects.get(id))
+            .map(|obj| obj.power.unwrap_or(0))
+            .filter(|&p| p > 0)
+            .sum(),
+    };
+    comparator.evaluate(total_positive_power, value)
 }
 
 fn selected_sacrifice_total_power(state: &GameState, chosen: &[ObjectId]) -> i32 {
@@ -1198,7 +1218,7 @@ pub(super) fn handle_ward_sacrifice_choice(
     };
 
     if let Some(threshold) = min_total_power {
-        // CR 118.12: Validate that the chosen permanents are unique and meet the required power threshold.
+        // CR 118.12a: Validate that the chosen permanents are unique and meet the aggregate constraint.
         if chosen.is_empty() || chosen.iter().any(|id| !permanents.contains(id)) {
             return Err(EngineError::InvalidAction(
                 "Must select one or more eligible permanents to sacrifice".to_string(),

@@ -190,15 +190,26 @@ export function useDeckBuilder({
     };
   }, [deck.main, format, isCommander]);
 
+  // Names whose copy-limit override has already been requested (in flight or
+  // resolved). A card's copy limit is static per name, so once queried it never
+  // needs re-querying — this keeps deck edits and repeated searches from
+  // re-issuing WASM calls for every card in the deck.
+  const queriedCopyLimitNamesRef = useRef<Set<string>>(new Set());
+
   const prefetchDeckCopyLimits = useCallback((names: string[]) => {
-    const unique = Array.from(new Set(names));
+    const unique = Array.from(new Set(names)).filter(
+      (name) => !queriedCopyLimitNamesRef.current.has(name),
+    );
     if (unique.length === 0) return;
-    let cancelled = false;
+    for (const name of unique) {
+      queriedCopyLimitNamesRef.current.add(name);
+    }
     Promise.all(
       unique.map(async (name) => [name, await deckCopyLimit(name)] as const),
     )
       .then((results) => {
-        if (cancelled) return;
+        // No cancellation guard: limits are static per name, so a resolved
+        // batch is never stale — merging is always safe.
         setDeckCopyLimits((prev) => {
           const next = new Map(prev);
           for (const [name, limit] of results) {
@@ -209,28 +220,24 @@ export function useDeckBuilder({
         });
       })
       .catch(() => {
-        // Retain previously resolved overrides on transient WASM failures.
+        // Retain previously resolved overrides and allow this batch to be
+        // retried after a transient WASM failure.
+        for (const name of unique) {
+          queriedCopyLimitNamesRef.current.delete(name);
+        }
       });
-    return () => {
-      cancelled = true;
-    };
   }, []);
 
   // CR 100.2a / CR 903.5b: resolve per-card copy-limit overrides for every card
   // referenced anywhere in the deck. The engine is the single authority — the
-  // frontend never re-parses Oracle text. Mirrors the commander-eligibility
-  // effect's union-of-names keying and cancellation guard.
+  // frontend never re-parses Oracle text. Limits are static per card name, so
+  // the resolved map is a monotonic cache: merged into, never cleared.
   useEffect(() => {
-    const names = [
+    prefetchDeckCopyLimits([
       ...deck.main.map((e) => e.name),
       ...deck.sideboard.map((e) => e.name),
       ...commanders,
-    ];
-    if (names.length === 0) {
-      setDeckCopyLimits(new Map());
-      return;
-    }
-    return prefetchDeckCopyLimits(names);
+    ]);
   }, [deck.main, deck.sideboard, commanders, prefetchDeckCopyLimits]);
 
   // Synchronous per-card effective copy cap: the override when present, else the

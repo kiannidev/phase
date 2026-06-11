@@ -1589,6 +1589,11 @@ pub enum CastingPermission {
         /// declines or fails to cast.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         duration: Option<Duration>,
+        /// CR 614.1a: Torrential Gearhulk / Toshiro class — a `CastFromZone`
+        /// grant whose sub-ability is "if that spell would be put into your
+        /// graveyard, exile it instead." Applied when the granted cast finalizes.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        exile_instead_of_graveyard_on_resolve: bool,
     },
     /// CR 400.7i: Play from exile until duration expires (impulse draw).
     /// Building block for "exile top N, choose one, you may play it this turn" patterns.
@@ -3488,6 +3493,15 @@ pub enum QuantityRef {
     /// targeted-player and cross-player aggregate variants per the same axis
     /// used by `LifeTotal`/`HandSize`.
     PartySize { player: PlayerScope },
+    /// CR 106.4: The amount of unspent mana in the controller's mana pool —
+    /// `Some(color)` counts only that color, `None` counts all colors. Drives
+    /// dynamic P/T and similar magnitudes that scale with floating mana
+    /// (Omnath, Locus of Mana — "gets +1/+1 for each unspent green mana you
+    /// have"). Controller-scoped: every printed "unspent … mana you have"
+    /// reference is to the ability's own controller, so no `PlayerScope` axis
+    /// is carried (unlike `LifeTotal`/`HandSize`, which opponents' effects do
+    /// read).
+    UnspentMana { color: Option<ManaColor> },
     /// CR 702.179f: `player`'s current speed, treating no speed as 0.
     /// `PlayerScope::Controller` is the default reading ("your speed");
     /// `Target` / `Opponent { .. }` / `AllPlayers { .. }` /
@@ -6137,6 +6151,12 @@ pub struct FaceDownProfile {
     /// CR 205.1a: Creature subtypes the effect grants ("Cyberman").
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub subtypes: Vec<String>,
+    /// CR 701.58a: Ward granted to the face-down permanent. `None` for plain
+    /// manifest/morph; `Some(Ward {2})` for cloak (and is also the correct home
+    /// for disguise's ward). Applied as a `Keyword::Ward` on entry and cleared
+    /// when the card is turned face up (the real card's keywords take over).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ward: Option<crate::types::keywords::WardCost>,
 }
 
 impl FaceDownProfile {
@@ -6149,6 +6169,19 @@ impl FaceDownProfile {
             toughness: None,
             extra_core_types: vec![],
             subtypes: vec![],
+            ward: None,
+        }
+    }
+
+    /// CR 701.58a: The cloak face-down characteristics — a vanilla 2/2 creature
+    /// with ward {2}. Otherwise identical to [`Self::vanilla_2_2`]; the card can
+    /// still be turned face up for its mana cost if it's a creature card.
+    pub fn cloaked_2_2() -> Self {
+        Self {
+            ward: Some(crate::types::keywords::WardCost::Mana(
+                crate::types::mana::ManaCost::generic(2),
+            )),
+            ..Self::vanilla_2_2()
         }
     }
 }
@@ -8002,6 +8035,28 @@ pub enum Effect {
     /// CR 701.62a: Manifest dread — look at top 2 cards of library, manifest one,
     /// put the rest into graveyard. Uses interactive WaitingFor::ManifestDreadChoice.
     ManifestDread,
+    /// CR 701.58a: Cloak — put card(s) onto the battlefield face down as a 2/2
+    /// creature **with ward {2}**, turnable face up for its mana cost if it's a
+    /// creature card. Distinct from `Manifest` (CR 701.40a): cloak grants ward
+    /// and is a separate keyword action for "cloak"-referencing text. `target`
+    /// selects whose library is cloaked from (mirrors `Manifest.target`); first
+    /// pass covers the top-of-library source. `count` is the number of cards.
+    Cloak {
+        target: TargetFilter,
+        count: QuantityExpr,
+    },
+    /// CR 406.3 + CR 701.20a: Turn a face-down card face up via a resolving effect (not the
+    /// morph special action). Used by the Imprint "flip" cards — Clone Shell,
+    /// Summoner's Egg, Compleated Clone Shell, The Creation of Avacyn — which
+    /// exile a card face down and later "turn the exiled card face up". `target`
+    /// selects the face-down object (default `ExiledBySource`, the card this
+    /// source exiled). Reveals the card's real characteristics; any conditional
+    /// follow-up ("if it's a creature card, put it onto the battlefield …")
+    /// chains as a sub-ability.
+    TurnFaceUp {
+        #[serde(default = "default_target_filter_exiled_by_source")]
+        target: TargetFilter,
+    },
     /// CR 500.7: Take an extra turn after this one. The target determines who
     /// takes the extra turn (usually Controller for "take an extra turn").
     /// Extra turns are stored as a LIFO stack — most recently created taken first.
@@ -8469,6 +8524,12 @@ fn is_target_filter_controller(t: &TargetFilter) -> bool {
 
 fn default_target_filter_self_ref() -> TargetFilter {
     TargetFilter::SelfRef
+}
+
+/// CR 406.3: default for `Effect::TurnFaceUp` — "the exiled card" this source
+/// exiled face down (Imprint flip cards).
+fn default_target_filter_exiled_by_source() -> TargetFilter {
+    TargetFilter::ExiledBySource
 }
 
 /// CR 608.2c: default for continuation effects whose target is inherited from
@@ -9144,6 +9205,8 @@ impl Effect {
             | Effect::ExileResolvingSpellInsteadOfGraveyard
             | Effect::Manifest { .. }
             | Effect::ManifestDread
+            | Effect::Cloak { .. }
+            | Effect::TurnFaceUp { .. }
             | Effect::RollDie { .. }
             | Effect::FlipCoin { .. }
             | Effect::FlipCoins { .. }
@@ -9245,6 +9308,7 @@ impl Effect {
             | Effect::PutAtLibraryPosition { count, .. }
             | Effect::ChooseDrawnThisTurnPayOrTopdeck { count, .. }
             | Effect::Manifest { count, .. }
+            | Effect::Cloak { count, .. }
             | Effect::SkipNextTurn { count, .. }
             | Effect::SkipNextStep { count, .. }
             | Effect::AdditionalPhase { count, .. }
@@ -9387,6 +9451,7 @@ impl Effect {
             | Effect::MadnessCast { .. }
             | Effect::Mana { .. }
             | Effect::ManifestDread
+            | Effect::TurnFaceUp { .. }
             | Effect::MiracleCast { .. }
             | Effect::OpenAttractions { .. }
             | Effect::PayCost { .. }
@@ -9440,6 +9505,7 @@ impl Effect {
             | Effect::PutAtLibraryPosition { count, .. }
             | Effect::ChooseDrawnThisTurnPayOrTopdeck { count, .. }
             | Effect::Manifest { count, .. }
+            | Effect::Cloak { count, .. }
             | Effect::SkipNextTurn { count, .. }
             | Effect::SkipNextStep { count, .. }
             | Effect::AdditionalPhase { count, .. }
@@ -9582,6 +9648,7 @@ impl Effect {
             | Effect::MadnessCast { .. }
             | Effect::Mana { .. }
             | Effect::ManifestDread
+            | Effect::TurnFaceUp { .. }
             | Effect::MiracleCast { .. }
             | Effect::OpenAttractions { .. }
             | Effect::PayCost { .. }
@@ -9772,6 +9839,8 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::Adapt { .. } => "Adapt",
         Effect::Manifest { .. } => "Manifest",
         Effect::ManifestDread => "ManifestDread",
+        Effect::Cloak { .. } => "Cloak",
+        Effect::TurnFaceUp { .. } => "TurnFaceUp",
         Effect::ExtraTurn { .. } => "ExtraTurn",
         Effect::GrantExtraLoyaltyActivations { .. } => "GrantExtraLoyaltyActivations",
         Effect::SkipNextTurn { .. } => "SkipNextTurn",
@@ -9967,6 +10036,8 @@ pub enum EffectKind {
     Adapt,
     Manifest,
     ManifestDread,
+    /// CR 701.58a: Cloak (face-down 2/2 with ward {2}).
+    Cloak,
     ExtraTurn,
     GrantExtraLoyaltyActivations,
     SkipNextTurn,
@@ -10175,6 +10246,8 @@ impl From<&Effect> for EffectKind {
             Effect::Adapt { .. } => EffectKind::Adapt,
             Effect::Manifest { .. } => EffectKind::Manifest,
             Effect::ManifestDread => EffectKind::ManifestDread,
+            Effect::Cloak { .. } => EffectKind::Cloak,
+            Effect::TurnFaceUp { .. } => EffectKind::TurnFaceUp,
             Effect::ExtraTurn { .. } => EffectKind::ExtraTurn,
             Effect::GrantExtraLoyaltyActivations { .. } => EffectKind::GrantExtraLoyaltyActivations,
             Effect::SkipNextTurn { .. } => EffectKind::SkipNextTurn,

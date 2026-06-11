@@ -8,7 +8,7 @@ use engine::game::scenario::{GameScenario, P0};
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{
     AbilityCost, AdditionalCost, AdditionalCostRepeatability, SacrificeRequirement,
-    StaticCondition, TargetFilter,
+    StaticCondition, TargetFilter, TypeFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::game_state::{CastPaymentMode, PayCostKind, WaitingFor};
@@ -113,7 +113,11 @@ fn rottenmouth_viper_parses_sacrifice_additional_cost_and_reduction() {
             cost: AbilityCost::Sacrifice(ref cost),
             repeatability: AdditionalCostRepeatability::Once,
         }) => {
-            assert_eq!(cost.target, TargetFilter::Any);
+            assert!(matches!(
+                cost.target,
+                TargetFilter::Typed(ref tf)
+                    if tf.type_filters.iter().any(|f| matches!(f, TypeFilter::Non(_)))
+            ));
             assert_eq!(
                 cost.requirement,
                 SacrificeRequirement::count(u32::MAX),

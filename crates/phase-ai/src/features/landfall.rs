@@ -212,7 +212,8 @@ fn has_extra_land_drop_static(face: &CardFace) -> bool {
 mod tests {
     use super::*;
     use engine::types::ability::{
-        AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, QuantityExpr, TriggerDefinition,
+        AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, QuantityExpr, SacrificeCost,
+        TriggerDefinition,
     };
     use engine::types::card::CardFace;
     use engine::types::card_type::{CardType, CoreType};

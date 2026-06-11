@@ -902,7 +902,7 @@ fn supported_at_resolution(cost: &AbilityCost) -> bool {
         | AbilityCost::Tap
         | AbilityCost::Untap
         | AbilityCost::Loyalty { .. }
-        | AbilityCost::Sacrifice { .. }
+        | AbilityCost::Sacrifice(_)
         | AbilityCost::Exile { .. }
         | AbilityCost::ExileMaterials { .. }
         | AbilityCost::CollectEvidence { .. }
@@ -1020,7 +1020,7 @@ fn can_pay_resolution(
         | AbilityCost::Untap
         | AbilityCost::Unattach
         | AbilityCost::Loyalty { .. }
-        | AbilityCost::Sacrifice { .. }
+        | AbilityCost::Sacrifice(_)
         | AbilityCost::Exile { .. }
         | AbilityCost::ExileMaterials { .. }
         | AbilityCost::CollectEvidence { .. }
@@ -1046,7 +1046,7 @@ mod tests {
     use crate::game::scenario::GameScenario;
     use crate::types::ability::{
         BeholdCostAction, CardSelectionMode, CostObjectCount, DiscardSelfScope, Effect,
-        NinjutsuVariant, QuantityExpr,
+        NinjutsuVariant, QuantityExpr, SacrificeCost,
     };
     use crate::types::counter::{CounterMatch, CounterType};
     use crate::types::mana::ManaCost;
@@ -1071,10 +1071,9 @@ mod tests {
             AbilityCost::Tap => AbilityCost::Tap,
             AbilityCost::Untap => AbilityCost::Untap,
             AbilityCost::Loyalty { .. } => AbilityCost::Loyalty { amount: 1 },
-            AbilityCost::Sacrifice { .. } => AbilityCost::Sacrifice {
-                target: TargetFilter::SelfRef,
-                count: 1,
-            },
+            AbilityCost::Sacrifice(_) => {
+                AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1))
+            }
             AbilityCost::PayLife { .. } => AbilityCost::PayLife {
                 amount: life.clone(),
             },
@@ -1175,10 +1174,7 @@ mod tests {
             AbilityCost::Tap,
             AbilityCost::Untap,
             AbilityCost::Loyalty { amount: 0 },
-            AbilityCost::Sacrifice {
-                target: TargetFilter::SelfRef,
-                count: 1,
-            },
+            AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1)),
             AbilityCost::PayLife {
                 amount: QuantityExpr::Fixed { value: 0 },
             },
@@ -1301,10 +1297,7 @@ mod tests {
             AbilityCost::PayEnergy {
                 amount: QuantityExpr::Fixed { value: 1 },
             },
-            AbilityCost::Sacrifice {
-                target: TargetFilter::SelfRef,
-                count: 1,
-            },
+            AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1)),
             AbilityCost::Loyalty { amount: 1 },
             AbilityCost::RemoveCounter {
                 count: 1,
@@ -1361,13 +1354,13 @@ mod tests {
         let mut scenario = GameScenario::new();
         let src = scenario.add_creature(P0, "Altar", 0, 1).id();
         // The source is a 0/1 creature; "another creature" filter excludes it.
-        let cost = AbilityCost::Sacrifice {
-            target: TargetFilter::Typed(
+        let cost = AbilityCost::Sacrifice(SacrificeCost::count(
+            TargetFilter::Typed(
                 TypedFilter::creature()
                     .properties(vec![crate::types::ability::FilterProp::Another]),
             ),
-            count: 1,
-        };
+            1,
+        ));
         assert!(
             !can_pay_activation(&scenario.state, src, &cost),
             "no other creature to sacrifice → unpayable"

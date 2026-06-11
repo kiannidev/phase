@@ -373,7 +373,7 @@ mod tests {
     use engine::game::DeckEntry;
     use engine::types::ability::{
         AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, Effect, PtValue, QuantityExpr,
-        TargetFilter, TriggerDefinition, TypedFilter,
+        SacrificeCost, TargetFilter, TriggerDefinition, TypedFilter,
     };
     use engine::types::card::CardFace;
     use engine::types::card_type::{CardType, CoreType};

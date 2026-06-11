@@ -296,7 +296,7 @@ mod tests {
     use super::*;
     use engine::types::ability::{
         AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, Effect, ManaContribution,
-        ManaProduction, QuantityExpr, TargetFilter, TypedFilter,
+        ManaProduction, QuantityExpr, SacrificeCost, TargetFilter, TypedFilter,
     };
     use engine::types::card::CardFace;
     use engine::types::card_type::{CardType, CoreType};

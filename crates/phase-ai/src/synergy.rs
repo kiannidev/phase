@@ -269,7 +269,8 @@ mod tests {
     use super::*;
     use engine::game::zones::create_object;
     use engine::types::ability::{
-        AbilityDefinition, AbilityKind, PtValue, QuantityExpr, TargetFilter, TriggerDefinition,
+        AbilityCost, AbilityDefinition, AbilityKind, PtValue, QuantityExpr, SacrificeCost,
+        TargetFilter, TriggerDefinition,
     };
     use engine::types::card_type::CardType;
     use engine::types::identifiers::CardId;

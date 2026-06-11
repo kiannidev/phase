@@ -243,7 +243,7 @@ mod tests {
     use engine::game::zones::create_object;
     use engine::types::ability::{
         AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, Effect, ManaContribution,
-        ManaProduction, QuantityExpr, TargetFilter, TypedFilter,
+        ManaProduction, QuantityExpr, SacrificeCost, TargetFilter, TypedFilter,
     };
     use engine::types::game_state::{GameState, WaitingFor};
     use engine::types::identifiers::{CardId, ObjectId};

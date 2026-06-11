@@ -135,12 +135,9 @@ mod issue_2435_traumatic_critique;
 mod issue_2439_wayta_trigger_doubling;
 mod issue_2894_spymasters_vault_connive;
 mod issue_2908_weathered_wayfarer;
-<<<<<<< fix/issue-2919-tarrasque-was-cast
-mod issue_2919_tarrasque_was_cast;
-=======
 mod issue_2914_shiko_flurry_target_gate;
 mod issue_2915_alexios;
->>>>>>> main
+mod issue_2919_tarrasque_was_cast;
 mod issue_2929_arc_trail_any_other_target;
 mod issue_2938_deflecting_swat;
 mod issue_2940_krark_thumbless;

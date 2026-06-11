@@ -7,7 +7,7 @@
 use engine::game::scenario::{GameScenario, P0};
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{
-    AbilityCost, AdditionalCost, AdditionalCostRepeatability, SacrificeCost, SacrificeRequirement,
+    AbilityCost, AdditionalCost, AdditionalCostRepeatability, SacrificeRequirement,
     StaticCondition, TargetFilter,
 };
 use engine::types::actions::GameAction;

@@ -13,8 +13,7 @@
 
 use engine::game::zones::create_object;
 use engine::types::ability::{
-    AbilityCost, AdditionalCost, SacrificeCost, SacrificeRequirement, TargetFilter, TypeFilter,
-    TypedFilter,
+    AbilityCost, AdditionalCost, SacrificeCost, TargetFilter, TypeFilter, TypedFilter,
 };
 use engine::types::card_type::CoreType;
 use engine::types::game_state::GameState;

@@ -26,7 +26,7 @@ use engine::game::casting::{can_cast_object_now, spell_objects_available_to_cast
 use engine::game::zones::create_object;
 use engine::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, Effect, ManaProduction, QuantityExpr,
-    SacrificeCost, SacrificeRequirement, TargetFilter, TypeFilter, TypedFilter,
+    SacrificeCost, TargetFilter, TypeFilter, TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;

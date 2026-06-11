@@ -26,7 +26,7 @@
 use engine::game::scenario::{GameScenario, P0};
 use engine::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, Effect, ObjectScope, QuantityExpr, QuantityRef,
-    SacrificeCost, SacrificeRequirement, TargetFilter, TypeFilter, TypedFilter,
+    SacrificeCost, TargetFilter, TypeFilter, TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;

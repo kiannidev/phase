@@ -5848,7 +5848,7 @@ mod tests {
         assert_eq!(
             r.additional_cost,
             Some(AdditionalCost::Required(AbilityCost::Sacrifice(
-                SacrificeCost::count(TargetFilter::Typed(TypedFilter::creature()), 1)
+                SacrificeCost::count(TargetFilter::Typed(TypedFilter::creature()), u32::MAX)
             )))
         );
         assert_eq!(r.abilities.len(), 1);

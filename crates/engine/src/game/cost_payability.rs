@@ -1022,7 +1022,7 @@ mod tests {
         let src = scenario.add_creature(P0, "Chatterfang", 3, 3).id();
         let cost = AbilityCost::Sacrifice(SacrificeCost::count(
             TargetFilter::Typed(TypedFilter::new(TypeFilter::Subtype("Squirrel".into()))),
-            1,
+            u32::MAX,
         ));
 
         assert!(

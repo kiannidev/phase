@@ -15387,7 +15387,7 @@ mod tests {
                         controller: Some(ControllerRef::You),
                         ..Default::default()
                     }),
-                    1,
+                    u32::MAX,
                 ),
             )));
         }

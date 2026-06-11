@@ -1580,7 +1580,10 @@ pub(crate) fn condition_text_is_rehomeable(condition_text: &str) -> bool {
 /// rider (", and you may choose new targets for the copy"), peel the rider off so
 /// the condition parser sees only the predicate (Shiko and Narset, Unified).
 fn peel_copy_retarget_tail_from_condition_text(condition_text: &str) -> (&str, Option<&str>) {
-    let Some((prefix, tail)) = condition_text.split_once(", and ") else {
+    let Ok((tail, prefix)) =
+        terminated(take_until(", and "), tag::<_, _, OracleError<'_>>(", and "))
+            .parse(condition_text)
+    else {
         return (condition_text, None);
     };
     if super::sequence::recognize_copy_retarget_clause(tail) {

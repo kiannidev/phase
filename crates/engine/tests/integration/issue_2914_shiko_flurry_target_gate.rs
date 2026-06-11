@@ -126,6 +126,11 @@ fn targeted_second_spell_is_copied_not_drawn() {
         !opt_drawn(&runner),
         "Flurry copied the targeted second spell, so it must not draw."
     );
+    assert_eq!(
+        runner.life(P1),
+        11,
+        "two Lightning Bolts plus the copied second Bolt should deal 9 total damage"
+    );
 }
 
 /// CR 608.2c + CR 707.10: an untargeted second spell is not copied, so Flurry draws.

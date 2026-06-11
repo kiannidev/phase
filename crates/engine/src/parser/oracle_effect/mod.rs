@@ -92,8 +92,8 @@ use crate::types::ability::{
     ContinuousModification, ControllerRef, DamageModification, DamageSource,
     DelayedTriggerCondition, DoubleTarget, Duration, Effect, EffectScope, FilterProp,
     GameRestriction, IntensityScope, IterationKindBinding, ManaProduction, ManaSpendPermission,
-    MultiTargetSpec, ObjectProperty, ObjectScope, PaymentCost, PlayerFilter, PlayerRelation,
-    PlayerScope, PreventionAmount, PreventionScope, ProhibitedActivity, QuantityExpr, QuantityRef,
+    MultiTargetSpec, ObjectProperty, ObjectScope, PlayerFilter, PlayerRelation, PlayerScope,
+    PreventionAmount, PreventionScope, ProhibitedActivity, PtValue, QuantityExpr, QuantityRef,
     ReplacementDefinition, RestrictionExpiry, RestrictionPlayerScope, RoundingMode,
     StaticCondition, StaticDefinition, StepSkipTarget, SubAbilityLink, TapStateChange,
     TargetFilter, TargetSelectionMode, TriggerCondition, TriggerDefinition, TypeFilter,
@@ -2013,8 +2013,8 @@ fn try_parse_earthbend_clause(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
 
     Some(ParsedEffectClause {
         effect: Effect::Animate {
-            power: Some(0),
-            toughness: Some(0),
+            power: Some(PtValue::Fixed(0)),
+            toughness: Some(PtValue::Fixed(0)),
             types: vec!["Creature".to_string()],
             remove_types: vec![],
             target,
@@ -3422,12 +3422,10 @@ fn try_parse_choose_and_pay_per_object(
     let pay_ability = AbilityDefinition::new(
         AbilityKind::Spell,
         Effect::PayCost {
-            cost: PaymentCost::ScaledMana {
-                base,
-                times: QuantityExpr::Ref {
-                    qty: QuantityRef::TrackedSetSize,
-                },
-            },
+            cost: AbilityCost::Mana { cost: base },
+            scale: Some(QuantityExpr::Ref {
+                qty: QuantityRef::TrackedSetSize,
+            }),
             payer: chooser.clone(),
         },
     );
@@ -3846,6 +3844,15 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     }
     if let Some(effect) = try_parse_leave_battlefield_exile_replacement(&lower) {
         return parsed_clause(effect);
+    }
+    // CR 614.1a + CR 608.2n + CR 607.2b: "exile it instead of putting it into a
+    // graveyard as it resolves" — the resolving-spell exile rider applied by a
+    // `WhenAPlayerCasts` trigger to the triggering spell (Rod of Absorption).
+    // Must run before the generic exile dispatch, which would otherwise lower it
+    // to a no-op `ChangeZone { origin: Graveyard }` that never finds the spell
+    // (it is on the stack, not in a graveyard, when the trigger resolves).
+    if try_parse_exile_resolving_spell_instead_of_graveyard(&lower) {
+        return parsed_clause(Effect::ExileResolvingSpellInsteadOfGraveyard);
     }
     // CR 614.1a + CR 514.2: Global "If [source] would deal damage this turn,
     // it deals that much damage plus N instead" pattern (Rankle and Torbran,
@@ -9605,6 +9612,41 @@ fn is_exile_after_spell_rider_clause(lower: &str) -> bool {
             tag("exile that card instead"),
             tag("exile that spell instead"),
         )),
+    ))
+    .parse(trimmed)
+    .is_ok()
+}
+
+/// CR 614.1a + CR 608.2n + CR 607.2b: Detect the resolving-spell exile rider —
+/// "exile it instead of putting it into a graveyard as it resolves". This is the
+/// trigger BODY of a `WhenAPlayerCasts` trigger (Rod of Absorption), distinct
+/// from the post-cast rider clause `is_exile_after_spell_rider_clause` ("if that
+/// spell would be put into a graveyard, exile it instead") that trails a
+/// `CastFromZone`/`Counter` effect.
+///
+/// Composed as a single nom chain over the independent axes: the bare anaphor
+/// ("it" / "that spell") and the graveyard determiner. "a graveyard" /
+/// "its owner's graveyard" / "a player's graveyard" are leaf variants of the
+/// same slot. The trailing "as it resolves" is the resolution-timing marker that
+/// distinguishes this from the immediate "exile it" zone-move.
+fn try_parse_exile_resolving_spell_instead_of_graveyard(lower: &str) -> bool {
+    use nom::branch::alt;
+    use nom::bytes::complete::tag;
+    use nom::combinator::all_consuming;
+    use nom::Parser;
+    let trimmed = lower.trim().trim_end_matches('.').trim();
+    all_consuming((
+        tag::<_, _, OracleError<'_>>("exile "),
+        alt((tag("it"), tag("that spell"), tag("that card"))),
+        tag(" instead of putting it into "),
+        alt((
+            tag("a graveyard"),
+            tag("the graveyard"),
+            tag("its owner's graveyard"),
+            tag("a player's graveyard"),
+            tag("their graveyard"),
+        )),
+        tag(" as it resolves"),
     ))
     .parse(trimmed)
     .is_ok()
@@ -18063,11 +18105,11 @@ mod tests {
     use super::*;
     use crate::parser::parse_oracle_text;
     use crate::types::ability::{
-        AbilityCondition, AggregateFunction, BounceSelection, CardTypeSetSource, CastVariantPaid,
-        ChoiceType, ChosenSubtypeKind, CombatRelation, CombatRelationSubject, Comparator,
-        ContinuousModification, ControllerRef, CopyRetargetPermission, CountScope, DoublePTMode,
-        Duration, FilterProp, LibraryPosition, LinkedExileScope, ManaContribution, ManaProduction,
-        ObjectProperty, ObjectScope, PaymentCost, PermissionGrantee, PlayerRelation,
+        AbilityCondition, AbilityCost, AggregateFunction, BounceSelection, CardTypeSetSource,
+        CastVariantPaid, ChoiceType, ChosenSubtypeKind, CombatRelation, CombatRelationSubject,
+        Comparator, ContinuousModification, ControllerRef, CopyRetargetPermission, CountScope,
+        DoublePTMode, Duration, FilterProp, LibraryPosition, LinkedExileScope, ManaContribution,
+        ManaProduction, ObjectProperty, ObjectScope, PermissionGrantee, PlayerRelation,
         PreventionScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
         SearchSelectionConstraint, SharedQuality, TargetChoiceTiming, TypeFilter, TypedFilter,
         ZoneRef,
@@ -18368,19 +18410,19 @@ mod tests {
         );
         // sub_ability: PayCost { ScaledMana { base: {4}, times: TrackedSetSize } }.
         let pay = clause.sub_ability.as_ref().expect("PayCost sub_ability");
-        let Effect::PayCost { cost, payer } = pay.effect.as_ref() else {
+        let Effect::PayCost { cost, scale, payer } = pay.effect.as_ref() else {
             panic!("expected PayCost, got {:?}", pay.effect);
         };
         assert_eq!(*payer, TargetFilter::TriggeringPlayer);
-        let PaymentCost::ScaledMana { base, times } = cost else {
-            panic!("expected ScaledMana, got {cost:?}");
+        let AbilityCost::Mana { cost: base } = cost else {
+            panic!("expected Mana base, got {cost:?}");
         };
         assert_eq!(*base, crate::types::mana::ManaCost::generic(4));
         assert_eq!(
-            *times,
-            QuantityExpr::Ref {
+            *scale,
+            Some(QuantityExpr::Ref {
                 qty: QuantityRef::TrackedSetSize
-            }
+            })
         );
     }
 
@@ -18396,11 +18438,12 @@ mod tests {
             .expect("Thelon's Curse main clause must parse");
         let pay = clause.sub_ability.as_ref().expect("PayCost sub_ability");
         let Effect::PayCost {
-            cost: PaymentCost::ScaledMana { base, .. },
+            cost: AbilityCost::Mana { cost: base },
+            scale: Some(_),
             ..
         } = pay.effect.as_ref()
         else {
-            panic!("expected PayCost {{ ScaledMana }}, got {:?}", pay.effect);
+            panic!("expected PayCost {{ Mana, scale }}, got {:?}", pay.effect);
         };
         assert_eq!(
             *base,
@@ -26725,6 +26768,52 @@ mod tests {
     }
 
     #[test]
+    fn effect_add_fixed_or_chosen_color_gate_land_black() {
+        // Issue #2933: Black Dragon Gate — same pattern with {B}.
+        let e = parse_effect("add {b} or one mana of the chosen color");
+        assert!(
+            matches!(
+                &e,
+                Effect::Mana {
+                    produced: ManaProduction::ChosenColor {
+                        fixed_alternative: Some(crate::types::mana::ManaColor::Black),
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "expected ChosenColor with fixed_alternative Some(Black), got {e:?}"
+        );
+    }
+
+    #[test]
+    fn effect_add_fixed_or_chosen_color_gate_land_all_colors() {
+        // Building-block: every Gate land fixed color must survive parsing.
+        for (symbol, color) in [
+            ("w", crate::types::mana::ManaColor::White),
+            ("u", crate::types::mana::ManaColor::Blue),
+            ("b", crate::types::mana::ManaColor::Black),
+            ("r", crate::types::mana::ManaColor::Red),
+            ("g", crate::types::mana::ManaColor::Green),
+        ] {
+            let e = parse_effect(&format!("add {{{symbol}}} or one mana of the chosen color"));
+            assert!(
+                matches!(
+                    &e,
+                    Effect::Mana {
+                        produced: ManaProduction::ChosenColor {
+                            fixed_alternative: Some(parsed),
+                            ..
+                        },
+                        ..
+                    } if *parsed == color
+                ),
+                "expected fixed_alternative {color:?} for {{{symbol}}}, got {e:?}"
+            );
+        }
+    }
+
+    #[test]
     fn effect_add_additional_mana_any_color_fertile_ground() {
         // CR 605.1a: Fertile Ground's "adds an additional one mana of any color"
         // carries the additive role on `AnyOneColor`.
@@ -26898,7 +26987,7 @@ mod tests {
         assert!(matches!(
             e,
             Effect::PayCost {
-                cost: PaymentCost::Life {
+                cost: AbilityCost::PayLife {
                     amount: crate::types::ability::QuantityExpr::Fixed { value: 3 },
                 },
                 ..
@@ -26911,10 +27000,7 @@ mod tests {
         let e = parse_effect("pay {1} and 3 life");
         match e {
             Effect::PayCost {
-                cost:
-                    PaymentCost::AbilityCost {
-                        cost: crate::types::ability::AbilityCost::Composite { costs },
-                    },
+                cost: crate::types::ability::AbilityCost::Composite { costs },
                 ..
             } => {
                 assert_eq!(costs.len(), 2);
@@ -26949,7 +27035,7 @@ mod tests {
             matches!(
                 &e,
                 Effect::PayCost {
-                    cost: PaymentCost::Life {
+                    cost: AbilityCost::PayLife {
                         amount: crate::types::ability::QuantityExpr::Ref {
                             qty: crate::types::ability::QuantityRef::Power {
                                 scope: crate::types::ability::ObjectScope::Anaphoric,
@@ -26970,7 +27056,7 @@ mod tests {
         match &e {
             Effect::PayCost {
                 cost:
-                    PaymentCost::Life {
+                    AbilityCost::PayLife {
                         amount:
                             crate::types::ability::QuantityExpr::Ref {
                                 qty: crate::types::ability::QuantityRef::Variable { name },
@@ -37640,7 +37726,7 @@ mod tests {
             matches!(
                 e,
                 Effect::PayCost {
-                    cost: PaymentCost::Energy {
+                    cost: AbilityCost::PayEnergy {
                         amount: QuantityExpr::Fixed { value: 2 },
                     },
                     ..
@@ -37657,7 +37743,7 @@ mod tests {
             matches!(
                 e,
                 Effect::PayCost {
-                    cost: PaymentCost::Energy {
+                    cost: AbilityCost::PayEnergy {
                         amount: QuantityExpr::Fixed { value: 3 },
                     },
                     ..
@@ -43665,8 +43751,9 @@ mod tests {
             matches!(
                 &*def.effect,
                 Effect::PayCost {
-                    cost: PaymentCost::Mana { .. },
+                    cost: AbilityCost::Mana { .. },
                     payer: TargetFilter::Controller,
+                    ..
                 }
             ),
             "Outer effect must be PayCost {{ Mana, Controller }}, got {:?}",
@@ -43806,8 +43893,9 @@ mod tests {
             matches!(
                 &*def.effect,
                 Effect::PayCost {
-                    cost: PaymentCost::Mana { .. },
+                    cost: AbilityCost::Mana { .. },
                     payer: TargetFilter::Controller,
+                    ..
                 }
             ),
             "Outer effect must be PayCost {{ Mana, Controller }}, got {:?}",
@@ -43860,8 +43948,9 @@ mod tests {
         assert!(matches!(
             &*def.effect,
             Effect::PayCost {
-                cost: PaymentCost::Mana { .. },
+                cost: AbilityCost::Mana { .. },
                 payer: TargetFilter::Controller,
+                ..
             }
         ));
         assert_eq!(def.player_scope, Some(PlayerFilter::All));
@@ -43893,8 +43982,9 @@ mod tests {
         assert!(matches!(
             &*def.effect,
             Effect::PayCost {
-                cost: PaymentCost::Mana { .. },
+                cost: AbilityCost::Mana { .. },
                 payer: TargetFilter::Controller,
+                ..
             }
         ));
         assert_eq!(def.player_scope, Some(PlayerFilter::All));

@@ -113,6 +113,141 @@ fn merge_unions_component_abilities_per_cr_702_140e() {
     );
 }
 
+/// CR 730.2d: a merged permanent is a token only if its TOPMOST component is a
+/// token. Mutating a card on top of a creature token (the host) makes the merged
+/// permanent NONTOKEN while merged; the survivor's intrinsic token-ness is
+/// captured and restored when the pile leaves the battlefield, so the CR 111.7
+/// cease-to-exist SBA applies to it again instead of leaking a nontoken object.
+#[test]
+fn merge_card_on_top_of_token_host_is_nontoken_and_restores_on_leave() {
+    let (mut state, host, rider, _p0) = two_creatures();
+    // CR 702.140a: the mutate host is a non-Human creature TOKEN you own.
+    state.objects.get_mut(&host).unwrap().is_token = true;
+    // Runtime invariant: the mutating spell resolved off the stack, never listed.
+    state.battlefield.retain(|&id| id != rider);
+    let mut events = Vec::new();
+
+    // Mutate the card (rider) ON TOP of the token (host).
+    merge_object_onto(&mut state, rider, host, MergeSide::Top, &mut events);
+    assert!(
+        !state.objects.get(&host).unwrap().is_token,
+        "card on top of a token host → nontoken merged permanent (CR 730.2d)"
+    );
+    assert_eq!(
+        state.objects.get(&host).unwrap().pre_merge_is_token,
+        Some(true),
+        "the survivor's intrinsic token-ness is captured for the on-leave restore"
+    );
+
+    // On leave, the survivor's intrinsic token-ness is restored.
+    crate::game::zones::move_to_zone(&mut state, host, Zone::Graveyard, &mut events);
+    let leave_record = events
+        .iter()
+        .find_map(|event| match event {
+            GameEvent::ZoneChanged {
+                object_id,
+                from,
+                to,
+                record,
+            } if *object_id == host
+                && *from == Some(Zone::Battlefield)
+                && *to == Zone::Graveyard =>
+            {
+                Some(record)
+            }
+            _ => None,
+        })
+        .expect("merged survivor emits a battlefield-to-graveyard ZoneChanged event");
+    assert!(
+        !leave_record.is_token,
+        "the leave event observes the card-on-top merged permanent as nontoken (CR 730.2d)"
+    );
+    let o = state.objects.get(&host).unwrap();
+    assert!(
+        o.is_token,
+        "the token host is a token again when the pile leaves (CR 730.2d + CR 111.7)"
+    );
+    assert_eq!(
+        o.pre_merge_is_token, None,
+        "the token-ness override is consumed on leave"
+    );
+}
+
+/// CR 730.2d: when the token host is TOPMOST (a card mutated underneath it), the
+/// merged permanent stays a token — and no override is captured because the
+/// topmost token-ness already matches the survivor's.
+#[test]
+fn merge_card_under_token_host_keeps_token_no_override() {
+    let (mut state, host, rider, _p0) = two_creatures();
+    state.objects.get_mut(&host).unwrap().is_token = true;
+    state.battlefield.retain(|&id| id != rider);
+    let mut events = Vec::new();
+
+    merge_object_onto(&mut state, rider, host, MergeSide::Bottom, &mut events);
+    assert!(
+        state.objects.get(&host).unwrap().is_token,
+        "token host on top (card underneath) → merged permanent stays a token (CR 730.2d)"
+    );
+    assert_eq!(
+        state.objects.get(&host).unwrap().pre_merge_is_token,
+        None,
+        "no override captured when the topmost already matches the survivor's token-ness"
+    );
+}
+
+/// CR 730.2d regression guard: an all-card merge (no token component) is nontoken
+/// and captures no override — the common case must be untouched.
+#[test]
+fn merge_all_card_components_stays_nontoken_no_override() {
+    let (mut state, host, rider, _p0) = two_creatures();
+    state.battlefield.retain(|&id| id != rider);
+    let mut events = Vec::new();
+
+    merge_object_onto(&mut state, rider, host, MergeSide::Top, &mut events);
+    assert!(
+        !state.objects.get(&host).unwrap().is_token,
+        "an all-card pile is nontoken"
+    );
+    assert_eq!(
+        state.objects.get(&host).unwrap().pre_merge_is_token,
+        None,
+        "no token-ness override is captured when no component is a token"
+    );
+}
+
+/// CR 730.2d + CR 730.2 (stacking): the topmost-derived token-ness is re-applied
+/// on each merge, and the survivor's intrinsic value is captured exactly ONCE so a
+/// multi-mutate token host still restores correctly on leave.
+#[test]
+fn merge_stacking_onto_token_host_captures_intrinsic_token_ness_once() {
+    use crate::game::scenario::GameScenario;
+    let mut sc = GameScenario::new();
+    let host = sc.add_creature(P0, "Token Host", 2, 2).id();
+    let rider1 = sc.add_creature(P0, "Rider1", 3, 3).id();
+    let rider2 = sc.add_creature(P0, "Rider2", 4, 4).id();
+    let mut state = sc.state;
+    state.objects.get_mut(&host).unwrap().is_token = true;
+    state.battlefield.retain(|&id| id != rider1 && id != rider2);
+    let mut events = Vec::new();
+
+    merge_object_onto(&mut state, rider1, host, MergeSide::Top, &mut events);
+    merge_object_onto(&mut state, rider2, host, MergeSide::Top, &mut events);
+    // Topmost is always a card (mutating objects are cards) → nontoken; the
+    // intrinsic token-ness is captured once, not overwritten by the second merge.
+    assert!(!state.objects.get(&host).unwrap().is_token);
+    assert_eq!(
+        state.objects.get(&host).unwrap().pre_merge_is_token,
+        Some(true),
+        "intrinsic token-ness captured exactly once across stacked merges"
+    );
+
+    crate::game::zones::move_to_zone(&mut state, host, Zone::Graveyard, &mut events);
+    assert!(
+        state.objects.get(&host).unwrap().is_token,
+        "the token host restores to a token on leave after multiple merges"
+    );
+}
+
 #[test]
 fn merge_is_same_object_no_etb_event() {
     // CR 730.2b/c: the merged permanent is NOT considered to have entered the
@@ -294,6 +429,136 @@ fn zone_change_origin(events: &[GameEvent], id: ObjectId) -> Option<Option<Zone>
         } if *object_id == id => Some(*from),
         _ => None,
     })
+}
+
+/// CR 730.3c: When a merged permanent is exiled, an effect that finds the object
+/// it became (a flicker/blink's "return it") must act on ALL component cards, not
+/// just the survivor. The absorbed component is recorded with a back-link to the
+/// survivor and is re-collected by `expand_returned_merge_components` — but ONLY
+/// for a continuity reference; a freshly chosen target (reanimation) must not
+/// over-return.
+#[test]
+fn exile_records_component_backlink_and_continuity_return_collects_all() {
+    use crate::types::ability::TargetFilter;
+    let (mut state, host, rider, _p0) = two_creatures();
+    // Runtime invariant: the mutating spell resolved off the stack, never listed.
+    state.battlefield.retain(|&id| id != rider);
+    let mut events = Vec::new();
+    merge_object_onto(&mut state, rider, host, MergeSide::Top, &mut events);
+
+    // Flicker step 1: exile the merged permanent. The survivor rides the normal
+    // move; the component is split into exile with a back-link to the survivor.
+    crate::game::zones::move_to_zone(&mut state, host, Zone::Exile, &mut events);
+    assert_eq!(state.objects.get(&host).unwrap().zone, Zone::Exile);
+    assert_eq!(state.objects.get(&rider).unwrap().zone, Zone::Exile);
+    assert_eq!(
+        state.objects.get(&rider).unwrap().split_from_merge_survivor,
+        Some(host),
+        "absorbed component records the survivor it split from (CR 730.3c)"
+    );
+
+    // A continuity reference ("return it") resolving to the survivor expands to
+    // include the co-exiled component (CR 730.3c).
+    let expanded =
+        expand_returned_merge_components(&state, vec![host], &TargetFilter::ParentTarget);
+    assert_eq!(
+        expanded,
+        vec![host, rider],
+        "a flicker returns the whole pile, not just the survivor"
+    );
+
+    // A freshly chosen target (e.g. reanimating one specific card) must NOT
+    // over-return — only continuity references expand.
+    let fresh = expand_returned_merge_components(&state, vec![host], &TargetFilter::Any);
+    assert_eq!(
+        fresh,
+        vec![host],
+        "a non-continuity target returns only the chosen object"
+    );
+}
+
+/// CR 730.3c + CR 730.3: the returned components come back as SEPARATE, non-merged
+/// objects, and the survivor back-link clears on battlefield entry.
+#[test]
+fn flicker_returns_components_unmerged_and_clears_backlink() {
+    use crate::types::ability::TargetFilter;
+    let (mut state, host, rider, _p0) = two_creatures();
+    state.battlefield.retain(|&id| id != rider);
+    let mut events = Vec::new();
+    merge_object_onto(&mut state, rider, host, MergeSide::Top, &mut events);
+    crate::game::zones::move_to_zone(&mut state, host, Zone::Exile, &mut events);
+
+    // Return the whole pile — what the `ChangeZone` return loop does for each
+    // expanded id (CR 730.3c).
+    let to_return =
+        expand_returned_merge_components(&state, vec![host], &TargetFilter::ParentTarget);
+    for id in to_return {
+        crate::game::zones::move_to_zone(&mut state, id, Zone::Battlefield, &mut events);
+    }
+
+    for id in [host, rider] {
+        let o = state.objects.get(&id).unwrap();
+        assert_eq!(
+            o.zone,
+            Zone::Battlefield,
+            "component returned to the battlefield"
+        );
+        assert!(
+            o.merged_components.is_empty(),
+            "components return un-merged (CR 730.3)"
+        );
+        assert_eq!(
+            o.split_from_merge_survivor, None,
+            "the survivor back-link clears on battlefield entry"
+        );
+    }
+    assert!(
+        state.battlefield.contains(&host) && state.battlefield.contains(&rider),
+        "both cards are present on the battlefield as separate objects"
+    );
+}
+
+/// CR 400.7: a split-out component is a NEW object on every zone change, so its
+/// survivor back-link must clear when it moves between non-battlefield zones —
+/// not only on battlefield entry. Otherwise a component that moved on (e.g.
+/// exile → graveyard) keeps a stale link and could be wrongly re-collected by a
+/// later continuity return once it re-converges with the survivor.
+#[test]
+fn split_component_backlink_clears_on_non_battlefield_zone_move() {
+    use crate::types::ability::TargetFilter;
+    let (mut state, host, rider, _p0) = two_creatures();
+    state.battlefield.retain(|&id| id != rider);
+    let mut events = Vec::new();
+    merge_object_onto(&mut state, rider, host, MergeSide::Top, &mut events);
+
+    // Exile the pile: the component is split into exile with a back-link.
+    crate::game::zones::move_to_zone(&mut state, host, Zone::Exile, &mut events);
+    assert_eq!(
+        state.objects.get(&rider).unwrap().split_from_merge_survivor,
+        Some(host),
+        "component records the survivor back-link when split into exile"
+    );
+
+    // The component moves exile → graveyard WITHOUT being returned (CR 400.7: a
+    // new object). The back-link must clear on this non-battlefield move.
+    crate::game::zones::move_to_zone(&mut state, rider, Zone::Graveyard, &mut events);
+    assert_eq!(
+        state.objects.get(&rider).unwrap().split_from_merge_survivor,
+        None,
+        "the survivor back-link clears on a non-battlefield zone move (CR 400.7)"
+    );
+
+    // Now move the survivor to the graveyard too, so it re-converges with the
+    // former component in one zone. A continuity reference to the survivor must
+    // NOT re-collect the moved-on component (the stale link is gone).
+    crate::game::zones::move_to_zone(&mut state, host, Zone::Graveyard, &mut events);
+    let expanded =
+        expand_returned_merge_components(&state, vec![host], &TargetFilter::ParentTarget);
+    assert_eq!(
+        expanded,
+        vec![host],
+        "a component that already moved on is not re-collected by a later continuity return"
+    );
 }
 
 /// CR 730.2: the absorbed (non-surviving) component is part of ONE battlefield

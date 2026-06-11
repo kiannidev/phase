@@ -12,6 +12,7 @@ use engine::types::zones::Zone;
 
 const FUTURE_SIGHT_ORACLE: &str = "Play with the top card of your library revealed.\n\
 You may play lands and cast spells from the top of your library.";
+const LANTERN_ORACLE: &str = "Players play with the top card of their libraries revealed.";
 
 fn move_to_top_of_library(
     state: &mut engine::types::game_state::GameState,
@@ -51,5 +52,38 @@ fn future_sight_keeps_library_top_revealed_to_all_players() {
     assert!(
         revealed_top.is_some(),
         "opponent-filtered state must expose the revealed library top"
+    );
+}
+
+#[test]
+fn lantern_effect_reveals_each_players_library_top() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_creature_from_oracle(P0, "Lantern", 0, 0, LANTERN_ORACLE);
+
+    let p0_top = scenario
+        .add_creature_to_hand(P0, "P0 Library Top", 2, 2)
+        .id();
+    let p1_top = scenario
+        .add_creature_to_hand(P1, "P1 Library Top", 2, 2)
+        .id();
+
+    let mut runner = scenario.build();
+    move_to_top_of_library(runner.state_mut(), p0_top, P0);
+    move_to_top_of_library(runner.state_mut(), p1_top, P1);
+    derive_display_state(runner.state_mut());
+
+    assert!(runner.state().revealed_cards.contains(&p0_top));
+    assert!(runner.state().revealed_cards.contains(&p1_top));
+
+    let p0_view = filter_state_for_viewer(runner.state(), P0);
+    let p1_player = p0_view.players.iter().find(|p| p.id == P1).unwrap();
+    let revealed_top = p1_player
+        .library
+        .front()
+        .and_then(|id| p0_view.objects.get(id));
+    assert!(
+        revealed_top.is_some(),
+        "all-player reveal static must expose opponents' library tops"
     );
 }

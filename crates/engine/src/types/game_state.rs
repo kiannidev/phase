@@ -6194,6 +6194,18 @@ pub struct GameState {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub lki_cache: HashMap<ObjectId, LKISnapshot>,
 
+    /// CR 607.2b + CR 603.10e: Last-known "cards exiled with [source]" linkage,
+    /// captured when a source with `TrackedBySource` exile links leaves the
+    /// battlefield. The live `exile_links` are pruned on battlefield exit
+    /// (CR 400.7), but an ability that sacrifices its own source as a cost and
+    /// then refers to "cards exiled with this permanent" (Rod of Absorption)
+    /// must still see those cards at resolution. `linked_exile_cards_for_source`
+    /// consults this as its final fallback, filtered to cards still in exile, so
+    /// stale entries (cards that later left exile) contribute nothing.
+    /// Cleared on phase/step transitions via `advance_phase()`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub linked_exile_lki: HashMap<ObjectId, Vec<LinkedExileSnapshot>>,
+
     /// Transient: set by PayCost resolver when payment fails.
     /// Gates IfYouDo sub-abilities. Reset in DecideOptionalEffect handler.
     #[serde(skip)]
@@ -6272,6 +6284,14 @@ pub struct PendingReplacement {
     /// `candidates` has exactly one entry (the real replacement); decline is synthetic.
     #[serde(default)]
     pub is_optional: bool,
+    /// CR 701.24a: the library placement requested by the original `move_object`
+    /// call whose replacement consult parked here (W3 library-placement arm only).
+    /// `Some` solely for a parked Library-targeting `ZoneChange`; the resume path
+    /// (`handle_replacement_choice`) threads it back into the delivery so the
+    /// object lands at the requested index instead of the tail auto-shuffling it
+    /// away. `None` for every other parked event (the common case).
+    #[serde(default)]
+    pub library_placement: Option<crate::types::ability::LibraryPosition>,
 }
 
 /// CR 703.4q + CR 616.1 + CR 614.1a: One step-end mana handler entry pending
@@ -6719,6 +6739,7 @@ impl GameState {
             current_trigger_events: Vec::new(),
             stack_trigger_event_batches: HashMap::new(),
             lki_cache: HashMap::new(),
+            linked_exile_lki: HashMap::new(),
             cost_payment_failed_flag: false,
             pending_discard_for_cost: None,
             pending_cast: None,

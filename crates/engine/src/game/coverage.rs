@@ -2020,8 +2020,13 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             target,
             ..
         } => {
+            let fmt_pt = |v: &PtValue| match v {
+                PtValue::Fixed(n) => n.to_string(),
+                PtValue::Variable(s) => s.clone(),
+                PtValue::Quantity(_) => "dyn".to_string(),
+            };
             if let (Some(p), Some(t)) = (power, toughness) {
-                d.push(("p/t".into(), format!("{p}/{t}")));
+                d.push(("p/t".into(), format!("{}/{}", fmt_pt(p), fmt_pt(t))));
             }
             if !types.is_empty() {
                 d.push(("types".into(), types.join(" ")));
@@ -2358,6 +2363,9 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         // stack object at resolution time.
         Effect::Cascade => {}
         Effect::Ripple { .. } => {}
+        // CR 614.1a: the "exile it instead of putting it into a graveyard as it
+        // resolves" rider acts on the triggering spell; no displayable parameter.
+        Effect::ExileResolvingSpellInsteadOfGraveyard => {}
         // CR 702.94a: MiracleCast is an internal engine effect, not parsed from Oracle text.
         Effect::MiracleCast { .. } => {}
         // CR 702.35a: MadnessCast is synthesized from Keyword::Madness.

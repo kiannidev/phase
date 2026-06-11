@@ -81,6 +81,7 @@ pub mod end_the_turn;
 pub mod endure;
 pub mod energy;
 pub mod epic;
+pub mod exile_resolving_spell;
 // Tests for `epic` live in a sibling file (declared here, not in `epic.rs`, so
 // `epic.rs` stays implementation-only).
 #[cfg(test)]
@@ -801,6 +802,38 @@ fn prepend_to_pending_continuation(state: &mut GameState, mut head: ResolvedAbil
     } else {
         state.pending_continuation = Some(PendingContinuation::new(Box::new(head)));
     }
+}
+
+pub(crate) fn prepend_remaining_pay_cost_continuation(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    payer: PlayerId,
+    remaining_cost: AbilityCost,
+) {
+    let mut remaining_payment = ability.clone();
+    remaining_payment.controller = payer;
+    remaining_payment.optional = false;
+    remaining_payment.optional_for = None;
+    remaining_payment.effect = Effect::PayCost {
+        cost: remaining_cost,
+        scale: None,
+        payer: TargetFilter::Controller,
+    };
+    remaining_payment.sub_ability = None;
+
+    if let Some(sub) = ability.sub_ability.as_ref() {
+        let mut sub_clone = sub.as_ref().clone();
+        if sub_clone.targets.is_empty() && !ability.targets.is_empty() {
+            sub_clone.targets = ability.targets.clone();
+        }
+        apply_parent_chain_context(&mut sub_clone, ability, None);
+        super::ability_utils::append_to_sub_chain(&mut remaining_payment, sub_clone);
+    }
+
+    // CR 118.12 + CR 608.2c: when payment pauses before later sub-costs are
+    // paid, resume by paying those costs before following the original
+    // sub-ability chain.
+    prepend_to_pending_continuation(state, remaining_payment);
 }
 
 pub(crate) fn parent_referent_context_from_events(
@@ -1994,6 +2027,9 @@ pub fn resolve_effect(
         Effect::PayCost { .. } => pay::resolve(state, ability, events),
         Effect::CastFromZone { .. } => cast_from_zone::resolve(state, ability, events),
         Effect::FreeCastFromZones { .. } => free_cast_from_zones::resolve(state, ability, events),
+        Effect::ExileResolvingSpellInsteadOfGraveyard => {
+            exile_resolving_spell::resolve(state, ability, events)
+        }
         Effect::PreventDamage { .. } => prevent_damage::resolve(state, ability, events),
         Effect::CreateDamageReplacement { .. } => {
             create_damage_replacement::resolve(state, ability, events)
@@ -2356,6 +2392,18 @@ fn affected_objects_from_events(
                     .collect()
             }
         }
+        // CR 701.20b + CR 608.2c: Reveal instructions do not move cards, so they
+        // emit `CardsRevealed` rather than `ZoneChanged`. Publish the revealed
+        // card ids for downstream "from among the revealed cards"
+        // `ChooseFromZone` continuations (Atraxa, Grand Unifier class).
+        Effect::RevealTop { .. } | Effect::RevealHand { .. } | Effect::Clash => events
+            .iter()
+            .filter_map(|event| match event {
+                GameEvent::CardsRevealed { card_ids, .. } => Some(card_ids.as_slice()),
+                _ => None,
+            })
+            .flat_map(|ids| ids.iter().copied())
+            .collect(),
         _ => {
             let dest_zone = match effect {
                 Effect::ChangeZone { destination, .. }
@@ -4872,6 +4920,13 @@ fn resolve_chain_body(
         let continuation_installed_by_this_effect = state.pending_continuation.is_some()
             && state.pending_continuation != pending_continuation_before;
         if continuation_installed_by_this_effect && !waits_for_resolution_choice(&state.waiting_for)
+        {
+            return Ok(());
+        }
+        // CR 118.12 + CR 608.2c: a paused PayCost resolver installs the full
+        // remaining-cost continuation itself so later sub-costs stay before
+        // the original rider after the choice resolves.
+        if continuation_installed_by_this_effect && matches!(ability.effect, Effect::PayCost { .. })
         {
             return Ok(());
         }
@@ -8417,9 +8472,10 @@ mod tests {
         let mut state = GameState::new_two_player(42);
         let mut ability = ResolvedAbility::new(
             Effect::PayCost {
-                cost: crate::types::ability::PaymentCost::Life {
+                cost: AbilityCost::PayLife {
                     amount: crate::types::ability::QuantityExpr::Fixed { value: 1 },
                 },
+                scale: None,
                 payer: TargetFilter::Controller,
             },
             vec![],
@@ -8487,9 +8543,10 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::PayCost {
-                cost: crate::types::ability::PaymentCost::Energy {
+                cost: AbilityCost::PayEnergy {
                     amount: QuantityExpr::Fixed { value: 3 },
                 },
+                scale: None,
                 payer: TargetFilter::Controller,
             },
             vec![],
@@ -8546,9 +8603,10 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::PayCost {
-                cost: crate::types::ability::PaymentCost::Energy {
+                cost: AbilityCost::PayEnergy {
                     amount: QuantityExpr::Fixed { value: 3 },
                 },
+                scale: None,
                 payer: TargetFilter::Controller,
             },
             vec![],
@@ -8621,9 +8679,10 @@ mod tests {
         // Sanity check: the same flag DOES gate a PayCost parent.
         let pay_cost_parent = ResolvedAbility::new(
             Effect::PayCost {
-                cost: crate::types::ability::PaymentCost::Energy {
+                cost: AbilityCost::PayEnergy {
                     amount: QuantityExpr::Fixed { value: 3 },
                 },
+                scale: None,
                 payer: TargetFilter::Controller,
             },
             vec![],
@@ -8904,6 +8963,43 @@ mod tests {
             .filter(|o| o.name == "Treasure")
             .count();
         assert_eq!(treasures0, 0, "Empty chain must mint zero tokens");
+    }
+
+    /// CR 701.20b + CR 608.2c: `RevealTop` publishes `CardsRevealed`, not
+    /// `ZoneChanged`. Without a dedicated arm in `affected_objects_from_events`,
+    /// the tracked-set publish is empty and `ChooseFromZone` falls back to a
+    /// stale graveyard set from an earlier resolution (issue #1374).
+    #[test]
+    fn reveal_top_publishes_cards_revealed_for_tracked_set() {
+        let mut state = GameState::new_two_player(42);
+        let top = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Top Card".to_string(),
+            Zone::Library,
+        );
+        let second = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Second Card".to_string(),
+            Zone::Library,
+        );
+        let events = vec![GameEvent::CardsRevealed {
+            player: PlayerId(0),
+            card_ids: vec![top, second],
+            card_names: vec!["Top Card".to_string(), "Second Card".to_string()],
+        }];
+        let effect = Effect::RevealTop {
+            player: TargetFilter::Controller,
+            count: 2,
+        };
+
+        assert_eq!(
+            affected_objects_from_events(&effect, &events, &[]),
+            vec![top, second]
+        );
     }
 
     /// CR 701.20a + CR 608.2f: an Indomitable Creativity-style
@@ -14875,18 +14971,17 @@ mod tests {
         .condition(AbilityCondition::effect_performed());
         let mut ability = ResolvedAbility::new(
             Effect::PayCost {
-                cost: crate::types::ability::PaymentCost::AbilityCost {
-                    cost: crate::types::ability::AbilityCost::Composite {
-                        costs: vec![
-                            crate::types::ability::AbilityCost::Mana {
-                                cost: ManaCost::generic(1),
-                            },
-                            crate::types::ability::AbilityCost::PayLife {
-                                amount: QuantityExpr::Fixed { value: 1 },
-                            },
-                        ],
-                    },
+                cost: crate::types::ability::AbilityCost::Composite {
+                    costs: vec![
+                        crate::types::ability::AbilityCost::Mana {
+                            cost: ManaCost::generic(1),
+                        },
+                        crate::types::ability::AbilityCost::PayLife {
+                            amount: QuantityExpr::Fixed { value: 1 },
+                        },
+                    ],
                 },
+                scale: None,
                 payer: TargetFilter::Controller,
             },
             vec![],
@@ -14964,9 +15059,10 @@ mod tests {
         .condition(AbilityCondition::effect_performed());
         let mut ability = ResolvedAbility::new(
             Effect::PayCost {
-                cost: crate::types::ability::PaymentCost::Mana {
+                cost: AbilityCost::Mana {
                     cost: ManaCost::generic(1),
                 },
+                scale: None,
                 payer: TargetFilter::Controller,
             },
             vec![],

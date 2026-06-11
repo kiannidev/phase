@@ -1754,7 +1754,7 @@ pub struct PendingManaAbility {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chosen_exiled: Vec<ObjectId>,
     /// CR 117.1 + CR 118.3: Pre-selected battlefield permanents to sacrifice
-    /// as part of an `AbilityCost::Sacrifice { target: !SelfRef }`. Used by
+    /// as part of an `AbilityCost::Sacrifice(SacrificeCost::count(!SelfRef, 1)`. Used by
     /// Phyrexian Altar and the broader sacrifice-for-mana-by-property class.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chosen_sacrificed_battlefield: Vec<ObjectId>,

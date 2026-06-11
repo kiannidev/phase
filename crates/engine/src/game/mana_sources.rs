@@ -80,7 +80,7 @@ pub enum ManaSourcePenalty {
     /// Examples: Mana Confluence (1), Starting Town (1).
     PaysLifeOnActivation { fixed_amount: Option<u16> },
 
-    /// CR 605.3b + CR 701.21: Cost contains an `AbilityCost::Sacrifice { .. }`
+    /// CR 605.3b + CR 701.21: Cost contains an `AbilityCost::Sacrifice(_)`
     /// component — bare or nested in a `Composite`, for any target filter. The
     /// activation sacrifices a permanent (the source itself OR another), so the
     /// sacrifice is irreversible and the activation is never rewindable.
@@ -244,7 +244,7 @@ pub(crate) fn has_tap_component(cost: &Option<AbilityCost>) -> bool {
 /// `Sacrifice` nested inside a `Composite`, for any target filter.
 fn cost_includes_sacrifice(cost: &Option<AbilityCost>) -> bool {
     fn is_sac(c: &AbilityCost) -> bool {
-        matches!(c, AbilityCost::Sacrifice { .. })
+        matches!(c, AbilityCost::Sacrifice(_))
     }
     match cost {
         Some(AbilityCost::Composite { costs }) => costs.iter().any(is_sac),
@@ -1882,7 +1882,8 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityDefinition, AbilityKind, ChosenAttribute, ManaContribution, QuantityExpr,
+        AbilityCost, AbilityDefinition, AbilityKind, ChosenAttribute, ManaContribution,
+        QuantityExpr, SacrificeCost, SacrificeRequirement,
     };
     use crate::types::identifiers::CardId;
 
@@ -2464,10 +2465,7 @@ mod tests {
         .cost(AbilityCost::Composite {
             costs: vec![
                 AbilityCost::Tap,
-                AbilityCost::Sacrifice {
-                    target: TargetFilter::SelfRef,
-                    count: 1,
-                },
+                AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1)),
             ],
         });
         let obj = state.objects.get_mut(&treasure).unwrap();
@@ -2739,10 +2737,10 @@ mod tests {
     #[test]
     fn krark_clan_ironworks_classifies_as_sacrifices() {
         use crate::types::ability::{TargetFilter, TypeFilter, TypedFilter};
-        let ability = mana_ability_with_cost(AbilityCost::Sacrifice {
-            target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact)),
-            count: 1,
-        });
+        let ability = mana_ability_with_cost(AbilityCost::Sacrifice(SacrificeCost::count(
+            TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact)),
+            1,
+        )));
         assert_eq!(
             mana_ability_penalty(&ability),
             ManaSourcePenalty::Sacrifices,
@@ -2759,10 +2757,10 @@ mod tests {
         let ability = mana_ability_with_cost(AbilityCost::Composite {
             costs: vec![
                 AbilityCost::Tap,
-                AbilityCost::Sacrifice {
-                    target: TargetFilter::Typed(TypedFilter::creature()),
-                    count: 1,
-                },
+                AbilityCost::Sacrifice(SacrificeCost::count(
+                    TargetFilter::Typed(TypedFilter::creature()),
+                    1,
+                )),
             ],
         });
         assert_eq!(
@@ -2781,10 +2779,7 @@ mod tests {
         let ability = mana_ability_with_cost(AbilityCost::Composite {
             costs: vec![
                 AbilityCost::Tap,
-                AbilityCost::Sacrifice {
-                    target: TargetFilter::SelfRef,
-                    count: 1,
-                },
+                AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1)),
             ],
         });
         assert_eq!(

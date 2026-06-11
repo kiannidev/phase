@@ -349,8 +349,8 @@ fn pay_ability_cost_inner(
             }
         }
         // CR 118.3: Sacrifice as a cost — sacrifice the source (SelfRef) or a chosen permanent.
-        AbilityCost::Sacrifice { target, .. } => {
-            if matches!(target, TargetFilter::SelfRef) {
+        AbilityCost::Sacrifice(cost) => {
+            if matches!(cost.target, TargetFilter::SelfRef) {
                 if super::static_abilities::player_cant_sacrifice_as_cost(state, player, source_id)
                 {
                     return Ok(payment_failed("Cannot sacrifice this permanent as a cost"));
@@ -726,8 +726,7 @@ fn pay_ability_cost_inner(
         | AbilityCost::Mill { .. }
         | AbilityCost::Blight { .. }
         | AbilityCost::Reveal { .. }
-        | AbilityCost::Behold { .. }
-        | AbilityCost::SacrificePowerThreshold { .. } => {}
+        | AbilityCost::Behold { .. } => {}
         AbilityCost::Discard { .. } | AbilityCost::NinjutsuFamily { .. } => {
             // At Activation these shapes are intercepted by the interactive
             // WaitingFor detours before payment is invoked, so passing through

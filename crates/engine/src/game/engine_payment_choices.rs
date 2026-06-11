@@ -1,8 +1,8 @@
 use crate::game::filter;
 use crate::game::replacement::{self, ReplacementResult};
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, Effect, EffectKind, EffectScope, ResolvedAbility,
-    TapStateChange, TargetFilter, TargetRef,
+    AbilityCondition, AbilityCost, Effect, EffectKind, EffectScope, ResolvedAbility, SacrificeCost,
+    SacrificeRequirement, TapStateChange, TargetFilter, TargetRef,
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
@@ -595,65 +595,69 @@ pub(super) fn handle_unless_payment(
             }
             // CR 118.12 + CR 701.21: Unless-sacrifice — collect eligible
             // permanents and surface the choice via `WardSacrificeChoice`.
-            AbilityCost::Sacrifice {
-                count,
-                target: ref filter,
-            } => {
-                let eligible = eligible_unless_sacrifice_permanents(
-                    state,
-                    player,
-                    pending_effect.source_id,
-                    filter,
-                );
-                if eligible.len() < count as usize {
-                    payment_failed = true;
-                } else {
-                    state.waiting_for = WaitingFor::WardSacrificeChoice {
+            AbilityCost::Sacrifice(cost) => match &cost.requirement {
+                SacrificeRequirement::Count { count } => {
+                    let filter = &cost.target;
+                    let eligible = eligible_unless_sacrifice_permanents(
+                        state,
                         player,
-                        permanents: eligible,
-                        pending_effect: pending_effect.clone(),
-                        remaining: count,
-                        min_total_power: None,
-                    };
-                    return Ok(action_result(events, state.waiting_for.clone()));
+                        pending_effect.source_id,
+                        filter,
+                    );
+                    if eligible.len() < *count as usize {
+                        payment_failed = true;
+                    } else {
+                        state.waiting_for = WaitingFor::WardSacrificeChoice {
+                            player,
+                            permanents: eligible,
+                            pending_effect: pending_effect.clone(),
+                            remaining: *count,
+                            min_total_power: None,
+                        };
+                        return Ok(action_result(events, state.waiting_for.clone()));
+                    }
                 }
-            }
-            AbilityCost::SacrificePowerThreshold {
-                target: ref filter,
-                stat,
-                comparator,
-                value,
-            } => {
-                // CR 118.12a: Unless-sacrifice with an aggregate constraint fails
-                // automatically when the pool cannot satisfy it.
-                let eligible = eligible_unless_sacrifice_permanents(
-                    state,
-                    player,
-                    pending_effect.source_id,
-                    filter,
-                );
-                if !sacrifice_pool_meets_aggregate_constraint(
-                    state, &eligible, stat, comparator, value,
-                ) {
-                    payment_failed = true;
-                } else {
-                    state.waiting_for = WaitingFor::WardSacrificeChoice {
+                SacrificeRequirement::Aggregate {
+                    stat,
+                    comparator,
+                    value,
+                } => {
+                    // CR 118.12a + CR 701.21: Unless-sacrifice with an aggregate
+                    // constraint fails automatically when the pool cannot satisfy it.
+                    let filter = &cost.target;
+                    let eligible = eligible_unless_sacrifice_permanents(
+                        state,
                         player,
-                        permanents: eligible,
-                        pending_effect: pending_effect.clone(),
-                        remaining: 0,
-                        min_total_power: matches!(
-                            (stat, comparator),
-                            (
-                                crate::types::ability::SacrificeAggregateStat::TotalPower,
-                                crate::types::ability::Comparator::GE
+                        pending_effect.source_id,
+                        filter,
+                    );
+                    if !sacrifice_pool_meets_aggregate_constraint(
+                        state,
+                        &eligible,
+                        *stat,
+                        *comparator,
+                        *value,
+                    ) {
+                        payment_failed = true;
+                    } else {
+                        state.waiting_for = WaitingFor::WardSacrificeChoice {
+                            player,
+                            permanents: eligible,
+                            pending_effect: pending_effect.clone(),
+                            remaining: 0,
+                            min_total_power: matches!(
+                                (stat, comparator),
+                                (
+                                    crate::types::ability::SacrificeAggregateStat::TotalPower,
+                                    crate::types::ability::Comparator::GE
+                                )
                             )
-                        )
-                        .then_some(value),
-                    };
-                    return Ok(action_result(events, state.waiting_for.clone()));
+                            .then_some(*value),
+                        };
+                        return Ok(action_result(events, state.waiting_for.clone()));
+                    }
                 }
-            }
+            },
             // CR 702.24a + CR 701.13: Thought Lash-style cumulative upkeep
             // pays by exiling the top N cards of the payer's library. This is
             // deterministic, so it does not need an object-selection prompt.
@@ -1644,10 +1648,10 @@ mod tests {
         let pending = ResolvedAbility::new(gain_life(4), vec![], ObjectId(100), PlayerId(0));
         state.waiting_for = WaitingFor::UnlessPayment {
             player: PlayerId(1),
-            cost: AbilityCost::Sacrifice {
-                target: TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
-                count: 1,
-            },
+            cost: AbilityCost::Sacrifice(SacrificeCost::count(
+                TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
+                1,
+            )),
             pending_effect: Box::new(pending),
             trigger_event: None,
             effect_description: None,
@@ -2271,10 +2275,7 @@ mod tests {
             deserialize_ability_cost_compat(&mut de).expect("legacy Sacrifice deserialize");
         assert_eq!(
             cost,
-            AbilityCost::Sacrifice {
-                target: TargetFilter::Any,
-                count: 2,
-            }
+            AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::Any, 2))
         );
     }
 

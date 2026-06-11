@@ -10135,9 +10135,10 @@ fn find_waterbend_cost(cost: &AbilityCost) -> Option<&ManaCost> {
 /// ("Sacrifice two creatures:") are modeled correctly.
 pub(super) fn find_non_self_sacrifice_cost(cost: &AbilityCost) -> Option<(u32, &TargetFilter)> {
     match cost {
-        AbilityCost::Sacrifice { target, count } if !matches!(target, TargetFilter::SelfRef) => {
-            Some((*count, target))
-        }
+        AbilityCost::Sacrifice(cost) if !matches!(cost.target, TargetFilter::SelfRef) => cost
+            .requirement
+            .fixed_count()
+            .map(|count| (count, &cost.target)),
         AbilityCost::Composite { costs } => costs.iter().find_map(find_non_self_sacrifice_cost),
         _ => None,
     }
@@ -12185,8 +12186,8 @@ mod tests {
         ModalSelectionCondition, ModalSelectionConstraint, MultiTargetSpec, ObjectProperty,
         ProhibitedActivity, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
         ReplacementDefinition, ReplacementMode, RestrictionExpiry, RestrictionPlayerScope,
-        SearchSelectionConstraint, StaticCondition, StaticDefinition, TapStateChange, TargetFilter,
-        TargetRef, TypeFilter, TypedFilter,
+        SacrificeCost, SacrificeRequirement, SearchSelectionConstraint, StaticCondition,
+        StaticDefinition, TapStateChange, TargetFilter, TargetRef, TypeFilter, TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::{CoreType, Supertype};
@@ -14348,10 +14349,7 @@ mod tests {
                     cost: colorless_activation_mana_cost(),
                 },
                 AbilityCost::Tap,
-                AbilityCost::Sacrifice {
-                    target: TargetFilter::SelfRef,
-                    count: 1,
-                },
+                AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1)),
             ],
         };
         let source = create_colorless_tap_activated_source(
@@ -14448,12 +14446,12 @@ mod tests {
                             },
                         },
                         AbilityCost::Tap,
-                        AbilityCost::Sacrifice {
-                            target: TargetFilter::Typed(
+                        AbilityCost::Sacrifice(SacrificeCost::count(
+                            TargetFilter::Typed(
                                 TypedFilter::permanent().properties(vec![FilterProp::Token]),
                             ),
-                            count: 1,
-                        },
+                            1,
+                        )),
                     ],
                 }),
             );
@@ -15390,14 +15388,16 @@ mod tests {
                 },
             }));
             Arc::make_mut(&mut obj.abilities).push(ability);
-            obj.additional_cost = Some(AdditionalCost::Required(AbilityCost::Sacrifice {
-                target: TargetFilter::Typed(TypedFilter {
-                    type_filters: vec![TypeFilter::Creature],
-                    controller: Some(ControllerRef::You),
-                    ..Default::default()
-                }),
-                count: u32::MAX,
-            }));
+            obj.additional_cost = Some(AdditionalCost::Required(AbilityCost::Sacrifice(
+                SacrificeCost::count(
+                    TargetFilter::Typed(TypedFilter {
+                        type_filters: vec![TypeFilter::Creature],
+                        controller: Some(ControllerRef::You),
+                        ..Default::default()
+                    }),
+                    1,
+                ),
+            )));
         }
 
         apply_as_current(
@@ -16656,10 +16656,7 @@ mod tests {
                             selection: crate::types::ability::CardSelectionMode::Chosen,
                             self_scope: crate::types::ability::DiscardSelfScope::FromHand,
                         },
-                        AbilityCost::Sacrifice {
-                            target: TargetFilter::SelfRef,
-                            count: 1,
-                        },
+                        AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1)),
                     ],
                 }),
             );
@@ -17876,10 +17873,7 @@ mod tests {
                 )
                 .cost(AbilityCost::Composite {
                     costs: vec![
-                        AbilityCost::Sacrifice {
-                            target: TargetFilter::SelfRef,
-                            count: 1,
-                        },
+                        AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1)),
                         AbilityCost::Mana {
                             cost: ManaCost::Cost {
                                 shards: vec![ManaCostShard::X, ManaCostShard::Green],
@@ -17915,13 +17909,14 @@ mod tests {
         // activation_cost should hold the deferred Sacrifice sub-cost.
         let pending = state.pending_cast.as_ref().expect("pending cast present");
         assert!(
-            matches!(
-                pending.activation_cost,
-                Some(AbilityCost::Sacrifice {
-                    target: TargetFilter::SelfRef,
-                    count: 1
-                })
-            ),
+            {
+                if let Some(AbilityCost::Sacrifice(sc)) = &pending.activation_cost {
+                    matches!(sc.target, TargetFilter::SelfRef)
+                        && sc.requirement == SacrificeRequirement::count(1)
+                } else {
+                    false
+                }
+            },
             "activation_cost must hold the deferred Sacrifice sub-cost, got {:?}",
             pending.activation_cost
         );
@@ -18467,10 +18462,7 @@ mod tests {
                             cost: ManaCost::generic(2),
                         },
                         AbilityCost::Tap,
-                        AbilityCost::Sacrifice {
-                            target: TargetFilter::SelfRef,
-                            count: 1,
-                        },
+                        AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1)),
                     ],
                 }),
             );
@@ -19733,10 +19725,9 @@ mod tests {
                 shards: vec![ManaCostShard::Green],
                 generic: 2,
             };
-            obj.additional_cost = Some(AdditionalCost::Required(AbilityCost::Sacrifice {
-                target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Land)),
-                count: 1,
-            }));
+            obj.additional_cost = Some(AdditionalCost::Required(AbilityCost::Sacrifice(
+                SacrificeCost::count(TargetFilter::Typed(TypedFilter::new(TypeFilter::Land)), 1),
+            )));
             Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
                 AbilityKind::Spell,
                 Effect::Draw {
@@ -20124,10 +20115,9 @@ mod tests {
         {
             let obj = state.objects.get_mut(&spell).unwrap();
             obj.card_types.core_types.push(CoreType::Sorcery);
-            obj.additional_cost = Some(AdditionalCost::Required(AbilityCost::Sacrifice {
-                target: TargetFilter::Typed(TypedFilter::permanent()),
-                count: 1,
-            }));
+            obj.additional_cost = Some(AdditionalCost::Required(AbilityCost::Sacrifice(
+                SacrificeCost::count(TargetFilter::Typed(TypedFilter::permanent()), 1),
+            )));
             Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
                 AbilityKind::Spell,
                 Effect::Draw {
@@ -27762,14 +27752,14 @@ mod tests {
             assert_eq!(obj.toughness, Some(1));
             assert!(
                 obj.abilities.iter().any(|ability| {
-                    matches!(*ability.effect, Effect::Mana { .. })
-                        && matches!(
-                            ability.cost,
-                            Some(AbilityCost::Sacrifice {
-                                target: TargetFilter::SelfRef,
-                                count: 1
-                            })
-                        )
+                    matches!(*ability.effect, Effect::Mana { .. }) && {
+                        if let Some(AbilityCost::Sacrifice(sc)) = &ability.cost {
+                            matches!(sc.target, TargetFilter::SelfRef)
+                                && sc.requirement == SacrificeRequirement::count(1)
+                        } else {
+                            false
+                        }
+                    }
                 }),
                 "each Eldrazi Spawn must carry 'Sacrifice this token: Add {{C}}'"
             );
@@ -28541,10 +28531,10 @@ mod tests {
             .core_types
             .push(CoreType::Creature);
 
-        let cost = AbilityCost::Sacrifice {
-            target: TargetFilter::Typed(TypedFilter::creature()),
-            count: 1,
-        };
+        let cost = AbilityCost::Sacrifice(SacrificeCost::count(
+            TargetFilter::Typed(TypedFilter::creature()),
+            1,
+        ));
         assert!(can_pay_ability_cost_now(&state, PlayerId(0), source, &cost));
     }
 
@@ -28561,10 +28551,10 @@ mod tests {
             Zone::Battlefield,
         );
         // No other creatures on the battlefield
-        let cost = AbilityCost::Sacrifice {
-            target: TargetFilter::Typed(TypedFilter::creature()),
-            count: 1,
-        };
+        let cost = AbilityCost::Sacrifice(SacrificeCost::count(
+            TargetFilter::Typed(TypedFilter::creature()),
+            1,
+        ));
         assert!(!can_pay_ability_cost_now(
             &state,
             PlayerId(0),
@@ -32750,10 +32740,7 @@ mod tests {
                 AbilityCost::PayLife {
                     amount: QuantityExpr::Fixed { value: 1 },
                 },
-                AbilityCost::Sacrifice {
-                    target: TargetFilter::SelfRef,
-                    count: 1,
-                },
+                AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1)),
             ],
         };
         let life_before = state.players[0].life;
@@ -37473,7 +37460,9 @@ mod tests {
                     assert!(
                         matches!(
                             alternative_additional_cost,
-                            Some(AbilityCost::Sacrifice { count: 1, .. })
+                            Some(AbilityCost::Sacrifice(cost))
+                                if cost.requirement
+                                    == crate::types::ability::SacrificeRequirement::count(1)
                         ),
                         "Emerge prompt must surface the required sacrifice cost"
                     );

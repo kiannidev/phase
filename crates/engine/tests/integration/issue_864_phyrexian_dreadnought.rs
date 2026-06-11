@@ -118,13 +118,16 @@ fn phyrexian_dreadnought_parsed_etb_carries_power_threshold_unless_cost() {
         .expect("ETB must carry unless_pay (#864)");
     assert_eq!(unless_pay.payer, TargetFilter::Controller);
     assert!(matches!(
-        unless_pay.cost,
-        AbilityCost::SacrificePowerThreshold {
-            stat: engine::types::ability::SacrificeAggregateStat::TotalPower,
-            comparator: engine::types::ability::Comparator::GE,
-            value: 12,
-            ..
-        }
+        &unless_pay.cost,
+        AbilityCost::Sacrifice(cost)
+            if matches!(
+                cost.requirement,
+                engine::types::ability::SacrificeRequirement::Aggregate {
+                    stat: engine::types::ability::SacrificeAggregateStat::TotalPower,
+                    comparator: engine::types::ability::Comparator::GE,
+                    value: 12,
+                }
+            )
     ));
 }
 

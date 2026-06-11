@@ -7,7 +7,8 @@
 use engine::game::scenario::{GameScenario, P0};
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{
-    AbilityCost, AdditionalCost, AdditionalCostRepeatability, StaticCondition,
+    AbilityCost, AdditionalCost, AdditionalCostRepeatability, SacrificeCost, SacrificeRequirement,
+    StaticCondition, TargetFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::game_state::{CastPaymentMode, PayCostKind, WaitingFor};
@@ -109,11 +110,16 @@ fn rottenmouth_viper_parses_sacrifice_additional_cost_and_reduction() {
     );
     match parsed.additional_cost {
         Some(AdditionalCost::Optional {
-            cost: AbilityCost::Sacrifice {
-                count: u32::MAX, ..
-            },
+            cost: AbilityCost::Sacrifice(ref cost),
             repeatability: AdditionalCostRepeatability::Once,
-        }) => {}
+        }) => {
+            assert_eq!(cost.target, TargetFilter::Any);
+            assert_eq!(
+                cost.requirement,
+                SacrificeRequirement::count(u32::MAX),
+                "any-number sacrifice must use MAX count"
+            );
+        }
         other => panic!("expected optional any-number sacrifice cost, got {other:?}"),
     }
     assert!(

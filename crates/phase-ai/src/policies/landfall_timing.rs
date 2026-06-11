@@ -269,10 +269,7 @@ mod tests {
         ability.cost = Some(AbilityCost::Composite {
             costs: vec![
                 AbilityCost::Tap,
-                AbilityCost::Sacrifice {
-                    target: TargetFilter::SelfRef,
-                    count: 1,
-                },
+                AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1)),
             ],
         });
         ability.sub_ability = Some(Box::new(AbilityDefinition::new(

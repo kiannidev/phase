@@ -174,10 +174,10 @@ mod tests {
                 damage_source: None,
             },
         );
-        ability.cost = Some(AbilityCost::Sacrifice {
-            target: TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
-            count: 1,
-        });
+        ability.cost = Some(AbilityCost::Sacrifice(SacrificeCost::count(
+            TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
+            1,
+        )));
         ability
     }
 

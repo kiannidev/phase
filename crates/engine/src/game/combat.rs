@@ -6165,6 +6165,39 @@ mod tests {
     }
 
     #[test]
+    fn cant_attack_owner_blocks_only_owner_attack_target() {
+        let mut state = setup_multiplayer_combat(3);
+        let attacker = create_creature(&mut state, PlayerId(1), "Owner-Restricted Bear", 2, 2);
+        {
+            let obj = state.objects.get_mut(&attacker).unwrap();
+            obj.controller = PlayerId(0);
+            obj.static_definitions.push(
+                StaticDefinition::new(StaticMode::CantAttack)
+                    .affected(TargetFilter::SelfRef)
+                    .attack_defended(Some(crate::types::triggers::AttackTargetFilter::Owner)),
+            );
+        }
+
+        let mut owner_attack_state = state.clone();
+        let attacks_owner = declare_attackers(
+            &mut owner_attack_state,
+            &[(attacker, AttackTarget::Player(PlayerId(1)))],
+            &mut vec![],
+        );
+        assert!(attacks_owner.is_err());
+        assert!(attacks_owner
+            .unwrap_err()
+            .contains("can't attack Player(PlayerId(1))"));
+
+        let attacks_non_owner = declare_attackers(
+            &mut state,
+            &[(attacker, AttackTarget::Player(PlayerId(2)))],
+            &mut vec![],
+        );
+        assert!(attacks_non_owner.is_ok());
+    }
+
+    #[test]
     fn must_attack_player_omitted_creature_fails() {
         let mut state = setup_combat_phase();
         let attacker = create_creature(&mut state, PlayerId(0), "Lured Bear", 2, 2);

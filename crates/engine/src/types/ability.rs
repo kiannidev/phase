@@ -6494,7 +6494,6 @@ pub enum Effect {
         /// to the player resolved from `ref` (currently only `ControllerRef::You`
         /// is supported at runtime — see resolver in `effects/change_zone.rs`).
         /// `None` leaves the object under its owner's control per CR 110.2.
-        ///
         #[serde(default, skip_serializing_if = "Option::is_none")]
         enters_under: Option<ControllerRef>,
         /// CR 614.1: The object enters the battlefield tapped.
@@ -15512,7 +15511,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // CR 110.2a: `Effect::ChangeZone.enters_under` serde roundtrip coverage.
+    // CR 110.2a: `Effect::ChangeZone.enters_under` serde coverage.
     // ---------------------------------------------------------------------
 
     /// Helper: build a minimal `Effect::ChangeZone` with `enters_under` set.
@@ -15534,6 +15533,7 @@ mod tests {
 
     #[test]
     fn enters_under_chosen_player_index_zero_roundtrips() {
+        // The modern shape can express `Some(ControllerRef::ChosenPlayer { index: 0 })`.
         let json = r#"{
             "type": "ChangeZone",
             "destination": "Battlefield",
@@ -15558,6 +15558,20 @@ mod tests {
         );
         let decoded: Effect = serde_json::from_str(&json).expect("roundtrip");
         assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn enters_under_field_not_emitted_when_none() {
+        // `enters_under: None` must skip-serialize; `Some(You)` must emit the
+        // modern key.
+        for variant in [None, Some(ControllerRef::You)] {
+            let effect = change_zone_with_enters_under(variant.clone());
+            let json = serde_json::to_string(&effect).expect("serialize");
+            assert!(
+                !json.contains("\"under_your_control\""),
+                "legacy bool field emitted for {variant:?}: {json}"
+            );
+        }
     }
 
     // CR 118: Cost taxonomy mapping — exhaustive per-variant coverage.

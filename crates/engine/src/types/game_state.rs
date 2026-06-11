@@ -941,7 +941,6 @@ pub struct PendingChangeZoneIteration {
     /// owner's control. Resolved from `Effect::ChangeZone.enters_under`
     /// at resolver entry, so the carrier never re-evaluates a `ControllerRef`
     /// across an interactive pause.
-    ///
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enters_under_player: Option<PlayerId>,
     pub enters_attacking: bool,
@@ -2904,7 +2903,6 @@ pub enum WaitingFor {
         /// `EffectZoneChoice` round-trip. `Some(pid)` routes the chosen
         /// object(s) to `pid` on battlefield entry; `None` leaves them
         /// under their owner's control.
-        ///
         #[serde(default, skip_serializing_if = "Option::is_none")]
         enters_under_player: Option<PlayerId>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -8010,8 +8008,8 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // CR 110.2a: serde roundtrip coverage for the resolved-once runtime
-    // carriers (`PendingChangeZoneIteration` and `WaitingFor::EffectZoneChoice`).
+    // CR 110.2a: serde coverage for the resolved-once runtime carriers
+    // (`PendingChangeZoneIteration` and `WaitingFor::EffectZoneChoice`).
     // ---------------------------------------------------------------------
 
     #[test]

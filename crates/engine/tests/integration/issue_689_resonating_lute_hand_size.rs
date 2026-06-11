@@ -103,9 +103,9 @@ fn resonating_lute_from_card_db_respects_hand_size_restriction() {
         .objects
         .get(&lute_id)
         .and_then(|o| {
-            o.abilities.iter().position(|a| {
-                matches!(*a.effect, engine::types::ability::Effect::Draw { .. })
-            })
+            o.abilities
+                .iter()
+                .position(|a| matches!(*a.effect, engine::types::ability::Effect::Draw { .. }))
         })
         .expect("Resonating Lute export must include a Draw activated ability");
 

@@ -614,6 +614,17 @@ pub struct GameObject {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub merge_layer_effect_id: Option<u64>,
 
+    /// CR 730.3c: When a merged permanent leaves the battlefield it "becomes"
+    /// multiple new objects (CR 730.3 / CR 400.7). Each absorbed component records
+    /// the surviving object's id here, so that an effect which finds the object
+    /// the merged permanent became — a flicker/blink referencing "it" — returns
+    /// ALL of the components, not just the survivor (see
+    /// `merge::expand_returned_merge_components`). Set when the component is split
+    /// out on battlefield exit; cleared on any battlefield (re-)entry. `None` for
+    /// objects that were never split out of a merged permanent this way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_from_merge_survivor: Option<ObjectId>,
+
     /// CR 702.148a-b + CR 612: `Some(_)` while this object's cleave
     /// text-changing effect is live (the spell was cast for its cleave cost).
     /// Carries the printed-form ability snapshot captured before the swap so the
@@ -830,6 +841,15 @@ pub struct GameObject {
     /// to evaluate conditions like "if you cast it from your hand".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_from_zone: Option<Zone>,
+
+    /// CR 614.1a + CR 608.2n + CR 607.2b + CR 406.6: While present, this spell
+    /// is exiled instead of being put into its owner's graveyard as it resolves,
+    /// and the resulting exile is recorded as "exiled with" the stored source.
+    /// Set by `Effect::ExileResolvingSpellInsteadOfGraveyard` (Rod of
+    /// Absorption's "exile it instead of putting it into a graveyard as it
+    /// resolves" rider); consumed by the stack-resolution router.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exile_from_stack_linked_source: Option<ObjectId>,
 
     /// CR 305.1 + CR 603.4: Transient field tracking the zone a land was played
     /// from. Consumed by ETB trigger processing for conditions like "without
@@ -1082,6 +1102,7 @@ impl GameObject {
             mutate_form: None,
             merged_components: Vec::new(),
             merge_layer_effect_id: None,
+            split_from_merge_survivor: None,
             cleave_form: None,
             cleave_variant: None,
             unimplemented_mechanics: Vec::new(),
@@ -1122,6 +1143,7 @@ impl GameObject {
             room_unlocks: None,
             class_level: None,
             cast_from_zone: None,
+            exile_from_stack_linked_source: None,
             played_from_zone: None,
             mana_spent_to_cast: false,
             colors_spent_to_cast: ColoredManaCount::default(),
@@ -1184,6 +1206,10 @@ impl GameObject {
         self.base_controller = Some(self.owner);
         self.controller = self.owner;
         self.entered_battlefield_turn = Some(turn_number);
+        // CR 730.3c + CR 400.7: a split-out merge component that (re-)enters the
+        // battlefield is a fresh permanent — drop the survivor back-link so it is
+        // not re-collected by a later continuity-reference return.
+        self.split_from_merge_survivor = None;
         // CR 302.6: A permanent that enters the battlefield has not been
         // continuously under its controller's control since that player's
         // most recent turn began. Cleared at controller's next turn start

@@ -143,6 +143,7 @@ mod issue_580_solitude_evoke_prompt;
 mod issue_581_mystic_remora_cumulative_upkeep;
 mod issue_583_vivi_ornitier_mana_source;
 mod issue_688_mind_into_matter;
+mod issue_691_sheoldred_saga_lore;
 mod issue_709_regression;
 mod issue_859_weathered_wayfarer;
 mod issue_860_luminarch_aspirant;

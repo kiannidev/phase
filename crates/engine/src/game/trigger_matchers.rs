@@ -1329,10 +1329,15 @@ pub(super) fn matching_attack_events(
         ..
     } = event
     {
-        // Find which attacker(s) satisfy the creature filter
+        // Find which attacker(s) satisfy the creature / attacking-player filter.
         let attacker_matches = |id: &ObjectId| -> bool {
             if trigger.valid_card.is_some() {
                 valid_card_matches(trigger, state, *id, source_id)
+            } else if let Some(filter) = trigger.valid_source.as_ref() {
+                match filter {
+                    TargetFilter::Player => true,
+                    _ => valid_source_matches(trigger, state, *id, source_id),
+                }
             } else {
                 *id == source_id
             }

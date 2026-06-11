@@ -4915,7 +4915,7 @@ fn parse_that_player_controls_more_comparison(input: &str) -> OracleResult<'_, S
 /// comparing the defending player's permanents to the trigger controller's.
 /// The object-count machinery already handles `ControllerRef::You`; this arm
 /// adds the combat-context controller axis for the LHS.
-/// CR 508.5 + CR 603.2b: "that opponent has more life than another of your
+/// CR 508.5 + CR 603.4: "that opponent has more life than another of your
 /// opponents" — defending player's life exceeds the lowest life total among
 /// the source controller's opponents (Breena, the Demagogue).
 fn parse_defending_player_more_life_than_another_opponent(

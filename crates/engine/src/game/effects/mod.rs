@@ -1042,6 +1042,8 @@ fn waits_for_resolution_choice(waiting_for: &WaitingFor) -> bool {
             | WaitingFor::MultiTargetSelection { .. }
             | WaitingFor::ReplacementChoice { .. }
             | WaitingFor::OptionalEffectChoice { .. }
+            | WaitingFor::UnlessPayment { .. }
+            | WaitingFor::UnlessPaymentChooseCost { .. }
             | WaitingFor::PairChoice { .. }
             | WaitingFor::OpponentMayChoice { .. }
             | WaitingFor::TributeChoice { .. }

@@ -5174,12 +5174,9 @@ impl<'de> serde::Deserialize<'de> for SacrificeCost {
     where
         D: serde::Deserializer<'de>,
     {
-        use serde::de::{self, MapAccess, Visitor};
-        use std::fmt;
-
         struct SacrificeCostVisitor;
 
-        impl<'de> Visitor<'de> for SacrificeCostVisitor {
+        impl<'de> de::Visitor<'de> for SacrificeCostVisitor {
             type Value = SacrificeCost;
 
             fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -5188,7 +5185,7 @@ impl<'de> serde::Deserialize<'de> for SacrificeCost {
 
             fn visit_map<V>(self, mut map: V) -> Result<SacrificeCost, V::Error>
             where
-                V: MapAccess<'de>,
+                V: de::MapAccess<'de>,
             {
                 let mut target: Option<TargetFilter> = None;
                 let mut count: Option<u32> = None;

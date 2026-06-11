@@ -421,7 +421,7 @@ fn multi_sacrifice_cost_count_is_honored() {
     )
     .cost(AbilityCost::Sacrifice(SacrificeCost::count(
         TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
-        1,
+        2,
     )));
 
     let host_id = scenario
@@ -509,7 +509,7 @@ fn multi_sacrifice_cost_resolves_through_pipeline() {
         )
         .cost(AbilityCost::Sacrifice(SacrificeCost::count(
             TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
-            1,
+            2,
         )))
     };
 

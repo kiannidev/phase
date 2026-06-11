@@ -3,7 +3,7 @@
 //! unconditionally via `StaticCondition::Unrecognized`.
 
 use engine::game::keywords::has_keyword;
-use engine::game::layers::{evaluate_layers, flush_layers, mark_layers_full};
+use engine::game::layers::evaluate_layers;
 use engine::game::scenario::{GameScenario, P0};
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::StaticCondition;
@@ -44,18 +44,17 @@ fn tarrasque_haste_only_when_cast_from_hand() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let cast_id = scenario
-        .add_creature_from_oracle(P0, "The Tarrasque", 10, 10, TARRASQUE_ORACLE)
+        .add_creature_to_hand_from_oracle(P0, "The Tarrasque", 10, 10, TARRASQUE_ORACLE)
         .id();
 
     let mut cast_runner = scenario.build();
-    cast_runner
-        .state_mut()
-        .objects
-        .get_mut(&cast_id)
-        .unwrap()
-        .cast_from_zone = Some(Zone::Hand);
-    mark_layers_full(cast_runner.state_mut());
-    flush_layers(cast_runner.state_mut());
+    let outcome = cast_runner.cast(cast_id).resolve();
+    outcome.assert_zone(&[cast_id], Zone::Battlefield);
+    assert_eq!(
+        cast_runner.state().objects[&cast_id].cast_from_zone,
+        Some(Zone::Hand),
+        "precondition: the real cast pipeline must stamp cast provenance"
+    );
 
     assert!(
         has_keyword(&cast_runner.state().objects[&cast_id], &Keyword::Haste),

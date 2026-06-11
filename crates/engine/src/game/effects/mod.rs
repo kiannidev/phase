@@ -90,6 +90,7 @@ mod epic_tests;
 pub mod exchange_control;
 // Tests for `intensify` live in a sibling file (declared here, not in
 // `intensify.rs`, so `intensify.rs` stays implementation-only).
+pub mod cloak;
 pub mod exchange_life;
 pub mod exile_from_top_until;
 pub mod exile_top;
@@ -1646,6 +1647,7 @@ fn collect_effect_quantity_exprs<'a>(effect: &'a Effect, out: &mut Vec<&'a Quant
         | Effect::Seek { count: amount, .. }
         | Effect::SetLifeTotal { amount, .. }
         | Effect::Manifest { count: amount, .. }
+        | Effect::Cloak { count: amount, .. }
         | Effect::GivePlayerCounter { count: amount, .. }
         | Effect::GainEnergy { amount, .. }
         | Effect::Discover {
@@ -2110,6 +2112,7 @@ pub fn resolve_effect(
         Effect::Bolster { .. } => bolster::resolve(state, ability, events),
         Effect::Manifest { .. } => manifest::resolve(state, ability, events),
         Effect::ManifestDread => manifest_dread::resolve(state, ability, events),
+        Effect::Cloak { .. } => cloak::resolve(state, ability, events),
         Effect::TurnFaceUp { .. } => turn_face_up::resolve(state, ability, events),
         Effect::ExtraTurn { .. } => extra_turn::resolve(state, ability, events),
         Effect::GrantExtraLoyaltyActivations { .. } => {

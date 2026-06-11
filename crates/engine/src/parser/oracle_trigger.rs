@@ -6219,7 +6219,7 @@ fn try_parse_event(
         // CR 508.1a + CR 508.5: player-subject attack triggers scope the attacking
         // player via `valid_source`, not `valid_card` — `TargetFilter::Player` never
         // matches an object (Breena, the Demagogue).
-        if subject_is_player(&subject) {
+        if subject_is_player(subject) {
             def.valid_source = Some(subject.clone());
         } else {
             def.valid_card = Some(subject.clone());

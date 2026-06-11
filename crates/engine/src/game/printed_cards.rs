@@ -680,6 +680,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         // seed collects it directly from the face (see
         // `collect_conjure_names_from_face`), so nothing to gather here.
         Effect::DraftFromSpellbook { .. } => {}
+        Effect::TurnFaceUp { .. } => {}
         // Nested-ability carriers — descend.
         Effect::Vote {
             per_choice_effect, ..
@@ -898,6 +899,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::ChangeTargets { .. }
         | Effect::Manifest { .. }
         | Effect::ManifestDread
+        | Effect::Cloak { .. }
         | Effect::ExtraTurn { .. }
         | Effect::GrantExtraLoyaltyActivations { .. }
         | Effect::SkipNextTurn { .. }

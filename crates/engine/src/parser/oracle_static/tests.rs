@@ -7222,6 +7222,63 @@ fn static_self_gets_dynamic_power_for_each_creature() {
 }
 
 #[test]
+fn static_self_gets_dynamic_pt_for_each_unspent_green_mana() {
+    // CR 106.4 + CR 613.4c: Omnath, Locus of Mana — "~ gets +1/+1 for each
+    // unspent green mana you have." The per-mana multiplier was dropped (frozen
+    // at +1/+1); now both P/T modifications scale dynamically with the floating
+    // green mana in the controller's pool via `QuantityRef::UnspentMana`.
+    use crate::types::ability::QuantityRef;
+    let def = parse_static_line("~ gets +1/+1 for each unspent green mana you have.")
+        .expect("Omnath dynamic P/T static must parse");
+    assert_eq!(def.mode, StaticMode::Continuous);
+
+    let expected = QuantityExpr::Ref {
+        qty: QuantityRef::UnspentMana {
+            color: Some(ManaColor::Green),
+        },
+    };
+    let dynamic_power = def
+        .modifications
+        .iter()
+        .find_map(|m| match m {
+            ContinuousModification::AddDynamicPower { value } => Some(value),
+            _ => None,
+        })
+        .expect("expected AddDynamicPower");
+    assert_eq!(
+        dynamic_power, &expected,
+        "power scales with unspent green mana"
+    );
+    let dynamic_toughness = def
+        .modifications
+        .iter()
+        .find_map(|m| match m {
+            ContinuousModification::AddDynamicToughness { value } => Some(value),
+            _ => None,
+        })
+        .expect("expected AddDynamicToughness");
+    assert_eq!(dynamic_toughness, &expected, "toughness scales too");
+}
+
+#[test]
+fn for_each_clause_unspent_mana() {
+    // Building-block: the for-each quantity parser maps "unspent <color> mana
+    // you have" to UnspentMana{color}, and the colorless "unspent mana you have"
+    // to UnspentMana{None} (all colors).
+    use crate::types::ability::QuantityRef;
+    assert_eq!(
+        crate::parser::oracle_quantity::parse_for_each_clause("unspent green mana you have"),
+        Some(QuantityRef::UnspentMana {
+            color: Some(ManaColor::Green),
+        }),
+    );
+    assert_eq!(
+        crate::parser::oracle_quantity::parse_for_each_clause("unspent mana you have"),
+        Some(QuantityRef::UnspentMana { color: None }),
+    );
+}
+
+#[test]
 fn static_self_gets_dynamic_pt_for_each_permanent_you_control_but_dont_own() {
     let def = parse_static_line("~ gets +1/+1 for each land you control but don't own.")
         .expect("control-without-ownership dynamic P/T static must parse");
@@ -15240,4 +15297,106 @@ fn single_sentence_anthem_unaffected_by_multi_sentence_split() {
     assert!(defs[0]
         .modifications
         .contains(&ContinuousModification::AddPower { value: 1 }));
+}
+
+/// CR 611.3a + CR 613.1f: Compound static where the keyword-grant conjunct has
+/// a different subject ("creatures you control") than the P/T conjunct ("~").
+/// Angelic Field Marshal: "As long as you control your commander, ~ gets +2/+2
+/// and creatures you control have vigilance."
+/// Must decompose into TWO StaticDefinitions sharing the same condition:
+///   - def[0]: SelfRef subject, [AddPower(2), AddToughness(2)], condition present
+///   - def[1]: Typed(creatures you control) subject, [AddKeyword(Vigilance)], condition present
+#[test]
+fn compound_static_foreign_keyword_grant_splits_angelic_field_marshal() {
+    let defs = parse_static_line_multi(
+        "As long as you control your commander, ~ gets +2/+2 and creatures you control have vigilance.",
+    );
+    assert_eq!(
+        defs.len(),
+        2,
+        "expected 2 StaticDefinitions (self P/T + foreign keyword), got {defs:?}"
+    );
+
+    // Primary def: self-ref P/T boost with condition.
+    let primary = &defs[0];
+    assert_eq!(primary.mode, StaticMode::Continuous);
+    assert!(
+        matches!(&primary.affected, Some(TargetFilter::SelfRef)),
+        "primary must target SelfRef, got {:?}",
+        primary.affected
+    );
+    assert!(
+        primary
+            .modifications
+            .contains(&ContinuousModification::AddPower { value: 2 }),
+        "primary must add +2 power, got {:?}",
+        primary.modifications
+    );
+    assert!(
+        primary
+            .modifications
+            .contains(&ContinuousModification::AddToughness { value: 2 }),
+        "primary must add +2 toughness, got {:?}",
+        primary.modifications
+    );
+    assert!(
+        primary.condition.is_some(),
+        "primary must carry the as-long-as condition"
+    );
+
+    // Companion def: creatures you control get vigilance with same condition.
+    let companion = &defs[1];
+    assert_eq!(companion.mode, StaticMode::Continuous);
+    match &companion.affected {
+        Some(TargetFilter::Typed(tf)) => {
+            assert_eq!(tf.controller, Some(ControllerRef::You));
+            assert!(
+                tf.type_filters.contains(&TypeFilter::Creature),
+                "companion must affect creatures you control, got {:?}",
+                tf.type_filters
+            );
+        }
+        other => panic!("companion affected must be Typed(creatures you control), got {other:?}"),
+    }
+    assert!(
+        companion.modifications.iter().any(|m| matches!(m, ContinuousModification::AddKeyword { keyword } if *keyword == Keyword::Vigilance)),
+        "companion must add Vigilance, got {:?}",
+        companion.modifications
+    );
+    assert!(
+        companion.condition.is_some(),
+        "companion must carry the as-long-as condition"
+    );
+}
+
+/// CR 702 + CR 613.1f: Kaldra Compleat — keyword list preceding a quoted
+/// trigger ability must not drop the last bare keyword. `strip_quoted_segments`
+/// removes the `, and "Whenever..."` tail but leaves a trailing comma; all five
+/// keywords (first strike, trample, indestructible, haste, and the trigger)
+/// must survive.
+#[test]
+fn static_keyword_list_before_quoted_trigger_keeps_last_keyword() {
+    let defs = parse_static_line_multi(
+        "Equipped creature gets +5/+5 and has first strike, trample, indestructible, haste, and \"Whenever this creature deals combat damage to a creature, exile that creature.\"",
+    );
+    assert_eq!(defs.len(), 1);
+    let mods = &defs[0].modifications;
+    for kw in [
+        Keyword::FirstStrike,
+        Keyword::Trample,
+        Keyword::Indestructible,
+        Keyword::Haste,
+    ] {
+        assert!(
+            mods.iter().any(
+                |m| matches!(m, ContinuousModification::AddKeyword { keyword } if *keyword == kw)
+            ),
+            "keyword {kw:?} missing from mods: {mods:?}"
+        );
+    }
+    assert!(
+        mods.iter()
+            .any(|m| matches!(m, ContinuousModification::GrantTrigger { .. })),
+        "GrantTrigger missing: {mods:?}"
+    );
 }

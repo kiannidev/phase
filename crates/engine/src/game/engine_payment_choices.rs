@@ -633,11 +633,7 @@ pub(super) fn handle_unless_payment(
                     filter,
                 );
                 if !sacrifice_pool_meets_aggregate_constraint(
-                    state,
-                    &eligible,
-                    stat,
-                    comparator,
-                    value,
+                    state, &eligible, stat, comparator, value,
                 ) {
                     payment_failed = true;
                 } else {

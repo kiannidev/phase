@@ -96,7 +96,10 @@ fn transformed_saga_back_face_entry_receives_lore_counter() {
 
     let saga = &runner.state().objects[&sheoldred_id];
     assert_eq!(saga.zone, Zone::Battlefield);
-    assert!(saga.transformed, "must enter showing the Saga back face (CR 712.14a)");
+    assert!(
+        saga.transformed,
+        "must enter showing the Saga back face (CR 712.14a)"
+    );
     assert_eq!(saga.name, "The True Scriptures");
     assert!(
         saga.card_types.subtypes.iter().any(|s| s == "Saga"),
@@ -130,9 +133,7 @@ fn sheoldred_activate_returns_true_scriptures_with_lore_counter() {
     }
 
     add_mana(&mut runner, 4, 1);
-    runner
-        .activate(sheoldred_id, 0)
-        .resolve();
+    runner.activate(sheoldred_id, 0).resolve();
 
     let saga = &runner.state().objects[&sheoldred_id];
     assert_eq!(saga.zone, Zone::Battlefield);

@@ -5797,35 +5797,6 @@ where
 {
     use serde::Deserialize as _;
     let raw: serde_json::Value = serde_json::Value::deserialize(d)?;
-    // Try the modern AbilityCost shape first.
-    if let Some(obj) = raw.as_object() {
-        if obj.get("type").and_then(|v| v.as_str()) == Some("SacrificePowerThreshold") {
-            let target: TargetFilter = serde_json::from_value(
-                raw.get("target")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-            )
-            .map_err(serde::de::Error::custom)?;
-            let stat: SacrificeAggregateStat =
-                serde_json::from_value(raw.get("stat").cloned().unwrap_or(serde_json::Value::Null))
-                    .map_err(serde::de::Error::custom)?;
-            let comparator: Comparator = serde_json::from_value(
-                raw.get("comparator")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
-            )
-            .map_err(serde::de::Error::custom)?;
-            let value: i32 = raw.get("value").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-            return Ok(AbilityCost::Sacrifice(SacrificeCost::new(
-                target,
-                SacrificeRequirement::Aggregate {
-                    stat,
-                    comparator,
-                    value,
-                },
-            )));
-        }
-    }
     if let Ok(cost) = serde_json::from_value::<AbilityCost>(raw.clone()) {
         return Ok(cost);
     }

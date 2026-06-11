@@ -1397,6 +1397,7 @@ pub fn compute_combat_tax(
                         attack_target.as_ref(),
                         filter,
                         source_obj.controller,
+                        source_obj.owner,
                     ) {
                         continue;
                     }

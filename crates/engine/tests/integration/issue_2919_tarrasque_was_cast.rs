@@ -5,9 +5,9 @@
 use engine::game::keywords::has_keyword;
 use engine::game::layers::{evaluate_layers, flush_layers, mark_layers_full};
 use engine::game::scenario::{GameScenario, P0};
-use engine::types::keywords::Keyword;
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::StaticCondition;
+use engine::types::keywords::Keyword;
 use engine::types::phase::Phase;
 use engine::types::statics::StaticMode;
 use engine::types::zones::Zone;

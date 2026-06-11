@@ -20545,24 +20545,48 @@ mod dedup_regression_tests {
             .card_types
             .core_types
             .push(CoreType::Creature);
+        let second_attacker = create_object(
+            &mut state,
+            CardId(3),
+            attacking_player,
+            "Second Attacker".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&second_attacker)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
 
         process_triggers(
             &mut state,
             &[GameEvent::AttackersDeclared {
-                attacker_ids: vec![attacker],
+                attacker_ids: vec![attacker, second_attacker],
                 defending_player,
-                attacks: vec![(attacker, AttackTarget::Player(defending_player))],
+                attacks: vec![
+                    (attacker, AttackTarget::Player(defending_player)),
+                    (second_attacker, AttackTarget::Player(defending_player)),
+                ],
             }],
         );
 
-        assert!(
-            state.stack.iter().any(|entry| entry.source_id == breena
-                && entry.controller == breena_controller
-                && matches!(
-                    &entry.kind,
-                    StackEntryKind::TriggeredAbility { ability, .. }
-                        if matches!(ability.effect, Effect::Draw { .. })
-                )),
+        let breena_trigger_count = state
+            .stack
+            .iter()
+            .filter(|entry| {
+                entry.source_id == breena
+                    && entry.controller == breena_controller
+                    && matches!(
+                        &entry.kind,
+                        StackEntryKind::TriggeredAbility { ability, .. }
+                            if matches!(ability.effect, Effect::Draw { .. })
+                    )
+            })
+            .count();
+        assert_eq!(
+            breena_trigger_count, 1,
             "Breena must trigger when a player attacks an opponent with more life than another opponent"
         );
 
@@ -20577,9 +20601,12 @@ mod dedup_regression_tests {
         process_triggers(
             &mut state,
             &[GameEvent::AttackersDeclared {
-                attacker_ids: vec![attacker],
+                attacker_ids: vec![attacker, second_attacker],
                 defending_player,
-                attacks: vec![(attacker, AttackTarget::Player(defending_player))],
+                attacks: vec![
+                    (attacker, AttackTarget::Player(defending_player)),
+                    (second_attacker, AttackTarget::Player(defending_player)),
+                ],
             }],
         );
 

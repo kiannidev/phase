@@ -3887,6 +3887,11 @@ pub enum PlayerFilter {
     OpponentLostLife,
     /// Each opponent who gained life this turn (life_gained_this_turn > 0).
     OpponentGainedLife,
+    /// CR 104.3 + CR 104.5: Each player who has lost the game (`is_eliminated`).
+    /// Quantity-only: players who lost have left the game, so this is not a live
+    /// effect recipient filter. Rampant Frogantua class: "+10/+10 for each
+    /// player who has lost the game".
+    HasLostTheGame,
     /// CR 120.1 + CR 510.1 + CR 120.9 + CR 608.2i: Each opponent who was dealt
     /// combat damage this turn, optionally restricted to damage from a source
     /// matching `source`. Resolved against `state.damage_dealt_this_turn`
@@ -4883,55 +4888,6 @@ pub enum ParsedCondition {
 }
 
 // ---------------------------------------------------------------------------
-// PaymentCost — cost paid during effect resolution (not activation)
-// ---------------------------------------------------------------------------
-
-/// CR 118.1: A cost paid as part of an effect's resolution.
-/// Distinct from AbilityCost (which gates activation before the colon).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum PaymentCost {
-    Mana {
-        cost: ManaCost,
-    },
-    /// CR 118.8 + CR 119.4: Pay life during effect resolution. Paying life IS losing
-    /// life — the replacement pipeline and `CantLoseLife` locks apply. `amount` is a
-    /// `QuantityExpr` so dynamic references (`"life equal to its power"`, `"X life"`,
-    /// `"life equal to the number of ..."`) compose through the same cost resolver
-    /// as a literal `"pay 2 life"`.
-    Life {
-        amount: QuantityExpr,
-    },
-    /// CR 118.3 + CR 702.179f: Pay speed during effect resolution.
-    Speed {
-        amount: QuantityExpr,
-    },
-    /// CR 107.14: Pay energy counters during effect resolution.
-    /// Distinct from `AbilityCost::PayEnergy` (activation cost before the colon).
-    Energy {
-        amount: QuantityExpr,
-    },
-    /// CR 118.1 + CR 118.12: Non-resource cost instructions paid while a spell or
-    /// ability resolves. Reuses the engine's existing `AbilityCost` taxonomy so
-    /// resolution-time costs such as "discard a card" do not grow a parallel
-    /// payment hierarchy.
-    AbilityCost {
-        cost: AbilityCost,
-    },
-    /// CR 118.1: Per-object scaled mana cost. The `base` `ManaCost` (which may
-    /// carry colored pips, e.g. `{U}`) is multiplied by `times` at payment
-    /// resolution — every pip is repeated and the generic component scaled.
-    /// Models "pay {N} for each [object] chosen this way" uniformly across
-    /// generic ({4}×N) and colored ({U}×N) bases.
-    /// CR 118.5: when `times` resolves to 0 the scaled cost is `{0}`, paid by
-    /// the player's acknowledgment (the empty selection) — a no-op SUCCESS.
-    ScaledMana {
-        base: ManaCost,
-        times: QuantityExpr,
-    },
-}
-
-// ---------------------------------------------------------------------------
 // AbilityCost -- expanded typed variants
 // ---------------------------------------------------------------------------
 
@@ -5098,6 +5054,8 @@ pub const REMOVE_COUNTER_COST_ALL: u32 = u32::MAX - 1;
 /// Sentinel for "any number of" remove-counter costs. This still requires a
 /// count choice, but is distinct from literal `X` for parser/data clarity.
 pub const REMOVE_COUNTER_COST_ANY_NUMBER: u32 = u32::MAX - 2;
+/// Sentinel for literal `X` in exile costs that use the compact numeric count.
+pub const EXILE_COST_X: u32 = u32::MAX;
 
 pub fn is_x_remove_counter_cost_count(count: u32) -> bool {
     count == REMOVE_COUNTER_COST_X
@@ -5946,6 +5904,91 @@ impl LegacyUnlessCost {
     }
 }
 
+/// Forward-compatible deserializer for `Effect::PayCost::cost` (cost-payment
+/// unification Phase 4). First tries the unified `AbilityCost` JSON shape, then
+/// falls back to the legacy `PaymentCost` wrapper shape so saved-game JSON /
+/// persisted continuations keep loading after `PaymentCost` was deleted.
+///
+/// Legacy `PaymentCost` → modern `AbilityCost` mapping (§4 of the unification
+/// plan; field types already align — the fold is lossless except `ScaledMana`,
+/// see below):
+/// - `Mana { cost }` → `Mana { cost }`
+/// - `Life { amount }` → `PayLife { amount }`
+/// - `Speed { amount }` → `PaySpeed { amount }`
+/// - `Energy { amount }` → `PayEnergy { amount }`
+/// - `AbilityCost { cost }` → `cost` (unwrap)
+/// - `ScaledMana { base, times }` → `Unimplemented` (deny, don't undercharge).
+///   The per-object `times` multiplier moved to the sibling
+///   `Effect::PayCost::scale` field, which a field-level deserializer cannot
+///   populate, so the multiplier is unrecoverable here. Mapping the base alone
+///   would silently undercharge (CR 118.1): a pre-Phase-4 save captured at a
+///   `ChooseObjectsSelection` prompt persists the stashed
+///   `PayCost { ScaledMana }` sub-ability inside
+///   `GameState::pending_continuation` (Magnetic Mountain–class, ~2 cards).
+///   Mapping to `Unimplemented` makes the authority fail the payment, so the
+///   CR 118.12 didn't-pay branch applies — rules-safer than charging `base`
+///   for an N-object effect. `card-data.json` is regenerated with the modern
+///   `(Mana, scale)` shape, so this fires only for saves crossing the
+///   pre→post-Phase-4 upgrade boundary.
+pub fn deserialize_pay_cost_compat<'de, D>(d: D) -> Result<AbilityCost, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    let raw: serde_json::Value = serde_json::Value::deserialize(d)?;
+    // Try the modern AbilityCost shape first.
+    if let Ok(cost) = serde_json::from_value::<AbilityCost>(raw.clone()) {
+        return Ok(cost);
+    }
+    // Fall back to the legacy `PaymentCost` wrapper shape and translate.
+    let legacy: LegacyPaymentCost =
+        serde_json::from_value(raw).map_err(serde::de::Error::custom)?;
+    Ok(legacy.into_ability_cost())
+}
+
+/// CR 118.1: Legacy shadow type used ONLY by `deserialize_pay_cost_compat` to
+/// accept pre-Phase-4 serialized JSON. The variants and field names mirror the
+/// deleted `PaymentCost` enum exactly. New code must NOT construct this type —
+/// it exists solely as a deserialization staging area.
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum LegacyPaymentCost {
+    Mana { cost: ManaCost },
+    Life { amount: QuantityExpr },
+    Speed { amount: QuantityExpr },
+    Energy { amount: QuantityExpr },
+    AbilityCost { cost: AbilityCost },
+    // The legacy `times` field is intentionally omitted: serde ignores the
+    // extra JSON key, and the per-object multiplier moved to the sibling
+    // `Effect::PayCost::scale` field which a field-level deserializer cannot
+    // reach (see `deserialize_pay_cost_compat`). The unrecoverable multiplier
+    // means this maps to `Unimplemented` (deny, don't undercharge).
+    ScaledMana { base: ManaCost },
+}
+
+impl LegacyPaymentCost {
+    fn into_ability_cost(self) -> AbilityCost {
+        match self {
+            LegacyPaymentCost::Mana { cost } => AbilityCost::Mana { cost },
+            LegacyPaymentCost::Life { amount } => AbilityCost::PayLife { amount },
+            LegacyPaymentCost::Speed { amount } => AbilityCost::PaySpeed { amount },
+            LegacyPaymentCost::Energy { amount } => AbilityCost::PayEnergy { amount },
+            LegacyPaymentCost::AbilityCost { cost } => cost,
+            // CR 118.1 + CR 118.12: the per-object `times` lives on the sibling
+            // `scale` field, which a field-level deserializer cannot reach.
+            // Deny rather than undercharge: `Unimplemented` fails the payment
+            // in the authority, taking the didn't-pay branch instead of
+            // charging `base` once for an N-object effect.
+            LegacyPaymentCost::ScaledMana { base } => AbilityCost::Unimplemented {
+                description: format!(
+                    "legacy ScaledMana PayCost from a pre-Phase-4 save (base {base:?}; \
+                     per-object multiplier unrecoverable)"
+                ),
+            },
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Effect enum -- typed variants, zero HashMap
 // ---------------------------------------------------------------------------
@@ -6452,17 +6495,7 @@ pub enum Effect {
         /// is supported at runtime — see resolver in `effects/change_zone.rs`).
         /// `None` leaves the object under its owner's control per CR 110.2.
         ///
-        /// Legacy on-disk shape (boolean `under_your_control`) deserializes via
-        /// `deserialize_enters_under_compat`; emission is always the modern
-        /// shape (`Option<ControllerRef>`). The compat path is guarded by
-        /// `_LEGACY_DESER_ETB_CONTROLLER_2026Q2` and is scheduled to be removed
-        /// once the workspace version exceeds 0.1.53.
-        #[serde(
-            default,
-            skip_serializing_if = "Option::is_none",
-            alias = "under_your_control",
-            deserialize_with = "deserialize_enters_under_compat"
-        )]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         enters_under: Option<ControllerRef>,
         /// CR 614.1: The object enters the battlefield tapped.
         /// Building block for "put onto the battlefield tapped" effects.
@@ -7420,9 +7453,21 @@ pub enum Effect {
         #[serde(default)]
         triggers: Vec<TriggerDefinition>,
     },
-    /// CR 118.1: Pay a cost during effect resolution (mana or life).
+    /// CR 118.1: Pay a cost during effect resolution. Carries the unified
+    /// `AbilityCost` taxonomy directly (no parallel `PaymentCost` hierarchy) so
+    /// resolution-time costs route through the single payment authority
+    /// (`game::costs`). Forward-compatible deserialization (`deserialize_pay_cost_compat`)
+    /// accepts the legacy `PaymentCost`-wrapped JSON shape so saved games /
+    /// persisted continuations keep loading after the fold.
     PayCost {
-        cost: PaymentCost,
+        #[serde(deserialize_with = "deserialize_pay_cost_compat")]
+        cost: AbilityCost,
+        /// CR 118.1 + CR 118.5: Resolution-only per-object scale (was
+        /// `PaymentCost::ScaledMana`). When `Some(times)` the mana `cost` base
+        /// is multiplied by `times` at payment ("pay {N} for each object chosen
+        /// this way"); `times == 0` yields `{0}`, a trivial no-op success.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scale: Option<QuantityExpr>,
         /// CR 608.2c: Player who pays the resolution-time cost. Defaults to
         /// the ability controller; target-derived refs such as
         /// `ParentTargetController` cover "that spell's controller may pay".
@@ -10444,14 +10489,25 @@ pub enum CastingRestriction {
     RequiresCondition { condition: Option<ParsedCondition> },
 }
 
-/// CR 601.2f: Self-referential cost reduction on an activated ability.
-/// "This ability costs {N} less to activate for each [condition]"
+/// CR 602.2b + CR 601.2f: Self-referential cost reduction on an activated ability.
+/// "This ability costs {N} less to activate for each [condition]" (scaling), or
+/// "This ability costs {N} less to activate if [condition]" (conditional flat:
+/// `count = Fixed(1)` gated by `condition`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CostReduction {
     /// Generic mana reduced per counted object (the {N} value).
     pub amount_per: u32,
     /// How many objects to count (e.g., legendary creatures you control).
+    /// For the conditional flat form this is `Fixed(1)`.
     pub count: QuantityExpr,
+    /// CR 602.2b + CR 601.2f: Optional gate for the conditional flat form — the reduction
+    /// applies only when this condition holds at cost-determination time
+    /// (Razorlash Transmogrant, Esquire of the King, …). `None` = unconditional
+    /// (the "for each" scaling form and all pre-existing reductions). Evaluated
+    /// at runtime via the shared `restrictions::evaluate_condition`, the same
+    /// path `ActivationRestriction::RequiresCondition` uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub condition: Option<ParsedCondition>,
 }
 
 /// CR 601.2c + CR 603.3d + CR 608.2d: Whether object/player choices for an
@@ -14158,131 +14214,6 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Legacy on-disk compatibility for `Effect::ChangeZone::enters_under`.
-//
-// The field was previously a `bool` named `under_your_control` (true = enters
-// under ability controller). It was lifted to `Option<ControllerRef>` so the
-// engine can express any `ControllerRef` variant on ETB (CR 110.2a). On-disk
-// payloads — semantic-audit snapshots, replays, and inline tests in
-// `mtgish-import` — may still carry the bool shape. `serde(alias =
-// "under_your_control")` routes them to this deserializer; we dispatch on the
-// JSON value to keep both shapes readable. Emission is always the modern
-// shape; new clients never see the bool. See `_LEGACY_DESER_ETB_CONTROLLER_2026Q2`
-// below for the removal tripwire.
-// ---------------------------------------------------------------------------
-
-/// Deserialize either the modern `Option<ControllerRef>` shape or the legacy
-/// boolean `under_your_control` shape (routed in via `#[serde(alias)]`).
-fn deserialize_enters_under_compat<'de, D>(
-    deserializer: D,
-) -> Result<Option<ControllerRef>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    use serde::de::Error;
-    let value = serde_json::Value::deserialize(deserializer)?;
-    match value {
-        serde_json::Value::Bool(true) => Ok(Some(ControllerRef::You)),
-        serde_json::Value::Bool(false) => Ok(None),
-        serde_json::Value::Null => Ok(None),
-        other => serde_json::from_value::<Option<ControllerRef>>(other).map_err(D::Error::custom),
-    }
-}
-
-/// Compat shim for the pre-2026-Q2 `under_your_control: bool` field on the
-/// resolved-once runtime carriers (`PendingChangeZoneIteration` and
-/// `WaitingFor::EffectZoneChoice`). Modern shape is `Option<PlayerId>` —
-/// the bool was resolved to a concrete `PlayerId` at the ChangeZone resolver
-/// entry per CR 110.2a so the carrier no longer re-evaluates a `ControllerRef`
-/// across an interactive pause.
-///
-/// Reached only through `serde_json::from_str` resume paths: IndexedDB resume
-/// (`client/src/services/gamePersistence.ts`), phase-server SQLite restore,
-/// and P2P resume. The `serde_wasm_bindgen` action-dispatch path never carries
-/// these carriers across the boundary.
-///
-/// **Mapping:** legacy `true` → `None` with `tracing::warn!`. The bool's
-/// original semantics ("under ability controller") cannot be reconstructed
-/// at deserialization time without the originating `AbilityDefinition`. Falling
-/// back to `None` matches what the unshimmed code would have produced anyway
-/// (object enters under its owner's control) — we accept that worst case and
-/// emit a warn so a paused mid-prompt resume that hits the wrong routing has
-/// an audit trail. Legacy `false` → `None` silently; modern shape roundtrips
-/// through `serde_json::from_value::<Option<PlayerId>>`.
-///
-/// Removal is gated by `_LEGACY_DESER_ETB_CONTROLLER_2026Q2` alongside
-/// `deserialize_enters_under_compat`.
-pub fn deserialize_enters_under_player_compat<'de, D>(
-    deserializer: D,
-) -> Result<Option<PlayerId>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    use serde::de::Error;
-    let value = serde_json::Value::deserialize(deserializer)?;
-    match value {
-        serde_json::Value::Bool(true) => {
-            tracing::warn!(
-                target: "engine::compat",
-                "LEGACY_DESER_ETB_CONTROLLER_2026Q2: legacy `under_your_control=true` \
-                 on resumed runtime carrier (PendingChangeZoneIteration or \
-                 EffectZoneChoice); cannot reconstruct PlayerId without ability \
-                 context. Defaulting to None (owner control). If the controller \
-                 assignment is load-bearing for this resume, the player should \
-                 restart the prompt."
-            );
-            Ok(None)
-        }
-        serde_json::Value::Bool(false) => Ok(None),
-        serde_json::Value::Null => Ok(None),
-        other => serde_json::from_value::<Option<PlayerId>>(other).map_err(D::Error::custom),
-    }
-}
-
-/// const fn version-component parser for `_LEGACY_DESER_ETB_CONTROLLER_2026Q2`.
-/// `env!` produces a `&'static str` at compile time; this consumes ASCII digits.
-const fn parse_version_component(s: &str) -> u32 {
-    let bytes = s.as_bytes();
-    let mut out: u32 = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        assert!(b >= b'0' && b <= b'9', "non-digit in version component");
-        out = out * 10 + (b - b'0') as u32;
-        i += 1;
-    }
-    out
-}
-
-/// Tripwire: the legacy `under_your_control` boolean compat path in
-/// `deserialize_enters_under_compat` was added at workspace version 0.1.39
-/// and is scheduled for removal once a release > 0.1.53 ships. The const
-/// below fails to compile when the workspace version crosses that boundary,
-/// forcing the maintainer to either remove the compat or push the deadline.
-///
-/// Grep token: `LEGACY_DESER_ETB_CONTROLLER_2026Q2`. See `docs/LEGACY-COMPAT.md`.
-///
-/// Clippy `absurd_extreme_comparisons` correctly observes that `MAJOR > 0`
-/// is always true for any non-zero major version; that's intentional — the
-/// tripwire fires the instant the major version bumps. Allow it locally.
-#[allow(dead_code, clippy::absurd_extreme_comparisons)]
-const _LEGACY_DESER_ETB_CONTROLLER_2026Q2: () = {
-    const MAJOR: u32 = parse_version_component(env!("CARGO_PKG_VERSION_MAJOR"));
-    const MINOR: u32 = parse_version_component(env!("CARGO_PKG_VERSION_MINOR"));
-    const PATCH: u32 = parse_version_component(env!("CARGO_PKG_VERSION_PATCH"));
-    assert!(
-        !(MAJOR > 0 || MINOR > 1 || (MINOR == 1 && PATCH > 53)),
-        "LEGACY_DESER_ETB_CONTROLLER_2026Q2: remove the under_your_control bool \
-         compat paths in deserialize_enters_under_compat (AST field) AND \
-         deserialize_enters_under_player_compat (PendingChangeZoneIteration + \
-         WaitingFor::EffectZoneChoice runtime carriers), the corresponding \
-         `#[serde(alias = ..., deserialize_with = ...)]` attributes on all \
-         three fields, and this tripwire once we ship past 0.1.53. See \
-         docs/LEGACY-COMPAT.md."
-    );
-};
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -15581,10 +15512,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // CR 110.2a: `Effect::ChangeZone.enters_under` serde-compat coverage.
-    // Modern shape is `Option<ControllerRef>`; legacy on-disk shape is the
-    // boolean `under_your_control`. Routed via `#[serde(alias = ...)]` +
-    // `deserialize_enters_under_compat`. See LEGACY_DESER_ETB_CONTROLLER_2026Q2.
+    // CR 110.2a: `Effect::ChangeZone.enters_under` serde roundtrip coverage.
     // ---------------------------------------------------------------------
 
     /// Helper: build a minimal `Effect::ChangeZone` with `enters_under` set.
@@ -15605,39 +15533,7 @@ mod tests {
     }
 
     #[test]
-    fn enters_under_legacy_bool_false_deserializes_to_none() {
-        let json = r#"{
-            "type": "ChangeZone",
-            "destination": "Battlefield",
-            "under_your_control": false
-        }"#;
-        let effect: Effect = serde_json::from_str(json).expect("legacy false should parse");
-        match effect {
-            Effect::ChangeZone { enters_under, .. } => assert_eq!(enters_under, None),
-            other => panic!("expected ChangeZone, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn enters_under_legacy_bool_true_deserializes_to_some_you() {
-        let json = r#"{
-            "type": "ChangeZone",
-            "destination": "Battlefield",
-            "under_your_control": true
-        }"#;
-        let effect: Effect = serde_json::from_str(json).expect("legacy true should parse");
-        match effect {
-            Effect::ChangeZone { enters_under, .. } => {
-                assert_eq!(enters_under, Some(ControllerRef::You))
-            }
-            other => panic!("expected ChangeZone, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn enters_under_chosen_player_index_zero_distinguishable_from_legacy_false() {
-        // The modern shape can express `Some(ControllerRef::ChosenPlayer { index: 0 })`,
-        // which must NOT collapse to the legacy `false` semantics (`None`).
+    fn enters_under_chosen_player_index_zero_roundtrips() {
         let json = r#"{
             "type": "ChangeZone",
             "destination": "Battlefield",
@@ -15656,52 +15552,12 @@ mod tests {
     fn enters_under_modern_shape_roundtrips() {
         let original = change_zone_with_enters_under(Some(ControllerRef::You));
         let json = serde_json::to_string(&original).expect("serialize");
-        // Modern shape must be emitted, NOT the legacy bool field.
         assert!(
             json.contains("\"enters_under\""),
             "expected modern field name in: {json}"
         );
-        assert!(
-            !json.contains("\"under_your_control\""),
-            "legacy field must not be emitted: {json}"
-        );
         let decoded: Effect = serde_json::from_str(&json).expect("roundtrip");
         assert_eq!(original, decoded);
-    }
-
-    #[test]
-    fn enters_under_alias_resolution_when_both_fields_present() {
-        // serde resolves `alias` by collapsing both names onto the same logical
-        // field, so a payload that includes BOTH the modern key and the legacy
-        // alias is treated as a duplicate-field error. This pins the behavior
-        // so a future schema migration is not surprised by it: on-disk payloads
-        // must use ONE of `enters_under` or `under_your_control`, never both.
-        let json = r#"{
-            "type": "ChangeZone",
-            "destination": "Battlefield",
-            "under_your_control": false,
-            "enters_under": "You"
-        }"#;
-        let err = serde_json::from_str::<Effect>(json)
-            .expect_err("duplicate alias+modern field must error");
-        assert!(
-            err.to_string().contains("duplicate field"),
-            "expected duplicate-field error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn legacy_under_your_control_field_not_emitted_in_serialization() {
-        // `enters_under: None` must skip-serialize; `Some(You)` must emit the
-        // modern key. Neither case may emit the legacy boolean field.
-        for variant in [None, Some(ControllerRef::You)] {
-            let effect = change_zone_with_enters_under(variant.clone());
-            let json = serde_json::to_string(&effect).expect("serialize");
-            assert!(
-                !json.contains("\"under_your_control\""),
-                "legacy bool field emitted for {variant:?}: {json}"
-            );
-        }
     }
 
     // CR 118: Cost taxonomy mapping — exhaustive per-variant coverage.
@@ -15982,5 +15838,140 @@ mod modal_ability_tests {
 
         assert!(def.modal.is_some());
         assert_eq!(def.mode_abilities.len(), 2);
+    }
+
+    /// CR 118.1 (cost-payment unification Phase 4, risk R2): a saved
+    /// `Effect::PayCost` persisted before `PaymentCost` was deleted still
+    /// deserializes. The legacy `cost` field carried a `PaymentCost`-tagged
+    /// object (`{"type":"Life",...}`, `{"type":"Energy",...}`, etc.);
+    /// `deserialize_pay_cost_compat` translates each into the unified
+    /// `AbilityCost` taxonomy. Mirrors the `deserialize_ability_cost_compat`
+    /// precedent for legacy `UnlessCost` saves.
+    #[test]
+    fn pay_cost_legacy_payment_cost_json_roundtrips() {
+        // Legacy PaymentCost::Life → AbilityCost::PayLife.
+        let legacy_life = r#"{
+            "type": "PayCost",
+            "cost": { "type": "Life", "amount": { "type": "Fixed", "value": 3 } },
+            "payer": { "type": "Controller" }
+        }"#;
+        let effect: Effect = serde_json::from_str(legacy_life).expect("legacy Life must load");
+        match effect {
+            Effect::PayCost { cost, scale, .. } => {
+                assert_eq!(
+                    cost,
+                    AbilityCost::PayLife {
+                        amount: QuantityExpr::Fixed { value: 3 }
+                    }
+                );
+                assert_eq!(scale, None);
+            }
+            other => panic!("expected PayCost, got {other:?}"),
+        }
+
+        // Legacy PaymentCost::Energy → AbilityCost::PayEnergy.
+        let legacy_energy = r#"{
+            "type": "PayCost",
+            "cost": { "type": "Energy", "amount": { "type": "Fixed", "value": 2 } }
+        }"#;
+        let effect: Effect = serde_json::from_str(legacy_energy).expect("legacy Energy must load");
+        let Effect::PayCost { cost, .. } = effect else {
+            panic!("expected PayCost");
+        };
+        assert_eq!(
+            cost,
+            AbilityCost::PayEnergy {
+                amount: QuantityExpr::Fixed { value: 2 }
+            }
+        );
+
+        // Legacy PaymentCost::Mana → AbilityCost::Mana.
+        let legacy_mana = r#"{
+            "type": "PayCost",
+            "cost": { "type": "Mana", "cost": { "type": "Cost", "shards": [], "generic": 2 } }
+        }"#;
+        let effect: Effect = serde_json::from_str(legacy_mana).expect("legacy Mana must load");
+        let Effect::PayCost { cost, .. } = effect else {
+            panic!("expected PayCost");
+        };
+        assert_eq!(
+            cost,
+            AbilityCost::Mana {
+                cost: ManaCost::generic(2)
+            }
+        );
+
+        // Legacy PaymentCost::AbilityCost wrapper → unwrapped AbilityCost.
+        let legacy_wrapper = r#"{
+            "type": "PayCost",
+            "cost": {
+                "type": "AbilityCost",
+                "cost": { "type": "PayLife", "amount": { "type": "Fixed", "value": 1 } }
+            }
+        }"#;
+        let effect: Effect =
+            serde_json::from_str(legacy_wrapper).expect("legacy AbilityCost wrapper must load");
+        let Effect::PayCost { cost, .. } = effect else {
+            panic!("expected PayCost");
+        };
+        assert_eq!(
+            cost,
+            AbilityCost::PayLife {
+                amount: QuantityExpr::Fixed { value: 1 }
+            }
+        );
+
+        // Legacy PaymentCost::Speed → AbilityCost::PaySpeed.
+        let legacy_speed = r#"{
+            "type": "PayCost",
+            "cost": { "type": "Speed", "amount": { "type": "Fixed", "value": 1 } }
+        }"#;
+        let effect: Effect = serde_json::from_str(legacy_speed).expect("legacy Speed must load");
+        let Effect::PayCost { cost, .. } = effect else {
+            panic!("expected PayCost");
+        };
+        assert_eq!(
+            cost,
+            AbilityCost::PaySpeed {
+                amount: QuantityExpr::Fixed { value: 1 }
+            }
+        );
+
+        // Legacy PaymentCost::ScaledMana (with the legacy `times` key present) →
+        // AbilityCost::Unimplemented: the per-object multiplier is unrecoverable
+        // by a field-level deserializer, so the mapping denies the payment
+        // (CR 118.12 didn't-pay branch) rather than undercharging `base` alone.
+        let legacy_scaled = r#"{
+            "type": "PayCost",
+            "cost": {
+                "type": "ScaledMana",
+                "base": { "type": "Cost", "shards": [], "generic": 4 },
+                "times": { "type": "Ref", "qty": { "type": "TrackedSetSize" } }
+            }
+        }"#;
+        let effect: Effect =
+            serde_json::from_str(legacy_scaled).expect("legacy ScaledMana must load");
+        let Effect::PayCost { cost, scale, .. } = effect else {
+            panic!("expected PayCost");
+        };
+        assert!(
+            matches!(cost, AbilityCost::Unimplemented { .. }),
+            "legacy ScaledMana must map to Unimplemented (deny, don't undercharge), got {cost:?}"
+        );
+        assert_eq!(scale, None);
+
+        // Modern shape (unwrapped AbilityCost + explicit scale) still round-trips.
+        let modern = Effect::PayCost {
+            cost: AbilityCost::Mana {
+                cost: ManaCost::generic(4),
+            },
+            scale: Some(QuantityExpr::Ref {
+                qty: QuantityRef::TrackedSetSize,
+            }),
+            payer: TargetFilter::Controller,
+        };
+        let json = serde_json::to_string(&modern).expect("serialize modern PayCost");
+        let back: Effect = serde_json::from_str(&json).expect("modern PayCost must round-trip");
+        assert_eq!(back, modern);
     }
 }

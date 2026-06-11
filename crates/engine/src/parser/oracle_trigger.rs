@@ -13,6 +13,7 @@ use super::oracle_effect::{
 };
 use super::oracle_ir::context::ParseContext;
 use super::oracle_ir::trigger::{FirstTimeLimit, TriggerBody, TriggerIr, TriggerModifiers};
+use super::oracle_modal::try_parse_inline_modal;
 use super::oracle_nom::condition::parse_inner_condition;
 use super::oracle_nom::condition::parse_source_has_counters;
 use super::oracle_nom::error::{oracle_err, OracleResult};
@@ -686,6 +687,35 @@ fn condition_introduces_damage_source_controller_player(cond_lower: &str) -> boo
     )
 }
 
+/// Check if the trigger condition is a DamageDone trigger pattern
+/// ("deals damage to a player" or "deals combat damage to a player").
+fn is_damage_done_trigger_pattern(cond_lower: &str) -> bool {
+    let input = cond_lower.trim_start();
+    let input = alt((
+        value((), tag::<_, _, OracleError<'_>>("whenever ")),
+        value((), tag("when ")),
+    ))
+    .parse(input)
+    .map(|(rest, _)| rest)
+    .unwrap_or(input);
+
+    // Check for "deals damage to a player" or "deals combat damage to a player"
+    let Ok((rest, _)) = parse_damage_source_subject(input) else {
+        return false;
+    };
+    let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("deals ").parse(rest) else {
+        return false;
+    };
+    let Ok((after_damage, _)) = parse_damage_predicate_tail(rest) else {
+        return false;
+    };
+
+    matches!(
+        parse_damage_to_qualifier(after_damage),
+        Some(TargetFilter::Player)
+    )
+}
+
 /// Parse a full trigger line into a TriggerDefinition.
 /// Input: a line starting with "When", "Whenever", or "At".
 /// The card_name is used for self-reference substitution.
@@ -794,7 +824,14 @@ pub(crate) fn parse_trigger_line_with_index_ir(
 
     // CR 109.4 + CR 115.1 + CR 506.2: Set relative-player scope for
     // TargetPlayer resolution inside the trigger effect body.
-    if condition_introduces_damage_source_controller_player(&cond_lower) {
+    // CR 603.7c: DamageDone triggers ("...deals damage to a player") use
+    // TriggeringPlayer for "that player" in the effect body. This must be
+    // checked BEFORE `condition_introduces_target_player` because both match
+    // "deals [combat] damage to a player", but DamageDone needs TriggeringPlayer
+    // while generic target-player triggers need TargetPlayer.
+    if is_damage_done_trigger_pattern(&cond_lower) {
+        effect_ctx.relative_player_scope = Some(ControllerRef::TriggeringPlayer);
+    } else if condition_introduces_damage_source_controller_player(&cond_lower) {
         effect_ctx.relative_player_scope = Some(ControllerRef::ParentTargetController);
     } else if condition_introduces_defending_player(&cond_lower) {
         // CR 608.2c: Attack triggers use DefendingPlayer (the attacked player
@@ -863,6 +900,19 @@ pub(crate) fn parse_trigger_line_with_index_ir(
             )
             .map(|ability| TriggerBody::PreLowered(Box::new(ability)))
             .or_else(|| {
+                // CR 700.2 + CR 608.2d: Inline modal trigger body — "choose one —
+                // mode1; or mode2" on a single line (no bullet-line modes). Grenzo,
+                // Havoc Raiser is the canonical case. Route through the modal parser
+                // so each mode body is independently parsed with the trigger's
+                // established relative_player_scope (e.g. TriggeringPlayer for
+                // DamageDone triggers) so "that player" in mode bodies resolves to
+                // the damaged player (CR 603.7c).
+                if let Some(modal_ability) = try_parse_inline_modal(
+                    &effect_for_parse,
+                    effect_ctx.relative_player_scope.clone(),
+                ) {
+                    return Some(TriggerBody::PreLowered(Box::new(modal_ability)));
+                }
                 let ir =
                     parse_effect_chain_ir(&effect_for_parse, AbilityKind::Spell, &mut effect_ctx);
                 Some(TriggerBody::EffectChain(ir))
@@ -6215,6 +6265,7 @@ fn try_parse_event(
                     )),
                 ),
                 value(AttackTargetFilter::Planeswalker, tag(" a planeswalker")),
+                value(AttackTargetFilter::Player, tag(" one of your opponents")),
                 value(AttackTargetFilter::Player, tag(" a player")),
                 value(AttackTargetFilter::Player, tag(" you")),
                 value(AttackTargetFilter::Battle, tag(" a battle")),
@@ -6222,6 +6273,9 @@ fn try_parse_event(
             .parse(input)
         }
         let attack_target_filter = parse_attack_target.parse(after).ok().map(|(_, f)| f);
+        let attacks_one_of_your_opponents = tag::<_, _, OracleError<'_>>(" one of your opponents")
+            .parse(after)
+            .is_ok();
         let mut def = make_base();
         // CR 508.3d: "Whenever [a player] attacks" triggers fire once per attack declaration,
         // not once per attacker. This applies to "opponent attacks you" patterns (e.g., Lulu,
@@ -6244,9 +6298,20 @@ fn try_parse_event(
         } else {
             TriggerMode::Attacks
         };
-        def.valid_card = Some(subject.clone());
+        // CR 508.1a + CR 508.5: player-subject attack triggers scope the attacking
+        // player via `valid_source`, not `valid_card` — `TargetFilter::Player` never
+        // matches an object (Breena, the Demagogue).
+        if subject_is_player(subject) {
+            def.valid_source = Some(subject.clone());
+        } else {
+            def.valid_card = Some(subject.clone());
+        }
         def.attack_target_filter = attack_target_filter;
-        if matches!(
+        if attacks_one_of_your_opponents {
+            def.valid_target = Some(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::Opponent),
+            ));
+        } else if matches!(
             def.attack_target_filter,
             Some(AttackTargetFilter::PlayerOrPlaneswalker) | Some(AttackTargetFilter::Player)
         ) && tag::<_, _, OracleError<'_>>(" you").parse(after).is_ok()
@@ -13934,7 +13999,7 @@ mod tests {
     #[test]
     fn parse_ezio_damage_trigger_full_structure() {
         use crate::types::ability::{
-            AbilityCondition, Effect, PaymentCost, PlayerScope, QuantityExpr, QuantityRef,
+            AbilityCondition, AbilityCost, Effect, PlayerScope, QuantityExpr, QuantityRef,
         };
         use crate::types::mana::{ManaCost, ManaCostShard};
 
@@ -13987,9 +14052,9 @@ mod tests {
 
         // (d) Cost effect — PayCost { Mana { WUBRG }, payer: Controller }.
         match &*execute.effect {
-            Effect::PayCost { cost, payer } => {
+            Effect::PayCost { cost, payer, .. } => {
                 match cost {
-                    PaymentCost::Mana {
+                    AbilityCost::Mana {
                         cost: ManaCost::Cost { shards, generic },
                     } => {
                         assert_eq!(*generic, 0, "WUBRG cost has no generic component");
@@ -14069,7 +14134,7 @@ mod tests {
     #[test]
     fn parse_ezio_damage_trigger_verbatim_oracle_text() {
         use crate::types::ability::{
-            AbilityCondition, Effect, PaymentCost, PlayerScope, QuantityExpr, QuantityRef,
+            AbilityCondition, AbilityCost, Effect, PlayerScope, QuantityExpr, QuantityRef,
         };
         use crate::types::mana::{ManaCost, ManaCostShard};
 
@@ -14109,9 +14174,9 @@ mod tests {
         // (c) Cost effect — PayCost { Mana { WUBRG }, payer: Controller }.
         // The cost shape must be identical to the normalized form.
         match &*execute.effect {
-            Effect::PayCost { cost, payer } => {
+            Effect::PayCost { cost, payer, .. } => {
                 match cost {
-                    PaymentCost::Mana {
+                    AbilityCost::Mana {
                         cost: ManaCost::Cost { shards, generic },
                     } => {
                         assert_eq!(*generic, 0, "WUBRG cost has no generic component");
@@ -22474,7 +22539,7 @@ mod tests {
     /// and made Tymna draw all 12 of the player's permanents instead of 1).
     #[test]
     fn trigger_tymna_the_weaver_pays_and_draws_bound_x() {
-        use crate::types::ability::{Effect, PaymentCost, PlayerFilter, QuantityExpr, QuantityRef};
+        use crate::types::ability::{AbilityCost, Effect, PlayerFilter, QuantityExpr, QuantityRef};
 
         let def = parse_trigger_line(
             "At the beginning of each of your postcombat main phases, you may pay X life, \
@@ -22501,7 +22566,7 @@ mod tests {
         // CR 118.8 + CR 107.3i: pay-life cost amount carries the bound X.
         match execute.effect.as_ref() {
             Effect::PayCost {
-                cost: PaymentCost::Life { amount },
+                cost: AbilityCost::PayLife { amount },
                 ..
             } => assert_eq!(*amount, bound_qty, "pay-life cost amount must be bound X"),
             other => panic!("expected PayCost::Life, got {:?}", other),
@@ -24115,6 +24180,33 @@ mod tests {
     }
 
     #[test]
+    fn breena_attaches_defending_life_intervening_if() {
+        // Issue #865: attack trigger gated on defending opponent life.
+        let def = parse_trigger_line(
+            "Whenever a player attacks one of your opponents, if that opponent has more life than another of your opponents, that attacking player draws a card and you put two +1/+1 counters on a creature you control.",
+            "Breena, the Demagogue",
+        );
+        assert_eq!(def.mode, TriggerMode::Attacks);
+        assert_eq!(def.valid_card, None);
+        assert_eq!(def.valid_source, Some(TargetFilter::Player));
+        assert_eq!(
+            def.valid_target,
+            Some(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::Opponent)
+            ))
+        );
+        match def.condition {
+            Some(TriggerCondition::QuantityComparison {
+                comparator: Comparator::GT,
+                ..
+            }) => {}
+            other => panic!(
+                "Breena must gate on defending player life exceeding another opponent, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
     fn glademuse_attaches_not_their_turn_intervening_if() {
         // Issue #873: "their" refers to the casting player, same as "that player's".
         let def = parse_trigger_line(
@@ -25093,7 +25185,8 @@ mod tests {
         match &*execute.effect {
             Effect::PayCost {
                 payer,
-                cost: crate::types::ability::PaymentCost::Mana { cost },
+                cost: AbilityCost::Mana { cost },
+                ..
             } => {
                 assert_eq!(payer, &TargetFilter::TriggeringPlayer);
                 assert_eq!(cost, &crate::types::mana::ManaCost::generic(2));
@@ -25418,7 +25511,8 @@ mod tests {
         match &*execute.effect {
             Effect::PayCost {
                 payer,
-                cost: crate::types::ability::PaymentCost::Mana { cost },
+                cost: AbilityCost::Mana { cost },
+                ..
             } => {
                 assert_eq!(payer, &TargetFilter::Controller);
                 assert_eq!(cost, &crate::types::mana::ManaCost::generic(2));
@@ -25448,7 +25542,8 @@ mod tests {
         match &*execute.effect {
             Effect::PayCost {
                 payer,
-                cost: crate::types::ability::PaymentCost::Mana { cost },
+                cost: AbilityCost::Mana { cost },
+                ..
             } => {
                 assert_eq!(payer, &TargetFilter::Controller);
                 assert_eq!(cost, &crate::types::mana::ManaCost::generic(1));
@@ -28151,6 +28246,81 @@ mod slicer_control_handoff_tests {
                 .iter()
                 .any(|e| matches!(e, Effect::Unimplemented { .. })),
             "control-handoff clause must not be dropped as Unimplemented, got {effects:#?}",
+        );
+    }
+
+    /// Regression test for issue #2346: Grenzo, Havoc Raiser - DamageDone triggers
+    /// with inline modal choices must scope "that player" in each mode body to the
+    /// damaged player (TriggeringPlayer), not ParentTargetController.
+    ///
+    /// Asserts the lowered Goad and ExileTop effects directly so the test is
+    /// discriminating: it fails if mode bodies produce TargetOnly/Unimplemented or
+    /// if "that player" resolves to the wrong player.
+    #[test]
+    fn damage_done_trigger_uses_triggering_player_for_that_player() {
+        let parsed = parse_oracle_text(
+            "Whenever a creature you control deals combat damage to a player, choose one \u{2014} goad target creature that player controls; or exile the top card of that player's library.",
+            "Grenzo, Havoc Raiser",
+            &[],
+            &["Artifact".into(), "Creature".into()],
+            &["Equipment".into()],
+        );
+        let trigger = parsed
+            .triggers
+            .iter()
+            .find(|t| matches!(t.mode, TriggerMode::DamageDone))
+            .expect("DamageDone trigger must parse");
+
+        assert_eq!(trigger.mode, TriggerMode::DamageDone);
+
+        let execute = trigger.execute.as_ref().expect("execute must be Some");
+
+        // The execute must have a modal with two mode abilities
+        let modal = execute.modal.as_ref().expect("execute must carry a modal");
+        assert_eq!(modal.mode_count, 2, "must have two modes, got {:?}", modal);
+
+        let mode_abilities = &execute.mode_abilities;
+        assert_eq!(
+            mode_abilities.len(),
+            2,
+            "must have two mode ability entries, got {:?}",
+            mode_abilities
+        );
+
+        // Mode 0: Goad — target creature that player (TriggeringPlayer) controls
+        let mode0_effects = flatten_effects(&mode_abilities[0]);
+        let goad_controller = mode0_effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::Goad {
+                    target: TargetFilter::Typed(tf),
+                } => Some(tf.controller.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| {
+                panic!("mode 0 must contain Goad with Typed filter, got {mode0_effects:?}")
+            });
+        assert_eq!(
+            goad_controller,
+            Some(ControllerRef::TriggeringPlayer),
+            "Goad target controller must be TriggeringPlayer (the damaged player), got {:?}",
+            goad_controller
+        );
+
+        // Mode 1: ExileTop — exile the top card of that player's (TriggeringPlayer) library
+        let mode1_effects = flatten_effects(&mode_abilities[1]);
+        let exile_player = mode1_effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::ExileTop { player, .. } => Some(player.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("mode 1 must contain ExileTop, got {mode1_effects:?}"));
+        assert_eq!(
+            exile_player,
+            TargetFilter::TriggeringPlayer,
+            "ExileTop player must be TriggeringPlayer (the damaged player), got {:?}",
+            exile_player
         );
     }
 }

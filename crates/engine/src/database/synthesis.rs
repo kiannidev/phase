@@ -15,9 +15,9 @@ use crate::types::ability::{
     ControllerRef, CopyRetargetPermission, CounterTriggerFilter, DamageKindFilter,
     DamageModification, DelayedTriggerCondition, Duration, Effect, EffectScope, FilterProp,
     KickerVariant, ManaContribution, ManaProduction, ModalSelectionCondition,
-    ModalSelectionConstraint, NinjutsuVariant, ObjectScope, ParsedCondition, PaymentCost,
-    PlayerFilter, PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
-    RenownSubject, ReplacementCondition, ReplacementDefinition, RuntimeHandler, SacrificeCost,
+    ModalSelectionConstraint, NinjutsuVariant, ObjectScope, ParsedCondition, PlayerFilter,
+    PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef, RenownSubject,
+    ReplacementCondition, ReplacementDefinition, RuntimeHandler, SacrificeCost,
     SearchSelectionConstraint, StaticCondition, StaticDefinition, TapStateChange,
     TargetChoiceTiming, TargetFilter, TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter,
     UnlessPayModifier,
@@ -5639,9 +5639,8 @@ fn is_extort_trigger(t: &TriggerDefinition) -> bool {
                 && matches!(
                     &*a.effect,
                     Effect::PayCost {
-                        cost: PaymentCost::AbilityCost {
-                            cost: AbilityCost::Mana { cost },
-                        },
+                        cost: AbilityCost::Mana { cost },
+                        scale: None,
                         payer: TargetFilter::Controller,
                     } if is_extort_mana_cost(cost)
                 )
@@ -5783,11 +5782,10 @@ fn build_extort_trigger() -> TriggerDefinition {
     let execute = AbilityDefinition::new(
         AbilityKind::Spell,
         Effect::PayCost {
-            cost: PaymentCost::AbilityCost {
-                cost: AbilityCost::Mana {
-                    cost: wb_mana.clone(),
-                },
+            cost: AbilityCost::Mana {
+                cost: wb_mana.clone(),
             },
+            scale: None,
             payer: TargetFilter::Controller,
         },
     )
@@ -13991,11 +13989,9 @@ mod extort_synthesis_tests {
         };
         assert!(execute.optional, "extort must be optional (may pay)");
         let Effect::PayCost {
-            cost:
-                PaymentCost::AbilityCost {
-                    cost: AbilityCost::Mana { cost },
-                },
+            cost: AbilityCost::Mana { cost },
             payer,
+            ..
         } = &*execute.effect
         else {
             panic!("extort must pay W/B via PayCost before draining");
@@ -14119,11 +14115,10 @@ mod extort_synthesis_tests {
         let execute = AbilityDefinition::new(
             AbilityKind::Spell,
             Effect::PayCost {
-                cost: PaymentCost::AbilityCost {
-                    cost: AbilityCost::Mana {
-                        cost: ManaCost::generic(1),
-                    },
+                cost: AbilityCost::Mana {
+                    cost: ManaCost::generic(1),
                 },
+                scale: None,
                 payer: TargetFilter::Controller,
             },
         )

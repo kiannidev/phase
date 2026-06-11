@@ -1,6 +1,6 @@
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, ChoiceValue, CostPaidObjectSnapshot, Effect,
-    ManaProduction, ResolvedAbility, SacrificeCost, TargetFilter, REMOVE_COUNTER_COST_ALL,
+    ManaProduction, ResolvedAbility, TargetFilter, REMOVE_COUNTER_COST_ALL,
     REMOVE_COUNTER_COST_ANY_NUMBER,
 };
 use crate::types::counter::{CounterMatch, CounterType};
@@ -2391,7 +2391,7 @@ fn tap_creature_cost_choice(
     source_id: ObjectId,
     cost: &Option<AbilityCost>,
 ) -> Option<(usize, Vec<ObjectId>)> {
-    let (count, filter) = find_tap_creatures_cost(cost.as_ref()?)?;
+    let (count, filter) = super::casting::find_tap_creatures_cost(cost.as_ref()?)?;
     let creatures = state
         .battlefield
         .iter()
@@ -2427,14 +2427,6 @@ fn discard_cost_choice(
     let resolved = super::quantity::resolve_quantity(state, count, player, source_id).max(0);
     let cards = super::casting::find_eligible_discard_targets(state, player, source_id, filter);
     Some((resolved as usize, cards))
-}
-
-fn find_tap_creatures_cost(cost: &AbilityCost) -> Option<(u32, &TargetFilter)> {
-    match cost {
-        AbilityCost::TapCreatures { count, filter } => Some((*count, filter)),
-        AbilityCost::Composite { costs } => costs.iter().find_map(find_tap_creatures_cost),
-        _ => None,
-    }
 }
 
 /// CR 117.1 + CR 118.3: Match non-self `AbilityCost::Exile` shapes. Returns
@@ -2706,8 +2698,8 @@ mod tests {
         AbilityCondition, AbilityCost, AbilityKind, AbilityTag, ActivationRestriction, Comparator,
         ContinuousModification, ControllerRef, DevotionColors, Duration, Effect, FilterProp,
         LinkedExileScope, ManaContribution, ManaProduction, MultiTargetSpec, ObjectScope,
-        PlayerScope, QuantityExpr, QuantityRef, StaticDefinition, TargetFilter, TypeFilter,
-        TypedFilter, REMOVE_COUNTER_COST_ANY_NUMBER,
+        PlayerScope, QuantityExpr, QuantityRef, SacrificeCost, StaticDefinition, TargetFilter,
+        TypeFilter, TypedFilter, REMOVE_COUNTER_COST_ANY_NUMBER,
     };
     use crate::types::card_type::CoreType;
     use crate::types::counter::CounterType;

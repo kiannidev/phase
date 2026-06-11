@@ -4857,6 +4857,9 @@ fn pipeline_loop(
                     candidates,
                     depth,
                     is_optional: true,
+                    // CR 701.24a: set by the W3 library-placement arm after parking
+                    // (the pipeline doesn't know the caller's placement here).
+                    library_placement: None,
                 });
                 return ReplacementResult::NeedsChoice(affected);
             }
@@ -4884,6 +4887,8 @@ fn pipeline_loop(
                 candidates,
                 depth,
                 is_optional: false,
+                // CR 701.24a: set by the W3 library-placement arm after parking.
+                library_placement: None,
             });
             return ReplacementResult::NeedsChoice(affected);
         } else {
@@ -6275,6 +6280,7 @@ mod tests {
             }],
             depth: 0,
             is_optional: true,
+            library_placement: None,
         });
 
         let WaitingFor::ReplacementChoice {

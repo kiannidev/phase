@@ -92,9 +92,9 @@ use crate::types::ability::{
     ContinuousModification, ControllerRef, DamageModification, DamageSource,
     DelayedTriggerCondition, DoubleTarget, Duration, Effect, EffectScope, FilterProp,
     GameRestriction, IntensityScope, IterationKindBinding, ManaProduction, ManaSpendPermission,
-    MultiTargetSpec, ObjectProperty, ObjectScope, PaymentCost, PlayerFilter, PlayerRelation,
-    PlayerScope, PreventionAmount, PreventionScope, ProhibitedActivity, PtValue, QuantityExpr,
-    QuantityRef, ReplacementDefinition, RestrictionExpiry, RestrictionPlayerScope, RoundingMode,
+    MultiTargetSpec, ObjectProperty, ObjectScope, PlayerFilter, PlayerRelation, PlayerScope,
+    PreventionAmount, PreventionScope, ProhibitedActivity, PtValue, QuantityExpr, QuantityRef,
+    ReplacementDefinition, RestrictionExpiry, RestrictionPlayerScope, RoundingMode,
     StaticCondition, StaticDefinition, StepSkipTarget, SubAbilityLink, TapStateChange,
     TargetFilter, TargetSelectionMode, TriggerCondition, TriggerDefinition, TypeFilter,
     TypedFilter, UnlessPayModifier, UntilCondition, ZoneOwner,
@@ -1725,6 +1725,16 @@ fn try_parse_cant_cast_spells_effect(tp: TextPair<'_>) -> Option<ParsedEffectCla
         }
     };
 
+    let tail = remaining
+        .trim_start()
+        .trim_start_matches([',', ' '])
+        .trim_start();
+    let sub_ability = if tail.is_empty() {
+        None
+    } else {
+        Some(Box::new(parse_effect_chain(tail, AbilityKind::Spell)))
+    };
+
     Some(ParsedEffectClause {
         effect: Effect::AddRestriction {
             restriction: GameRestriction::ProhibitActivity {
@@ -1735,7 +1745,7 @@ fn try_parse_cant_cast_spells_effect(tp: TextPair<'_>) -> Option<ParsedEffectCla
             },
         },
         duration,
-        sub_ability: None,
+        sub_ability,
         distribute: None,
         multi_target: None,
         condition: None,
@@ -3422,12 +3432,10 @@ fn try_parse_choose_and_pay_per_object(
     let pay_ability = AbilityDefinition::new(
         AbilityKind::Spell,
         Effect::PayCost {
-            cost: PaymentCost::ScaledMana {
-                base,
-                times: QuantityExpr::Ref {
-                    qty: QuantityRef::TrackedSetSize,
-                },
-            },
+            cost: AbilityCost::Mana { cost: base },
+            scale: Some(QuantityExpr::Ref {
+                qty: QuantityRef::TrackedSetSize,
+            }),
             payer: chooser.clone(),
         },
     );
@@ -18107,11 +18115,11 @@ mod tests {
     use super::*;
     use crate::parser::parse_oracle_text;
     use crate::types::ability::{
-        AbilityCondition, AggregateFunction, BounceSelection, CardTypeSetSource, CastVariantPaid,
-        ChoiceType, ChosenSubtypeKind, CombatRelation, CombatRelationSubject, Comparator,
-        ContinuousModification, ControllerRef, CopyRetargetPermission, CountScope, DoublePTMode,
-        Duration, FilterProp, LibraryPosition, LinkedExileScope, ManaContribution, ManaProduction,
-        ObjectProperty, ObjectScope, PaymentCost, PermissionGrantee, PlayerRelation,
+        AbilityCondition, AbilityCost, AggregateFunction, BounceSelection, CardTypeSetSource,
+        CastVariantPaid, ChoiceType, ChosenSubtypeKind, CombatRelation, CombatRelationSubject,
+        Comparator, ContinuousModification, ControllerRef, CopyRetargetPermission, CountScope,
+        DoublePTMode, Duration, FilterProp, LibraryPosition, LinkedExileScope, ManaContribution,
+        ManaProduction, ObjectProperty, ObjectScope, PermissionGrantee, PlayerRelation,
         PreventionScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
         SearchSelectionConstraint, SharedQuality, TargetChoiceTiming, TypeFilter, TypedFilter,
         ZoneRef,
@@ -18412,19 +18420,19 @@ mod tests {
         );
         // sub_ability: PayCost { ScaledMana { base: {4}, times: TrackedSetSize } }.
         let pay = clause.sub_ability.as_ref().expect("PayCost sub_ability");
-        let Effect::PayCost { cost, payer } = pay.effect.as_ref() else {
+        let Effect::PayCost { cost, scale, payer } = pay.effect.as_ref() else {
             panic!("expected PayCost, got {:?}", pay.effect);
         };
         assert_eq!(*payer, TargetFilter::TriggeringPlayer);
-        let PaymentCost::ScaledMana { base, times } = cost else {
-            panic!("expected ScaledMana, got {cost:?}");
+        let AbilityCost::Mana { cost: base } = cost else {
+            panic!("expected Mana base, got {cost:?}");
         };
         assert_eq!(*base, crate::types::mana::ManaCost::generic(4));
         assert_eq!(
-            *times,
-            QuantityExpr::Ref {
+            *scale,
+            Some(QuantityExpr::Ref {
                 qty: QuantityRef::TrackedSetSize
-            }
+            })
         );
     }
 
@@ -18440,11 +18448,12 @@ mod tests {
             .expect("Thelon's Curse main clause must parse");
         let pay = clause.sub_ability.as_ref().expect("PayCost sub_ability");
         let Effect::PayCost {
-            cost: PaymentCost::ScaledMana { base, .. },
+            cost: AbilityCost::Mana { cost: base },
+            scale: Some(_),
             ..
         } = pay.effect.as_ref()
         else {
-            panic!("expected PayCost {{ ScaledMana }}, got {:?}", pay.effect);
+            panic!("expected PayCost {{ Mana, scale }}, got {:?}", pay.effect);
         };
         assert_eq!(
             *base,
@@ -23698,6 +23707,206 @@ mod tests {
         ));
     }
 
+    /// CR 707.10c: Copy + bare-`and` retarget in one imperative clause (no comma).
+    #[test]
+    fn effect_copy_spell_bare_and_retarget_same_clause() {
+        let def = parse_effect_chain(
+            "copy that spell and may choose new targets for the copy",
+            AbilityKind::Spell,
+        );
+        assert!(
+            matches!(
+                *def.effect,
+                Effect::CopySpell {
+                    retarget: CopyRetargetPermission::MayChooseNewTargets,
+                    ..
+                }
+            ),
+            "expected MayChooseNewTargets, got {:?}",
+            def.effect
+        );
+    }
+
+    /// CR 707.10c: Krark, the Thumbless win branch — comma-joined retarget clause.
+    #[test]
+    fn effect_krark_win_branch_copy_absorbs_comma_and_retarget() {
+        let def = parse_effect_chain(
+            "copy that spell, and you may choose new targets for the copy.",
+            AbilityKind::Spell,
+        );
+        assert!(
+            matches!(
+                *def.effect,
+                Effect::CopySpell {
+                    retarget: CopyRetargetPermission::MayChooseNewTargets,
+                    ..
+                }
+            ),
+            "expected MayChooseNewTargets, got {:?}",
+            def.effect
+        );
+    }
+
+    /// CR 705: Coin-flip branch lowering path (same as `try_parse_coin_flip_branch` handler).
+    #[test]
+    fn effect_krark_coin_flip_branch_lower_path_preserves_retarget() {
+        let effect_text = "copy that spell, and you may choose new targets for the copy.";
+        let ir = parse_effect_chain_ir(
+            effect_text,
+            AbilityKind::Spell,
+            &mut ParseContext::default(),
+        );
+        let branch_def = lower_effect_chain_ir(&ir);
+        assert!(
+            matches!(
+                *branch_def.effect,
+                Effect::CopySpell {
+                    retarget: CopyRetargetPermission::MayChooseNewTargets,
+                    ..
+                }
+            ),
+            "coin-flip branch lower path: {:?}",
+            branch_def.effect
+        );
+    }
+
+    /// CR 705: Full Krark text must keep retarget on the win-flip chunk through splitting.
+    #[test]
+    fn effect_krark_win_flip_chunk_includes_retarget_clause() {
+        use super::sequence::split_clause_sequence;
+        use crate::parser::oracle_effect::imperative::try_parse_coin_flip_branch;
+
+        let text = "flip a coin. If you lose the flip, return that spell to its owner's hand. \
+            If you win the flip, copy that spell, and you may choose new targets for the copy.";
+        let chunks: Vec<_> = split_clause_sequence(text)
+            .into_iter()
+            .map(|c| c.text)
+            .collect();
+        assert!(
+            chunks.len() == 3,
+            "expected three sentence chunks, got {chunks:?}"
+        );
+        let (is_win, effect_text) =
+            try_parse_coin_flip_branch(chunks[2].trim()).expect("win chunk should parse");
+        assert!(is_win);
+        let def = parse_effect_chain(effect_text, AbilityKind::Spell);
+        assert!(
+            matches!(
+                *def.effect,
+                Effect::CopySpell {
+                    retarget: CopyRetargetPermission::MayChooseNewTargets,
+                    ..
+                }
+            ),
+            "parsed win branch: {:?}",
+            def.effect
+        );
+    }
+
+    /// CR 705: Prior flip-coin chunks must not poison win-branch retarget absorption.
+    #[test]
+    fn effect_krark_win_branch_retarget_after_prior_flip_chunks() {
+        let mut ctx = ParseContext::default();
+        let _ = parse_effect_chain_ir("flip a coin", AbilityKind::Spell, &mut ctx);
+        let lose_ir = parse_effect_chain_ir(
+            "return that spell to its owner's hand",
+            AbilityKind::Spell,
+            &mut ctx,
+        );
+        let _ = lower_effect_chain_ir(&lose_ir);
+        let win_ir = parse_effect_chain_ir(
+            "copy that spell, and you may choose new targets for the copy.",
+            AbilityKind::Spell,
+            &mut ctx,
+        );
+        let win = lower_effect_chain_ir(&win_ir);
+        assert!(
+            matches!(
+                *win.effect,
+                Effect::CopySpell {
+                    retarget: CopyRetargetPermission::MayChooseNewTargets,
+                    ..
+                }
+            ),
+            "win branch after prior chunks: {:?}",
+            win.effect
+        );
+    }
+
+    /// CR 705: Win-branch retarget must survive IR production (pre-consolidation).
+    #[test]
+    fn effect_krark_full_flip_coin_ir_embeds_win_retarget() {
+        let text = "flip a coin. If you lose the flip, return that spell to its owner's hand. \
+            If you win the flip, copy that spell, and you may choose new targets for the copy.";
+        let ir = parse_effect_chain_ir(text, AbilityKind::Spell, &mut ParseContext::default());
+        let win_branch = ir
+            .clauses
+            .iter()
+            .find_map(|c| {
+                if let Effect::FlipCoin {
+                    win_effect: Some(win),
+                    ..
+                } = &c.parsed.effect
+                {
+                    Some(win.as_ref())
+                } else {
+                    None
+                }
+            })
+            .expect("win-branch FlipCoin clause");
+        if let Effect::CopySpell { retarget, .. } = win_branch.effect.as_ref() {
+            assert_eq!(
+                *retarget,
+                CopyRetargetPermission::MayChooseNewTargets,
+                "IR-embedded win branch: {:?}",
+                win_branch.effect
+            );
+        } else {
+            panic!("expected CopySpell win branch, got {:?}", win_branch.effect);
+        }
+    }
+
+    /// CR 707.10c + CR 705: Full Krark flip-coin chain must preserve retarget on win branch.
+    #[test]
+    fn effect_krark_full_flip_coin_chain_preserves_win_retarget() {
+        let text = "flip a coin. If you lose the flip, return that spell to its owner's hand. \
+            If you win the flip, copy that spell, and you may choose new targets for the copy.";
+        let def = parse_effect_chain(text, AbilityKind::Spell);
+        let Effect::FlipCoin {
+            win_effect,
+            lose_effect,
+        } = &*def.effect
+        else {
+            panic!("expected FlipCoin, got {:?}", def.effect);
+        };
+        let win = win_effect.as_ref().expect("win branch");
+        let lose = lose_effect.as_ref().expect("lose branch");
+        assert!(
+            matches!(win.effect.as_ref(), Effect::CopySpell { .. }),
+            "win branch should be CopySpell, got {:?}",
+            win.effect
+        );
+        assert!(
+            matches!(
+                lose.effect.as_ref(),
+                Effect::Bounce { .. }
+                    | Effect::ChangeZone {
+                        destination: Zone::Hand,
+                        ..
+                    }
+            ),
+            "lose branch should bounce, got {:?}",
+            lose.effect
+        );
+        if let Effect::CopySpell { retarget, .. } = win.effect.as_ref() {
+            assert_eq!(
+                *retarget,
+                CopyRetargetPermission::MayChooseNewTargets,
+                "comma-and retarget must patch win-branch CopySpell"
+            );
+        }
+    }
+
     /// CR 707.10c (B3): Galvanic Iteration — the retarget clause must be
     /// absorbed through the `CreateDelayedTrigger` wrapper onto the inner
     /// `CopySpell`.
@@ -26774,6 +26983,52 @@ mod tests {
     }
 
     #[test]
+    fn effect_add_fixed_or_chosen_color_gate_land_black() {
+        // Issue #2933: Black Dragon Gate — same pattern with {B}.
+        let e = parse_effect("add {b} or one mana of the chosen color");
+        assert!(
+            matches!(
+                &e,
+                Effect::Mana {
+                    produced: ManaProduction::ChosenColor {
+                        fixed_alternative: Some(crate::types::mana::ManaColor::Black),
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "expected ChosenColor with fixed_alternative Some(Black), got {e:?}"
+        );
+    }
+
+    #[test]
+    fn effect_add_fixed_or_chosen_color_gate_land_all_colors() {
+        // Building-block: every Gate land fixed color must survive parsing.
+        for (symbol, color) in [
+            ("w", crate::types::mana::ManaColor::White),
+            ("u", crate::types::mana::ManaColor::Blue),
+            ("b", crate::types::mana::ManaColor::Black),
+            ("r", crate::types::mana::ManaColor::Red),
+            ("g", crate::types::mana::ManaColor::Green),
+        ] {
+            let e = parse_effect(&format!("add {{{symbol}}} or one mana of the chosen color"));
+            assert!(
+                matches!(
+                    &e,
+                    Effect::Mana {
+                        produced: ManaProduction::ChosenColor {
+                            fixed_alternative: Some(parsed),
+                            ..
+                        },
+                        ..
+                    } if *parsed == color
+                ),
+                "expected fixed_alternative {color:?} for {{{symbol}}}, got {e:?}"
+            );
+        }
+    }
+
+    #[test]
     fn effect_add_additional_mana_any_color_fertile_ground() {
         // CR 605.1a: Fertile Ground's "adds an additional one mana of any color"
         // carries the additive role on `AnyOneColor`.
@@ -26947,7 +27202,7 @@ mod tests {
         assert!(matches!(
             e,
             Effect::PayCost {
-                cost: PaymentCost::Life {
+                cost: AbilityCost::PayLife {
                     amount: crate::types::ability::QuantityExpr::Fixed { value: 3 },
                 },
                 ..
@@ -26960,10 +27215,7 @@ mod tests {
         let e = parse_effect("pay {1} and 3 life");
         match e {
             Effect::PayCost {
-                cost:
-                    PaymentCost::AbilityCost {
-                        cost: crate::types::ability::AbilityCost::Composite { costs },
-                    },
+                cost: crate::types::ability::AbilityCost::Composite { costs },
                 ..
             } => {
                 assert_eq!(costs.len(), 2);
@@ -26998,7 +27250,7 @@ mod tests {
             matches!(
                 &e,
                 Effect::PayCost {
-                    cost: PaymentCost::Life {
+                    cost: AbilityCost::PayLife {
                         amount: crate::types::ability::QuantityExpr::Ref {
                             qty: crate::types::ability::QuantityRef::Power {
                                 scope: crate::types::ability::ObjectScope::Anaphoric,
@@ -27019,7 +27271,7 @@ mod tests {
         match &e {
             Effect::PayCost {
                 cost:
-                    PaymentCost::Life {
+                    AbilityCost::PayLife {
                         amount:
                             crate::types::ability::QuantityExpr::Ref {
                                 qty: crate::types::ability::QuantityRef::Variable { name },
@@ -37695,7 +37947,7 @@ mod tests {
             matches!(
                 e,
                 Effect::PayCost {
-                    cost: PaymentCost::Energy {
+                    cost: AbilityCost::PayEnergy {
                         amount: QuantityExpr::Fixed { value: 2 },
                     },
                     ..
@@ -37712,7 +37964,7 @@ mod tests {
             matches!(
                 e,
                 Effect::PayCost {
-                    cost: PaymentCost::Energy {
+                    cost: AbilityCost::PayEnergy {
                         amount: QuantityExpr::Fixed { value: 3 },
                     },
                     ..
@@ -43727,8 +43979,9 @@ mod tests {
             matches!(
                 &*def.effect,
                 Effect::PayCost {
-                    cost: PaymentCost::Mana { .. },
+                    cost: AbilityCost::Mana { .. },
                     payer: TargetFilter::Controller,
+                    ..
                 }
             ),
             "Outer effect must be PayCost {{ Mana, Controller }}, got {:?}",
@@ -43868,8 +44121,9 @@ mod tests {
             matches!(
                 &*def.effect,
                 Effect::PayCost {
-                    cost: PaymentCost::Mana { .. },
+                    cost: AbilityCost::Mana { .. },
                     payer: TargetFilter::Controller,
+                    ..
                 }
             ),
             "Outer effect must be PayCost {{ Mana, Controller }}, got {:?}",
@@ -43922,8 +44176,9 @@ mod tests {
         assert!(matches!(
             &*def.effect,
             Effect::PayCost {
-                cost: PaymentCost::Mana { .. },
+                cost: AbilityCost::Mana { .. },
                 payer: TargetFilter::Controller,
+                ..
             }
         ));
         assert_eq!(def.player_scope, Some(PlayerFilter::All));
@@ -43955,8 +44210,9 @@ mod tests {
         assert!(matches!(
             &*def.effect,
             Effect::PayCost {
-                cost: PaymentCost::Mana { .. },
+                cost: AbilityCost::Mana { .. },
                 payer: TargetFilter::Controller,
+                ..
             }
         ));
         assert_eq!(def.player_scope, Some(PlayerFilter::All));

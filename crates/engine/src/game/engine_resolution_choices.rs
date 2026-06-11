@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::types::ability::{
-    ChoiceType, ChoiceValue, ChosenAttribute, Effect, EffectKind, PaymentCost, QuantityExpr,
+    AbilityCost, ChoiceType, ChoiceValue, ChosenAttribute, Effect, EffectKind, QuantityExpr,
     QuantityRef, ResolvedAbility, TargetRef,
 };
 use crate::types::actions::{GameAction, LearnOption, OutsideGameSelection};
@@ -162,16 +162,29 @@ fn route_rest_partition(
             // DigChoice) and the reveal-until rest pile (effects::reveal_until::
             // move_rest_then) ARE migrated; this shared partition helper is not,
             // because it has three callers — two synchronous (search-split at
-            // :279, dig at the kept block) and ONE inside `run_batch_completion`'s
-            // RevealRestPile arm. Routing it through `move_objects_simultaneously`
-            // makes a CR 616.1 pause possible from inside a completion, which
-            // requires a re-pause-from-completion contract (the completion returns
-            // `()` and cannot signal a fresh park to its caller) plus pause
-            // handling threaded through both synchronous callers. That is a
-            // cross-cutting state-machine change; tracked for a follow-up so it
-            // lands as one reviewable unit rather than a partial migration here.
-            // (Practical exposure: a graveyard-redirect on a dig REST pile — the
-            // non-kept cards — with RIP/Leyline on the battlefield.)
+            // `apply_search_partition`, dig at the kept block) and ONE inside
+            // `run_batch_completion`'s RevealRestPile arm.
+            //
+            // RE-PAUSE CONTRACT STATUS (updated): the "pause from inside a
+            // completion" blocker named here previously is RESOLVED — the
+            // re-pause contract documented on
+            // `zone_pipeline::drain_pending_batch_deliveries` now covers a fresh
+            // park raised FROM a completion (the drain `.take()`s the old record
+            // BEFORE invoking the completion, so a completion that re-enters the
+            // batch machinery installs a clean record; see the
+            // `AttractionOpenRemainder` arm, which already pauses + re-defers
+            // through this exact path). The ONLY remaining work to migrate this
+            // helper onto `move_objects_simultaneously` is threading the
+            // `BatchMoveResult::NeedsChoice` return through the two SYNCHRONOUS
+            // callers (`apply_search_partition` and the dig kept-block), each of
+            // which currently returns `Result<(), _>` / `()` and would need to
+            // surface a parked prompt the same way the migrated DigChoice
+            // unkept-loop does (`defer_completion_on_pause` + early return). That
+            // is a cross-cutting signature change across both callers; tracked for
+            // a follow-up so it lands as one reviewable unit rather than a partial
+            // migration here. (Practical exposure: a graveyard-redirect on a dig
+            // REST pile — the non-kept cards — with RIP/Leyline on the
+            // battlefield.)
             for &obj_id in rest_ids {
                 zones::move_to_zone(state, obj_id, zone, events);
             }
@@ -3327,11 +3340,12 @@ fn route_kept_card_or_defer(
 fn starts_with_pay_amount_prompt(ability: &ResolvedAbility) -> bool {
     match &ability.effect {
         Effect::PayCost {
-            cost: PaymentCost::Mana { cost },
+            cost: AbilityCost::Mana { cost },
+            scale: None,
             ..
         } => casting_costs::cost_has_x(cost),
         Effect::PayCost {
-            cost: PaymentCost::Energy { amount },
+            cost: AbilityCost::PayEnergy { amount },
             ..
         } => matches!(
             amount,

@@ -771,9 +771,9 @@ pub(crate) fn apply_create_token_after_replacement_with_created_ids(
             }
         }
 
-        // CR 111.10: Inject predefined abilities for known token subtypes.
-        inject_predefined_token_abilities(state, obj_id);
-        inject_catalog_token_abilities(state, obj_id);
+        // CR 111.4 + CR 707.2a: Predefined abilities first; catalog rules_text
+        // only when the predefined path contributed nothing.
+        inject_resolved_token_abilities(state, obj_id);
         // Battlefield entry: request an incremental layer re-derive for just this
         // token. `flush_layers` escalates to a full pass if the token sources a
         // continuous effect / carries counters / etc., or if any active effect
@@ -2377,6 +2377,19 @@ fn predefined_role_token_spec(name: &str) -> Option<RoleSpec> {
 /// the layer pass rebuilds live from base on each pass, but several code
 /// paths (SBAs, action enumeration) consult the live set directly between
 /// passes so keeping them in sync here avoids a one-frame lag.
+/// CR 111.4 + CR 707.2a: Apply predefined token abilities first; fall back to
+/// catalog `rules_text` only when the predefined path contributed nothing
+/// (artifacts, Roles, Incubator, …).
+pub(super) fn inject_resolved_token_abilities(
+    state: &mut GameState,
+    obj_id: crate::types::identifiers::ObjectId,
+) {
+    let predefined_injected = inject_predefined_token_abilities(state, obj_id);
+    if !predefined_injected {
+        inject_catalog_token_abilities(state, obj_id);
+    }
+}
+
 /// CR 111.4 + CR 707.2a: Grant catalog `rules_text` when token creation resolved
 /// a `token_image_ref` preset whose abilities are not already covered by the
 /// predefined path (e.g. SOS Pest attack life gain).
@@ -2392,15 +2405,6 @@ pub(super) fn inject_catalog_token_abilities(
     }) else {
         return;
     };
-    // CR 111.10 + CR 707.2a: Predefined-artifact presets already receive their
-    // abilities from `inject_predefined_token_abilities`; re-deriving from
-    // rules_text would double-grant the same sacrifice/mana ability.
-    if matches!(
-        preset.category,
-        crate::game::token_presets::TokenCategory::PredefinedArtifact { .. }
-    ) {
-        return;
-    }
     let Some(rules_text) = preset.rules_text.as_deref().filter(|text| !text.is_empty()) else {
         return;
     };
@@ -2451,10 +2455,10 @@ pub(super) fn inject_catalog_token_abilities(
 pub(super) fn inject_predefined_token_abilities(
     state: &mut GameState,
     obj_id: crate::types::identifiers::ObjectId,
-) {
+) -> bool {
     let (subtypes, name) = match state.objects.get(&obj_id) {
         Some(obj) => (obj.card_types.subtypes.clone(), obj.name.clone()),
-        None => return,
+        None => return false,
     };
     let mut abilities_to_add = Vec::new();
     for subtype in &subtypes {
@@ -2465,13 +2469,14 @@ pub(super) fn inject_predefined_token_abilities(
     } else {
         None
     };
+    let is_incubator = subtypes.iter().any(|s| s == "Incubator");
 
-    if abilities_to_add.is_empty() && role_spec.is_none() {
-        return;
+    if abilities_to_add.is_empty() && role_spec.is_none() && !is_incubator {
+        return false;
     }
 
     let Some(obj) = state.objects.get_mut(&obj_id) else {
-        return;
+        return false;
     };
 
     if !abilities_to_add.is_empty() {
@@ -2511,6 +2516,8 @@ pub(super) fn inject_predefined_token_abilities(
             }
         }
     }
+
+    true
 }
 
 #[cfg(test)]
@@ -3725,6 +3732,83 @@ mod tests {
         assert!(
             obj.trigger_definitions.is_empty(),
             "catalog injection must not double-grant predefined Treasure triggers"
+        );
+    }
+
+    #[test]
+    fn predefined_royal_role_create_token_pipeline_has_exactly_one_role_static() {
+        use crate::types::proposed_event::TokenCharacteristics;
+        use std::collections::HashSet;
+
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(99),
+            PlayerId(0),
+            "Royal Treatment".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .source_related_token_ids
+            .push("48b5010a-9c00-5cc1-b5e1-f407670846ba".to_string());
+        let spec = TokenSpec {
+            characteristics: TokenCharacteristics {
+                display_name: "Royal".to_string(),
+                power: None,
+                toughness: None,
+                core_types: vec![CoreType::Enchantment],
+                subtypes: vec!["Aura".to_string(), "Role".to_string()],
+                supertypes: vec![],
+                colors: vec![],
+                keywords: vec![],
+            },
+            script_name: "Royal".to_string(),
+            static_abilities: vec![],
+            enter_with_counters: vec![],
+            tapped: false,
+            enters_attacking: false,
+            sacrifice_at: None,
+            source_id: source,
+            controller: PlayerId(0),
+            attach_to: None,
+        };
+        let event = ProposedEvent::CreateToken {
+            owner: PlayerId(0),
+            spec: Box::new(spec),
+            copy: None,
+            enter_tapped: crate::types::proposed_event::EtbTapState::Unspecified,
+            count: 1,
+            applied: HashSet::new(),
+        };
+        let mut events = vec![];
+        apply_create_token_after_replacement(&mut state, event, &mut events);
+
+        let role_id = state.last_created_token_ids[0];
+        let obj = &state.objects[&role_id];
+        assert!(
+            obj.token_image_ref.is_some(),
+            "Royal Role creation must resolve a catalog preset image ref"
+        );
+        assert_eq!(
+            obj.static_definitions.len(),
+            1,
+            "predefined Royal Role must carry exactly one enchanted-creature static"
+        );
+        assert_eq!(
+            obj.base_static_definitions.len(),
+            1,
+            "base_static_definitions must mirror the single role static"
+        );
+        assert!(
+            obj.abilities.is_empty(),
+            "Royal Role has no activated abilities from the predefined path"
+        );
+        assert!(
+            obj.trigger_definitions.is_empty(),
+            "catalog injection must not double-grant predefined Royal Role statics"
         );
     }
 

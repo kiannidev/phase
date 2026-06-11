@@ -4,9 +4,9 @@
 //! Lute, an artifact) must be a legal target for the optional sub-ability.
 
 use engine::game::ability_utils::build_resolved_from_def;
+use engine::game::filter::{matches_target_filter, FilterContext};
 use engine::game::scenario::{GameScenario, P0};
 use engine::game::scenario_db::GameScenarioDbExt;
-use engine::game::filter::{FilterContext, matches_target_filter};
 use engine::types::ability::Effect;
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;

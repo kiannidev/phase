@@ -729,7 +729,7 @@ fn pay_ability_cost_inner(
         | AbilityCost::Reveal { .. }
         | AbilityCost::Behold { .. }
         | AbilityCost::SacrificePowerThreshold { .. } => {}
-        | AbilityCost::NinjutsuFamily { .. } => {
+        AbilityCost::NinjutsuFamily { .. } => {
             // At Activation these shapes are intercepted by the interactive
             // WaitingFor detours before payment is invoked, so passing through
             // is sound. At Resolution there is no interceptor: falling through

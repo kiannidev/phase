@@ -719,7 +719,6 @@ fn pay_ability_cost_inner(
         // Other cost types require interactive resolution and are intercepted
         // before reaching pay_ability_cost, or are not yet auto-payable.
         AbilityCost::Untap
-        | AbilityCost::Discard { .. }
         | AbilityCost::Exile { .. }
         | AbilityCost::CollectEvidence { .. }
         | AbilityCost::TapCreatures { .. }
@@ -729,7 +728,7 @@ fn pay_ability_cost_inner(
         | AbilityCost::Reveal { .. }
         | AbilityCost::Behold { .. }
         | AbilityCost::SacrificePowerThreshold { .. } => {}
-        AbilityCost::NinjutsuFamily { .. } => {
+        AbilityCost::Discard { .. } | AbilityCost::NinjutsuFamily { .. } => {
             // At Activation these shapes are intercepted by the interactive
             // WaitingFor detours before payment is invoked, so passing through
             // is sound. At Resolution there is no interceptor: falling through

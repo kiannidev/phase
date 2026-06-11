@@ -27,7 +27,7 @@ fn tarrasque_was_cast_static_condition_parses() {
     let continuous = parsed
         .statics
         .iter()
-        .find(|d| matches!(d.mode, StaticMode::Continuous { .. }))
+        .find(|d| matches!(d.mode, StaticMode::Continuous))
         .expect("Tarrasque must produce a Continuous static");
     assert!(
         matches!(

@@ -4031,7 +4031,7 @@ mod tests {
         )));
         // Self-sacrifice of more than one is not the single-token shape.
         assert!(!cost_resolves_without_choice(&Some(
-            AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1))
+            AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 2))
         )));
         // Filter-land style mana sub-cost requires a payment choice.
         assert!(!cost_resolves_without_choice(&Some(

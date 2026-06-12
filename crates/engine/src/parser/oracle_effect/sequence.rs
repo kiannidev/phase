@@ -1330,13 +1330,8 @@ fn starts_attach_equipment_was_attached_clause(text: &str) -> bool {
 /// `take_until(" and ")` from the start binds the first internal " and " (e.g.
 /// Gogo's "~ and that creature each get +2/+0 and gain …") and returns false.
 fn current_ends_with_bare_and(current: &str) -> bool {
-    const SUFFIX: &str = " and ";
-    let suffix_start = current.len().checked_sub(SUFFIX.len());
-    suffix_start.is_some_and(|start| {
-        tag::<_, _, OracleError<'_>>(SUFFIX)
-            .parse(&current[start..])
-            .is_ok()
-    })
+    // allow-noncombinator: terminal suffix probe on incremental chunk buffer during char scan, not parsing dispatch.
+    current.ends_with(" and ")
 }
 
 /// Restricted clause-start check for bare " and " splitting (not after comma).

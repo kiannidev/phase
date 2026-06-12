@@ -36,12 +36,7 @@ fn agitator_ant_parsed_trigger_scopes_counters_and_goad() {
     let execute = trigger.execute.as_ref().expect("execute");
     assert!(execute.optional, "counter step must be optional");
     assert_eq!(execute.player_scope, Some(PlayerFilter::All));
-    let Effect::PutCounter {
-        target,
-        count,
-        ..
-    } = execute.effect.as_ref()
-    else {
+    let Effect::PutCounter { target, count, .. } = execute.effect.as_ref() else {
         panic!("expected PutCounter, got {:?}", execute.effect);
     };
     assert_eq!(
@@ -56,10 +51,7 @@ fn agitator_ant_parsed_trigger_scopes_counters_and_goad() {
     let Effect::GoadAll { target } = sub.effect.as_ref() else {
         panic!("expected GoadAll, got {:?}", sub.effect);
     };
-    assert!(matches!(
-        target,
-        TargetFilter::TrackedSetFiltered { .. }
-    ));
+    assert!(matches!(target, TargetFilter::TrackedSetFiltered { .. }));
 }
 
 #[test]

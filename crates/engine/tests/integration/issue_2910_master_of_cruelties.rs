@@ -51,9 +51,10 @@ fn master_of_cruelties_has_no_unimplemented_attack_alone_leak() {
         "attack-alone line must produce static abilities"
     );
     assert!(
-        parsed.statics.iter().all(|sd| {
-            !matches!(&sd.mode, StaticMode::Other(name) if name == "Unimplemented")
-        }),
+        parsed
+            .statics
+            .iter()
+            .all(|sd| { !matches!(&sd.mode, StaticMode::Other(name) if name == "Unimplemented") }),
         "static line must not leak Unimplemented: {:?}",
         parsed.statics
     );

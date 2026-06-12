@@ -1376,8 +1376,8 @@ fn starts_bare_and_clause_lower(s: &str) -> bool {
     // 21-arm limit; adding it inline would push the cluster over and trip
     // the `Choice<...>` trait-bound check at compile time.
     .or(value((), tag("puts ")))
-    // CR 608.2c: "put … and attach …" compound (Zack Fair).
-    .or(value((), tag("attach ")))
+    // CR 608.2c: "put … and attach an Equipment that was attached …" (Zack Fair).
+    .or(value((), tag("attach an equipment that was attached ")))
     .or(alt((
         // CR 608.2c: Subject-prefixed verb patterns — "you [verb]" is always a clause start.
         value((), tag("you gain ")),

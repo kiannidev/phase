@@ -3519,9 +3519,10 @@ pub fn find_applicable_replacements(
             {
                 continue;
             }
-            // CR 614.12: a stack-resident object reached only via the
+            // CR 614.12 + CR 608.2n: a stack-resident object reached only via the
             // stack-self-move exception can apply only its own self-replacement
-            // effects (mirrors the entering-object / discarded-card guards).
+            // effects. Explicit `SelfRef` is the canonical marker (Invoke
+            // Calamity rider, Nexus of Fate).
             if is_stack_self_move
                 && !in_scanned_zone
                 && repl_def.valid_card != Some(crate::types::ability::TargetFilter::SelfRef)

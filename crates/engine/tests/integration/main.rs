@@ -94,6 +94,7 @@ mod issue_1302_final_parting;
 mod issue_1305_thalisse_tokens_created_this_turn;
 mod issue_1308_unstoppable_plan;
 mod issue_1312_prepared_spell_cast_triggers;
+mod issue_1326_tabernacle_upkeep_destroy;
 mod issue_1374_atraxa_grand_unifier;
 mod issue_1499_arabella;
 mod issue_1509_sorcery_main_phase_cast;

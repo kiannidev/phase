@@ -197,6 +197,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         | FilterProp::SameName
         | FilterProp::SameNameAsParentTarget
         | FilterProp::AttackingController
+        | FilterProp::AttackingOpponent
         | FilterProp::IsCommander
         | FilterProp::Other { .. } => false,
     }
@@ -390,6 +391,7 @@ fn entered_object_perturbs_filter_prop(
         | FilterProp::SameName
         | FilterProp::SameNameAsParentTarget
         | FilterProp::AttackingController
+        | FilterProp::AttackingOpponent
         | FilterProp::IsCommander
         | FilterProp::Other { .. } => false,
     }
@@ -2446,6 +2448,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         // All remaining props require on-battlefield or stack state unavailable from a snapshot.
         FilterProp::Attacking
         | FilterProp::AttackingController
+        | FilterProp::AttackingOpponent
         | FilterProp::Blocking
         | FilterProp::BlockingSource
         | FilterProp::CombatRelation { .. }
@@ -2729,6 +2732,15 @@ fn matches_filter_prop(
             combat.attackers.iter().any(|a| {
                 a.object_id == object_id
                     && source.controller.is_some_and(|sc| a.defending_player == sc)
+            })
+        }),
+        FilterProp::AttackingOpponent => state.combat.as_ref().is_some_and(|combat| {
+            combat.attackers.iter().any(|a| {
+                a.object_id == object_id
+                    && source.controller.is_some_and(|sc| {
+                        a.defending_player != sc
+                            && super::players::is_opponent(state, sc, a.defending_player)
+                    })
             })
         }),
         // CR 509.1a: A creature is blocking if it was declared as a blocker.
@@ -3531,6 +3543,14 @@ fn zone_change_record_matches_property(
         FilterProp::AttackingController => {
             record.combat_status.attacking
                 && source.controller == record.combat_status.defending_player
+        }
+        FilterProp::AttackingOpponent => {
+            record.combat_status.attacking
+                && source.controller.is_some_and(|sc| {
+                    record.combat_status.defending_player.is_some_and(|dp| {
+                        dp != sc && super::players::is_opponent(state, sc, dp)
+                    })
+                })
         }
         FilterProp::Blocking => record.combat_status.blocking,
         // `ZoneChangeCombatStatus` snapshots role, not the blocker-to-attacker

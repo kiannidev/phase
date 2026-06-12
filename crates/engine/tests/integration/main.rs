@@ -150,6 +150,7 @@ mod issue_2897_nexus_of_fate;
 mod issue_2900_blinkmoth_urn;
 mod issue_2904_life_of_the_party;
 mod issue_2908_weathered_wayfarer;
+mod issue_2909_blast_furnace_hellkite;
 mod issue_2914_shiko_flurry_target_gate;
 mod issue_2915_alexios;
 mod issue_2916_torment_repeat_unless;

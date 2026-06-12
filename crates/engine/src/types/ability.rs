@@ -2535,6 +2535,10 @@ pub enum FilterProp {
     /// filter's source controller ("creatures attacking you"). Distinct from
     /// `Attacking`, which matches any attacker regardless of defender.
     AttackingController,
+    /// CR 508.1b + CR 102.3: Matches attacking creatures whose defending player
+    /// is an opponent of the filter's source controller ("creatures attacking
+    /// your opponents").
+    AttackingOpponent,
     /// CR 903.3 + CR 903.3d: Matches permanents on the battlefield that are a
     /// commander. Reads `GameObject::is_commander`, set during deck construction
     /// per CR 903.3 (the legendary card designated as that deck's commander).
@@ -15600,6 +15604,7 @@ mod tests {
             FilterProp::Token,
             FilterProp::Attacking,
             FilterProp::AttackingController,
+            FilterProp::AttackingOpponent,
             FilterProp::Blocking,
             FilterProp::BlockingSource,
             FilterProp::CombatRelation {

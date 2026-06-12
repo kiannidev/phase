@@ -524,6 +524,18 @@ pub(crate) fn parse_static_line_inner(
         }
     }
 
+    // CR 508.1b: "Creatures attacking your opponents have double strike." —
+    // attackers whose defending player is an opponent of the source's controller
+    // (Blast-Furnace Hellkite).
+    if let Some(rest) = nom_tag_tp(&tp, "creatures attacking your opponents ") {
+        let filter = TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::AttackingOpponent]),
+        );
+        if let Some(def) = parse_continuous_gets_has(rest.original, filter, &text) {
+            return Some(def);
+        }
+    }
+
     // CR 205.3m + CR 613.1: "Each creature you control that's a <Subtype>[ or a <Subtype>] <predicate>"
     // Example (Auriok Steelshaper): "each creature you control that's a Soldier or a Knight gets +1/+1"
     // Consumes a capitalized-subtype list joined by " or a " / " and a " / " or " / " and ",

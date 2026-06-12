@@ -447,6 +447,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
             FilterProp::NonToken => parts.push("nontoken".into()),
             FilterProp::Attacking => parts.push("attacking".into()),
             FilterProp::AttackingController => parts.push("attacking you".into()),
+            FilterProp::AttackingOpponent => parts.push("attacking your opponents".into()),
             FilterProp::Blocking => parts.push("blocking".into()),
             FilterProp::BlockingSource => parts.push("blocking source".into()),
             FilterProp::CombatRelation { .. } => parts.push("combat related".into()),

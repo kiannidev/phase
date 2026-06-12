@@ -5098,6 +5098,24 @@ fn static_attacking_creatures_you_control_have_double_strike() {
 }
 
 #[test]
+fn static_creatures_attacking_your_opponents_have_double_strike() {
+    let def =
+        parse_static_line("Creatures attacking your opponents have double strike.").unwrap();
+    assert_eq!(def.mode, StaticMode::Continuous);
+    assert_eq!(
+        def.affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::AttackingOpponent]),
+        ))
+    );
+    assert!(def
+        .modifications
+        .contains(&ContinuousModification::AddKeyword {
+            keyword: Keyword::DoubleStrike,
+        }));
+}
+
+#[test]
 fn static_during_your_turn_creatures_you_control_have_hexproof() {
     let def = parse_static_line("During your turn, creatures you control have hexproof.").unwrap();
     assert_eq!(def.mode, StaticMode::Continuous);

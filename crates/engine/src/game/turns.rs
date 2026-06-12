@@ -1401,6 +1401,7 @@ fn add_lore_counters_to_sagas(state: &mut GameState, events: &mut Vec<GameEvent>
 fn process_phase_triggers(state: &mut GameState) -> (bool, Option<WaitingFor>) {
     let phase_event = [GameEvent::PhaseChanged { phase: state.phase }];
     let stack_before = state.stack.len();
+    let waiting_before = state.waiting_for.clone();
     super::triggers::process_triggers(state, &phase_event);
     // CR 603.3b: an unresolved ordering pass keeps its triggers in
     // `pending_trigger_order` (not on the stack, not in `pending_trigger`), so it
@@ -1420,9 +1421,12 @@ fn process_phase_triggers(state: &mut GameState) -> (bool, Option<WaitingFor>) {
     // `waiting_for` without `pending_trigger` after the trigger has reached the
     // stack and begun resolving. Surface any non-priority prompt
     // `process_triggers` left behind so auto_advance does not clobber it with an
-    // upkeep/draw/main priority window (Tabernacle #1326).
+    // upkeep/draw/main priority window (Tabernacle #1326). The prompt must be
+    // newly produced by trigger processing; stale turn-action prompts from an
+    // earlier phase (DeclareAttackers, etc.) are not phase-trigger work.
     let inline_resolution_prompt = (order_triggers_prompt.is_none()
         && active_trigger_prompt.is_none()
+        && state.waiting_for != waiting_before
         && !matches!(
             state.waiting_for,
             WaitingFor::Priority { .. } | WaitingFor::GameOver { .. }

@@ -554,7 +554,7 @@ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
                 // Handles patterns like "you lose 1 life and create a Treasure token".
                 // Uses a restricted verb list to avoid false positives on noun phrases
                 // like "target creature and all other creatures" or "it and each other".
-                if paren_depth == 0 && !in_double_quote && current.ends_with(" and ") {
+                if paren_depth == 0 && !in_double_quote && current_ends_with_bare_and(&current) {
                     let remainder: String = chars.clone().collect();
                     let remainder_trimmed = remainder.trim_start();
                     // CR 608.2c: Card-name possessives like "~'s controller …" open
@@ -1319,8 +1319,21 @@ fn controlled_creature_each_subject_starts(lower: &str) -> bool {
 /// CR 608.2c: Zack Fair — "put ~'s counters … and attach an Equipment that was
 /// attached …". Recognized as a bare-and tail even when ~'s quote mode is active.
 fn starts_attach_equipment_was_attached_clause(text: &str) -> bool {
-    text.to_ascii_lowercase()
-        .starts_with("attach an equipment that was attached ")
+    let lower = text.to_ascii_lowercase();
+    let result = tag::<_, _, OracleError<'_>>("attach an equipment that was attached ")
+        .parse(lower.as_str());
+    result.is_ok()
+}
+
+/// True when `current` ends with the bare-and delimiter during character-by-
+/// character clause chunking (suffix is the final " and " in the buffer).
+fn current_ends_with_bare_and(current: &str) -> bool {
+    all_consuming(terminated(
+        take_until::<_, _, OracleError<'_>>(" and "),
+        tag(" and "),
+    ))
+    .parse(current)
+    .is_ok()
 }
 
 /// Restricted clause-start check for bare " and " splitting (not after comma).

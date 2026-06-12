@@ -4273,13 +4273,21 @@ pub(super) fn strip_activated_constraints(text: &str) -> (String, ActivatedConst
 
         // CR 602.2: "Any player may activate this ability." — strip as a recognized
         // annotation. This appears as a trailing sentence on activated abilities.
-        if let Some(prefix) = lower.strip_suffix("any player may activate this ability") {
-            let end = remaining.len() - "any player may activate this ability".len();
+        const ANY_PLAYER_ACTIVATE_SUFFIX: &str = "any player may activate this ability";
+        let any_player_suffix = all_consuming(terminated(
+            take_until::<_, _, OracleError<'_>>(ANY_PLAYER_ACTIVATE_SUFFIX),
+            tag::<_, _, OracleError<'_>>(ANY_PLAYER_ACTIVATE_SUFFIX),
+        ))
+        .parse(lower.as_str())
+        .is_ok();
+        if any_player_suffix {
+            let end = remaining.len() - ANY_PLAYER_ACTIVATE_SUFFIX.len();
+            let prefix = lower[..end].trim();
             remaining = remaining[..end]
                 .trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace())
                 .to_string();
             constraints.any_player_may_activate = true;
-            if prefix.trim().is_empty() {
+            if prefix.is_empty() {
                 break;
             }
             continue;

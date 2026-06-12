@@ -7,7 +7,9 @@ use engine::game::combat::AttackTarget;
 use engine::game::layers::evaluate_layers;
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::parser::oracle::{keyword_display_name, parse_oracle_text};
-use engine::types::ability::{ContinuousModification, FilterProp, TargetFilter, TypedFilter};
+use engine::types::ability::{
+    ContinuousModification, ControllerRef, FilterProp, TargetFilter, TypedFilter,
+};
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::{CastPaymentMode, WaitingFor};
@@ -65,9 +67,11 @@ fn blast_furnace_hellkite_parses_artifact_offering_and_attacking_opponents_stati
 
     assert_eq!(
         static_def.affected,
-        Some(TargetFilter::Typed(
-            TypedFilter::creature().properties(vec![FilterProp::AttackingOpponent]),
-        ))
+        Some(TargetFilter::Typed(TypedFilter::creature().properties(
+            vec![FilterProp::Attacking {
+                defender: Some(ControllerRef::Opponent)
+            }]
+        ),))
     );
 
     assert!(

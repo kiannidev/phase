@@ -2135,7 +2135,12 @@ pub enum FilterProp {
     Token,
     /// CR 111.1: Matches objects that are not tokens.
     NonToken,
-    Attacking,
+    /// CR 508.1b: Matches attacking creatures, optionally scoped by which player
+    /// the creature is attacking.
+    Attacking {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        defender: Option<ControllerRef>,
+    },
     /// CR 509.1a: Matches creatures that are blocking.
     Blocking,
     /// CR 509.1g: Matches creatures currently blocking the filter source.
@@ -2531,14 +2536,6 @@ pub enum FilterProp {
     NameMatchesAnyPermanent {
         controller: Option<ControllerRef>,
     },
-    /// CR 508.1b: Matches attacking creatures whose defending player equals the
-    /// filter's source controller ("creatures attacking you"). Distinct from
-    /// `Attacking`, which matches any attacker regardless of defender.
-    AttackingController,
-    /// CR 508.1b + CR 102.3: Matches attacking creatures whose defending player
-    /// is an opponent of the filter's source controller ("creatures attacking
-    /// your opponents").
-    AttackingOpponent,
     /// CR 903.3 + CR 903.3d: Matches permanents on the battlefield that are a
     /// commander. Reads `GameObject::is_commander`, set during deck construction
     /// per CR 903.3 (the legendary card designated as that deck's commander).
@@ -15615,9 +15612,13 @@ mod tests {
     fn filter_prop_roundtrip() {
         let props = vec![
             FilterProp::Token,
-            FilterProp::Attacking,
-            FilterProp::AttackingController,
-            FilterProp::AttackingOpponent,
+            FilterProp::Attacking { defender: None },
+            FilterProp::Attacking {
+                defender: Some(ControllerRef::You),
+            },
+            FilterProp::Attacking {
+                defender: Some(ControllerRef::Opponent),
+            },
             FilterProp::Blocking,
             FilterProp::BlockingSource,
             FilterProp::CombatRelation {

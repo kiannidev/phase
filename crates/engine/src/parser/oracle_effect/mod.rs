@@ -14495,31 +14495,63 @@ fn wire_optional_cast_decline_fallback(def: &mut AbilityDefinition) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RepeatStopPredicate {
+    PutToHand,
+    DuplicateExiledNames,
+}
+
+fn parse_repeat_stop_predicate(input: &str) -> OracleResult<'_, RepeatStopPredicate> {
+    alt((
+        value(
+            RepeatStopPredicate::PutToHand,
+            alt((
+                tag("you put a card into your hand"),
+                tag("you put that card into your hand"),
+            )),
+        ),
+        value(
+            RepeatStopPredicate::DuplicateExiledNames,
+            tag("you exile two cards with the same name"),
+        ),
+    ))
+    .parse(input)
+}
+
 /// CR 608.2c + CR 107.1c: "Repeat this process until … whichever comes first."
 fn try_parse_repeat_until_stop_conditions(
     lower: &str,
 ) -> Option<crate::types::ability::RepeatContinuation> {
     let trimmed = lower.trim().trim_end_matches('.');
-    // allow-noncombinator: fixed repeat-until directive classification on pre-normalized lowercase; consumed before generic repeat-this-process nom dispatch.
-    if !trimmed.starts_with("repeat this process until ") {
-        // allow-noncombinator: fixed directive prefix probe, not parse dispatch
-        return None;
+    let (rest, first) = preceded(
+        tag("repeat this process until "),
+        parse_repeat_stop_predicate,
+    )
+    .parse(trimmed)
+    .ok()?;
+    let (rest, second) = opt(preceded(tag(" or "), parse_repeat_stop_predicate))
+        .parse(rest)
+        .ok()?;
+    let (rest, _) = opt(tag::<_, _, OracleError<'_>>(", whichever comes first"))
+        .parse(rest)
+        .ok()?;
+    eof::<_, OracleError<'_>>(rest).ok()?;
+
+    let mut stop_on_put_to_hand = false;
+    let mut stop_on_duplicate_exiled_names = false;
+    for predicate in [Some(first), second].into_iter().flatten() {
+        match predicate {
+            RepeatStopPredicate::PutToHand => stop_on_put_to_hand = true,
+            RepeatStopPredicate::DuplicateExiledNames => stop_on_duplicate_exiled_names = true,
+        }
     }
-    let rest = &trimmed["repeat this process until ".len()..];
-    let stop_on_put_to_hand = rest.contains("put a card into your hand") // allow-noncombinator: stop-predicate scan in fixed Tainted Pact until template
-        || rest.contains("put that card into your hand"); // allow-noncombinator: stop-predicate scan in fixed Tainted Pact until template
-    let stop_on_duplicate_exiled_names = rest.contains("exile two cards with the same name") // allow-noncombinator: stop-predicate scan in fixed Tainted Pact until template
-        || rest.contains("two cards with the same name"); // allow-noncombinator: stop-predicate scan in fixed Tainted Pact until template
-    if stop_on_put_to_hand || stop_on_duplicate_exiled_names {
-        Some(
-            crate::types::ability::RepeatContinuation::UntilStopConditions {
-                stop_on_put_to_hand,
-                stop_on_duplicate_exiled_names,
-            },
-        )
-    } else {
-        None
-    }
+
+    Some(
+        crate::types::ability::RepeatContinuation::UntilStopConditions {
+            stop_on_put_to_hand,
+            stop_on_duplicate_exiled_names,
+        },
+    )
 }
 
 /// Parse a compound effect chain into an `AbilityDefinition` sub-ability chain.
@@ -14594,7 +14626,7 @@ pub(crate) fn parse_effect_chain_with_context(
 /// by the casting-line parser; an optional leading copy of that sentence is
 /// stripped here defensively in case it reaches this entry inline.
 ///
-/// `FilterProp::AttackingController` matches every attacker whose defending
+/// `FilterProp::Attacking { defender: Some(ControllerRef::You) }` matches every attacker whose defending
 /// player is the controller — which the engine records as the controller of an
 /// attacked planeswalker/battle too, so "attacking you" and "or a planeswalker
 /// you control" collapse onto the one predicate.
@@ -14656,9 +14688,12 @@ fn try_parse_for_each_attacker_copy_blocker(
         true
     };
 
-    let source_filter = TargetFilter::Typed(
-        TypedFilter::creature().properties(vec![FilterProp::AttackingController]),
-    );
+    let source_filter =
+        TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::Attacking {
+                defender: Some(ControllerRef::You),
+            }]),
+        );
     let mut def = AbilityDefinition::new(
         kind,
         Effect::CopyTokenBlockingAttacker {
@@ -23945,10 +23980,12 @@ mod tests {
                 owner,
             } => {
                 assert_eq!(*owner, TargetFilter::Controller);
-                assert!(tf
-                    .properties
-                    .iter()
-                    .any(|p| matches!(p, FilterProp::AttackingController)));
+                assert!(tf.properties.iter().any(|p| matches!(
+                    p,
+                    FilterProp::Attacking {
+                        defender: Some(ControllerRef::You)
+                    }
+                )));
             }
             other => panic!("expected CopyTokenBlockingAttacker, got {other:?}"),
         }
@@ -36418,7 +36455,7 @@ mod tests {
         for (input, expected_prop, expected_negated) in [
             (
                 "draw a card if it was attacking",
-                FilterProp::Attacking,
+                FilterProp::Attacking { defender: None },
                 false,
             ),
             (
@@ -36428,7 +36465,7 @@ mod tests {
             ),
             (
                 "draw a card if it wasn't attacking",
-                FilterProp::Attacking,
+                FilterProp::Attacking { defender: None },
                 true,
             ),
             (
@@ -38345,10 +38382,11 @@ mod tests {
                     factor: 3,
                     inner: Box::new(QuantityExpr::Ref {
                         qty: QuantityRef::ObjectCount {
-                            filter: TargetFilter::Typed(
-                                TypedFilter::creature()
-                                    .properties(vec![FilterProp::AttackingController]),
-                            ),
+                            filter: TargetFilter::Typed(TypedFilter::creature().properties(vec![
+                                FilterProp::Attacking {
+                                    defender: Some(ControllerRef::You)
+                                }
+                            ]),),
                         },
                     }),
                 },
@@ -38661,7 +38699,7 @@ mod tests {
                         filter: TargetFilter::Typed(TypedFilter {
                             type_filters: vec![TypeFilter::Creature],
                             controller: Some(ControllerRef::TargetPlayer),
-                            properties: vec![FilterProp::Attacking],
+                            properties: vec![FilterProp::Attacking { defender: None }],
                         }),
                     },
                 },
@@ -40053,7 +40091,7 @@ mod tests {
                         properties,
                         ..
                     }) if type_filters.contains(&TypeFilter::Creature)
-                        && properties.contains(&FilterProp::Attacking)
+                        && properties.contains(&FilterProp::Attacking { defender: None })
                         && properties.contains(&FilterProp::Another)
                 ));
                 assert!(matches!(
@@ -40067,7 +40105,7 @@ mod tests {
                             })
                         }
                     }) if type_filters == &vec![TypeFilter::Creature]
-                        && properties == &vec![FilterProp::Attacking, FilterProp::Another]
+                        && properties == &vec![FilterProp::Attacking { defender: None }, FilterProp::Another]
                 ));
                 assert_eq!(power, toughness);
             }
@@ -43348,7 +43386,7 @@ mod tests {
                         ..
                     })
                 }
-            } if properties.as_slice() == [FilterProp::Attacking]
+            } if properties.as_slice() == [FilterProp::Attacking { defender: None }]
         ));
     }
 

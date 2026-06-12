@@ -7763,7 +7763,7 @@ mod tests {
         };
         assert_eq!(filters.len(), 2);
         for (filter, property) in [
-            (&filters[0], FilterProp::Attacking),
+            (&filters[0], FilterProp::Attacking { defender: None }),
             (&filters[1], FilterProp::Blocking),
         ] {
             let TargetFilter::Typed(typed) = filter else {

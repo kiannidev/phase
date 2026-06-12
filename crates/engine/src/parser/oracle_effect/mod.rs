@@ -13964,11 +13964,13 @@ fn rewrite_player_scope_refs(def: &mut AbilityDefinition) {
     }
 
     each_quantity_expr_mut(&mut def.effect, &mut rewrite_quantity_expr);
-    // CR 608.2 + CR 109.5: Rebind `You`-scoped target filters (e.g. "a creature
-    // they control" when `relative_player_scope` was unset at parse time) to
-    // `ScopedPlayer` so each-player iterations act on the iterated player's
-    // permanents — Agitator Ant's optional counter placement (issue #2903).
-    each_target_filter_mut(&mut def.effect, &mut rewrite_filter_controller_to_scoped);
+    // CR 608.2 + CR 109.5: Rebind actor-default `You` controllers to
+    // `ScopedPlayer` for each-*player* iterations only. Each-opponent scopes
+    // keep `You` so optional opponent-choice sacrifices ("permanent of their
+    // choice") retain the chooser-as-controller binding (issue #2903).
+    if matches!(def.player_scope, Some(PlayerFilter::All)) {
+        each_target_filter_mut(&mut def.effect, &mut rewrite_filter_controller_to_scoped);
+    }
     if let Some(condition) = def.condition.as_mut() {
         rewrite_condition(condition);
     }

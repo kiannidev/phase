@@ -7,7 +7,8 @@ use engine::types::actions::GameAction;
 use engine::types::game_state::WaitingFor;
 use engine::types::zones::Zone;
 
-const BRONZEHIDE_LION_ORACLE: &str = "{G}{W}: This creature gains indestructible until end of turn.\n\
+const BRONZEHIDE_LION_ORACLE: &str =
+    "{G}{W}: This creature gains indestructible until end of turn.\n\
 When this creature dies, return it to the battlefield. It's an Aura enchantment with enchant \
 creature you control and \"{G}{W}: Enchanted creature gains indestructible until end of turn,\" \
 and it loses all other abilities.";

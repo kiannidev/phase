@@ -117,13 +117,7 @@ pub fn resolve(
         // and loses its other abilities (including its own dies trigger) before
         // the no-target graveyard move. Without stripping first, the subsequent
         // LTB event re-queues the same self-return trigger forever (issue #1332).
-        install_aura_continuous_effect(
-            state,
-            ability,
-            returned_id,
-            &enchant_filter,
-            grants,
-        );
+        install_aura_continuous_effect(state, ability, returned_id, &enchant_filter, grants);
         crate::game::layers::evaluate_layers(state);
         if let Some(obj) = state.objects.get_mut(&returned_id) {
             obj.trigger_definitions.clear();
@@ -265,13 +259,7 @@ pub(crate) fn finalize_attach(
         return Err(EffectError::ObjectNotFound(returned_id));
     }
 
-    install_aura_continuous_effect(
-        state,
-        ability,
-        returned_id,
-        enchant_filter,
-        grants,
-    );
+    install_aura_continuous_effect(state, ability, returned_id, enchant_filter, grants);
 
     // CR 701.3 + CR 303.4: attach the Aura to the chosen permanent. This is
     // a silent no-op if the target carries `CantBeEnchanted` / `CantBeAttached`

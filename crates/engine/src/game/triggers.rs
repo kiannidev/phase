@@ -11136,9 +11136,7 @@ pub mod tests {
     #[test]
     fn extract_target_skips_mass_phase_out_permanents_you_control() {
         let effect = Effect::PhaseOut {
-            target: TargetFilter::Typed(
-                TypedFilter::permanent().controller(ControllerRef::You),
-            ),
+            target: TargetFilter::Typed(TypedFilter::permanent().controller(ControllerRef::You)),
         };
         assert!(
             extract_target_filter_from_effect(&effect).is_none(),

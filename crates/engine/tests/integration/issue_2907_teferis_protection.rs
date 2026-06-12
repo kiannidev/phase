@@ -6,13 +6,13 @@
 //! cast time; the effect expands its mass filter at resolution.
 
 use engine::game::ability_utils::{build_resolved_from_def, build_target_slots};
+use engine::game::zones::create_object;
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{ControllerRef, Effect, TargetFilter, TypeFilter, TypedFilter};
 use engine::types::game_state::GameState;
 use engine::types::identifiers::CardId;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
-use engine::game::zones::create_object;
 
 const TEFERIS_PROTECTION_ORACLE: &str = "\
 Until your next turn, your life total can't change and you gain protection from everything. All permanents you control phase out.\n\
@@ -67,14 +67,12 @@ fn teferis_protection_parsed_phase_out_uses_mass_permanent_filter() {
         *target,
         TargetFilter::Typed(TypedFilter::permanent().controller(ControllerRef::You))
     );
-    assert!(
-        matches!(
-            target,
-            TargetFilter::Typed(TypedFilter {
-                type_filters,
-                controller: Some(ControllerRef::You),
-                ..
-            }) if type_filters.contains(&TypeFilter::Permanent)
-        )
-    );
+    assert!(matches!(
+        target,
+        TargetFilter::Typed(TypedFilter {
+            type_filters,
+            controller: Some(ControllerRef::You),
+            ..
+        }) if type_filters.contains(&TypeFilter::Permanent)
+    ));
 }

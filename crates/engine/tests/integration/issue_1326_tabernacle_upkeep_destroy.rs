@@ -15,7 +15,10 @@ use engine::types::zones::Zone;
 const TABERNACLE_ORACLE: &str =
     "All creatures have \"At the beginning of your upkeep, destroy this creature unless you pay {1}.\"";
 
-fn patch_tabernacle_as_land(state: &mut engine::types::game_state::GameState, tabernacle: ObjectId) {
+fn patch_tabernacle_as_land(
+    state: &mut engine::types::game_state::GameState,
+    tabernacle: ObjectId,
+) {
     let tab = state.objects.get_mut(&tabernacle).unwrap();
     tab.card_types.core_types = vec![CoreType::Land];
     tab.base_card_types.core_types = vec![CoreType::Land];
@@ -73,7 +76,13 @@ fn tabernacle_static_parses_grant_trigger_with_unless_pay() {
 fn tabernacle_grant_trigger_survives_consecutive_layer_flush() {
     let mut scenario = GameScenario::new();
     let tabernacle = scenario
-        .add_creature_from_oracle(P0, "The Tabernacle at Pendrell Vale", 0, 0, TABERNACLE_ORACLE)
+        .add_creature_from_oracle(
+            P0,
+            "The Tabernacle at Pendrell Vale",
+            0,
+            0,
+            TABERNACLE_ORACLE,
+        )
         .id();
     let bear = scenario.add_creature(P0, "Bear", 2, 2).id();
 
@@ -100,12 +109,18 @@ fn tabernacle_grant_trigger_survives_consecutive_layer_flush() {
 }
 
 #[test]
-fn tabernacle_creature_destroyed_when_upkeep_cost_declined() {
+fn tabernacle_creature_destroyed_when_upkeep_cost_declined_shape() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::Untap);
 
     let tabernacle = scenario
-        .add_creature_from_oracle(P0, "The Tabernacle at Pendrell Vale", 0, 0, TABERNACLE_ORACLE)
+        .add_creature_from_oracle(
+            P0,
+            "The Tabernacle at Pendrell Vale",
+            0,
+            0,
+            TABERNACLE_ORACLE,
+        )
         .id();
     let bear = scenario.add_creature(P0, "Bear", 2, 2).id();
 
@@ -127,12 +142,18 @@ fn tabernacle_creature_destroyed_when_upkeep_cost_declined() {
 }
 
 #[test]
-fn tabernacle_creature_destroyed_after_upkeep_sba_and_phase_triggers() {
+fn tabernacle_creature_destroyed_after_upkeep_sba_and_phase_triggers_shape() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::Upkeep);
 
     let tabernacle = scenario
-        .add_creature_from_oracle(P0, "The Tabernacle at Pendrell Vale", 0, 0, TABERNACLE_ORACLE)
+        .add_creature_from_oracle(
+            P0,
+            "The Tabernacle at Pendrell Vale",
+            0,
+            0,
+            TABERNACLE_ORACLE,
+        )
         .id();
     let bear = scenario.add_creature(P0, "Bear", 2, 2).id();
 
@@ -164,14 +185,19 @@ fn tabernacle_creature_destroyed_via_upkeep_auto_advance() {
     scenario.at_phase(Phase::Upkeep);
 
     let tabernacle = scenario
-        .add_creature_from_oracle(P0, "The Tabernacle at Pendrell Vale", 0, 0, TABERNACLE_ORACLE)
+        .add_creature_from_oracle(
+            P0,
+            "The Tabernacle at Pendrell Vale",
+            0,
+            0,
+            TABERNACLE_ORACLE,
+        )
         .id();
     let bear = scenario.add_creature(P0, "Bear", 2, 2).id();
 
     let mut runner = scenario.build();
     patch_tabernacle_as_land(runner.state_mut(), tabernacle);
     mark_layers_full(runner.state_mut());
-    flush_layers(runner.state_mut());
 
     let mut events = Vec::new();
     let waiting = engine::game::turns::auto_advance(runner.state_mut(), &mut events);

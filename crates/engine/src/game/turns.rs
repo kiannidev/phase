@@ -1399,13 +1399,6 @@ fn add_lore_counters_to_sagas(state: &mut GameState, events: &mut Vec<GameEvent>
 ///     `pending_trigger` / `deferred_triggers` still hold unresolved work (CR
 ///     603.3). The caller MUST surface this prompt instead of granting priority.
 fn process_phase_triggers(state: &mut GameState) -> (bool, Option<WaitingFor>) {
-    // CR 613.1f + CR 603.6a: Layer-granted triggers (Tabernacle upkeep,
-    // Changeling, etc.) live in post-layer `trigger_definitions` and the
-    // `TriggerIndex`. Flush before phase-trigger collection so
-    // `process_triggers` consults the current derived trigger set — the
-    // post-action `finalize_public_state` flush runs too late when
-    // `auto_advance` fires triggers inline in the same apply() pass.
-    super::layers::flush_layers(state);
     let phase_event = [GameEvent::PhaseChanged { phase: state.phase }];
     let stack_before = state.stack.len();
     super::triggers::process_triggers(state, &phase_event);
@@ -1423,10 +1416,11 @@ fn process_phase_triggers(state: &mut GameState) -> (bool, Option<WaitingFor>) {
     let active_trigger_prompt = (order_triggers_prompt.is_none()
         && (state.pending_trigger.is_some() || !state.deferred_triggers.is_empty()))
     .then(|| state.waiting_for.clone());
-    // Unless-pay and other inline resolution prompts arm `waiting_for` without
-    // `pending_trigger` (the trigger may already be on the stack). Surface any
-    // non-priority prompt `process_triggers` left behind so auto_advance does
-    // not clobber it with an upkeep/draw/main priority window (Tabernacle #1326).
+    // CR 117.5 + CR 118.12a: Unless-pay and other inline resolution prompts arm
+    // `waiting_for` without `pending_trigger` after the trigger has reached the
+    // stack and begun resolving. Surface any non-priority prompt
+    // `process_triggers` left behind so auto_advance does not clobber it with an
+    // upkeep/draw/main priority window (Tabernacle #1326).
     let inline_resolution_prompt = (order_triggers_prompt.is_none()
         && active_trigger_prompt.is_none()
         && !matches!(

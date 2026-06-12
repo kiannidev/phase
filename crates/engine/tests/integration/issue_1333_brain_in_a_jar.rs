@@ -91,14 +91,12 @@ fn brain_in_a_jar_puts_counter_before_optional_cast_filters_cmc_one() {
     let mut runner = scenario.build();
     add_colorless_mana(&mut runner, 2);
 
-    runner
-        .activate(jar_id, 0)
-        .accept_optional()
-        .resolve();
+    runner.activate(jar_id, 0).accept_optional().resolve();
 
     let jar = &runner.state().objects[&jar_id];
     assert_eq!(
-        jar.counters.get(&CounterType::Generic("charge".to_string())),
+        jar.counters
+            .get(&CounterType::Generic("charge".to_string())),
         Some(&1),
         "Brain in a Jar must have one charge counter after resolving the put-counter clause"
     );

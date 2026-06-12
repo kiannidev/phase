@@ -3280,7 +3280,7 @@ pub(super) fn parse_utility_imperative_ast(
             return Some(UtilityImperativeAst::SwitchPT { target });
         }
     }
-    // CR 608.2k + CR 400.7: Zack Fair — "attach an Equipment that was attached
+    // CR 400.7c + CR 608.2g: Zack Fair — "attach an Equipment that was attached
     // to ~ to that creature". The attachment is battlefield Equipment whose
     // host was the ability source (including LKI after self-sacrifice).
     if let Some(((), recipient_text)) = nom_on_lower(text, lower, |input| {
@@ -8590,11 +8590,10 @@ mod tests {
         };
         match attachment {
             TargetFilter::Typed(tf) => {
-                assert!(
-                    tf.type_filters
-                        .iter()
-                        .any(|t| matches!(t, TypeFilter::Subtype(s) if s == "Equipment"))
-                );
+                assert!(tf
+                    .type_filters
+                    .iter()
+                    .any(|t| matches!(t, TypeFilter::Subtype(s) if s == "Equipment")));
                 assert!(tf.properties.contains(&FilterProp::AttachedToSource));
             }
             other => panic!("expected typed Equipment filter, got {other:?}"),

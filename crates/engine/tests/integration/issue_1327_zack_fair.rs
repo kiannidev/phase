@@ -42,7 +42,12 @@ fn add_colorless_mana(runner: &mut engine::game::scenario::GameRunner, count: u3
         .expect("P0")
         .mana_pool;
     for _ in 0..count {
-        pool.add(ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]));
+        pool.add(ManaUnit::new(
+            ManaType::Colorless,
+            ObjectId(0),
+            false,
+            vec![],
+        ));
     }
 }
 
@@ -140,9 +145,9 @@ fn zack_fair_sacrifice_moves_counters_and_reattaches_equipment() {
                     .iter()
                     .find(|t| matches!(t, TargetRef::Object(id) if *id == bearer))
                     .or_else(|| {
-                        slot.legal_targets.iter().find(|t| {
-                            matches!(t, TargetRef::Object(id) if *id == equipment)
-                        })
+                        slot.legal_targets
+                            .iter()
+                            .find(|t| matches!(t, TargetRef::Object(id) if *id == equipment))
                     })
                     .or(slot.legal_targets.first())
                     .cloned()

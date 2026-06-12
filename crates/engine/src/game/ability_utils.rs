@@ -1941,7 +1941,18 @@ pub(crate) fn rewrite_chosen_player_to_you(filter: &TargetFilter) -> TargetFilte
 /// player-chosen target. Scan-based filters (e.g. "Equipment attached to ~")
 /// resolve from the battlefield/LKI and must not steal `ParentTarget` slots.
 fn attach_attachment_filter_needs_target_slot(filter: &TargetFilter) -> bool {
-    matches!(filter, TargetFilter::Any)
+    match filter {
+        TargetFilter::Any => true,
+        TargetFilter::Typed(tf) => !tf
+            .properties
+            .iter()
+            .any(|p| matches!(p, FilterProp::AttachedToSource)),
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => filters
+            .iter()
+            .any(attach_attachment_filter_needs_target_slot),
+        TargetFilter::Not { filter } => attach_attachment_filter_needs_target_slot(filter),
+        _ => false,
+    }
 }
 
 /// Whether the host operand of `Effect::Attach` consumes an explicit target.

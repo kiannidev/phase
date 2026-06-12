@@ -18193,16 +18193,13 @@ mod pipeline_snapshot_tests {
                 .is_some_and(|sub| has_effect(sub, pred))
         }
 
-        assert!(has_effect(
-            &def,
-            &|e| matches!(
-                e,
-                Effect::MoveCounters {
-                    source: TargetFilter::SelfRef,
-                    ..
-                }
-            )
-        ));
+        assert!(has_effect(&def, &|e| matches!(
+            e,
+            Effect::MoveCounters {
+                source: TargetFilter::SelfRef,
+                ..
+            }
+        )));
         assert!(
             has_effect(&def, &|e| matches!(e, Effect::Attach { .. })),
             "expected Attach in sub chain, got {:?}",

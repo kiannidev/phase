@@ -2704,7 +2704,7 @@ fn matches_last_chosen_land_or_nonland_kind(
     }
 }
 
-/// CR 400.7 + CR 603.10a: Equipment that was attached to a source when it left
+/// CR 400.7c + CR 608.2g: Equipment that was attached to a source when it left
 /// the battlefield (Zack Fair — self-sacrifice leaves Equipment unattached
 /// before the attach instruction resolves).
 fn source_attachment_snapshot_matches(

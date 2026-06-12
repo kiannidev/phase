@@ -746,10 +746,10 @@ pub(super) fn try_parse_move_counters<'a>(
     let after_put = after_put.trim();
     // Detect "its counters" / "~'s counters" / "this creature's counters" /
     // "those counters".
-    let (source, after_possessive) = if let Some(((), rest)) = nom_on_lower(after_put, after_put, |i| {
-        value((), tag("~'s counter")).parse(i)
-    })
-    {
+    let (source, after_possessive) = if let Some(((), rest)) =
+        nom_on_lower(after_put, after_put, |i| {
+            value((), tag("~'s counter")).parse(i)
+        }) {
         (TargetFilter::SelfRef, rest)
     } else {
         let ((), rest) = nom_on_lower(after_put, after_put, |i| {

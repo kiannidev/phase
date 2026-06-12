@@ -309,8 +309,9 @@ pub fn record_sacrifice(
     let mut record =
         obj.snapshot_for_zone_change(object_id, Some(Zone::Battlefield), Zone::Graveyard);
     if obj.zone == Zone::Battlefield {
-        record.attachments =
-            crate::game::zones::capture_attachment_snapshot(state, obj);
+        // CR 400.7c + CR 608.2g: Preserve attachment LKI for sacrifice-cost
+        // attach effects (Zack Fair — Equipment that was attached to ~).
+        record.attachments = crate::game::zones::capture_attachment_snapshot(state, obj);
     }
     state.sacrificed_permanents_this_turn.push(record);
     if obj.card_types.core_types.contains(&CoreType::Artifact) {

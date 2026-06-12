@@ -2,7 +2,7 @@ use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::game_object::AttachTarget;
 use crate::game::targeting::resolved_object_ids_for_filter;
 use crate::types::ability::{
-    Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter, TargetRef,
+    Effect, EffectError, EffectKind, FilterProp, ResolvedAbility, TargetFilter, TargetRef,
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::GameState;
@@ -21,6 +21,8 @@ pub fn resolve(
         _ => (&TargetFilter::SelfRef, &TargetFilter::Any),
     };
 
+    // CR 701.27a + CR 607.2a: Typed attachment operands resolve from the
+    // battlefield/LKI unless they are explicit player-chosen targets.
     // Typed/scan-based attachment filters (e.g. "Equipment attached to ~") resolve
     // from the battlefield/LKI, not from explicit target slots. Consuming
     // `ability.targets` here would steal the ParentTarget bearer (Zack Fair).
@@ -29,12 +31,7 @@ pub fn resolve(
     let attachment_id = if attachment_filter_uses_explicit_target_slot(attachment_filter) {
         resolve_object_filter(state, ability, attachment_filter, &mut target_slots)
     } else {
-        resolve_object_filter(
-            state,
-            ability,
-            attachment_filter,
-            &mut std::iter::empty(),
-        )
+        resolve_object_filter(state, ability, attachment_filter, &mut std::iter::empty())
     }
     .ok_or_else(|| EffectError::MissingParam("No attachment for Attach".to_string()))?;
     let target_id = resolve_object_filter(state, ability, target_filter, &mut target_slots)
@@ -133,10 +130,22 @@ fn current_attachment_target(state: &GameState, attachment_id: ObjectId) -> Opti
         .map(target_ref_from_attach_target)
 }
 
-/// Only `TargetFilter::Any` attachment choices are supplied via explicit
-/// `ability.targets` slots (see `attach_resolves_non_source_attachment_from_target_slot`).
+/// Only explicit attachment choices consume player-chosen target slots.
+/// Scan-based filters (e.g. "Equipment that was attached to ~") resolve from
+/// the battlefield or LKI and must not steal `ParentTarget` slots.
 fn attachment_filter_uses_explicit_target_slot(filter: &TargetFilter) -> bool {
-    matches!(filter, TargetFilter::Any)
+    match filter {
+        TargetFilter::Any => true,
+        TargetFilter::Typed(tf) => !tf
+            .properties
+            .iter()
+            .any(|p| matches!(p, FilterProp::AttachedToSource)),
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => filters
+            .iter()
+            .any(attachment_filter_uses_explicit_target_slot),
+        TargetFilter::Not { filter } => attachment_filter_uses_explicit_target_slot(filter),
+        _ => false,
+    }
 }
 
 fn resolve_object_filter<'a>(

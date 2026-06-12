@@ -2704,6 +2704,27 @@ fn matches_last_chosen_land_or_nonland_kind(
     }
 }
 
+/// CR 400.7 + CR 603.10a: Equipment that was attached to a source when it left
+/// the battlefield (Zack Fair — self-sacrifice leaves Equipment unattached
+/// before the attach instruction resolves).
+fn source_attachment_snapshot_matches(
+    state: &GameState,
+    attachment_id: ObjectId,
+    source_id: ObjectId,
+) -> bool {
+    state
+        .sacrificed_permanents_this_turn
+        .iter()
+        .chain(state.zone_changes_this_turn.iter())
+        .filter(|record| record.object_id == source_id)
+        .any(|record| {
+            record
+                .attachments
+                .iter()
+                .any(|snap| snap.object_id == attachment_id)
+        })
+}
+
 /// Check if an object satisfies a single FilterProp.
 fn matches_filter_prop(
     prop: &FilterProp,
@@ -2980,6 +3001,7 @@ fn matches_filter_prop(
         // quantity clauses on the source object (Kellan, the Fae-Blooded).
         FilterProp::AttachedToSource => {
             obj.attached_to.and_then(|t| t.as_object()) == Some(source.id)
+                || source_attachment_snapshot_matches(state, obj.id, source.id)
         }
         // CR 301.5 + CR 303.4 + CR 613.4c + CR 109.3: Anaphoric "it" referent
         // in "for each X attached to it". Two contextual referents share the

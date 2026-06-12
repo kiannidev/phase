@@ -1376,6 +1376,8 @@ fn starts_bare_and_clause_lower(s: &str) -> bool {
     // 21-arm limit; adding it inline would push the cluster over and trip
     // the `Choice<...>` trait-bound check at compile time.
     .or(value((), tag("puts ")))
+    // CR 608.2c: "put … and attach …" compound (Zack Fair).
+    .or(value((), tag("attach ")))
     .or(alt((
         // CR 608.2c: Subject-prefixed verb patterns — "you [verb]" is always a clause start.
         value((), tag("you gain ")),
@@ -1769,11 +1771,14 @@ fn starts_with_damage_clause(lower: &str) -> bool {
 
 pub(super) fn is_possessive_apostrophe(current: &str, next: Option<char>) -> bool {
     let prev = current.chars().last();
-    matches!(
-        (prev, next),
-        (Some(prev), Some(next)) if prev.is_alphanumeric() && next.is_alphanumeric()
-            || prev == 's' && next.is_whitespace()
-    )
+    match (prev, next) {
+        // CR 608.2k: "~'s counters" self-reference must not open quote mode and
+        // block bare-"and" clause splitting (Zack Fair).
+        (Some('~'), Some('s')) => true,
+        (Some(prev), Some(next)) if prev.is_alphanumeric() && next.is_alphanumeric() => true,
+        (Some('s'), Some(next)) if next.is_whitespace() => true,
+        _ => false,
+    }
 }
 
 pub(super) fn push_clause_chunk(
@@ -4589,6 +4594,32 @@ mod tests {
     fn bare_and_splits_draw_and_lose() {
         let chunks = clause_texts("draw a card and lose 1 life");
         assert_eq!(chunks, vec!["draw a card", "lose 1 life"]);
+    }
+
+    #[test]
+    fn possessive_apostrophe_in_tilde_counters() {
+        assert!(is_possessive_apostrophe("~", Some('s')));
+    }
+
+    #[test]
+    fn bare_and_starts_attach_clause() {
+        assert!(starts_bare_and_clause(
+            "attach an Equipment that was attached to ~ to that creature"
+        ));
+    }
+
+    #[test]
+    fn bare_and_splits_zack_fair_counter_move_and_attach() {
+        let chunks = clause_texts(
+            "put ~'s counters on that creature and attach an Equipment that was attached to ~ to that creature",
+        );
+        assert_eq!(
+            chunks,
+            vec![
+                "put ~'s counters on that creature",
+                "attach an Equipment that was attached to ~ to that creature",
+            ]
+        );
     }
 
     #[test]

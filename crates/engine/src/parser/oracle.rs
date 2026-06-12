@@ -18175,4 +18175,39 @@ mod pipeline_snapshot_tests {
             other => panic!("sub-ability must be Draw, got {:?}", other),
         }
     }
+
+    #[test]
+    fn zack_fair_activated_parses_counter_move_and_attach_sub_chain() {
+        use crate::types::ability::TargetFilter;
+
+        let effect = "Target creature you control gains indestructible until end of turn. Put Zack Fair's counters on that creature and attach an Equipment that was attached to Zack Fair to that creature.";
+        let mut ctx = ParseContext::default();
+        let def = parse_activated_with_self_ref_fallback(effect, "Zack Fair", &mut ctx);
+
+        fn has_effect(def: &AbilityDefinition, pred: &dyn Fn(&Effect) -> bool) -> bool {
+            if pred(&def.effect) {
+                return true;
+            }
+            def.sub_ability
+                .as_ref()
+                .is_some_and(|sub| has_effect(sub, pred))
+        }
+
+        assert!(has_effect(
+            &def,
+            &|e| matches!(
+                e,
+                Effect::MoveCounters {
+                    source: TargetFilter::SelfRef,
+                    ..
+                }
+            )
+        ));
+        assert!(
+            has_effect(&def, &|e| matches!(e, Effect::Attach { .. })),
+            "expected Attach in sub chain, got {:?}",
+            def.sub_ability
+        );
+        assert!(!has_unimplemented(&def));
+    }
 }

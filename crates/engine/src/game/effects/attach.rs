@@ -21,9 +21,22 @@ pub fn resolve(
         _ => (&TargetFilter::SelfRef, &TargetFilter::Any),
     };
 
+    // Typed/scan-based attachment filters (e.g. "Equipment attached to ~") resolve
+    // from the battlefield/LKI, not from explicit target slots. Consuming
+    // `ability.targets` here would steal the ParentTarget bearer (Zack Fair).
+    // `Any`/`Any` pairs share one iterator so [equipment, host] slots stay ordered.
     let mut target_slots = ability.targets.iter();
-    let attachment_id = resolve_object_filter(state, ability, attachment_filter, &mut target_slots)
-        .ok_or_else(|| EffectError::MissingParam("No attachment for Attach".to_string()))?;
+    let attachment_id = if attachment_filter_uses_explicit_target_slot(attachment_filter) {
+        resolve_object_filter(state, ability, attachment_filter, &mut target_slots)
+    } else {
+        resolve_object_filter(
+            state,
+            ability,
+            attachment_filter,
+            &mut std::iter::empty(),
+        )
+    }
+    .ok_or_else(|| EffectError::MissingParam("No attachment for Attach".to_string()))?;
     let target_id = resolve_object_filter(state, ability, target_filter, &mut target_slots)
         .ok_or_else(|| EffectError::MissingParam("No target for Attach".to_string()))?;
 
@@ -120,6 +133,12 @@ fn current_attachment_target(state: &GameState, attachment_id: ObjectId) -> Opti
         .map(target_ref_from_attach_target)
 }
 
+/// Only `TargetFilter::Any` attachment choices are supplied via explicit
+/// `ability.targets` slots (see `attach_resolves_non_source_attachment_from_target_slot`).
+fn attachment_filter_uses_explicit_target_slot(filter: &TargetFilter) -> bool {
+    matches!(filter, TargetFilter::Any)
+}
+
 fn resolve_object_filter<'a>(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -145,10 +164,16 @@ fn resolve_object_filter<'a>(
             TargetRef::Object(id) => Some(*id),
             TargetRef::Player(_) => None,
         }),
-        _ => target_slots.find_map(|target| match target {
-            TargetRef::Object(id) => Some(*id),
-            TargetRef::Player(_) => None,
-        }),
+        _ => target_slots
+            .find_map(|target| match target {
+                TargetRef::Object(id) => Some(*id),
+                TargetRef::Player(_) => None,
+            })
+            .or_else(|| {
+                resolved_object_ids_for_filter(state, ability, filter)
+                    .into_iter()
+                    .next()
+            }),
     }
 }
 
@@ -1272,6 +1297,42 @@ mod tests {
         assert!(
             state.objects.get(&equip).unwrap().attachments.is_empty(),
             "self-attach adds nothing to attachments"
+        );
+    }
+
+    #[test]
+    fn attach_equipment_was_attached_to_sacrificed_source() {
+        use crate::game::sacrifice::sacrifice_permanent;
+        use crate::types::ability::{FilterProp, TypedFilter};
+
+        let mut state = setup();
+        let zack = spawn_creature(&mut state, "Zack Fair");
+        let bearer = spawn_creature(&mut state, "Bearer");
+        let equipment = spawn_with_subtype(&mut state, "Hero's Sword", "Equipment");
+        attach_to(&mut state, equipment, zack);
+
+        let mut events = Vec::new();
+        sacrifice_permanent(&mut state, zack, PlayerId(0), &mut events).unwrap();
+
+        let ability = crate::types::ability::ResolvedAbility::new(
+            crate::types::ability::Effect::Attach {
+                attachment: TargetFilter::Typed(
+                    TypedFilter::default()
+                        .subtype("Equipment".to_string())
+                        .properties(vec![FilterProp::AttachedToSource]),
+                ),
+                target: TargetFilter::ParentTarget,
+            },
+            vec![crate::types::ability::TargetRef::Object(bearer)],
+            zack,
+            PlayerId(0),
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.objects.get(&equipment).unwrap().attached_to,
+            Some(AttachTarget::Object(bearer))
         );
     }
 }

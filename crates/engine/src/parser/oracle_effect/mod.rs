@@ -14495,6 +14495,29 @@ fn wire_optional_cast_decline_fallback(def: &mut AbilityDefinition) {
     }
 }
 
+/// CR 608.2c + CR 107.1c: "Repeat this process until … whichever comes first."
+fn try_parse_repeat_until_stop_conditions(
+    lower: &str,
+) -> Option<crate::types::ability::RepeatContinuation> {
+    let trimmed = lower.trim().trim_end_matches('.');
+    if !trimmed.starts_with("repeat this process until ") {
+        return None;
+    }
+    let rest = &trimmed["repeat this process until ".len()..];
+    let stop_on_put_to_hand = rest.contains("put a card into your hand")
+        || rest.contains("put that card into your hand");
+    let stop_on_duplicate_exiled_names = rest.contains("exile two cards with the same name")
+        || rest.contains("two cards with the same name");
+    if stop_on_put_to_hand || stop_on_duplicate_exiled_names {
+        Some(crate::types::ability::RepeatContinuation::UntilStopConditions {
+            stop_on_put_to_hand,
+            stop_on_duplicate_exiled_names,
+        })
+    } else {
+        None
+    }
+}
+
 /// Parse a compound effect chain into an `AbilityDefinition` sub-ability chain.
 ///
 /// Phase 1 keeps the existing clause/effect semantics but replaces the fragile
@@ -15358,6 +15381,13 @@ pub(crate) fn parse_effect_chain_ir(
             }
         }
 
+        // CR 608.2c + CR 107.1c: "Repeat this process until … whichever comes
+        // first" — auto-repeat loop with game-state stop predicates (Tainted Pact).
+        if let Some(continuation) = try_parse_repeat_until_stop_conditions(&lower_check) {
+            pending_repeat_until = Some(continuation);
+            continue;
+        }
+
         // CR 608.2c + CR 107.1c: "Repeat this process" — a loop-continuation
         // directive that doesn't produce an independent effect. It is a
         // back-reference applying to the process (chain) built so far.
@@ -15962,6 +15992,26 @@ pub(crate) fn parse_effect_chain_ir(
         }
         let (is_optional, opponent_may_scope, implicit_player_scope, text) =
             strip_optional_effect_prefix(&text);
+        let (unless_same_name_condition, text) = if is_optional {
+            if let Some((stripped, unless_cond)) =
+                crate::parser::oracle_effect::conditions::strip_unless_shares_name_with_other_exiled_this_way(
+                    &text,
+                )
+            {
+                (Some(unless_cond), stripped)
+            } else {
+                (None, text)
+            }
+        } else {
+            (None, text)
+        };
+        let condition = match (condition, unless_same_name_condition) {
+            (Some(existing), Some(unless_cond)) => Some(AbilityCondition::And {
+                conditions: vec![existing, unless_cond],
+            }),
+            (None, Some(unless_cond)) => Some(unless_cond),
+            (existing, None) => existing,
+        };
         // CR 701.34a + CR 122.1: keep the whole "for each kind of counter on
         // target permanent or player, give … another counter of that kind"
         // clause intact so the targeted-proliferate recognizer in

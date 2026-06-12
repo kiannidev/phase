@@ -11167,6 +11167,15 @@ pub enum RepeatContinuation {
     /// each iteration fully resolves, the controller is prompted
     /// (`WaitingFor::RepeatDecision`) to repeat or stop.
     ControllerChoice,
+    /// CR 608.2c + CR 107.1c: "repeat this process until [stop conditions],
+    /// whichever comes first" — after each iteration fully resolves, the engine
+    /// checks the configured stop predicates and auto-repeats when none fired.
+    /// Tainted Pact: stop when the controller puts a card into their hand or
+    /// when two cards exiled this way share a name.
+    UntilStopConditions {
+        stop_on_put_to_hand: bool,
+        stop_on_duplicate_exiled_names: bool,
+    },
 }
 
 /// CR 608.2c + CR 122.1: tags a `ChooseOneOf` branch whose effect must be
@@ -11513,6 +11522,10 @@ pub enum AbilityCondition {
         reference: TargetFilter,
         quality: SharedQuality,
     },
+    /// CR 607.2a + CR 608.2c: "unless it has the same name as another card
+    /// exiled this way" — true when the resolved `target` shares a name with
+    /// any other card linked to this ability's source via `exile_links`.
+    TargetSharesNameWithOtherExiledThisWay { target: TargetFilter },
     /// CR 400.7 + CR 608.2c: True when the source permanent entered the battlefield
     /// this turn. For the "did not enter this turn" sense (e.g., Moon-Circuit Hacker
     /// "unless ~ entered this turn"), wrap with `AbilityCondition::Not`.

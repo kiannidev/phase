@@ -1326,14 +1326,17 @@ fn starts_attach_equipment_was_attached_clause(text: &str) -> bool {
 }
 
 /// True when `current` ends with the bare-and delimiter during character-by-
-/// character clause chunking (suffix is the final " and " in the buffer).
+/// character clause chunking. Must match only the terminal suffix — a naive
+/// `take_until(" and ")` from the start binds the first internal " and " (e.g.
+/// Gogo's "~ and that creature each get +2/+0 and gain …") and returns false.
 fn current_ends_with_bare_and(current: &str) -> bool {
-    all_consuming(terminated(
-        take_until::<_, _, OracleError<'_>>(" and "),
-        tag(" and "),
-    ))
-    .parse(current)
-    .is_ok()
+    const SUFFIX: &str = " and ";
+    let suffix_start = current.len().checked_sub(SUFFIX.len());
+    suffix_start.is_some_and(|start| {
+        tag::<_, _, OracleError<'_>>(SUFFIX)
+            .parse(&current[start..])
+            .is_ok()
+    })
 }
 
 /// Restricted clause-start check for bare " and " splitting (not after comma).

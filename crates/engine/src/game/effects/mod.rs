@@ -1043,6 +1043,9 @@ fn try_begin_reflexive_target_selection(
         reflexive.target_selection_mode,
         crate::types::ability::TargetSelectionMode::Random
     ) {
+        // CR 115.1d + CR 603.12: Random-mode reflexive triggers still choose
+        // the targets for the reflexive triggered ability; the seeded RNG
+        // supplies that choice without entering an interactive prompt.
         let chosen = crate::game::ability_utils::random_select_targets_for_ability(
             state,
             &target_slots,
@@ -1051,18 +1054,10 @@ fn try_begin_reflexive_target_selection(
         .map_err(|e| EffectError::InvalidParam(e.to_string()))?;
         let mut reflexive_clone = reflexive.clone();
         if let Some(parent) = parent {
-            apply_parent_chain_context(
-                &mut reflexive_clone,
-                parent,
-                effect_context_object,
-            );
+            apply_parent_chain_context(&mut reflexive_clone, parent, effect_context_object);
         }
-        crate::game::ability_utils::assign_targets_in_chain(
-            state,
-            &mut reflexive_clone,
-            &chosen,
-        )
-        .map_err(|e| EffectError::InvalidParam(e.to_string()))?;
+        crate::game::ability_utils::assign_targets_in_chain(state, &mut reflexive_clone, &chosen)
+            .map_err(|e| EffectError::InvalidParam(e.to_string()))?;
         resolve_ability_chain(state, &reflexive_clone, events, depth + 1)?;
         return Ok(true);
     }
@@ -1077,11 +1072,7 @@ fn try_begin_reflexive_target_selection(
 
     let mut reflexive_clone = reflexive.clone();
     if let Some(parent) = parent {
-        apply_parent_chain_context(
-            &mut reflexive_clone,
-            parent,
-            effect_context_object,
-        );
+        apply_parent_chain_context(&mut reflexive_clone, parent, effect_context_object);
     }
     let trigger_description = reflexive_clone
         .description
@@ -1104,10 +1095,12 @@ fn try_begin_reflexive_target_selection(
         description: trigger_description.clone(),
         may_trigger_origin: None,
         subject_match_count: None,
+        // CR 706.2 + CR 603.12: capture the live die-roll result from the
+        // creating ability so the reflexive entry can re-stamp it when it
+        // resolves as its own stack object.
         die_result: state.die_result_this_resolution,
     };
-    let trigger_events =
-        crate::game::triggers::take_pending_trigger_event_batch(state, &pending);
+    let trigger_events = crate::game::triggers::take_pending_trigger_event_batch(state, &pending);
     let pending_for_state = pending.clone();
     let entry_id = crate::game::triggers::push_pending_trigger_to_stack_with_event_batch(
         state,
@@ -1117,6 +1110,9 @@ fn try_begin_reflexive_target_selection(
     );
     state.pending_trigger = Some(pending_for_state);
     state.pending_trigger_entry = Some(entry_id);
+    // CR 115.1d + CR 603.3d: the reflexive triggered ability is on the stack
+    // before targets are chosen; finalization mutates this pending entry once
+    // the controller completes TriggerTargetSelection.
     state.waiting_for = WaitingFor::TriggerTargetSelection {
         player: controller,
         target_slots,
@@ -4172,14 +4168,8 @@ fn resolve_chain_body(
         if matches!(
             condition,
             AbilityCondition::WhenYouDo | AbilityCondition::QuantityCheck { .. }
-        ) && try_begin_reflexive_target_selection(
-            state,
-            ability,
-            None,
-            None,
-            events,
-            depth,
-        )? {
+        ) && try_begin_reflexive_target_selection(state, ability, None, None, events, depth)?
+        {
             return Ok(());
         }
     }

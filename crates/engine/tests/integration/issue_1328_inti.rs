@@ -15,6 +15,7 @@ use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
+use engine::types::keywords::Keyword;
 use engine::types::phase::Phase;
 
 use super::rules::AttackTarget;
@@ -160,10 +161,7 @@ fn inti_reflexive_counter_after_interactive_discard_choice() {
         .act(GameAction::DecideOptionalEffect { accept: true })
         .expect("accept optional discard");
     assert!(
-        matches!(
-            runner.state().waiting_for,
-            WaitingFor::DiscardChoice { .. }
-        ),
+        matches!(runner.state().waiting_for, WaitingFor::DiscardChoice { .. }),
         "multiple cards in hand must prompt DiscardChoice before reflexive targeting, got {:?}",
         runner.state().waiting_for
     );
@@ -193,5 +191,14 @@ fn inti_reflexive_counter_after_interactive_discard_choice() {
         p1p1(&runner, attacker),
         1,
         "Inti must put a +1/+1 counter on the attacker after interactive discard"
+    );
+    assert!(
+        runner
+            .state()
+            .objects
+            .get(&attacker)
+            .expect("attacker should remain on battlefield")
+            .has_keyword(&Keyword::Trample),
+        "Inti must also grant trample to the chosen attacker"
     );
 }

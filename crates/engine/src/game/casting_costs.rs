@@ -5,7 +5,7 @@ use crate::types::ability::{
     AbilityKind, AdditionalCost, BeholdCostAction, CastTimingPermission, CostPaidObjectSnapshot,
     CounterCostSelection, Effect, KickerVariant, QuantityExpr, QuantityRef, ReplacementDefinition,
     ResolvedAbility, SacrificeCost, SacrificeRequirement, SpellCastingOptionKind, StaticCondition,
-    TargetFilter, TypedFilter, TypeFilter, EXILE_COST_X,
+    TargetFilter, TypeFilter, TypedFilter, EXILE_COST_X,
 };
 use crate::types::events::{GameEvent, ManaTapState};
 use crate::types::game_state::{
@@ -13854,8 +13854,7 @@ its replicate cost was paid.)\nDraw a card.";
         {
             let obj = state.objects.get_mut(&spell).unwrap();
             obj.card_types.core_types.push(CoreType::Creature);
-            obj.keywords
-                .push(Keyword::Offering("Artifact".to_string()));
+            obj.keywords.push(Keyword::Offering("Artifact".to_string()));
             obj.mana_cost = ManaCost::NoCost;
         }
 

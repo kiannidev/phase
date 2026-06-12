@@ -5,7 +5,7 @@
 
 use engine::game::ability_utils::build_resolved_from_def;
 use engine::game::effects::resolve_ability_chain;
-use engine::game::scenario::{GameScenario, GameRunner, P0};
+use engine::game::scenario::{GameRunner, GameScenario, P0};
 use engine::game::zones::move_to_library_position;
 use engine::parser::oracle_effect::parse_effect_chain;
 use engine::types::ability::AbilityKind;
@@ -54,9 +54,15 @@ fn tainted_pact_repeats_until_controller_puts_a_card_into_hand() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
 
-    let third = scenario.add_spell_to_library_top(P0, "Third Card", true).id();
-    let second = scenario.add_spell_to_library_top(P0, "Second Card", true).id();
-    let first = scenario.add_spell_to_library_top(P0, "First Card", true).id();
+    let third = scenario
+        .add_spell_to_library_top(P0, "Third Card", true)
+        .id();
+    let second = scenario
+        .add_spell_to_library_top(P0, "Second Card", true)
+        .id();
+    let first = scenario
+        .add_spell_to_library_top(P0, "First Card", true)
+        .id();
 
     let mut runner = scenario.build();
     put_library_top(&mut runner, first);
@@ -108,8 +114,14 @@ fn tainted_pact_stops_when_two_exiled_cards_share_a_name() {
         runner.state().objects.get(&bolt_b).unwrap().zone,
         Zone::Exile
     );
-    assert_eq!(runner.state().objects.get(&island).unwrap().zone, Zone::Exile);
-    assert_eq!(runner.state().objects.get(&bolt_a).unwrap().zone, Zone::Exile);
+    assert_eq!(
+        runner.state().objects.get(&island).unwrap().zone,
+        Zone::Exile
+    );
+    assert_eq!(
+        runner.state().objects.get(&bolt_a).unwrap().zone,
+        Zone::Exile
+    );
     assert!(
         !matches!(
             runner.state().waiting_for,

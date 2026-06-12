@@ -7,14 +7,12 @@ use engine::game::combat::AttackTarget;
 use engine::game::layers::evaluate_layers;
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::parser::oracle::{keyword_display_name, parse_oracle_text};
-use engine::types::ability::{
-    ContinuousModification, FilterProp, TargetFilter, TypedFilter,
-};
+use engine::types::ability::{ContinuousModification, FilterProp, TargetFilter, TypedFilter};
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::{CastPaymentMode, WaitingFor};
 use engine::types::keywords::Keyword;
-use engine::types::mana::{ManaCost, ManaCostShard, ManaColor};
+use engine::types::mana::{ManaColor, ManaCost, ManaCostShard};
 use engine::types::phase::Phase;
 use engine::types::statics::StaticMode;
 use engine::types::zones::Zone;
@@ -54,12 +52,14 @@ fn blast_furnace_hellkite_parses_artifact_offering_and_attacking_opponents_stati
         .iter()
         .find(|s| {
             matches!(s.mode, StaticMode::Continuous)
-                && s.modifications.iter().any(|m| matches!(
-                    m,
-                    ContinuousModification::AddKeyword {
-                        keyword: Keyword::DoubleStrike
-                    }
-                ))
+                && s.modifications.iter().any(|m| {
+                    matches!(
+                        m,
+                        ContinuousModification::AddKeyword {
+                            keyword: Keyword::DoubleStrike
+                        }
+                    )
+                })
         })
         .expect("expected continuous double strike static");
 
@@ -87,8 +87,7 @@ fn blast_furnace_hellkite_parses_artifact_offering_and_attacking_opponents_stati
 fn blast_furnace_hellkite_grants_double_strike_to_creature_attacking_opponent() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    scenario
-        .add_creature_from_oracle(P0, "Blast-Furnace Hellkite", 5, 5, BLAST_FURNACE_ORACLE);
+    scenario.add_creature_from_oracle(P0, "Blast-Furnace Hellkite", 5, 5, BLAST_FURNACE_ORACLE);
     let attacker = scenario.add_creature(P0, "Raider", 2, 2).id();
     let mut runner = scenario.build();
 
@@ -170,10 +169,7 @@ fn blast_furnace_hellkite_offering_prompts_artifact_sacrifice() {
         .expect("accept Artifact offering");
 
     assert!(
-        matches!(
-            runner.state().waiting_for,
-            WaitingFor::PayCost { .. }
-        ),
+        matches!(runner.state().waiting_for, WaitingFor::PayCost { .. }),
         "expected sacrifice target selection for offering, got {:?}",
         runner.state().waiting_for
     );

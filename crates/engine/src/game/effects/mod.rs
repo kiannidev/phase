@@ -570,10 +570,7 @@ fn should_stop_repeat_until(
         }
     }
     stop_on_duplicate_exiled_names
-        && crate::game::exile_links::duplicate_name_among_exiled_by_source(
-            state,
-            ability.source_id,
-        )
+        && crate::game::exile_links::duplicate_name_among_exiled_by_source(state, ability.source_id)
 }
 
 /// CR 303.4f + CR 614.12b + CR 614.1c + CR 614.13: Resume a multi-target
@@ -3775,27 +3772,24 @@ pub fn resolve_ability_chain(
         Some(RepeatContinuation::UntilStopConditions {
             stop_on_put_to_hand,
             stop_on_duplicate_exiled_names,
-        }) => {
-            loop {
-                let initial_waiting_for = state.waiting_for.clone();
-                resolve_chain_body(state, &ability, events, depth)?;
-                if state.waiting_for != initial_waiting_for {
-                    state.pending_repeat_until =
-                        Some(crate::types::game_state::PendingRepeatUntil {
-                            ability: Box::new(ability.clone()),
-                        });
-                    return Ok(());
-                }
-                if should_stop_repeat_until(
-                    state,
-                    &ability,
-                    stop_on_put_to_hand,
-                    stop_on_duplicate_exiled_names,
-                ) {
-                    return Ok(());
-                }
+        }) => loop {
+            let initial_waiting_for = state.waiting_for.clone();
+            resolve_chain_body(state, ability, events, depth)?;
+            if state.waiting_for != initial_waiting_for {
+                state.pending_repeat_until = Some(crate::types::game_state::PendingRepeatUntil {
+                    ability: Box::new(ability.clone()),
+                });
+                return Ok(());
             }
-        }
+            if should_stop_repeat_until(
+                state,
+                ability,
+                stop_on_put_to_hand,
+                stop_on_duplicate_exiled_names,
+            ) {
+                return Ok(());
+            }
+        },
     }
 }
 

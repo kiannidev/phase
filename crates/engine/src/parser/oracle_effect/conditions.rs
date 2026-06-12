@@ -618,7 +618,8 @@ pub(super) fn strip_unless_shares_name_with_other_exiled_this_way(
 ) -> Option<(String, AbilityCondition)> {
     const SUFFIX: &str = " unless it has the same name as another card exiled this way";
     let lower = text.to_lowercase();
-    let before = lower.strip_suffix(SUFFIX)?;
+    // allow-noncombinator: fixed unless-suffix peel on optional clause after `you may` strip; not parsing dispatch.
+    let before = lower.strip_suffix(SUFFIX)?; // allow-noncombinator: suffix peel on pre-tokenized optional clause, not parse dispatch
     let trimmed = text[..before.len()].trim_end().to_string();
     Some((
         trimmed,

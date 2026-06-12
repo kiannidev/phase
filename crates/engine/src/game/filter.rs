@@ -2734,6 +2734,9 @@ fn matches_filter_prop(
                     && source.controller.is_some_and(|sc| a.defending_player == sc)
             })
         }),
+        // CR 508.1b: Matches attacking creatures whose defending player is an
+        // opponent of the filter's source controller ("creatures attacking your
+        // opponents" — Blast-Furnace Hellkite).
         FilterProp::AttackingOpponent => state.combat.as_ref().is_some_and(|combat| {
             combat.attackers.iter().any(|a| {
                 a.object_id == object_id
@@ -3544,6 +3547,8 @@ fn zone_change_record_matches_property(
             record.combat_status.attacking
                 && source.controller == record.combat_status.defending_player
         }
+        // CR 508.1b: Zone-change snapshot for "creatures attacking your opponents"
+        // static grants (Blast-Furnace Hellkite).
         FilterProp::AttackingOpponent => {
             record.combat_status.attacking
                 && source.controller.is_some_and(|sc| {

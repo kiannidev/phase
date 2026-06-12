@@ -119,7 +119,9 @@ pub(crate) fn duplicate_name_among_exiled_by_source(
         .map(|obj| obj.name.as_str())
         .collect();
     names.sort_unstable();
-    names.windows(2).any(|pair| pair[0].eq_ignore_ascii_case(pair[1]))
+    names
+        .windows(2)
+        .any(|pair| pair[0].eq_ignore_ascii_case(pair[1]))
 }
 
 /// CR 607.2a: True when `card_id` shares a name with another card linked to

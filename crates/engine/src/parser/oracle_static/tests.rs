@@ -5099,8 +5099,7 @@ fn static_attacking_creatures_you_control_have_double_strike() {
 
 #[test]
 fn static_creatures_attacking_your_opponents_have_double_strike() {
-    let def =
-        parse_static_line("Creatures attacking your opponents have double strike.").unwrap();
+    let def = parse_static_line("Creatures attacking your opponents have double strike.").unwrap();
     assert_eq!(def.mode, StaticMode::Continuous);
     assert_eq!(
         def.affected,

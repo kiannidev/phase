@@ -14500,19 +14500,23 @@ fn try_parse_repeat_until_stop_conditions(
     lower: &str,
 ) -> Option<crate::types::ability::RepeatContinuation> {
     let trimmed = lower.trim().trim_end_matches('.');
+    // allow-noncombinator: fixed repeat-until directive classification on pre-normalized lowercase; consumed before generic repeat-this-process nom dispatch.
     if !trimmed.starts_with("repeat this process until ") {
+        // allow-noncombinator: fixed directive prefix probe, not parse dispatch
         return None;
     }
     let rest = &trimmed["repeat this process until ".len()..];
-    let stop_on_put_to_hand = rest.contains("put a card into your hand")
-        || rest.contains("put that card into your hand");
-    let stop_on_duplicate_exiled_names = rest.contains("exile two cards with the same name")
-        || rest.contains("two cards with the same name");
+    let stop_on_put_to_hand = rest.contains("put a card into your hand") // allow-noncombinator: stop-predicate scan in fixed Tainted Pact until template
+        || rest.contains("put that card into your hand"); // allow-noncombinator: stop-predicate scan in fixed Tainted Pact until template
+    let stop_on_duplicate_exiled_names = rest.contains("exile two cards with the same name") // allow-noncombinator: stop-predicate scan in fixed Tainted Pact until template
+        || rest.contains("two cards with the same name"); // allow-noncombinator: stop-predicate scan in fixed Tainted Pact until template
     if stop_on_put_to_hand || stop_on_duplicate_exiled_names {
-        Some(crate::types::ability::RepeatContinuation::UntilStopConditions {
-            stop_on_put_to_hand,
-            stop_on_duplicate_exiled_names,
-        })
+        Some(
+            crate::types::ability::RepeatContinuation::UntilStopConditions {
+                stop_on_put_to_hand,
+                stop_on_duplicate_exiled_names,
+            },
+        )
     } else {
         None
     }

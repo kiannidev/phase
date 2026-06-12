@@ -5234,12 +5234,9 @@ fn phase_out_or_in_filter_is_mass(filter: &TargetFilter) -> bool {
     match filter {
         TargetFilter::Controller | TargetFilter::Player | TargetFilter::ScopedPlayer => true,
         TargetFilter::Typed(tf) => {
-            tf.type_filters.contains(&TypeFilter::Permanent)
-                && !tf
-                    .type_filters
-                    .iter()
-                    .any(|t| matches!(t, TypeFilter::Creature))
+            tf.type_filters == [TypeFilter::Permanent]
                 && tf.controller.is_some()
+                && tf.properties.is_empty()
         }
         _ => false,
     }
@@ -11153,6 +11150,23 @@ pub mod tests {
         assert!(
             extract_target_filter_from_effect(&effect).is_some(),
             "targeted PhaseOut{{Creature}} must generate a target slot"
+        );
+    }
+
+    /// CR 115.1: "Any number of target nonland permanents you control phase
+    /// out" uses declared targets even though the filter is controller-scoped.
+    #[test]
+    fn extract_target_keeps_targeted_phase_out_nonland_permanents_you_control() {
+        let effect = Effect::PhaseOut {
+            target: TargetFilter::Typed(
+                TypedFilter::permanent()
+                    .with_type(TypeFilter::Non(Box::new(TypeFilter::Land)))
+                    .controller(ControllerRef::You),
+            ),
+        };
+        assert!(
+            extract_target_filter_from_effect(&effect).is_some(),
+            "targeted PhaseOut{{Nonland Permanent, You}} must generate a target slot"
         );
     }
 

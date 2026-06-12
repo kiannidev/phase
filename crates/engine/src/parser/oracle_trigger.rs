@@ -199,6 +199,15 @@ fn self_recursion_trigger_zone(
         } if destination.is_none_or(|zone| zone == Zone::Hand) => {
             parse_self_return_origin_zone(source_lower)
         }
+        // CR 603.10a + CR 603.7a: A trigger whose effect schedules a delayed
+        // self-return ("return this card from your graveyard ... at the
+        // beginning of the next end step", Prized Amalgam) fires while the
+        // source is in that origin zone — so the origin zone of the delayed
+        // trigger's inner self-return is the firing zone. Descend into the
+        // carried effect to surface it.
+        crate::types::ability::Effect::CreateDelayedTrigger { effect, .. } => {
+            self_recursion_trigger_zone(effect, source_lower)
+        }
         _ => ability
             .sub_ability
             .as_deref()
@@ -2512,7 +2521,10 @@ fn static_condition_to_trigger_condition(sc: &StaticCondition) -> Option<Trigger
 
         // CR 601.2 + CR 611.3a: "as long as it was cast" — 1:1 bridge to the
         // trigger-side cast-origin check (same `cast_from_zone` field).
-        StaticCondition::WasCast { zone } => Some(TriggerCondition::WasCast { zone: *zone }),
+        StaticCondition::WasCast { zone } => Some(TriggerCondition::WasCast {
+            zone: *zone,
+            controller: None,
+        }),
 
         // CR 702.176a + CR 603.4: Impending's battlefield trigger checks the
         // persistent alternative-cost marker, not whether it was paid this turn.
@@ -2702,6 +2714,67 @@ fn static_condition_to_trigger_condition(sc: &StaticCondition) -> Option<Trigger
     }
 }
 
+/// CR 603.4 + CR 601.2 + CR 603.2c + CR 603.10a: Build the disjunctive
+/// "entered-from-graveyard OR cast-from-graveyard" intervening-if.
+///
+/// The entering object either changed zones into the battlefield from a
+/// graveyard (`ZoneChangeObjectMatchesFilter`) or was a spell cast from a
+/// graveyard (`WasCast`). `owner` carries the graveyard's owner scope: "your
+/// graveyard" (Prized Amalgam) restricts the entered-from filter to objects you
+/// own; "a graveyard" (any graveyard) leaves it unrestricted.
+fn graveyard_origin_or_condition(owner: Option<ControllerRef>) -> TriggerCondition {
+    let filter = match owner {
+        Some(ref controller) => with_owner_scope(TargetFilter::Any, controller.clone()),
+        None => TargetFilter::Any,
+    };
+    TriggerCondition::Or {
+        conditions: vec![
+            TriggerCondition::ZoneChangeObjectMatchesFilter {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Battlefield,
+                filter,
+            },
+            TriggerCondition::WasCast {
+                zone: Some(Zone::Graveyard),
+                controller: owner,
+            },
+        ],
+    }
+}
+
+/// CR 603.4 + CR 603.10a: Recognize the "entered/was-cast from graveyard"
+/// disjunctive intervening-if as a single nom combinator covering the whole
+/// class — both the compact "a graveyard" form (Twilight Diviner) and the
+/// owner-scoped "your graveyard" form with an explicit "you cast it" arm
+/// (Prized Amalgam). Returns the parsed condition; the caller excises the
+/// matched clause from the effect text.
+///
+/// Grammar (subject anaphor × graveyard-origin disjunction):
+///   "if " ( "it " | "they " )
+///   ( <compact-form> | <split-your-form> )
+/// where
+///   <compact-form>     = "entered or " ( "was" | "were" ) " cast from a graveyard"
+///   <split-your-form>  = "entered from your graveyard or you cast it from your graveyard"
+fn parse_graveyard_origin_intervening_if(input: &str) -> OracleResult<'_, TriggerCondition> {
+    let (rest, _) = tag("if ").parse(input)?;
+    let (rest, _) = alt((tag("it "), tag("they "))).parse(rest)?;
+    // Compact "a graveyard" form: "entered or (was|were) cast from a graveyard".
+    let compact = map(
+        (
+            tag("entered or "),
+            alt((tag("was"), tag("were"))),
+            tag(" cast from a graveyard"),
+        ),
+        |_| graveyard_origin_or_condition(None),
+    );
+    // Owner-scoped "your graveyard" form with an explicit "you cast it" arm.
+    let split_your = map(
+        tag("entered from your graveyard or you cast it from your graveyard"),
+        |_| graveyard_origin_or_condition(Some(ControllerRef::You)),
+    );
+    alt((compact, split_your)).parse(rest)
+}
+
 /// Extract an intervening-if condition from effect text.
 /// Returns (cleaned effect text, optional condition).
 ///
@@ -2751,34 +2824,28 @@ fn extract_if_condition(text: &str) -> (String, Option<TriggerCondition>) {
         if !after.starts_with(" from") {
             return (
                 strip_condition_clause(text, pos, "if you cast it".len()),
-                Some(TriggerCondition::WasCast { zone: None }),
+                Some(TriggerCondition::WasCast {
+                    zone: None,
+                    controller: None,
+                }),
             );
         }
     }
 
-    // CR 603.4 + CR 601.2 + CR 603.2c: "if it/they entered or w(as|ere) cast from a graveyard"
-    // allow-noncombinator: structural if-clause excision, not parse dispatch
-    for pattern in &[
-        "if they entered or were cast from a graveyard",
-        "if it entered or was cast from a graveyard",
-    ] {
-        if let Some(pos) = tp.find(pattern) {
-            return (
-                strip_condition_clause(text, pos, pattern.len()),
-                Some(TriggerCondition::Or {
-                    conditions: vec![
-                        TriggerCondition::ZoneChangeObjectMatchesFilter {
-                            origin: Some(Zone::Graveyard),
-                            destination: Zone::Battlefield,
-                            filter: TargetFilter::Any,
-                        },
-                        TriggerCondition::WasCast {
-                            zone: Some(Zone::Graveyard),
-                        },
-                    ],
-                }),
-            );
-        }
+    // CR 603.4 + CR 601.2 + CR 603.2c + CR 603.10a: disjunctive
+    // "entered/was-cast from [a|your] graveyard" intervening-if. Scan at word
+    // boundaries so the clause is recognized wherever it sits in the effect
+    // text; `parse_graveyard_origin_intervening_if` covers both the compact
+    // "a graveyard" form and the owner-scoped "your graveyard" form (Prized
+    // Amalgam) as one combinator.
+    if let Some((prefix, condition, rest)) =
+        scan_preceded(&lower, parse_graveyard_origin_intervening_if)
+    {
+        let clause_len = lower.len() - prefix.len() - rest.len();
+        return (
+            strip_condition_clause(text, prefix.len(), clause_len),
+            Some(condition),
+        );
     }
 
     // CR 603.4 + CR 601.2: "if none of them were cast or no mana was spent to cast them" —
@@ -2791,7 +2858,10 @@ fn extract_if_condition(text: &str) -> (String, Option<TriggerCondition>) {
             Some(TriggerCondition::Or {
                 conditions: vec![
                     TriggerCondition::Not {
-                        condition: Box::new(TriggerCondition::WasCast { zone: None }),
+                        condition: Box::new(TriggerCondition::WasCast {
+                            zone: None,
+                            controller: None,
+                        }),
                     },
                     TriggerCondition::ManaSpentCondition {
                         text: "no mana was spent to cast them".to_string(),
@@ -2827,7 +2897,10 @@ fn extract_if_condition(text: &str) -> (String, Option<TriggerCondition>) {
     if let Some(pos) = was_cast_pos {
         return (
             strip_condition_clause(text, pos, "if it was cast".len()),
-            Some(TriggerCondition::WasCast { zone: None }),
+            Some(TriggerCondition::WasCast {
+                zone: None,
+                controller: None,
+            }),
         );
     }
 
@@ -2836,7 +2909,10 @@ fn extract_if_condition(text: &str) -> (String, Option<TriggerCondition>) {
         return (
             strip_condition_clause(text, pos, "if it wasn't cast".len()),
             Some(TriggerCondition::Not {
-                condition: Box::new(TriggerCondition::WasCast { zone: None }),
+                condition: Box::new(TriggerCondition::WasCast {
+                    zone: None,
+                    controller: None,
+                }),
             }),
         );
     }
@@ -6044,6 +6120,40 @@ fn split_taps_for_mana_for_clause(text: &str) -> Option<(String, Option<Vec<Mana
     Some((subject.to_string(), produced))
 }
 
+/// CR 509.1h: Strip a trailing "and isn't/aren't blocked" qualifier from attack
+/// trigger event text. Covers singular self-referential phrasing ("attacks and
+/// isn't blocked", Frenzy) and plural batched phrasing ("attack you and aren't
+/// blocked", Coveted Jewel).
+fn strip_attack_unblocked_qualifier(after: &str) -> (bool, &str) {
+    fn parse_suffix(input: &str) -> OracleResult<'_, &str> {
+        alt((
+            terminated(take_until(" and isn't blocked"), tag(" and isn't blocked")),
+            terminated(
+                take_until(" and isn\u{2019}t blocked"),
+                tag(" and isn\u{2019}t blocked"),
+            ),
+            terminated(
+                take_until(" and aren't blocked"),
+                tag(" and aren't blocked"),
+            ),
+            terminated(
+                take_until(" and aren\u{2019}t blocked"),
+                tag(" and aren\u{2019}t blocked"),
+            ),
+            terminated(
+                take_until(" and are not blocked"),
+                tag(" and are not blocked"),
+            ),
+        ))
+        .parse(input)
+    }
+
+    if let Ok((_, rest)) = all_consuming(parse_suffix).parse(after) {
+        return (true, rest);
+    }
+    (false, after)
+}
+
 /// Try to parse an event verb and build a TriggerDefinition from subject + event.
 fn try_parse_event(
     subject: &TargetFilter,
@@ -6284,15 +6394,7 @@ fn try_parse_event(
                 .filter(|r| !r.starts_with("er") && !r.starts_with("ing"))
         });
     if let Some(after) = attacks_result {
-        let attacks_and_isnt_blocked = value(
-            (),
-            alt((
-                tag::<_, _, OracleError<'_>>(" and isn't blocked"),
-                tag(" and isn\u{2019}t blocked"),
-            )),
-        )
-        .parse(after)
-        .is_ok();
+        let (attacks_and_unblocked, after) = strip_attack_unblocked_qualifier(after);
         // CR 508.3a: Detect attack target qualifier ("attacks a planeswalker" etc.)
         fn parse_attack_target(input: &str) -> OracleResult<'_, AttackTargetFilter> {
             alt((
@@ -6330,8 +6432,10 @@ fn try_parse_event(
                 attack_target_filter,
                 Some(AttackTargetFilter::PlayerOrPlaneswalker) | Some(AttackTargetFilter::Player)
             ) && tag::<_, _, OracleError<'_>>(" you").parse(after).is_ok();
-        def.mode = if attacks_and_isnt_blocked && matches!(subject, TargetFilter::SelfRef) {
+        def.mode = if attacks_and_unblocked && matches!(subject, TargetFilter::SelfRef) {
             TriggerMode::AttackerUnblocked
+        } else if attacks_and_unblocked {
+            TriggerMode::YouAttackUnblocked
         } else if is_opponent_attacks_you {
             TriggerMode::AttackersDeclared
         } else {
@@ -11579,13 +11683,13 @@ mod tests {
     use crate::parser::oracle_ir::context::ParseContext;
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
     use crate::types::ability::{
-        AbilityCondition, AbilityCost, AbilityKind, AggregateFunction, AttackScope, AttackSubject,
-        BounceSelection, CardSelectionMode, CastingPermission, ChosenAttribute, Comparator,
-        ContinuousModification, ControllerRef, CountScope, DamageModification, DamageSource,
-        DelayedTriggerCondition, DiscardSelfScope, Duration, Effect, EffectScope, FilterProp,
-        ManaProduction, ManaSpendPermission, ObjectScope, PlayerFilter, PlayerScope, PtStat,
-        PtValue, PtValueScope, QuantityExpr, QuantityRef, SharedQuality, TapStateChange,
-        TargetFilter, TypeFilter, TypedFilter,
+        AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
+        AttackScope, AttackSubject, BounceSelection, CardSelectionMode, CastingPermission,
+        ChosenAttribute, Comparator, ContinuousModification, ControllerRef, CountScope,
+        DamageModification, DamageSource, DelayedTriggerCondition, DiscardSelfScope, Duration,
+        Effect, EffectScope, FilterProp, ManaProduction, ManaSpendPermission, ObjectScope,
+        PlayerFilter, PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
+        SharedQuality, TapStateChange, TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::counter::{CounterMatch, CounterType};
     use crate::types::game_state::WaitingFor;
@@ -12870,6 +12974,83 @@ mod tests {
             }
             other => panic!("Expected Mill, got {other:?}"),
         }
+    }
+
+    /// Issue #1354 — full Coveted Jewel Oracle must retain the unblocked-attack trigger.
+    #[test]
+    fn coveted_jewel_full_oracle_parses_you_attack_unblocked_trigger() {
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            "When this artifact enters, draw three cards.\n\
+             {T}: Add three mana of any one color.\n\
+             Whenever one or more creatures an opponent controls attack you and aren't blocked, \
+             that player draws three cards and gains control of this artifact. Untap it.",
+            "Coveted Jewel",
+            &[],
+            &["Artifact".to_string()],
+            &[],
+        );
+        assert!(
+            parsed
+                .triggers
+                .iter()
+                .any(|trigger| { matches!(trigger.mode, TriggerMode::YouAttackUnblocked) }),
+            "expected YouAttackUnblocked among {:?}",
+            parsed
+                .triggers
+                .iter()
+                .map(|trigger| format!("{:?}", trigger.mode))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Issue #1354 — Coveted Jewel: plural "aren't blocked" on a batched opponent-
+    /// creature attack must fire after blockers are declared, not at attack declaration.
+    #[test]
+    fn trigger_opponent_creatures_attack_you_and_arent_blocked_uses_you_attack_unblocked() {
+        let def = parse_trigger_line(
+            "Whenever one or more creatures an opponent controls attack you and aren't blocked, that player draws three cards and gains control of this artifact. Untap it.",
+            "Coveted Jewel",
+        );
+        assert_eq!(def.mode, TriggerMode::YouAttackUnblocked);
+        assert!(def.batched);
+        assert_eq!(def.attack_target_filter, Some(AttackTargetFilter::Player));
+        assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+        let execute = def.execute.as_ref().expect("trigger should have effect");
+        fn effect_chain_contains_give_control_self(ability: &AbilityDefinition) -> bool {
+            match ability.effect.as_ref() {
+                Effect::GiveControl {
+                    target: TargetFilter::SelfRef,
+                    ..
+                } => true,
+                _ => ability
+                    .sub_ability
+                    .as_ref()
+                    .is_some_and(|sub| effect_chain_contains_give_control_self(sub)),
+            }
+        }
+        fn effect_chain_contains_untap_self(ability: &AbilityDefinition) -> bool {
+            match ability.effect.as_ref() {
+                Effect::SetTapState {
+                    target: TargetFilter::SelfRef,
+                    scope: EffectScope::Single,
+                    state: TapStateChange::Untap,
+                } => true,
+                _ => ability
+                    .sub_ability
+                    .as_ref()
+                    .is_some_and(|sub| effect_chain_contains_untap_self(sub)),
+            }
+        }
+        assert!(
+            effect_chain_contains_give_control_self(execute),
+            "expected GiveControl of SelfRef in effect chain, got {:?}",
+            execute.effect
+        );
+        assert!(
+            effect_chain_contains_untap_self(execute),
+            "expected Untap of SelfRef in effect chain, got {:?}",
+            execute.effect
+        );
     }
 
     #[test]
@@ -25345,7 +25526,10 @@ mod tests {
                 assert_eq!(
                     conditions[0],
                     TriggerCondition::Not {
-                        condition: Box::new(TriggerCondition::WasCast { zone: None }),
+                        condition: Box::new(TriggerCondition::WasCast {
+                            zone: None,
+                            controller: None,
+                        }),
                     }
                 );
                 assert!(
@@ -25375,7 +25559,10 @@ mod tests {
         assert_eq!(
             def.condition,
             Some(TriggerCondition::Not {
-                condition: Box::new(TriggerCondition::WasCast { zone: None }),
+                condition: Box::new(TriggerCondition::WasCast {
+                    zone: None,
+                    controller: None,
+                }),
             })
         );
     }
@@ -28340,7 +28527,8 @@ mod snapshot_tests {
                 assert_eq!(
                     conditions[1],
                     TriggerCondition::WasCast {
-                        zone: Some(Zone::Graveyard)
+                        zone: Some(Zone::Graveyard),
+                        controller: None
                     }
                 );
             }
@@ -28368,7 +28556,8 @@ mod snapshot_tests {
                 assert_eq!(
                     conditions[1],
                     TriggerCondition::WasCast {
-                        zone: Some(Zone::Graveyard)
+                        zone: Some(Zone::Graveyard),
+                        controller: None
                     }
                 );
             }
@@ -28381,7 +28570,8 @@ mod snapshot_tests {
 mod slicer_control_handoff_tests {
     use crate::parser::oracle::parse_oracle_text;
     use crate::types::ability::{
-        AbilityDefinition, ControllerRef, Effect, EffectScope, TapStateChange, TargetFilter,
+        AbilityDefinition, ControllerRef, Effect, EffectScope, FilterProp, TapStateChange,
+        TargetFilter,
     };
     use crate::types::TriggerMode;
 
@@ -28582,5 +28772,97 @@ mod slicer_control_handoff_tests {
             "ExileTop player must be TriggeringPlayer (the damaged player), got {:?}",
             exile_player
         );
+    }
+
+    /// CR 603.10 + CR 603.4 (issue #2861): Prized Amalgam is a graveyard-zone
+    /// delayed-return trigger. It fires from the graveyard whenever *another*
+    /// creature enters, gated by the intervening-if "if it entered from your
+    /// graveyard or you cast it from your graveyard". The parser must:
+    ///   1. set `trigger_zones = [Graveyard]` (the source is in the graveyard
+    ///      when it fires — NOT the battlefield default), and
+    ///   2. attach the graveyard-origin intervening-if condition (not `None`).
+    #[test]
+    fn prized_amalgam_graveyard_origin_intervening_if() {
+        use crate::types::ability::TriggerCondition;
+        use crate::types::Zone;
+        let parsed = parse_oracle_text(
+            "Whenever a creature enters, if it entered from your graveyard or \
+             you cast it from your graveyard, return this card from your graveyard \
+             to the battlefield tapped at the beginning of the next end step.",
+            "Prized Amalgam",
+            &[],
+            &["Creature".into()],
+            &["Zombie".into()],
+        );
+        let def = parsed
+            .triggers
+            .iter()
+            .find(|t| matches!(t.mode, TriggerMode::ChangesZone))
+            .expect("ChangesZone trigger must parse");
+        // (1) graveyard-zone trigger: the source lives in the graveyard.
+        assert!(
+            def.trigger_zones.contains(&Zone::Graveyard),
+            "trigger must fire from the graveyard, got trigger_zones={:?}",
+            def.trigger_zones
+        );
+        assert!(
+            !def.trigger_zones.contains(&Zone::Battlefield),
+            "trigger must NOT fire from the battlefield, got trigger_zones={:?}",
+            def.trigger_zones
+        );
+        // (2) graveyard-origin intervening-if must be preserved (not dropped).
+        let condition = def
+            .condition
+            .as_ref()
+            .expect("graveyard-origin intervening-if must be parsed, got condition=None");
+        // Must reference the graveyard origin (entered-from or cast-from).
+        fn references_graveyard_origin(c: &TriggerCondition) -> bool {
+            match c {
+                TriggerCondition::ZoneChangeObjectMatchesFilter {
+                    origin: Some(Zone::Graveyard),
+                    ..
+                } => true,
+                TriggerCondition::WasCast {
+                    zone: Some(Zone::Graveyard),
+                    ..
+                } => true,
+                TriggerCondition::Or { conditions } | TriggerCondition::And { conditions } => {
+                    conditions.iter().any(references_graveyard_origin)
+                }
+                TriggerCondition::Not { condition } => references_graveyard_origin(condition),
+                _ => false,
+            }
+        }
+        assert!(
+            references_graveyard_origin(condition),
+            "condition must gate on graveyard origin, got {condition:?}"
+        );
+        match condition {
+            TriggerCondition::Or { conditions } => {
+                assert!(
+                    matches!(
+                        &conditions[0],
+                        TriggerCondition::ZoneChangeObjectMatchesFilter {
+                            filter: TargetFilter::Typed(typed),
+                            ..
+                        } if typed.properties.contains(&FilterProp::Owned {
+                            controller: ControllerRef::You
+                        })
+                    ),
+                    "entered-from-your-graveyard branch must be owner-scoped to you, got {condition:?}"
+                );
+                assert!(
+                    matches!(
+                        &conditions[1],
+                        TriggerCondition::WasCast {
+                            zone: Some(Zone::Graveyard),
+                            controller: Some(ControllerRef::You),
+                        }
+                    ),
+                    "cast-from-your-graveyard branch must be caster-scoped to you, got {condition:?}"
+                );
+            }
+            other => panic!("expected Or condition, got {other:?}"),
+        }
     }
 }

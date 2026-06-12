@@ -3280,7 +3280,7 @@ pub(super) fn parse_utility_imperative_ast(
             return Some(UtilityImperativeAst::SwitchPT { target });
         }
     }
-    // CR 400.7c + CR 608.2g: Zack Fair — "attach an Equipment that was attached
+    // CR 400.7j + CR 608.2h: Zack Fair — "attach an Equipment that was attached
     // to ~ to that creature". The attachment is battlefield Equipment whose
     // host was the ability source (including LKI after self-sacrifice).
     if let Some(((), recipient_text)) = nom_on_lower(text, lower, |input| {

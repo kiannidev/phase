@@ -22,7 +22,7 @@ pub fn resolve(
         _ => (&TargetFilter::SelfRef, &TargetFilter::Any),
     };
 
-    // CR 701.27a + CR 607.2a: Typed attachment operands resolve from the
+    // CR 608.2h + CR 608.2k: Typed attachment operands resolve from the
     // battlefield/LKI unless they are explicit player-chosen targets.
     // Typed/scan-based attachment filters (e.g. "Equipment attached to ~") resolve
     // from the battlefield/LKI, not from explicit target slots. Consuming
@@ -226,7 +226,7 @@ fn strip_attached_to_source_prop(filter: &TargetFilter) -> TargetFilter {
     }
 }
 
-/// CR 400.7c + CR 608.2g: Zack Fair — after self-sacrifice the Equipment operand
+/// CR 400.7j + CR 608.2h: Zack Fair — after self-sacrifice the Equipment operand
 /// is no longer `AttachedToSource` on the battlefield; resolve it from the
 /// source's departure attachment snapshot instead of the global filter predicate.
 fn resolve_attached_to_source_lki_attachment(
@@ -240,24 +240,22 @@ fn resolve_attached_to_source_lki_attachment(
     let source_id = ability.source_id;
     let ctx = FilterContext::from_ability(ability);
     let without_attached = strip_attached_to_source_prop(filter);
-    let mut candidates = Vec::new();
-    for record in state
-        .sacrificed_permanents_this_turn
+    state
+        .zone_changes_this_turn
         .iter()
-        .chain(state.zone_changes_this_turn.iter())
-    {
-        if record.object_id != source_id {
-            continue;
-        }
-        for snap in &record.attachments {
-            if state.objects.contains_key(&snap.object_id)
-                && matches_target_filter(state, snap.object_id, &without_attached, &ctx)
-            {
-                candidates.push(snap.object_id);
-            }
-        }
-    }
-    candidates.into_iter().next()
+        .rev()
+        .find(|record| record.object_id == source_id)
+        .and_then(|record| {
+            record.attachments.iter().find_map(|snap| {
+                if state.objects.contains_key(&snap.object_id)
+                    && matches_target_filter(state, snap.object_id, &without_attached, &ctx)
+                {
+                    Some(snap.object_id)
+                } else {
+                    None
+                }
+            })
+        })
 }
 
 /// CR 701.3c: Attaching to a different object gives the attachment a new timestamp.
@@ -554,8 +552,12 @@ pub(crate) fn unattach(state: &mut GameState, attachment_id: ObjectId) -> Option
 mod tests {
     use super::*;
     use crate::game::zones::create_object;
-    use crate::types::ability::{ControllerRef, StaticDefinition, TargetFilter};
+    use crate::types::ability::{
+        AttachmentKind, ControllerRef, FilterProp, StaticDefinition, TargetFilter, TargetRef,
+        TypedFilter,
+    };
     use crate::types::card_type::CoreType;
+    use crate::types::game_state::{AttachmentSnapshot, ZoneChangeRecord};
     use crate::types::identifiers::CardId;
     use crate::types::player::PlayerId;
     use crate::types::statics::StaticMode;
@@ -1386,7 +1388,6 @@ mod tests {
     #[test]
     fn attach_equipment_was_attached_to_sacrificed_source() {
         use crate::game::sacrifice::sacrifice_permanent;
-        use crate::types::ability::{FilterProp, TypedFilter};
 
         let mut state = setup();
         let zack = spawn_creature(&mut state, "Zack Fair");
@@ -1417,5 +1418,54 @@ mod tests {
             state.objects.get(&equipment).unwrap().attached_to,
             Some(AttachTarget::Object(bearer))
         );
+    }
+
+    #[test]
+    fn attach_equipment_was_attached_uses_latest_departure_snapshot() {
+        let mut state = setup();
+        let zack = spawn_creature(&mut state, "Zack Fair");
+        let bearer = spawn_creature(&mut state, "Bearer");
+        let old_equipment = spawn_with_subtype(&mut state, "Old Sword", "Equipment");
+        let new_equipment = spawn_with_subtype(&mut state, "New Sword", "Equipment");
+
+        state.zone_changes_this_turn.push(ZoneChangeRecord {
+            attachments: vec![AttachmentSnapshot {
+                object_id: old_equipment,
+                controller: PlayerId(0),
+                kind: AttachmentKind::Equipment,
+            }],
+            ..ZoneChangeRecord::test_minimal(zack, Some(Zone::Battlefield), Zone::Graveyard)
+        });
+        state.zone_changes_this_turn.push(ZoneChangeRecord {
+            attachments: vec![AttachmentSnapshot {
+                object_id: new_equipment,
+                controller: PlayerId(0),
+                kind: AttachmentKind::Equipment,
+            }],
+            ..ZoneChangeRecord::test_minimal(zack, Some(Zone::Battlefield), Zone::Graveyard)
+        });
+
+        let ability = crate::types::ability::ResolvedAbility::new(
+            crate::types::ability::Effect::Attach {
+                attachment: TargetFilter::Typed(
+                    TypedFilter::default()
+                        .subtype("Equipment".to_string())
+                        .properties(vec![FilterProp::AttachedToSource]),
+                ),
+                target: TargetFilter::ParentTarget,
+            },
+            vec![TargetRef::Object(bearer)],
+            zack,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.objects.get(&new_equipment).unwrap().attached_to,
+            Some(AttachTarget::Object(bearer))
+        );
+        assert_eq!(state.objects.get(&old_equipment).unwrap().attached_to, None);
     }
 }

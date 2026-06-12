@@ -1772,7 +1772,7 @@ fn starts_with_damage_clause(lower: &str) -> bool {
 pub(super) fn is_possessive_apostrophe(current: &str, next: Option<char>) -> bool {
     let prev = current.chars().last();
     match (prev, next) {
-        // CR 608.2k: "~'s counters" self-reference must not open quote mode and
+        // CR 608.2c: "~'s counters" self-reference must not open quote mode and
         // block bare-"and" clause splitting (Zack Fair).
         (Some('~'), Some('s')) => true,
         (Some(prev), Some(next)) if prev.is_alphanumeric() && next.is_alphanumeric() => true,

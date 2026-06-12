@@ -3,6 +3,7 @@ use crate::game::game_object::AttachTarget;
 use crate::game::targeting::resolved_object_ids_for_filter;
 use crate::types::ability::{
     Effect, EffectError, EffectKind, FilterProp, ResolvedAbility, TargetFilter, TargetRef,
+    TypedFilter,
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::GameState;
@@ -182,8 +183,81 @@ fn resolve_object_filter<'a>(
                 resolved_object_ids_for_filter(state, ability, filter)
                     .into_iter()
                     .next()
-            }),
+            })
+            .or_else(|| resolve_attached_to_source_lki_attachment(state, ability, filter)),
     }
+}
+
+fn filter_has_attached_to_source(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(tf) => tf
+            .properties
+            .iter()
+            .any(|p| matches!(p, FilterProp::AttachedToSource)),
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+            filters.iter().any(filter_has_attached_to_source)
+        }
+        TargetFilter::Not { filter } => filter_has_attached_to_source(filter),
+        _ => false,
+    }
+}
+
+fn strip_attached_to_source_prop(filter: &TargetFilter) -> TargetFilter {
+    match filter {
+        TargetFilter::Typed(tf) => TargetFilter::Typed(TypedFilter {
+            properties: tf
+                .properties
+                .iter()
+                .filter(|p| !matches!(p, FilterProp::AttachedToSource))
+                .cloned()
+                .collect(),
+            ..tf.clone()
+        }),
+        TargetFilter::And { filters } => TargetFilter::And {
+            filters: filters.iter().map(strip_attached_to_source_prop).collect(),
+        },
+        TargetFilter::Or { filters } => TargetFilter::Or {
+            filters: filters.iter().map(strip_attached_to_source_prop).collect(),
+        },
+        TargetFilter::Not { filter } => TargetFilter::Not {
+            filter: Box::new(strip_attached_to_source_prop(filter)),
+        },
+        other => other.clone(),
+    }
+}
+
+/// CR 400.7c + CR 608.2g: Zack Fair — after self-sacrifice the Equipment operand
+/// is no longer `AttachedToSource` on the battlefield; resolve it from the
+/// source's departure attachment snapshot instead of the global filter predicate.
+fn resolve_attached_to_source_lki_attachment(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    filter: &TargetFilter,
+) -> Option<ObjectId> {
+    if !filter_has_attached_to_source(filter) {
+        return None;
+    }
+    let source_id = ability.source_id;
+    let ctx = FilterContext::from_ability(ability);
+    let without_attached = strip_attached_to_source_prop(filter);
+    let mut candidates = Vec::new();
+    for record in state
+        .sacrificed_permanents_this_turn
+        .iter()
+        .chain(state.zone_changes_this_turn.iter())
+    {
+        if record.object_id != source_id {
+            continue;
+        }
+        for snap in &record.attachments {
+            if state.objects.contains_key(&snap.object_id)
+                && matches_target_filter(state, snap.object_id, &without_attached, &ctx)
+            {
+                candidates.push(snap.object_id);
+            }
+        }
+    }
+    candidates.into_iter().next()
 }
 
 /// CR 701.3c: Attaching to a different object gives the attachment a new timestamp.

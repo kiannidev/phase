@@ -41,9 +41,7 @@ fn drain_delayed_triggers(runner: &mut engine::game::scenario::GameRunner) {
                     .expect("declare no blockers");
             }
             _ => {
-                runner
-                    .act(GameAction::PassPriority)
-                    .expect("pass priority");
+                runner.act(GameAction::PassPriority).expect("pass priority");
             }
         }
     }
@@ -66,12 +64,7 @@ fn marchesa_returns_creature_with_plus_one_at_next_end_step() {
     let mut runner = scenario.build();
 
     let mut events = Vec::new();
-    engine::game::zones::move_to_zone(
-        runner.state_mut(),
-        bear_id,
-        Zone::Graveyard,
-        &mut events,
-    );
+    engine::game::zones::move_to_zone(runner.state_mut(), bear_id, Zone::Graveyard, &mut events);
     engine::game::triggers::process_triggers(runner.state_mut(), &events);
 
     // Resolve Marchesa's dies trigger onto the stack before checking delayed registration.

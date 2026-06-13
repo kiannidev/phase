@@ -1025,7 +1025,7 @@ fn known_role_token_identity(descriptor: &str) -> Option<(String, Vec<String>)> 
 /// Strip trailing dynamic/attachment clauses from a token "with …" keyword phrase.
 fn strip_token_keyword_clause_suffixes(text: &str) -> &str {
     let mut clause = text;
-    if let Ok((head, _)) = take_until::<_, _, nom::error::Error<&str>>("\"").parse(clause) {
+    if let Ok((_, head)) = take_until::<_, _, nom::error::Error<&str>>("\"").parse(clause) {
         clause = head;
     }
     for marker in [" where ", " equal to ", " attached "] {
@@ -1492,6 +1492,12 @@ mod tests {
             "with flying equal to the number of card types among cards in your graveyard",
         );
         assert_eq!(kws, vec![Keyword::Flying]);
+    }
+
+    #[test]
+    fn keyword_clause_keeps_numbered_keyword_before_quoted_static() {
+        let kws = parse_token_keyword_clause(r#"with toxic 1 and "This token can't block.""#);
+        assert_eq!(kws, vec![Keyword::Toxic(1)]);
     }
 
     #[test]

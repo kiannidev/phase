@@ -68,6 +68,33 @@ fn sync_derived_from_counters(obj: &mut GameObject, counter_type: &CounterType) 
     }
 }
 
+/// CR 306.5c: A battlefield planeswalker whose loyalty characteristic is set but
+/// whose counter map has no `Loyalty` entry is not counter-tracked. Layer
+/// evaluation then keeps reverting `obj.loyalty` to `base_loyalty`, and loyalty
+/// removal is a no-op. Seed the map from the live field before the first
+/// loyalty-counter mutation.
+fn ensure_loyalty_counters_tracked(state: &mut GameState, object_id: ObjectId) {
+    use crate::types::card_type::CoreType;
+    use crate::types::zones::Zone;
+
+    let Some(obj) = state.objects.get(&object_id) else {
+        return;
+    };
+    if obj.zone != Zone::Battlefield
+        || !obj.card_types.core_types.contains(&CoreType::Planeswalker)
+        || obj.counters.contains_key(&CounterType::Loyalty)
+    {
+        return;
+    }
+    let loyalty = obj.loyalty.or(obj.base_loyalty).unwrap_or(0);
+    state
+        .objects
+        .get_mut(&object_id)
+        .expect("object exists")
+        .counters
+        .insert(CounterType::Loyalty, loyalty);
+}
+
 /// Mark layers dirty if this counter type projects into a derived characteristic
 /// computed by the layer system. P/T counters feed layer 7c (CR 613.4c);
 /// Loyalty/Defense are cached fields mirrored from the counter map; keyword
@@ -108,6 +135,9 @@ pub fn add_counter_with_replacement(
 ) -> bool {
     if count == 0 {
         return true;
+    }
+    if counter_type == CounterType::Loyalty {
+        ensure_loyalty_counters_tracked(state, object_id);
     }
     let proposed = ProposedEvent::AddCounter {
         placement: CounterPlacement::Object {
@@ -816,6 +846,9 @@ pub fn remove_counter_with_replacement(
     count: u32,
     events: &mut Vec<GameEvent>,
 ) {
+    if counter_type == CounterType::Loyalty {
+        ensure_loyalty_counters_tracked(state, object_id);
+    }
     let proposed = ProposedEvent::RemoveCounter {
         object_id,
         counter_type,
@@ -3694,6 +3727,52 @@ mod tests {
                 .copied(),
             Some(5),
             "counters[Loyalty] must remain 5 after layer evaluation"
+        );
+    }
+
+    /// Regression (issue #2862): planeswalkers that carry a loyalty characteristic
+    /// but no loyalty-counter map entry must still lose loyalty from combat damage
+    /// and loyalty-ability costs after layer evaluation.
+    #[test]
+    fn loyalty_removal_seeds_counter_map_from_field_when_missing() {
+        use crate::game::layers::evaluate_layers;
+        use crate::types::card_type::CoreType;
+
+        let mut state = GameState::new_two_player(42);
+        let pw_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Teferi, Time Raveler".to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&pw_id).unwrap();
+        obj.card_types.core_types.push(CoreType::Planeswalker);
+        obj.base_loyalty = Some(4);
+        obj.loyalty = Some(4);
+        obj.counters.clear();
+
+        let mut events = Vec::new();
+        remove_counter_with_replacement(
+            &mut state,
+            pw_id,
+            CounterType::Loyalty,
+            2,
+            &mut events,
+        );
+        evaluate_layers(&mut state);
+
+        assert_eq!(
+            state.objects[&pw_id].loyalty,
+            Some(2),
+            "combat-style loyalty loss must persist after layer evaluation"
+        );
+        assert_eq!(
+            state.objects[&pw_id]
+                .counters
+                .get(&CounterType::Loyalty)
+                .copied(),
+            Some(2)
         );
     }
 

@@ -3148,8 +3148,16 @@ fn parse_attacking_defender_suffix(text: &str) -> Option<(FilterProp, usize)> {
         ("attacking your opponents", ControllerRef::Opponent),
     ] {
         if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(pattern).parse(trimmed) {
+            let rest_trim = rest.trim_start();
+            // "...attacking you if it's controlled by..." is a target resolution
+            // gate, not a defender suffix (Stalking Leonin). Accepting the bare
+            // "attacking you" prefix leaves the trailing " if " unrepresented
+            // and trips swallowed-clause detection.
+            if rest_trim.starts_with("if ") || rest_trim.starts_with("unless ") {
+                continue;
+            }
             match rest.chars().next() {
-                None | Some('.') | Some(',') | Some(' ') => {
+                None | Some('.') | Some(',') | Some(' ') if rest_trim.is_empty() => {
                     return Some((
                         FilterProp::Attacking {
                             defender: Some(defender),
@@ -5977,6 +5985,25 @@ mod tests {
         assert!(typed.properties.contains(&FilterProp::Attacking {
             defender: Some(ControllerRef::You),
         }));
+    }
+
+    /// Stalking Leonin: "attacking you if it's controlled by..." must not treat
+    /// the defender suffix as complete at "attacking you" — the trailing " if "
+    /// clause is a separate target gate.
+    #[test]
+    fn parse_target_creature_attacking_you_if_controlled_does_not_consume_if_clause() {
+        let phrase = "creature that's attacking you if it's controlled by the chosen player";
+        let (filter, remainder) = parse_type_phrase(phrase);
+        let TargetFilter::Typed(typed) = filter else {
+            panic!("expected typed filter, got {filter:?}");
+        };
+        assert!(!typed.properties.contains(&FilterProp::Attacking {
+            defender: Some(ControllerRef::You),
+        }));
+        assert!(
+            remainder.contains("if it's controlled by the chosen player"),
+            "remainder: '{remainder}'"
+        );
     }
 
     // CR 701.60b: "suspected" is a battlefield designation usable as a type-phrase

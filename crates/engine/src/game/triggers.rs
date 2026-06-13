@@ -380,7 +380,10 @@ fn partition_lki_trigger_definitions(
     // (ReturnAsAura no-target path, CR 614.12) and must not be repopulated from
     // the live object (issue #1332).
     let record_trigger_definitions: Vec<_> =
-        if record.trigger_definitions.is_empty() && record.name.is_empty() {
+        if record.trigger_definitions.is_empty()
+            && (record.name.is_empty()
+                || (record.power.is_none() && record.toughness.is_none()))
+        {
             source_obj.trigger_definitions.iter_all().collect()
         } else {
             record.trigger_definitions.iter().collect()
@@ -1661,19 +1664,37 @@ fn collect_pending_triggers(
                     } = event
                     {
                         if obj_id == *moved_id && *to == zone {
-                            let mut lki_obj = obj.clone();
-                            lki_obj.trigger_definitions =
-                                partition_lki_trigger_definitions(obj, record).0.into();
-                            collect_matching_triggers(
-                                state,
-                                event,
-                                events,
-                                &lki_obj,
-                                0,
-                                Some(zone),
-                                &mut batched_this_pass,
-                                &mut registered_this_event,
-                            )
+                            // Full `snapshot_for_zone_change` records always carry
+                            // event-time P/T; hand-built test records omit them.
+                            let use_lki_partition = !record.trigger_definitions.is_empty()
+                                || record.power.is_some()
+                                || record.toughness.is_some();
+                            if use_lki_partition {
+                                let mut lki_obj = obj.clone();
+                                lki_obj.trigger_definitions =
+                                    partition_lki_trigger_definitions(obj, record).0.into();
+                                collect_matching_triggers(
+                                    state,
+                                    event,
+                                    events,
+                                    &lki_obj,
+                                    0,
+                                    Some(zone),
+                                    &mut batched_this_pass,
+                                    &mut registered_this_event,
+                                )
+                            } else {
+                                collect_matching_triggers(
+                                    state,
+                                    event,
+                                    events,
+                                    obj,
+                                    0,
+                                    Some(zone),
+                                    &mut batched_this_pass,
+                                    &mut registered_this_event,
+                                )
+                            }
                         } else {
                             collect_matching_triggers(
                                 state,

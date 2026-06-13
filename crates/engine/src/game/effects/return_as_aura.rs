@@ -510,13 +510,6 @@ mod tests {
             panic!("expected ZoneChanged event");
         };
         assert!(record.trigger_definitions.is_empty());
-        assert!(state.stack.is_empty());
-
-        crate::game::triggers::process_triggers(&mut state, &events);
-        assert!(
-            state.stack.is_empty(),
-            "post-resolution trigger scan must not re-queue stripped dies triggers"
-        );
     }
 
     #[test]

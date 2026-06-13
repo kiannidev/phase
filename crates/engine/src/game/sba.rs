@@ -840,6 +840,21 @@ fn check_unattached_auras(
                 // CR 704.5m + CR 614.6: an Aura attached to nothing is put into
                 // its owner's graveyard — a "leaves the battlefield" event that
                 // must consult Moved redirects. Bail on a CR 616.1 pause.
+                // Sever the live attachment graph before the pipeline move so
+                // the graveyard object cannot retain a dangling `attached_to`
+                // pointer (zone-change records retain attachment LKI).
+                if let Some(old_target_id) = state
+                    .objects
+                    .get(&id)
+                    .and_then(|obj| obj.attached_to.and_then(|t| t.as_object()))
+                {
+                    if let Some(host) = state.objects.get_mut(&old_target_id) {
+                        host.attachments.retain(|&attachment| attachment != id);
+                    }
+                }
+                if let Some(obj) = state.objects.get_mut(&id) {
+                    obj.attached_to = None;
+                }
                 if move_to_graveyard_via_pipeline(state, id, events) {
                     return;
                 }

@@ -3963,6 +3963,18 @@ fn resolve_chain_body(
     };
     let ability = ability.as_ref();
 
+    if effect_depends_on_missing_chosen_player(ability) {
+        state.cost_payment_failed_flag = true;
+        if let Some(ref next) = ability.sub_ability {
+            if next.sub_link == SubAbilityLink::SequentialSibling {
+                let mut sibling = next.as_ref().clone();
+                apply_parent_chain_context(&mut sibling, ability, None);
+                resolve_ability_chain(state, &sibling, events, depth + 1)?;
+            }
+        }
+        return Ok(());
+    }
+
     if repeat_for_outermost_with_scope_or_unless(ability)
         && !has_member_driven_repeat_after_hydration(state, ability)
     {
@@ -5479,6 +5491,14 @@ fn resolve_chain_body(
     }
 
     Ok(())
+}
+
+fn effect_depends_on_missing_chosen_player(ability: &ResolvedAbility) -> bool {
+    ability
+        .effect
+        .target_filter()
+        .and_then(crate::game::ability_utils::filter_chosen_player_index)
+        .is_some_and(|index| ability.chosen_players.get(index as usize).is_none())
 }
 
 /// CR 608.2c + CR 109.5: Spell-effect "if you sacrificed a [filter] this way"
@@ -7906,6 +7926,61 @@ mod tests {
         assert_eq!(state.players[1].life, 18);
         // Controller drew a card
         assert_eq!(state.players[0].hand.len(), 1);
+    }
+
+    #[test]
+    fn resolve_ability_chain_impossible_choice_does_not_wedge_chain() {
+        // CR 609.3 (issue #3040): a `Choose` whose engine-enumerated option set
+        // is empty is an impossible choice. It must resolve as a no-op so the
+        // rest of the chain continues, instead of emitting an unsatisfiable
+        // `WaitingFor::NamedChoice` that no `ChooseOption` can advance — which
+        // would stash the dependent sub-ability forever and hang the game.
+        use crate::types::ability::ChoiceType;
+
+        let mut state = GameState::new_two_player(42);
+        create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Card A".to_string(),
+            Zone::Library,
+        );
+
+        // Empty `Keyword` option list → "choose an ability the target has" with
+        // nothing to choose. The dependent Draw must still resolve.
+        let draw = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let ability = ResolvedAbility::new(
+            Effect::Choose {
+                choice_type: ChoiceType::Keyword { options: vec![] },
+                persist: false,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        )
+        .sub_ability(draw);
+        let mut events = Vec::new();
+
+        let result = resolve_ability_chain(&mut state, &ability, &mut events, 0);
+        assert!(result.is_ok());
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::NamedChoice { .. }),
+            "impossible choice must not leave the chain wedged on an empty NamedChoice"
+        );
+        // The dependent sub-ability resolved inline (no choice paused the chain).
+        assert_eq!(
+            state.players[0].hand.len(),
+            1,
+            "the chain must continue past an impossible choice and draw the card"
+        );
     }
 
     /// Regression (issue #1977, Party Thrasher): "you may discard a card. If you

@@ -423,6 +423,21 @@ pub fn parse_trigger_lines(text: &str, card_name: &str) -> Vec<TriggerDefinition
     parse_trigger_lines_at_index(text, card_name, None, &mut ParseContext::default())
 }
 
+/// Extract the `(lhs, rhs)` operands of a `QuantityComparison` trigger
+/// condition, looking through a top-level `And` composite (intervening-if
+/// conditions are composed onto any pre-existing condition via
+/// `and_trigger_conditions`). Used to resolve the anaphoric "draw cards equal
+/// to the difference" count against the hoisted condition's two operands.
+fn quantity_comparison_operands(cond: &TriggerCondition) -> Option<(&QuantityExpr, &QuantityExpr)> {
+    match cond {
+        TriggerCondition::QuantityComparison { lhs, rhs, .. } => Some((lhs, rhs)),
+        TriggerCondition::And { conditions } | TriggerCondition::Or { conditions } => {
+            conditions.iter().find_map(quantity_comparison_operands)
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn parse_trigger_lines_at_index(
     text: &str,
     card_name: &str,
@@ -1045,6 +1060,42 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
         Some(if_cond) => Some(and_trigger_conditions(def.condition.take(), if_cond)),
         None => def.condition.take(),
     };
+
+    // CR 121.1 + CR 603.4: "draw cards equal to the difference" inside a
+    // trigger body (Kozilek the Great Distortion, Damia Sage of Stone, Krang
+    // Master Mind, The Ten Rings, Doctor Octopus). The "if you have fewer than
+    // N cards in hand" gate is hoisted to the trigger-level condition above, so
+    // the body's effect parser never sees the two operands and leaves the
+    // anaphoric draw count as `Unimplemented`. Resolve it here against the
+    // hoisted `QuantityComparison`, mirroring the standalone `difference_draw`
+    // branch in `oracle_effect/mod.rs` (`QuantityExpr::Difference { lhs, rhs }`).
+    let difference_count = def
+        .condition
+        .as_ref()
+        .and_then(quantity_comparison_operands)
+        .map(|(lhs, rhs)| QuantityExpr::Difference {
+            left: Box::new(lhs.clone()),
+            right: Box::new(rhs.clone()),
+        });
+    if let Some(count) = difference_count {
+        if let Some(execute) = def.execute.as_deref_mut() {
+            let is_difference_draw = matches!(
+                execute.effect.as_ref(),
+                Effect::Unimplemented { name, description: Some(desc) }
+                    if name == "draw"
+                        && desc
+                            .trim()
+                            .trim_end_matches('.')
+                            .eq_ignore_ascii_case("draw cards equal to the difference")
+            );
+            if is_difference_draw {
+                *execute.effect = Effect::Draw {
+                    count,
+                    target: TargetFilter::Controller,
+                };
+            }
+        }
+    }
 
     // CR 603.4: Intervening-if life-gain triggers check the gained-life
     // condition when they trigger and resolve, so "that many" distribution
@@ -7322,9 +7373,64 @@ fn try_parse_named_trigger_mode(lower: &str) -> Option<(TriggerMode, TriggerDefi
         return Some((TriggerMode::HauntedCreatureDies, def));
     }
 
-    if matches!(lower, "whenever chaos ensues" | "when chaos ensues") {
+    // CR 311.7 / CR 901.9b: "Whenever/When chaos ensues" — the active plane's
+    // chaos-triggered ability. Self-referential (fires for its own plane).
+    if (
+        alt((tag::<_, _, OracleError<'_>>("whenever "), tag("when "))),
+        tag("chaos ensues"),
+    )
+        .parse(lower)
+        .is_ok()
+    {
         def.mode = TriggerMode::ChaosEnsues;
+        def.valid_card = Some(TargetFilter::SelfRef);
         return Some((TriggerMode::ChaosEnsues, def));
+    }
+
+    // CR 701.31d: "Whenever you planeswalk away from ~" — fires when this
+    // plane/phenomenon is the card planeswalked away from.
+    if (
+        alt((tag::<_, _, OracleError<'_>>("whenever "), tag("when "))),
+        tag("you planeswalk away from ~"),
+    )
+        .parse(lower)
+        .is_ok()
+    {
+        def.mode = TriggerMode::PlaneswalkedFrom;
+        def.valid_card = Some(TargetFilter::SelfRef);
+        def.valid_target = Some(TargetFilter::Controller);
+        return Some((TriggerMode::PlaneswalkedFrom, def));
+    }
+
+    // CR 312.5 / CR 701.31d: encounter == the planeswalked-to face-up endpoint.
+    // A plane/phenomenon's arrival trigger fires when it becomes the face-up
+    // card. Oracle text names that arrival several ways — all one phrase axis,
+    // composed with a single `alt` rather than enumerated as whole sentences:
+    //   * "planeswalk here"            (e.g. Ghirapur Grand Prix)
+    //   * "planeswalk to ~"            (the card naming itself, normalized to ~)
+    //   * "planeswalk to this plane"   (literal self-reference)
+    //   * "encounter ~"                (the phenomenon naming itself, normalized)
+    //   * "encounter this phenomenon"  (literal self-reference)
+    // "this plane"/"this phenomenon" are absent from `SELF_REF_TYPE_PHRASES`, so
+    // they survive normalization as literals — hence the explicit literal arms.
+    if (
+        alt((tag::<_, _, OracleError<'_>>("whenever "), tag("when "))),
+        tag("you "),
+        alt((
+            tag("planeswalk here"),
+            tag("planeswalk to ~"),
+            tag("planeswalk to this plane"),
+            tag("encounter ~"),
+            tag("encounter this phenomenon"),
+        )),
+    )
+        .parse(lower)
+        .is_ok()
+    {
+        def.mode = TriggerMode::PlaneswalkedTo;
+        def.valid_card = Some(TargetFilter::SelfRef);
+        def.valid_target = Some(TargetFilter::Controller);
+        return Some((TriggerMode::PlaneswalkedTo, def));
     }
 
     if matches!(
@@ -12088,6 +12194,56 @@ mod tests {
             "effect chain leaked Unimplemented: {:?}",
             execute
         );
+    }
+
+    // CR 121.1 + CR 603.4: "draw cards equal to the difference" inside a trigger
+    // body. The "if you have fewer than N cards in hand" gate is hoisted to the
+    // trigger-level condition, so the anaphoric draw count must resolve against
+    // those operands (Difference{HandSize, N}), not leak as Unimplemented.
+    // Kozilek the Great Distortion, Damia Sage of Stone, Krang Master Mind,
+    // The Ten Rings, Doctor Octopus.
+    #[test]
+    fn parse_difference_draw_trigger_resolves_against_hoisted_hand_size_gate() {
+        for (text, name, threshold) in [
+            (
+                "When you cast this spell, if you have fewer than seven cards in hand, \
+                 draw cards equal to the difference.",
+                "Kozilek, the Great Distortion",
+                7,
+            ),
+            (
+                "At the beginning of your end step, if you have fewer than ten cards in hand, \
+                 draw cards equal to the difference.",
+                "The Ten Rings",
+                10,
+            ),
+        ] {
+            let defs = parse_trigger_lines(text, name);
+            assert_eq!(defs.len(), 1, "{name}: expected one trigger: {defs:?}");
+            let execute = defs[0].execute.as_ref().expect("execute ability");
+            match &*execute.effect {
+                Effect::Draw {
+                    count: QuantityExpr::Difference { left, right },
+                    ..
+                } => {
+                    assert_eq!(
+                        **right,
+                        QuantityExpr::Fixed { value: threshold },
+                        "{name}: wrong difference threshold"
+                    );
+                    assert!(
+                        matches!(
+                            **left,
+                            QuantityExpr::Ref {
+                                qty: QuantityRef::HandSize { .. }
+                            }
+                        ),
+                        "{name}: expected HandSize lhs, got {left:?}"
+                    );
+                }
+                other => panic!("{name}: expected Draw with Difference count, got {other:?}"),
+            }
+        }
     }
 
     // CR 603.6a + CR 110.5b: "When this land enters untapped, ..." — Gingerbread
@@ -20100,6 +20256,99 @@ mod tests {
     fn trigger_chaos_ensues_mode() {
         let def = parse_trigger_line("Whenever chaos ensues, draw a card.", "Plane");
         assert_eq!(def.mode, TriggerMode::ChaosEnsues);
+        // CR 311.7: self-referential — fires for its own plane.
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+    }
+
+    #[test]
+    fn trigger_planeswalk_away_from_mode() {
+        // CR 701.31d: "Whenever you planeswalk away from [this plane]".
+        let def = parse_trigger_line(
+            "Whenever you planeswalk away from Test Plane, draw a card.",
+            "Test Plane",
+        );
+        assert_eq!(def.mode, TriggerMode::PlaneswalkedFrom);
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+        assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+    }
+
+    #[test]
+    fn trigger_planeswalk_to_mode() {
+        // CR 701.31d: "Whenever you planeswalk to [this plane]".
+        let def = parse_trigger_line(
+            "Whenever you planeswalk to Test Plane, draw a card.",
+            "Test Plane",
+        );
+        assert_eq!(def.mode, TriggerMode::PlaneswalkedTo);
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+        assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+    }
+
+    #[test]
+    fn trigger_encounter_maps_to_planeswalked_to() {
+        // CR 312.5: "When you encounter [this phenomenon]" is the face-up
+        // (planeswalked-to) endpoint.
+        let def = parse_trigger_line(
+            "When you encounter Test Phenomenon, draw a card.",
+            "Test Phenomenon",
+        );
+        assert_eq!(def.mode, TriggerMode::PlaneswalkedTo);
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+    }
+
+    #[test]
+    fn trigger_arrival_phrase_axis_all_map_to_planeswalked_to() {
+        // CR 312.5 / CR 701.31d: every arrival/encounter phrasing in the class
+        // maps to PlaneswalkedTo with the controller target filter — including
+        // the "here" and literal "this plane"/"this phenomenon" forms that do
+        // NOT normalize to ~ (so they exercise the literal arms of the axis).
+        for (oracle, name) in [
+            // "planeswalk here" — Ghirapur Grand Prix's arrival trigger.
+            (
+                "When you planeswalk here, draw a card.",
+                "Ghirapur Grand Prix",
+            ),
+            ("Whenever you planeswalk here, draw a card.", "Some Plane"),
+            // literal "this plane" (not a SELF_REF_TYPE_PHRASE → stays literal).
+            (
+                "When you planeswalk to this plane, draw a card.",
+                "Some Plane",
+            ),
+            // literal "this phenomenon".
+            (
+                "When you encounter this phenomenon, draw a card.",
+                "Some Phenomenon",
+            ),
+        ] {
+            let def = parse_trigger_line(oracle, name);
+            assert_eq!(
+                def.mode,
+                TriggerMode::PlaneswalkedTo,
+                "`{oracle}` should map to PlaneswalkedTo",
+            );
+            assert_eq!(
+                def.valid_card,
+                Some(TargetFilter::SelfRef),
+                "`{oracle}` arrival trigger is self-referential",
+            );
+            assert_eq!(
+                def.valid_target,
+                Some(TargetFilter::Controller),
+                "`{oracle}` resolves the arrival for the planar controller",
+            );
+        }
+    }
+
+    #[test]
+    fn trigger_chaos_no_zone_stamped_by_parser() {
+        // Synthesis stamps trigger_zones=[Command]; the parser must NOT (preserves
+        // the trigger_no_zone test-lock). Confirm the parser leaves it default.
+        let def = parse_trigger_line("Whenever chaos ensues, draw a card.", "Plane");
+        assert!(
+            !def.trigger_zones.contains(&Zone::Command),
+            "parser must not stamp Zone::Command — synthesis owns that, got {:?}",
+            def.trigger_zones
+        );
     }
 
     #[test]

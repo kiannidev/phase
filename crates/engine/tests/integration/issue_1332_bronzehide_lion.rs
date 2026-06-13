@@ -55,7 +55,7 @@ fn bronzehide_lion_dies_with_no_creature_you_control_returns_then_graveyards() {
 
     let lion = &runner.state().objects[&lion_id];
     assert_eq!(lion.zone, Zone::Graveyard);
-    assert!(lion.trigger_definitions.is_empty());
+    assert!(!lion.base_trigger_definitions.is_empty());
     assert!(runner.state().stack.is_empty());
     assert!(!matches!(
         runner.state().waiting_for,

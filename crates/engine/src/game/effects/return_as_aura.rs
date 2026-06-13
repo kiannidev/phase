@@ -119,10 +119,6 @@ pub fn resolve(
         // LTB event re-queues the same self-return trigger forever (issue #1332).
         install_aura_continuous_effect(state, ability, returned_id, &enchant_filter, grants);
         crate::game::layers::evaluate_layers(state);
-        if let Some(obj) = state.objects.get_mut(&returned_id) {
-            obj.trigger_definitions.clear();
-            std::sync::Arc::make_mut(&mut obj.base_trigger_definitions).clear();
-        }
 
         // CR 303.4g + CR 614.6 + CR 616.1: No legal object to enchant → owner's
         // graveyard. Route the Battlefield → Graveyard move through the
@@ -458,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn no_legal_target_strips_dies_trigger_before_ltb() {
+    fn no_legal_target_strips_live_trigger_without_mutating_baseline() {
         use crate::types::ability::{
             AbilityDefinition, AbilityKind, QuantityExpr, TriggerDefinition,
         };
@@ -478,12 +474,11 @@ mod tests {
                 target: TargetFilter::Controller,
             },
         )));
-        state
-            .objects
-            .get_mut(&host)
-            .unwrap()
-            .trigger_definitions
-            .push(dies_trigger);
+        {
+            let obj = state.objects.get_mut(&host).unwrap();
+            std::sync::Arc::make_mut(&mut obj.base_trigger_definitions).push(dies_trigger.clone());
+            obj.trigger_definitions.push(dies_trigger);
+        }
 
         let ability = ResolvedAbility::new(
             Effect::ReturnAsAura {
@@ -497,7 +492,15 @@ mod tests {
         let mut events = Vec::new();
         resolve(&mut state, &ability, &mut events).unwrap();
         assert_eq!(state.objects[&host].zone, Zone::Graveyard);
-        assert!(state.objects[&host].trigger_definitions.is_empty());
+        assert!(!state.objects[&host].base_trigger_definitions.is_empty());
+        let GameEvent::ZoneChanged { record, .. } = events
+            .iter()
+            .find(|event| matches!(event, GameEvent::ZoneChanged { object_id, .. } if *object_id == host))
+            .expect("return-as-aura no-target path should emit a ZoneChanged event")
+        else {
+            panic!("expected ZoneChanged event");
+        };
+        assert!(record.trigger_definitions.is_empty());
     }
 
     #[test]

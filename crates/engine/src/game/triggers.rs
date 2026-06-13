@@ -379,15 +379,13 @@ fn partition_lki_trigger_definitions(
     // trigger list is empty that means abilities were stripped at event time
     // (ReturnAsAura no-target path, CR 614.12) and must not be repopulated from
     // the live object (issue #1332).
-    let record_trigger_definitions: Vec<_> =
-        if record.trigger_definitions.is_empty()
-            && (record.name.is_empty()
-                || (record.power.is_none() && record.toughness.is_none()))
-        {
-            source_obj.trigger_definitions.iter_all().collect()
-        } else {
-            record.trigger_definitions.iter().collect()
-        };
+    let record_trigger_definitions: Vec<_> = if record.trigger_definitions.is_empty()
+        && (record.name.is_empty() || (record.power.is_none() && record.toughness.is_none()))
+    {
+        source_obj.trigger_definitions.iter_all().collect()
+    } else {
+        record.trigger_definitions.iter().collect()
+    };
     for trigger in record_trigger_definitions {
         if let Some(pos) = base_triggers.iter().position(|base| base == trigger) {
             base_triggers.remove(pos);

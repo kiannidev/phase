@@ -7,8 +7,10 @@
 use engine::game::scenario::{GameScenario, P0};
 use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::actions::GameAction;
-use engine::types::game_state::{CastPaymentMode, CastingVariant, StackEntryKind, WaitingFor};
-use engine::types::identifiers::ObjectId;
+use engine::types::game_state::{
+    CastPaymentMode, CastingVariant, StackEntry, StackEntryKind, WaitingFor,
+};
+use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
@@ -50,6 +52,18 @@ fn issue_2872_drc_surveil_with_hardened_academic_graveyard_trigger() {
     engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
 
     let practiced_card_id = runner.state().objects[&practiced].card_id;
+
+    runner.state_mut().resolving_stack_entry = Some(StackEntry {
+        id: ObjectId(9999),
+        source_id: ObjectId(9999),
+        controller: P0,
+        kind: StackEntryKind::Spell {
+            card_id: CardId(9999),
+            ability: None,
+            casting_variant: CastingVariant::Normal,
+            actual_mana_spent: 0,
+        },
+    });
 
     runner
         .act(GameAction::CastSpell {

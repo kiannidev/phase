@@ -3173,7 +3173,7 @@ fn parse_attacking_defender_suffix(text: &str) -> Option<(FilterProp, usize)> {
                 continue;
             }
             match rest.chars().next() {
-                None | Some('.') | Some(',') | Some(' ') => {
+                None | Some('.') | Some(',') | Some(' ') if rest_trim.is_empty() => {
                     return Some((
                         FilterProp::Attacking {
                             defender: Some(defender),

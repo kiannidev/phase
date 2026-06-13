@@ -17384,6 +17384,33 @@ mod tests {
     }
 
     #[test]
+    fn trigger_intervening_if_you_were_dealt_damage_threshold_this_turn() {
+        let def = parse_trigger_line(
+            "At the beginning of each end step, if you were dealt 4 or more damage this turn, exile this artifact.",
+            "Boarded Window",
+        );
+        assert!(matches!(
+            def.condition,
+            Some(TriggerCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::DamageDealtThisTurn {
+                        source,
+                        target,
+                        ..
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 4 },
+            }) if *source == TargetFilter::Any
+                && matches!(
+                    &*target,
+                    TargetFilter::Typed(ref typed)
+                        if typed.controller == Some(ControllerRef::You)
+                )
+        ));
+    }
+
+    #[test]
     fn trigger_intervening_if_counter_was_put_on_owned_permanent_this_turn() {
         let def = parse_trigger_line(
             "At the beginning of each end step, if a +1/+1 counter was put on a permanent under your control this turn, put a +1/+1 counter on this creature.",

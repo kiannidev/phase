@@ -125,10 +125,7 @@ fn issue_2860_flashback_cast_offers_optional_spell_copy() {
         .act(GameAction::DecideOptionalEffect { accept: true })
         .expect("accept optional copy");
 
-    if matches!(
-        runner.state().waiting_for,
-        WaitingFor::CopyRetarget { .. }
-    ) {
+    if matches!(runner.state().waiting_for, WaitingFor::CopyRetarget { .. }) {
         runner
             .act(GameAction::KeepAllCopyTargets)
             .expect("keep copy targets");

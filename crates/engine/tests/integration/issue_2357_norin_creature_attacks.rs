@@ -17,7 +17,7 @@ Return it to the battlefield under its owner's control at the beginning of the n
 
 fn resolve_stack_and_triggers(runner: &mut GameRunner) {
     let mut guard = 0;
-    while runner.state().stack.len() > 0
+    while !runner.state().stack.is_empty()
         || matches!(runner.state().waiting_for, WaitingFor::Priority { .. })
     {
         guard += 1;

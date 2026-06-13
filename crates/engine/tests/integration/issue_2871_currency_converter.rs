@@ -26,29 +26,22 @@ fn issue_2871_currency_converter_tap_creates_no_token_without_exiled_card() {
     let treasure_before = count_battlefield_tokens(runner.state(), "Treasure");
     let rogue_before = count_battlefield_tokens(runner.state(), "Rogue");
 
-    runner
-        .activate(converter, 0)
-        .resolve();
+    runner.activate(converter, 0).resolve();
 
     let treasure_after = count_battlefield_tokens(runner.state(), "Treasure");
     let rogue_after = count_battlefield_tokens(runner.state(), "Rogue");
 
     assert_eq!(
-        treasure_after,
-        treasure_before,
+        treasure_after, treasure_before,
         "must not create Treasure with no exiled card"
     );
     assert_eq!(
-        rogue_after,
-        rogue_before,
+        rogue_after, rogue_before,
         "must not create Rogue with no exiled card"
     );
 }
 
-fn count_battlefield_tokens(
-    state: &engine::types::game_state::GameState,
-    subtype: &str,
-) -> usize {
+fn count_battlefield_tokens(state: &engine::types::game_state::GameState, subtype: &str) -> usize {
     state
         .battlefield
         .iter()

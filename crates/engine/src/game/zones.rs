@@ -482,13 +482,10 @@ pub fn move_to_zone(
         // than battlefield, exile, or command move to command instead.
         to = Zone::Command;
     }
-    let unattached_from = state
-        .objects
-        .get(&object_id)
-        .and_then(|obj| {
-            obj.attached_to
-                .map(super::effects::attach::target_ref_from_attach_target)
-        });
+    let unattached_from = state.objects.get(&object_id).and_then(|obj| {
+        obj.attached_to
+            .map(super::effects::attach::target_ref_from_attach_target)
+    });
     let mut zone_change_record = obj.snapshot_for_zone_change(object_id, Some(from), to);
     // CR 603.10a + CR 603.6e: Capture attachment snapshot before SBA can detach.
     zone_change_record.attachments = capture_attachment_snapshot(state, obj);
@@ -819,13 +816,10 @@ pub fn move_to_library_at_index(
     let obj = state.objects.get(&object_id).expect("object exists");
     let from = obj.zone;
     let owner = obj.owner;
-    let unattached_from = state
-        .objects
-        .get(&object_id)
-        .and_then(|obj| {
-            obj.attached_to
-                .map(super::effects::attach::target_ref_from_attach_target)
-        });
+    let unattached_from = state.objects.get(&object_id).and_then(|obj| {
+        obj.attached_to
+            .map(super::effects::attach::target_ref_from_attach_target)
+    });
     let mut zone_change_record = obj.snapshot_for_zone_change(object_id, Some(from), Zone::Library);
     // CR 603.10a + CR 603.6e: Capture attachment snapshot before SBA can detach.
     zone_change_record.attachments = capture_attachment_snapshot(state, obj);
@@ -2163,5 +2157,18 @@ mod tests {
         assert!(matches!(result, ZoneMoveResult::Done));
         assert_eq!(state.objects[&aura].zone, Zone::Graveyard);
         assert!(state.objects[&aura].attached_to.is_none());
+        assert!(
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    GameEvent::Unattached {
+                        attachment_id,
+                        old_target
+                    } if *attachment_id == aura
+                        && *old_target == crate::types::ability::TargetRef::Object(host)
+                )
+            }),
+            "SBA zone movement must still publish the unattach event for triggers"
+        );
     }
 }

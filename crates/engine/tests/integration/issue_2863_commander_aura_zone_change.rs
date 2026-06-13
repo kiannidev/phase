@@ -4,8 +4,8 @@
 //!
 //! https://github.com/phase-rs/phase/issues/2863
 
-use engine::game::effects::attach::attach_to;
 use engine::game::deck_loading::create_object_from_card_face;
+use engine::game::effects::attach::attach_to;
 use engine::game::scenario::{GameScenario, P0};
 use engine::game::scenario_db::GameScenarioDbExt;
 use engine::game::zones::{add_to_zone, remove_from_zone};
@@ -86,12 +86,7 @@ fn issue_2863_aura_put_in_graveyard_when_commander_exiled_and_returns() {
     );
 
     let mut events = Vec::new();
-    engine::game::zones::move_to_zone(
-        runner.state_mut(),
-        arcades,
-        Zone::Exile,
-        &mut events,
-    );
+    engine::game::zones::move_to_zone(runner.state_mut(), arcades, Zone::Exile, &mut events);
 
     engine::game::sba::check_state_based_actions(runner.state_mut(), &mut events);
     while matches!(
@@ -141,7 +136,9 @@ fn issue_2863_aura_put_in_graveyard_when_commander_exiled_and_returns() {
 
     assert_eq!(runner.state().objects[&arcades].zone, Zone::Battlefield);
     assert!(
-        !runner.state().objects[&arcades].attachments.contains(&inviolability),
+        !runner.state().objects[&arcades]
+            .attachments
+            .contains(&inviolability),
         "recast commander must not list the old aura as attached"
     );
 }
@@ -183,12 +180,7 @@ fn issue_2863_commander_not_duplicated_in_graveyard_on_death() {
     attach_to(runner.state_mut(), inviolability, arcades);
 
     let mut events = Vec::new();
-    engine::game::zones::move_to_zone(
-        runner.state_mut(),
-        arcades,
-        Zone::Graveyard,
-        &mut events,
-    );
+    engine::game::zones::move_to_zone(runner.state_mut(), arcades, Zone::Graveyard, &mut events);
     engine::game::sba::check_state_based_actions(runner.state_mut(), &mut events);
 
     assert!(
@@ -203,16 +195,13 @@ fn issue_2863_commander_not_duplicated_in_graveyard_on_death() {
         .act(GameAction::DecideOptionalEffect { accept: true })
         .expect("return commander to command zone");
 
-    let graveyard_arcades = runner
-        .state()
-        .players[0]
+    let graveyard_arcades = runner.state().players[0]
         .graveyard
         .iter()
         .filter(|id| runner.state().objects[id].name == "Arcades, the Strategist")
         .count();
     assert_eq!(
-        graveyard_arcades,
-        0,
+        graveyard_arcades, 0,
         "commander must not remain in graveyard after returning to command zone"
     );
     assert_eq!(runner.state().objects[&arcades].zone, Zone::Command);

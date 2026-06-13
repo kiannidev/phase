@@ -197,24 +197,31 @@ fn parse_damage_dealt_this_turn_conditions(input: &str) -> OracleResult<'_, Stat
     .parse(input)
 }
 
-/// CR 603.4 + CR 120.3: "you were dealt N or more damage this turn" — Boarded
-/// Window's end-step intervening-if. Any-source damage to the controller.
+/// CR 603.4 + CR 120.3: "you were/an opponent was dealt N or more damage this
+/// turn" — Boarded Window and Phoenix Chick-style end-step intervening-if
+/// predicates. Any-source damage to the matching player set.
 fn parse_player_was_dealt_damage_threshold_this_turn(
     input: &str,
 ) -> OracleResult<'_, StaticCondition> {
-    let (rest, target) = alt((
+    let (rest, (target, passive_verb)) = alt((
         value(
-            TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::You)),
+            (
+                TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::You)),
+                " were dealt ",
+            ),
             tag("you"),
         ),
-        value(TargetFilter::Player, tag("a player")),
+        value((TargetFilter::Player, " was dealt "), tag("a player")),
         value(
-            TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent)),
+            (
+                TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent)),
+                " was dealt ",
+            ),
             tag("an opponent"),
         ),
     ))
     .parse(input)?;
-    let (rest, _) = tag(" were dealt ").parse(rest)?;
+    let (rest, _) = tag(passive_verb).parse(rest)?;
     let (rest, amount) = parse_number(rest)?;
     let (rest, _) = tag(" or more damage this turn").parse(rest)?;
     Ok((
@@ -10172,6 +10179,37 @@ mod tests {
                 assert_eq!(typed.controller, Some(ControllerRef::You));
             }
             other => panic!("expected player damage threshold quantity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_opponent_was_dealt_damage_threshold_this_turn() {
+        let (rest, c) =
+            parse_inner_condition("an opponent was dealt 3 or more damage this turn").unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::DamageDealtThisTurn {
+                                source,
+                                target,
+                                aggregate: AggregateFunction::Sum,
+                                group_by: None,
+                                damage_kind: DamageKindFilter::Any,
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 3 },
+            } => {
+                assert_eq!(*source, TargetFilter::Any);
+                let TargetFilter::Typed(typed) = *target else {
+                    panic!("expected typed target filter");
+                };
+                assert_eq!(typed.controller, Some(ControllerRef::Opponent));
+            }
+            other => panic!("expected opponent damage threshold quantity, got {other:?}"),
         }
     }
 

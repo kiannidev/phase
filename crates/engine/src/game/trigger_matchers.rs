@@ -1040,6 +1040,35 @@ pub(super) fn match_changes_zone_all(
 }
 
 // CR 603.6d: DamageDone trigger fires on damage dealt events.
+fn matching_combat_damage_to_player_sources(
+    trigger: &TriggerDefinition,
+    source_id: ObjectId,
+    state: &GameState,
+    player_id: PlayerId,
+    source_amounts: &[(ObjectId, u32)],
+) -> Vec<(ObjectId, u32)> {
+    if trigger.damage_kind == DamageKindFilter::NoncombatOnly {
+        return Vec::new();
+    }
+    if let Some(ref vt) = trigger.valid_target {
+        if !player_matches_filter(vt, state, player_id, source_id) {
+            return Vec::new();
+        }
+    }
+    source_amounts
+        .iter()
+        .filter(|(src, amt)| {
+            if let Some((cmp, threshold)) = trigger.damage_amount {
+                if !cmp.evaluate(*amt as i32, threshold as i32) {
+                    return false;
+                }
+            }
+            valid_source_matches(trigger, state, *src, source_id)
+        })
+        .copied()
+        .collect()
+}
+
 pub(super) fn match_damage_done(
     event: &GameEvent,
     trigger: &TriggerDefinition,
@@ -1104,9 +1133,55 @@ pub(super) fn match_damage_done(
             }
         }
         true
+    } else if let GameEvent::CombatDamageDealtToPlayer {
+        player_id,
+        source_amounts,
+        ..
+    } = event
+    {
+        !matching_combat_damage_to_player_sources(
+            trigger,
+            source_id,
+            state,
+            *player_id,
+            source_amounts,
+        )
+        .is_empty()
     } else {
         false
     }
+}
+
+/// CR 510.2 + CR 603.2: `DamageDone` triggers on equipment (and other
+/// observers) listen for per-source combat damage via the aggregate
+/// `CombatDamageDealtToPlayer` event. Expand matching sources into synthetic
+/// `DamageDealt` events so downstream `EventContextAmount` and intervening-if
+/// checks see the per-source amount.
+pub(super) fn matching_damage_done_events(
+    event: &GameEvent,
+    trigger: &TriggerDefinition,
+    source_id: ObjectId,
+    state: &GameState,
+) -> Vec<GameEvent> {
+    let GameEvent::CombatDamageDealtToPlayer {
+        player_id,
+        source_amounts,
+        ..
+    } = event
+    else {
+        return Vec::new();
+    };
+
+    matching_combat_damage_to_player_sources(trigger, source_id, state, *player_id, source_amounts)
+        .into_iter()
+        .map(|(src, amt)| GameEvent::DamageDealt {
+            source_id: src,
+            target: TargetRef::Player(*player_id),
+            amount: amt,
+            is_combat: true,
+            excess: 0,
+        })
+        .collect()
 }
 
 pub(super) fn match_damage_done_once_by_controller(
@@ -6640,6 +6715,55 @@ mod tests {
         assert_eq!(rebuilt_amounts, vec![(creature_a, 3)]);
         // Only creature_a's 3 damage counts, not the aggregate 5.
         assert_eq!(total_damage, 3);
+    }
+
+    #[test]
+    fn matching_damage_done_events_expands_equipped_creature_combat_damage() {
+        let mut state = setup();
+        let equipment = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "The Key to the Vault".to_string(),
+            Zone::Battlefield,
+        );
+        let bearer = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Equipped Attacker".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&bearer).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+        }
+        state.objects.get_mut(&equipment).unwrap().attached_to = Some(AttachTarget::Object(bearer));
+
+        let mut trigger = make_trigger(TriggerMode::DamageDone);
+        trigger.valid_source = Some(TargetFilter::AttachedTo);
+        trigger.valid_target = Some(TargetFilter::Player);
+        trigger.damage_kind = DamageKindFilter::CombatOnly;
+
+        let event = GameEvent::CombatDamageDealtToPlayer {
+            player_id: PlayerId(1),
+            source_amounts: vec![(bearer, 3)],
+            total_damage: 3,
+        };
+
+        assert!(match_damage_done(&event, &trigger, equipment, &state));
+        let expanded = matching_damage_done_events(&event, &trigger, equipment, &state);
+        assert_eq!(expanded.len(), 1);
+        assert!(matches!(
+            expanded[0],
+            GameEvent::DamageDealt {
+                source_id,
+                target: TargetRef::Player(PlayerId(1)),
+                amount: 3,
+                is_combat: true,
+                ..
+            } if source_id == bearer
+        ));
     }
 
     #[test]

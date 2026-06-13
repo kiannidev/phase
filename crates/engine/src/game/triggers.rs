@@ -372,12 +372,21 @@ fn partition_lki_trigger_definitions(
         .collect();
     let mut printed = Vec::new();
     let mut granted_keywords = Vec::new();
-    for trigger in &record.trigger_definitions {
+    // Prefer the event's LKI snapshot, but preserve older/minimal records that
+    // carry type data without cloned trigger definitions.
+    let record_trigger_definitions: Vec<_> = if record.trigger_definitions.is_empty() {
+        source_obj.trigger_definitions.iter_all().collect()
+    } else {
+        record.trigger_definitions.iter().collect()
+    };
+    for trigger in record_trigger_definitions {
         if let Some(pos) = base_triggers.iter().position(|base| base == trigger) {
             base_triggers.remove(pos);
             printed.push(trigger.clone());
         } else if let Some(kind) = keyword_kind_for_trigger(&record.keywords, trigger) {
             granted_keywords.push((kind, trigger.clone()));
+        } else {
+            printed.push(trigger.clone());
         }
     }
     (printed, granted_keywords)

@@ -372,14 +372,7 @@ fn partition_lki_trigger_definitions(
         .collect();
     let mut printed = Vec::new();
     let mut granted_keywords = Vec::new();
-    // Prefer the event's LKI snapshot, but preserve older/minimal records that
-    // carry type data without cloned trigger definitions.
-    let record_trigger_definitions: Vec<_> = if record.trigger_definitions.is_empty() {
-        source_obj.trigger_definitions.iter_all().collect()
-    } else {
-        record.trigger_definitions.iter().collect()
-    };
-    for trigger in record_trigger_definitions {
+    for trigger in &record.trigger_definitions {
         if let Some(pos) = base_triggers.iter().position(|base| base == trigger) {
             base_triggers.remove(pos);
             printed.push(trigger.clone());
@@ -765,9 +758,10 @@ fn source_was_not_co_departed_into_zone(
         // already functioning in the scanned zone when the trigger event
         // occurred. A source that co-departed into that zone as the triggering
         // object moved there was not there yet for this event, so Recover-style
-        // graveyard triggers must not see it. The event object itself is not
-        // suppressed here: self-referential LTB triggers (Rancor class) still use
-        // the destination-zone scan plus CR 603.10a last-known information.
+        // graveyard triggers must not see it. The event object itself may still
+        // have self-referential LTB triggers (Rancor class), but the destination
+        // scan must read those from the CR 603.10a LKI record, not from the
+        // post-move object.
         GameEvent::ZoneChanged { to, record, .. } if *to == zone => {
             !record.co_departed.contains(&source_id)
         }
@@ -1646,16 +1640,50 @@ fn collect_pending_triggers(
                         Some(o) => o,
                         None => continue,
                     };
-                    collect_matching_triggers(
-                        state,
-                        event,
-                        events,
-                        obj,
-                        0,
-                        Some(zone),
-                        &mut batched_this_pass,
-                        &mut registered_this_event,
-                    )
+                    if let GameEvent::ZoneChanged {
+                        object_id,
+                        to,
+                        record,
+                        ..
+                    } = event
+                    {
+                        if *object_id == obj_id && *to == zone {
+                            let mut lki_obj = obj.clone();
+                            lki_obj.trigger_definitions = record.trigger_definitions.clone().into();
+                            collect_matching_triggers(
+                                state,
+                                event,
+                                events,
+                                &lki_obj,
+                                0,
+                                Some(zone),
+                                &mut batched_this_pass,
+                                &mut registered_this_event,
+                            )
+                        } else {
+                            collect_matching_triggers(
+                                state,
+                                event,
+                                events,
+                                obj,
+                                0,
+                                Some(zone),
+                                &mut batched_this_pass,
+                                &mut registered_this_event,
+                            )
+                        }
+                    } else {
+                        collect_matching_triggers(
+                            state,
+                            event,
+                            events,
+                            obj,
+                            0,
+                            Some(zone),
+                            &mut batched_this_pass,
+                            &mut registered_this_event,
+                        )
+                    }
                 };
 
                 for matched in matched_triggers {
@@ -10856,32 +10884,45 @@ pub mod tests {
             mite.controller = PlayerId(0);
             mite.card_types.core_types.push(CoreType::Creature);
             mite.card_types.core_types.push(CoreType::Artifact);
+            let trigger = TriggerDefinition::new(TriggerMode::ChangesZone)
+                .valid_card(TargetFilter::SelfRef)
+                .origin(Zone::Battlefield)
+                .destination(Zone::Graveyard)
+                .trigger_zones(vec![Zone::Battlefield])
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 2 },
+                        player: TargetFilter::Controller,
+                    },
+                ))
+                .description("When this creature dies, you gain 2 life.".to_string());
             // Dies trigger: "When this creature dies, you gain 2 life"
-            mite.trigger_definitions.push(
-                TriggerDefinition::new(TriggerMode::ChangesZone)
-                    .valid_card(TargetFilter::SelfRef)
-                    .origin(Zone::Battlefield)
-                    .destination(Zone::Graveyard)
-                    .trigger_zones(vec![Zone::Battlefield])
-                    .execute(AbilityDefinition::new(
-                        AbilityKind::Spell,
-                        Effect::GainLife {
-                            amount: QuantityExpr::Fixed { value: 2 },
-                            player: TargetFilter::Controller,
-                        },
-                    ))
-                    .description("When this creature dies, you gain 2 life.".to_string()),
-            );
+            mite.trigger_definitions.push(trigger.clone());
+            std::sync::Arc::make_mut(&mut mite.base_trigger_definitions).push(trigger);
         }
 
+        // CR 603.10a: real zone-change events carry the LKI trigger snapshot
+        // from immediately before the object left the battlefield.
+        let trigger_definitions = state.objects[&mite_id]
+            .trigger_definitions
+            .iter_all()
+            .cloned()
+            .collect();
+
         // Simulate the ZoneChanged event from sacrifice
-        let events = vec![zone_changed_event(
+        let mut events = vec![zone_changed_event(
             mite_id,
             Zone::Battlefield,
             Zone::Graveyard,
             vec![CoreType::Creature, CoreType::Artifact],
             Vec::new(),
         )];
+        if let GameEvent::ZoneChanged { record, .. } = &mut events[0] {
+            record.trigger_definitions = trigger_definitions;
+        } else {
+            panic!("expected ZoneChanged event");
+        }
 
         process_triggers(&mut state, &events);
 

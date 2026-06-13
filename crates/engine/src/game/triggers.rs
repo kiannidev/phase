@@ -372,20 +372,19 @@ fn partition_lki_trigger_definitions(
         .collect();
     let mut printed = Vec::new();
     let mut granted_keywords = Vec::new();
-    // Prefer the event's LKI snapshot. `ZoneChangeRecord::test_minimal` (and
-    // other hand-built records) leave `name` empty and omit trigger clones —
-    // fall back to the live object's trigger list for those. A full snapshot
-    // from `snapshot_for_zone_change` always carries the object name; when its
-    // trigger list is empty that means abilities were stripped at event time
-    // (ReturnAsAura no-target path, CR 614.12) and must not be repopulated from
-    // the live object (issue #1332).
-    let record_trigger_definitions: Vec<_> = if record.trigger_definitions.is_empty()
-        && (record.name.is_empty() || (record.power.is_none() && record.toughness.is_none()))
-    {
-        source_obj.trigger_definitions.iter_all().collect()
-    } else {
-        record.trigger_definitions.iter().collect()
-    };
+    // Prefer the event's LKI snapshot. `ZoneChangeRecord::test_minimal` leaves
+    // `name` empty and omits trigger clones, so tests that hand-build minimal
+    // records can still fall back to the live object's trigger list. A full
+    // `snapshot_for_zone_change` record always carries the object name; when
+    // its trigger list is empty that means abilities were stripped at event
+    // time (ReturnAsAura no-target path, CR 614.12) and must not be repopulated
+    // from the live object (issue #1332).
+    let record_trigger_definitions: Vec<_> =
+        if record.trigger_definitions.is_empty() && record.name.is_empty() {
+            source_obj.trigger_definitions.iter_all().collect()
+        } else {
+            record.trigger_definitions.iter().collect()
+        };
     for trigger in record_trigger_definitions {
         if let Some(pos) = base_triggers.iter().position(|base| base == trigger) {
             base_triggers.remove(pos);
@@ -1662,11 +1661,14 @@ fn collect_pending_triggers(
                     } = event
                     {
                         if obj_id == *moved_id && *to == zone {
-                            // Full `snapshot_for_zone_change` records always carry
-                            // event-time P/T; hand-built test records omit them.
-                            let use_lki_partition = !record.trigger_definitions.is_empty()
-                                || record.power.is_some()
-                                || record.toughness.is_some();
+                            // Full `snapshot_for_zone_change` records always
+                            // carry the object name; hand-built test records
+                            // omit it. Empty trigger snapshots on named records
+                            // are authoritative and must suppress stripped
+                            // triggers instead of falling back to the live
+                            // object.
+                            let use_lki_partition =
+                                !record.trigger_definitions.is_empty() || !record.name.is_empty();
                             if use_lki_partition {
                                 let mut lki_obj = obj.clone();
                                 lki_obj.trigger_definitions =

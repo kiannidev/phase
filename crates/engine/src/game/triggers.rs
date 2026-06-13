@@ -5602,6 +5602,22 @@ pub mod tests {
         }
     }
 
+    fn zone_changed_event_with_triggers(
+        object_id: ObjectId,
+        from: Zone,
+        to: Zone,
+        core_types: Vec<CoreType>,
+        subtypes: Vec<&str>,
+        trigger_definitions: Vec<TriggerDefinition>,
+    ) -> GameEvent {
+        let mut event = zone_changed_event(object_id, from, to, core_types, subtypes);
+        let GameEvent::ZoneChanged { record, .. } = &mut event else {
+            unreachable!("zone_changed_event always returns ZoneChanged");
+        };
+        record.trigger_definitions = trigger_definitions;
+        event
+    }
+
     fn make_creature(
         state: &mut GameState,
         player: PlayerId,
@@ -11725,23 +11741,23 @@ pub mod tests {
             "Dying Creature".to_string(),
             Zone::Battlefield,
         );
-        {
+        let dies_trigger = {
             let obj = state.objects.get_mut(&dying).unwrap();
             obj.card_types.core_types.push(CoreType::Creature);
             obj.entered_battlefield_turn = Some(0);
-            obj.trigger_definitions.push(
-                TriggerDefinition::new(TriggerMode::ChangesZone)
-                    .execute(AbilityDefinition::new(
-                        AbilityKind::Database,
-                        Effect::Draw {
-                            count: QuantityExpr::Fixed { value: 1 },
-                            target: TargetFilter::Controller,
-                        },
-                    ))
-                    .origin(Zone::Battlefield)
-                    .destination(Zone::Graveyard),
-            );
-        }
+            let dies_trigger = TriggerDefinition::new(TriggerMode::ChangesZone)
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Database,
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                ))
+                .origin(Zone::Battlefield)
+                .destination(Zone::Graveyard);
+            obj.trigger_definitions.push(dies_trigger.clone());
+            dies_trigger
+        };
         // Move the object out of the battlefield to mirror a real death.
         {
             let obj = state.objects.get_mut(&dying).unwrap();
@@ -11749,12 +11765,13 @@ pub mod tests {
         }
         state.battlefield.retain(|id| *id != dying);
 
-        let events = vec![zone_changed_event(
+        let events = vec![zone_changed_event_with_triggers(
             dying,
             Zone::Battlefield,
             Zone::Graveyard,
             vec![CoreType::Creature],
             Vec::new(),
+            vec![dies_trigger],
         )];
 
         process_triggers(&mut state, &events);
@@ -11790,35 +11807,36 @@ pub mod tests {
             "Hushed Creature".to_string(),
             Zone::Battlefield,
         );
-        {
+        let dies_trigger = {
             let obj = state.objects.get_mut(&dying).unwrap();
             obj.card_types.core_types.push(CoreType::Creature);
             obj.entered_battlefield_turn = Some(0);
-            obj.trigger_definitions.push(
-                TriggerDefinition::new(TriggerMode::ChangesZone)
-                    .execute(AbilityDefinition::new(
-                        AbilityKind::Database,
-                        Effect::Draw {
-                            count: QuantityExpr::Fixed { value: 1 },
-                            target: TargetFilter::Controller,
-                        },
-                    ))
-                    .origin(Zone::Battlefield)
-                    .destination(Zone::Graveyard),
-            );
-        }
+            let dies_trigger = TriggerDefinition::new(TriggerMode::ChangesZone)
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Database,
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                ))
+                .origin(Zone::Battlefield)
+                .destination(Zone::Graveyard);
+            obj.trigger_definitions.push(dies_trigger.clone());
+            dies_trigger
+        };
         {
             let obj = state.objects.get_mut(&dying).unwrap();
             obj.zone = Zone::Graveyard;
         }
         state.battlefield.retain(|id| *id != dying);
 
-        let events = vec![zone_changed_event(
+        let events = vec![zone_changed_event_with_triggers(
             dying,
             Zone::Battlefield,
             Zone::Graveyard,
             vec![CoreType::Creature],
             Vec::new(),
+            vec![dies_trigger],
         )];
 
         process_triggers(&mut state, &events);
@@ -11854,35 +11872,36 @@ pub mod tests {
             "Dying Artifact".to_string(),
             Zone::Battlefield,
         );
-        {
+        let dies_trigger = {
             let obj = state.objects.get_mut(&dying_artifact).unwrap();
             obj.card_types.core_types.push(CoreType::Artifact);
             obj.entered_battlefield_turn = Some(0);
-            obj.trigger_definitions.push(
-                TriggerDefinition::new(TriggerMode::ChangesZone)
-                    .execute(AbilityDefinition::new(
-                        AbilityKind::Database,
-                        Effect::Draw {
-                            count: QuantityExpr::Fixed { value: 1 },
-                            target: TargetFilter::Controller,
-                        },
-                    ))
-                    .origin(Zone::Battlefield)
-                    .destination(Zone::Graveyard),
-            );
-        }
+            let dies_trigger = TriggerDefinition::new(TriggerMode::ChangesZone)
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Database,
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                ))
+                .origin(Zone::Battlefield)
+                .destination(Zone::Graveyard);
+            obj.trigger_definitions.push(dies_trigger.clone());
+            dies_trigger
+        };
         {
             let obj = state.objects.get_mut(&dying_artifact).unwrap();
             obj.zone = Zone::Graveyard;
         }
         state.battlefield.retain(|id| *id != dying_artifact);
 
-        let events = vec![zone_changed_event(
+        let events = vec![zone_changed_event_with_triggers(
             dying_artifact,
             Zone::Battlefield,
             Zone::Graveyard,
             vec![CoreType::Artifact],
             Vec::new(),
+            vec![dies_trigger],
         )];
 
         process_triggers(&mut state, &events);

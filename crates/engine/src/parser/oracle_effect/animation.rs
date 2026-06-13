@@ -17,8 +17,10 @@ use super::token::{
 };
 use crate::parser::oracle_ir::ast::*;
 use crate::parser::oracle_ir::context::ParseContext;
+use crate::parser::oracle_nom::bridge::nom_on_lower;
 use crate::parser::oracle_quantity;
 use crate::types::ability::{PtValue, QuantityExpr, QuantityRef};
+use crate::types::card_type::Supertype;
 use crate::types::keywords::Keyword;
 use crate::types::mana::ManaColor;
 
@@ -56,6 +58,10 @@ pub(crate) fn parse_animation_spec(text: &str, _ctx: &mut ParseContext) -> Optio
     } else if let Some(stripped) = rest.strip_prefix("an ") {
         rest = stripped;
     }
+
+    let (leading_supertypes, after_supertypes) = strip_animation_supertypes(rest);
+    spec.supertypes = leading_supertypes;
+    rest = after_supertypes;
 
     // CR 107.3c: "X/X where X is ~'s power" — X is bound to a dynamic quantity
     // (source's power), NOT the cost paid. This pattern must be detected BEFORE
@@ -139,11 +145,37 @@ pub(crate) fn parse_animation_spec(text: &str, _ctx: &mut ParseContext) -> Optio
         && spec.colors.is_none()
         && spec.keywords.is_empty()
         && spec.types.is_empty()
+        && spec.supertypes.is_empty()
         && !spec.remove_all_abilities
     {
         None
     } else {
         Some(spec)
+    }
+}
+
+/// CR 205.4a: Peel leading supertype words before P/T/color/type parsing so
+/// "becomes a legendary 4/4 …" (Sarkhan, the Dragonspeaker) does not stall at
+/// `legendary` and fall through to keyword-only partial parses.
+fn strip_animation_supertypes(mut text: &str) -> (Vec<Supertype>, &str) {
+    let mut supertypes = Vec::new();
+    loop {
+        let trimmed = text.trim_start();
+        let trimmed_lower = trimmed.to_lowercase();
+        let Some((supertype, stripped)) = nom_on_lower(trimmed, &trimmed_lower, |i| {
+            alt((
+                value(Supertype::Legendary, tag("legendary ")),
+                value(Supertype::Snow, tag("snow ")),
+                value(Supertype::Basic, tag("basic ")),
+            ))
+            .parse(i)
+        }) else {
+            return (supertypes, trimmed);
+        };
+        if !supertypes.contains(&supertype) {
+            supertypes.push(supertype);
+        }
+        text = stripped;
     }
 }
 
@@ -178,6 +210,11 @@ pub(crate) fn animation_modifications(
     }
     if spec.remove_all_abilities {
         modifications.push(ContinuousModification::RemoveAllAbilities);
+    }
+    for supertype in &spec.supertypes {
+        modifications.push(ContinuousModification::AddSupertype {
+            supertype: *supertype,
+        });
     }
     for keyword in &spec.keywords {
         modifications.push(ContinuousModification::AddKeyword {
@@ -1087,6 +1124,48 @@ mod test_den_bugbear {
             parse_animation_types("snow Creature Elemental", false),
             vec!["Creature", "Elemental"]
         );
+    }
+
+    /// Issue #2362 (Sarkhan, the Dragonspeaker): "+1: … becomes a legendary
+    /// 4/4 red Dragon creature with flying, indestructible, and haste" must emit
+    /// full layer-4 mods, not keywords alone.
+    #[test]
+    fn sarkhan_become_legendary_dragon_animation_spec() {
+        use crate::types::ability::ContinuousModification;
+        use crate::types::card_type::{CoreType, Supertype};
+
+        let spec = parse_animation_spec(
+            "a legendary 4/4 red Dragon creature with flying, indestructible, and haste",
+            &mut ParseContext::default(),
+        )
+        .expect("Sarkhan +1 animation phrase must parse");
+        assert_eq!(spec.supertypes, vec![Supertype::Legendary]);
+        assert_eq!(spec.power, Some(4));
+        assert_eq!(spec.toughness, Some(4));
+        assert_eq!(spec.colors, Some(vec![ManaColor::Red]));
+        assert_eq!(
+            spec.types,
+            vec!["Creature".to_string(), "Dragon".to_string()]
+        );
+        assert!(spec.keywords.contains(&Keyword::Flying));
+        assert!(spec.keywords.contains(&Keyword::Indestructible));
+        assert!(spec.keywords.contains(&Keyword::Haste));
+
+        let mods = animation_modifications(&spec);
+        assert!(mods.contains(&ContinuousModification::AddSupertype {
+            supertype: Supertype::Legendary,
+        }));
+        assert!(mods.contains(&ContinuousModification::SetPower { value: 4 }));
+        assert!(mods.contains(&ContinuousModification::SetToughness { value: 4 }));
+        assert!(mods.contains(&ContinuousModification::SetColor {
+            colors: vec![ManaColor::Red],
+        }));
+        assert!(mods.contains(&ContinuousModification::AddType {
+            core_type: CoreType::Creature,
+        }));
+        assert!(mods.contains(&ContinuousModification::AddSubtype {
+            subtype: "Dragon".to_string(),
+        }));
     }
 
     /// Regression: the subtype grammar must reject tokens where a capital

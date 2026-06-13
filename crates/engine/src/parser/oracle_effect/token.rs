@@ -1496,8 +1496,17 @@ mod tests {
 
     #[test]
     fn keyword_clause_keeps_numbered_keyword_before_quoted_static() {
-        let kws = parse_token_keyword_clause(r#"with toxic 1 and "This token can't block.""#);
-        assert_eq!(kws, vec![Keyword::Toxic(1)]);
+        for clause in [
+            r#"with toxic 1 and "This token can't block.""#,
+            r#"with toxic 1 and "~ can't block.""#,
+        ] {
+            let kws = parse_token_keyword_clause(clause);
+            assert_eq!(
+                kws,
+                vec![Keyword::Toxic(1)],
+                "quoted static suffix must not swallow toxic keyword in {clause:?}"
+            );
+        }
     }
 
     #[test]
@@ -1795,9 +1804,15 @@ mod tests {
             &mut ParseContext::default(),
         );
         if let Some(Effect::Token {
-            static_abilities, ..
+            keywords,
+            static_abilities,
+            ..
         }) = effect
         {
+            assert!(
+                keywords.contains(&Keyword::Toxic(1)),
+                "Mite token must carry Toxic(1), got {keywords:?}"
+            );
             assert_eq!(
                 static_abilities.len(),
                 1,

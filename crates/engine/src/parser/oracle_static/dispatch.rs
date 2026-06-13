@@ -698,10 +698,15 @@ pub(crate) fn parse_static_line_inner(
         }
     }
 
-    // CR 508.1b: "Creatures attacking your opponents have double strike." —
-    // attackers whose defending player is an opponent of the source's controller
-    // (Blast-Furnace Hellkite).
-    if let Some(rest) = nom_tag_tp(&tp, "creatures attacking your opponents ") {
+    // CR 508.1b: "Creatures attacking your opponents [and/or planeswalkers they
+    // control] have/get ..." — attackers whose defending player is an opponent
+    // of the source's controller (Blast-Furnace Hellkite, Neyali).
+    if let Some(rest) = nom_tag_tp(
+        &tp,
+        "creatures attacking your opponents and/or planeswalkers they control ",
+    )
+    .or_else(|| nom_tag_tp(&tp, "creatures attacking your opponents "))
+    {
         let filter =
             TargetFilter::Typed(
                 TypedFilter::creature().properties(vec![FilterProp::Attacking {

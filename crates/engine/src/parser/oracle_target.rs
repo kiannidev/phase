@@ -3144,7 +3144,15 @@ fn parse_attacking_defender_suffix(text: &str) -> Option<(FilterProp, usize)> {
             "attacking you or a planeswalker you control",
             ControllerRef::You,
         ),
+        (
+            "attacking you and/or planeswalkers you control",
+            ControllerRef::You,
+        ),
         ("attacking you", ControllerRef::You),
+        (
+            "attacking your opponents and/or planeswalkers they control",
+            ControllerRef::Opponent,
+        ),
         ("attacking your opponents", ControllerRef::Opponent),
     ] {
         if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(pattern).parse(trimmed) {
@@ -3153,11 +3161,19 @@ fn parse_attacking_defender_suffix(text: &str) -> Option<(FilterProp, usize)> {
             // gate, not a defender suffix (Stalking Leonin). Accepting the bare
             // "attacking you" prefix leaves the trailing " if " unrepresented
             // and trips swallowed-clause detection.
-            if rest_trim.starts_with("if ") || rest_trim.starts_with("unless ") {
+            if alt((
+                tag::<_, _, OracleError<'_>>("if "),
+                tag::<_, _, OracleError<'_>>("unless "),
+                tag::<_, _, OracleError<'_>>("and/or "),
+                tag::<_, _, OracleError<'_>>("or "),
+            ))
+            .parse(rest_trim)
+            .is_ok()
+            {
                 continue;
             }
             match rest.chars().next() {
-                None | Some('.') | Some(',') | Some(' ') if rest_trim.is_empty() => {
+                None | Some('.') | Some(',') | Some(' ') => {
                     return Some((
                         FilterProp::Attacking {
                             defender: Some(defender),
@@ -6000,10 +6016,24 @@ mod tests {
         assert!(!typed.properties.contains(&FilterProp::Attacking {
             defender: Some(ControllerRef::You),
         }));
-        assert!(
-            remainder.contains("if it's controlled by the chosen player"),
-            "remainder: '{remainder}'"
+        assert_eq!(
+            remainder.trim_start(),
+            "that's attacking you if it's controlled by the chosen player"
         );
+    }
+
+    #[test]
+    fn parse_creatures_attacking_your_opponents_and_planeswalkers() {
+        let (filter, remainder) =
+            parse_target("creatures attacking your opponents and/or planeswalkers they control");
+        assert!(remainder.trim().is_empty(), "remainder: '{remainder}'");
+        let TargetFilter::Typed(typed) = filter else {
+            panic!("expected typed filter, got {filter:?}");
+        };
+        assert!(typed.type_filters.contains(&TypeFilter::Creature));
+        assert!(typed.properties.contains(&FilterProp::Attacking {
+            defender: Some(ControllerRef::Opponent),
+        }));
     }
 
     // CR 701.60b: "suspected" is a battlefield designation usable as a type-phrase

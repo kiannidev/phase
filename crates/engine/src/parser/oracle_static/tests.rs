@@ -5265,6 +5265,26 @@ fn static_creatures_attacking_your_opponents_have_double_strike() {
 }
 
 #[test]
+fn static_creatures_attacking_opponents_and_planeswalkers_get_pump() {
+    let def = parse_static_line(
+        "Creatures attacking your opponents and/or planeswalkers they control get +2/+0 until end of turn.",
+    )
+    .unwrap();
+    assert_eq!(def.mode, StaticMode::Continuous);
+    assert_eq!(
+        def.affected,
+        Some(TargetFilter::Typed(TypedFilter::creature().properties(
+            vec![FilterProp::Attacking {
+                defender: Some(ControllerRef::Opponent)
+            }]
+        ),))
+    );
+    assert!(def
+        .modifications
+        .contains(&ContinuousModification::AddPower { value: 2 }));
+}
+
+#[test]
 fn static_during_your_turn_creatures_you_control_have_hexproof() {
     let def = parse_static_line("During your turn, creatures you control have hexproof.").unwrap();
     assert_eq!(def.mode, StaticMode::Continuous);

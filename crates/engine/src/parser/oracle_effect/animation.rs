@@ -17,7 +17,6 @@ use super::token::{
 };
 use crate::parser::oracle_ir::ast::*;
 use crate::parser::oracle_ir::context::ParseContext;
-use crate::parser::oracle_nom::bridge::nom_on_lower;
 use crate::parser::oracle_quantity;
 use crate::types::ability::{PtValue, QuantityExpr, QuantityRef};
 use crate::types::card_type::Supertype;
@@ -58,10 +57,6 @@ pub(crate) fn parse_animation_spec(text: &str, _ctx: &mut ParseContext) -> Optio
     } else if let Some(stripped) = rest.strip_prefix("an ") {
         rest = stripped;
     }
-
-    let (leading_supertypes, after_supertypes) = strip_animation_supertypes(rest);
-    spec.supertypes = leading_supertypes;
-    rest = after_supertypes;
 
     // CR 107.3c: "X/X where X is ~'s power" — X is bound to a dynamic quantity
     // (source's power), NOT the cost paid. This pattern must be detected BEFORE
@@ -130,13 +125,15 @@ pub(crate) fn parse_animation_spec(text: &str, _ctx: &mut ParseContext) -> Optio
         rest = after_colors;
     }
 
-    spec.types = parse_animation_types(
+    let (supertypes, types) = parse_animation_type_parts(
         rest,
         spec.power.is_some()
             || spec.toughness.is_some()
             || spec.dynamic_power.is_some()
             || spec.dynamic_toughness.is_some(),
     );
+    spec.supertypes = supertypes;
+    spec.types = types;
 
     if spec.power.is_none()
         && spec.toughness.is_none()
@@ -151,31 +148,6 @@ pub(crate) fn parse_animation_spec(text: &str, _ctx: &mut ParseContext) -> Optio
         None
     } else {
         Some(spec)
-    }
-}
-
-/// CR 205.4a: Peel leading supertype words before P/T/color/type parsing so
-/// "becomes a legendary 4/4 …" (Sarkhan, the Dragonspeaker) does not stall at
-/// `legendary` and fall through to keyword-only partial parses.
-fn strip_animation_supertypes(mut text: &str) -> (Vec<Supertype>, &str) {
-    let mut supertypes = Vec::new();
-    loop {
-        let trimmed = text.trim_start();
-        let trimmed_lower = trimmed.to_lowercase();
-        let Some((supertype, stripped)) = nom_on_lower(trimmed, &trimmed_lower, |i| {
-            alt((
-                value(Supertype::Legendary, tag("legendary ")),
-                value(Supertype::Snow, tag("snow ")),
-                value(Supertype::Basic, tag("basic ")),
-            ))
-            .parse(i)
-        }) else {
-            return (supertypes, trimmed);
-        };
-        if !supertypes.contains(&supertype) {
-            supertypes.push(supertype);
-        }
-        text = stripped;
     }
 }
 
@@ -443,17 +415,16 @@ fn split_animation_dynamic_pt_clause(text: &str) -> Option<(&str, QuantityExpr)>
 
 /// Classification of a single token within a "becomes [type expression]" noun
 /// phrase. Encodes the full design space so callers can't conflate core types
-/// (emitted as `AddType`) with subtypes (emitted as `AddSubtype`) or leak
-/// supertypes (recognized-but-discarded: animations never change supertypes).
+/// (emitted as `AddType`) with subtypes (emitted as `AddSubtype`) or supertypes
+/// (emitted as `AddSupertype`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AnimationTypeToken {
     /// CR 205.2a core type — maps to `ContinuousModification::AddType`.
     CoreType(&'static str),
     /// CR 205.3 subtype — maps to `ContinuousModification::AddSubtype`.
     Subtype(String),
-    /// CR 205.4 supertype — recognized to avoid halting the sequence, but
-    /// not emitted as a modification (animations don't grant supertypes).
-    Supertype,
+    /// CR 205.4 supertype — maps to `ContinuousModification::AddSupertype`.
+    Supertype(Supertype),
 }
 
 /// Zero-width word-boundary check: next char must be non-alphabetic (whitespace,
@@ -491,14 +462,16 @@ fn parse_animation_core_type(input: &str) -> OracleResult<'_, AnimationTypeToken
 
 /// Parse a CR 205.4 supertype keyword (case-insensitive, word-boundary terminated).
 fn parse_animation_supertype(input: &str) -> OracleResult<'_, AnimationTypeToken> {
-    let (rest, _) = alt((
-        tag_no_case("legendary"),
-        tag_no_case("basic"),
-        tag_no_case("snow"),
+    let (rest, supertype) = alt((
+        value(Supertype::Legendary, tag_no_case("legendary")),
+        value(Supertype::Basic, tag_no_case("basic")),
+        value(Supertype::Snow, tag_no_case("snow")),
+        value(Supertype::World, tag_no_case("world")),
+        value(Supertype::Ongoing, tag_no_case("ongoing")),
     ))
     .parse(input)?;
     let (rest, _) = alpha_word_boundary(rest)?;
-    Ok((rest, AnimationTypeToken::Supertype))
+    Ok((rest, AnimationTypeToken::Supertype(supertype)))
 }
 
 /// Parse a CR 205.3 subtype: a capitalized proper-noun word of length ≥ 2,
@@ -683,8 +656,8 @@ pub(crate) fn has_in_addition_to_other_types(text: &str) -> bool {
 /// outside the effect-animation path (e.g., static-ability parsing of
 /// "target creature ... becomes a Horror enchantment creature in addition to
 /// its other types") get the same type-line decomposition: one `AddType` per
-/// CR 205.2 core type, one `AddSubtype` per CR 205.3 subtype, supertypes
-/// discarded (CR 205.4 — animations never grant supertypes).
+/// CR 205.2 core type, one `AddSubtype` per CR 205.3 subtype, and one
+/// `AddSupertype` per CR 205.4 supertype.
 ///
 /// The descriptor is the noun phrase *after* the "becomes a"/"becomes an"
 /// article and *before* any trailing "in addition to its other types" clause.
@@ -741,7 +714,12 @@ pub(crate) fn parse_becomes_type_modifications(
                     modifications.push(modification);
                 }
             }
-            AnimationTypeToken::Supertype => {}
+            AnimationTypeToken::Supertype(supertype) => {
+                let modification = ContinuousModification::AddSupertype { supertype };
+                if !modifications.contains(&modification) {
+                    modifications.push(modification);
+                }
+            }
         }
     }
     modifications
@@ -755,31 +733,36 @@ pub(crate) fn parse_becomes_type_modifications(
 /// This prevents misparses like *"this creature becomes a Dragon, gets +5/+3,
 /// and gains flying"* from sweeping `Gets`, `And`, `Gains`, `Flying` in as
 /// AddSubtype modifications — a common coverage false-positive pattern.
-fn parse_animation_types(text: &str, infer_creature: bool) -> Vec<String> {
+fn parse_animation_type_parts(text: &str, infer_creature: bool) -> (Vec<Supertype>, Vec<String>) {
     let descriptor = text.trim().trim_end_matches(',').trim();
     if descriptor.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     // See parse_becomes_type_modifications for the same forward-parse pattern.
     // oracle_nom/PATTERNS.md ("Optional trailing clause after a token sequence").
     let tokens = match try_parse_type_sequence_with_suffix(descriptor) {
         Some(tokens) => tokens,
-        None => return Vec::new(),
+        None => return (Vec::new(), Vec::new()),
     };
 
+    let mut supertypes = Vec::new();
     let mut core_types = Vec::new();
     let mut subtypes = Vec::new();
     for token in tokens {
         match token {
             AnimationTypeToken::CoreType(name) => push_unique_string(&mut core_types, name),
             AnimationTypeToken::Subtype(name) => subtypes.push(title_case_word(&name)),
-            AnimationTypeToken::Supertype => {}
+            AnimationTypeToken::Supertype(supertype) => {
+                if !supertypes.contains(&supertype) {
+                    supertypes.push(supertype);
+                }
+            }
         }
     }
 
     if core_types.is_empty() && subtypes.is_empty() {
-        return Vec::new();
+        return (supertypes, Vec::new());
     }
     if core_types.is_empty() && infer_creature {
         push_unique_string(&mut core_types, "Creature");
@@ -789,7 +772,11 @@ fn parse_animation_types(text: &str, infer_creature: bool) -> Vec<String> {
     for subtype in subtypes {
         push_unique_string(&mut types, subtype);
     }
-    types
+    (supertypes, types)
+}
+
+fn parse_animation_types(text: &str, infer_creature: bool) -> Vec<String> {
+    parse_animation_type_parts(text, infer_creature).1
 }
 
 fn split_animation_keyword_clause(text: &str) -> (&str, Vec<Keyword>) {
@@ -1108,18 +1095,28 @@ mod test_den_bugbear {
         ));
     }
 
-    /// Regression: supertypes (CR 205.4) must be recognized-and-discarded
-    /// so they don't halt the sequence. Animations never grant supertypes,
-    /// but a leading `legendary` / `basic` / `snow` word in the noun phrase
-    /// must not prevent the subtype that follows from being captured.
+    /// Regression: supertypes (CR 205.4) must be captured without halting the
+    /// sequence. A leading or mid-phrase `legendary` / `basic` / `snow` word in
+    /// the noun phrase must not prevent the subtype that follows from being
+    /// captured.
     #[test]
-    fn animation_types_discards_supertypes_without_halting_sequence() {
+    fn animation_types_captures_supertypes_without_halting_sequence() {
+        let (supertypes, types) = parse_animation_type_parts("legendary Angel creature", false);
+        assert_eq!(supertypes, vec![Supertype::Legendary]);
+        assert_eq!(types, vec!["Creature", "Angel"]);
+
         assert_eq!(
             parse_animation_types("legendary Angel creature", false),
             vec!["Creature", "Angel"]
         );
-        assert_eq!(parse_animation_types("basic Forest", false), vec!["Forest"]);
+        let (supertypes, types) = parse_animation_type_parts("basic Forest", false);
+        assert_eq!(supertypes, vec![Supertype::Basic]);
+        assert_eq!(types, vec!["Forest"]);
+
         // Supertype between core type and subtype must not halt.
+        let (supertypes, types) = parse_animation_type_parts("snow Creature Elemental", false);
+        assert_eq!(supertypes, vec![Supertype::Snow]);
+        assert_eq!(types, vec!["Creature", "Elemental"]);
         assert_eq!(
             parse_animation_types("snow Creature Elemental", false),
             vec!["Creature", "Elemental"]
@@ -1147,9 +1144,10 @@ mod test_den_bugbear {
             spec.types,
             vec!["Creature".to_string(), "Dragon".to_string()]
         );
-        assert!(spec.keywords.contains(&Keyword::Flying));
-        assert!(spec.keywords.contains(&Keyword::Indestructible));
-        assert!(spec.keywords.contains(&Keyword::Haste));
+        assert_eq!(
+            spec.keywords,
+            vec![Keyword::Flying, Keyword::Indestructible, Keyword::Haste]
+        );
 
         let mods = animation_modifications(&spec);
         assert!(mods.contains(&ContinuousModification::AddSupertype {
@@ -1188,7 +1186,7 @@ mod test_den_bugbear {
     #[test]
     fn becomes_type_modifications_decomposes_subtype_and_core_types() {
         use crate::types::ability::ContinuousModification;
-        use crate::types::card_type::CoreType;
+        use crate::types::card_type::{CoreType, Supertype};
 
         // Pure core type.
         assert_eq!(
@@ -1261,10 +1259,13 @@ mod test_den_bugbear {
             ]
         );
 
-        // Supertype (CR 205.4) is recognized and discarded.
+        // Supertype (CR 205.4) is recognized and emitted with the type phrase.
         assert_eq!(
             parse_becomes_type_modifications("legendary Angel creature"),
             vec![
+                ContinuousModification::AddSupertype {
+                    supertype: Supertype::Legendary
+                },
                 ContinuousModification::AddSubtype {
                     subtype: "Angel".into()
                 },

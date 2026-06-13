@@ -119,6 +119,15 @@ pub fn resolve(
         // LTB event re-queues the same self-return trigger forever (issue #1332).
         install_aura_continuous_effect(state, ability, returned_id, &enchant_filter, grants);
         crate::game::layers::evaluate_layers(state);
+        // CR 614.12 + CR 303.4g: Ensure the imminent Battlefield → Graveyard
+        // snapshot omits stripped triggers. `evaluate_layers` applies
+        // `RemoveAllAbilities` to the live list, but the zone-change record
+        // clones `trigger_definitions.iter_all()` at move time — an explicit
+        // clear guarantees LTB look-back (issue #1332) cannot re-queue the
+        // self-return trigger from a stale live list.
+        if let Some(obj) = state.objects.get_mut(&returned_id) {
+            obj.trigger_definitions.clear();
+        }
 
         // CR 303.4g + CR 614.6 + CR 616.1: No legal object to enchant → owner's
         // graveyard. Route the Battlefield → Graveyard move through the
@@ -501,6 +510,13 @@ mod tests {
             panic!("expected ZoneChanged event");
         };
         assert!(record.trigger_definitions.is_empty());
+        assert!(state.stack.is_empty());
+
+        crate::game::triggers::process_triggers(&mut state, &events);
+        assert!(
+            state.stack.is_empty(),
+            "post-resolution trigger scan must not re-queue stripped dies triggers"
+        );
     }
 
     #[test]

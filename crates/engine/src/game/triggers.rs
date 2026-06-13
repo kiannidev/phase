@@ -372,7 +372,20 @@ fn partition_lki_trigger_definitions(
         .collect();
     let mut printed = Vec::new();
     let mut granted_keywords = Vec::new();
-    for trigger in &record.trigger_definitions {
+    // Prefer the event's LKI snapshot. `ZoneChangeRecord::test_minimal` (and
+    // other hand-built records) leave `name` empty and omit trigger clones —
+    // fall back to the live object's trigger list for those. A full snapshot
+    // from `snapshot_for_zone_change` always carries the object name; when its
+    // trigger list is empty that means abilities were stripped at event time
+    // (ReturnAsAura no-target path, CR 614.12) and must not be repopulated from
+    // the live object (issue #1332).
+    let record_trigger_definitions: Vec<_> =
+        if record.trigger_definitions.is_empty() && record.name.is_empty() {
+            source_obj.trigger_definitions.iter_all().collect()
+        } else {
+            record.trigger_definitions.iter().collect()
+        };
+    for trigger in record_trigger_definitions {
         if let Some(pos) = base_triggers.iter().position(|base| base == trigger) {
             base_triggers.remove(pos);
             printed.push(trigger.clone());
@@ -1641,15 +1654,16 @@ fn collect_pending_triggers(
                         None => continue,
                     };
                     if let GameEvent::ZoneChanged {
-                        object_id,
+                        object_id: moved_id,
                         to,
                         record,
                         ..
                     } = event
                     {
-                        if *object_id == obj_id && *to == zone {
+                        if obj_id == *moved_id && *to == zone {
                             let mut lki_obj = obj.clone();
-                            lki_obj.trigger_definitions = record.trigger_definitions.clone().into();
+                            lki_obj.trigger_definitions =
+                                partition_lki_trigger_definitions(obj, record).0.into();
                             collect_matching_triggers(
                                 state,
                                 event,

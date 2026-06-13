@@ -123,20 +123,9 @@ pub fn resolve(
         events.push(spell_copied.clone());
         // CR 603.2 + CR 707.10: Magecraft (`SpellCastOrCopy`) and other copy
         // observers must react when a spell copy is created mid-resolution.
-        // `apply()` only scans triggers from `run_post_action_pipeline` when
-        // the action settles to `WaitingFor::Priority`; copies created during an
-        // optional-choice or retarget pause (Chain of Smog) otherwise never
-        // reach `process_triggers` (issue #2866). Mirror the cast-announcement
-        // drain so observers go on the stack while the copy remains there.
+        // Collect now; drain after the copy is fully formed (CR 707.10c retarget
+        // choice completes, or immediately when no retarget pause is needed).
         crate::game::triggers::collect_triggers_into_deferred(state, &[spell_copied]);
-        if let Some(wf) =
-            crate::game::triggers::drain_deferred_triggers_after_stack_object_announcement(
-                state, events,
-            )
-        {
-            state.waiting_for = wf;
-            return Ok(());
-        }
     }
 
     // CR 707.10c: If the copy has targets, allow the controller to choose new ones.
@@ -168,6 +157,7 @@ pub fn resolve(
                 kind: EffectKind::from(&ability.effect),
                 source_id: ability.source_id,
             });
+            drain_spell_copied_observer_triggers(state, events, copied_spell_card_id.is_some())?;
             return Ok(());
         };
         open_copy_retarget_choice(
@@ -188,6 +178,27 @@ pub fn resolve(
         source_id: ability.source_id,
     });
 
+    drain_spell_copied_observer_triggers(state, events, copied_spell_card_id.is_some())?;
+    Ok(())
+}
+
+/// CR 603.2 + CR 707.10: Drain `SpellCopied` observers collected when the copy
+/// was announced. Deferred until the copy is fully formed — after any CR 707.10c
+/// retarget choice, or immediately when no retarget pause is armed.
+fn drain_spell_copied_observer_triggers(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+    spell_copied_collected: bool,
+) -> Result<(), EffectError> {
+    if spell_copied_collected {
+        if let Some(wf) =
+            crate::game::triggers::drain_deferred_triggers_after_stack_object_announcement(
+                state, events,
+            )
+        {
+            state.waiting_for = wf;
+        }
+    }
     Ok(())
 }
 

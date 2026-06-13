@@ -131,12 +131,22 @@ fn issue_2866_professor_onyx_magecraft_on_chain_of_smog_copy() {
         .act(GameAction::DecideOptionalEffect { accept: true })
         .expect("accept copy");
 
-    // Magecraft from the copy must fire before/during copy retarget — at minimum
-    // the life totals must reflect cast + copy by the time we settle.
     match runner.state().waiting_for.clone() {
         WaitingFor::CopyRetarget { player, .. } => assert_eq!(player, P0),
         other => panic!("expected CopyRetarget after accepting copy, got {other:?}"),
     }
+
+    // Copy observers must not drain until CopyRetarget completes — only cast magecraft so far.
+    assert_eq!(
+        player_life(&runner, P1),
+        p1_life_before - 2,
+        "only cast magecraft should have fired before retarget finalizes"
+    );
+    assert_eq!(
+        player_life(&runner, P0),
+        p0_life_before + 2,
+        "only cast magecraft should have fired before retarget finalizes"
+    );
 
     runner
         .act(GameAction::KeepAllCopyTargets)

@@ -7,13 +7,16 @@
 use engine::game::combat::AttackTarget;
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::game::scenario_db::GameScenarioDbExt;
-use engine::types::ability::{Effect, PtValue, QuantityExpr, TargetFilter};
+use engine::parser::parse_oracle_text;
+use engine::types::ability::{AbilityKind, Effect, QuantityExpr};
 use engine::types::actions::GameAction;
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
-use engine::types::mana::{ManaColor, ManaType, ManaUnit};
+use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
+
+const BROODSPINNER_ORACLE: &str = "{4}{B}{G}, {T}, Sacrifice this creature: Create a number of 1/1 black and green Insect creature tokens with flying equal to the number of card types among cards in your graveyard.";
 
 fn issue_2854_db() -> &'static engine::database::card_db::CardDatabase {
     static DB: std::sync::OnceLock<engine::database::card_db::CardDatabase> =
@@ -24,6 +27,39 @@ fn issue_2854_db() -> &'static engine::database::card_db::CardDatabase {
         engine::database::card_db::CardDatabase::from_export(&path)
             .expect("issue_2854_cards.json fixture must load")
     })
+}
+
+fn parsed_broodspinner_token_effect() -> Effect {
+    let parsed = parse_oracle_text(
+        BROODSPINNER_ORACLE,
+        "Broodspinner",
+        &[],
+        &["Creature".to_string()],
+        &["Spider".to_string()],
+    );
+    let token_effect = parsed
+        .abilities
+        .into_iter()
+        .find(|ability| {
+            matches!(ability.kind, AbilityKind::Activated)
+                && matches!(ability.effect.as_ref(), Effect::Token { .. })
+        })
+        .expect("Broodspinner activated token ability must parse")
+        .effect;
+
+    let mut effect = *token_effect;
+    let Effect::Token {
+        keywords, count, ..
+    } = &mut effect
+    else {
+        unreachable!("matched Token effect above");
+    };
+    assert!(
+        keywords.contains(&Keyword::Flying),
+        "parsed Broodspinner token effect must carry Flying, got {keywords:?}"
+    );
+    *count = QuantityExpr::Fixed { value: 1 };
+    effect
 }
 
 fn create_flying_insect(runner: &mut engine::game::scenario::GameRunner) -> ObjectId {
@@ -39,33 +75,25 @@ fn create_flying_insect(runner: &mut engine::game::scenario::GameRunner) -> Obje
         ),
     );
     let ability = engine::types::ability::ResolvedAbility::new(
-        Effect::Token {
-            name: "Insect".to_string(),
-            power: PtValue::Fixed(1),
-            toughness: PtValue::Fixed(1),
-            types: vec!["Creature".to_string(), "Insect".to_string()],
-            colors: vec![ManaColor::White],
-            keywords: vec![Keyword::Flying, Keyword::Haste],
-            tapped: false,
-            count: QuantityExpr::Fixed { value: 1 },
-            owner: TargetFilter::Controller,
-            attach_to: None,
-            enters_attacking: false,
-            supertypes: vec![],
-            static_abilities: vec![],
-            enter_with_counters: vec![],
-        },
+        parsed_broodspinner_token_effect(),
         vec![],
         source,
         P0,
     );
     let mut events = Vec::new();
     engine::game::effects::token::resolve(runner.state_mut(), &ability, &mut events).unwrap();
-    *runner
+    let insect = *runner
         .state()
         .battlefield
         .back()
-        .expect("insect token created")
+        .expect("insect token created");
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&insect)
+        .expect("insect object exists")
+        .summoning_sick = false;
+    insect
 }
 
 #[test]

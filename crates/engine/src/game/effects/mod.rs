@@ -2631,6 +2631,21 @@ fn effect_uses_implicit_tracked_set_targets(effect: &Effect) -> bool {
     )
 }
 
+/// CR 707.10: A `CopySpell { SelfRef }` sub-ability after a `forward_result`
+/// parent copies the resolving spell, not the object the parent just moved.
+/// Rebinding `source_id` to the forwarded permanent breaks the
+/// `resolving_stack_entry` fallback in `copy_spell::resolve` once the spell
+/// has left the stack (Sevinne's Reclamation — issue #2860).
+fn copy_spell_self_ref_keeps_resolving_spell_source(sub: &ResolvedAbility) -> bool {
+    matches!(
+        &sub.effect,
+        Effect::CopySpell {
+            target: TargetFilter::SelfRef,
+            ..
+        }
+    )
+}
+
 /// CR 608.2c + CR 614.6: Pair each object affected by `effect` with the producer
 /// ACTION that made it part of the tracked set, mirroring
 /// [`affected_objects_from_events`] one-for-one but retaining a per-object
@@ -5473,34 +5488,41 @@ fn resolve_chain_body(
         // resolve to it.
         if !forwarded_objects.is_empty() {
             let mut sub_with_context = sub.as_ref().clone();
-            sub_with_context.source_id = forwarded_objects[0];
-            if matches!(sub.effect, Effect::Attach { .. }) {
-                if !sub_with_context
-                    .targets
-                    .iter()
-                    .any(|t| matches!(t, TargetRef::Object(id) if *id == ability.source_id))
+            // CR 707.10: `CopySpell { SelfRef }` copies the resolving spell
+            // itself (Sevinne's Reclamation, Chain cycle). `forward_result`
+            // rebinding `source_id` to the just-moved permanent would make
+            // `copy_spell::resolve` look up the wrong stack entry after
+            // `resolve_top` has popped the spell (issue #2860).
+            if !copy_spell_self_ref_keeps_resolving_spell_source(sub) {
+                sub_with_context.source_id = forwarded_objects[0];
+                if matches!(sub.effect, Effect::Attach { .. }) {
+                    if !sub_with_context
+                        .targets
+                        .iter()
+                        .any(|t| matches!(t, TargetRef::Object(id) if *id == ability.source_id))
+                    {
+                        sub_with_context
+                            .targets
+                            .push(TargetRef::Object(ability.source_id));
+                    }
+                } else if sub_with_context.targets.is_empty()
+                    && !effect_uses_implicit_tracked_set_targets(&sub.effect)
                 {
-                    sub_with_context
-                        .targets
-                        .push(TargetRef::Object(ability.source_id));
-                }
-            } else if sub_with_context.targets.is_empty()
-                && !effect_uses_implicit_tracked_set_targets(&sub.effect)
-            {
-                // CR 608.2c: ParentTarget consumers in a forward_result sub-chain
-                // need the moved object's id in `targets`, not just a rebound
-                // `source_id`. Goryo's Vengeance ("return target … creature …
-                // That creature gains haste. Exile it at the beginning of the
-                // next end step.") carries explicit cast-time targets on the
-                // parent `ChangeZone`; Emperor-of-Bones-style descriptors do
-                // not. Both shapes must snapshot the just-moved card for
-                // downstream ParentTarget / delayed-trigger registration.
-                if !ability.targets.is_empty() {
-                    sub_with_context.targets = ability.targets.clone();
-                } else {
-                    sub_with_context
-                        .targets
-                        .insert(0, TargetRef::Object(forwarded_objects[0]));
+                    // CR 608.2c: ParentTarget consumers in a forward_result sub-chain
+                    // need the moved object's id in `targets`, not just a rebound
+                    // `source_id`. Goryo's Vengeance ("return target … creature …
+                    // That creature gains haste. Exile it at the beginning of the
+                    // next end step.") carries explicit cast-time targets on the
+                    // parent `ChangeZone`; Emperor-of-Bones-style descriptors do
+                    // not. Both shapes must snapshot the just-moved card for
+                    // downstream ParentTarget / delayed-trigger registration.
+                    if !ability.targets.is_empty() {
+                        sub_with_context.targets = ability.targets.clone();
+                    } else {
+                        sub_with_context
+                            .targets
+                            .insert(0, TargetRef::Object(forwarded_objects[0]));
+                    }
                 }
             }
             apply_parent_chain_context(

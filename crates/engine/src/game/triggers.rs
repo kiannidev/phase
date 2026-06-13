@@ -355,24 +355,32 @@ fn runtime_granted_lki_keyword_triggers(
     source_obj: &GameObject,
     record: &crate::types::game_state::ZoneChangeRecord,
 ) -> Vec<(KeywordKind, TriggerDefinition)> {
+    partition_lki_trigger_definitions(source_obj, record).1
+}
+
+fn partition_lki_trigger_definitions(
+    source_obj: &GameObject,
+    record: &crate::types::game_state::ZoneChangeRecord,
+) -> (
+    Vec<TriggerDefinition>,
+    Vec<(KeywordKind, TriggerDefinition)>,
+) {
     let mut base_triggers: Vec<TriggerDefinition> = source_obj
         .base_trigger_definitions
         .iter()
         .cloned()
         .collect();
-    record
-        .trigger_definitions
-        .iter()
-        .filter_map(|trigger| {
-            if let Some(pos) = base_triggers.iter().position(|base| base == trigger) {
-                base_triggers.remove(pos);
-                None
-            } else {
-                keyword_kind_for_trigger(&record.keywords, trigger)
-                    .map(|kind| (kind, trigger.clone()))
-            }
-        })
-        .collect()
+    let mut printed = Vec::new();
+    let mut granted_keywords = Vec::new();
+    for trigger in &record.trigger_definitions {
+        if let Some(pos) = base_triggers.iter().position(|base| base == trigger) {
+            base_triggers.remove(pos);
+            printed.push(trigger.clone());
+        } else if let Some(kind) = keyword_kind_for_trigger(&record.keywords, trigger) {
+            granted_keywords.push((kind, trigger.clone()));
+        }
+    }
+    (printed, granted_keywords)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1464,7 +1472,8 @@ fn collect_pending_triggers(
             {
                 let matched_triggers = {
                     let mut obj = state.objects[moved_id].clone();
-                    obj.trigger_definitions = record.trigger_definitions.clone().into();
+                    obj.trigger_definitions =
+                        partition_lki_trigger_definitions(&obj, record).0.into();
                     collect_matching_triggers(
                         state,
                         event,

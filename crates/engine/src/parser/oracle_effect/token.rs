@@ -1038,6 +1038,9 @@ pub(super) fn parse_token_keyword_clause(text: &str) -> Vec<Keyword> {
         .split(" where ")
         .next()
         .unwrap_or(after_with)
+        .split(" equal to ")
+        .next()
+        .unwrap_or(after_with)
         .split(" attached ")
         .next()
         .unwrap_or(after_with)
@@ -1469,6 +1472,32 @@ mod tests {
     fn keyword_clause_no_where() {
         let kws = parse_token_keyword_clause("with flying");
         assert_eq!(kws, vec![Keyword::Flying]);
+    }
+
+    /// Issue #2854 (Broodspinner): "with flying equal to …" must not treat the
+    /// count clause as part of the keyword name.
+    #[test]
+    fn keyword_clause_with_equal_to_count_suffix() {
+        let kws = parse_token_keyword_clause(
+            "with flying equal to the number of card types among cards in your graveyard",
+        );
+        assert_eq!(kws, vec![Keyword::Flying]);
+    }
+
+    #[test]
+    fn broodspinner_insect_tokens_with_flying_equal_to_count() {
+        let text = "Create a number of 1/1 black and green Insect creature tokens with flying equal to the number of card types among cards in your graveyard.";
+        let effect = try_parse_token(text, text, &mut ParseContext::default())
+            .expect("Broodspinner token line must parse");
+        match effect {
+            crate::types::ability::Effect::Token { keywords, .. } => {
+                assert!(
+                    keywords.contains(&Keyword::Flying),
+                    "flying insect tokens must carry Flying, got {keywords:?}"
+                );
+            }
+            other => panic!("expected Token effect, got {other:?}"),
+        }
     }
 
     #[test]

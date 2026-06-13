@@ -13444,6 +13444,21 @@ mod tests {
         assert_eq!(def.mode, TriggerMode::AttackersDeclared);
         assert_eq!(def.attack_target_filter, Some(AttackTargetFilter::Player));
         assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+        let execute = def.execute.as_ref().expect("trigger should have effect");
+        assert!(
+            matches!(
+                execute.effect.as_ref(),
+                Effect::TargetOnly {
+                    target: TargetFilter::Typed(typed),
+                    ..
+                } if typed.type_filters.contains(&TypeFilter::Creature)
+                    && typed.properties.contains(&FilterProp::Attacking {
+                        defender: Some(ControllerRef::You),
+                    })
+            ),
+            "expected TargetOnly(creature attacking you), got {:?}",
+            execute.effect
+        );
     }
 
     /// Issue #594 — Maralen, Fae Ascendant's ETB trigger: the full Oracle

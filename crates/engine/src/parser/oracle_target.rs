@@ -2096,6 +2096,11 @@ pub fn parse_type_phrase_with_ctx<'a>(
         }
     }
 
+    if let Some((prop, consumed)) = parse_attacking_defender_suffix(&lower[pos..]) {
+        properties.push(prop);
+        pos += consumed;
+    }
+
     // Check zone suffix: "card from a graveyard", "card in your graveyard", "from exile", etc.
     if let Some((zone_props, zone_ctrl, consumed)) = parse_zone_suffix(&lower[pos..]) {
         properties.extend(zone_props);
@@ -3126,6 +3131,36 @@ pub(crate) fn parse_combat_status_prefix(text: &str) -> Option<(FilterProp, usiz
         return Some((FilterProp::FaceDown, text.len() - rest.len()));
     }
 
+    None
+}
+
+/// CR 508.1b: Postnominal "attacking you" / "attacking your opponents" on a
+/// typed phrase ("target creature attacking you"). The prefix form emits
+/// `Attacking { defender: None }`; this suffix scopes the defending player.
+fn parse_attacking_defender_suffix(text: &str) -> Option<(FilterProp, usize)> {
+    let trimmed = text.trim_start();
+    for (pattern, defender) in [
+        (
+            "attacking you or a planeswalker you control",
+            ControllerRef::You,
+        ),
+        ("attacking you", ControllerRef::You),
+        ("attacking your opponents", ControllerRef::Opponent),
+    ] {
+        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(pattern).parse(trimmed) {
+            match rest.chars().next() {
+                None | Some('.') | Some(',') | Some(' ') => {
+                    return Some((
+                        FilterProp::Attacking {
+                            defender: Some(defender),
+                        },
+                        text.len() - rest.len(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
     None
 }
 
@@ -5927,6 +5962,21 @@ mod tests {
             )
         );
         assert_eq!(rest, "");
+    }
+
+    /// Issue #2386 (Lulu, Stern Guardian): "target creature attacking you"
+    /// must scope attackers to the controller, not every creature.
+    #[test]
+    fn parse_target_creature_attacking_you() {
+        let (filter, remainder) = parse_target("target creature attacking you");
+        assert!(remainder.trim().is_empty(), "remainder: '{remainder}'");
+        let TargetFilter::Typed(typed) = filter else {
+            panic!("expected typed filter, got {filter:?}");
+        };
+        assert!(typed.type_filters.contains(&TypeFilter::Creature));
+        assert!(typed.properties.contains(&FilterProp::Attacking {
+            defender: Some(ControllerRef::You),
+        }));
     }
 
     // CR 701.60b: "suspected" is a battlefield designation usable as a type-phrase

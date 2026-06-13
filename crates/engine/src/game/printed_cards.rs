@@ -1116,59 +1116,12 @@ pub fn populate_back_face_if_dfc(obj: &mut GameObject, db: &CardDatabase, card_f
 pub fn rehydrate_game_from_card_db(state: &mut GameState, db: &CardDatabase) {
     rehydrate_card_db_metadata(state, db);
     let (changed_any, changed_battlefield) = reapply_printed_faces_from_card_db(state, db);
-    repair_missing_intrinsic_face_counters_on_battlefield(state);
     repair_battlefield_trigger_index_after_face_reapply(state, changed_battlefield);
 
     if changed_any || state.layers_dirty.is_dirty() {
         bump_state_revision(state);
         mark_public_state_all_dirty(state);
         finalize_public_state(state);
-    }
-}
-
-/// CR 306.5b + CR 310.4b: Battlefield planeswalkers and battles that carry a
-/// loyalty/defense characteristic but lack the corresponding counter-map entry
-/// bypassed the CR 614.1c delivery tail (`add_to_zone` seeding, stale snapshots).
-/// Route intrinsic face counters through the shared ETB counter resolver so
-/// AddCounter replacements (CR 614.1a) can still modify them.
-fn repair_missing_intrinsic_face_counters_on_battlefield(state: &mut GameState) {
-    let object_ids: Vec<ObjectId> = state.objects.keys().copied().collect();
-    let mut events = Vec::new();
-
-    for object_id in object_ids {
-        let needs_repair = state.objects.get(&object_id).is_some_and(|obj| {
-            if obj.zone != Zone::Battlefield {
-                return false;
-            }
-            let is_planeswalker = obj.card_types.core_types.contains(&CoreType::Planeswalker);
-            let is_battle = obj.card_types.core_types.contains(&CoreType::Battle);
-            match (is_planeswalker, is_battle) {
-                (true, _) if !obj.counters.contains_key(&CounterType::Loyalty) => {
-                    obj.loyalty.or(obj.base_loyalty).is_some()
-                }
-                (_, true) if !obj.counters.contains_key(&CounterType::Defense) => {
-                    obj.defense.or(obj.base_defense).is_some()
-                }
-                _ => false,
-            }
-        });
-        if !needs_repair {
-            continue;
-        }
-        let intrinsic = state
-            .objects
-            .get(&object_id)
-            .map(intrinsic_etb_counters)
-            .unwrap_or_default();
-        if intrinsic.is_empty() {
-            continue;
-        }
-        crate::game::engine_replacement::apply_etb_counters(
-            state,
-            object_id,
-            &intrinsic,
-            &mut events,
-        );
     }
 }
 
@@ -2170,58 +2123,6 @@ mod tests {
                 .get(&CounterType::Loyalty),
             Some(&1)
         );
-    }
-
-    /// CR 306.5b + CR 614.1c (issue #2862): Rehydration must repair battlefield
-    /// planeswalkers that carry a loyalty characteristic but lack intrinsic
-    /// counter-map entries from a bypassed ETB delivery tail.
-    #[test]
-    fn rehydrate_repairs_missing_planeswalker_loyalty_counters() {
-        let mut face = test_face(
-            "Teferi, Time Raveler",
-            "teferi-time-raveler-oracle-id",
-            vec![CoreType::Planeswalker],
-            ManaCost::default(),
-        );
-        face.loyalty = Some("4".to_string());
-        let export = serde_json::json!({
-            "teferi, time raveler": serde_json::to_value(&face).unwrap(),
-        })
-        .to_string();
-        let db = CardDatabase::from_json_str(&export).expect("export db should parse");
-
-        let mut state = GameState::new_two_player(42);
-        let pw_id = create_object(
-            &mut state,
-            CardId(1),
-            PlayerId(0),
-            "Teferi, Time Raveler".to_string(),
-            Zone::Battlefield,
-        );
-        {
-            let obj = state.objects.get_mut(&pw_id).unwrap();
-            obj.card_types.core_types.push(CoreType::Planeswalker);
-            obj.base_loyalty = Some(4);
-            obj.loyalty = Some(4);
-            obj.counters.clear();
-            obj.base_characteristics_initialized = true;
-            obj.printed_ref = printed_ref_from_face(&face);
-            obj.base_printed_ref = obj.printed_ref.clone();
-        }
-
-        rehydrate_game_from_card_db(&mut state, &db);
-
-        assert_eq!(
-            state
-                .objects
-                .get(&pw_id)
-                .unwrap()
-                .counters
-                .get(&CounterType::Loyalty),
-            Some(&4),
-            "rehydration must seed missing intrinsic loyalty counters"
-        );
-        assert_eq!(state.objects.get(&pw_id).unwrap().loyalty, Some(4));
     }
 
     /// CR 310.4c: Rehydration must preserve live defense counters on battlefield

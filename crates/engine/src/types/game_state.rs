@@ -13,7 +13,7 @@ use super::ability::{
     CounterCostSelection, DelayedTriggerCondition, Duration, EffectKind, GameRestriction,
     KeywordAction, KickerVariant, LibraryPosition, ModalChoice, QuantityExpr, ResolvedAbility,
     SearchDestinationSplit, SearchSelectionConstraint, StaticCondition, TargetFilter, TargetRef,
-    TriggerCondition, TriggerDefinition,
+    ThisWayCause, TriggerCondition, TriggerDefinition,
 };
 use super::attribution::ObjectAttribution;
 use super::card::CardFace;
@@ -5425,6 +5425,29 @@ pub struct GameState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain_tracked_set_id: Option<TrackedSetId>,
 
+    /// CR 608.2c + CR 614.6: Per-member producer-action provenance for tracked
+    /// sets. When a producer publishes (or extends) a chain tracked set, each
+    /// affected object is additionally stamped here with the ACTION that made it
+    /// part of the set — derived from the resolving EFFECT, NOT the member's
+    /// final landing zone (Sacrificed for `Effect::Sacrifice`, Destroyed for
+    /// `Effect::Destroy`/`DestroyAll`, Milled for `Effect::Mill`, Discarded for
+    /// `Effect::Discard`/`DiscardCard`, Exiled/Returned/Bounced for zone changes
+    /// by destination). A downstream "this way" consumer that binds to a
+    /// specific verb — `TargetFilter::TrackedSetFiltered`/
+    /// `QuantityRef::FilteredTrackedSetSize` with `caused_by: Some(cause)` —
+    /// consults this map so it counts only the members the matching action
+    /// produced. Because the stamp is the action, a sacrifice that a replacement
+    /// redirects to Exile (CR 614.6) is still `Sacrificed`, and same-destination
+    /// actions (mill vs. sacrifice, both → graveyard) never collide. This keeps
+    /// `tracked_object_sets` (the id-only membership read by every existing
+    /// consumer) byte-identical while letting a single merged exile→sacrifice
+    /// chain set serve both an "exiled this way" return and a sibling
+    /// "sacrificed this way" reference (issue #2932). Members published without
+    /// action provenance (selection sets via `publish_fresh_tracked_set`) are
+    /// absent here and are read only by `caused_by: None` references.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tracked_set_member_causes: HashMap<TrackedSetId, HashMap<ObjectId, ThisWayCause>>,
+
     // Commander support
     #[serde(default)]
     pub commander_cast_count: HashMap<ObjectId, u32>,
@@ -6332,6 +6355,15 @@ pub struct GameState {
     /// CR 309 / CR 701.49: Per-player dungeon venture progress.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub dungeon_progress: HashMap<PlayerId, crate::game::dungeon::DungeonProgress>,
+    /// CR 901.15: The planar deck (single-deck Planechase option). Front = top;
+    /// the active face-up plane/phenomenon lives in the command zone, NOT here.
+    #[serde(default, skip_serializing_if = "im::Vector::is_empty")]
+    pub planar_deck: im::Vector<ObjectId>,
+    /// CR 311.5: The planar controller — the player designated to roll the
+    /// planar die and resolve the active plane's abilities. `None` outside a
+    /// Planechase game.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planar_controller: Option<PlayerId>,
     /// CR 725: The initiative designation (like monarch — one player at a time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiative: Option<PlayerId>,
@@ -6731,6 +6763,7 @@ impl GameState {
             tracked_object_sets: HashMap::new(),
             next_tracked_set_id: 1,
             chain_tracked_set_id: None,
+            tracked_set_member_causes: HashMap::new(),
             commander_cast_count: HashMap::new(),
             commander_cast_owners: HashMap::new(),
             extra_turns: Vec::new(),
@@ -6873,6 +6906,8 @@ impl GameState {
             ring_level: HashMap::new(),
             ring_bearer: HashMap::new(),
             dungeon_progress: HashMap::new(),
+            planar_deck: im::Vector::new(),
+            planar_controller: None,
             initiative: None,
             combat_prevention_tally: None,
             cancelled_casts: Vec::new(),
@@ -7151,6 +7186,7 @@ impl PartialEq for GameState {
             && self.tracked_object_sets == other.tracked_object_sets
             && self.next_tracked_set_id == other.next_tracked_set_id
             && self.chain_tracked_set_id == other.chain_tracked_set_id
+            && self.tracked_set_member_causes == other.tracked_set_member_causes
             && self.commander_cast_count == other.commander_cast_count
             && self.commander_cast_owners == other.commander_cast_owners
             && self.commander_declined_zone_return == other.commander_declined_zone_return
@@ -7283,6 +7319,8 @@ impl PartialEq for GameState {
             && self.exiled_from_hand_this_resolution == other.exiled_from_hand_this_resolution
             && self.lki_cache == other.lki_cache
             && self.city_blessing == other.city_blessing
+            && self.planar_deck == other.planar_deck
+            && self.planar_controller == other.planar_controller
     }
 }
 

@@ -1022,6 +1022,28 @@ fn known_role_token_identity(descriptor: &str) -> Option<(String, Vec<String>)> 
     ))
 }
 
+/// Strip trailing dynamic/attachment clauses from a token "with …" keyword phrase.
+fn strip_token_keyword_clause_suffixes(text: &str) -> &str {
+    let mut clause = text;
+    if let Ok((head, _)) = take_until::<_, _, nom::error::Error<&str>>("\"").parse(clause) {
+        clause = head;
+    }
+    for marker in [" where ", " equal to ", " attached "] {
+        clause = truncate_token_keyword_clause_before(clause, marker);
+    }
+    clause
+}
+
+/// Strip a token keyword clause at the first `marker` (e.g. `" equal to "`).
+fn truncate_token_keyword_clause_before<'a>(text: &'a str, marker: &str) -> &'a str {
+    let lower = text.to_ascii_lowercase();
+    let head_len = match take_until::<_, _, nom::error::Error<&str>>(marker).parse(&lower) {
+        Ok((rest, _)) => lower.len() - rest.len(),
+        Err(_) => return text,
+    };
+    &text[..head_len]
+}
+
 pub(super) fn parse_token_keyword_clause(text: &str) -> Vec<Keyword> {
     let trimmed = text.trim_start();
     let trimmed_lower = trimmed.to_lowercase();
@@ -1031,19 +1053,7 @@ pub(super) fn parse_token_keyword_clause(text: &str) -> Vec<Keyword> {
         return Vec::new();
     };
 
-    let raw_clause = after_with
-        .split('"')
-        .next()
-        .unwrap_or(after_with)
-        .split(" where ")
-        .next()
-        .unwrap_or(after_with)
-        .split(" equal to ")
-        .next()
-        .unwrap_or(after_with)
-        .split(" attached ")
-        .next()
-        .unwrap_or(after_with)
+    let raw_clause = strip_token_keyword_clause_suffixes(after_with)
         .trim()
         .trim_end_matches('.')
         .trim_end_matches(',')

@@ -928,6 +928,19 @@ fn has_effective_graveyard_cast_keyword(
             && super::keywords::effective_mayhem_cost(state, object_id).is_some())
 }
 
+fn mayhem_castable_from_graveyard(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+) -> bool {
+    was_discarded_this_turn(state, object_id)
+        && super::keywords::effective_mayhem_cost(state, object_id).is_some()
+        && state
+            .objects
+            .get(&object_id)
+            .is_some_and(|o| o.zone == Zone::Graveyard && o.owner == player)
+}
+
 fn upsert_keyword_by_kind(keywords: &mut Vec<Keyword>, keyword: Keyword) {
     if let Some(existing) = keywords
         .iter_mut()
@@ -2914,9 +2927,7 @@ fn casting_variant_candidates(
         // CR 702.187b: Mayhem is available only while the card was discarded this
         // turn. The cost may be printed or granted to graveyard cards by a static
         // (Green Goblin), so query the effective off-zone keyword cost.
-        if super::keywords::effective_mayhem_cost(state, object_id).is_some()
-            && was_discarded_this_turn(state, object_id)
-        {
+        if mayhem_castable_from_graveyard(state, player, object_id) {
             candidates.push(CastingVariant::Mayhem);
         }
         if super::keywords::effective_flashback_cost(state, object_id).is_some() {
@@ -3191,6 +3202,7 @@ fn prepare_spell_cast_with_variant_override_inner(
         );
     let has_graveyard_cast_keyword =
         obj.zone == Zone::Graveyard && has_effective_graveyard_cast_keyword(state, object_id, obj);
+    let has_mayhem = mayhem_castable_from_graveyard(state, player, object_id);
     // CR 601.2a + CR 117.1c: Graveyard cast via static permission (Lurrus, etc.).
     let graveyard_permission_src = if obj.zone == Zone::Graveyard && state.active_player == player {
         graveyard_permission_source(state, player, object_id)
@@ -3245,6 +3257,7 @@ fn prepare_spell_cast_with_variant_override_inner(
                     && oathbreaker_on_battlefield(state, player))
                 || has_madness
                 || has_graveyard_cast_keyword
+                || has_mayhem
                 || has_graveyard_permission
                 || has_graveyard_alt_cost
                 || has_top_of_library_permission));
@@ -3501,8 +3514,8 @@ fn prepare_spell_cast_with_variant_override_inner(
     let (flashback_mana_cost, flashback_non_mana_cost) =
         split_flashback_cost_components(flashback_cost.as_ref());
 
-    // Precedence: Escape > Retrace > Harmonize > Flashback > Aftermath > Disturb >
-    // GraveyardPermission > Warp > Normal.
+    // Precedence: Escape > Retrace > Harmonize > Mayhem > Flashback > Aftermath >
+    // Disturb > Jump-start > GraveyardPermission > Warp > Normal.
     // No standard card has multiple graveyard-cast keywords; if one did, the card's own
     // keyword overrides an external source's grant (GraveyardPermission).
     //
@@ -3559,6 +3572,8 @@ fn prepare_spell_cast_with_variant_override_inner(
             CastingVariant::Retrace
         } else if harmonize_cost.is_some() {
             CastingVariant::Harmonize
+        } else if has_mayhem {
+            CastingVariant::Mayhem
         } else if flashback_cost.is_some() {
             CastingVariant::Flashback
         } else if obj.zone == Zone::Graveyard
@@ -3573,8 +3588,6 @@ fn prepare_spell_cast_with_variant_override_inner(
             CastingVariant::JumpStart
         } else if disturb_cost.is_some() {
             CastingVariant::Disturb
-        } else if mayhem_cost.is_some() {
-            CastingVariant::Mayhem
         } else if let Some(source) = graveyard_permission_src {
             // CR 110.4: For OncePerTurnPerPermanentType permissions, auto-pick
             // the slot when only one is available. When multiple slots are
@@ -3951,6 +3964,11 @@ fn prepare_spell_cast_with_variant_override_inner(
     } else {
         None
     };
+    let effective_mayhem_cost_for_path = if casting_variant == CastingVariant::Mayhem {
+        mayhem_cost
+    } else {
+        None
+    };
     let effective_flashback_mana_cost_for_path = if casting_variant == CastingVariant::Flashback {
         flashback_mana_cost
     } else {
@@ -3958,13 +3976,6 @@ fn prepare_spell_cast_with_variant_override_inner(
     };
     let effective_disturb_cost_for_path = if casting_variant == CastingVariant::Disturb {
         disturb_cost
-    } else {
-        None
-    };
-    // CR 702.187b: When casting via Mayhem, the mayhem mana cost replaces the
-    // card's mana cost (an alternative cost paid from the graveyard).
-    let effective_mayhem_cost_for_path = if casting_variant == CastingVariant::Mayhem {
-        mayhem_cost
     } else {
         None
     };
@@ -3995,9 +4006,9 @@ fn prepare_spell_cast_with_variant_override_inner(
             .or(prototype_cost)
             .or(effective_escape_cost_for_path)
             .or(effective_harmonize_cost_for_path)
+            .or(effective_mayhem_cost_for_path)
             .or(effective_flashback_mana_cost_for_path)
             .or(effective_disturb_cost_for_path)
-            .or(effective_mayhem_cost_for_path)
             .or(effective_sneak_cost_for_path)
             .or(effective_web_slinging_cost_for_path)
             .or(alt_cost_from_exile)
@@ -9423,6 +9434,13 @@ fn can_cast_prepared_now(
         return false;
     }
 
+    // CR 702.187b: Mayhem requires that you discarded this card this turn.
+    if prepared.casting_variant == CastingVariant::Mayhem
+        && !was_discarded_this_turn(state, prepared.object_id)
+    {
+        return false;
+    }
+
     // CR 702.119a-c: Emerge affordability is the reduced emerge cost after
     // sacrificing a legal creature, not the unreduced `prepared.mana_cost`.
     if prepared.casting_variant == CastingVariant::Emerge {
@@ -10011,7 +10029,7 @@ pub fn can_pay_ability_mana_cost_after_auto_tap(
     )
 }
 
-pub(super) fn can_pay_ability_mana_cost_after_auto_tap_excluding(
+pub fn can_pay_ability_mana_cost_after_auto_tap_excluding(
     state: &GameState,
     player: PlayerId,
     source_id: ObjectId,
@@ -24487,6 +24505,121 @@ mod tests {
         assert!(spell_objects_available_to_cast(&state, PlayerId(0)).contains(&bauble));
         prepare_spell_cast(&state, PlayerId(0), bauble)
             .expect("bauble must be castable from graveyard");
+    }
+
+    /// Regression (Sunforger infinite recast): a `CastFromZone` "cast it
+    /// without paying its mana cost" grant attached *in place* to a card the
+    /// effect routed through the hand (Sunforger: search → to hand → cast from
+    /// hand) leaves a zero-cost `ExileWithAltCost { duration: None }` on the
+    /// card. The card never visits exile, so the exile-exit cleanup never fires.
+    /// Before the fix, after the spell resolved to the graveyard the spent grant
+    /// persisted there, and `has_graveyard_timed_alt_cost_permission` re-offered
+    /// the free cast on every priority — the AI cast Abrade from its graveyard
+    /// endlessly. CR 400.7 + CR 601.2a: the one-shot grant must be consumed when
+    /// the card leaves the stack after its single cast.
+    ///
+    /// This test seeds the post-resolution graveyard state directly (the bug's
+    /// observed surface) and drives the real cast+resolve pipeline through the
+    /// fixed `apply_zone_exit_cleanup` seam. Grant *creation* provenance (the
+    /// hand-origin `CastFromZone` resolve and its `UntilEndOfTurn` default) is
+    /// covered by `cast_from_zone::tests::hand_in_place_grant_defaults_to_until_end_of_turn`.
+    #[test]
+    fn graveyard_in_place_alt_cost_grant_is_consumed_after_one_cast() {
+        let mut state = setup_game_at_main_phase();
+        // Seed library so the resolving Draw does not hit an empty library.
+        for i in 0..3 {
+            create_object(
+                &mut state,
+                CardId(7100 + i),
+                PlayerId(0),
+                format!("Library Card {i}"),
+                Zone::Library,
+            );
+        }
+
+        let spell = create_object(
+            &mut state,
+            CardId(7000),
+            PlayerId(0),
+            "Abrade".to_string(),
+            Zone::Graveyard,
+        );
+        {
+            let obj = state.objects.get_mut(&spell).unwrap();
+            obj.card_types.core_types.push(CoreType::Instant);
+            Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+            ));
+            // Printed cost is real; the only way this casts is the free grant.
+            obj.mana_cost = ManaCost::generic(3);
+            // Hand-origin in-place grant: `duration: None` (graveyard-origin
+            // grants default to UntilEndOfTurn — the leak class is the one that
+            // never expires).
+            obj.casting_permissions
+                .push(CastingPermission::ExileWithAltCost {
+                    cost: ManaCost::zero(),
+                    cast_transformed: false,
+                    constraint: None,
+                    granted_to: Some(PlayerId(0)),
+                    resolution_cleanup: None,
+                    duration: None,
+                    exile_instead_of_graveyard_on_resolve: false,
+                });
+        }
+
+        // Precondition (the bug's trigger): the stale grant makes the free
+        // graveyard cast available even with no mana in the pool.
+        assert!(
+            spell_objects_available_to_cast(&state, PlayerId(0)).contains(&spell),
+            "stale in-place grant should surface the free graveyard cast"
+        );
+
+        // Cast it for free and resolve it back to the graveyard.
+        apply_as_current(
+            &mut state,
+            GameAction::CastSpell {
+                object_id: spell,
+                card_id: CardId(7000),
+                targets: vec![],
+                payment_mode: CastPaymentMode::Auto,
+            },
+        )
+        .expect("free graveyard cast should be accepted");
+        assert_eq!(state.stack.len(), 1, "spell should be on the stack");
+
+        for _ in 0..4 {
+            if state.stack.is_empty() {
+                break;
+            }
+            apply_as_current(&mut state, GameAction::PassPriority).unwrap();
+        }
+
+        assert_eq!(
+            state.objects[&spell].zone,
+            Zone::Graveyard,
+            "instant should resolve back to the graveyard"
+        );
+        // The fix: the spent one-shot grant is gone.
+        assert!(
+            !state.objects[&spell]
+                .casting_permissions
+                .iter()
+                .any(|p| matches!(
+                    p,
+                    CastingPermission::ExileWithAltCost { .. }
+                        | CastingPermission::ExileWithAltAbilityCost { .. }
+                )),
+            "the consumed CastFromZone grant must be cleared on leaving the stack"
+        );
+        // And the infinite-recast surface is closed.
+        assert!(
+            !spell_objects_available_to_cast(&state, PlayerId(0)).contains(&spell),
+            "the spell must not be re-offered from the graveyard after its single cast"
+        );
     }
 
     #[test]

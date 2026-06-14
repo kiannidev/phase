@@ -337,6 +337,18 @@ pub(crate) fn matches_player_scope(
                     // `speed_effects::players_for_filter` instead, which has
                     // the ability in scope. Unreachable here.
                     PlayerFilter::ParentObjectTargetController => false,
+                    // CR 608.2c + CR 109.4: the chosen-player anchor requires the
+                    // resolving `ResolvedAbility` (for `ability.chosen_players`),
+                    // which this generic scope predicate does not carry.
+                    // `choose_one_of::choosing_players` resolves it directly
+                    // (it has the ability in scope). Unreachable here — fail
+                    // closed, mirroring the `ParentObjectTargetController` arm.
+                    PlayerFilter::ChosenPlayer { .. } => false,
+                    // CR 108.3 + CR 109.4: the parent-object-target OWNER anchor
+                    // likewise requires `ability.targets` to resolve via
+                    // `ability_utils::parent_target_owner`. Resolved in
+                    // `choose_one_of::choosing_players`; unreachable here.
+                    PlayerFilter::ParentObjectTargetOwner => false,
                     // CR 109.4 + CR 109.5: "each [player class] who controls
                     // [comparator] [count] [filter]" — the candidate must
                     // satisfy both the `relation` predicate and the
@@ -490,6 +502,12 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
     // and emits its `EffectResolved` event.
     if !waits_for_resolution_choice(&state.waiting_for) {
         drain_pending_change_zone_iteration(state, events);
+    }
+    // CR 701.38d: Resume per-ballot vote iteration after an interactive
+    // choice resolves. Must run after change_zone_iteration (which may be
+    // nested inside a ballot body) and before repeat_iteration.
+    if !waits_for_resolution_choice(&state.waiting_for) {
+        vote::drain_pending_vote_ballot_iteration(state, events);
     }
     // CR 609.3 + CR 109.5: After the per-iteration chain drains, drive any
     // remaining `repeat_for` iterations. Each resumed iteration may itself
@@ -1080,6 +1098,38 @@ fn is_public_zone(zone: crate::types::zones::Zone) -> bool {
     )
 }
 
+/// CR 603.12 + CR 601.2c: Freeze the reflexive event count into the pending
+/// trigger's `subject_match_count` at the moment the "When you do" sub-ability
+/// fires. The reflexive ability's "up to that many target ..." bound is an
+/// `EventContextAmount` that resolves against the count of subjects affected by
+/// the triggering action (e.g. the number of Treasures sacrificed). At
+/// creation time `last_effect_count` (and the rest of the event-context
+/// cascade) is still live, so resolving `EventContextAmount` here captures the
+/// real count. The reflexive triggered ability resolves later in a fresh
+/// `apply()` where that scratch state has been cleared; `subject_match_count`
+/// is rehydrated into `current_trigger_match_count` (CR 603.2c) and resolves
+/// the number of targets at target-assign time. Without this freeze the bound
+/// collapses to 0 — yielding "Unused selected target slots" or a silently
+/// wrong amount. Resolves via the single authoritative `resolve_quantity`
+/// cascade (`QuantityRef::EventContextAmount`) — never re-counts. `None` when
+/// the live count resolves to 0 (no event context), matching the prior
+/// behavior for reflexive abilities with no event-count bound.
+fn freeze_reflexive_event_count(
+    state: &GameState,
+    controller: PlayerId,
+    source_id: ObjectId,
+) -> Option<u32> {
+    let count = crate::game::quantity::resolve_quantity(
+        state,
+        &QuantityExpr::Ref {
+            qty: QuantityRef::EventContextAmount,
+        },
+        controller,
+        source_id,
+    );
+    u32::try_from(count).ok().filter(|&c| c > 0)
+}
+
 /// CR 603.12: Begin reflexive target selection for a `WhenYouDo` /
 /// `QuantityCheck` ability whose targets were deferred to resolution time.
 /// Returns `true` when `WaitingFor::TriggerTargetSelection` (or inline random
@@ -1129,7 +1179,10 @@ fn try_begin_reflexive_target_selection(
             mode_abilities: reflexive.mode_abilities.clone(),
             description: trigger_description,
             may_trigger_origin: None,
-            subject_match_count: None,
+            // CR 603.12 + CR 601.2c: freeze the live event count (e.g. number
+            // sacrificed) so an "up to that many target ..." bound survives
+            // into the later fresh-`apply()` target-assign.
+            subject_match_count: freeze_reflexive_event_count(state, controller, source_id),
             die_result: state.die_result_this_resolution,
         };
         let trigger_events =
@@ -1219,7 +1272,12 @@ fn try_begin_reflexive_target_selection(
         mode_abilities: vec![],
         description: trigger_description.clone(),
         may_trigger_origin: None,
-        subject_match_count: None,
+        // CR 603.12 + CR 601.2c: freeze the live event count (e.g. number of
+        // subjects sacrificed) so an "up to that many target ..." bound — an
+        // `EventContextAmount` resolved against the firing action — survives
+        // into the later fresh-`apply()` target-assign instead of collapsing
+        // to 0.
+        subject_match_count: freeze_reflexive_event_count(state, controller, source_id),
         // CR 706.2 + CR 603.12: capture the live die-roll result from the
         // creating ability so the reflexive entry can re-stamp it when it
         // resolves as its own stack object.
@@ -1379,13 +1437,21 @@ pub(super) fn resolve_optional_effect_decision(
         AutoMayChoice::Decline => {
             let decline_branch = ability.else_ability.as_ref().or_else(|| {
                 ability.sub_ability.as_ref().filter(|sub| {
-                    // CR 608.2c: A separate-sentence sibling ("You may shuffle."
-                    // "Draw a card.") is the next printed instruction — it
-                    // resolves regardless of the optional decision. A
-                    // within-clause continuation only resolves if it is a
-                    // conditioned decline branch (IfYouDo / Otherwise / composite).
-                    sub.sub_link == SubAbilityLink::SequentialSibling
-                        || should_resolve_subability_on_optional_decline(sub)
+                    // CR 608.2c: a conditioned decline branch (IfYouDo /
+                    // Otherwise / composite) resolves on decline — authoritative
+                    // check.
+                    should_resolve_subability_on_optional_decline(sub)
+                        // CR 608.2c: a separate-sentence sibling is the next
+                        // printed instruction and resolves regardless of the
+                        // optional decision — BUT only when it is not a
+                        // reflexive trigger. CR 603.12: a reflexive ("When you
+                        // do, …") sub's "do" did not occur when the action was
+                        // declined, so it must NOT fire even though it is a
+                        // separate sentence (issue #3179: Swashbuckler
+                        // Extraordinaire's declined Treasure sacrifice must not
+                        // resolve the double-strike reflexive).
+                        || (sub.sub_link == SubAbilityLink::SequentialSibling
+                            && !sub_ability_is_reflexive(sub))
                 })
             });
             if let Some(branch) = decline_branch {
@@ -1428,6 +1494,33 @@ fn condition_depends_on_effect_performed(condition: &AbilityCondition) -> bool {
         AbilityCondition::Not { condition } => condition_depends_on_effect_performed(condition),
         AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => {
             conditions.iter().any(condition_depends_on_effect_performed)
+        }
+        _ => false,
+    }
+}
+
+/// CR 603.12: Whether a sub-ability is a *reflexive* trigger — its "do"
+/// depends on whether the just-prompted action actually occurred during this
+/// resolution. A reflexive sub MUST NOT resolve when the optional parent was
+/// declined (the "do" did not happen), regardless of its sentence-boundary
+/// `sub_link`. Covers the bare `WhenYouDo` reflexive (CR 603.12 Heart-Piercer
+/// Manticore) and any condition that reads a per-iteration effect outcome
+/// (`IfYouDo` / composite `Or{[IfYouDo,…]}`). Predicate helper, not rule code.
+fn sub_ability_is_reflexive(sub: &ResolvedAbility) -> bool {
+    match &sub.condition {
+        Some(AbilityCondition::WhenYouDo) => true,
+        Some(condition) => condition_depends_on_effect_performed(condition),
+        None => false,
+    }
+}
+
+fn condition_contains_city_blessing(condition: &AbilityCondition) -> bool {
+    match condition {
+        AbilityCondition::HasCityBlessing => true,
+        AbilityCondition::Not { condition } => condition_contains_city_blessing(condition),
+        AbilityCondition::ConditionInstead { inner } => condition_contains_city_blessing(inner),
+        AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => {
+            conditions.iter().any(condition_contains_city_blessing)
         }
         _ => false,
     }
@@ -5199,6 +5292,20 @@ fn resolve_chain_body(
         crate::game::layers::flush_layers(state);
     }
 
+    // CR 702.131b + CR 702.131d: If the sub-ability's condition is gated on
+    // the city's blessing, re-evaluate the blessing now — before checking the
+    // condition — so a permanent created by the parent effect (e.g. Ocelot
+    // Pride's Cat token becoming the 10th permanent) is reflected in
+    // `state.city_blessing`. This mirrors the SBA loop's "any time" semantics
+    // without waiting for the next priority pass.
+    if ability.sub_ability.as_ref().is_some_and(|sub| {
+        sub.condition
+            .as_ref()
+            .is_some_and(condition_contains_city_blessing)
+    }) {
+        crate::game::sba::apply_city_blessing_if_triggered(state, events);
+    }
+
     // Follow typed sub_ability chain, propagating parent targets when sub has none.
     // This allows sub-abilities like "its controller gains life" to access the object
     // targeted by the parent (e.g. the exiled creature in Swords to Plowshares).
@@ -6279,6 +6386,8 @@ fn scoped_player_matches_filter(
         | PlayerFilter::OpponentOfTriggeringPlayerNotAttacked
         | PlayerFilter::VotedFor { .. }
         | PlayerFilter::ParentObjectTargetController
+        | PlayerFilter::ChosenPlayer { .. }
+        | PlayerFilter::ParentObjectTargetOwner
         | PlayerFilter::ControlsCount { .. }
         | PlayerFilter::PlayerAttribute { .. } => false,
     }
@@ -17213,6 +17322,128 @@ mod tests {
         assert!(
             !mandatory_parent_effect_performed(&copy, &not_made),
             "a CopySpell that made no copy is NOT 'performed' — the draw rider must run"
+        );
+    }
+
+    /// CR 702.131b + CR 702.131d (#2873): Ocelot Pride's race. The parent
+    /// `Effect::Token` pushes the controller from 9 to 10 permanents *during*
+    /// resolution. The sub-ability is gated on `HasCityBlessing`. Without the
+    /// eager re-evaluation in `resolve_chain_body`, `state.city_blessing` is
+    /// still empty when the sub-ability condition is checked (it would only be
+    /// updated by the SBA loop at the next priority pass), so the sub-ability's
+    /// token would NOT be created. With the fix, the blessing is granted before
+    /// the gate fires, so BOTH tokens exist.
+    ///
+    /// Discriminating assertion: `state.battlefield.len() == 11` (9 + 2 tokens)
+    /// and `state.city_blessing.contains(PlayerId(0))`. Reverting the fix makes
+    /// the sub-ability gate read a false `HasCityBlessing`, dropping the second
+    /// token (battlefield 10, not 11).
+    #[test]
+    fn city_blessing_race_grants_sub_ability_token_same_resolution() {
+        let mut state = GameState::new_two_player(42);
+
+        let mut ascend_permanent = None;
+        for i in 0..9u64 {
+            let id = create_object(
+                &mut state,
+                CardId(i + 1),
+                PlayerId(0),
+                format!("Permanent {i}"),
+                Zone::Battlefield,
+            );
+            if i == 0 {
+                let obj = state.objects.get_mut(&id).unwrap();
+                obj.card_types.core_types.push(CoreType::Creature);
+                obj.base_card_types = obj.card_types.clone();
+                obj.base_power = Some(1);
+                obj.base_toughness = Some(1);
+                obj.power = Some(1);
+                obj.toughness = Some(1);
+                obj.keywords.push(Keyword::Ascend);
+                obj.static_definitions.push(
+                    StaticDefinition::continuous()
+                        .condition(crate::types::ability::StaticCondition::HasCityBlessing)
+                        .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)))
+                        .modifications(vec![
+                            ContinuousModification::AddPower { value: 1 },
+                            ContinuousModification::AddToughness { value: 1 },
+                        ]),
+                );
+                ascend_permanent = Some(id);
+            }
+        }
+        crate::game::layers::flush_layers(&mut state);
+        assert!(
+            !state.city_blessing.contains(&PlayerId(0)),
+            "precondition: no city's blessing at 9 permanents"
+        );
+        assert_eq!(
+            state
+                .objects
+                .get(&ascend_permanent.unwrap())
+                .and_then(|obj| obj.power),
+            Some(1),
+            "the city's-blessing-gated continuous effect must be inactive before the grant"
+        );
+
+        let make_cat = || Effect::Token {
+            name: "Cat".to_string(),
+            power: PtValue::Fixed(1),
+            toughness: PtValue::Fixed(1),
+            types: vec!["Creature".to_string(), "Cat".to_string()],
+            colors: vec![ManaColor::White],
+            keywords: vec![],
+            tapped: false,
+            count: QuantityExpr::Fixed { value: 1 },
+            owner: TargetFilter::Controller,
+            attach_to: None,
+            enters_attacking: false,
+            supertypes: vec![],
+            static_abilities: vec![],
+            enter_with_counters: vec![],
+        };
+
+        let mut sub = ResolvedAbility::new(make_cat(), vec![], ObjectId(1000), PlayerId(0));
+        sub.condition = Some(AbilityCondition::HasCityBlessing);
+
+        let mut parent = ResolvedAbility::new(make_cat(), vec![], ObjectId(1000), PlayerId(0));
+        parent.sub_ability = Some(Box::new(sub));
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &parent, &mut events, 0).unwrap();
+
+        assert!(
+            state.city_blessing.contains(&PlayerId(0)),
+            "the parent token made the 10th permanent, so the blessing must be granted \
+             before the sub-ability gate fires"
+        );
+        assert_eq!(
+            state.battlefield.len(),
+            11,
+            "9 starting permanents + parent Cat + sub-ability Cat = 11; a missing \
+             city's-blessing re-evaluation would drop the sub-ability token (10)"
+        );
+        assert_eq!(
+            state
+                .objects
+                .get(&ascend_permanent.unwrap())
+                .and_then(|obj| obj.power),
+            Some(2),
+            "CR 702.131d: continuous effects gated on the city's blessing must be \
+             reapplied before the sub-ability condition/effect continues"
+        );
+    }
+
+    #[test]
+    fn condition_contains_city_blessing_recurses_through_condition_instead() {
+        let condition = AbilityCondition::ConditionInstead {
+            inner: Box::new(AbilityCondition::HasCityBlessing),
+        };
+
+        assert!(
+            condition_contains_city_blessing(&condition),
+            "city's-blessing gated continuations wrapped in ConditionInstead must run the \
+             mid-chain blessing check before the condition is evaluated"
         );
     }
 }

@@ -1933,7 +1933,8 @@ fn parse_you_have_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, n) = parse_number(rest)?;
 
     if let Ok((after_or_more, _)) = tag::<_, _, OracleError<'_>>(" or more ").parse(rest) {
-        // "you have N or more creature cards in your graveyard" (Oversold Cemetery)
+        // CR 603.4 + CR 404.2: Oversold Cemetery's intervening-if predicate
+        // counts face-up creature cards in its controller's graveyard.
         if let Ok((rest, type_filters)) =
             parse_you_have_typed_cards_in_your_graveyard(after_or_more)
         {
@@ -1950,7 +1951,9 @@ fn parse_you_have_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
                 ),
             ));
         }
-        // "you have N or more cards in your graveyard" → GraveyardSize GE N
+        // CR 603.4 + CR 404.2: Generic "you have N or more cards in your
+        // graveyard" intervening-if predicates use the controller's graveyard
+        // size.
         if let Ok((rest, _)) =
             tag::<_, _, OracleError<'_>>("cards in your graveyard").parse(after_or_more)
         {
@@ -1996,11 +1999,10 @@ fn parse_you_have_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
     )))
 }
 
-/// "creature cards in your graveyard" tail of a "you have N or more …" predicate.
-fn parse_you_have_typed_cards_in_your_graveyard(
-    input: &str,
-) -> OracleResult<'_, Vec<TypeFilter>> {
-    let (rest, type_text) = take_until::<_, _, OracleError<'_>>(" cards in your graveyard").parse(input)?;
+/// CR 404.2: Parse the typed card-count tail of a controller graveyard predicate.
+fn parse_you_have_typed_cards_in_your_graveyard(input: &str) -> OracleResult<'_, Vec<TypeFilter>> {
+    let (rest, type_text) =
+        take_until::<_, _, OracleError<'_>>(" cards in your graveyard").parse(input)?;
     let (rest, _) = tag::<_, _, OracleError<'_>>(" cards in your graveyard").parse(rest)?;
     let type_filters = parse_zone_card_type_text(type_text.trim());
     if type_filters.is_empty() {
@@ -6911,10 +6913,9 @@ mod tests {
 
     #[test]
     fn test_typed_graveyard_creature_count_ge() {
-        let (rest, c) = parse_inner_condition(
-            "you have four or more creature cards in your graveyard",
-        )
-        .unwrap();
+        let (rest, c) =
+            parse_inner_condition("you have four or more creature cards in your graveyard")
+                .unwrap();
         assert_eq!(rest, "");
         match c {
             StaticCondition::QuantityComparison {

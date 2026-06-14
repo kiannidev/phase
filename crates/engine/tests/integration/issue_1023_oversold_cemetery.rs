@@ -3,11 +3,11 @@
 
 use engine::game::scenario::{GameScenario, P0};
 use engine::game::scenario_db::GameScenarioDbExt;
-use engine::types::CoreType;
-use engine::types::PlayerId;
 use engine::types::game_state::WaitingFor;
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
+use engine::types::CoreType;
+use engine::types::PlayerId;
 
 use crate::support::shared_card_db as load_db;
 
@@ -65,8 +65,7 @@ fn issue_1023_oversold_cemetery_does_not_trigger_below_four_creature_cards() {
     assert!(
         !matches!(
             runner.state().waiting_for,
-            WaitingFor::TriggerTargetSelection { .. }
-                | WaitingFor::OptionalEffectChoice { .. }
+            WaitingFor::TriggerTargetSelection { .. } | WaitingFor::OptionalEffectChoice { .. }
         ),
         "Oversold Cemetery must not trigger with only three creature cards in graveyard, got {:?}",
         runner.state().waiting_for
@@ -103,8 +102,7 @@ fn issue_1023_oversold_cemetery_triggers_at_four_creature_cards() {
     assert!(
         matches!(
             runner.state().waiting_for,
-            WaitingFor::OptionalEffectChoice { .. }
-                | WaitingFor::TriggerTargetSelection { .. }
+            WaitingFor::OptionalEffectChoice { .. } | WaitingFor::TriggerTargetSelection { .. }
         ),
         "Oversold Cemetery must trigger at four creature cards in graveyard, got {:?}",
         runner.state().waiting_for

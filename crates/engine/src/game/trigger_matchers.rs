@@ -1041,13 +1041,17 @@ pub(super) fn match_changes_zone_all(
 
 // CR 603.6d: DamageDone trigger fires on damage dealt events.
 
-/// CR 510.2 + CR 603.2: Only equipment-style `AttachedTo` observers listen on
-/// the aggregate `CombatDamageDealtToPlayer` event. Self-referential creature
-/// triggers already fire on per-source `DamageDealt` events emitted during the
-/// combat damage step; matching them again on the aggregate event double-fires.
+/// CR 510.2 + CR 603.2: Source-filtered observers whose source is not the
+/// trigger source itself listen on the aggregate `CombatDamageDealtToPlayer`
+/// event. Self/no-source creature triggers already fire on per-source
+/// `DamageDealt` events emitted during the combat damage step; matching them
+/// again on the aggregate event double-fires.
 pub(super) fn listens_on_aggregate_combat_damage_done(trigger: &TriggerDefinition) -> bool {
     trigger.mode == TriggerMode::DamageDone
-        && matches!(trigger.valid_source, Some(TargetFilter::AttachedTo))
+        && matches!(
+            trigger.valid_source,
+            Some(ref filter) if !matches!(filter, TargetFilter::SelfRef)
+        )
 }
 
 fn matching_combat_damage_to_player_sources(
@@ -1093,6 +1097,12 @@ pub(super) fn match_damage_done(
         ..
     } = event
     {
+        if *is_combat
+            && matches!(target, TargetRef::Player(_))
+            && listens_on_aggregate_combat_damage_done(trigger)
+        {
+            return false;
+        }
         // Check if trigger requires damage from a specific source
         if !valid_source_matches(trigger, state, *dmg_source, source_id) {
             return false;
@@ -6784,6 +6794,71 @@ mod tests {
     }
 
     #[test]
+    fn matching_damage_done_events_expands_source_filtered_combat_damage() {
+        let mut state = setup();
+        let watcher = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Damage Watcher".to_string(),
+            Zone::Battlefield,
+        );
+        let attacker_a = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Attacker A".to_string(),
+            Zone::Battlefield,
+        );
+        let attacker_b = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Attacker B".to_string(),
+            Zone::Battlefield,
+        );
+        for attacker in [attacker_a, attacker_b] {
+            state
+                .objects
+                .get_mut(&attacker)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+        }
+
+        let mut trigger = make_trigger(TriggerMode::DamageDoneOnce);
+        trigger.valid_source = Some(TargetFilter::Typed(
+            TypedFilter::creature().controller(ControllerRef::You),
+        ));
+        trigger.valid_target = Some(TargetFilter::Player);
+        trigger.damage_kind = DamageKindFilter::CombatOnly;
+
+        let event = GameEvent::CombatDamageDealtToPlayer {
+            player_id: PlayerId(1),
+            source_amounts: vec![(attacker_a, 2), (attacker_b, 3)],
+            total_damage: 5,
+        };
+
+        let per_source_event = GameEvent::DamageDealt {
+            source_id: attacker_a,
+            target: TargetRef::Player(PlayerId(1)),
+            amount: 2,
+            is_combat: true,
+            excess: 0,
+        };
+        assert!(
+            !match_damage_done(&per_source_event, &trigger, watcher, &state),
+            "source-filtered observers use the aggregate event for combat damage to players"
+        );
+        assert!(match_damage_done(&event, &trigger, watcher, &state));
+        assert_eq!(
+            matching_damage_done_events(&event, &trigger, watcher, &state).len(),
+            2
+        );
+    }
+
+    #[test]
     fn matching_damage_done_events_does_not_expand_once_modes() {
         let mut state = setup();
         let watcher = create_object(
@@ -6830,10 +6905,7 @@ mod tests {
             total_damage: 5,
         };
 
-        assert!(
-            !match_damage_done(&event, &trigger, watcher, &state),
-            "aggregate combat damage matching is reserved for AttachedTo observers"
-        );
+        assert!(!match_damage_done(&event, &trigger, watcher, &state));
         assert!(matching_damage_done_events(&event, &trigger, watcher, &state).is_empty());
     }
 

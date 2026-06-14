@@ -1958,13 +1958,23 @@ fn card_is_known(db: &CardDatabase, name: &str) -> bool {
 ///
 /// CR 201.3 + CR 903.5b: For deck construction, cards with interchangeable
 /// names have the same name.
+/// Canonical key for aggregating deck copy counts (CR 201.3 / CR 100.2a).
+/// Uses the indexed face name when the card resolves so alias spellings
+/// ("Nazgul" vs "Nazgûl") merge into one bucket for copy-limit checks.
+fn canonical_deck_count_key(db: &CardDatabase, name: &str) -> String {
+    let resolved = resolve_card_name(db, name);
+    db.get_face_by_name(resolved)
+        .map(|face| face.name.to_ascii_lowercase())
+        .unwrap_or_else(|| resolved.to_ascii_lowercase())
+}
+
 fn combined_copy_counts(
     db: &CardDatabase,
     request: &DeckCompatibilityRequest,
 ) -> HashMap<String, u32> {
     let mut counts: HashMap<String, u32> = HashMap::new();
     for name in all_deck_cards(request) {
-        let canonical = resolve_card_name(db, name).to_ascii_lowercase();
+        let canonical = canonical_deck_count_key(db, name);
         *counts.entry(canonical).or_insert(0) += 1;
     }
     counts
@@ -2815,6 +2825,50 @@ mod tests {
         assert!(copy_limit_violations(&db, &counts_of(&[("Nazgûl", 9)]), 1).is_empty());
         // A normal card is still singleton-restricted to 1.
         assert!(!copy_limit_violations(&db, &counts_of(&[("Red Card", 2)]), 1).is_empty());
+    }
+
+    #[test]
+    fn combined_copy_counts_merge_nazgul_spelling_variants() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        let mut main = expand("Nazgul", 5);
+        main.extend(expand("Nazgûl", 5));
+        main.extend(expand("Plains", 80));
+        let request = DeckCompatibilityRequest {
+            main_deck: main,
+            sideboard: Vec::new(),
+            commander: vec!["Legal Commander".to_string()],
+            signature_spell: Vec::new(),
+            selected_format: None,
+            selected_match_type: None,
+            summary_only: false,
+        };
+
+        let counts = combined_copy_counts(&db, &request);
+        assert_eq!(counts.get("nazgûl"), Some(&10));
+        assert!(!copy_limit_violations(&db, &counts, 1).is_empty());
+    }
+
+    #[test]
+    fn commander_accepts_nine_nazgul_copies() {
+        let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
+        let mut main = expand("Nazgul", 9);
+        main.extend(expand("Mountain", 90));
+        let request = DeckCompatibilityRequest {
+            main_deck: main,
+            sideboard: Vec::new(),
+            commander: vec!["Grub Commander".to_string()],
+            signature_spell: Vec::new(),
+            selected_format: None,
+            selected_match_type: None,
+            summary_only: false,
+        };
+
+        let result = evaluate_deck_compatibility(&db, &request);
+        assert!(
+            result.commander.compatible,
+            "expected compatible commander deck, got: {:?}",
+            result.commander.reasons
+        );
     }
 
     #[test]

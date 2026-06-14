@@ -4626,7 +4626,21 @@ fn parse_token_replacement_shape(lower: &str) -> Option<TokenReplacementShape> {
     let descriptor = lower
         .get(descriptor_start..descriptor_start + descriptor_len)?
         .trim();
-    let token = super::oracle_effect::parse_token_description(descriptor)?;
+    // CR 614.1a: Peregrin Took / Xorn-class descriptors often prefix the token
+    // tail with "an additional " ("those tokens plus an additional Food token").
+    let stripped_additional = descriptor
+        .strip_prefix("an additional ")
+        .or_else(|| descriptor.strip_prefix("a additional "))
+        .or_else(|| descriptor.strip_prefix("additional "));
+    let descriptor = stripped_additional.unwrap_or(descriptor);
+    let descriptor_owned;
+    let descriptor_for_parse: &str = if stripped_additional.is_some() {
+        descriptor_owned = format!("a {descriptor}");
+        &descriptor_owned
+    } else {
+        descriptor
+    };
+    let token = super::oracle_effect::parse_token_description(descriptor_for_parse)?;
     let spec = token_description_to_spec(&token)?;
     Some(TokenReplacementShape::PlusSpec {
         spec: Box::new(spec),
@@ -11207,6 +11221,21 @@ mod tests {
         assert_eq!(spec.characteristics.core_types, vec![CoreType::Creature]);
         assert_eq!(spec.characteristics.subtypes, vec!["Squirrel".to_string()]);
         assert_eq!(spec.characteristics.colors, vec![ManaColor::Green]);
+    }
+
+    /// CR 614.1a + CR 111.1: Peregrin Took's "those tokens plus an additional
+    /// Food token are created instead" replacement.
+    #[test]
+    fn parses_peregrin_took_additional_food_token() {
+        let text = "If one or more tokens would be created under your control, those tokens plus an additional Food token are created instead.";
+        let def = parse_replacement_line(text, "Peregrin Took").expect("should parse Peregrin");
+        assert_eq!(def.event, ReplacementEvent::CreateToken);
+        assert_eq!(def.token_owner_scope, Some(ControllerRef::You));
+        let spec = def
+            .additional_token_spec
+            .as_ref()
+            .expect("additional Food token spec");
+        assert_eq!(spec.characteristics.subtypes, vec!["Food".to_string()]);
     }
 
     /// CR 614.1a: The "twice that many" shape and the "those tokens plus"

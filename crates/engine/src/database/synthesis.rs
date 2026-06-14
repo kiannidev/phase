@@ -8734,6 +8734,58 @@ pub fn synthesize_planechase(face: &mut CardFace) {
     }
 }
 
+/// CR 314.2 / CR 904.8: Scheme cards remain in the command zone throughout the
+/// game and their abilities function from there. CR 314.4: a scheme's abilities
+/// function while it is face up in the command zone. CR 113.6b: an ability that
+/// states which zones it functions in functions only from those zones.
+/// Parser-emitted triggers/statics on a scheme carry no zone designation, so
+/// this stamps `Zone::Command` onto each — the same precedent as
+/// `synthesize_planechase` for planes/phenomena. Idempotent: only stamps when
+/// the zone list does not already contain Command.
+pub fn synthesize_archenemy(face: &mut CardFace) {
+    let is_scheme = face
+        .card_type
+        .core_types
+        .iter()
+        .any(|ct| matches!(ct, CoreType::Scheme));
+    if !is_scheme {
+        return;
+    }
+    for trigger in face.triggers.iter_mut() {
+        if !trigger.trigger_zones.contains(&Zone::Command) {
+            trigger.trigger_zones.push(Zone::Command);
+        }
+    }
+    for static_def in face.static_abilities.iter_mut() {
+        if !static_def.active_zones.contains(&Zone::Command) {
+            static_def.active_zones.push(Zone::Command);
+        }
+    }
+}
+
+/// CR 905.4: Conspiracy cards exist only in the command zone and their abilities
+/// function from there. CR 113.6b: an ability that states which zones it
+/// functions in functions only from those zones. Parser-emitted
+/// triggers/statics on a conspiracy carry no zone designation, so this stamps
+/// `Zone::Command` onto each — the same precedent as `synthesize_archenemy` for
+/// schemes and `synthesize_planechase` for planes/phenomena. Idempotent: only
+/// stamps when `Zone::Command` is not already present.
+pub fn synthesize_conspiracy(face: &mut CardFace) {
+    if !face.card_type.core_types.contains(&CoreType::Conspiracy) {
+        return;
+    }
+    for trigger in face.triggers.iter_mut() {
+        if !trigger.trigger_zones.contains(&Zone::Command) {
+            trigger.trigger_zones.push(Zone::Command);
+        }
+    }
+    for static_def in face.static_abilities.iter_mut() {
+        if !static_def.active_zones.contains(&Zone::Command) {
+            static_def.active_zones.push(Zone::Command);
+        }
+    }
+}
+
 pub fn synthesize_all(face: &mut CardFace) {
     synthesize_basic_land_mana(face);
     synthesize_equip(face);
@@ -9027,6 +9079,12 @@ pub fn synthesize_all(face: &mut CardFace) {
     // CR 311.2 / CR 312.2 / CR 113.6b: stamp Zone::Command onto plane/phenomenon
     // triggers and statics so the command-zone scans evaluate them.
     synthesize_planechase(face);
+    // CR 314.2 / CR 904.8 / CR 113.6b: stamp Zone::Command onto scheme triggers
+    // and statics so the command-zone scans evaluate them.
+    synthesize_archenemy(face);
+    // CR 905.4 / CR 113.6b: stamp Zone::Command onto conspiracy triggers and
+    // statics so the command-zone scans evaluate them.
+    synthesize_conspiracy(face);
 }
 
 /// CR 702.176a: Synthesize Impending's battlefield static and end-step trigger.
@@ -9265,7 +9323,7 @@ pub fn synthesize_siege_intrinsics(face: &mut CardFace) {
             && matches!(
                 r.execute.as_deref().map(|a| &*a.effect),
                 Some(Effect::Choose {
-                    choice_type: ChoiceType::Opponent,
+                    choice_type: ChoiceType::Opponent { .. },
                     persist: true,
                 })
             )
@@ -9281,7 +9339,7 @@ pub fn synthesize_siege_intrinsics(face: &mut CardFace) {
         protector_replacement.execute = Some(Box::new(AbilityDefinition::new(
             AbilityKind::Spell,
             Effect::Choose {
-                choice_type: ChoiceType::Opponent,
+                choice_type: ChoiceType::Opponent { restriction: None },
                 persist: true,
             },
         )));
@@ -9384,7 +9442,7 @@ pub fn synthesize_tribute_intrinsics(face: &mut CardFace) {
             && matches!(
                 r.execute.as_deref().map(|a| &*a.effect),
                 Some(Effect::Choose {
-                    choice_type: ChoiceType::Opponent,
+                    choice_type: ChoiceType::Opponent { .. },
                     persist: true,
                 }),
             )
@@ -9405,7 +9463,7 @@ pub fn synthesize_tribute_intrinsics(face: &mut CardFace) {
     let choose_stage = AbilityDefinition::new(
         AbilityKind::Spell,
         Effect::Choose {
-            choice_type: ChoiceType::Opponent,
+            choice_type: ChoiceType::Opponent { restriction: None },
             persist: true,
         },
     )
@@ -16286,7 +16344,7 @@ mod siege_synthesis_tests {
         assert!(matches!(
             protector.execute.as_deref().map(|a| &*a.effect),
             Some(Effect::Choose {
-                choice_type: ChoiceType::Opponent,
+                choice_type: ChoiceType::Opponent { .. },
                 persist: true,
             })
         ));

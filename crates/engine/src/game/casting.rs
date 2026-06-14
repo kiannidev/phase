@@ -928,6 +928,19 @@ fn has_effective_graveyard_cast_keyword(
             && super::keywords::effective_mayhem_cost(state, object_id).is_some())
 }
 
+fn mayhem_castable_from_graveyard(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+) -> bool {
+    was_discarded_this_turn(state, object_id)
+        && super::keywords::effective_mayhem_cost(state, object_id).is_some()
+        && state
+            .objects
+            .get(&object_id)
+            .is_some_and(|o| o.zone == Zone::Graveyard && o.owner == player)
+}
+
 fn upsert_keyword_by_kind(keywords: &mut Vec<Keyword>, keyword: Keyword) {
     if let Some(existing) = keywords
         .iter_mut()
@@ -1605,12 +1618,8 @@ fn source_has_collection_counter_play_permission(
     state.objects.get(&source).is_some_and(|source_obj| {
         source_obj.zone == Zone::Battlefield
             && source_obj.controller == player
-            && active_static_definitions(state, source_obj).any(|def| {
-                matches!(
-                    &def.mode,
-                    StaticMode::Other(name) if name == "LinkedCollectionCounterPlayPermission"
-                )
-            })
+            && active_static_definitions(state, source_obj)
+                .any(|def| matches!(&def.mode, StaticMode::LinkedCollectionCounterPlayPermission))
     })
 }
 
@@ -2914,9 +2923,7 @@ fn casting_variant_candidates(
         // CR 702.187b: Mayhem is available only while the card was discarded this
         // turn. The cost may be printed or granted to graveyard cards by a static
         // (Green Goblin), so query the effective off-zone keyword cost.
-        if super::keywords::effective_mayhem_cost(state, object_id).is_some()
-            && was_discarded_this_turn(state, object_id)
-        {
+        if mayhem_castable_from_graveyard(state, player, object_id) {
             candidates.push(CastingVariant::Mayhem);
         }
         if super::keywords::effective_flashback_cost(state, object_id).is_some() {
@@ -3191,6 +3198,7 @@ fn prepare_spell_cast_with_variant_override_inner(
         );
     let has_graveyard_cast_keyword =
         obj.zone == Zone::Graveyard && has_effective_graveyard_cast_keyword(state, object_id, obj);
+    let has_mayhem = mayhem_castable_from_graveyard(state, player, object_id);
     // CR 601.2a + CR 117.1c: Graveyard cast via static permission (Lurrus, etc.).
     let graveyard_permission_src = if obj.zone == Zone::Graveyard && state.active_player == player {
         graveyard_permission_source(state, player, object_id)
@@ -3245,6 +3253,7 @@ fn prepare_spell_cast_with_variant_override_inner(
                     && oathbreaker_on_battlefield(state, player))
                 || has_madness
                 || has_graveyard_cast_keyword
+                || has_mayhem
                 || has_graveyard_permission
                 || has_graveyard_alt_cost
                 || has_top_of_library_permission));
@@ -3501,8 +3510,8 @@ fn prepare_spell_cast_with_variant_override_inner(
     let (flashback_mana_cost, flashback_non_mana_cost) =
         split_flashback_cost_components(flashback_cost.as_ref());
 
-    // Precedence: Escape > Retrace > Harmonize > Flashback > Aftermath > Disturb >
-    // GraveyardPermission > Warp > Normal.
+    // Precedence: Escape > Retrace > Harmonize > Mayhem > Flashback > Aftermath >
+    // Disturb > Jump-start > GraveyardPermission > Warp > Normal.
     // No standard card has multiple graveyard-cast keywords; if one did, the card's own
     // keyword overrides an external source's grant (GraveyardPermission).
     //
@@ -3559,6 +3568,8 @@ fn prepare_spell_cast_with_variant_override_inner(
             CastingVariant::Retrace
         } else if harmonize_cost.is_some() {
             CastingVariant::Harmonize
+        } else if has_mayhem {
+            CastingVariant::Mayhem
         } else if flashback_cost.is_some() {
             CastingVariant::Flashback
         } else if obj.zone == Zone::Graveyard
@@ -3573,8 +3584,6 @@ fn prepare_spell_cast_with_variant_override_inner(
             CastingVariant::JumpStart
         } else if disturb_cost.is_some() {
             CastingVariant::Disturb
-        } else if mayhem_cost.is_some() {
-            CastingVariant::Mayhem
         } else if let Some(source) = graveyard_permission_src {
             // CR 110.4: For OncePerTurnPerPermanentType permissions, auto-pick
             // the slot when only one is available. When multiple slots are
@@ -3951,6 +3960,11 @@ fn prepare_spell_cast_with_variant_override_inner(
     } else {
         None
     };
+    let effective_mayhem_cost_for_path = if casting_variant == CastingVariant::Mayhem {
+        mayhem_cost
+    } else {
+        None
+    };
     let effective_flashback_mana_cost_for_path = if casting_variant == CastingVariant::Flashback {
         flashback_mana_cost
     } else {
@@ -3958,13 +3972,6 @@ fn prepare_spell_cast_with_variant_override_inner(
     };
     let effective_disturb_cost_for_path = if casting_variant == CastingVariant::Disturb {
         disturb_cost
-    } else {
-        None
-    };
-    // CR 702.187b: When casting via Mayhem, the mayhem mana cost replaces the
-    // card's mana cost (an alternative cost paid from the graveyard).
-    let effective_mayhem_cost_for_path = if casting_variant == CastingVariant::Mayhem {
-        mayhem_cost
     } else {
         None
     };
@@ -3995,9 +4002,9 @@ fn prepare_spell_cast_with_variant_override_inner(
             .or(prototype_cost)
             .or(effective_escape_cost_for_path)
             .or(effective_harmonize_cost_for_path)
+            .or(effective_mayhem_cost_for_path)
             .or(effective_flashback_mana_cost_for_path)
             .or(effective_disturb_cost_for_path)
-            .or(effective_mayhem_cost_for_path)
             .or(effective_sneak_cost_for_path)
             .or(effective_web_slinging_cost_for_path)
             .or(alt_cost_from_exile)
@@ -9423,6 +9430,13 @@ fn can_cast_prepared_now(
         return false;
     }
 
+    // CR 702.187b: Mayhem requires that you discarded this card this turn.
+    if prepared.casting_variant == CastingVariant::Mayhem
+        && !was_discarded_this_turn(state, prepared.object_id)
+    {
+        return false;
+    }
+
     // CR 702.119a-c: Emerge affordability is the reduced emerge cost after
     // sacrificing a legal creature, not the unreduced `prepared.mana_cost`.
     if prepared.casting_variant == CastingVariant::Emerge {
@@ -10011,7 +10025,7 @@ pub fn can_pay_ability_mana_cost_after_auto_tap(
     )
 }
 
-pub(super) fn can_pay_ability_mana_cost_after_auto_tap_excluding(
+pub fn can_pay_ability_mana_cost_after_auto_tap_excluding(
     state: &GameState,
     player: PlayerId,
     source_id: ObjectId,
@@ -24489,6 +24503,121 @@ mod tests {
             .expect("bauble must be castable from graveyard");
     }
 
+    /// Regression (Sunforger infinite recast): a `CastFromZone` "cast it
+    /// without paying its mana cost" grant attached *in place* to a card the
+    /// effect routed through the hand (Sunforger: search → to hand → cast from
+    /// hand) leaves a zero-cost `ExileWithAltCost { duration: None }` on the
+    /// card. The card never visits exile, so the exile-exit cleanup never fires.
+    /// Before the fix, after the spell resolved to the graveyard the spent grant
+    /// persisted there, and `has_graveyard_timed_alt_cost_permission` re-offered
+    /// the free cast on every priority — the AI cast Abrade from its graveyard
+    /// endlessly. CR 400.7 + CR 601.2a: the one-shot grant must be consumed when
+    /// the card leaves the stack after its single cast.
+    ///
+    /// This test seeds the post-resolution graveyard state directly (the bug's
+    /// observed surface) and drives the real cast+resolve pipeline through the
+    /// fixed `apply_zone_exit_cleanup` seam. Grant *creation* provenance (the
+    /// hand-origin `CastFromZone` resolve and its `UntilEndOfTurn` default) is
+    /// covered by `cast_from_zone::tests::hand_in_place_grant_defaults_to_until_end_of_turn`.
+    #[test]
+    fn graveyard_in_place_alt_cost_grant_is_consumed_after_one_cast() {
+        let mut state = setup_game_at_main_phase();
+        // Seed library so the resolving Draw does not hit an empty library.
+        for i in 0..3 {
+            create_object(
+                &mut state,
+                CardId(7100 + i),
+                PlayerId(0),
+                format!("Library Card {i}"),
+                Zone::Library,
+            );
+        }
+
+        let spell = create_object(
+            &mut state,
+            CardId(7000),
+            PlayerId(0),
+            "Abrade".to_string(),
+            Zone::Graveyard,
+        );
+        {
+            let obj = state.objects.get_mut(&spell).unwrap();
+            obj.card_types.core_types.push(CoreType::Instant);
+            Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+            ));
+            // Printed cost is real; the only way this casts is the free grant.
+            obj.mana_cost = ManaCost::generic(3);
+            // Hand-origin in-place grant: `duration: None` (graveyard-origin
+            // grants default to UntilEndOfTurn — the leak class is the one that
+            // never expires).
+            obj.casting_permissions
+                .push(CastingPermission::ExileWithAltCost {
+                    cost: ManaCost::zero(),
+                    cast_transformed: false,
+                    constraint: None,
+                    granted_to: Some(PlayerId(0)),
+                    resolution_cleanup: None,
+                    duration: None,
+                    exile_instead_of_graveyard_on_resolve: false,
+                });
+        }
+
+        // Precondition (the bug's trigger): the stale grant makes the free
+        // graveyard cast available even with no mana in the pool.
+        assert!(
+            spell_objects_available_to_cast(&state, PlayerId(0)).contains(&spell),
+            "stale in-place grant should surface the free graveyard cast"
+        );
+
+        // Cast it for free and resolve it back to the graveyard.
+        apply_as_current(
+            &mut state,
+            GameAction::CastSpell {
+                object_id: spell,
+                card_id: CardId(7000),
+                targets: vec![],
+                payment_mode: CastPaymentMode::Auto,
+            },
+        )
+        .expect("free graveyard cast should be accepted");
+        assert_eq!(state.stack.len(), 1, "spell should be on the stack");
+
+        for _ in 0..4 {
+            if state.stack.is_empty() {
+                break;
+            }
+            apply_as_current(&mut state, GameAction::PassPriority).unwrap();
+        }
+
+        assert_eq!(
+            state.objects[&spell].zone,
+            Zone::Graveyard,
+            "instant should resolve back to the graveyard"
+        );
+        // The fix: the spent one-shot grant is gone.
+        assert!(
+            !state.objects[&spell]
+                .casting_permissions
+                .iter()
+                .any(|p| matches!(
+                    p,
+                    CastingPermission::ExileWithAltCost { .. }
+                        | CastingPermission::ExileWithAltAbilityCost { .. }
+                )),
+            "the consumed CastFromZone grant must be cleared on leaving the stack"
+        );
+        // And the infinite-recast surface is closed.
+        assert!(
+            !spell_objects_available_to_cast(&state, PlayerId(0)).contains(&spell),
+            "the spell must not be re-offered from the graveyard after its single cast"
+        );
+    }
+
     #[test]
     fn hand_alt_cost_permission_overrides_printed_mana_cost() {
         let mut state = setup_game_at_main_phase();
@@ -24637,9 +24766,9 @@ mod tests {
             .get_mut(&source)
             .unwrap()
             .static_definitions
-            .push(StaticDefinition::new(StaticMode::Other(
-                "LinkedCollectionCounterPlayPermission".to_string(),
-            )));
+            .push(StaticDefinition::new(
+                StaticMode::LinkedCollectionCounterPlayPermission,
+            ));
 
         let obj_id = create_object(
             &mut state,
@@ -24705,9 +24834,9 @@ mod tests {
             .get_mut(&source)
             .unwrap()
             .static_definitions
-            .push(StaticDefinition::new(StaticMode::Other(
-                "LinkedCollectionCounterPlayPermission".to_string(),
-            )));
+            .push(StaticDefinition::new(
+                StaticMode::LinkedCollectionCounterPlayPermission,
+            ));
 
         // An opponent-owned (PlayerId(1)) exiled spell with a collection counter,
         // exiled by an ability PlayerId(0) controlled — the reported scenario.
@@ -43026,6 +43155,240 @@ mod tests {
             generic_of(&def_b),
             3,
             "legendary creature present → cost reduced by {{3}}"
+        );
+    }
+
+    // --- cluster-04: first-qualifying-spell keyword grant, cast-time snapshot
+    // (CR 611.2f). These tests would FAIL if the Cascade/Demonstrate seams
+    // re-queried the grant post-record (the `SpellsCastThisTurn == 0` gate would
+    // be false for the first spell), and pass only because `finalize_cast`
+    // snapshots the cast-time keywords into `cast_spell_keywords`. ---
+
+    /// Create a {0}-cost sorcery (Effect::Draw, no targets) in hand for the given
+    /// owner. Free to cast through `finalize_cast` without mana or target choices.
+    fn create_free_sorcery(state: &mut GameState, card_id: CardId, owner: PlayerId) -> ObjectId {
+        let id = create_object(
+            state,
+            card_id,
+            owner,
+            "Free Sorcery".to_string(),
+            Zone::Hand,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Sorcery);
+        obj.mana_cost = ManaCost::zero();
+        Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+        ));
+        id
+    }
+
+    /// Drive a full cast of `spell` to completion (spell on the stack, waiting for
+    /// priority), resolving any targetless target-selection prompts. Returns the
+    /// `SpellCast` events emitted by `handle_cast_spell`.
+    fn cast_free_sorcery_to_stack(
+        state: &mut GameState,
+        spell: ObjectId,
+        card_id: CardId,
+    ) -> Vec<GameEvent> {
+        let mut events = Vec::new();
+        let waiting = handle_cast_spell(state, PlayerId(0), spell, card_id, &mut events)
+            .expect("free sorcery should be castable");
+        if !matches!(waiting, WaitingFor::Priority { .. }) {
+            state.waiting_for = waiting;
+            loop {
+                match &state.waiting_for {
+                    WaitingFor::Priority { .. } => break,
+                    WaitingFor::TargetSelection { .. } => {
+                        apply_as_current(state, GameAction::SelectTargets { targets: vec![] })
+                            .expect("targetless draw spell should not need targets");
+                    }
+                    other => panic!("unexpected waiting state during free cast: {other:?}"),
+                }
+            }
+        }
+        events
+    }
+
+    /// Empty the stack and return priority to P0 so a subsequent sorcery-speed
+    /// cast is legal. The turn-scoped `spells_cast_this_turn_by_player` history is
+    /// intentionally left intact — that is the first-spell gate's source of truth.
+    fn clear_stack_to_priority(state: &mut GameState) {
+        state.stack.clear();
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+    }
+
+    fn install_first_spell_cascade_grant(state: &mut GameState) {
+        let source = create_object(
+            state,
+            CardId(7_000),
+            PlayerId(0),
+            "Maelstrom Nexus".to_string(),
+            Zone::Battlefield,
+        );
+        let grant = parse_static_line("The first spell you cast each turn has cascade.")
+            .expect("Maelstrom Nexus static should parse");
+        // Sanity: the parser must emit the gated form, not the legacy condition-null
+        // static — otherwise this test silently stops exercising the gate.
+        assert!(
+            grant.condition.is_some(),
+            "first-spell grant must carry the SpellsCastThisTurn gate"
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .static_definitions
+            .push(grant);
+    }
+
+    #[test]
+    fn snapshot_first_qualifying_spell_captures_grant_second_does_not() {
+        let mut state = setup_game_at_main_phase();
+        install_first_spell_cascade_grant(&mut state);
+
+        let first = create_free_sorcery(&mut state, CardId(7_001), PlayerId(0));
+        cast_free_sorcery_to_stack(&mut state, first, CardId(7_001));
+        assert!(
+            state.objects[&first]
+                .cast_spell_keywords
+                .iter()
+                .any(|k| matches!(k, Keyword::Cascade)),
+            "the first qualifying spell's cast-time snapshot must capture the granted Cascade"
+        );
+
+        // CR 117.1a: clear the stack so the second sorcery may be cast at
+        // sorcery speed. `spells_cast_this_turn_by_player` (the gate's source)
+        // persists, so the second spell still counts as the second cast.
+        clear_stack_to_priority(&mut state);
+
+        let second = create_free_sorcery(&mut state, CardId(7_002), PlayerId(0));
+        cast_free_sorcery_to_stack(&mut state, second, CardId(7_002));
+        assert!(
+            !state.objects[&second]
+                .cast_spell_keywords
+                .iter()
+                .any(|k| matches!(k, Keyword::Cascade)),
+            "the second same-turn spell must NOT receive Cascade (the gate is now false)"
+        );
+    }
+
+    #[test]
+    fn first_qualifying_spell_enqueues_cascade_second_does_not() {
+        let mut state = setup_game_at_main_phase();
+        install_first_spell_cascade_grant(&mut state);
+
+        let count_cascade = |state: &GameState| {
+            state
+                .stack
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        &entry.kind,
+                        StackEntryKind::TriggeredAbility { ability, .. }
+                            if matches!(ability.effect, Effect::Cascade)
+                    )
+                })
+                .count()
+        };
+
+        let first = create_free_sorcery(&mut state, CardId(7_011), PlayerId(0));
+        let events = cast_free_sorcery_to_stack(&mut state, first, CardId(7_011));
+        super::super::triggers::process_triggers(&mut state, &events);
+        assert_eq!(
+            count_cascade(&state),
+            1,
+            "the first qualifying spell each turn must enqueue a Cascade trigger"
+        );
+
+        // CR 117.1a: clear the stack so the second sorcery may be cast at
+        // sorcery speed; the gate's spell history persists.
+        clear_stack_to_priority(&mut state);
+
+        let second = create_free_sorcery(&mut state, CardId(7_012), PlayerId(0));
+        let events = cast_free_sorcery_to_stack(&mut state, second, CardId(7_012));
+        super::super::triggers::process_triggers(&mut state, &events);
+        assert_eq!(
+            count_cascade(&state),
+            0,
+            "the second same-turn spell must NOT enqueue a Cascade trigger"
+        );
+    }
+
+    #[test]
+    fn convoke_query_before_record_unaffected_by_snapshot() {
+        // CR 702.51a: the pre-record convoke consumer (`effective_spell_keywords`
+        // read during finalize) must still see the grant for the first historic
+        // spell and NOT for the second. Step 0 must not disturb this path.
+        let mut state = setup_game_at_main_phase();
+        let source = create_object(
+            &mut state,
+            CardId(7_200),
+            PlayerId(0),
+            "Peri Brown".to_string(),
+            Zone::Battlefield,
+        );
+        let grant = parse_static_line("The first historic spell you cast each turn has convoke.")
+            .expect("Peri Brown static should parse");
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .static_definitions
+            .push(grant);
+
+        // A historic (legendary) spell already on the stack, recorded as if cast.
+        let first = create_object(
+            &mut state,
+            CardId(7_201),
+            PlayerId(0),
+            "Legendary Sorcery".to_string(),
+            Zone::Stack,
+        );
+        {
+            let obj = state.objects.get_mut(&first).unwrap();
+            obj.card_types.core_types.push(CoreType::Sorcery);
+            obj.card_types.supertypes.push(Supertype::Legendary);
+            obj.cast_from_zone = Some(Zone::Hand);
+        }
+        // Before any historic spell is recorded, the grant applies to a historic
+        // spell (count == 0).
+        assert!(
+            effective_spell_keywords(&state, PlayerId(0), first)
+                .iter()
+                .any(|k| matches!(k, Keyword::Convoke)),
+            "first historic spell (pre-record) must receive Convoke"
+        );
+
+        // Record one historic spell this turn; the gate is now false.
+        state.spells_cast_this_turn_by_player.insert(
+            PlayerId(0),
+            vec![SpellCastRecord {
+                name: "Already Cast Legend".to_string(),
+                core_types: vec![CoreType::Sorcery],
+                supertypes: vec![Supertype::Legendary],
+                subtypes: vec![],
+                keywords: vec![],
+                colors: vec![],
+                mana_value: 0,
+                has_x_in_cost: false,
+                from_zone: Zone::Hand,
+                cast_variant: crate::types::game_state::CastingVariant::Normal,
+            }]
+            .into(),
+        );
+        assert!(
+            !effective_spell_keywords(&state, PlayerId(0), first)
+                .iter()
+                .any(|k| matches!(k, Keyword::Convoke)),
+            "second historic spell (a historic spell already recorded) must NOT receive Convoke"
         );
     }
 }

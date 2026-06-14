@@ -22,6 +22,7 @@ use super::oracle_nom::primitives::{
     self as nom_primitives, scan_contains, scan_preceded, scan_split_at_phrase,
 };
 use super::oracle_nom::quantity as nom_quantity;
+use super::oracle_nom::target::parse_type_phrase as parse_type_phrase_nom;
 use super::oracle_static::parse_commander_subject_filter_prefix;
 use super::oracle_target::{
     attachment_kinds_filter_prop, parse_attachment_kind_disjunction, parse_type_phrase,
@@ -77,6 +78,22 @@ fn strip_spell_not_owned_qualifier(payload: &str) -> (&str, bool) {
             tag::<_, _, OracleError<'_>>(" you don't own"),
         ),
         terminated(take_until(" you do not own"), tag(" you do not own")),
+    ));
+    parser
+        .parse(payload)
+        .map(|(body, _)| (body.trim(), true))
+        .unwrap_or((payload, false))
+}
+
+/// CR 603.7c: "Whenever a player casts a spell they don't own" — the casting
+/// player is the trigger event's player; the spell must not be owned by them.
+fn strip_spell_they_dont_own_qualifier(payload: &str) -> (&str, bool) {
+    let mut parser = alt((
+        terminated(
+            take_until(" they don't own"),
+            tag::<_, _, OracleError<'_>>(" they don't own"),
+        ),
+        terminated(take_until(" they do not own"), tag(" they do not own")),
     ));
     parser
         .parse(payload)
@@ -2724,6 +2741,9 @@ fn static_condition_to_trigger_condition(sc: &StaticCondition) -> Option<Trigger
 
         // Variants with no TriggerCondition equivalent (combat-only / source-state / cost).
         StaticCondition::SourceEnteredThisTurn
+        // CR 702.11b + CR 120.3: "has dealt damage since entering" is a static-only
+        // Layer-6 gate with no intervening-if (`TriggerCondition`) equivalent.
+        | StaticCondition::SourceHasDealtDamage
         | StaticCondition::IsRingBearer
         | StaticCondition::RingLevelAtLeast { .. }
         | StaticCondition::DevotionGE { .. }
@@ -5936,50 +5956,90 @@ fn with_triggering_player_controller(filter: TargetFilter) -> TargetFilter {
 /// - "to you"                       → `Controller`
 /// - "to a player or planeswalker"  → `Or { Player, Planeswalker }`
 fn parse_damage_to_qualifier(after_verb: &str) -> Option<TargetFilter> {
-    let (rest, ()) = value((), tag::<_, _, OracleError<'_>>("to "))
-        .parse(after_verb.trim_start())
-        .ok()?;
-    // Use nom alt() to match damage target qualifiers (input already lowercase)
-    fn parse_damage_target(input: &str) -> OracleResult<'_, TargetFilter> {
-        fn opponent_player_filter() -> TargetFilter {
-            TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent))
-        }
-
-        fn parse_opponent_player_recipient(input: &str) -> OracleResult<'_, TargetFilter> {
-            value(
-                opponent_player_filter(),
-                alt((
-                    preceded(tag("an "), tag("opponent")),
-                    preceded(tag("one of your "), tag("opponents")),
-                    preceded(tag("another "), tag("player")),
-                )),
-            )
-            .parse(input)
-        }
-
-        alt((
-            value(
-                TargetFilter::Or {
-                    filters: vec![
-                        TargetFilter::Player,
-                        TargetFilter::Typed(TypedFilter::new(TypeFilter::Planeswalker)),
-                    ],
-                },
-                alt((
-                    tag("a player or planeswalker"),
-                    tag("a player or a planeswalker"),
-                )),
-            ),
-            value(TargetFilter::Player, tag("a player")),
-            parse_opponent_player_recipient,
-            value(TargetFilter::Controller, tag("you")),
-        ))
-        .parse(input)
-    }
-    parse_damage_target
-        .parse(rest)
+    parse_damage_to_qualifier_with_rest(after_verb)
         .ok()
         .map(|(_, filter)| filter)
+}
+
+/// CR 120.1 + CR 603.2: Parse the `"to <recipient>"` clause that follows a
+/// damage predicate, returning the recipient `TargetFilter` AND the remainder so
+/// the caller can consume a trailing qualifier. `parse_damage_to_qualifier` is
+/// the discard-remainder convenience wrapper for call sites that don't read the
+/// tail.
+///
+/// Recognizes only the *player* recipient axis — "a player", "an opponent",
+/// "you", "a player or planeswalker". The object-recipient axis (a
+/// creature/permanent/planeswalker that took the damage) is deliberately NOT
+/// matched here: it is reachable only through
+/// [`parse_object_recipient_pt_gate`], which requires the trailing "equal to
+/// that <recipient>'s toughness/power" qualifier. Folding the object axis in
+/// unconditionally would silently change the `valid_target` of every existing
+/// DamageDone trigger that names an object recipient (e.g. Questing Beast's
+/// "deals combat damage to a planeswalker"), so the object axis stays gated.
+fn parse_damage_to_qualifier_with_rest(after_verb: &str) -> OracleResult<'_, TargetFilter> {
+    let (rest, ()) =
+        value((), tag::<_, _, OracleError<'_>>("to ")).parse(after_verb.trim_start())?;
+
+    fn opponent_player_filter() -> TargetFilter {
+        TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent))
+    }
+
+    fn parse_opponent_player_recipient(input: &str) -> OracleResult<'_, TargetFilter> {
+        value(
+            opponent_player_filter(),
+            alt((
+                preceded(tag("an "), tag("opponent")),
+                preceded(tag("one of your "), tag("opponents")),
+                preceded(tag("another "), tag("player")),
+            )),
+        )
+        .parse(input)
+    }
+
+    alt((
+        value(
+            TargetFilter::Or {
+                filters: vec![
+                    TargetFilter::Player,
+                    TargetFilter::Typed(TypedFilter::new(TypeFilter::Planeswalker)),
+                ],
+            },
+            alt((
+                tag("a player or planeswalker"),
+                tag("a player or a planeswalker"),
+            )),
+        ),
+        value(TargetFilter::Player, tag("a player")),
+        parse_opponent_player_recipient,
+        value(TargetFilter::Controller, tag("you")),
+    ))
+    .parse(rest)
+}
+
+/// CR 120.1 + CR 208.1 + CR 603.4: Parse the full Taii Wakeen recipient shape —
+/// `"to <object> equal to that <object>'s toughness|power"` — atomically. Only
+/// succeeds when an object recipient is immediately followed by the equal-to-P/T
+/// qualifier, so it never perturbs the `valid_target` of an ordinary DamageDone
+/// trigger that merely names an object recipient (those have no such tail and
+/// fall through to the player-only [`parse_damage_to_qualifier_with_rest`]).
+///
+/// Returns the recipient object `TargetFilter` (so the trigger's `valid_target`
+/// scopes to the damaged object's type) and the recipient-relative `QuantityRef`
+/// for the intervening-`if` `QuantityComparison`.
+fn parse_object_recipient_pt_gate(
+    after_verb: &str,
+) -> OracleResult<'_, (TargetFilter, QuantityRef)> {
+    let (rest, ()) =
+        value((), tag::<_, _, OracleError<'_>>("to ")).parse(after_verb.trim_start())?;
+    // CR 120.1: object recipient ("a creature" / "a permanent" / typed). The
+    // leading article is consumed before delegating to `parse_type_phrase`.
+    let (rest, _) = alt((tag("a "), tag("an "))).parse(rest)?;
+    let (rest, filter) = parse_type_phrase_nom(rest)?;
+    // The equal-to-P/T qualifier is mandatory: without it this is an ordinary
+    // damage recipient that the player-only qualifier already declined, and the
+    // caller must not set an EventTarget gate.
+    let (rest, recipient_pt) = parse_damage_equal_to_recipient_pt(rest.trim_start())?;
+    Ok((rest, (filter, recipient_pt)))
 }
 
 /// CR 603.6a + CR 110.5b: After consuming the `"enter"` prefix in a ChangesZone
@@ -6467,7 +6527,26 @@ fn try_parse_event(
             def.damage_kind = kind;
             def.damage_amount = amount;
             def.valid_source = Some(subject.clone());
-            def.valid_target = parse_damage_to_qualifier(after_damage);
+            // CR 120.1 + CR 208.1 + CR 603.4: Taii Wakeen's damage==recipient-P/T
+            // shape ("to <object> equal to that <object>'s toughness/power") is
+            // tried first and atomically — it succeeds only when the object
+            // recipient is immediately followed by the equal-to-P/T qualifier, so
+            // it never fires for "deals damage equal to its power to X" (amount =
+            // source's power) or for ordinary object recipients without the tail.
+            if let Ok((_, (filter, recipient_pt))) = parse_object_recipient_pt_gate(after_damage) {
+                def.valid_target = Some(filter);
+                def.condition = Some(TriggerCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::EventContextAmount,
+                    },
+                    comparator: Comparator::EQ,
+                    rhs: QuantityExpr::Ref { qty: recipient_pt },
+                });
+            } else if let Some(filter) = parse_damage_to_qualifier(after_damage) {
+                // Ordinary player recipient ("to a player" / "to an opponent" /
+                // …) — unchanged from the pre-Taii behavior.
+                def.valid_target = Some(filter);
+            }
             return Some((TriggerMode::DamageDone, def));
         }
     }
@@ -7638,6 +7717,25 @@ fn try_parse_source_deals_damage_trigger(lower: &str) -> Option<(TriggerMode, Tr
     def.mode = TriggerMode::DamageDone;
     def.damage_kind = damage_kind;
     def.valid_source = Some(source_filter);
+    // CR 120.1 + CR 208.1 + CR 603.4: Taii Wakeen's damage==recipient-P/T shape
+    // ("to <object> equal to that <object>'s toughness/power"). Tried first and
+    // atomically — succeeds only when an object recipient is immediately
+    // followed by the equal-to-P/T qualifier, so it never fires for "deals
+    // damage equal to its power to X" (amount = source's power) nor changes the
+    // recipient handling of any ordinary damage trigger.
+    if let Ok((_, (filter, recipient_pt))) = parse_object_recipient_pt_gate(after_damage) {
+        def.valid_target = Some(filter);
+        def.condition = Some(TriggerCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::EventContextAmount,
+            },
+            comparator: Comparator::EQ,
+            rhs: QuantityExpr::Ref { qty: recipient_pt },
+        });
+        def.damage_amount = threshold;
+        return Some((TriggerMode::DamageDone, def));
+    }
+
     // Optional recipient: "to <recipient>" narrows the damage target; absence
     // means any damage target may satisfy the event. If a "to ..." tail exists
     // but is not one of this parser's recipient qualifiers, leave the line for
@@ -7790,6 +7888,42 @@ fn parse_damage_predicate_tail(
     let (rest, amount) = opt(parse_event_amount_quantifier).parse(rest)?;
     let (rest, _) = tag("damage").parse(rest)?;
     Ok((rest, (kind.unwrap_or(DamageKindFilter::Any), amount)))
+}
+
+/// CR 120.1 + CR 208.1 + CR 603.2: Parse the `"equal to <recipient>'s
+/// toughness|power"` tail that gates a damage trigger on the dealt amount
+/// matching the damaged object's characteristic (Taii Wakeen — "deals noncombat
+/// damage to a creature equal to that creature's toughness").
+///
+/// The possessive antecedent is a demonstrative referring back to the damage
+/// recipient ("that creature's" / "that permanent's" / "that planeswalker's") or
+/// the pronoun "its"; all resolve to `ObjectScope::EventTarget` (the object that
+/// received the triggering damage). Returns the recipient-relative `QuantityRef`
+/// so the caller can lift it into the intervening-`if` `QuantityComparison`.
+fn parse_damage_equal_to_recipient_pt(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (rest, _) = tag("equal to ").parse(input.trim_start())?;
+    let (rest, _) = alt((
+        tag("that creature's "),
+        tag("that permanent's "),
+        tag("that planeswalker's "),
+        tag("its "),
+    ))
+    .parse(rest)?;
+    alt((
+        value(
+            QuantityRef::Toughness {
+                scope: ObjectScope::EventTarget,
+            },
+            tag("toughness"),
+        ),
+        value(
+            QuantityRef::Power {
+                scope: ObjectScope::EventTarget,
+            },
+            tag("power"),
+        ),
+    ))
+    .parse(rest)
 }
 
 /// CR 603.2: Parse an event-magnitude quantifier ("`5 or more `" / "`exactly 5 `")
@@ -8129,6 +8263,33 @@ fn try_parse_special_trigger_pattern(lower: &str) -> Option<(TriggerMode, Trigge
             def.valid_card = Some(TargetFilter::Typed(TypedFilter::creature()));
             def.condition = Some(TriggerCondition::DealtDamageBySourceThisTurn);
             return Some((TriggerMode::ChangesZone, def));
+        }
+    }
+
+    // CR 700.4 + CR 120.1 + CR 608.2i: "another creature dealt damage this turn
+    // by [source filter] dies" (Shelob, Child of Ungoliant).
+    let mut damaged_this_turn_prefix = alt((
+        tag::<_, _, OracleError<'_>>("whenever another creature dealt damage this turn by "),
+        tag("when another creature dealt damage this turn by "),
+    ));
+    if let Ok((rest, _)) = damaged_this_turn_prefix.parse(lower) {
+        if let Some((after_source, source)) =
+            super::oracle_replacement::parse_damage_history_source(rest)
+        {
+            if tag::<_, _, OracleError<'_>>(" dies")
+                .parse(after_source)
+                .is_ok()
+            {
+                let mut def = make_base();
+                def.mode = TriggerMode::ChangesZone;
+                def.origin = Some(Zone::Battlefield);
+                def.destination = Some(Zone::Graveyard);
+                def.valid_card = Some(TargetFilter::Typed(
+                    TypedFilter::creature().properties(vec![FilterProp::Another]),
+                ));
+                def.condition = Some(TriggerCondition::DealtDamageThisTurnBySource { source });
+                return Some((TriggerMode::ChangesZone, def));
+            }
         }
     }
 
@@ -9663,7 +9824,11 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
                 .map(|(rest, _)| rest)
                 .unwrap_or(after_casts)
                 .trim_start();
-            let spell_clause = after_article;
+            let (spell_clause, spell_not_owned_by_caster) =
+                strip_spell_they_dont_own_qualifier(after_article);
+            if spell_not_owned_by_caster {
+                def.valid_target = Some(TargetFilter::TriggeringPlayer);
+            }
             // CR 601.2a: pre-extract the "from <zone>" cast-origin tail (see
             // the rationale in the "you cast a/an" branch above). Without
             // this, the zone constraint is silently dropped (Ghostly Pilferer
@@ -9688,17 +9853,35 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
             // (Talion, the Kindly Lord). CR 202.3 + CR 208.1: disjunctive match on
             // mana value, power, or toughness against the source's chosen number.
             if let Some(base_tf) = parse_spell_chosen_number_quality(spell_clause) {
-                def.valid_card = Some(TargetFilter::Typed(base_tf));
+                let filter = if spell_not_owned_by_caster {
+                    with_owner_scope(TargetFilter::Typed(base_tf), ControllerRef::Opponent)
+                } else {
+                    TargetFilter::Typed(base_tf)
+                };
+                def.valid_card = Some(filter);
                 return Some((TriggerMode::SpellCast, def));
             }
             // Handle "multicolored" as a spell property (not a type phrase)
             if scan_contains(spell_clause, "multicolored") {
-                def.valid_card = Some(TargetFilter::Typed(TypedFilter::default().properties(
-                    vec![FilterProp::ColorCount {
-                        comparator: Comparator::GE,
-                        count: 2,
-                    }],
-                )));
+                let filter = if spell_not_owned_by_caster {
+                    with_owner_scope(
+                        TargetFilter::Typed(TypedFilter::default().properties(vec![
+                            FilterProp::ColorCount {
+                                comparator: Comparator::GE,
+                                count: 2,
+                            },
+                        ])),
+                        ControllerRef::Opponent,
+                    )
+                } else {
+                    TargetFilter::Typed(TypedFilter::default().properties(vec![
+                        FilterProp::ColorCount {
+                            comparator: Comparator::GE,
+                            count: 2,
+                        },
+                    ]))
+                };
+                def.valid_card = Some(filter);
             } else {
                 let (filter, _rest) = parse_type_phrase(spell_clause);
                 let is_meaningful = match &filter {
@@ -9706,7 +9889,12 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
                     TargetFilter::Or { .. } => true,
                     _ => false,
                 };
-                if is_meaningful {
+                let filter = if spell_not_owned_by_caster {
+                    with_owner_scope(filter, ControllerRef::Opponent)
+                } else {
+                    filter
+                };
+                if is_meaningful || spell_not_owned_by_caster {
                     def.valid_card = Some(filter);
                 }
             }
@@ -10372,6 +10560,39 @@ pub(crate) fn parse_post_spell_modifier(modifier: &str) -> Option<TargetFilter> 
         if modifier[consumed..].trim().is_empty() {
             return Some(TargetFilter::Typed(
                 TypedFilter::default().properties(vec![prop]),
+            ));
+        }
+    }
+
+    // CR 601.2a: cast-origin qualifier. A spell is cast from a zone; "from
+    // anywhere other than [hand]" matches the cast-capable zones except the hand
+    // (The Twelfth Doctor), and "from exile" / "from your graveyard" match that
+    // single origin zone (Wild-Magic Sorcerer class). Emits an InAnyZone /
+    // InZone origin predicate consumed by `spell_object_matches_filter_from_state`
+    // against the cast-from zone.
+    if let Ok((rest, ())) = value(
+        (),
+        tag::<_, _, OracleError<'_>>("from anywhere other than your hand"),
+    )
+    .parse(modifier)
+    {
+        if rest.trim().is_empty() {
+            return Some(TargetFilter::Typed(TypedFilter::default().properties(
+                vec![FilterProp::InAnyZone {
+                    zones: super::oracle_target::cast_capable_zones_except(Zone::Hand),
+                }],
+            )));
+        }
+    }
+    if let Ok((rest, zone)) = alt((
+        value(Zone::Exile, tag::<_, _, OracleError<'_>>("from exile")),
+        value(Zone::Graveyard, tag("from your graveyard")),
+    ))
+    .parse(modifier)
+    {
+        if rest.trim().is_empty() {
+            return Some(TargetFilter::Typed(
+                TypedFilter::default().properties(vec![FilterProp::InZone { zone }]),
             ));
         }
     }
@@ -11395,6 +11616,36 @@ fn try_parse_discard_trigger(
         return Some((TriggerMode::DiscardedAll, def));
     }
 
+    // CR 109.5 + CR 603.2: "a spell or ability an opponent controls causes you to
+    // discard this card" — the self-discard caused by an opponent's spell/ability
+    // (Guerrilla Tactics, Sand Golem, Quagnoth, Mangara's Blessing). The
+    // `EventSourceControlledBy { Opponent }` constraint gates on the discard
+    // event's cause; mirrors the replacement form in `oracle_replacement.rs`.
+    if tag::<_, _, OracleError<'_>>(
+        "a spell or ability an opponent controls causes you to discard this card",
+    )
+    .parse(event)
+    .is_ok()
+    {
+        let mut def = make_base();
+        def.mode = TriggerMode::Discarded;
+        def.valid_card = Some(TargetFilter::SelfRef);
+        def.valid_target = Some(TargetFilter::Controller);
+        def.constraint = Some(
+            crate::types::ability::TriggerConstraint::EventSourceControlledBy {
+                controller: ControllerRef::Opponent,
+            },
+        );
+        // CR 113.6 + CR 113.6k: the source is the discarded card itself. By the time
+        // process_triggers scans the Discarded event, complete_discard_to_graveyard has
+        // already moved the card hand->graveyard (CR 701.9a), so the trigger must
+        // function from the graveyard it lands in (the same off-zone seam Necropotence-
+        // style self-discard triggers use). Exile keeps it live under a madness/RIP-class
+        // redirect (a redirected discard is still a discard).
+        def.trigger_zones = vec![Zone::Graveyard, Zone::Exile];
+        return Some((TriggerMode::Discarded, def));
+    }
+
     // Determine subject and find "discards"/"discard" verb using nom alt()
     fn parse_discard_subject(input: &str) -> OracleResult<'_, Option<ControllerRef>> {
         alt((
@@ -11927,7 +12178,7 @@ mod tests {
         DamageModification, DamageSource, DelayedTriggerCondition, DiscardSelfScope, Duration,
         Effect, EffectScope, FilterProp, ManaProduction, ManaSpendPermission, ObjectScope,
         PlayerFilter, PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
-        SharedQuality, TapStateChange, TargetFilter, TypeFilter, TypedFilter,
+        SharedQuality, TapStateChange, TargetFilter, TypeFilter, TypedFilter, ZoneRef,
     };
     use crate::types::counter::{CounterMatch, CounterType};
     use crate::types::game_state::WaitingFor;
@@ -11989,6 +12240,56 @@ mod tests {
             }
             other => panic!("expected Typed or Or filter, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_post_spell_modifier_cast_origin_from_nonhand() {
+        // CR 601.2a: "from anywhere other than your hand" → InAnyZone over the
+        // cast-capable zones except the hand.
+        let expected = crate::parser::oracle_target::cast_capable_zones_except(Zone::Hand);
+        let filter = parse_post_spell_modifier("from anywhere other than your hand")
+            .expect("expected a cast-origin filter");
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected Typed filter");
+        };
+        assert!(
+            tf.properties.contains(&FilterProp::InAnyZone {
+                zones: expected.clone()
+            }),
+            "expected InAnyZone({expected:?}), got {:?}",
+            tf.properties
+        );
+    }
+
+    #[test]
+    fn parse_post_spell_modifier_cast_origin_single_zone() {
+        // CR 601.2a: "from exile" / "from your graveyard" → InZone(single).
+        for (text, zone) in [
+            ("from exile", Zone::Exile),
+            ("from your graveyard", Zone::Graveyard),
+        ] {
+            let filter = parse_post_spell_modifier(text)
+                .unwrap_or_else(|| panic!("expected a filter for {text:?}"));
+            let TargetFilter::Typed(tf) = filter else {
+                panic!("expected Typed filter for {text:?}");
+            };
+            assert!(
+                tf.properties.contains(&FilterProp::InZone { zone }),
+                "expected InZone({zone:?}) for {text:?}, got {:?}",
+                tf.properties
+            );
+        }
+    }
+
+    #[test]
+    fn parse_post_spell_modifier_rejects_unsupported_origin() {
+        // CR 601.2a: only the printed cast-origin forms are recognized; an
+        // unmodeled exclusion ("from anywhere other than your graveyard") must
+        // return None so the first-spell parser reports UnsupportedQualifier.
+        assert_eq!(
+            parse_post_spell_modifier("from anywhere other than your graveyard"),
+            None
+        );
     }
 
     #[test]
@@ -12648,6 +12949,71 @@ mod tests {
         assert_eq!(
             def.condition,
             Some(TriggerCondition::ZoneChangeObjectIsTapped)
+        );
+    }
+
+    /// CR 608.2k: the "untap it"/"tap it" bare-object-pronoun anaphor binds by
+    /// the trigger SUBJECT, not to `ParentTarget` (which resolves against the
+    /// effect's empty target list on a primary, non-targeted trigger effect and
+    /// silently no-ops the untap). This is a parse-shape building-block test for
+    /// the whole class, exercised end-to-end by
+    /// `tests/integration/issue_2915_alexios.rs`:
+    ///   - typed/attached subject ("a permanent you control", "equipped
+    ///     creature") → `TriggeringSource` (the entering/attacking object),
+    ///     matching the sibling sacrifice/destroy/exile anaphor verbs;
+    ///   - self subject (the source named in the same instruction, Alexios's
+    ///     "gains control of ~, untaps it") → `SelfRef`.
+    #[test]
+    fn untap_it_anaphor_binds_to_trigger_subject_not_parent_target() {
+        fn find_untap_target(ability: &AbilityDefinition) -> &TargetFilter {
+            let mut node = Some(ability);
+            while let Some(current) = node {
+                if let Effect::SetTapState {
+                    target,
+                    state: TapStateChange::Untap,
+                    ..
+                } = current.effect.as_ref()
+                {
+                    return target;
+                }
+                node = current.sub_ability.as_deref();
+            }
+            panic!("expected an Untap SetTapState in the trigger chain");
+        }
+
+        // Typed subject: "it" is the entering permanent (the triggering object).
+        let amulet = parse_trigger_line(
+            "Whenever a permanent you control enters tapped, untap it.",
+            "Amulet of Vigor",
+        );
+        assert_eq!(
+            find_untap_target(amulet.execute.as_ref().expect("execute present")),
+            &TargetFilter::TriggeringSource,
+            "typed-subject 'untap it' must bind to the triggering object"
+        );
+
+        // Attached subject: "it" is the equipped (attacking) creature.
+        let genji = parse_trigger_line(
+            "Whenever equipped creature attacks, untap it.",
+            "Genji Glove",
+        );
+        assert_eq!(
+            find_untap_target(genji.execute.as_ref().expect("execute present")),
+            &TargetFilter::TriggeringSource,
+            "attached-subject 'untap it' must bind to the triggering object"
+        );
+
+        // Self subject: "it" is the source named earlier in the instruction.
+        let alexios = parse_trigger_line(
+            "At the beginning of each player's upkeep, that player gains control of \
+             Alexios, untaps it, and puts a +1/+1 counter on it. It gains haste until \
+             end of turn.",
+            "Alexios, Deimos of Kosmos",
+        );
+        assert_eq!(
+            find_untap_target(alexios.execute.as_ref().expect("execute present")),
+            &TargetFilter::SelfRef,
+            "self-subject 'untaps it' must bind to the named source"
         );
     }
 
@@ -16770,6 +17136,21 @@ mod tests {
     }
 
     #[test]
+    fn trigger_a_player_casts_spell_they_dont_own() {
+        let def = parse_trigger_line(
+            "Whenever a player casts a spell they don't own, that player creates a Treasure token.",
+            "Gonti, Night Minister",
+        );
+        assert_eq!(def.mode, TriggerMode::SpellCast);
+        assert_eq!(def.valid_target, Some(TargetFilter::TriggeringPlayer));
+        assert_owned_by_opponent(
+            def.valid_card
+                .as_ref()
+                .expect("spell they don't own must carry valid_card"),
+        );
+    }
+
+    #[test]
     fn trigger_you_cast_spell_you_dont_own() {
         let def = parse_trigger_line(
             "Whenever you cast a spell you don't own, put a +1/+1 counter on each creature you control.",
@@ -20493,6 +20874,20 @@ mod tests {
     }
 
     #[test]
+    fn trigger_ring_tempts_you_draws_card() {
+        let def = parse_trigger_line("Whenever the Ring tempts you, draw a card.", "Ring Watcher");
+        assert_eq!(def.mode, TriggerMode::RingTemptsYou);
+        assert!(
+            def.execute.is_some(),
+            "draw effect must lower onto the trigger execute slot"
+        );
+        assert!(matches!(
+            def.execute.as_ref().unwrap().effect.as_ref(),
+            Effect::Draw { .. }
+        ));
+    }
+
+    #[test]
     fn trigger_ring_tempts_you_when() {
         let def = parse_trigger_line(
             "When the Ring tempts you, return this card from your graveyard to your hand.",
@@ -21041,6 +21436,33 @@ mod tests {
                 TypedFilter::new(TypeFilter::Card).controller(ControllerRef::Opponent)
             ))
         );
+    }
+
+    /// CR 109.5 + CR 603.2: "When a spell or ability an opponent controls causes
+    /// you to discard this card, [effect]" (Guerrilla Tactics, Sand Golem) — a
+    /// self-discard trigger gated by the `EventSourceControlledBy { Opponent }`
+    /// constraint. Issue #3109-style. (issue67)
+    #[test]
+    fn trigger_opponent_causes_you_to_discard_this_card() {
+        let def = parse_trigger_line(
+            "When a spell or ability an opponent controls causes you to discard this card, this card deals 4 damage to any target.",
+            "Guerrilla Tactics",
+        );
+        assert_eq!(def.mode, TriggerMode::Discarded);
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+        assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+        assert_eq!(
+            def.constraint,
+            Some(
+                crate::types::ability::TriggerConstraint::EventSourceControlledBy {
+                    controller: ControllerRef::Opponent
+                }
+            )
+        );
+        // The discarded card has already moved hand->graveyard (or exile under a
+        // madness/RIP redirect) by the time the Discarded event is scanned, so the
+        // trigger must function off the battlefield to fire at all.
+        assert_eq!(def.trigger_zones, vec![Zone::Graveyard, Zone::Exile]);
     }
 
     /// CR 701.9 + CR 603.7c + CR 406.1: Necropotence's on-discard trigger
@@ -23240,6 +23662,32 @@ mod tests {
     }
 
     #[test]
+    fn trigger_oversold_cemetery_upkeep_creature_graveyard_gate() {
+        let def = parse_trigger_line(
+            "At the beginning of your upkeep, if you have four or more creature cards in your graveyard, you may return target creature card from your graveyard to your hand.",
+            "Oversold Cemetery",
+        );
+        assert_eq!(def.mode, TriggerMode::Phase);
+        assert_eq!(def.phase, Some(Phase::Upkeep));
+        assert_eq!(
+            def.condition,
+            Some(TriggerCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Creature],
+                        filter: None,
+                        scope: CountScope::Controller,
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 4 },
+            })
+        );
+        assert!(def.optional);
+    }
+
+    #[test]
     fn trigger_put_into_your_graveyard_from_library() {
         let def = parse_trigger_line(
             "Whenever a creature card is put into your graveyard from your library, draw a card.",
@@ -24194,6 +24642,34 @@ mod tests {
         assert_eq!(
             def.condition,
             Some(TriggerCondition::DealtDamageBySourceThisTurn)
+        );
+    }
+
+    #[test]
+    fn trigger_another_creature_damaged_by_spider_you_controlled_dies() {
+        // Issue #1206 — Shelob, Child of Ungoliant
+        let def = parse_trigger_line(
+            "Whenever another creature dealt damage this turn by a Spider you controlled dies, create a token that's a copy of that creature, except it's a Food artifact with \"{2}, {T}, Sacrifice ~: You gain 3 life,\" and it loses all other card types.",
+            "Shelob, Child of Ungoliant",
+        );
+        assert_eq!(def.mode, TriggerMode::ChangesZone);
+        assert_eq!(def.origin, Some(Zone::Battlefield));
+        assert_eq!(def.destination, Some(Zone::Graveyard));
+        assert_eq!(
+            def.valid_card,
+            Some(TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::Another])
+            ))
+        );
+        assert_eq!(
+            def.condition,
+            Some(TriggerCondition::DealtDamageThisTurnBySource {
+                source: TargetFilter::Typed(
+                    TypedFilter::default()
+                        .subtype("Spider".to_string())
+                        .controller(ControllerRef::You)
+                )
+            })
         );
     }
 
@@ -28211,6 +28687,218 @@ mod tests {
             ),
             other => panic!("expected Discard, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Taii Wakeen, Perfect Shot — "deals … damage to a creature equal to that
+    // creature's toughness" damage==recipient-P/T gate, and the anti-over-match
+    // regression that distinguishes it from "deals damage equal to its power to
+    // X" (amount = source's power, NOT a recipient-P/T gate).
+    // -----------------------------------------------------------------------
+
+    /// CR 120.1 + CR 208.1 + CR 603.4: the recipient-P/T gate fires only on a
+    /// genuine object recipient parsed on the success path, producing
+    /// `QuantityComparison { EventContextAmount EQ Toughness{EventTarget} }`.
+    #[test]
+    fn taii_damage_equals_recipient_toughness_gate() {
+        let def = parse_trigger_line(
+            "Whenever a source you control deals noncombat damage to a creature \
+             equal to that creature's toughness, draw a card.",
+            "Taii Wakeen, Perfect Shot",
+        );
+        assert_eq!(def.mode, TriggerMode::DamageDone);
+        assert_eq!(def.damage_kind, DamageKindFilter::NoncombatOnly);
+        assert_eq!(
+            def.condition,
+            Some(TriggerCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                },
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Ref {
+                    qty: QuantityRef::Toughness {
+                        scope: ObjectScope::EventTarget,
+                    },
+                },
+            }),
+            "the damage==toughness intervening-if must compare the dealt amount \
+             against the damaged creature's toughness (EventTarget)"
+        );
+    }
+
+    /// The "power" variant resolves to `Power{EventTarget}`.
+    #[test]
+    fn taii_variant_damage_equals_recipient_power() {
+        let def = parse_trigger_line(
+            "Whenever a source you control deals noncombat damage to a creature \
+             equal to that creature's power, draw a card.",
+            "Taii Variant",
+        );
+        assert_eq!(
+            def.condition,
+            Some(TriggerCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                },
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Ref {
+                    qty: QuantityRef::Power {
+                        scope: ObjectScope::EventTarget,
+                    },
+                },
+            })
+        );
+    }
+
+    /// A permanent recipient parses on the object axis and still anchors the gate.
+    #[test]
+    fn taii_variant_permanent_recipient() {
+        let def = parse_trigger_line(
+            "Whenever a source you control deals noncombat damage to a permanent \
+             equal to that permanent's toughness, draw a card.",
+            "Taii Permanent Variant",
+        );
+        assert_eq!(def.mode, TriggerMode::DamageDone);
+        assert_eq!(
+            def.valid_target,
+            Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Permanent)))
+        );
+        assert_eq!(
+            def.condition,
+            Some(TriggerCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                },
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Ref {
+                    qty: QuantityRef::Toughness {
+                        scope: ObjectScope::EventTarget,
+                    },
+                },
+            })
+        );
+    }
+
+    /// Anti-over-match regression (Bionic Blow's clause). "it deals damage equal
+    /// to its power to up to one other target creature" defines the damage
+    /// AMOUNT as the SOURCE's power (CR 120.3) — the "equal to" precedes the
+    /// recipient, so no object recipient parses on the success path and the
+    /// `EventTarget` gate must NOT be set. This locks the over-match fix.
+    #[test]
+    fn deals_damage_equal_to_its_power_does_not_set_event_target_gate() {
+        // The subject-led ("it deals …") and source-led ("a source you control
+        // deals …") forms both route through the recipient/gate logic; assert
+        // neither produces an EventTarget condition for the "equal to its power
+        // to X" shape.
+        for line in [
+            "Whenever a creature you control deals damage equal to its power to \
+             another target creature, draw a card.",
+            "When a source you control deals damage equal to its power to each \
+             other creature, draw a card.",
+        ] {
+            let def = parse_trigger_line(line, "Over-Match Probe");
+            let sets_event_target = matches!(
+                &def.condition,
+                Some(TriggerCondition::QuantityComparison { rhs, .. })
+                    if matches!(
+                        rhs,
+                        QuantityExpr::Ref {
+                            qty: QuantityRef::Toughness { scope: ObjectScope::EventTarget }
+                                | QuantityRef::Power { scope: ObjectScope::EventTarget },
+                        }
+                    )
+            );
+            assert!(
+                !sets_event_target,
+                "'deals damage equal to its power to X' must NOT set an \
+                 EventTarget recipient-P/T gate (amount is the source's power, \
+                 not a damage==recipient-P/T condition): {line}"
+            );
+        }
+    }
+
+    /// End-to-end: the full card parses into both abilities (the damage==
+    /// toughness trigger and the {X}{T} damage-boost activated ability) with no
+    /// `Effect::Unimplemented` and no swallowed clause.
+    #[test]
+    fn taii_wakeen_full_card_parses_both_abilities() {
+        let parsed = parse_oracle_text(
+            "Whenever a source you control deals noncombat damage to a creature \
+             equal to that creature's toughness, draw a card.\n\
+             {X}, {T}: If a source you control would deal noncombat damage to a \
+             permanent or player this turn, it deals that much damage plus X instead.",
+            "Taii Wakeen, Perfect Shot",
+            &[],
+            &["Legendary".to_string(), "Creature".to_string()],
+            &["Human".to_string(), "Mercenary".to_string()],
+        );
+
+        // No clause may be swallowed into an Unimplemented effect.
+        let has_unimplemented = parsed
+            .abilities
+            .iter()
+            .any(|a| matches!(a.effect.as_ref(), Effect::Unimplemented { .. }))
+            || parsed.triggers.iter().any(|t| {
+                t.execute
+                    .as_ref()
+                    .is_some_and(|e| matches!(e.effect.as_ref(), Effect::Unimplemented { .. }))
+            });
+        assert!(
+            !has_unimplemented,
+            "Taii must parse with no Unimplemented effect: {parsed:#?}"
+        );
+
+        // Ability 1: the damage==toughness draw trigger.
+        assert_eq!(parsed.triggers.len(), 1, "exactly one trigger (ability 1)");
+        let trigger = &parsed.triggers[0];
+        assert_eq!(trigger.mode, TriggerMode::DamageDone);
+        assert_eq!(trigger.damage_kind, DamageKindFilter::NoncombatOnly);
+        assert_eq!(
+            trigger.condition,
+            Some(TriggerCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                },
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Ref {
+                    qty: QuantityRef::Toughness {
+                        scope: ObjectScope::EventTarget,
+                    },
+                },
+            })
+        );
+        let exec = trigger.execute.as_deref().expect("trigger execute body");
+        assert!(
+            matches!(exec.effect.as_ref(), Effect::Draw { .. }),
+            "ability 1 draws a card, got {:?}",
+            exec.effect
+        );
+
+        // Ability 2: the {X}{T} damage-boost activated ability installs an
+        // AddTargetReplacement with the "plus X" placeholder, NoncombatOnly,
+        // end-of-turn expiry.
+        assert_eq!(parsed.abilities.len(), 1, "exactly one activated ability");
+        let activated = &parsed.abilities[0];
+        let Effect::AddTargetReplacement { replacement, .. } = activated.effect.as_ref() else {
+            panic!(
+                "ability 2 must be AddTargetReplacement, got {:?}",
+                activated.effect
+            );
+        };
+        assert_eq!(
+            replacement.damage_modification,
+            Some(DamageModification::Plus { value: 0 }),
+            "the 'plus X' placeholder is frozen at activation, not parse time"
+        );
+        assert_eq!(
+            replacement.combat_scope,
+            Some(crate::types::ability::CombatDamageScope::NoncombatOnly)
+        );
+        assert_eq!(
+            replacement.expiry,
+            Some(crate::types::ability::RestrictionExpiry::EndOfTurn),
+            "the boost lasts until end of turn"
+        );
     }
 }
 

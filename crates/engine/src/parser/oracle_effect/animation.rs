@@ -17,6 +17,7 @@ use super::token::{
 };
 use crate::parser::oracle_ir::ast::*;
 use crate::parser::oracle_ir::context::ParseContext;
+use crate::parser::oracle_nom::bridge::nom_on_lower;
 use crate::parser::oracle_quantity;
 use crate::types::ability::{PtValue, QuantityExpr, QuantityRef};
 use crate::types::card_type::Supertype;
@@ -57,6 +58,10 @@ pub(crate) fn parse_animation_spec(text: &str, _ctx: &mut ParseContext) -> Optio
     } else if let Some(stripped) = rest.strip_prefix("an ") {
         rest = stripped;
     }
+
+    let (leading_supertypes, after_supertypes) = strip_animation_supertypes(rest);
+    spec.supertypes = leading_supertypes;
+    rest = after_supertypes;
 
     // CR 107.3c: "X/X where X is ~'s power" — X is bound to a dynamic quantity
     // (source's power), NOT the cost paid. This pattern must be detected BEFORE
@@ -125,14 +130,18 @@ pub(crate) fn parse_animation_spec(text: &str, _ctx: &mut ParseContext) -> Optio
         rest = after_colors;
     }
 
-    let (supertypes, types) = parse_animation_type_parts(
+    let (parsed_supertypes, types) = parse_animation_type_parts(
         rest,
         spec.power.is_some()
             || spec.toughness.is_some()
             || spec.dynamic_power.is_some()
             || spec.dynamic_toughness.is_some(),
     );
-    spec.supertypes = supertypes;
+    for supertype in parsed_supertypes {
+        if !spec.supertypes.contains(&supertype) {
+            spec.supertypes.push(supertype);
+        }
+    }
     spec.types = types;
 
     if spec.power.is_none()
@@ -148,6 +157,31 @@ pub(crate) fn parse_animation_spec(text: &str, _ctx: &mut ParseContext) -> Optio
         None
     } else {
         Some(spec)
+    }
+}
+
+/// CR 205.4a: Peel leading supertype words before P/T/color/type parsing so
+/// "becomes a legendary 4/4 …" (Sarkhan, the Dragonspeaker) does not stall at
+/// `legendary` and fall through to keyword-only partial parses.
+fn strip_animation_supertypes(mut text: &str) -> (Vec<Supertype>, &str) {
+    let mut supertypes = Vec::new();
+    loop {
+        let trimmed = text.trim_start();
+        let trimmed_lower = trimmed.to_lowercase();
+        let Some((supertype, stripped)) = nom_on_lower(trimmed, &trimmed_lower, |i| {
+            alt((
+                value(Supertype::Legendary, tag("legendary ")),
+                value(Supertype::Snow, tag("snow ")),
+                value(Supertype::Basic, tag("basic ")),
+            ))
+            .parse(i)
+        }) else {
+            return (supertypes, trimmed);
+        };
+        if !supertypes.contains(&supertype) {
+            supertypes.push(supertype);
+        }
+        text = stripped;
     }
 }
 

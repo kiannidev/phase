@@ -991,7 +991,7 @@ fn parse_attached_object_is_filter_condition(input: &str) -> OracleResult<'_, St
 /// caller so negation (`"~ isn't attacking"`) composes cleanly.
 ///
 /// Subjects: "~", "this creature", "this permanent", "this land", "this artifact",
-/// "this enchantment", "equipped creature", "enchanted creature", "it".
+/// "this enchantment", "equipped creature", "enchanted creature".
 ///
 /// DEFER: the "equipped creature " / "enchanted creature " prefixes collapse to
 /// `Source*` checks for the HOST creature across the tapped/monstrous/saddled/
@@ -1011,9 +1011,6 @@ fn parse_source_subject(input: &str) -> OracleResult<'_, &str> {
         tag("this enchantment "),
         tag("equipped creature "),
         tag("enchanted creature "),
-        // CR 201.5: Pronouns in self-referential granted abilities refer to
-        // the object that has the ability.
-        tag("it "),
     ))
     .parse(input)
 }
@@ -1515,7 +1512,15 @@ fn parse_possessive_property(input: &str) -> OracleResult<'_, QuantityRef> {
 /// canonical source phrasing (`~`, `this creature`, `this permanent`, …,
 /// `enchanted creature`, `equipped creature`) composes identically.
 fn parse_subject_has_property(input: &str) -> OracleResult<'_, QuantityRef> {
-    let (rest, _) = parse_source_subject(input)?;
+    let (rest, _) = alt((
+        parse_source_subject,
+        // CR 201.5: Pronouns in self-referential granted abilities refer to
+        // the object that has the ability. Keep this scoped to the property
+        // grammar so it does not steal recipient-bound "it has a counter"
+        // duration clauses from `parse_recipient_has_counters`.
+        tag("it "),
+    ))
+    .parse(input)?;
     let (rest, _) = tag("has ").parse(rest)?;
     alt((
         value(

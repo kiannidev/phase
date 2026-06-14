@@ -6827,7 +6827,7 @@ mod tests {
                 .push(CoreType::Creature);
         }
 
-        let mut trigger = make_trigger(TriggerMode::DamageDoneOnce);
+        let mut trigger = make_trigger(TriggerMode::DamageDone);
         trigger.valid_source = Some(TargetFilter::Typed(
             TypedFilter::creature().controller(ControllerRef::You),
         ));

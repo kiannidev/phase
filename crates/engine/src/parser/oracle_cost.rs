@@ -1145,14 +1145,26 @@ fn try_parse_return_to_hand_cost(rest_lower: &str) -> Option<AbilityCost> {
         filter
     } else {
         let (filter, _) = parse_type_phrase(filter_text);
-        if matches!(filter, TargetFilter::Any) {
+        filter
+    };
+    let filter = match filter {
+        TargetFilter::Any => {
             // CR 201.5: A cost using the source card's own name, such as
             // "Return Recurring Nightmare to its owner's hand", refers to that
             // source object.
             TargetFilter::SelfRef
-        } else {
-            filter
         }
+        TargetFilter::Typed(TypedFilter {
+            type_filters,
+            controller: None,
+            properties,
+        }) if type_filters.is_empty() && properties.is_empty() => {
+            // CR 201.5: A cost using the source card's own name, such as
+            // "Return Recurring Nightmare to its owner's hand", refers to that
+            // source object.
+            TargetFilter::SelfRef
+        }
+        filter => filter,
     };
     Some(AbilityCost::ReturnToHand {
         count: 1,

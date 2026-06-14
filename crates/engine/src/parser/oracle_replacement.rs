@@ -4626,25 +4626,40 @@ fn parse_token_replacement_shape(lower: &str) -> Option<TokenReplacementShape> {
     let descriptor = lower
         .get(descriptor_start..descriptor_start + descriptor_len)?
         .trim();
-    // CR 614.1a: Peregrin Took / Xorn-class descriptors often prefix the token
-    // tail with "an additional " ("those tokens plus an additional Food token").
-    let stripped_additional = descriptor
-        .strip_prefix("an additional ")
-        .or_else(|| descriptor.strip_prefix("a additional "))
-        .or_else(|| descriptor.strip_prefix("additional "));
-    let descriptor = stripped_additional.unwrap_or(descriptor);
-    let descriptor_owned;
-    let descriptor_for_parse: &str = if stripped_additional.is_some() {
-        descriptor_owned = format!("a {descriptor}");
-        &descriptor_owned
-    } else {
-        descriptor
-    };
-    let token = super::oracle_effect::parse_token_description(descriptor_for_parse)?;
+    let descriptor = normalize_additional_token_descriptor(descriptor)?;
+    let token = super::oracle_effect::parse_token_description(&descriptor)?;
     let spec = token_description_to_spec(&token)?;
     Some(TokenReplacementShape::PlusSpec {
         spec: Box::new(spec),
     })
+}
+
+/// CR 614.1a + CR 111.1: Normalize the optional "additional" modifier on
+/// token descriptors before delegating to `parse_token_description`, whose token
+/// grammar expects an article or numeric count prefix.
+fn normalize_additional_token_descriptor(descriptor: &str) -> Option<String> {
+    let (rest, stripped_additional) = opt(value(
+        (),
+        preceded(
+            opt(alt((tag::<_, _, OracleError<'_>>("a "), tag("an ")))),
+            tag("additional "),
+        ),
+    ))
+    .parse(descriptor)
+    .ok()?;
+    let descriptor = rest.trim();
+    if descriptor.is_empty() {
+        return None;
+    }
+    if stripped_additional.is_some() {
+        let (_, article) = peek(opt(alt((tag::<_, _, OracleError<'_>>("a "), tag("an ")))))
+            .parse(descriptor)
+            .ok()?;
+        if article.is_none() {
+            return Some(format!("a {descriptor}"));
+        }
+    }
+    Some(descriptor.to_string())
 }
 
 /// CR 614.1a + CR 111.1: Parse Xorn-class subtype-gated additional-token

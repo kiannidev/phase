@@ -1139,13 +1139,6 @@ pub(super) fn match_damage_done(
         ..
     } = event
     {
-        // Self-referential "this creature deals combat damage" triggers already
-        // fire on per-source `DamageDealt` events emitted during the combat
-        // damage step. Only equipment-style observer triggers (`AttachedTo`)
-        // listen on the aggregate `CombatDamageDealtToPlayer` event.
-        if !matches!(trigger.valid_source, Some(TargetFilter::AttachedTo)) {
-            return false;
-        }
         !matching_combat_damage_to_player_sources(
             trigger,
             source_id,
@@ -1170,7 +1163,7 @@ pub(super) fn matching_damage_done_events(
     source_id: ObjectId,
     state: &GameState,
 ) -> Vec<GameEvent> {
-    if trigger.mode != TriggerMode::DamageDone {
+    if trigger.mode != TriggerMode::DamageDone || trigger.valid_source.is_none() {
         return Vec::new();
     }
 
@@ -6829,6 +6822,38 @@ mod tests {
             "aggregate combat damage matching is reserved for AttachedTo observers"
         );
         assert!(matching_damage_done_events(&event, &trigger, watcher, &state).is_empty());
+    }
+
+    #[test]
+    fn matching_damage_done_events_does_not_expand_self_source_triggers() {
+        let mut state = setup();
+        let attacker = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Tempest Hawk".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&attacker)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+
+        let mut trigger = make_trigger(TriggerMode::DamageDone);
+        trigger.valid_target = Some(TargetFilter::Player);
+        trigger.damage_kind = DamageKindFilter::CombatOnly;
+
+        let event = GameEvent::CombatDamageDealtToPlayer {
+            player_id: PlayerId(1),
+            source_amounts: vec![(attacker, 2)],
+            total_damage: 2,
+        };
+
+        assert!(match_damage_done(&event, &trigger, attacker, &state));
+        assert!(matching_damage_done_events(&event, &trigger, attacker, &state).is_empty());
     }
 
     #[test]

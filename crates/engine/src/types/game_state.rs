@@ -970,6 +970,11 @@ pub struct PendingChangeZoneIteration {
     /// carry-through pattern on this same struct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub face_down_profile: Option<crate::types::ability::FaceDownProfile>,
+    /// CR 401.4 + CR 701.24a: Library placement override carried across a
+    /// replacement-ordering pause so Endurance-style "on the bottom of their
+    /// library" still suppresses auto-shuffle on resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_placement: Option<crate::types::ability::LibraryPosition>,
     pub effect_kind: crate::types::ability::EffectKind,
 }
 
@@ -1024,6 +1029,22 @@ pub struct PendingChooseOneOf {
     #[serde(default)]
     pub context: super::ability::SpellContext,
     pub remaining_players: Vec<PlayerId>,
+}
+
+/// CR 701.38d + CR 608.2c: Stores the remaining voters whose per-ballot
+/// interactive body has not yet been resolved. Created when the first
+/// ballot's ChooseFromZone parks WaitingFor::ChooseFromZoneChoice; drained
+/// after each choice resolves until all voters are processed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingVoteBallotIteration {
+    /// The ability template to instantiate for each remaining voter.
+    pub ability_template: Box<AbilityDefinition>,
+    /// Voters whose ballots have not yet been processed (in APNAP order).
+    pub remaining_voters: Vec<PlayerId>,
+    /// The source object that initiated the vote.
+    pub source_id: ObjectId,
+    /// The controller of the vote spell/ability.
+    pub controller: PlayerId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6001,6 +6022,11 @@ pub struct GameState {
     /// selected branch has finished resolving, including any nested choices.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_choose_one_of: Option<PendingChooseOneOf>,
+    /// CR 701.38d + CR 608.2c: Per-ballot vote iteration paused by an
+    /// interactive choice. Drained after `pending_change_zone_iteration` and
+    /// before `pending_repeat_iteration`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_vote_ballot_iteration: Option<PendingVoteBallotIteration>,
 
     /// CR 122.5: Pending atomic counter moves selected during a resolution-time
     /// distribution prompt. Drained before normal pending continuations so
@@ -6857,6 +6883,7 @@ impl GameState {
             pending_coin_flip: None,
             pending_repeat_until: None,
             pending_choose_one_of: None,
+            pending_vote_ballot_iteration: None,
             pending_counter_moves: None,
             pending_batch_deliveries: None,
             pending_counter_additions: None,
@@ -7297,6 +7324,7 @@ impl PartialEq for GameState {
             && self.pending_coin_flip == other.pending_coin_flip
             && self.pending_repeat_until == other.pending_repeat_until
             && self.pending_choose_one_of == other.pending_choose_one_of
+            && self.pending_vote_ballot_iteration == other.pending_vote_ballot_iteration
             && self.pending_counter_moves == other.pending_counter_moves
             && self.pending_batch_deliveries == other.pending_batch_deliveries
             && self.pending_counter_additions == other.pending_counter_additions
@@ -8197,6 +8225,7 @@ mod tests {
                 subtypes: vec!["Forest".to_string()],
                 ward: None,
             }),
+            library_placement: None,
             effect_kind: crate::types::ability::EffectKind::ChangeZone,
         };
         let json = serde_json::to_string(&original).expect("serialize");

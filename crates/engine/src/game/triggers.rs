@@ -629,6 +629,13 @@ fn collect_matching_triggers(
                 .into_iter()
                 .map(|trigger_event| vec![trigger_event])
                 .collect()
+            } else if super::trigger_matchers::listens_on_aggregate_combat_damage_done(trig_def)
+                && matches!(event, GameEvent::CombatDamageDealtToPlayer { .. })
+            {
+                super::trigger_matchers::matching_damage_done_events(event, trig_def, obj_id, state)
+                    .into_iter()
+                    .map(|trigger_event| vec![trigger_event])
+                    .collect()
             } else {
                 vec![vec![event.clone()]]
             };
@@ -1806,11 +1813,24 @@ fn collect_pending_triggers(
                 }
             }
 
+            // CR 611.2f + CR 702.85a: count Cascade from the cast-time keyword
+            // snapshot (`obj.cast_spell_keywords`), NOT a fresh
+            // `effective_spell_keywords` query. The latter re-evaluates the
+            // grant's `SpellsCastThisTurn == 0` gate AFTER the spell was recorded,
+            // which would drop a first-qualifying-spell-each-turn Cascade grant on
+            // its own spell (Maelstrom Nexus / Wild-Magic Sorcerer / Tardis Bay).
+            // Only `SpellsCastThisTurn`-gated `CastWithKeyword` grants require this
+            // snapshot; the Storm/Ripple/Casualty/Conspire/Replicate seams stay on
+            // the live query because their gates are point-stable. For printed
+            // Cascade and unconditional grants the snapshot is behavior-preserving:
+            // printed Cascade is in `obj.keywords` (captured by the snapshot) and
+            // unconditional grants evaluate identically pre- and post-record.
             let (instance_count, controller) = state
                 .objects
                 .get(cast_obj_id)
                 .map(|obj| {
-                    let n = super::casting::effective_spell_keywords(state, *caster, *cast_obj_id)
+                    let n = obj
+                        .cast_spell_keywords
                         .iter()
                         .filter(|k| matches!(k, Keyword::Cascade))
                         .count();
@@ -2152,6 +2172,60 @@ fn collect_pending_triggers(
                         die_result: None,
                     }));
                 }
+            }
+
+            // CR 702.144a: Demonstrate's copy trigger is synthesized onto printed
+            // Demonstrate spells by `synthesize_demonstrate`. Dynamically granted
+            // Demonstrate (StaticMode::CastWithKeyword — The Twelfth Doctor) has no
+            // face-level trigger and no additional cost, so mirror the dynamic
+            // copy-keyword seams here (minus the cost gate) and reuse the canonical
+            // Demonstrate copy ability definition. Gate on the cast-time keyword
+            // snapshot (CR 611.2f) rather than a fresh `effective_spell_keywords`
+            // query, so a first-qualifying-spell grant is not dropped by the
+            // post-record `SpellsCastThisTurn == 0` gate. Count only the granted
+            // delta: printed Demonstrate instances are handled by the face trigger,
+            // while a printed-Demonstrate spell with an extra dynamic Demonstrate
+            // still gets the extra CR 702.144a trigger.
+            let dynamically_granted_demonstrate_instances = state
+                .objects
+                .get(cast_obj_id)
+                .map(|obj| {
+                    let printed_count = obj
+                        .keywords
+                        .iter()
+                        .filter(|k| matches!(k, Keyword::Demonstrate))
+                        .count();
+                    let cast_count = obj
+                        .cast_spell_keywords
+                        .iter()
+                        .filter(|k| matches!(k, Keyword::Demonstrate))
+                        .count();
+                    (cast_count.saturating_sub(printed_count), obj.controller)
+                })
+                .unwrap_or((0, PlayerId(0)));
+            for _ in 0..dynamically_granted_demonstrate_instances.0 {
+                let demonstrate_ability = build_resolved_from_def(
+                    &crate::database::synthesis::demonstrate_copy_ability_definition(),
+                    *cast_obj_id,
+                    dynamically_granted_demonstrate_instances.1,
+                );
+                let timestamp = state.next_timestamp() as u32;
+                pending.push(PendingTriggerContext::single(PendingTrigger {
+                    source_id: *cast_obj_id,
+                    controller: dynamically_granted_demonstrate_instances.1,
+                    condition: None,
+                    ability: demonstrate_ability,
+                    timestamp,
+                    target_constraints: Vec::new(),
+                    distribute: None,
+                    trigger_event: Some(event.clone()),
+                    modal: None,
+                    mode_abilities: vec![],
+                    description: Some("Demonstrate".to_string()),
+                    may_trigger_origin: None,
+                    subject_match_count: None,
+                    die_result: None,
+                }));
             }
         }
 
@@ -4647,6 +4721,27 @@ pub(crate) fn check_trigger_condition(
                 _ => false,
             }
         }
+        // CR 700.4 + CR 120.1 + CR 608.2i: "another creature dealt damage this turn
+        // by [source filter] dies" — match the dying creature against damage records
+        // whose source satisfies the filter (Spider you controlled, etc.).
+        TriggerCondition::DealtDamageThisTurnBySource { source } => {
+            let dying_creature = trigger_event.and_then(|e| match e {
+                GameEvent::CreatureDestroyed { object_id } => Some(*object_id),
+                GameEvent::ZoneChanged { object_id, .. } => Some(*object_id),
+                _ => None,
+            });
+            let Some(subj) = dying_creature else {
+                return false;
+            };
+            let ctx = FilterContext::from_source_with_controller(
+                source_id.unwrap_or(ObjectId(0)),
+                controller,
+            );
+            state.damage_dealt_this_turn.iter().any(|record| {
+                record.target == TargetRef::Object(subj)
+                    && matches_target_filter_on_damage_record_source(state, record, source, &ctx)
+            })
+        }
         // CR 400.7 + CR 603.10: "if it was a [type]" — check LKI for the source's
         // core types at the time it left the battlefield.
         TriggerCondition::WasType { card_type } => source_id
@@ -4799,6 +4894,11 @@ pub(crate) fn check_trigger_condition(
             | PlayerFilter::VotedFor { .. }
             | PlayerFilter::OwnersOfCardsExiledBySource
             | PlayerFilter::ParentObjectTargetController
+            // CR 108.3 + CR 608.2c: parent-target-owner and resolution-scoped
+            // chosen-player anchors are effect-resolution references, not
+            // turn-binding predicates — no "whose turn" semantic. Fail-closed.
+            | PlayerFilter::ParentObjectTargetOwner
+            | PlayerFilter::ChosenPlayer { .. }
             // CR 102.1: a controls-a-permanent population predicate is
             // set-valued — it has no single-player "whose turn" semantic.
             // Fail-closed alongside the other set-valued variants.
@@ -5588,8 +5688,8 @@ pub mod tests {
     use crate::types::card_type::CoreType;
     use crate::types::events::{GameEvent, ManaTapState};
     use crate::types::game_state::{
-        DelayedTrigger, DistributionUnit, GameState, SpellCastRecord, StackEntry, StackEntryKind,
-        WaitingFor, ZoneChangeRecord,
+        DamageRecord, DelayedTrigger, DistributionUnit, GameState, SpellCastRecord, StackEntry,
+        StackEntryKind, WaitingFor, ZoneChangeRecord,
     };
     use crate::types::identifiers::{CardId, ObjectId, TrackedSetId};
     use crate::types::keywords::{Keyword, KeywordKind};
@@ -10400,6 +10500,143 @@ pub mod tests {
     }
 
     #[test]
+    fn dealt_damage_this_turn_by_source_trigger_condition() {
+        // Issue #1206 — Shelob's Spider damage gate on another creature's death.
+        let mut state = setup();
+        let shelob = ObjectId(10);
+        let spider = ObjectId(11);
+        let victim = ObjectId(20);
+
+        let mut spider_obj = GameObject::new(
+            spider,
+            CardId(1),
+            PlayerId(0),
+            "Spider".to_string(),
+            Zone::Battlefield,
+        );
+        spider_obj.controller = PlayerId(0);
+        spider_obj.card_types.subtypes.push("Spider".to_string());
+        state.objects.insert(spider, spider_obj);
+
+        state.damage_dealt_this_turn.push_back(DamageRecord {
+            source_id: spider,
+            source_controller: PlayerId(0),
+            target: TargetRef::Object(victim),
+            target_controller: PlayerId(0),
+            amount: 2,
+            is_combat: false,
+            source_controller_snapshot: PlayerId(0),
+            source_owner: PlayerId(0),
+            source_subtypes: vec!["Spider".to_string()],
+            ..Default::default()
+        });
+
+        let condition = TriggerCondition::DealtDamageThisTurnBySource {
+            source: TargetFilter::Typed(
+                TypedFilter::default()
+                    .subtype("Spider".to_string())
+                    .controller(ControllerRef::You),
+            ),
+        };
+        let event = GameEvent::CreatureDestroyed { object_id: victim };
+
+        assert!(check_trigger_condition(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(shelob),
+            Some(&event),
+        ));
+
+        let wrong_victim = GameEvent::CreatureDestroyed {
+            object_id: ObjectId(99),
+        };
+        assert!(!check_trigger_condition(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(shelob),
+            Some(&wrong_victim),
+        ));
+    }
+
+    #[test]
+    fn shelob_spider_damage_death_trigger_end_to_end() {
+        use crate::game::sba;
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::parser::oracle_trigger::parse_trigger_line;
+        use crate::types::game_state::TriggerIndex;
+        use crate::types::triggers::TriggerMode;
+
+        const SHELOB_DEATH_TRIGGER: &str = "Whenever another creature dealt damage this turn by a Spider you controlled dies, create a token that's a copy of that creature, except it's a Food artifact with \"{2}, {T}, Sacrifice ~: You gain 3 life,\" and it loses all other card types.";
+
+        let mut scenario = GameScenario::new();
+        let shelob_id = scenario
+            .add_creature(P0, "Shelob, Child of Ungoliant", 4, 4)
+            .id();
+        let spider_id = scenario.add_creature(P0, "Acid Web Spider", 3, 3).id();
+        let victim_id = scenario.add_creature(P0, "Grizzly Bears", 2, 2).id();
+
+        let mut runner = scenario.build();
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&spider_id)
+            .unwrap()
+            .card_types
+            .subtypes
+            .push("Spider".to_string());
+
+        let death_trigger = parse_trigger_line(SHELOB_DEATH_TRIGGER, "Shelob, Child of Ungoliant");
+        assert_eq!(death_trigger.mode, TriggerMode::ChangesZone);
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&shelob_id)
+            .unwrap()
+            .trigger_definitions
+            .push(death_trigger);
+
+        TriggerIndex::rebuild_from_battlefield(runner.state_mut());
+
+        runner
+            .state_mut()
+            .damage_dealt_this_turn
+            .push_back(DamageRecord {
+                source_id: spider_id,
+                source_controller: P0,
+                target: TargetRef::Object(victim_id),
+                target_controller: P0,
+                amount: 2,
+                is_combat: false,
+                source_controller_snapshot: P0,
+                source_owner: P0,
+                source_subtypes: vec!["Spider".to_string()],
+                ..Default::default()
+            });
+
+        let mut death_events = Vec::new();
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&victim_id)
+            .unwrap()
+            .damage_marked = 99;
+        sba::check_state_based_actions(runner.state_mut(), &mut death_events);
+
+        let pending = collect_pending_triggers(runner.state_mut(), &death_events);
+        assert!(
+            !pending.is_empty(),
+            "Shelob's spider-damage death trigger must collect pending entries"
+        );
+        process_triggers(runner.state_mut(), &death_events);
+        assert!(
+            !runner.state().stack.is_empty(),
+            "Shelob trigger must reach the stack"
+        );
+    }
+
+    #[test]
     fn test_no_monarch_trigger_condition() {
         // CR 725.1: NoMonarch is true only when no player holds the monarch.
         let mut state = setup();
@@ -12068,6 +12305,7 @@ pub mod tests {
             &[],   // effect_enter_with_counters
             None,  // face_down_profile
             false, // track_exiled_by_source
+            None,  // library_placement
             &mut events,
         );
 
@@ -14387,6 +14625,11 @@ pub mod tests {
             let obj = state.objects.get_mut(&spell).unwrap();
             obj.card_types.core_types.push(CoreType::Sorcery);
             obj.cast_from_zone = Some(Zone::Hand);
+            // CR 611.2f: the Cascade seam reads the cast-time keyword snapshot
+            // (`cast_spell_keywords`) stamped by `finalize_cast`. This test bypasses
+            // finalize and pushes a synthetic SpellCast, so set the snapshot to the
+            // keyword the static would have granted at cast time.
+            obj.cast_spell_keywords.push(Keyword::Cascade);
         }
 
         process_triggers(
@@ -14427,6 +14670,11 @@ pub mod tests {
             obj.card_types.core_types.push(CoreType::Sorcery);
             obj.keywords.push(Keyword::Cascade);
             obj.cast_from_zone = Some(Zone::Hand);
+            // CR 611.2f: the Cascade seam reads the cast-time keyword snapshot.
+            // For a printed-Cascade spell `finalize_cast` snapshots the printed
+            // keyword (`effective_spell_keyword_instances` includes `obj.keywords`);
+            // mirror that here since this test bypasses finalize.
+            obj.cast_spell_keywords.push(Keyword::Cascade);
         }
 
         process_triggers(
@@ -14486,6 +14734,9 @@ pub mod tests {
             obj.card_types.core_types.push(CoreType::Creature);
             obj.card_types.subtypes.push("Sliver".into());
             obj.cast_from_zone = Some(Zone::Hand);
+            // CR 611.2f: the Cascade seam reads the cast-time keyword snapshot;
+            // mirror the grant the First Sliver static would have stamped at cast.
+            obj.cast_spell_keywords.push(Keyword::Cascade);
         }
 
         process_triggers(
@@ -14506,6 +14757,177 @@ pub mod tests {
                 )
             }),
             "Sliver spells cast with The First Sliver on the battlefield should trigger cascade"
+        );
+    }
+
+    #[test]
+    fn dynamically_granted_demonstrate_enqueues_copy_trigger() {
+        // CR 702.144a + CR 611.2f: a spell whose cast-time snapshot carries a
+        // granted Demonstrate (The Twelfth Doctor) and has NO printed Demonstrate
+        // must get a synthesized Demonstrate copy trigger from the seam.
+        let mut state = setup();
+        let caster = PlayerId(0);
+
+        let spell = create_object(
+            &mut state,
+            CardId(1),
+            caster,
+            "Granted Demonstrate Spell".to_string(),
+            Zone::Stack,
+        );
+        {
+            let obj = state.objects.get_mut(&spell).unwrap();
+            obj.card_types.core_types.push(CoreType::Sorcery);
+            obj.cast_from_zone = Some(Zone::Graveyard);
+            obj.cast_spell_keywords.push(Keyword::Demonstrate);
+        }
+
+        process_triggers(
+            &mut state,
+            &[GameEvent::SpellCast {
+                object_id: spell,
+                controller: caster,
+                card_id: CardId(1),
+            }],
+        );
+
+        assert!(
+            state.stack.iter().any(|entry| matches!(
+                &entry.kind,
+                StackEntryKind::TriggeredAbility { description, .. }
+                    if description.as_deref() == Some("Demonstrate")
+            )),
+            "dynamically granted Demonstrate should enqueue a copy trigger"
+        );
+    }
+
+    fn count_demonstrate_triggers(state: &GameState) -> usize {
+        state
+            .stack
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.kind,
+                    StackEntryKind::TriggeredAbility { description, .. }
+                        if description.as_deref() == Some("Demonstrate")
+                )
+            })
+            .count()
+    }
+
+    #[test]
+    fn printed_demonstrate_does_not_double_enqueue_via_seam() {
+        // CR 702.144a: a printed-Demonstrate spell already carries its face
+        // copy trigger. A cast-time snapshot with only that printed instance has
+        // no granted delta, so this seam must not enqueue an extra trigger.
+        let mut state = setup();
+        let caster = PlayerId(0);
+
+        let spell = create_object(
+            &mut state,
+            CardId(1),
+            caster,
+            "Printed Demonstrate Spell".to_string(),
+            Zone::Stack,
+        );
+        {
+            let obj = state.objects.get_mut(&spell).unwrap();
+            obj.card_types.core_types.push(CoreType::Sorcery);
+            obj.keywords.push(Keyword::Demonstrate);
+            obj.cast_spell_keywords.push(Keyword::Demonstrate);
+        }
+
+        process_triggers(
+            &mut state,
+            &[GameEvent::SpellCast {
+                object_id: spell,
+                controller: caster,
+                card_id: CardId(1),
+            }],
+        );
+
+        assert_eq!(
+            count_demonstrate_triggers(&state),
+            0,
+            "printed Demonstrate must not get a second copy trigger from the dynamic seam"
+        );
+    }
+
+    #[test]
+    fn printed_demonstrate_with_dynamic_grant_enqueues_delta_trigger() {
+        // CR 702.144a: multiple Demonstrate instances trigger separately. The
+        // printed instance is covered by the face-synthesized trigger; an extra
+        // cast-time Demonstrate instance from a static grant still needs one seam
+        // trigger.
+        let mut state = setup();
+        let caster = PlayerId(0);
+
+        let spell = create_object(
+            &mut state,
+            CardId(1),
+            caster,
+            "Printed Plus Granted Demonstrate Spell".to_string(),
+            Zone::Stack,
+        );
+        {
+            let obj = state.objects.get_mut(&spell).unwrap();
+            obj.card_types.core_types.push(CoreType::Sorcery);
+            obj.keywords.push(Keyword::Demonstrate);
+            obj.cast_spell_keywords.push(Keyword::Demonstrate);
+            obj.cast_spell_keywords.push(Keyword::Demonstrate);
+        }
+
+        process_triggers(
+            &mut state,
+            &[GameEvent::SpellCast {
+                object_id: spell,
+                controller: caster,
+                card_id: CardId(1),
+            }],
+        );
+
+        assert_eq!(
+            count_demonstrate_triggers(&state),
+            1,
+            "one granted Demonstrate beyond the printed instance should enqueue one seam trigger"
+        );
+    }
+
+    #[test]
+    fn multiple_dynamic_demonstrate_grants_enqueue_multiple_triggers() {
+        // CR 702.144a: each Demonstrate instance is a separate triggered ability.
+        // With no printed instance, two cast-time granted instances require two
+        // seam triggers.
+        let mut state = setup();
+        let caster = PlayerId(0);
+
+        let spell = create_object(
+            &mut state,
+            CardId(1),
+            caster,
+            "Double Granted Demonstrate Spell".to_string(),
+            Zone::Stack,
+        );
+        {
+            let obj = state.objects.get_mut(&spell).unwrap();
+            obj.card_types.core_types.push(CoreType::Sorcery);
+            obj.cast_spell_keywords.push(Keyword::Demonstrate);
+            obj.cast_spell_keywords.push(Keyword::Demonstrate);
+        }
+
+        process_triggers(
+            &mut state,
+            &[GameEvent::SpellCast {
+                object_id: spell,
+                controller: caster,
+                card_id: CardId(1),
+            }],
+        );
+
+        assert_eq!(
+            count_demonstrate_triggers(&state),
+            2,
+            "two dynamically granted Demonstrate instances should enqueue two seam triggers"
         );
     }
 
@@ -18217,6 +18639,8 @@ pub mod tests {
                 enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enter_with_counters: vec![],
                 face_down_profile: None,
+                library_position: None,
+                random_order: false,
             },
             Vec::new(),
             ObjectId(9002),
@@ -18600,6 +19024,8 @@ pub mod tests {
                 enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enter_with_counters: vec![],
                 face_down_profile: None,
+                library_position: None,
+                random_order: false,
             },
             Vec::new(),
             ObjectId(9100),

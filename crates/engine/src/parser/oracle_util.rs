@@ -1629,6 +1629,9 @@ fn of_short_name_collides_with_possessive_zone_phrase(text: &str, short_name: &s
 /// ("Sharuum the Hegemon" → "Sharuum"), plus generic phrases like "this creature".
 const RING_TEMPTS_YOU_PLACEHOLDER: &str = "\u{E0000}";
 
+// CR 701.54d: "Whenever the Ring tempts you" abilities trigger from the
+// temptation event, so this rules phrase must survive self-reference
+// normalization even on cards whose names contain "Ring".
 fn mask_ring_tempts_you_phrase(text: &str) -> String {
     const PHRASE: &str = "the ring tempts you";
     let lower = text.to_ascii_lowercase();

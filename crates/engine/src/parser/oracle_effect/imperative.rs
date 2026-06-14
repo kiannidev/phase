@@ -99,6 +99,16 @@ fn parse_dig_library_owner(rest_lower: &str) -> TargetFilter {
         return TargetFilter::ParentTarget;
     }
 
+    if preceded(
+        take_until::<_, _, OracleError<'_>>("that opponent's library"),
+        tag::<_, _, OracleError<'_>>("that opponent's library"),
+    )
+    .parse(rest_lower)
+    .is_ok()
+    {
+        return TargetFilter::ParentTarget;
+    }
+
     // CR 608.2c + CR 400.3: "that library" — anaphoric to a library
     // identified earlier in the instruction (Chaos Warp: owner's library
     // after shuffle).
@@ -1165,9 +1175,24 @@ pub(super) fn parse_targeted_action_ast(
         alt((value("tap", tag("tap ")), value("untap", tag("untap ")))).parse(input)
     }) {
         let (target_text, _) = super::strip_optional_target_prefix(strip_article(rest));
-        let (target, _rem) = parse_target_with_ctx(target_text, ctx);
-        #[cfg(debug_assertions)]
-        assert_no_compound_remainder(_rem, text);
+        // CR 608.2k: A bare object pronoun ("untaps it") in a subject-bearing
+        // clause is an anaphor, not a parent-target chain. Route it through
+        // `resolve_it_pronoun` — identical to the sacrifice/counter clauses in
+        // the same instruction — so "that player gains control of ~, untaps it,
+        // and puts a +1/+1 counter on it" (Alexios, Deimos of Kosmos) binds the
+        // untap to `SelfRef` (the named source), and observer triggers like
+        // "whenever a permanent you control enters tapped, untap it" (Amulet of
+        // Vigor) bind to `TriggeringSource` (the entering permanent). Without a
+        // subject (a true parent-target chain, "tap target creature. untap it")
+        // the guard falls through to `parse_target_with_ctx` → `ParentTarget`.
+        let target = if ctx.subject.is_some() && is_bare_object_pronoun(target_text.trim()) {
+            resolve_it_pronoun(ctx)
+        } else {
+            let (target, _rem) = parse_target_with_ctx(target_text, ctx);
+            #[cfg(debug_assertions)]
+            assert_no_compound_remainder(_rem, text);
+            target
+        };
         return match verb {
             "tap" => Some(TargetedImperativeAst::Tap { target }),
             "untap" => Some(TargetedImperativeAst::Untap { target }),
@@ -1725,6 +1750,8 @@ pub(super) fn lower_targeted_action_ast(ast: TargetedImperativeAst) -> Effect {
                 // counters (e.g. a finality counter on Shilgengar's mass return).
                 enter_with_counters,
                 face_down_profile: None,
+                library_position: None,
+                random_order: false,
             }
         }
         TargetedImperativeAst::Fight { target } => Effect::Fight {
@@ -1922,6 +1949,7 @@ pub(super) fn parse_search_and_creation_ast(
     if let Some((reveal, rest)) = nom_on_lower(text, lower, |input| {
         alt((
             value(false, tag("look at the top ")),
+            value(false, tag("looks at the top ")),
             value(true, tag("reveal the top ")),
             value(true, tag("reveals the top ")),
         ))
@@ -1941,10 +1969,28 @@ pub(super) fn parse_search_and_creation_ast(
         } else {
             QuantityExpr::Fixed { value: 1 }
         };
+        let player = parse_dig_library_owner(rest_lower);
+        // CR 701.20e + CR 701.13a + CR 406.3: "look at the top card ... and
+        // exiles it face down" (Gonti, Night Minister) — fuse into ExileTop so
+        // the card leaves the library and the trailing play grant can bind to
+        // the tracked set.
+        if preceded(
+            take_until::<_, _, OracleError<'_>>("and exiles it face down"),
+            tag::<_, _, OracleError<'_>>("and exiles it face down"),
+        )
+        .parse(rest_lower)
+        .is_ok()
+        {
+            return Some(SearchCreationImperativeAst::ExileTopLookedAt {
+                player,
+                count,
+                face_down: true,
+            });
+        }
         return Some(SearchCreationImperativeAst::Dig {
             count,
             reveal,
-            player: parse_dig_library_owner(rest_lower),
+            player,
         });
     }
     // CR 701.16a: "look at that many cards from the top of your library" — variable-count dig
@@ -2228,6 +2274,15 @@ pub(super) fn lower_search_and_creation_ast(ast: SearchCreationImperativeAst) ->
             reveal,
             enter_tapped: false,
         },
+        SearchCreationImperativeAst::ExileTopLookedAt {
+            player,
+            count,
+            face_down,
+        } => Effect::ExileTop {
+            player,
+            count,
+            face_down,
+        },
         SearchCreationImperativeAst::CopyTokenOf {
             target,
             count,
@@ -2296,6 +2351,8 @@ pub(super) fn lower_search_and_creation_ast(ast: SearchCreationImperativeAst) ->
             enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             enter_with_counters: vec![],
             face_down_profile: None,
+            library_position: None,
+            random_order: false,
         },
     }
 }
@@ -2551,6 +2608,15 @@ pub(super) fn parse_choose_ast(
             return Some(ast);
         }
 
+        // CR 108.3 + CR 701.38d: "choose a permanent owned by the voter" —
+        // voter-referential ownership scoping on the Battlefield. This must be
+        // checked BEFORE is_choose_as_targeting so it routes to the interactive
+        // ChooseFromZone seam (which pauses for player choice) instead of the
+        // non-interactive TargetOnly path.
+        if let Some(ast) = try_parse_choose_owned_by_voter(rest, rest_lower, ctx) {
+            return Some(ast);
+        }
+
         if super::is_choose_as_targeting(rest_lower) {
             // CR 115.1c + CR 601.2c: "Choose target X and target Y" declares
             // two independent target slots on the same activated/triggered
@@ -2599,6 +2665,48 @@ pub(super) fn parse_choose_ast(
     }
 
     None
+}
+
+/// CR 108.3 + CR 701.38d: Detect "a <type> owned by the voter" and emit
+/// `ChooseFromZone { Battlefield, ScopedPlayer }` so the interactive choice
+/// seam handles mid-resolution target binding for per-ballot vote effects.
+fn try_parse_choose_owned_by_voter(
+    _text: &str,
+    lower: &str,
+    ctx: &mut ParseContext,
+) -> Option<ChooseImperativeAst> {
+    // Match: "a permanent owned by the voter", "a creature owned by the voter", etc.
+    // The chain splitter has already stripped any " and gain control of it" continuation.
+    // Uses nom `scan_preceded` + `tag` to locate the ownership suffix compositionally.
+    type E<'a> = OracleError<'a>;
+    let (filter_text, _, _suffix) =
+        nom_primitives::scan_preceded(lower, tag::<_, _, E>("owned by the voter"))?;
+    let filter_text = filter_text.trim_end();
+    let filter = super::search::parse_search_filter(filter_text, ctx);
+    // CR 108.3: Inject ownership filter so choose_from_zone restricts
+    // candidates to permanents owned by the scoped player (voter).
+    let filter = match filter {
+        TargetFilter::Typed(mut tf) => {
+            tf.properties.push(FilterProp::Owned {
+                controller: ControllerRef::ScopedPlayer,
+            });
+            TargetFilter::Typed(tf)
+        }
+        TargetFilter::Any => {
+            TargetFilter::Typed(TypedFilter::permanent().properties(vec![FilterProp::Owned {
+                controller: ControllerRef::ScopedPlayer,
+            }]))
+        }
+        other => other,
+    };
+    Some(ChooseImperativeAst::FromZone {
+        count: 1,
+        zones: vec![Zone::Battlefield],
+        zone_owner: ZoneOwner::ScopedPlayer,
+        filter,
+        chooser: Chooser::Controller,
+        up_to: false,
+    })
 }
 
 fn try_parse_choose_from_zone(lower: &str, ctx: &mut ParseContext) -> Option<ChooseImperativeAst> {
@@ -3879,17 +3987,19 @@ pub(super) fn parse_put_ast(text: &str, lower: &str) -> Option<PutImperativeAst>
         }
     }
 
+    let has_mass_zone_origin = (nom_primitives::scan_contains(lower, "all")
+        || nom_primitives::scan_contains(lower, "each"))
+        && nom_primitives::scan_contains(lower, "from");
+
     // "put X on top of Y's library" — specific position, no auto-shuffle.
     // Must check before try_parse_put_zone_change which would emit ChangeZone (auto-shuffles).
-    // Only matches forms WITHOUT an explicit origin zone ("from your hand") — those
-    // specify a real zone transfer and should go through try_parse_put_zone_change.
+    // Fixed-count forms with an origin zone ("from your graveyard") remain library
+    // reposition effects; mass "all"/"each" forms move a whole source zone.
     if nom_primitives::scan_contains(lower, "on top of")
         && nom_primitives::scan_contains(lower, "library")
+        && !has_mass_zone_origin
     {
-        let has_origin = nom_primitives::scan_contains(lower, " from ");
-        if !has_origin {
-            return Some(PutImperativeAst::TopOfLibrary);
-        }
+        return Some(PutImperativeAst::TopOfLibrary);
     }
 
     // "put that card on top" / "put it on top" / "put them on top" —
@@ -3898,16 +4008,14 @@ pub(super) fn parse_put_ast(text: &str, lower: &str) -> Option<PutImperativeAst>
         return Some(PutImperativeAst::TopOfLibrary);
     }
 
-    // "put X on the bottom of Y's library" — specific position without
-    // explicit origin zone. Forms with "from" (e.g. "from your hand") go through
-    // try_parse_put_zone_change for proper ChangeZone handling.
+    // "put X on the bottom of Y's library" — specific position. Fixed-count
+    // origin-zone forms remain library reposition effects; mass "all"/"each"
+    // forms move a whole source zone.
     if nom_primitives::scan_contains(lower, "on the bottom of")
         && nom_primitives::scan_contains(lower, "library")
+        && !has_mass_zone_origin
     {
-        let has_origin = nom_primitives::scan_contains(lower, " from ");
-        if !has_origin {
-            return Some(PutImperativeAst::BottomOfLibrary);
-        }
+        return Some(PutImperativeAst::BottomOfLibrary);
     }
 
     // "put that card on the bottom" / "put it on the bottom" —
@@ -3939,6 +4047,8 @@ pub(super) fn parse_put_ast(text: &str, lower: &str) -> Option<PutImperativeAst>
                 target,
                 enters_under,
                 enter_tapped,
+                library_position,
+                random_order,
                 ..
             } => {
                 // CR 608.2c: "Put all <filter> revealed this way into <z1> and
@@ -3960,6 +4070,8 @@ pub(super) fn parse_put_ast(text: &str, lower: &str) -> Option<PutImperativeAst>
                     target,
                     enters_under,
                     enter_tapped: enter_tapped.is_tapped(),
+                    library_position,
+                    random_order,
                     rest_destination,
                 })
             }
@@ -4009,6 +4121,8 @@ pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
             target,
             enters_under,
             enter_tapped,
+            library_position,
+            random_order,
             // CR 608.2c: The "and the rest into <zone>" complement is materialized
             // as a sibling sub-ability by `lower_imperative_family_ast`, which
             // intercepts the partition form before this bare-effect lowering.
@@ -4022,6 +4136,8 @@ pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
             enter_tapped: crate::types::zones::EtbTapState::from_legacy_bool(enter_tapped),
             enter_with_counters: vec![],
             face_down_profile: None,
+            library_position,
+            random_order,
         },
         PutImperativeAst::ZoneChange {
             origin,
@@ -4054,6 +4170,8 @@ pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
                     enter_tapped: crate::types::zones::EtbTapState::from_legacy_bool(enter_tapped),
                     enter_with_counters: vec![],
                     face_down_profile: None,
+                    library_position: None,
+                    random_order: false,
                 }
             } else {
                 Effect::ChangeZone {
@@ -4398,6 +4516,40 @@ pub(super) fn parse_shuffle_ast(text: &str, lower: &str) -> Option<ShuffleImpera
         return Some(ShuffleImperativeAst::ChangeZoneAllToLibrary {
             origins: vec![Zone::Hand],
         });
+    }
+    // CR 701.24c + CR 400.3: "shuffle <descriptive target> into their/your
+    // library" — the actor-possessive destination form. A card put into a
+    // library always returns to its OWNER's library (CR 400.3), and the target
+    // phrase carries the actor scope (e.g. "another creature they own" →
+    // `Owned { controller: ScopedPlayer }`), which binds the chosen object to
+    // the acting player. Powers the villainous-choice branch "they shuffle
+    // another creature they own into their library" (This Is How It Ends).
+    //
+    // Placed AFTER the whole-zone mass-move paths so that bare zone-possessive
+    // moves with an actor-possessive destination ("shuffle your graveyard into
+    // your library") are still classified as `ChangeZoneAll`, not as a single
+    // descriptive-target shuffle.
+    if let Some(((target_phrase, ()), _)) = nom_on_lower(lower, lower, |input| {
+        let (input, _) = tag::<_, _, OracleError<'_>>("shuffle ").parse(input)?;
+        let (input, target_phrase) = take_until(" into ").parse(input)?;
+        not(take_until::<_, _, OracleError<'_>>(" from ")).parse(target_phrase)?;
+        let (input, _) = tag(" into ").parse(input)?;
+        let (input, ()) = alt((
+            value((), tag("their library")),
+            value((), tag("your library")),
+        ))
+        .parse(input)?;
+        Ok((input, (target_phrase.to_string(), ())))
+    }) {
+        let (target, _) = parse_target(&target_phrase);
+        // Only accept a real typed object target — never a whole-zone phrase
+        // (which the mass-move paths above already handled).
+        if matches!(target, TargetFilter::Typed(_)) {
+            return Some(ShuffleImperativeAst::ChangeZoneToLibrary {
+                target,
+                owner_library: true,
+            });
+        }
     }
     // CR 701.24c: "shuffle target card from your graveyard into your library" —
     // targeted zone change (origin → library) + implicit shuffle.
@@ -4795,6 +4947,8 @@ fn change_zone_all_to_library_effect(origin: Zone) -> Effect {
         enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         enter_with_counters: vec![],
         face_down_profile: None,
+        library_position: None,
+        random_order: false,
     }
 }
 
@@ -7204,6 +7358,8 @@ pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEff
             target,
             enters_under,
             enter_tapped,
+            library_position,
+            random_order,
             rest_destination: Some(rest_destination),
         }) => {
             // "The rest" excludes the chosen subset by predicate. When the
@@ -7234,6 +7390,8 @@ pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEff
                 enter_tapped: crate::types::zones::EtbTapState::from_legacy_bool(enter_tapped),
                 enter_with_counters: vec![],
                 face_down_profile: None,
+                library_position,
+                random_order,
             };
             let complement = Effect::ChangeZoneAll {
                 origin: None,
@@ -7243,6 +7401,8 @@ pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEff
                 enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enter_with_counters: vec![],
                 face_down_profile: None,
+                library_position: None,
+                random_order: false,
             };
             let mut clause = parsed_clause(primary);
             clause.sub_ability = Some(Box::new(AbilityDefinition::new(
@@ -7824,6 +7984,8 @@ pub(super) fn lower_zone_counter_ast(ast: ZoneCounterImperativeAst) -> Effect {
                     enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     enter_with_counters: vec![],
                     face_down_profile: None,
+                    library_position: None,
+                    random_order: false,
                 }
             } else {
                 Effect::ChangeZone {
@@ -9551,6 +9713,8 @@ mod tests {
                 enter_tapped,
                 enter_with_counters: _,
                 face_down_profile: None,
+                library_position: None,
+                random_order: false,
             } => {
                 assert_eq!(origin, None);
                 assert_eq!(destination, Zone::Battlefield);
@@ -11229,7 +11393,7 @@ mod tests {
             matches!(
                 &*execute.effect,
                 Effect::Choose {
-                    choice_type: ChoiceType::Opponent,
+                    choice_type: ChoiceType::Opponent { .. },
                     ..
                 }
             ),

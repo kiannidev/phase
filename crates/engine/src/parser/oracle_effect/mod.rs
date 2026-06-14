@@ -12481,7 +12481,7 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
             without_paying_mana_cost: without_paying,
             mode,
             cast_transformed: false,
-            alt_ability_cost: None,
+            alt_ability_cost,
             constraint,
             duration: None,
             driver,

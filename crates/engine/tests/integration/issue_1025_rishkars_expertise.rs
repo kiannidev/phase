@@ -10,7 +10,8 @@ use engine::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
-const RISHKAR_EXPERTISE: &str = "Draw cards equal to the greatest power among creatures you control. \
+const RISHKAR_EXPERTISE: &str =
+    "Draw cards equal to the greatest power among creatures you control. \
 You may cast a spell with mana value 5 or less from your hand without paying its mana cost.";
 
 fn floating_mana(generic: usize, green: usize) -> Vec<ManaUnit> {
@@ -36,7 +37,13 @@ fn rishkars_expertise_free_cast_completes_during_resolution() {
 
     scenario.with_library_top(
         P0,
-        &["Library One", "Library Two", "Library Three", "Library Four", "Library Five"],
+        &[
+            "Library One",
+            "Library Two",
+            "Library Three",
+            "Library Four",
+            "Library Five",
+        ],
     );
     scenario.add_creature(P0, "Elf", 1, 1);
     let expertise = scenario
@@ -58,10 +65,7 @@ fn rishkars_expertise_free_cast_completes_during_resolution() {
     let expertise_card_id = runner.state().objects[&expertise].card_id;
 
     let parsed = &runner.state().objects[&expertise].abilities[0];
-    let cast = parsed
-        .sub_ability
-        .as_ref()
-        .expect("free cast sub-ability");
+    let cast = parsed.sub_ability.as_ref().expect("free cast sub-ability");
     assert!(matches!(
         cast.effect.as_ref(),
         Effect::CastFromZone {

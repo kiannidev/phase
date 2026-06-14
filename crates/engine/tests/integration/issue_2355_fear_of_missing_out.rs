@@ -75,7 +75,7 @@ fn fear_of_missing_out_parses_delirium_attack_untap_trigger() {
         .find(|t| t.mode == TriggerMode::Attacks)
         .expect("FOMO must have delirium attack trigger");
     assert!(matches!(
-        attack.execute.as_ref().and_then(|e| Some(&*e.effect)),
+        attack.execute.as_ref().map(|e| &*e.effect),
         Some(engine::types::ability::Effect::SetTapState { .. })
     ));
 }

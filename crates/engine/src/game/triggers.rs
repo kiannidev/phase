@@ -629,13 +629,8 @@ fn collect_matching_triggers(
                 .into_iter()
                 .map(|trigger_event| vec![trigger_event])
                 .collect()
-            } else if matches!(
-                trig_def.mode,
-                TriggerMode::DamageDone
-                    | TriggerMode::DamageDoneOnce
-                    | TriggerMode::DamageAll
-                    | TriggerMode::DamageDealtOnce
-            ) && matches!(event, GameEvent::CombatDamageDealtToPlayer { .. })
+            } else if matches!(trig_def.mode, TriggerMode::DamageDone)
+                && matches!(event, GameEvent::CombatDamageDealtToPlayer { .. })
             {
                 super::trigger_matchers::matching_damage_done_events(event, trig_def, obj_id, state)
                     .into_iter()

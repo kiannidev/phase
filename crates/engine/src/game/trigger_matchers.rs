@@ -1163,6 +1163,10 @@ pub(super) fn matching_damage_done_events(
     source_id: ObjectId,
     state: &GameState,
 ) -> Vec<GameEvent> {
+    if trigger.mode != TriggerMode::DamageDone {
+        return Vec::new();
+    }
+
     let GameEvent::CombatDamageDealtToPlayer {
         player_id,
         source_amounts,
@@ -6764,6 +6768,57 @@ mod tests {
                 ..
             } if source_id == bearer
         ));
+    }
+
+    #[test]
+    fn matching_damage_done_events_does_not_expand_once_modes() {
+        let mut state = setup();
+        let watcher = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Damage Watcher".to_string(),
+            Zone::Battlefield,
+        );
+        let attacker_a = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Attacker A".to_string(),
+            Zone::Battlefield,
+        );
+        let attacker_b = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Attacker B".to_string(),
+            Zone::Battlefield,
+        );
+        for attacker in [attacker_a, attacker_b] {
+            state
+                .objects
+                .get_mut(&attacker)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+        }
+
+        let mut trigger = make_trigger(TriggerMode::DamageDoneOnce);
+        trigger.valid_source = Some(TargetFilter::Typed(
+            TypedFilter::creature().controller(ControllerRef::You),
+        ));
+        trigger.valid_target = Some(TargetFilter::Player);
+        trigger.damage_kind = DamageKindFilter::CombatOnly;
+
+        let event = GameEvent::CombatDamageDealtToPlayer {
+            player_id: PlayerId(1),
+            source_amounts: vec![(attacker_a, 2), (attacker_b, 3)],
+            total_damage: 5,
+        };
+
+        assert!(match_damage_done(&event, &trigger, watcher, &state));
+        assert!(matching_damage_done_events(&event, &trigger, watcher, &state).is_empty());
     }
 
     #[test]

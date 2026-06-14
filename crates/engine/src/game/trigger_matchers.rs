@@ -1040,6 +1040,16 @@ pub(super) fn match_changes_zone_all(
 }
 
 // CR 603.6d: DamageDone trigger fires on damage dealt events.
+
+/// CR 510.2 + CR 603.2: Only equipment-style `AttachedTo` observers listen on
+/// the aggregate `CombatDamageDealtToPlayer` event. Self-referential creature
+/// triggers already fire on per-source `DamageDealt` events emitted during the
+/// combat damage step; matching them again on the aggregate event double-fires.
+pub(super) fn listens_on_aggregate_combat_damage_done(trigger: &TriggerDefinition) -> bool {
+    trigger.mode == TriggerMode::DamageDone
+        && matches!(trigger.valid_source, Some(TargetFilter::AttachedTo))
+}
+
 fn matching_combat_damage_to_player_sources(
     trigger: &TriggerDefinition,
     source_id: ObjectId,
@@ -1139,7 +1149,7 @@ pub(super) fn match_damage_done(
         ..
     } = event
     {
-        if trigger.valid_source.is_none() {
+        if !listens_on_aggregate_combat_damage_done(trigger) {
             return false;
         }
         !matching_combat_damage_to_player_sources(
@@ -1166,7 +1176,7 @@ pub(super) fn matching_damage_done_events(
     source_id: ObjectId,
     state: &GameState,
 ) -> Vec<GameEvent> {
-    if trigger.mode != TriggerMode::DamageDone || trigger.valid_source.is_none() {
+    if !listens_on_aggregate_combat_damage_done(trigger) {
         return Vec::new();
     }
 
@@ -6846,6 +6856,7 @@ mod tests {
             .push(CoreType::Creature);
 
         let mut trigger = make_trigger(TriggerMode::DamageDone);
+        trigger.valid_source = Some(TargetFilter::SelfRef);
         trigger.valid_target = Some(TargetFilter::Player);
         trigger.damage_kind = DamageKindFilter::CombatOnly;
 
@@ -6857,8 +6868,9 @@ mod tests {
 
         assert!(
             !match_damage_done(&event, &trigger, attacker, &state),
-            "self/no-source triggers already fire from per-source DamageDealt events"
+            "SelfRef triggers must not match aggregate combat damage"
         );
+        assert!(!listens_on_aggregate_combat_damage_done(&trigger));
         assert!(matching_damage_done_events(&event, &trigger, attacker, &state).is_empty());
     }
 

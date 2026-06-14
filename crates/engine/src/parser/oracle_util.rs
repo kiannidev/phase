@@ -640,6 +640,7 @@ const POSSESSIVES: &[&str] = &[
     "their",
     "its owner's",
     "that player's",
+    "target player's",
     "defending player's",
     "each player's",
     "each opponent's",

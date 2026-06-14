@@ -22579,6 +22579,28 @@ mod tests {
     }
 
     #[test]
+    fn suffer_the_past_exiles_from_target_player_graveyard() {
+        let def = parse_effect_chain(
+            "Exile X target cards from target player's graveyard. For each card exiled this way, that player loses 1 life and you gain 1 life.",
+            AbilityKind::Spell,
+        );
+        let Effect::ChangeZone {
+            origin,
+            destination,
+            ..
+        } = &*def.effect
+        else {
+            panic!("expected ChangeZone exile, got {:?}", def.effect);
+        };
+        assert_eq!(
+            *origin,
+            Some(Zone::Graveyard),
+            "must exile from graveyard, not an open-zone pick"
+        );
+        assert_eq!(*destination, Zone::Exile);
+    }
+
+    #[test]
     fn effect_exile_target_opponent_graveyard_is_change_zone_all() {
         // CR 400.12: "exile target opponent's graveyard" — same class.
         let e = parse_effect("exile target opponent's graveyard");

@@ -976,6 +976,8 @@ fn parse_source_subject(input: &str) -> OracleResult<'_, &str> {
         tag("this enchantment "),
         tag("equipped creature "),
         tag("enchanted creature "),
+        // CR 201.5: Pronouns in self-referential granted abilities refer to
+        // the object that has the ability.
         tag("it "),
     ))
     .parse(input)

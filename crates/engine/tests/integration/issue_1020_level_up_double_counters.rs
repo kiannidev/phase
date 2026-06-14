@@ -56,13 +56,15 @@ fn level_up_doubles_counters_when_enchanted_creature_attacks() {
     outcome.assert_zone(&[aura], Zone::Battlefield);
     runner.advance_until_stack_empty();
 
-    runner
-        .state_mut()
-        .objects
-        .get_mut(&bear)
-        .unwrap()
-        .counters
-        .insert(CounterType::Plus1Plus1, 1);
+    assert_eq!(
+        runner.state().objects[&bear]
+            .counters
+            .get(&CounterType::Plus1Plus1)
+            .copied()
+            .unwrap_or(0),
+        1,
+        "Level Up ETB trigger should put the first +1/+1 counter on the enchanted creature"
+    );
 
     run_combat(&mut runner, vec![bear], vec![]);
     runner.advance_until_stack_empty();

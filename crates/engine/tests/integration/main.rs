@@ -125,6 +125,7 @@ mod issue_2345_lavinia_no_mana_spent;
 mod issue_2348_key_to_the_vault;
 mod issue_2351_aven_interrupter;
 mod issue_2353_ulamog_etb_counters;
+mod issue_2355_fear_of_missing_out;
 mod issue_2357_norin_creature_attacks;
 mod issue_2359_rod_of_absorption;
 mod issue_2360_the_rack;

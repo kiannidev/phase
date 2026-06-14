@@ -1139,6 +1139,9 @@ pub(super) fn match_damage_done(
         ..
     } = event
     {
+        if trigger.valid_source.is_none() {
+            return false;
+        }
         !matching_combat_damage_to_player_sources(
             trigger,
             source_id,
@@ -6852,7 +6855,10 @@ mod tests {
             total_damage: 2,
         };
 
-        assert!(match_damage_done(&event, &trigger, attacker, &state));
+        assert!(
+            !match_damage_done(&event, &trigger, attacker, &state),
+            "self/no-source triggers already fire from per-source DamageDealt events"
+        );
         assert!(matching_damage_done_events(&event, &trigger, attacker, &state).is_empty());
     }
 

@@ -93,6 +93,7 @@ mod integration_bending;
 mod integration_landfall;
 mod invoke_calamity_free_cast;
 mod issue_1016_peregrin_took_food_token;
+mod issue_1017_ring_tempts_you;
 mod issue_1018_manifest_dread_choice;
 mod issue_1019_heraldic_banner_chosen_color;
 mod issue_1020_level_up_double_counters;

@@ -64,8 +64,7 @@ fn recurring_nightmare_returns_itself_to_hand_when_activating() {
                     .expect("sacrifice creature");
                 saw_sacrifice = true;
             }
-            WaitingFor::TargetSelection { .. }
-            | WaitingFor::TriggerTargetSelection { .. } => {
+            WaitingFor::TargetSelection { .. } | WaitingFor::TriggerTargetSelection { .. } => {
                 runner
                     .act(GameAction::SelectTargets {
                         targets: vec![TargetRef::Object(gy_creature)],
@@ -90,8 +89,14 @@ fn recurring_nightmare_returns_itself_to_hand_when_activating() {
         }
     }
 
-    assert!(saw_sacrifice, "activation must require sacrificing a creature");
-    assert!(saw_target, "activation must require choosing a graveyard creature");
+    assert!(
+        saw_sacrifice,
+        "activation must require sacrificing a creature"
+    );
+    assert!(
+        saw_target,
+        "activation must require choosing a graveyard creature"
+    );
     assert_eq!(
         runner.state().objects[&nightmare].zone,
         Zone::Hand,

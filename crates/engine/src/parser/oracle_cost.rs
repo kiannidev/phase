@@ -1139,56 +1139,26 @@ fn try_parse_return_to_hand_cost(rest_lower: &str) -> Option<AbilityCost> {
             from_zone: None,
         });
     }
-    if return_to_hand_filter_is_card_name_self_reference(filter_text) {
-        return Some(AbilityCost::ReturnToHand {
-            count: 1,
-            filter: Some(TargetFilter::SelfRef),
-            from_zone: None,
-        });
-    }
     let target_text = format!("target {filter_text}");
     let (filter, rem) = parse_target(&target_text);
     let filter = if rem.trim().is_empty() {
         filter
     } else {
         let (filter, _) = parse_type_phrase(filter_text);
-        filter
+        if matches!(filter, TargetFilter::Any) {
+            // CR 201.5: A cost using the source card's own name, such as
+            // "Return Recurring Nightmare to its owner's hand", refers to that
+            // source object.
+            TargetFilter::SelfRef
+        } else {
+            filter
+        }
     };
     Some(AbilityCost::ReturnToHand {
         count: 1,
         filter: Some(filter),
         from_zone: None,
     })
-}
-
-/// CR 702.29-style card-name bounce costs such as "Return Recurring Nightmare
-/// to its owner's hand" refer to the source card itself, not a typed permanent
-/// filter. Typed costs always include a card-type word or a controller clause.
-fn return_to_hand_filter_is_card_name_self_reference(filter_text: &str) -> bool {
-    let text = filter_text.trim();
-    if text.is_empty() {
-        return false;
-    }
-    const TYPED_MARKERS: &[&str] = &[
-        "creature",
-        "artifact",
-        "enchantment",
-        "land",
-        "permanent",
-        "equipment",
-        "vehicle",
-        "planeswalker",
-        "battle",
-        "you control",
-        "another",
-        "target",
-        "untapped",
-        "tapped",
-        "nonland",
-        "basic",
-        "legendary",
-    ];
-    !TYPED_MARKERS.iter().any(|marker| text.contains(marker))
 }
 
 /// Strip ability-word cost prefixes like "Cohort — {T}", "Boast — {1}",

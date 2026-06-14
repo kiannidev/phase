@@ -951,7 +951,7 @@ impl<'a> CardBuilder<'a> {
         self
     }
 
-    /// Set the mana cost of this card and derive its color identity from that cost.
+    /// Set the mana cost of this card and derive its color from that cost.
     pub fn with_mana_cost(&mut self, cost: crate::types::mana::ManaCost) -> &mut Self {
         let obj = self.obj();
         obj.mana_cost = cost.clone();
@@ -3497,6 +3497,10 @@ mod tests {
         assert!(
             obj.color.contains(&ManaColor::Red),
             "color should be derived from mana cost"
+        );
+        assert!(
+            obj.base_color.contains(&ManaColor::Red),
+            "base color should be derived from mana cost"
         );
     }
 

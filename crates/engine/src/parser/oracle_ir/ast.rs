@@ -90,6 +90,7 @@ pub(crate) struct AnimationSpec {
     pub(crate) colors: Option<Vec<ManaColor>>,
     pub(crate) keywords: Vec<Keyword>,
     pub(crate) types: Vec<String>,
+    pub(crate) supertypes: Vec<crate::types::card_type::Supertype>,
     pub(crate) remove_all_abilities: bool,
 }
 
@@ -889,6 +890,12 @@ pub(crate) enum SearchCreationImperativeAst {
         /// CR 701.20a vs CR 701.16a: True = revealed (public), false = looked at (private).
         reveal: bool,
         player: TargetFilter,
+    },
+    /// CR 701.20e + CR 701.13a + CR 406.3: Fused "look at the top N ... and exiles it face down".
+    ExileTopLookedAt {
+        player: TargetFilter,
+        count: QuantityExpr,
+        face_down: bool,
     },
     CopyTokenOf {
         target: TargetFilter,

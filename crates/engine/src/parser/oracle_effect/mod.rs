@@ -2192,6 +2192,15 @@ fn try_parse_unless_three_branch_choice(
 /// complete imperatives. This helper handles the shared-leading-verb token
 /// grammar by parsing each token noun phrase through `token::try_parse_token`
 /// and wrapping the resulting normal token effects in `ChooseOneOf`.
+/// CR 111.2 + CR 608.2d: "create [your choice of] A, B[, or C] token" — a
+/// disjunctive list of predefined-token branches the controller chooses among at
+/// resolution. Generalizes the binary "A or B" form to an N-way Oxford-comma
+/// list (The Third Doctor: "create your choice of a Clue token, a Food token, or
+/// a Treasure token") by reusing the shared `split_choice_list_items` combinator
+/// — the same N-way primitive the put-counter choice list uses. Each item is
+/// parsed independently through the normal token grammar, so every option keeps
+/// its own token identity (no Clue→Food collapse). Returns `None` unless EVERY
+/// item parses to an `Effect::Token`.
 fn try_parse_create_token_choice(
     tp: TextPair<'_>,
     ctx: &mut ParseContext,
@@ -2199,33 +2208,44 @@ fn try_parse_create_token_choice(
     let ((), after_create_original) = nom_on_lower(tp.original, tp.lower, |i| {
         value((), tag("create ")).parse(i)
     })?;
-    let consumed = tp.original.len() - after_create_original.len();
-    let after_create = TextPair::new(after_create_original, &tp.lower[consumed..]);
-    let (left, right) = after_create.split_around(" or ")?;
+    // Strip the optional "your choice of " lead-in (mirrors the put-counter
+    // "put your choice of " form). Absent on the binary "create A or B token"
+    // shape, present on The Third Doctor's three-way list.
+    let after_create_original = nom_on_lower(
+        after_create_original,
+        &after_create_original.to_lowercase(),
+        |i| value((), opt(tag("your choice of "))).parse(i),
+    )
+    .map(|((), rest)| rest)
+    .unwrap_or(after_create_original);
 
-    if nom_primitives::split_once_on(left.lower, " or ").is_ok()
-        || nom_primitives::split_once_on(right.lower, " or ").is_ok()
-    {
+    let choices_text = after_create_original.trim().trim_end_matches('.');
+    let items = split_choice_list_items(choices_text)?;
+    if items.len() < 2 {
+        return None;
+    }
+    if items.iter().any(|item| item.trim().is_empty()) {
         return None;
     }
 
-    let left_text = left.original.trim();
-    let right_text = right.original.trim();
-    if left_text.is_empty() || right_text.is_empty() {
-        return None;
+    let mut branches: Vec<AbilityDefinition> = Vec::with_capacity(items.len());
+    for item in &items {
+        let item_text = item.trim();
+        let item_lower = item_text.to_lowercase();
+        let effect = token::try_parse_token(&item_lower, item_text, ctx)?;
+        // Every branch must be a predefined token; a non-token item means this
+        // was not a token-choice list (decline so other parsers can try).
+        if !matches!(effect, Effect::Token { .. }) {
+            return None;
+        }
+        let mut def = AbilityDefinition::new(AbilityKind::Spell, effect);
+        def.description = Some(format!("create {item_text}"));
+        branches.push(def);
     }
-
-    let left_effect = token::try_parse_token(left.lower, left_text, ctx)?;
-    let right_effect = token::try_parse_token(right.lower, right_text, ctx)?;
-
-    let mut left_def = AbilityDefinition::new(AbilityKind::Spell, left_effect);
-    left_def.description = Some(format!("create {left_text}"));
-    let mut right_def = AbilityDefinition::new(AbilityKind::Spell, right_effect);
-    right_def.description = Some(format!("create {right_text}"));
 
     Some(parsed_clause(Effect::ChooseOneOf {
         chooser: PlayerFilter::Controller,
-        branches: vec![left_def, right_def],
+        branches,
     }))
 }
 
@@ -2922,6 +2942,17 @@ fn parse_villainous_choice_chooser_prefix(input: &str) -> OracleResult<'_, Playe
             PlayerFilter::Opponent,
             tag("target opponent faces a villainous choice — "),
         ),
+        // CR 701.55a + CR 608.2c + CR 109.4: "That player faces a villainous
+        // choice — …" anaphors the single opponent chosen earlier this
+        // resolution (the preceding `choose an opponent`), so the chooser is the
+        // first chosen player. The Master, Gallifrey's End: "choose an
+        // opponent … That player faces a villainous choice — …". Setting
+        // `scoped_choice_player` (the caller does so on any prefix match) binds
+        // the "They lose N life" branch to that opponent via `ScopedPlayer`.
+        value(
+            PlayerFilter::ChosenPlayer { index: 0 },
+            tag("that player faces a villainous choice — "),
+        ),
         parse_life_lost_villainous_choice_chooser,
         value(PlayerFilter::Controller, tag("face a villainous choice — ")),
         value(
@@ -3554,6 +3585,42 @@ fn is_copy_token_anaphor_body(input: &str) -> bool {
 ///
 /// The ordinal word ("second"/"third") is a parse-time consistency hint only —
 /// the engine index is derived from chain position, not the ordinal.
+/// CR 102.3 + CR 608.2d: Recognize the "with the most life [among
+/// your opponents]" qualifier on a "choose an opponent" instruction and lower it
+/// to the equivalent `PlayerFilter::PlayerAttribute` restriction: each candidate
+/// opponent whose life total is `>=` the maximum life total across all opponents.
+/// CR 102.3 scopes the candidate set to opponents; CR 608.2d lets the controller
+/// pick ONE qualifying opponent (resolving ties) when multiple share the maximum.
+/// The candidate's life is read PER-CANDIDATE (`PlayerScope::ScopedPlayer`); the
+/// `value` threshold is the controller-relative max (`PlayerScope::Opponent {
+/// aggregate: Max }`), composed from existing typed enums rather than a bespoke
+/// `MostLife` sibling. Consumes the qualifier text; returns the parsed
+/// restriction so the caller can attach it to `ChoiceType::Opponent`.
+fn parse_opponent_most_life_restriction(input: &str) -> OracleResult<'_, PlayerFilter> {
+    let (input, _) = preceded(
+        tag(" with the most life"),
+        opt(tag(" among your opponents")),
+    )
+    .parse(input)?;
+    Ok((
+        input,
+        PlayerFilter::PlayerAttribute {
+            relation: PlayerRelation::Opponent,
+            attr: Box::new(QuantityRef::LifeTotal {
+                player: PlayerScope::ScopedPlayer,
+            }),
+            comparator: Comparator::GE,
+            value: Box::new(QuantityExpr::Ref {
+                qty: QuantityRef::LifeTotal {
+                    player: PlayerScope::Opponent {
+                        aggregate: AggregateFunction::Max,
+                    },
+                },
+            }),
+        },
+    ))
+}
+
 fn try_parse_choose_player_to_verb(
     tp: TextPair<'_>,
     ctx: &mut ParseContext,
@@ -3587,10 +3654,28 @@ fn try_parse_choose_player_to_verb(
         Ok::<_, nom::Err<OracleError<'_>>>((i, ChoiceType::Player))
     };
     let opponent_arm = value(
-        ChoiceType::Opponent,
+        ChoiceType::Opponent { restriction: None },
         tag::<_, _, OracleError<'_>>("n opponent"),
     );
-    let (after_player, choice_type) = alt((player_arm, opponent_arm)).parse(after_choose).ok()?;
+    let (after_player, mut choice_type) =
+        alt((player_arm, opponent_arm)).parse(after_choose).ok()?;
+
+    // CR 102.3 + CR 608.2d: "choose an opponent with the most life [among your
+    // opponents]" narrows the pick to the highest-life opponent(s). Attach the
+    // restriction to the `Opponent` choice so it stays a single pick (CR 608.2d
+    // resolves ties) rather than fanning out. Consume the qualifier so it is not
+    // left dangling on the verb tail.
+    let after_player = if let ChoiceType::Opponent { restriction } = &mut choice_type {
+        match parse_opponent_most_life_restriction(after_player) {
+            Ok((rest, filter)) => {
+                *restriction = Some(Box::new(filter));
+                rest
+            }
+            Err(_) => after_player,
+        }
+    } else {
+        after_player
+    };
 
     // The chain index is the count of `Choose(Player)` clauses already
     // finalized in this chain. The chunk loop owns the increment (once per
@@ -3684,7 +3769,7 @@ fn try_parse_an_opponent_to_verb(
     }
 
     let mut clause = parsed_clause(Effect::Choose {
-        choice_type: ChoiceType::Opponent,
+        choice_type: ChoiceType::Opponent { restriction: None },
         persist: false,
     });
     let mut sub = AbilityDefinition::new(AbilityKind::Spell, verb_clause.effect);
@@ -6077,6 +6162,10 @@ fn try_parse_per_grantee_play_grant(tp: TextPair<'_>) -> Option<ParsedEffectClau
         tag("they may cast those cards"),
         tag("they may play them"),
         tag("they may cast them"),
+        tag("they may play that card"),
+        tag("they may cast that card"),
+        tag("they may play that spell"),
+        tag("they may cast that spell"),
     ))
     .parse(lower)
     .is_ok()
@@ -6233,16 +6322,41 @@ fn try_parse_cast_from_tracked_exile_grant(tp: TextPair<'_>) -> Option<ParsedEff
 }
 
 fn try_parse_exile_play_grant_with_any_mana(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
-    let (rest, _) = alt((
-        tag::<_, _, OracleError<'_>>("you may look at and play "),
-        tag("you may play "),
-        tag("you may cast "),
-        tag("look at and play "),
-        tag("play "),
-        tag("cast "),
-    ))
-    .parse(tp.lower)
-    .ok()?;
+    // Third-person "they may play/cast that card ... cast a spell this way" (Gonti,
+    // Night Minister) binds to the parent player target via `ParentTargetController`
+    // and the tracked exile set. First-person forms keep the legacy `Any` target
+    // (rebound to TrackedSet by the chain parser when chained after an exile).
+    let (rest, grantee, target) = if let Ok((rest, _)) =
+        tag::<_, _, OracleError<'_>>("they may play ").parse(tp.lower)
+    {
+        (
+            rest,
+            crate::types::ability::PermissionGrantee::ParentTargetController,
+            TargetFilter::TrackedSet {
+                id: TrackedSetId(0),
+            },
+        )
+    } else if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("they may cast ").parse(tp.lower) {
+        (
+            rest,
+            crate::types::ability::PermissionGrantee::ParentTargetController,
+            TargetFilter::TrackedSet {
+                id: TrackedSetId(0),
+            },
+        )
+    } else {
+        let (rest, _) = alt((
+            tag::<_, _, OracleError<'_>>("you may look at and play "),
+            tag("you may play "),
+            tag("you may cast "),
+            tag("look at and play "),
+            tag("play "),
+            tag("cast "),
+        ))
+        .parse(tp.lower)
+        .ok()?;
+        (rest, Default::default(), TargetFilter::Any)
+    };
     let (rest, _) = alt((
         tag::<_, _, OracleError<'_>>("that card"),
         tag("that spell"),
@@ -6265,6 +6379,8 @@ fn try_parse_exile_play_grant_with_any_mana(tp: TextPair<'_>) -> Option<ParsedEf
     let (rest, _) = alt((
         tag::<_, _, OracleError<'_>>("mana of any type can be spent to cast that spell"),
         tag("mana of any color can be spent to cast that spell"),
+        tag("mana of any type can be spent to cast a spell this way"),
+        tag("mana of any color can be spent to cast a spell this way"),
     ))
     .parse(rest)
     .ok()?;
@@ -6282,8 +6398,8 @@ fn try_parse_exile_play_grant_with_any_mana(tp: TextPair<'_>) -> Option<ParsedEf
             single_use_group: None,
             single_use: false,
         },
-        target: TargetFilter::Any,
-        grantee: Default::default(),
+        target,
+        grantee,
     }))
 }
 
@@ -6291,15 +6407,19 @@ fn try_parse_exile_play_grant_with_any_mana(tp: TextPair<'_>) -> Option<ParsedEf
 fn try_parse_play_from_exile(tp: TextPair, ctx: &ParseContext) -> Option<ParsedEffectClause> {
     let tp = tp.trim_end_matches('.');
 
+    // CR 118.9 + CR 609.4b: The any-mana conjunct must win over the bare
+    // per-grantee branch so "they may play that card ... mana of any type can
+    // be spent to cast a spell this way" (Gonti, Night Minister) keeps
+    // `mana_spend_permission: AnyTypeOrColor`.
+    if let Some(clause) = try_parse_exile_play_grant_with_any_mana(tp) {
+        return Some(clause);
+    }
     // CR 611.2a + CR 108.3: Per-object grant clauses from compound-exile chains.
     // These bind the grant to a player OTHER than the ability's controller via
     // Theme D's `granted_to` field, resolved per-iteration by
     // `grant_permission::resolve`. The target is `TrackedSet` — the most
     // recently published set (the exiled cards from the parent effect).
     if let Some(clause) = try_parse_per_grantee_play_grant(tp) {
-        return Some(clause);
-    }
-    if let Some(clause) = try_parse_exile_play_grant_with_any_mana(tp) {
         return Some(clause);
     }
     // CR 400.7i + CR 609.4b: Persistent duration-scoped variant —
@@ -10788,6 +10908,42 @@ fn extract_player_anchor(effect: &Effect) -> Option<TargetFilter> {
     Some(candidate.clone())
 }
 
+/// CR 608.2c + CR 108.3: Find a chain-level player anchor in a parsed clause,
+/// descending into its `sub_ability` chain. A clause such as "target creature's
+/// owner shuffles it into their library" lowers to a top `ChangeZone` with the
+/// owner `Shuffle(ParentTargetOwner)` as a sub-ability, so the anchor lives one
+/// level down — `extract_player_anchor` alone (top-effect only) would miss it.
+/// Used so a following "then faces a villainous choice — …" continuation can
+/// inherit the named owner as its chooser (This Is How It Ends).
+fn extract_player_anchor_in_chain(clause: &ParsedEffectClause) -> Option<TargetFilter> {
+    if let Some(anchor) = extract_player_anchor(&clause.effect) {
+        return Some(anchor);
+    }
+    let mut sub = clause.sub_ability.as_deref();
+    while let Some(def) = sub {
+        if let Some(anchor) = extract_player_anchor(&def.effect) {
+            return Some(anchor);
+        }
+        sub = def.sub_ability.as_deref();
+    }
+    None
+}
+
+/// CR 108.3 + CR 109.4: Map a chain-level anchor subject (a `TargetFilter`
+/// player reference established by a prior clause) to the `PlayerFilter` a
+/// villainous-choice `ChooseOneOf` chooser should adopt when the choice
+/// continuation named no leading subject of its own ("[target's owner] …, then
+/// faces a villainous choice — …", This Is How It Ends). Only the
+/// parent-target-owner anchor maps today — the owner of the targeted permanent
+/// is the player facing the choice. Other anchors return `None` so the chooser
+/// keeps its default.
+fn player_filter_from_anchor_for_chooser(anchor: &TargetFilter) -> Option<PlayerFilter> {
+    match anchor {
+        TargetFilter::ParentTargetOwner => Some(PlayerFilter::ParentObjectTargetOwner),
+        _ => None,
+    }
+}
+
 /// CR 608.2c + CR 117.3a: Apply an anchor subject (tracked by the chain parser)
 /// to a caster-defaulted player-scope effect, so chained instructions like
 /// "then shuffle" inherit the earlier subject ("its controller").
@@ -12342,15 +12498,28 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
         .unwrap_or_else(|| super::oracle_target::parse_type_phrase(cast_target_rest).0);
     if cast_filter_has_typed_leaf(&filter) {
         apply_cast_target_suffixes(&mut filter, rest);
+        let alt_ability_cost = parse_alt_ability_cost_rider(lower);
+        let hand_origin = matches!(
+            &filter,
+            TargetFilter::Typed(tf)
+                if tf.properties.iter().any(|prop| {
+                    matches!(prop, FilterProp::InZone { zone: Zone::Hand })
+                })
+        );
+        let driver = if without_paying && alt_ability_cost.is_none() && hand_origin {
+            crate::types::ability::CastFromZoneDriver::DuringResolution
+        } else {
+            crate::types::ability::CastFromZoneDriver::LingeringPermission
+        };
         return Some(Effect::CastFromZone {
             target: filter,
             without_paying_mana_cost: without_paying,
             mode,
             cast_transformed: false,
-            alt_ability_cost: None,
+            alt_ability_cost,
             constraint,
             duration: None,
-            driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+            driver,
         });
     }
 
@@ -12847,6 +13016,13 @@ fn is_choose_as_targeting(rest: &str) -> bool {
         return true;
     }
 
+    // CR 108.3 + CR 701.38d: Passive ownership form "owned by <player-ref>".
+    // Expropriate: "choose a permanent owned by the voter and gain control of it."
+    // The ownership suffix scopes the candidate pool to a specific player.
+    if scan_contains_phrase(rest, "owned by") {
+        return true;
+    }
+
     false
 }
 
@@ -12968,7 +13144,7 @@ pub(crate) fn try_parse_named_choice(lower: &str) -> Option<ChoiceType> {
         Some(ChoiceType::LandType)
     } else if tag::<_, _, E>("an opponent").parse(rest).is_ok() {
         // CR 800.4a: Choose an opponent from among players in the game.
-        Some(ChoiceType::Opponent)
+        Some(ChoiceType::Opponent { restriction: None })
     } else if tag::<_, _, E>("a player").parse(rest).is_ok() {
         Some(ChoiceType::Player)
     } else if tag::<_, _, E>("two colors").parse(rest).is_ok() {
@@ -16691,7 +16867,7 @@ pub(crate) fn parse_effect_chain_ir(
         if matches!(
             clause.effect,
             Effect::Choose {
-                choice_type: ChoiceType::Player | ChoiceType::Opponent,
+                choice_type: ChoiceType::Player | ChoiceType::Opponent { .. },
                 ..
             }
         ) {
@@ -16796,6 +16972,24 @@ pub(crate) fn parse_effect_chain_ir(
             {
                 *chooser = scope;
                 player_scope = None;
+            } else if let Effect::ChooseOneOf { chooser, .. } = &mut clause.effect {
+                // CR 701.55a + CR 108.3 + CR 109.4: "[target's owner] …, then
+                // faces a villainous choice — …" (This Is How It Ends). The bare
+                // "faces a villainous choice — " prefix defaulted the chooser to
+                // `Controller`, but the player facing the choice is the subject
+                // named in the prior clause — the owner of the targeted
+                // permanent, carried as the `anchor_subject` (ParentTargetOwner)
+                // set by the preceding `Shuffle(ParentTargetOwner)` clause.
+                // Rebind the chooser to that owner; the branches already resolve
+                // to `ScopedPlayer` (bound to the affected player at runtime).
+                if matches!(chooser, PlayerFilter::Controller) {
+                    if let Some(owner_chooser) = anchor_subject
+                        .as_ref()
+                        .and_then(player_filter_from_anchor_for_chooser)
+                    {
+                        *chooser = owner_chooser;
+                    }
+                }
             }
         }
         if let Some(ref anchor) = anchor_subject {
@@ -16803,8 +16997,11 @@ pub(crate) fn parse_effect_chain_ir(
         }
 
         // Update anchor from this clause's subject (e.g., SearchLibrary.target_player
-        // set to a non-caster player-scope filter).
-        if let Some(extracted) = extract_player_anchor(&clause.effect) {
+        // set to a non-caster player-scope filter). Descends the sub_ability
+        // chain so an owner-shuffle carried as a sub-ability (CR 108.3 — "target
+        // creature's owner shuffles it into their library") still registers its
+        // ParentTargetOwner anchor for a following villainous-choice clause.
+        if let Some(extracted) = extract_player_anchor_in_chain(&clause) {
             anchor_subject = Some(extracted);
         }
 
@@ -27186,13 +27383,55 @@ mod tests {
         );
     }
 
-    /// CR 406.3 + CR 701.16a: "look at the top card of <player>'s library, then
-    /// exile it face down" is the Gonti, Canny Acquisitor impulse idiom. The
-    /// private `Dig` look step (CR 701.16a) only inspects the top card; the
-    /// "then exile it face down" clause must rewrite it into a face-down
+    /// CR 701.20e + CR 701.13a + CR 406.3: "look at the top card of <player>'s
+    /// library, then exile it face down" is the Gonti, Canny Acquisitor impulse
+    /// idiom. The private `Dig` look step (CR 701.20e) only inspects the top
+    /// card; the "then exile it face down" clause must rewrite it into a face-down
     /// `Effect::ExileTop` so the card actually leaves the library (issue #1316).
     /// Building-block coverage independent of any trigger context — a bare chain
     /// resolves "that player's library" to `ParentTarget`.
+    #[test]
+    fn gonti_night_minister_look_and_exile_face_down_fuses_to_exile_top() {
+        let def = parse_effect_chain(
+            "Its controller looks at the top card of that opponent's library and exiles it face down. They may play that card for as long as it remains exiled, and mana of any type can be spent to cast a spell this way.",
+            AbilityKind::Spell,
+        );
+        assert!(
+            matches!(
+                &*def.effect,
+                Effect::ExileTop {
+                    player: TargetFilter::ParentTarget,
+                    count: QuantityExpr::Fixed { value: 1 },
+                    face_down: true,
+                }
+            ),
+            "expected fused look-and-exile to lower to ExileTop, got {:?}",
+            def.effect
+        );
+        let grant = def
+            .sub_ability
+            .as_ref()
+            .expect("impulse-play grant must chain after exile");
+        assert!(
+            matches!(
+                &*grant.effect,
+                Effect::GrantCastingPermission {
+                    permission: CastingPermission::PlayFromExile {
+                        duration: Duration::Permanent,
+                        mana_spend_permission: Some(ManaSpendPermission::AnyTypeOrColor),
+                        ..
+                    },
+                    target: TargetFilter::TrackedSet {
+                        id: TrackedSetId(0),
+                    },
+                    grantee: crate::types::ability::PermissionGrantee::ParentTargetController,
+                }
+            ),
+            "expected PlayFromExile grant on tracked set with any-mana permission, got {:?}",
+            grant.effect
+        );
+    }
+
     #[test]
     fn look_at_top_then_exile_it_face_down_rewrites_dig_to_exile_top() {
         let def = parse_effect_chain(
@@ -42265,6 +42504,178 @@ mod tests {
     }
 
     #[test]
+    fn the_third_doctor_three_way_token_choice() {
+        // CR 111.2 + CR 608.2d: "create your choice of A, B, or C token" must
+        // produce one ChooseOneOf branch per list item, each with its own token
+        // identity (no Clue→Food collapse, no leaked "your choice of " text).
+        let ability = parse_effect_chain(
+            "create your choice of a Clue token, a Food token, or a Treasure token",
+            AbilityKind::Spell,
+        );
+        match &*ability.effect {
+            Effect::ChooseOneOf { chooser, branches } => {
+                assert_eq!(*chooser, PlayerFilter::Controller);
+                assert_eq!(branches.len(), 3, "expected three token branches");
+                let names: Vec<&str> = branches
+                    .iter()
+                    .map(|b| match &*b.effect {
+                        Effect::Token { name, .. } => name.as_str(),
+                        other => panic!("expected Token branch, got {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(names, vec!["Clue", "Food", "Treasure"]);
+                // Branch types must each be the item's own identity.
+                for (b, expected) in branches.iter().zip(["Clue", "Food", "Treasure"]) {
+                    if let Effect::Token { types, name, .. } = &*b.effect {
+                        assert!(
+                            types.iter().any(|t| t == "Artifact")
+                                && types.iter().any(|t| t == expected),
+                            "branch {name} types {types:?} must include Artifact + {expected}"
+                        );
+                        assert!(
+                            // allow-noncombinator: test assertion on parsed output, not parsing dispatch
+                            !name.contains("your choice of"),
+                            "branch name must not leak list lead-in: {name}"
+                        );
+                    }
+                }
+            }
+            other => panic!("expected ChooseOneOf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_token_choice_binary_still_two_branches() {
+        // The N-way generalization must not regress the binary "A or B" form.
+        let ability = parse_effect_chain(
+            "create a Food token or a Treasure token",
+            AbilityKind::Spell,
+        );
+        match &*ability.effect {
+            Effect::ChooseOneOf { branches, .. } => {
+                assert_eq!(branches.len(), 2);
+                assert!(matches!(&*branches[0].effect, Effect::Token { .. }));
+                assert!(matches!(&*branches[1].effect, Effect::Token { .. }));
+            }
+            other => panic!("expected ChooseOneOf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn this_is_how_it_ends_villainous_continuation() {
+        // CR 701.55a + CR 108.3: "[target's owner] shuffles it …, then faces a
+        // villainous choice — …" must produce a ChooseOneOf whose chooser is the
+        // target's OWNER (the named subject of the prior clause), with branches
+        // bound to that owner via ScopedPlayer.
+        let ability = parse_effect_chain(
+            "Target creature's owner shuffles it into their library, then faces a villainous choice — They lose 5 life, or they shuffle another creature they own into their library.",
+            AbilityKind::Spell,
+        );
+        // The villainous ChooseOneOf is nested in the sub-ability chain.
+        fn find_choose(def: &AbilityDefinition) -> Option<&AbilityDefinition> {
+            if matches!(&*def.effect, Effect::ChooseOneOf { .. }) {
+                return Some(def);
+            }
+            def.sub_ability.as_deref().and_then(find_choose)
+        }
+        let choose = find_choose(&ability).expect("expected nested ChooseOneOf");
+        match &*choose.effect {
+            Effect::ChooseOneOf { chooser, branches } => {
+                assert_eq!(*chooser, PlayerFilter::ParentObjectTargetOwner);
+                assert_eq!(branches.len(), 2);
+                assert!(matches!(
+                    &*branches[0].effect,
+                    Effect::LoseLife {
+                        target: Some(TargetFilter::ScopedPlayer),
+                        ..
+                    }
+                ));
+                assert!(matches!(
+                    &*branches[1].effect,
+                    Effect::ChangeZone {
+                        destination: crate::types::zones::Zone::Library,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected ChooseOneOf, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_master_most_life_villainous_choice() {
+        // CR 800.4a + CR 701.55a: "choose an opponent with the most life among
+        // your opponents. That player faces a villainous choice — …" must
+        // produce a restricted Choose(Opponent) plus a ChooseOneOf whose chooser
+        // is the chosen player and whose "They lose N life" branch is scoped.
+        let ability = parse_effect_chain(
+            "choose an opponent with the most life among your opponents. That player faces a villainous choice — They lose 4 life, or you create a token that's a copy of that card.",
+            AbilityKind::Spell,
+        );
+        match &*ability.effect {
+            Effect::Choose {
+                choice_type:
+                    ChoiceType::Opponent {
+                        restriction: Some(restriction),
+                    },
+                persist,
+            } => {
+                assert!(!persist, "The Master does not need persist");
+                match restriction.as_ref() {
+                    PlayerFilter::PlayerAttribute {
+                        relation,
+                        attr,
+                        comparator,
+                        value,
+                    } => {
+                        assert_eq!(*relation, PlayerRelation::Opponent);
+                        assert_eq!(*comparator, Comparator::GE);
+                        assert!(matches!(
+                            attr.as_ref(),
+                            QuantityRef::LifeTotal {
+                                player: PlayerScope::ScopedPlayer
+                            }
+                        ));
+                        assert!(matches!(
+                            value.as_ref(),
+                            QuantityExpr::Ref {
+                                qty: QuantityRef::LifeTotal {
+                                    player: PlayerScope::Opponent {
+                                        aggregate: AggregateFunction::Max
+                                    }
+                                }
+                            }
+                        ));
+                    }
+                    other => {
+                        panic!("expected most-life PlayerAttribute restriction, got {other:?}")
+                    }
+                }
+            }
+            other => panic!("expected restricted Choose(Opponent), got {other:?}"),
+        }
+        let choose = ability
+            .sub_ability
+            .as_deref()
+            .expect("expected villainous ChooseOneOf sub-ability");
+        match &*choose.effect {
+            Effect::ChooseOneOf { chooser, branches } => {
+                assert_eq!(*chooser, PlayerFilter::ChosenPlayer { index: 0 });
+                assert_eq!(branches.len(), 2);
+                assert!(matches!(
+                    &*branches[0].effect,
+                    Effect::LoseLife {
+                        target: Some(TargetFilter::ScopedPlayer),
+                        ..
+                    }
+                ));
+                assert!(matches!(&*branches[1].effect, Effect::CopyTokenOf { .. }));
+            }
+            other => panic!("expected ChooseOneOf sub-ability, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn villainous_choice_supports_life_lost_restricted_chooser() {
         let ability = parse_effect_chain(
             "Each opponent who lost 3 or more life this turn faces a villainous choice — You draw a card, or that player discards a card.",
@@ -46973,7 +47384,7 @@ mod snapshot_tests {
             matches!(
                 choose.effect.as_ref(),
                 Effect::Choose {
-                    choice_type: ChoiceType::Opponent,
+                    choice_type: ChoiceType::Opponent { .. },
                     ..
                 }
             ),
@@ -47212,7 +47623,7 @@ mod snapshot_tests {
             matches!(
                 def.effect.as_ref(),
                 Effect::Choose {
-                    choice_type: ChoiceType::Opponent,
+                    choice_type: ChoiceType::Opponent { .. },
                     ..
                 }
             ),

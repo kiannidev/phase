@@ -7,6 +7,7 @@
 use engine::game::layers::evaluate_layers;
 use engine::game::restrictions::record_discard;
 use engine::game::scenario::{GameScenario, P0};
+use engine::game::{casting::can_cast_object_now, casting::spell_objects_available_to_cast};
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::actions::GameAction;
 use engine::types::game_state::{CastingVariant, StackEntryKind, WaitingFor};
@@ -85,8 +86,37 @@ fn mayhem_allows_cast_from_graveyard_after_discard_this_turn() {
     {
         let state = runner.state_mut();
         engine::game::zones::move_to_zone(state, spell, Zone::Graveyard, &mut Vec::new());
-        record_discard(state, P0, spell);
     }
+    evaluate_layers(runner.state_mut());
+
+    let card_id = runner.state().objects[&spell].card_id;
+    assert!(
+        runner.state().objects[&spell]
+            .keywords
+            .iter()
+            .any(|k| matches!(k, Keyword::Mayhem(_))),
+        "nonland spell must gain Mayhem from Green Goblin in the graveyard"
+    );
+    assert!(
+        !can_cast_object_now(runner.state(), P0, spell),
+        "Mayhem must not make the spell castable before it was discarded this turn"
+    );
+    assert!(
+        !spell_objects_available_to_cast(runner.state(), P0).contains(&spell),
+        "legal actions must not expose Mayhem before the discarded-this-turn gate"
+    );
+    assert!(
+        runner
+            .act(GameAction::CastSpell {
+                object_id: spell,
+                card_id,
+                targets: vec![],
+            })
+            .is_err(),
+        "direct CastSpell must reject a Mayhem card that was not discarded this turn"
+    );
+
+    record_discard(runner.state_mut(), P0, spell);
     evaluate_layers(runner.state_mut());
 
     assert!(
@@ -96,8 +126,15 @@ fn mayhem_allows_cast_from_graveyard_after_discard_this_turn() {
             .any(|k| matches!(k, Keyword::Mayhem(_))),
         "discarded nonland spell must gain Mayhem from Green Goblin"
     );
+    assert!(
+        can_cast_object_now(runner.state(), P0, spell),
+        "Mayhem must make the spell castable after it was discarded this turn"
+    );
+    assert!(
+        spell_objects_available_to_cast(runner.state(), P0).contains(&spell),
+        "legal actions must expose Mayhem after the discarded-this-turn gate"
+    );
 
-    let card_id = runner.state().objects[&spell].card_id;
     let result = runner
         .act(GameAction::CastSpell {
             object_id: spell,

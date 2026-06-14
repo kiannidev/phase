@@ -409,9 +409,10 @@ pub fn spell_objects_available_to_cast(state: &GameState, player: PlayerId) -> V
         })
     }));
 
-    // CR 702.34 / CR 702.81 / CR 702.127 / CR 702.138 / CR 702.180: Cards in
-    // graveyard with graveyard-cast keywords. Escape and Retrace must have
-    // enough eligible non-mana additional-cost material available.
+    // CR 702.34 / CR 702.81 / CR 702.127 / CR 702.138 / CR 702.180 / CR
+    // 702.187: Cards in graveyard with graveyard-cast keywords. Escape,
+    // Retrace, and Mayhem must have enough eligible non-mana gate material
+    // available.
     objects.extend(player_data.graveyard.iter().copied().filter(|&obj_id| {
         state.objects.get(&obj_id).is_some_and(|obj| {
             obj.owner == player
@@ -420,7 +421,8 @@ pub fn spell_objects_available_to_cast(state: &GameState, player: PlayerId) -> V
                     || has_flashback_keyword(state, obj_id)
                     || has_aftermath_keyword(state, obj_id)
                     || retrace_has_discardable_land(state, player, obj_id)
-                    || graveyard_has_enough_for_escape(state, player, obj_id))
+                    || graveyard_has_enough_for_escape(state, player, obj_id)
+                    || mayhem_castable_from_graveyard(state, player, obj_id))
         })
     }));
 
@@ -621,11 +623,10 @@ pub fn handle_foretell(
 }
 
 // CR 702.34 (Flashback) / CR 702.81 (Retrace) / CR 702.127 (Aftermath) /
-// CR 702.138 (Escape) / CR 702.180 (Harmonize) / CR 702.187 (Mayhem):
-// graveyard-cast alternative permissions. Sneak (CR 702.190a) is a HAND-cast
-// alt-cost and is deliberately NOT listed here — including it would
-// misclassify graveyard objects with a granted Sneak as castable from the
-// graveyard, which the rules do not permit.
+// CR 702.138 (Escape) / CR 702.180 (Harmonize): graveyard-cast alternative
+// permissions. Sneak (CR 702.190a) is a HAND-cast alt-cost and is deliberately
+// NOT listed here — including it would misclassify graveyard objects with a
+// granted Sneak as castable from the graveyard, which the rules do not permit.
 fn has_effective_graveyard_cast_keyword(
     state: &GameState,
     object_id: ObjectId,
@@ -637,7 +638,6 @@ fn has_effective_graveyard_cast_keyword(
             .keywords
             .iter()
             .any(|k| matches!(k, crate::types::keywords::Keyword::Harmonize(_)))
-        || super::keywords::effective_mayhem_cost(state, object_id).is_some()
         || has_flashback_keyword(state, object_id)
         || has_aftermath_keyword(state, object_id)
 }
@@ -652,7 +652,7 @@ fn mayhem_castable_from_graveyard(
         && state
             .objects
             .get(&object_id)
-            .is_some_and(|o| o.zone == Zone::Graveyard && o.controller == player)
+            .is_some_and(|o| o.zone == Zone::Graveyard && o.owner == player)
 }
 
 fn upsert_keyword_by_kind(keywords: &mut Vec<Keyword>, keyword: Keyword) {
@@ -2137,6 +2137,7 @@ fn prepare_spell_cast_with_variant_override_inner(
         );
     let has_graveyard_cast_keyword =
         obj.zone == Zone::Graveyard && has_effective_graveyard_cast_keyword(state, object_id, obj);
+    let has_mayhem = mayhem_castable_from_graveyard(state, player, object_id);
     // CR 601.2a + CR 117.1c: Graveyard cast via static permission (Lurrus, etc.).
     let graveyard_permission_src = if obj.zone == Zone::Graveyard && state.active_player == player {
         graveyard_permission_source(state, player, object_id)
@@ -2175,6 +2176,7 @@ fn prepare_spell_cast_with_variant_override_inner(
                     && obj.is_commander)
                 || has_madness
                 || has_graveyard_cast_keyword
+                || has_mayhem
                 || has_graveyard_permission
                 || has_top_of_library_permission));
     if !castable_zone {
@@ -2425,8 +2427,7 @@ fn prepare_spell_cast_with_variant_override_inner(
             CastingVariant::Retrace
         } else if harmonize_cost.is_some() {
             CastingVariant::Harmonize
-        } else if mayhem_cost.is_some() && state.discarded_object_ids_this_turn.contains(&object_id)
-        {
+        } else if has_mayhem {
             CastingVariant::Mayhem
         } else if flashback_cost.is_some() {
             CastingVariant::Flashback

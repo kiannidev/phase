@@ -1651,8 +1651,13 @@ pub(super) fn handle_resolution_choice(
             },
             GameAction::SelectCards { cards: chosen },
         ) => {
-            // CR 107.1c + CR 701.23d: "up to N" / "any number of" accept 0..=count picks.
-            let valid = if up_to {
+            // CR 701.23b/d: "up to N" OR a stated-quality constraint accepts a
+            // short/empty pick (fail-to-find); a pure quantity search needs
+            // exactly `count`. The subsequent `selection_satisfies_constraint`
+            // re-check validates the distinct-slot consistency of whatever was
+            // chosen, so widening the count bound here is safe.
+            let lower_bounded = up_to || constraint.permits_partial_find();
+            let valid = if lower_bounded {
                 chosen.len() <= count
             } else {
                 chosen.len() == count
@@ -1660,7 +1665,7 @@ pub(super) fn handle_resolution_choice(
             if !valid {
                 return Err(EngineError::InvalidAction(format!(
                     "Must select {}{} card(s), got {}",
-                    if up_to { "up to " } else { "exactly " },
+                    if lower_bounded { "up to " } else { "exactly " },
                     count,
                     chosen.len()
                 )));
@@ -2531,6 +2536,7 @@ pub(super) fn handle_resolution_choice(
                         // DOWN with the specified characteristics instead of
                         // resuming face up and exposing the real object.
                         face_down_profile: face_down_profile.clone(),
+                        library_placement: None,
                     };
                     let chosen_ids: Vec<_> = chosen.to_vec();
                     for (i, card_id) in chosen_ids.iter().enumerate() {
@@ -2557,6 +2563,7 @@ pub(super) fn handle_resolution_choice(
                                         // CR 708.2a + CR 708.3: preserve the
                                         // face-down profile across a further pause.
                                         face_down_profile: ctx.face_down_profile.clone(),
+                                        library_placement: ctx.library_placement.clone(),
                                         effect_kind,
                                     });
                                 return Ok(action_result_outcome(
@@ -2588,6 +2595,7 @@ pub(super) fn handle_resolution_choice(
                                         // CR 708.2a + CR 708.3: preserve the
                                         // face-down profile across a further pause.
                                         face_down_profile: ctx.face_down_profile.clone(),
+                                        library_placement: ctx.library_placement.clone(),
                                         effect_kind,
                                     });
                                 state.waiting_for =
@@ -3062,7 +3070,15 @@ pub(super) fn handle_resolution_choice(
             }
             state.ring_bearer.insert(player, Some(target));
             crate::game::layers::mark_layers_full(state);
-            ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
+            let waiting_for = finish_with_continuation(state, player, events);
+            // CR 603.2 + CR 701.54: RingTemptsYou observer triggers are batched
+            // while ChooseRingBearer pauses spell resolution (issue #1017).
+            if let Some(outcome) =
+                batch_or_drain_observer_triggers(state, events, events.len(), events.len())
+            {
+                return Ok(outcome);
+            }
+            ResolutionChoiceOutcome::WaitingFor(waiting_for)
         }
         (WaitingFor::ChooseDungeon { player, options }, GameAction::ChooseDungeon { dungeon }) => {
             if !options.contains(&dungeon) {

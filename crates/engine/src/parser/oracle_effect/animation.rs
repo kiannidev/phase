@@ -512,7 +512,7 @@ fn parse_animation_type_token(input: &str) -> OracleResult<'_, AnimationTypeToke
 }
 
 /// Parse a whitespace-separated sequence of type tokens, halting at the first
-/// non-type token. Used by [`parse_animation_types`] as the grammar root.
+/// non-type token. Used by [`parse_animation_type_parts`] as the grammar root.
 fn parse_animation_type_sequence(input: &str) -> OracleResult<'_, Vec<AnimationTypeToken>> {
     separated_list1(multispace1, parse_animation_type_token).parse(input)
 }
@@ -566,7 +566,7 @@ fn parse_animation_type_sequence_loose(input: &str) -> OracleResult<'_, Vec<Anim
 /// "in addition to {its/their/his/her} other [creature ]types" structural signal. The tail
 /// guarantees the preceding phrase is a type expression, so lowercase subtype
 /// words are safe to classify. Shared by [`parse_becomes_type_modifications`]
-/// and [`parse_animation_types`] so both the static-ability and effect-
+/// and [`parse_animation_type_parts`] so both the static-ability and effect-
 /// imperative paths decompose the descriptor identically.
 fn try_parse_type_sequence_with_suffix(input: &str) -> Option<Vec<AnimationTypeToken>> {
     // Strict path first — preserves existing behavior when the CR 205.3
@@ -775,10 +775,6 @@ fn parse_animation_type_parts(text: &str, infer_creature: bool) -> (Vec<Supertyp
     (supertypes, types)
 }
 
-fn parse_animation_types(text: &str, infer_creature: bool) -> Vec<String> {
-    parse_animation_type_parts(text, infer_creature).1
-}
-
 fn split_animation_keyword_clause(text: &str) -> (&str, Vec<Keyword>) {
     const NEEDLE: &str = " with ";
     let lower = text.to_lowercase();
@@ -870,46 +866,47 @@ mod test_den_bugbear {
         assert_eq!(spec.toughness, Some(2));
     }
 
-    /// Regression: parse_animation_types must halt at connectives and
+    /// Regression: parse_animation_type_parts must halt at connectives and
     /// punctuation rather than sweeping subsequent words in as subtypes.
     /// Previously a text like "Dragon, gets +5/+3, and gains flying and trample"
     /// produced subtypes ["Dragon", "Gets", "+5/+3", "And", "Gains", "Flying", "Trample"].
     #[test]
     fn animation_types_halts_at_connectives_and_punctuation() {
         assert_eq!(
-            parse_animation_types("Dragon", true),
+            parse_animation_type_parts("Dragon", true).1,
             vec!["Creature", "Dragon"]
         );
         assert_eq!(
-            parse_animation_types("artifact creature Golem", false),
+            parse_animation_type_parts("artifact creature Golem", false).1,
             vec!["Artifact", "Creature", "Golem"]
         );
 
         // Trailing comma on a valid subtype: accept the subtype, stop after.
         assert_eq!(
-            parse_animation_types("Dragon, gets +5/+3, and gains flying", true),
+            parse_animation_type_parts("Dragon, gets +5/+3, and gains flying", true).1,
             vec!["Creature", "Dragon"]
         );
 
         // Lowercase word immediately after subtype must terminate parsing.
         assert_eq!(
-            parse_animation_types("Golem until end of combat", false),
+            parse_animation_type_parts("Golem until end of combat", false).1,
             vec!["Golem"]
         );
 
         // P/T tokens and quoted triggers must not become subtypes.
         assert_eq!(
-            parse_animation_types("Cat X/X", true),
+            parse_animation_type_parts("Cat X/X", true).1,
             vec!["Creature", "Cat"]
         );
         assert_eq!(
-            parse_animation_types("Shade and gains \"{B}: This creature gets +1/+1\"", true),
+            parse_animation_type_parts("Shade and gains \"{B}: This creature gets +1/+1\"", true,)
+                .1,
             vec!["Creature", "Shade"],
         );
 
         // Leading lowercase connective before any subtype → nothing parseable.
         assert_eq!(
-            parse_animation_types("in addition to its other types and gains flying", false),
+            parse_animation_type_parts("in addition to its other types and gains flying", false).1,
             Vec::<String>::new()
         );
     }
@@ -1106,7 +1103,7 @@ mod test_den_bugbear {
         assert_eq!(types, vec!["Creature", "Angel"]);
 
         assert_eq!(
-            parse_animation_types("legendary Angel creature", false),
+            parse_animation_type_parts("legendary Angel creature", false).1,
             vec!["Creature", "Angel"]
         );
         let (supertypes, types) = parse_animation_type_parts("basic Forest", false);
@@ -1118,7 +1115,7 @@ mod test_den_bugbear {
         assert_eq!(supertypes, vec![Supertype::Snow]);
         assert_eq!(types, vec!["Creature", "Elemental"]);
         assert_eq!(
-            parse_animation_types("snow Creature Elemental", false),
+            parse_animation_type_parts("snow Creature Elemental", false).1,
             vec!["Creature", "Elemental"]
         );
     }
@@ -1311,9 +1308,9 @@ mod test_den_bugbear {
         // but lacking the structural signal we must reject lowercase input.
         assert!(parse_becomes_type_modifications("demon").is_empty());
 
-        // parse_animation_types exercises the same fallback.
+        // parse_animation_type_parts exercises the same fallback.
         assert_eq!(
-            parse_animation_types("demon in addition to its other types", false),
+            parse_animation_type_parts("demon in addition to its other types", false).1,
             vec!["Demon"]
         );
     }

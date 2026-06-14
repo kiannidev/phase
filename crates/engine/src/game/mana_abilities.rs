@@ -43,7 +43,32 @@ pub fn is_mana_ability(ability_def: &AbilityDefinition) -> bool {
     // `Effect::Mana::target` field (Jeska's Will mode 1: "Add {R} for each
     // card in target opponent's hand" — the spell targets, so it must use the
     // stack and is not a mana ability under CR 605).
-    ability_def.multi_target.is_none() && target_attached.is_none()
+    if ability_def.multi_target.is_some() || target_attached.is_some() {
+        return false;
+    }
+    // CR 605.1a: An activated mana ability cannot have any other effects.
+    // Vexing Puzzlebox ({T}: Add one mana of any color. Roll a d20.) must use
+    // the stack so the d20 resolves after mana production.
+    ability_def_chain_is_all_mana(ability_def)
+}
+
+/// True iff every reachable link in an activated ability's resolution graph
+/// (`sub_ability` and `else_ability` per CR 608.2c) is `Effect::Mana`.
+fn ability_def_chain_is_all_mana(def: &AbilityDefinition) -> bool {
+    if !matches!(&*def.effect, Effect::Mana { .. }) {
+        return false;
+    }
+    if let Some(sub) = def.sub_ability.as_deref() {
+        if !ability_def_chain_is_all_mana(sub) {
+            return false;
+        }
+    }
+    if let Some(else_branch) = def.else_ability.as_deref() {
+        if !ability_def_chain_is_all_mana(else_branch) {
+            return false;
+        }
+    }
+    true
 }
 
 /// CR 605.1b: A triggered ability is a mana ability iff all three hold:
@@ -2866,6 +2891,38 @@ mod tests {
         )
         .cost(AbilityCost::Tap);
         assert!(!is_mana_ability(&def));
+    }
+
+    #[test]
+    fn mana_with_roll_die_sub_is_not_mana_ability() {
+        // CR 605.1a: Vexing Puzzlebox — mana plus a d20 roll is not a mana ability.
+        let mut def = make_mana_ability(ManaProduction::AnyOneColor {
+            count: QuantityExpr::Fixed { value: 1 },
+            color_options: ManaColor::ALL.to_vec(),
+        });
+        def.sub_ability = Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 1 },
+                sides: 20,
+                results: vec![],
+                modifier: None,
+            },
+        )));
+        assert!(!is_mana_ability(&def));
+    }
+
+    #[test]
+    fn mana_with_mana_sub_remains_mana_ability() {
+        let mut def = make_mana_ability(ManaProduction::Fixed {
+            colors: vec![ManaColor::Blue],
+            contribution: ManaContribution::Base,
+        });
+        def.sub_ability = Some(Box::new(make_mana_ability(ManaProduction::Fixed {
+            colors: vec![ManaColor::Red],
+            contribution: ManaContribution::Base,
+        })));
+        assert!(is_mana_ability(&def));
     }
 
     #[test]

@@ -403,10 +403,11 @@ pub fn activate_mana_ability(
     if source.controller != player {
         return Err(EngineError::NotYourPriority);
     }
-    if !ability_def.can_activate_from_zone(source.zone) {
+    let required_zone = ability_def.activation_zone.unwrap_or(Zone::Battlefield);
+    if source.zone != required_zone {
         return Err(EngineError::InvalidAction(format!(
             "Object is not in the correct zone (expected {:?})",
-            ability_def.activation_zone.unwrap_or(Zone::Battlefield)
+            required_zone
         )));
     }
     // CR 602.5: enforce activation prohibitions at the executor, not just at
@@ -953,7 +954,8 @@ fn mana_ability_ready_without_simulation(
     // CR 113.6 + CR 113.6b: A permanent's abilities function only on the battlefield by
     // default; an ability that states which zones it functions in (activation_zone, e.g.
     // Hand/Graveyard mana abilities) functions only from those zones.
-    if !ability_def.can_activate_from_zone(obj.zone) {
+    let required_zone = ability_def.activation_zone.unwrap_or(Zone::Battlefield);
+    if obj.zone != required_zone {
         return false;
     }
     // CR 106.12 + CR 602.5a: A tap-cost mana ability requires an untapped source.

@@ -44,19 +44,13 @@ pub(crate) fn complete_discard_to_graveyard(
     applied: HashSet<crate::types::ReplacementId>,
     events: &mut Vec<GameEvent>,
 ) -> DiscardOutcome {
-    // CR 614.6 + CR 701.9a/701.9c: lower the accepted discard to an inner
-    // zone → graveyard `ZoneChange` carrying the outer pass's `applied` set,
-    // then run it through the pipeline so `Moved` redirects (Rest in Peace
-    // class) get their consult. Hand discards are the common case; cycling a
-    // permanent on the battlefield discards from the battlefield instead.
-    let from_zone = state
-        .objects
-        .get(&object_id)
-        .map(|obj| obj.zone)
-        .unwrap_or(Zone::Hand);
+    // CR 614.6 + CR 701.9a: lower the accepted discard to an inner hand →
+    // graveyard `ZoneChange` carrying the outer pass's `applied` set, then run
+    // it through the pipeline so `Moved` redirects (Rest in Peace class) get
+    // their consult. A plain discard previously moved raw and never saw them.
     let proposed = ProposedEvent::ZoneChange {
         object_id,
-        from: from_zone,
+        from: Zone::Hand,
         to: Zone::Graveyard,
         cause: source_id,
         attach_to: None,
@@ -994,28 +988,6 @@ mod tests {
                 .copied(),
             Some(1)
         );
-    }
-
-    #[test]
-    fn discard_as_cost_from_battlefield_moves_to_graveyard() {
-        let mut state = GameState::new_two_player(42);
-        let land = create_object(
-            &mut state,
-            CardId(2),
-            PlayerId(0),
-            "Triome".to_string(),
-            Zone::Battlefield,
-        );
-        state.battlefield.push_back(land);
-        let mut events = Vec::new();
-
-        let outcome = discard_as_cost(&mut state, land, PlayerId(0), &mut events);
-
-        assert!(matches!(outcome, DiscardOutcome::Complete));
-        assert_eq!(state.objects[&land].zone, Zone::Graveyard);
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, GameEvent::Discarded { object_id, .. } if *object_id == land)));
     }
 
     #[test]

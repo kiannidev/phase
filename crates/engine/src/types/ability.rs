@@ -11641,37 +11641,6 @@ impl AbilityDefinition {
         self.cost.as_ref().is_some_and(AbilityCost::consumes_source)
     }
 
-    /// CR 602.1: Whether this activated ability may begin activation while the
-    /// source object is in `obj_zone`. Cycling (CR 702.29) functions from hand
-    /// or from the battlefield; other hand-only abilities (Channel, Transmute)
-    /// stay hand-only via their explicit `activation_zone`.
-    pub fn can_activate_from_zone(&self, obj_zone: Zone) -> bool {
-        if self.is_cycling_ability() {
-            return matches!(obj_zone, Zone::Hand | Zone::Battlefield);
-        }
-        let required = self.activation_zone.unwrap_or(Zone::Battlefield);
-        obj_zone == required
-    }
-
-    /// CR 702.29: Basic and typecycling activated abilities discard the source
-    /// card and may be activated from hand or from the battlefield.
-    pub fn is_cycling_ability(&self) -> bool {
-        if self.ability_tag == Some(AbilityTag::Cycling) {
-            return true;
-        }
-        if self.activation_zone != Some(Zone::Hand) || !self.consumes_source() {
-            return false;
-        }
-        // Transmute shares discard-self + search but is hand-only sorcery speed.
-        if self.is_sorcery_speed() {
-            return false;
-        }
-        matches!(
-            self.effect.as_ref(),
-            Effect::Draw { .. } | Effect::SearchLibrary { .. }
-        )
-    }
-
     pub fn player_scope(mut self, scope: PlayerFilter) -> Self {
         self.player_scope = Some(scope);
         self

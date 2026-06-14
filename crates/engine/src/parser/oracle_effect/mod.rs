@@ -12498,15 +12498,28 @@ fn try_parse_cast_effect(lower: &str) -> Option<Effect> {
         .unwrap_or_else(|| super::oracle_target::parse_type_phrase(cast_target_rest).0);
     if cast_filter_has_typed_leaf(&filter) {
         apply_cast_target_suffixes(&mut filter, rest);
+        let alt_ability_cost = parse_alt_ability_cost_rider(lower);
+        let hand_origin = matches!(
+            &filter,
+            TargetFilter::Typed(tf)
+                if tf.properties.iter().any(|prop| {
+                    matches!(prop, FilterProp::InZone { zone: Zone::Hand })
+                })
+        );
+        let driver = if without_paying && alt_ability_cost.is_none() && hand_origin {
+            crate::types::ability::CastFromZoneDriver::DuringResolution
+        } else {
+            crate::types::ability::CastFromZoneDriver::LingeringPermission
+        };
         return Some(Effect::CastFromZone {
             target: filter,
             without_paying_mana_cost: without_paying,
             mode,
             cast_transformed: false,
-            alt_ability_cost: None,
+            alt_ability_cost,
             constraint,
             duration: None,
-            driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+            driver,
         });
     }
 
@@ -13000,6 +13013,13 @@ fn is_choose_as_targeting(rest: &str) -> bool {
     if !scan_contains_phrase(rest, "from among")
         && (scan_contains_phrase(rest, "they control") || scan_contains_phrase(rest, "you control"))
     {
+        return true;
+    }
+
+    // CR 108.3 + CR 701.38d: Passive ownership form "owned by <player-ref>".
+    // Expropriate: "choose a permanent owned by the voter and gain control of it."
+    // The ownership suffix scopes the candidate pool to a specific player.
+    if scan_contains_phrase(rest, "owned by") {
         return true;
     }
 

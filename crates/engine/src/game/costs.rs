@@ -756,6 +756,29 @@ fn pay_ability_cost_inner(
                 None,
             );
         }
+        // CR 118.3 + CR 601.2h: Self-return costs such as Recurring Nightmare
+        // and Maze's End are automatic once chosen; non-self returns use the
+        // WaitingFor::PayCost detour before payment begins.
+        AbilityCost::ReturnToHand {
+            count,
+            filter: Some(TargetFilter::SelfRef),
+            from_zone: _,
+        } => {
+            if *count != 1 {
+                return Ok(payment_failed(
+                    "self return-to-hand cost must return exactly one permanent",
+                ));
+            }
+            let Some(obj) = state.objects.get(&source_id) else {
+                return Ok(payment_failed("source not found for return-to-hand cost"));
+            };
+            if obj.zone != Zone::Battlefield {
+                return Ok(payment_failed(
+                    "cannot return source to hand: source is not on the battlefield",
+                ));
+            }
+            super::zones::move_to_zone(state, source_id, Zone::Hand, events);
+        }
         // Other cost types require interactive resolution and are intercepted
         // before reaching pay_ability_cost, or are not yet auto-payable.
         AbilityCost::Untap

@@ -630,7 +630,7 @@ fn collect_matching_triggers(
                 .map(|trigger_event| vec![trigger_event])
                 .collect()
             } else if matches!(trig_def.mode, TriggerMode::DamageDone)
-                && matches!(trig_def.valid_source, Some(TargetFilter::AttachedTo))
+                && trig_def.valid_source.is_some()
                 && matches!(event, GameEvent::CombatDamageDealtToPlayer { .. })
             {
                 super::trigger_matchers::matching_damage_done_events(event, trig_def, obj_id, state)

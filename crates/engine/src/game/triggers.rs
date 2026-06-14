@@ -17584,14 +17584,14 @@ mod dedup_regression_tests {
         );
 
         // Only the controller discarded → still no opponent discard → condition unmet.
-        crate::game::restrictions::record_discard(&mut state, controller);
+        crate::game::restrictions::record_discard(&mut state, controller, ObjectId(9001));
         assert!(
             !check_trigger_condition(&state, &condition, controller, None, None),
             "self-discard must not satisfy 'an opponent discarded a card this turn'"
         );
 
         // Opponent discarded → condition met.
-        crate::game::restrictions::record_discard(&mut state, opponent);
+        crate::game::restrictions::record_discard(&mut state, opponent, ObjectId(9002));
         assert!(
             check_trigger_condition(&state, &condition, controller, None, None),
             "opponent-discard must satisfy 'an opponent discarded a card this turn'"

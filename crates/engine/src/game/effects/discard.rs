@@ -99,7 +99,7 @@ pub fn resolve(
                             ..
                         } => {
                             zones::move_to_zone(state, oid, Zone::Graveyard, events);
-                            crate::game::restrictions::record_discard(state, pid);
+                            crate::game::restrictions::record_discard(state, pid, oid);
                             events.push(GameEvent::Discarded {
                                 player_id: pid,
                                 object_id: oid,
@@ -112,7 +112,7 @@ pub fn resolve(
                             );
                             // CR 702.35: The card was still discarded — record and emit event
                             // so "whenever you discard" triggers fire.
-                            crate::game::restrictions::record_discard(state, player_id);
+                            crate::game::restrictions::record_discard(state, player_id, oid);
                             events.push(GameEvent::Discarded {
                                 player_id,
                                 object_id: oid,
@@ -256,7 +256,7 @@ pub(crate) fn discard_as_cost_with_source(
                 ..
             } => {
                 zones::move_to_zone(state, oid, Zone::Graveyard, events);
-                crate::game::restrictions::record_discard(state, pid);
+                crate::game::restrictions::record_discard(state, pid, oid);
                 events.push(GameEvent::Discarded {
                     player_id: pid,
                     object_id: oid,
@@ -269,7 +269,7 @@ pub(crate) fn discard_as_cost_with_source(
                 change_zone::deliver_replaced_zone_change(
                     state, zone_event, None, None, false, events,
                 );
-                crate::game::restrictions::record_discard(state, player);
+                crate::game::restrictions::record_discard(state, player, oid);
                 events.push(GameEvent::Discarded {
                     player_id: player,
                     object_id: oid,

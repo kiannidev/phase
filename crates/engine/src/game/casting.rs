@@ -621,10 +621,11 @@ pub fn handle_foretell(
 }
 
 // CR 702.34 (Flashback) / CR 702.81 (Retrace) / CR 702.127 (Aftermath) /
-// CR 702.138 (Escape) / CR 702.180 (Harmonize): graveyard-cast alternative
-// permissions. Sneak (CR 702.190a) is a HAND-cast alt-cost and is deliberately
-// NOT listed here — including it would misclassify graveyard objects with a
-// granted Sneak as castable from the graveyard, which the rules do not permit.
+// CR 702.138 (Escape) / CR 702.180 (Harmonize) / CR 702.187 (Mayhem):
+// graveyard-cast alternative permissions. Sneak (CR 702.190a) is a HAND-cast
+// alt-cost and is deliberately NOT listed here — including it would
+// misclassify graveyard objects with a granted Sneak as castable from the
+// graveyard, which the rules do not permit.
 fn has_effective_graveyard_cast_keyword(
     state: &GameState,
     object_id: ObjectId,
@@ -636,8 +637,22 @@ fn has_effective_graveyard_cast_keyword(
             .keywords
             .iter()
             .any(|k| matches!(k, crate::types::keywords::Keyword::Harmonize(_)))
+        || super::keywords::effective_mayhem_cost(state, object_id).is_some()
         || has_flashback_keyword(state, object_id)
         || has_aftermath_keyword(state, object_id)
+}
+
+fn mayhem_castable_from_graveyard(
+    state: &GameState,
+    player: PlayerId,
+    object_id: ObjectId,
+) -> bool {
+    super::keywords::effective_mayhem_cost(state, object_id).is_some()
+        && state.discarded_object_ids_this_turn.contains(&object_id)
+        && state
+            .objects
+            .get(&object_id)
+            .is_some_and(|o| o.zone == Zone::Graveyard && o.controller == player)
 }
 
 fn upsert_keyword_by_kind(keywords: &mut Vec<Keyword>, keyword: Keyword) {
@@ -2013,6 +2028,9 @@ fn casting_variant_candidates(
         {
             candidates.push(CastingVariant::Harmonize);
         }
+        if mayhem_castable_from_graveyard(state, player, object_id) {
+            candidates.push(CastingVariant::Mayhem);
+        }
         if super::keywords::effective_flashback_cost(state, object_id).is_some() {
             candidates.push(CastingVariant::Flashback);
         }
@@ -2306,6 +2324,13 @@ fn prepare_spell_cast_with_variant_override_inner(
         None
     };
 
+    // CR 702.187b: Mayhem — use mayhem cost when casting a discarded card from graveyard.
+    let mayhem_cost = if obj.zone == Zone::Graveyard {
+        super::keywords::effective_mayhem_cost(state, object_id)
+    } else {
+        None
+    };
+
     // CR 702.34a: Flashback — use flashback cost when casting from graveyard.
     let flashback_cost = if obj.zone == Zone::Graveyard {
         super::keywords::effective_flashback_cost(state, object_id)
@@ -2343,7 +2368,7 @@ fn prepare_spell_cast_with_variant_override_inner(
     let (flashback_mana_cost, flashback_non_mana_cost) =
         split_flashback_cost_components(flashback_cost.as_ref());
 
-    // Precedence: Escape > Retrace > Harmonize > Flashback > Aftermath > GraveyardPermission > Warp > Normal.
+    // Precedence: Escape > Retrace > Harmonize > Mayhem > Flashback > Aftermath > GraveyardPermission > Warp > Normal.
     // No standard card has multiple graveyard-cast keywords; if one did, the card's own
     // keyword overrides an external source's grant (GraveyardPermission).
     //
@@ -2400,6 +2425,9 @@ fn prepare_spell_cast_with_variant_override_inner(
             CastingVariant::Retrace
         } else if harmonize_cost.is_some() {
             CastingVariant::Harmonize
+        } else if mayhem_cost.is_some() && state.discarded_object_ids_this_turn.contains(&object_id)
+        {
+            CastingVariant::Mayhem
         } else if flashback_cost.is_some() {
             CastingVariant::Flashback
         } else if obj.zone == Zone::Graveyard
@@ -2648,6 +2676,11 @@ fn prepare_spell_cast_with_variant_override_inner(
     } else {
         None
     };
+    let effective_mayhem_cost_for_path = if casting_variant == CastingVariant::Mayhem {
+        mayhem_cost
+    } else {
+        None
+    };
     let effective_flashback_mana_cost_for_path = if casting_variant == CastingVariant::Flashback {
         flashback_mana_cost
     } else {
@@ -2674,6 +2707,7 @@ fn prepare_spell_cast_with_variant_override_inner(
             .or(impending_cost)
             .or(effective_escape_cost_for_path)
             .or(effective_harmonize_cost_for_path)
+            .or(effective_mayhem_cost_for_path)
             .or(effective_flashback_mana_cost_for_path)
             .or(effective_sneak_cost_for_path)
             .or(effective_web_slinging_cost_for_path)
@@ -6615,6 +6649,15 @@ fn can_cast_prepared_now(
     // CR 702.81a: Retrace requires a discardable land card in hand.
     if prepared.casting_variant == CastingVariant::Retrace
         && !casting_costs::can_pay_retrace_additional_cost(state, player, prepared.object_id)
+    {
+        return false;
+    }
+
+    // CR 702.187b: Mayhem requires that you discarded this card this turn.
+    if prepared.casting_variant == CastingVariant::Mayhem
+        && !state
+            .discarded_object_ids_this_turn
+            .contains(&prepared.object_id)
     {
         return false;
     }

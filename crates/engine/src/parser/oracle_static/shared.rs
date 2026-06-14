@@ -305,6 +305,7 @@ pub(crate) fn target_filter_is_your_graveyard(filter: &TargetFilter) -> bool {
 pub(crate) enum GraveyardGrantedKeywordKind {
     Flashback,
     Escape,
+    Mayhem,
 }
 
 impl GraveyardGrantedKeywordKind {
@@ -315,6 +316,9 @@ impl GraveyardGrantedKeywordKind {
             }
             GraveyardGrantedKeywordKind::Escape => {
                 keyword.kind() == crate::types::keywords::KeywordKind::Escape
+            }
+            GraveyardGrantedKeywordKind::Mayhem => {
+                keyword.kind() == crate::types::keywords::KeywordKind::Mayhem
             }
         }
     }

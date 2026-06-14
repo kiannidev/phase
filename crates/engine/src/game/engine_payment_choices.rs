@@ -901,7 +901,7 @@ pub(super) fn handle_ward_discard_choice(
     }
 
     zones::move_to_zone(state, chosen[0], Zone::Graveyard, events);
-    restrictions::record_discard(state, player);
+    restrictions::record_discard(state, player, chosen[0]);
     events.push(GameEvent::Discarded {
         player_id: player,
         object_id: chosen[0],

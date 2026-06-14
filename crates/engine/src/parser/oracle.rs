@@ -644,6 +644,27 @@ fn parse_graveyard_keyword_continuation(
                 exile_count,
             })
         }
+        GraveyardGrantedKeywordKind::Mayhem => {
+            let (_, rest) = nom_on_lower(text, &lower, |i| {
+                value((), tag("the mayhem cost is equal to ")).parse(i)
+            })?;
+            let rest_lower = rest.to_lowercase();
+            let (_, rest) = nom_on_lower(rest, &rest_lower, |i| {
+                value(
+                    (),
+                    alt((
+                        tag("that card's mana cost"),
+                        tag("the card's mana cost"),
+                        tag("its mana cost"),
+                    )),
+                )
+                .parse(i)
+            })?;
+            if !continuation_fully_consumed(rest) {
+                return None;
+            }
+            Some(Keyword::Mayhem(ManaCost::SelfManaCost))
+        }
     }
 }
 

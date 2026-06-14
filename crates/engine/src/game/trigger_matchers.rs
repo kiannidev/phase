@@ -1139,6 +1139,12 @@ pub(super) fn match_damage_done(
         ..
     } = event
     {
+        // Self-referential creature triggers already fire on per-source `DamageDealt`
+        // events. Only equipment-style observers (`AttachedTo`) listen on the
+        // aggregate combat-damage event.
+        if !matches!(trigger.valid_source, Some(TargetFilter::AttachedTo)) {
+            return false;
+        }
         !matching_combat_damage_to_player_sources(
             trigger,
             source_id,
@@ -1163,7 +1169,9 @@ pub(super) fn matching_damage_done_events(
     source_id: ObjectId,
     state: &GameState,
 ) -> Vec<GameEvent> {
-    if trigger.mode != TriggerMode::DamageDone || trigger.valid_source.is_none() {
+    if trigger.mode != TriggerMode::DamageDone
+        || !matches!(trigger.valid_source, Some(TargetFilter::AttachedTo))
+    {
         return Vec::new();
     }
 
@@ -6843,6 +6851,7 @@ mod tests {
             .push(CoreType::Creature);
 
         let mut trigger = make_trigger(TriggerMode::DamageDone);
+        trigger.valid_source = Some(TargetFilter::SelfRef);
         trigger.valid_target = Some(TargetFilter::Player);
         trigger.damage_kind = DamageKindFilter::CombatOnly;
 
@@ -6852,7 +6861,10 @@ mod tests {
             total_damage: 2,
         };
 
-        assert!(match_damage_done(&event, &trigger, attacker, &state));
+        assert!(
+            !match_damage_done(&event, &trigger, attacker, &state),
+            "SelfRef triggers must not match aggregate combat damage"
+        );
         assert!(matching_damage_done_events(&event, &trigger, attacker, &state).is_empty());
     }
 

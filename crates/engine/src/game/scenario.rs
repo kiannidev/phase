@@ -951,9 +951,14 @@ impl<'a> CardBuilder<'a> {
         self
     }
 
-    /// Set the mana cost of this card.
+    /// Set the mana cost of this card and derive its color identity from that cost.
     pub fn with_mana_cost(&mut self, cost: crate::types::mana::ManaCost) -> &mut Self {
-        self.obj().mana_cost = cost;
+        let obj = self.obj();
+        obj.mana_cost = cost.clone();
+        obj.base_mana_cost = cost.clone();
+        let color = crate::game::printed_cards::derive_colors_from_mana_cost(&cost);
+        obj.color = color.clone();
+        obj.base_color = color;
         self
     }
 

@@ -8134,7 +8134,7 @@ fn try_parse_special_trigger_pattern(lower: &str) -> Option<(TriggerMode, Trigge
 
     // CR 700.4 + CR 120.1 + CR 608.2i: "another creature dealt damage this turn
     // by [source filter] dies" (Shelob, Child of Ungoliant).
-    let damaged_this_turn_prefix = alt((
+    let mut damaged_this_turn_prefix = alt((
         tag::<_, _, OracleError<'_>>("whenever another creature dealt damage this turn by "),
         tag("when another creature dealt damage this turn by "),
     ));

@@ -23,10 +23,6 @@
 //! CR 712.14 / 712.14a: a double-faced card put onto the battlefield
 //! transformed enters with its back face up.
 
-use std::path::Path;
-use std::sync::OnceLock;
-
-use engine::database::card_db::CardDatabase;
 use engine::game::scenario::{GameScenario, P0};
 use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::ability::TargetRef;
@@ -38,14 +34,8 @@ use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
-fn load_db() -> Option<&'static CardDatabase> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../client/public/card-data.json");
-    if !path.exists() {
-        return None;
-    }
-    static DB: OnceLock<CardDatabase> = OnceLock::new();
-    Some(DB.get_or_init(|| CardDatabase::from_export(&path).expect("export should load")))
-}
+use crate::support::shared_card_db as load_db;
+use engine::types::game_state::CastPaymentMode;
 
 /// Drive the full pipeline: a Cat dies → Ajani's trigger fires → the player
 /// accepts the optional "you may" → Ajani returns to the battlefield
@@ -103,6 +93,8 @@ fn ajani_nacatl_pariah_returns_transformed_when_another_cat_dies() {
             object_id: bolt,
             card_id: bolt_card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("cast Lightning Bolt");
     if matches!(result.waiting_for, WaitingFor::TargetSelection { .. }) {

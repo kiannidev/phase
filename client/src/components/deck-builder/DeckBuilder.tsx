@@ -99,15 +99,15 @@ export function DeckBuilder({
   const searchActive = hasSearchCriteria(searchFilters);
   const deckCount = deck.main.reduce((sum, e) => sum + e.count, 0) + commanders.length;
 
-  // Filters are a collapsible rail (lg+) / overlay sheet (below lg), shown on
-  // demand so the deck canvas owns the space by default. useIsMobile flips at the
-  // same 1024px boundary as the rail's `lg:static`, so it cleanly distinguishes
-  // "modal sheet" (mobile/tablet) from "inline rail" (desktop) — only the former
-  // gets dialog semantics + a focus trap.
-  const isMobile = useIsMobile();
+  // Filters are an inline sidebar (≥820px) / overlay sheet (below 820px), shown on
+  // demand so the deck canvas owns the space by default. The 820px breakpoint
+  // matches the shell rail's appearance and the sheet's `min-[820px]:static`, so it
+  // cleanly distinguishes "modal sheet" (narrow, rail hidden) from "inline sidebar"
+  // (rail visible) — only the former gets dialog semantics + a focus trap.
+  const isNarrow = useIsMobile(820);
   const filterPanelRef = useRef<HTMLDivElement>(null);
   const [filtersOpen, setFiltersOpen] = useState(false);
-  const filtersAsDialog = filtersOpen && isMobile;
+  const filtersAsDialog = filtersOpen && isNarrow;
   useEffect(() => {
     if (!filtersOpen) return;
     const onKey = (e: KeyboardEvent) => {
@@ -221,7 +221,7 @@ export function DeckBuilder({
   const infoVisible = activeSurface === "info" ? "flex" : "hidden md:flex";
 
   return (
-    <div className="flex h-screen flex-col bg-transparent">
+    <div className="flex h-full min-h-0 flex-col bg-transparent">
       <DeckBuilderToolbar
         onBack={requestBack}
         deckName={deckName}
@@ -250,7 +250,7 @@ export function DeckBuilder({
             type="button"
             aria-label={t("filters.close")}
             onClick={() => setFiltersOpen(false)}
-            className="fixed inset-0 z-30 bg-black/60 lg:hidden"
+            className="fixed inset-0 z-30 bg-black/60 min-[820px]:hidden"
           />
         )}
 
@@ -264,7 +264,13 @@ export function DeckBuilder({
           aria-label={filtersAsDialog ? t("filters.title") : undefined}
           className={
             filtersOpen
-              ? "fixed inset-y-0 left-0 z-40 flex w-[min(20rem,85vw)] flex-col border-r border-white/10 bg-[#0b1020]/96 backdrop-blur-md lg:static lg:z-auto lg:w-64 lg:bg-black/12"
+              ? // Overlay sheet below 820px (where the shell rail is hidden, so a
+                // fixed left-0 sheet is unobstructed). At ≥820px — exactly where the
+                // rail appears — the sheet becomes an inline `static` sidebar that
+                // flows inside the rail-offset content column, so it can never be
+                // painted over by the rail. Breakpoint matches the rail's so there
+                // is no in-between band.
+                "fixed inset-y-0 left-0 z-40 flex w-[min(20rem,85vw)] flex-col border-r border-white/10 bg-[#0b1020]/96 backdrop-blur-md min-[820px]:static min-[820px]:left-auto min-[820px]:z-auto min-[820px]:w-64 min-[820px]:bg-black/12"
               : "hidden"
           }
         >
@@ -278,7 +284,7 @@ export function DeckBuilder({
               {t("filters.done")}
             </button>
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto pb-16">
+          <div className="thin-scrollbar min-h-0 flex-1 overflow-y-auto pb-16">
             <CardSearch
               onResults={handleSearchResults}
               onSearchTrigger={handleSearchTrigger}
@@ -350,7 +356,7 @@ export function DeckBuilder({
 
           <div className="min-h-0 flex-1 overflow-hidden">
             {searchActive ? (
-              <div className="h-full overflow-y-auto pb-16">
+              <div className="thin-scrollbar h-full overflow-y-auto pb-16">
                 <CardGrid
                   cards={searchResults}
                   onAddCard={handleAddCard}
@@ -367,7 +373,7 @@ export function DeckBuilder({
               // swallow the canvas.
               <div className="flex h-full flex-col">
                 {warnings.length > 0 && (
-                  <div className="max-h-32 shrink-0 space-y-0.5 overflow-y-auto border-b border-white/8 px-3 py-2">
+                  <div className="thin-scrollbar max-h-32 shrink-0 space-y-0.5 overflow-y-auto border-b border-white/8 px-3 py-2">
                     {warnings.map((w) => (
                       <div
                         key={w}
@@ -380,7 +386,7 @@ export function DeckBuilder({
                 )}
                 <div className="min-h-0 flex-1 overflow-hidden">
                   {deckView === "list" ? (
-                    <div className="h-full overflow-y-auto px-3 pt-3 pb-16">
+                    <div className="thin-scrollbar h-full overflow-y-auto px-3 pt-3 pb-16">
                       <DeckList
                         deck={currentDeck}
                         onRemoveCard={handleRemoveCard}
@@ -424,7 +430,7 @@ export function DeckBuilder({
           aria-labelledby={tabId("info")}
           className={`${infoVisible} min-h-0 w-full flex-col overflow-hidden border-white/8 bg-black/12 backdrop-blur-sm md:w-80 md:shrink-0 md:border-l lg:w-96`}
         >
-          <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-3 pt-3 pb-16">
+          <div className="thin-scrollbar flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-3 pt-3 pb-16">
             {isCommander && (
               <CommanderPanel
                 commanders={commanders}

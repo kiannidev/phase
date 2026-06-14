@@ -10,10 +10,6 @@
 //!    multicolored creature in hand — paying {G}{W}{U} and returning a tapped
 //!    creature you control (CR 702.188a + CR 604.1).
 
-use std::path::Path;
-use std::sync::OnceLock;
-
-use engine::database::card_db::CardDatabase;
 use engine::game::scenario::{GameScenario, P0};
 use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::actions::GameAction;
@@ -24,15 +20,8 @@ use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
-fn load_db() -> Option<&'static CardDatabase> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../client/public/card-data.json");
-    if !path.exists() {
-        eprintln!("skipping: client/public/card-data.json not generated");
-        return None;
-    }
-    static DB: OnceLock<CardDatabase> = OnceLock::new();
-    Some(DB.get_or_init(|| CardDatabase::from_export(&path).expect("export should load")))
-}
+use crate::support::shared_card_db as load_db;
+use engine::types::game_state::CastPaymentMode;
 
 /// CR 712.11b: casting the modal DFC lets the caster choose the back face, so
 /// Amazing Spider-Man (4/4) comes down directly from hand for {1}{G}{W}{U}.
@@ -79,6 +68,8 @@ fn peter_parker_back_face_amazing_spider_man_is_castable_from_hand() {
             object_id: card,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("CastSpell on Peter Parker accepted");
     assert!(
@@ -166,6 +157,8 @@ fn amazing_spider_man_grants_web_slinging_to_a_big_legendary_creature_in_hand() 
             hand_object: niv,
             card_id: niv_card_id,
             creature_to_return: mana_dork,
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("web-sling cast accepted");
     runner.advance_until_stack_empty();

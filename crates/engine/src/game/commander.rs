@@ -21,7 +21,7 @@ pub fn commander_tax(state: &GameState, commander_id: ObjectId) -> u32 {
 pub fn record_commander_cast(state: &mut GameState, commander_id: ObjectId) {
     *state.commander_cast_count.entry(commander_id).or_insert(0) += 1;
     if let Some(obj) = state.objects.get(&commander_id) {
-        if obj.is_commander {
+        if obj.uses_command_zone_rules() {
             state.commander_cast_owners.insert(commander_id, obj.owner);
         }
     }
@@ -52,7 +52,7 @@ fn cast_owner_for_command_zone_count(
     state
         .objects
         .get(&commander_id)
-        .filter(|obj| obj.is_commander)
+        .filter(|obj| obj.uses_command_zone_rules())
         .map(|obj| obj.owner)
 }
 
@@ -64,7 +64,8 @@ pub fn controls_any_commander(state: &GameState, player: PlayerId) -> bool {
         state
             .objects
             .get(id)
-            .is_some_and(|obj| obj.controller == player && obj.is_commander)
+            // CR 702.26b: a phased-out permanent is treated as though it does not exist.
+            .is_some_and(|obj| obj.is_commander && obj.controller == player && obj.is_phased_in())
     })
 }
 
@@ -77,7 +78,13 @@ pub fn controls_own_commander(state: &GameState, player: PlayerId) -> bool {
         state
             .objects
             .get(id)
-            .is_some_and(|obj| obj.is_commander && obj.owner == player && obj.controller == player)
+            // CR 702.26b: a phased-out permanent is treated as though it does not exist.
+            .is_some_and(|obj| {
+                obj.is_commander
+                    && obj.owner == player
+                    && obj.controller == player
+                    && obj.is_phased_in()
+            })
     })
 }
 
@@ -120,7 +127,9 @@ pub fn commander_lethal_headroom(
 /// deep interception of every `move_to_zone` call site.
 pub fn commander_eligible_for_zone_return(state: &GameState) -> Option<(ObjectId, PlayerId, Zone)> {
     state.objects.values().find_map(|obj| {
-        if !obj.is_commander {
+        // Oathbreaker RC: signature spells return to the command zone just like
+        // commanders.
+        if !obj.uses_command_zone_rules() {
             return None;
         }
         // CR 903.9a: graveyard or exile; CR 903.9b: hand or library.
@@ -427,6 +436,28 @@ mod tests {
         assert_eq!(commander_casts_from_command_zone(&state, PlayerId(1)), 1);
     }
 
+    #[test]
+    fn command_zone_cast_count_includes_signature_spells() {
+        let mut state = setup_commander_game();
+        let sig_id = create_object(
+            &mut state,
+            CardId(50),
+            PlayerId(0),
+            "Signature Spell".to_string(),
+            Zone::Command,
+        );
+        state
+            .objects
+            .get_mut(&sig_id)
+            .expect("signature object exists")
+            .mark_signature_spell();
+
+        record_commander_cast(&mut state, sig_id);
+
+        assert_eq!(commander_tax(&state, sig_id), 2);
+        assert_eq!(commander_casts_from_command_zone(&state, PlayerId(0)), 1);
+    }
+
     // --- Zone Return Eligibility Tests (CR 903.9a/b) ---
 
     #[test]
@@ -504,6 +535,28 @@ mod tests {
 
         assert!(commander_eligible_for_zone_return(&state).is_none());
         let _ = obj_id; // suppress unused warning
+    }
+
+    // --- Control-Condition Phasing Tests (CR 702.26b) ---
+
+    #[test]
+    fn phased_out_commander_excluded_from_control_conditions() {
+        use crate::game::game_object::PhaseOutCause;
+        use crate::game::phasing::phase_out_object;
+
+        let mut state = setup_commander_game();
+        let cmd_id = create_commander_in_command_zone(&mut state, PlayerId(0), "Kaalia", vec![]);
+        let mut events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, cmd_id, Zone::Battlefield, &mut events);
+
+        // Phased in: both "you control a commander" conditions hold.
+        assert!(controls_any_commander(&state, PlayerId(0)));
+        assert!(controls_own_commander(&state, PlayerId(0)));
+
+        // CR 702.26b: a phased-out commander is treated as though it does not exist.
+        phase_out_object(&mut state, cmd_id, PhaseOutCause::Directly, &mut events);
+        assert!(!controls_any_commander(&state, PlayerId(0)));
+        assert!(!controls_own_commander(&state, PlayerId(0)));
     }
 
     // --- Color Identity Tests ---
@@ -904,7 +957,7 @@ mod tests {
             player_data.mana_pool.add(ManaUnit {
                 color: ManaType::Red,
                 source_id: crate::types::identifiers::ObjectId(0),
-                snow: false,
+                supertype: None,
                 source_could_produce_two_or_more_colors: false,
                 restrictions: Vec::new(),
                 grants: vec![],
@@ -980,7 +1033,7 @@ mod tests {
             player_data.mana_pool.add(ManaUnit {
                 color: ManaType::Red,
                 source_id: crate::types::identifiers::ObjectId(0),
-                snow: false,
+                supertype: None,
                 source_could_produce_two_or_more_colors: false,
                 restrictions: Vec::new(),
                 grants: vec![],
@@ -1070,7 +1123,7 @@ mod tests {
         player_data.mana_pool.add(ManaUnit {
             color: ManaType::Colorless,
             source_id: crate::types::identifiers::ObjectId(0),
-            snow: false,
+            supertype: None,
             source_could_produce_two_or_more_colors: false,
             restrictions: Vec::new(),
             grants: vec![],
@@ -1084,6 +1137,8 @@ mod tests {
             object_id: cmd_id,
             card_id,
             targets: Vec::new(),
+
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
         };
         let result = apply_as_current(&mut state, cast).expect("announce commander cast");
         match &result.waiting_for {
@@ -1170,7 +1225,7 @@ mod tests {
         player_data.mana_pool.add(ManaUnit {
             color: ManaType::Colorless,
             source_id: crate::types::identifiers::ObjectId(0),
-            snow: false,
+            supertype: None,
             source_could_produce_two_or_more_colors: false,
             restrictions: Vec::new(),
             grants: vec![],
@@ -1184,6 +1239,8 @@ mod tests {
             object_id: cmd_id,
             card_id,
             targets: Vec::new(),
+
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
         };
         let result = apply_as_current(&mut state, cast).expect("announce commander cast");
         assert!(matches!(
@@ -1409,6 +1466,7 @@ mod tests {
             parse_warnings: vec![],
             brawl_commander: false,
             is_commander: true,
+            is_oathbreaker: false,
             deck_copy_limit: None,
             metadata: Default::default(),
             rarities: Default::default(),

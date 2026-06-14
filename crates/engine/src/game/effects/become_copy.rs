@@ -4,7 +4,7 @@ use crate::types::ability::{
     TargetFilter, TargetRef,
 };
 use crate::types::events::GameEvent;
-use crate::types::game_state::GameState;
+use crate::types::game_state::{GameState, PendingCounterAddition, PendingEffectResolved};
 
 /// CR 707.2 / CR 613.1a: Become a copy of target permanent via a layer-1 copy effect.
 pub fn resolve(
@@ -42,27 +42,63 @@ pub fn resolve(
     let values = compute_current_copiable_values(state, target_id)
         .ok_or(EffectError::ObjectNotFound(target_id))?;
 
-    // Display identity follows the copy: carry the source's image pointer so the
-    // copying object renders the copied card's art. Not a CR 707.2 copiable
+    // Display identity follows the copy: carry the source's image routing so the
+    // copying object renders the copied source's art. Not a CR 707.2 copiable
     // value (kept off `CopiableValues`); rides on the modification so it reverts
     // with the effect. The source is guaranteed present — the copiable-values
     // lookup above returned `Some` for `target_id`.
-    let source_printed_ref = state
+    //
+    // CR 111.1 + CR 707.2: when the source is a true token, `printed_ref` is
+    // `None` and the token's art lives only in the token database — so capture
+    // `display_source` + `token_image_ref` too, otherwise a copy-of-token (e.g.
+    // Mockingbird copying a Rabbit token) is stranded on the real-card name path
+    // for a name that has no real-card printing and renders blank.
+    let (source_display_source, source_printed_ref, source_token_image_ref) = state
         .objects
         .get(&target_id)
-        .and_then(|o| o.printed_ref.clone());
+        .map(|o| {
+            (
+                o.display_source,
+                o.printed_ref.clone(),
+                o.token_image_ref.clone(),
+            )
+        })
+        .unwrap_or_default();
 
-    // CR 122.1 + CR 614.1c: `AddCounterOnEnter` is consumed at resolution
-    // (not layered) — partition the modifications so the layer pipeline only
-    // sees the layered variants and the counter-on-enter variants are
-    // applied via the counter primitive after layer evaluation.
-    let (counter_mods, layered_mods): (Vec<_>, Vec<_>) = additional_modifications
-        .into_iter()
-        .partition(|m| matches!(m, ContinuousModification::AddCounterOnEnter { .. }));
+    // CR 202.1b + CR 707.9: "except it has no mana cost" is a copy-value
+    // exception consumed at resolution — strip the copied mana cost from the
+    // values themselves so the continuous copy carries mana value 0 on every
+    // layer pass (BecomeCopy re-applies `CopyValues` each pass; a one-shot bake
+    // would be overwritten). Mirrors token_copy.rs, which bakes the strip into
+    // the freshly created token's base mana cost.
+    let mut values = values;
+    if additional_modifications
+        .iter()
+        .any(|m| matches!(m, ContinuousModification::RemoveManaCost))
+    {
+        values.mana_cost = crate::types::mana::ManaCost::NoCost;
+    }
+
+    // CR 122.1 + CR 614.1c + CR 202.1b: `AddCounterOnEnter` (counter placement)
+    // and `RemoveManaCost` (consumed above) are resolution-time exceptions, not
+    // layered modifications — partition them out so the layer pipeline only sees
+    // the layered variants. The counter-on-enter variants are applied via the
+    // counter primitive after layer evaluation; RemoveManaCost is already
+    // consumed into `values`, so it is dropped here.
+    let (resolution_mods, layered_mods): (Vec<_>, Vec<_>) =
+        additional_modifications.into_iter().partition(|m| {
+            matches!(
+                m,
+                ContinuousModification::AddCounterOnEnter { .. }
+                    | ContinuousModification::RemoveManaCost
+            )
+        });
 
     let mut modifications = vec![ContinuousModification::CopyValues {
         values: Box::new(values),
+        display_source: source_display_source,
         printed_ref: source_printed_ref,
+        token_image_ref: source_token_image_ref,
     }];
     modifications.extend(layered_mods);
 
@@ -78,14 +114,19 @@ pub fn resolve(
     );
 
     // CR 707.9f: "Some exceptions to the copying process apply only if the
-    // copy is or has certain characteristics" — re-evaluate layers so the
-    // copied card_types is realized before checking `if_type` on each
-    // counter-on-enter modification (Spark Double's branches). Counters are
-    // then placed via the shared replacement-aware primitive (Doubling
-    // Season etc. apply normally).
-    if !counter_mods.is_empty() {
-        crate::game::layers::evaluate_layers(state);
-        for modification in counter_mods {
+    // copy is or has certain characteristics" — flush the layer re-evaluation
+    // queued by `add_transient_continuous_effect` so the copied card_types is
+    // realized. This is required for keyword grants (e.g., "except it has
+    // myriad") to synthesize their associated triggers. Counters are then
+    // placed via the shared replacement-aware primitive (Doubling Season etc.
+    // apply normally).
+    crate::game::layers::flush_layers(state);
+
+    if !resolution_mods.is_empty() {
+        let mut additions = Vec::new();
+        for modification in resolution_mods {
+            // RemoveManaCost was already consumed into `values`; only the
+            // counter-placement exceptions remain to apply here.
             if let ContinuousModification::AddCounterOnEnter {
                 counter_type,
                 count,
@@ -113,14 +154,41 @@ pub fn resolve(
                 if !gate_passes {
                     continue;
                 }
-                super::counters::add_counter_with_replacement(
-                    state,
-                    ability.controller,
-                    ability.source_id,
+                additions.push(PendingCounterAddition::Object {
+                    actor: ability.controller,
+                    object_id: ability.source_id,
                     counter_type,
-                    n,
-                    events,
+                    count: n,
+                });
+            }
+        }
+        for (index, addition) in additions.iter().cloned().enumerate() {
+            let PendingCounterAddition::Object {
+                actor,
+                object_id,
+                counter_type,
+                count,
+            } = addition
+            else {
+                continue;
+            };
+            if !super::counters::add_counter_with_replacement(
+                state,
+                actor,
+                object_id,
+                counter_type,
+                count,
+                events,
+            ) {
+                super::counters::stash_pending_counter_additions(
+                    state,
+                    additions[index + 1..].to_vec(),
+                    PendingEffectResolved::new(
+                        EffectKind::from(&ability.effect),
+                        ability.source_id,
+                    ),
                 );
+                return Ok(());
             }
         }
     }
@@ -383,6 +451,98 @@ mod tests {
     }
 
     #[test]
+    fn become_copy_of_token_carries_token_display_routing_and_reverts() {
+        // CR 111.1 + CR 707.2: a nontoken that becomes a copy of a *token* (e.g.
+        // Mockingbird copying a Rabbit token) stays a nontoken but takes the
+        // token's name — which only resolves in the token art database. The copy
+        // must therefore carry the source token's `display_source = Token` +
+        // `token_image_ref` (not `printed_ref`), or it renders blank on the
+        // real-card name path. On a temporary copy that routing reverts to the
+        // copier's own when the effect expires. Drives the real pipeline
+        // (resolve → evaluate_layers → cleanup → evaluate_layers). Token-source
+        // analog of `become_copy_propagates_source_printed_ref_and_reverts_at_cleanup`.
+        let mut state = GameState::new_two_player(42);
+
+        let token_ref = crate::types::card::TokenImageRef {
+            scryfall_id: "rabbit-scryfall-id".to_string(),
+            scryfall_oracle_id: Some("rabbit-oracle-id".to_string()),
+            face_name: None,
+            preset_id: "rabbit-preset".to_string(),
+        };
+        let own_ref = crate::types::card::PrintedCardRef {
+            oracle_id: "mockingbird-oracle-id".to_string(),
+            face_name: "Mockingbird".to_string(),
+        };
+
+        // Copy source: a true 1/1 Rabbit token (no printed identity).
+        let token_id = create_creature(&mut state, 1, PlayerId(0), "Rabbit", 1, 1);
+        {
+            let token = state.objects.get_mut(&token_id).unwrap();
+            token.is_token = true;
+            token.display_source = crate::game::game_object::DisplaySource::Token;
+            token.token_image_ref = Some(token_ref.clone());
+        }
+        // Copier: a real nontoken card with its own printed identity.
+        let copier_id = create_creature(&mut state, 2, PlayerId(0), "Mockingbird", 1, 1);
+        {
+            let copier = state.objects.get_mut(&copier_id).unwrap();
+            copier.printed_ref = Some(own_ref.clone());
+            copier.base_printed_ref = Some(own_ref.clone());
+        }
+
+        let mut events = Vec::new();
+        let ability = make_copy_ability(
+            token_id,
+            copier_id,
+            PlayerId(0),
+            Some(Duration::UntilEndOfTurn),
+        );
+        resolve(&mut state, &ability, &mut events).unwrap();
+        evaluate_layers(&mut state);
+
+        let copy = &state.objects[&copier_id];
+        assert_eq!(
+            copy.display_source,
+            crate::game::game_object::DisplaySource::Token,
+            "a copy of a token must route art through the token database"
+        );
+        assert_eq!(
+            copy.token_image_ref,
+            Some(token_ref),
+            "the copy must carry the source token's exact art pointer"
+        );
+        assert_eq!(
+            copy.printed_ref, None,
+            "a token source has no printed identity to carry"
+        );
+        assert_eq!(copy.name, "Rabbit");
+        assert!(
+            !copy.is_token,
+            "CR 111.1: copying a token does not make the copy a token"
+        );
+
+        // Temporary copy expires: display routing reverts to the copier's own.
+        execute_cleanup(&mut state, &mut events);
+        evaluate_layers(&mut state);
+        let reverted = &state.objects[&copier_id];
+        assert_eq!(
+            reverted.display_source,
+            crate::game::game_object::DisplaySource::Card,
+            "when the copy expires, a nontoken reverts to card-database routing"
+        );
+        assert_eq!(
+            reverted.token_image_ref, None,
+            "the stale token-art pointer is cleared on revert"
+        );
+        assert_eq!(
+            reverted.printed_ref,
+            Some(own_ref),
+            "the copier's own printed identity is restored"
+        );
+        assert_eq!(reverted.name, "Mockingbird");
+    }
+
+    #[test]
     fn permanent_become_copy_is_pruned_when_object_leaves_battlefield() {
         let mut state = GameState::new_two_player(42);
         let target_id = create_object(
@@ -418,7 +578,12 @@ mod tests {
         evaluate_layers(&mut state);
         assert_eq!(state.objects[&source_id].name, "Target Bear");
 
-        move_to_zone(&mut state, source_id, Zone::Exile, &mut events);
+        move_to_zone(&mut state, source_id, Zone::Graveyard, &mut events);
+        assert_eq!(
+            state.objects[&source_id].name, "Copy Source",
+            "copy identity must not persist in graveyard after leaving the battlefield"
+        );
+
         move_to_zone(&mut state, source_id, Zone::Battlefield, &mut events);
         evaluate_layers(&mut state);
         assert_eq!(state.objects[&source_id].name, "Copy Source");
@@ -493,6 +658,64 @@ mod tests {
         assert!(source.card_types.subtypes.contains(&"Bear".to_string()));
         assert!(source.card_types.subtypes.contains(&"Bird".to_string()));
         assert!(source.keywords.contains(&Keyword::Flying));
+    }
+
+    /// CR 202.1b + CR 707.9: a BecomeCopy "except it has no mana cost" exception
+    /// strips the copied mana cost from the copy's copiable values. Because
+    /// BecomeCopy re-applies `CopyValues` on every layer pass, the strip must
+    /// survive re-evaluation — a one-shot bake would be overwritten with the
+    /// copied {4}{R}{R}.
+    #[test]
+    fn become_copy_strips_mana_cost_and_survives_layer_reeval() {
+        let mut state = GameState::new_two_player(42);
+        let target_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Pricey Source".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let target = state.objects.get_mut(&target_id).unwrap();
+            target.base_name = "Pricey Source".to_string();
+            target.base_power = Some(3);
+            target.base_toughness = Some(3);
+            target.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Dragon".to_string()],
+            };
+            target.base_mana_cost = ManaCost::Cost {
+                shards: vec![ManaCostShard::Red, ManaCostShard::Red],
+                generic: 4,
+            };
+        }
+        let clone_id = create_creature(&mut state, 2, PlayerId(0), "Clone", 0, 0);
+
+        let ability = ResolvedAbility::new(
+            Effect::BecomeCopy {
+                target: TargetFilter::Any,
+                duration: None,
+                mana_value_limit: None,
+                additional_modifications: vec![ContinuousModification::RemoveManaCost],
+            },
+            vec![TargetRef::Object(target_id)],
+            clone_id,
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+        evaluate_layers(&mut state);
+
+        // Gains the source's characteristics but with no mana cost (mana value 0).
+        assert_eq!(state.objects[&clone_id].name, "Pricey Source");
+        assert_eq!(state.objects[&clone_id].mana_cost, ManaCost::NoCost);
+
+        // The strip rides on the copied values, not a one-shot bake, so a second
+        // layer pass must NOT restore the copied {4}{R}{R}.
+        evaluate_layers(&mut state);
+        assert_eq!(state.objects[&clone_id].mana_cost, ManaCost::NoCost);
     }
 
     // ── Plan test 3/8: Chained copies ─────────────────────────────────────
@@ -1260,6 +1483,60 @@ mod tests {
         );
     }
 
+    // CR 707.9a: Activated-ability "except it has this ability" (Thespian's
+    // Stage class) retains the source's printed activated ability on the copy.
+    #[test]
+    fn become_copy_retains_printed_ability_from_source() {
+        use crate::types::ability::{
+            AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification,
+        };
+
+        let mut state = GameState::new_two_player(42);
+        let target = create_creature(&mut state, 1, PlayerId(0), "Urza's Saga", 2, 2);
+        state.objects.get_mut(&target).unwrap().base_keywords = vec![Keyword::Trample];
+
+        let source = create_creature(&mut state, 2, PlayerId(0), "Thespian's Stage", 0, 0);
+        let copy_ability = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::BecomeCopy {
+                target: TargetFilter::Any,
+                duration: None,
+                mana_value_limit: None,
+                additional_modifications: vec![],
+            },
+        )
+        .cost(AbilityCost::Tap);
+        state.objects.get_mut(&source).unwrap().base_abilities =
+            Arc::new(vec![copy_ability.clone()]);
+
+        let ability = ResolvedAbility::new(
+            Effect::BecomeCopy {
+                target: TargetFilter::Any,
+                duration: None,
+                mana_value_limit: None,
+                additional_modifications: vec![
+                    ContinuousModification::RetainPrintedAbilityFromSource {
+                        source_ability_index: 0,
+                    },
+                ],
+            },
+            vec![TargetRef::Object(target)],
+            source,
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+        evaluate_layers(&mut state);
+
+        let copied = state.objects.get(&source).unwrap();
+        assert!(
+            copied.abilities.iter().any(|a| a == &copy_ability),
+            "retained activated copy ability must survive Layer 1; got {:?}",
+            copied.abilities
+        );
+    }
+
     // ── Reset regression: abilities revert when copy ends ─────────────────
     #[test]
     fn abilities_revert_to_empty_when_copy_expires() {
@@ -1291,6 +1568,236 @@ mod tests {
         assert!(
             state.objects[&source].abilities.is_empty(),
             "abilities must revert to empty base after copy expires"
+        );
+    }
+
+    // ── Issue #1558: Keyword grants via except clause synthesize triggers ─────
+    #[test]
+    fn become_copy_with_except_it_has_myriad_synthesizes_trigger() {
+        use crate::types::ability::ContinuousModification;
+        use crate::types::keywords::Keyword;
+        use crate::types::triggers::TriggerMode;
+
+        let mut state = GameState::new_two_player(42);
+        let target = create_creature(&mut state, 1, PlayerId(0), "Target", 2, 2);
+        let source = create_creature(&mut state, 2, PlayerId(0), "Muddle", 1, 1);
+
+        let mut events = Vec::new();
+        let ability = ResolvedAbility::new(
+            Effect::BecomeCopy {
+                target: TargetFilter::Any,
+                duration: None,
+                mana_value_limit: None,
+                additional_modifications: vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Myriad,
+                }],
+            },
+            vec![TargetRef::Object(target)],
+            source,
+            PlayerId(0),
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+        // evaluate_layers is now called unconditionally in resolve()
+
+        let source_obj = state.objects.get(&source).unwrap();
+        assert!(
+            source_obj.keywords.contains(&Keyword::Myriad),
+            "Myriad keyword should be granted via except clause"
+        );
+        let has_myriad_trigger = source_obj.trigger_definitions.iter_all().any(|trigger| {
+            matches!(trigger.mode, TriggerMode::Attacks)
+                && matches!(trigger.valid_card, Some(TargetFilter::SelfRef))
+                && trigger.execute.as_deref().is_some_and(|ability| {
+                    ability.optional && matches!(ability.effect.as_ref(), Effect::Myriad)
+                })
+        });
+        assert!(
+            has_myriad_trigger,
+            "Myriad attack trigger should be synthesized when keyword is granted"
+        );
+    }
+
+    // ── Issue #1514: Dark Depths copied by Thespian's Stage → Marit Lage ──────
+    //
+    // CR 707.2: A copy does not copy counters, so Thespian's Stage becoming a
+    // copy of Dark Depths produces a Dark Depths with ZERO ice counters. CR
+    // 603.8: the copied state-triggered ability ("When Dark Depths has no ice
+    // counters on it, sacrifice it. If you do, create Marit Lage") is re-checked
+    // when a player would receive priority; with no ice counters it fires
+    // immediately. Resolving the trigger sacrifices the copy and creates the
+    // 20/20 flying indestructible legendary Avatar token.
+    //
+    // This drives the real runtime path: BecomeCopy resolution → layer
+    // evaluation → check_state_triggers (via the priority window) → stack
+    // resolution of the Sacrifice + "if you do, create" chain.
+    #[test]
+    fn copying_dark_depths_with_zero_counters_creates_marit_lage() {
+        use crate::game::scenario::GameRunner;
+        use crate::parser::oracle::parse_oracle_text;
+        use crate::types::card_type::{CoreType, Supertype};
+        use crate::types::counter::CounterType;
+        use crate::types::game_state::WaitingFor;
+        use crate::types::keywords::Keyword;
+        use crate::types::triggers::TriggerMode;
+
+        const DARK_DEPTHS_TEXT: &str = "Dark Depths enters the battlefield with ten ice counters on it.\n{3}: Remove an ice counter from Dark Depths.\nWhen Dark Depths has no ice counters on it, sacrifice it. If you do, create Marit Lage, a legendary 20/20 black Avatar creature token with flying and indestructible.";
+
+        let parsed = parse_oracle_text(
+            DARK_DEPTHS_TEXT,
+            "Dark Depths",
+            &[],
+            &["Land".to_string()],
+            &[],
+        );
+        // Sanity: the parser yields the state-triggered "has no ice counters"
+        // ability that the copy must inherit (CR 603.8).
+        assert!(
+            parsed
+                .triggers
+                .iter()
+                .any(|t| t.mode == TriggerMode::StateCondition),
+            "Dark Depths must parse a StateCondition trigger; got {:?}",
+            parsed.triggers
+        );
+
+        let mut state = GameState::new_two_player(42);
+        state.phase = crate::types::phase::Phase::PreCombatMain;
+        state.turn_number = 2;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+
+        // Helper to install Dark Depths' parsed printed abilities onto a land.
+        let install_dark_depths =
+            |state: &mut GameState, id: crate::types::identifiers::ObjectId| {
+                let obj = state.objects.get_mut(&id).unwrap();
+                obj.base_card_types = CardType {
+                    supertypes: vec![],
+                    core_types: vec![CoreType::Land],
+                    subtypes: vec![],
+                };
+                obj.card_types = obj.base_card_types.clone();
+                obj.base_abilities = Arc::new(parsed.abilities.clone());
+                obj.base_trigger_definitions = Arc::new(parsed.triggers.clone());
+                obj.base_replacement_definitions = Arc::new(parsed.replacements.clone());
+            };
+
+        // Target: a real Dark Depths on the battlefield with its 10 ice counters.
+        let dark_depths = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Dark Depths".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&dark_depths).unwrap().base_name = "Dark Depths".to_string();
+        install_dark_depths(&mut state, dark_depths);
+        state
+            .objects
+            .get_mut(&dark_depths)
+            .unwrap()
+            .counters
+            .insert(CounterType::Generic("ice".to_string()), 10);
+
+        // Source: Thespian's Stage (a Land). Its "{2}, {T}: becomes a copy of
+        // target land, except it has this ability" produces a BecomeCopy effect.
+        let stage = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Thespian's Stage".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&stage).unwrap();
+            obj.base_name = "Thespian's Stage".to_string();
+            obj.base_card_types = CardType {
+                supertypes: vec![],
+                core_types: vec![CoreType::Land],
+                subtypes: vec![],
+            };
+            obj.card_types = obj.base_card_types.clone();
+        }
+
+        evaluate_layers(&mut state);
+
+        // Thespian's Stage becomes a copy of Dark Depths (CR 707.2). The copy
+        // inherits Dark Depths' abilities but NOT its ice counters.
+        let mut events = Vec::new();
+        let ability = make_copy_ability(dark_depths, stage, PlayerId(0), None);
+        resolve(&mut state, &ability, &mut events).unwrap();
+        evaluate_layers(&mut state);
+
+        // The copy is a Dark Depths with zero ice counters and the state trigger.
+        let stage_obj = state.objects.get(&stage).unwrap();
+        assert_eq!(stage_obj.name, "Dark Depths", "copy is named Dark Depths");
+        assert_eq!(
+            stage_obj
+                .counters
+                .get(&CounterType::Generic("ice".to_string()))
+                .copied()
+                .unwrap_or(0),
+            0,
+            "CR 707.2: a copy does not copy counters — the Stage copy has no ice counters"
+        );
+        assert!(
+            stage_obj
+                .trigger_definitions
+                .iter_all()
+                .any(|t| t.mode == TriggerMode::StateCondition),
+            "the copy must inherit Dark Depths' state-triggered ability (CR 603.8)"
+        );
+
+        // Drive the runtime: granting priority runs `check_state_triggers`,
+        // which sees zero ice counters and puts the sacrifice trigger on the
+        // stack; resolving it sacrifices the copy and creates Marit Lage.
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        // CR 603.8 + CR 117.1: state triggers are checked whenever a player would
+        // receive priority. Run the engine's state-trigger check (the same call
+        // the priority pipeline makes), which puts the sacrifice trigger on the
+        // stack, then drain the stack to resolve the Sacrifice + "if you do,
+        // create Marit Lage" chain.
+        crate::game::triggers::check_state_triggers(&mut state);
+        let mut runner = GameRunner::from_state(state);
+        runner.advance_until_stack_empty();
+        let state = runner.state();
+
+        // The copy must have been sacrificed (CR 603.8 → CR 701.21 Sacrifice).
+        assert!(
+            !state.battlefield.contains(&stage),
+            "the Dark Depths copy must be sacrificed when it has no ice counters"
+        );
+
+        // A Marit Lage token (legendary 20/20 black Avatar, flying + indestructible)
+        // must have been created (CR 111.1 / 707.2 combo payoff).
+        let marit_lage = state
+            .battlefield
+            .iter()
+            .filter_map(|id| state.objects.get(id))
+            .find(|obj| obj.is_token && obj.name == "Marit Lage")
+            .expect("Marit Lage token must be created");
+        assert_eq!(marit_lage.power, Some(20), "Marit Lage is 20 power");
+        assert_eq!(marit_lage.toughness, Some(20), "Marit Lage is 20 toughness");
+        assert!(
+            marit_lage
+                .card_types
+                .supertypes
+                .contains(&Supertype::Legendary),
+            "Marit Lage is legendary"
+        );
+        assert!(
+            marit_lage.card_types.subtypes.iter().any(|s| s == "Avatar"),
+            "Marit Lage is an Avatar"
+        );
+        assert!(
+            marit_lage.keywords.contains(&Keyword::Flying),
+            "Marit Lage has flying"
+        );
+        assert!(
+            marit_lage.keywords.contains(&Keyword::Indestructible),
+            "Marit Lage has indestructible"
         );
     }
 }

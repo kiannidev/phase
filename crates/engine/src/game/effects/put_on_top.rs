@@ -105,12 +105,14 @@ pub fn resolve(
                     effect_kind: EffectKind::PutAtLibraryPosition,
                     zone: source_zone,
                     destination: None,
-                    enter_tapped: false,
+                    enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     enter_transformed: false,
                     enters_under_player: None,
                     enters_attacking: false,
                     owner_library: false,
                     track_exiled_by_source: false,
+                    // CR 708.2a: library-position selection is not a face-down entry.
+                    face_down_profile: None,
                     count_param: 0,
                 };
                 return Ok(());

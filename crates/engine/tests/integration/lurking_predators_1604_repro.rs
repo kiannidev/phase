@@ -16,6 +16,7 @@ use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{AbilityCondition, Effect};
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
+use engine::types::game_state::CastPaymentMode;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
 use engine::types::phase::Phase;
@@ -48,6 +49,8 @@ fn cast_creature_from_hand(runner: &mut engine::game::scenario::GameRunner, hand
             object_id: hand_card,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("cast should succeed");
 }
@@ -104,17 +107,15 @@ fn lurking_predators_puts_creature_from_library_top_when_opponent_casts() {
     runner.state_mut().priority_player = P1;
     runner.state_mut().waiting_for = WaitingFor::Priority { player: P1 };
 
-    cast_creature_from_hand(&mut runner, opponent_spell);
-    runner.advance_until_stack_empty();
+    // P1 casts a spell → P0's Lurking Predators reveals the top card. A creature
+    // top takes the mandatory battlefield branch, so the resolution driver never
+    // surfaces the optional bottom prompt.
+    let outcome = runner.cast(opponent_spell).resolve();
 
-    assert_eq!(
-        zone_of(&runner, library_creature),
-        Zone::Battlefield,
-        "creature on top of library must enter the battlefield (no optional bottom prompt)"
-    );
+    outcome.assert_zone(&[library_creature], Zone::Battlefield);
     assert!(
         !matches!(
-            runner.state().waiting_for,
+            outcome.final_waiting_for(),
             WaitingFor::OptionalEffectChoice { .. }
         ),
         "mandatory creature branch must not leave an optional prompt pending"
@@ -218,15 +219,9 @@ fn lurking_predators_creature_branch_requires_card_types_on_library_object() {
     runner.state_mut().priority_player = P1;
     runner.state_mut().waiting_for = WaitingFor::Priority { player: P1 };
 
-    cast_creature_from_hand(&mut runner, opponent_spell);
-    runner.advance_until_stack_empty();
+    let outcome = runner.cast(opponent_spell).resolve();
 
-    assert_eq!(
-        zone_of(&runner, library_creature),
-        Zone::Battlefield,
-        "creature-typed library cards must take the battlefield branch even when \
-         the object was created without runtime core_types (issue #1604)"
-    );
+    outcome.assert_zone(&[library_creature], Zone::Battlefield);
 }
 
 #[test]
@@ -250,11 +245,11 @@ fn lurking_predators_parsed_trigger_chain_shape() {
         .as_ref()
         .expect("RevealTop must chain to conditional sub");
     assert!(matches!(
-        conditional.condition,
+        conditional.condition.as_ref(),
         Some(AbilityCondition::RevealedHasCardType {
-            card_type: CoreType::Creature,
+            card_types,
             ..
-        })
+        }) if card_types.as_slice() == [CoreType::Creature]
     ));
     assert!(matches!(
         *conditional.effect,

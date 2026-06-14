@@ -2,12 +2,13 @@ use crate::game::filter;
 use crate::game::layers::evaluate_condition;
 use crate::game::quantity::{quantity_expr_uses_recipient, resolve_quantity_with_targets};
 use crate::types::ability::{
-    ContinuousModification, Duration, Effect, EffectError, EffectKind, QuantityExpr, QuantityRef,
-    ResolvedAbility, StaticDefinition, TargetFilter, TargetRef,
+    ContinuousModification, ControllerRef, Duration, Effect, EffectError, EffectKind, QuantityExpr,
+    QuantityRef, ResolvedAbility, StaticCondition, StaticDefinition, TargetFilter, TargetRef,
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::GameState;
 use crate::types::identifiers::ObjectId;
+use crate::types::player::PlayerId;
 
 /// Effect handler: creates transient continuous effects from a GenericEffect.
 ///
@@ -64,7 +65,7 @@ pub fn resolve(
             // so `layers.rs` never re-evaluates it — the resulting grant
             // persists for `dur` (CR 611.2c) regardless of later state.
             if let Some(condition) = &static_def.condition {
-                if !evaluate_condition(state, condition, ability.controller, ability.source_id) {
+                if !evaluate_static_condition_for_ability(state, condition, ability) {
                     continue;
                 }
                 let mut snapshotted = static_def.clone();
@@ -84,6 +85,33 @@ pub fn resolve(
     Ok(())
 }
 
+fn evaluate_static_condition_for_ability(
+    state: &GameState,
+    condition: &StaticCondition,
+    ability: &ResolvedAbility,
+) -> bool {
+    match condition {
+        StaticCondition::QuantityComparison {
+            lhs,
+            comparator,
+            rhs,
+        } => comparator.evaluate(
+            resolve_quantity_with_targets(state, lhs, ability),
+            resolve_quantity_with_targets(state, rhs, ability),
+        ),
+        StaticCondition::And { conditions } => conditions
+            .iter()
+            .all(|condition| evaluate_static_condition_for_ability(state, condition, ability)),
+        StaticCondition::Or { conditions } => conditions
+            .iter()
+            .any(|condition| evaluate_static_condition_for_ability(state, condition, ability)),
+        StaticCondition::Not { condition } => {
+            !evaluate_static_condition_for_ability(state, condition, ability)
+        }
+        _ => evaluate_condition(state, condition, ability.controller, ability.source_id),
+    }
+}
+
 fn register_transient_effect(
     state: &mut GameState,
     ability: &ResolvedAbility,
@@ -98,8 +126,10 @@ fn register_transient_effect(
     // Short-circuit BEFORE the chosen-targets branch so chained Effect
     // sub-abilities with `target: SelfRef` don't inherit the parent's targets
     // via chain propagation in `effects::mod.rs::resolve_ability_chain`.
-    let resolved_filter = target_filter.or(static_def.affected.as_ref());
-    if matches!(resolved_filter, Some(TargetFilter::SelfRef)) {
+    if matches!(
+        target_filter.or(static_def.affected.as_ref()),
+        Some(TargetFilter::SelfRef)
+    ) {
         state.add_transient_continuous_effect(
             ability.source_id,
             ability.controller,
@@ -112,23 +142,67 @@ fn register_transient_effect(
         );
         return;
     }
+    // CR 603.2 + CR 608.2c: Judith modal sub-abilities set `target:
+    // TriggeringSource` (the GenericEffect `target` parameter); a SequentialSibling
+    // continuous grant on a non-targeted trigger ("put a +1/+1 counter on it. It
+    // gains haste until end of turn" — Surrak and Goreclaw, issue #2378) instead
+    // carries `affected: TriggeringSource` with `target: None`. Both name the
+    // triggering object directly, so when there is no chosen target to inherit
+    // (`ability.targets.is_empty()`), resolve via `resolve_event_context_target`
+    // here. We must NOT short-circuit when targets exist: `affected:
+    // TriggeringSource` with chosen targets is the inherited-target form that the
+    // branch below resolves against `ability.targets` (Earthbender Ascension).
+    let affected_is_triggering_source = static_def
+        .affected
+        .as_ref()
+        .is_some_and(|filter| matches!(filter, TargetFilter::TriggeringSource));
+    if matches!(target_filter, Some(TargetFilter::TriggeringSource))
+        || (target_filter.is_none() && affected_is_triggering_source && ability.targets.is_empty())
+    {
+        if let Some(TargetRef::Object(obj_id)) =
+            crate::game::targeting::resolve_event_context_target(
+                state,
+                &TargetFilter::TriggeringSource,
+                ability.source_id,
+            )
+        {
+            state.add_transient_continuous_effect(
+                ability.source_id,
+                ability.controller,
+                duration.clone(),
+                TargetFilter::SpecificObject { id: obj_id },
+                modifications,
+                static_def.condition.clone(),
+            );
+        }
+        return;
+    }
+    // CR 608.2c + CR 611.2c: `GenericEffect.target` is the player-chosen
+    // targeting slot (e.g. `Typed(Creature)` for "target creature"), while
+    // `static_def.affected` is the runtime binding filter (often
+    // `ParentTarget` for "apply to the chosen object"). Registration must
+    // follow `affected` when it carries an inherited-target reference —
+    // otherwise `target_filter.or(affected)` prefers the broadcast
+    // targeting descriptor and fans the grant to every matching permanent
+    // (issue #2922: Mu Yanling +2).
+    let application_filter =
+        generic_effect_application_filter(target_filter, static_def.affected.as_ref());
     let static_affected_references_target_player = target_filter.is_none()
         && static_def
             .affected
             .as_ref()
             .is_some_and(crate::game::ability_utils::filter_references_target_player);
-    let inherited_object_target = target_filter.is_none()
-        && static_def
-            .affected
-            .as_ref()
-            .is_some_and(generic_effect_affected_uses_inherited_targets)
+    let inherited_object_target = static_def
+        .affected
+        .as_ref()
+        .is_some_and(generic_effect_affected_uses_inherited_targets)
         && !static_affected_references_target_player
         && ability
             .targets
             .iter()
             .any(|target| matches!(target, TargetRef::Object(_)));
     let direct_binding_uses_targets = target_filter.is_some()
-        || matches!(resolved_filter, Some(TargetFilter::ParentTarget))
+        || application_filter.is_some_and(generic_effect_affected_uses_inherited_targets)
         || inherited_object_target;
 
     // CR 611.1 + CR 611.2c + CR 115.1: Targeted effects — register one transient
@@ -152,7 +226,7 @@ fn register_transient_effect(
             && matches!(ability.targets.first(), Some(TargetRef::Player(_)));
         for bound_filter in transient_bound_filters(
             ability,
-            resolved_filter,
+            application_filter,
             skip_companion_player_target,
             inherited_object_target,
         ) {
@@ -168,8 +242,24 @@ fn register_transient_effect(
         return;
     }
 
+    // Shared registration for player-scope fan-out arms: bind one
+    // `SpecificPlayer` TCE per player id. Takes `state` as a parameter so the
+    // sibling object/single-player arms below retain exclusive access to it.
+    let register_for_players = |state: &mut GameState, ids: Vec<PlayerId>| {
+        for player_id in ids {
+            state.add_transient_continuous_effect(
+                ability.source_id,
+                ability.controller,
+                duration.clone(),
+                TargetFilter::SpecificPlayer { id: player_id },
+                modifications.clone(),
+                static_def.condition.clone(),
+            );
+        }
+    };
+
     // Non-targeted: resolve the affected filter (SelfRef handled above).
-    match resolved_filter {
+    match application_filter {
         // CR 113.10 + CR 702.16j: Player-scoped affected filter — register the
         // transient effect bound to the ability's controller (a player) via
         // SpecificPlayer. Queried by player_has_protection_from_everything
@@ -208,22 +298,54 @@ fn register_transient_effect(
         // spell-applied player-scoped statics like Everybody Lives! never reach
         // those queries.
         Some(TargetFilter::Player) => {
-            let player_ids: Vec<_> = state
+            let player_ids: Vec<PlayerId> = state
                 .players
                 .iter()
                 .filter(|p| !p.is_eliminated)
                 .map(|p| p.id)
                 .collect();
-            for player_id in player_ids {
-                state.add_transient_continuous_effect(
-                    ability.source_id,
-                    ability.controller,
-                    duration.clone(),
-                    TargetFilter::SpecificPlayer { id: player_id },
-                    modifications.clone(),
-                    static_def.condition.clone(),
-                );
-            }
+            register_for_players(state, player_ids);
+        }
+        // CR 119.7 + CR 119.8: Bare player-scope `Typed` affected
+        // filter. A `TargetFilter::Typed` with no `type_filters` and no
+        // `properties`, carrying a `You`/`Opponent`/unscoped `controller`, is the
+        // engine's canonical *player* filter (see `targeting.rs`: "Typed filter
+        // with no type_filters targets players, not permanents"). The "[possessor]
+        // life total can't change" parser (Teferi's Protection) and the
+        // "[possessor] can't gain/lose life" restriction parser emit player-scoped
+        // statics with this shape. Resolve the `controller` ref to concrete
+        // player(s) via the shared `collect_player_targets` authority — which
+        // matches every `ControllerRef` variant exhaustively with per-variant CR
+        // annotations (no `_ => true` wildcard over the closed enum) — and bind
+        // each as `SpecificPlayer` so player-scoped runtime queries
+        // (`player_has_cant_gain_life`, etc.) can find them. Without this arm the
+        // grant falls through to the object-broadcast branch below, binds to
+        // (zero, under Teferi's mass phase-out) battlefield objects as
+        // `SpecificObject`, and the life-lock silently never applies. The guard
+        // keeps the arm scoped to `You`/`Opponent`/unscoped controllers; filters
+        // carrying `properties` or a context-relative controller are genuine
+        // object filters and stay on the broadcast path.
+        Some(player_filter @ TargetFilter::Typed(tf))
+            if tf.type_filters.is_empty()
+                && tf.properties.is_empty()
+                && matches!(
+                    tf.controller,
+                    None | Some(ControllerRef::You) | Some(ControllerRef::Opponent)
+                ) =>
+        {
+            // CR 104.2: eliminated players hold no game-state restrictions.
+            let eliminated: std::collections::HashSet<PlayerId> = state
+                .players
+                .iter()
+                .filter(|p| p.is_eliminated)
+                .map(|p| p.id)
+                .collect();
+            let player_ids: Vec<PlayerId> =
+                crate::game::ability_utils::collect_player_targets(state, ability, player_filter)
+                    .into_iter()
+                    .filter(|id| !eliminated.contains(id))
+                    .collect();
+            register_for_players(state, player_ids);
         }
         Some(TargetFilter::None) | None => {}
         // CR 608.2k: A grant whose affected object is the ability's cost-paid
@@ -248,6 +370,7 @@ fn register_transient_effect(
                 );
             }
         }
+        // TriggeringSource is handled via early short-circuit to avoid target propagation bugs.
         Some(TargetFilter::ParentTarget) if ability.targets.is_empty() => {
             let tracked = state
                 .chain_tracked_set_id
@@ -265,6 +388,9 @@ fn register_transient_effect(
             }
         }
         Some(filter) => {
+            if generic_effect_affected_uses_inherited_targets(filter) {
+                return;
+            }
             let filter = crate::game::effects::resolved_object_filter(ability, filter);
             let filter = crate::game::targeting::resolve_tracked_set_sentinel(state, filter);
             // Broadcast filter: find matching objects at resolution time and bind each.
@@ -322,6 +448,23 @@ fn generic_effect_affected_uses_inherited_targets(filter: &TargetFilter) -> bool
         filter,
         TargetFilter::TriggeringSource | TargetFilter::ParentTarget | TargetFilter::CostPaidObject
     )
+}
+
+/// CR 608.2c: Choose the filter that governs *where modifications land* at
+/// resolution. The outer `GenericEffect.target` slot names what the player
+/// chose; `static_def.affected` names how that choice is bound onto objects.
+/// Inherited-reference `affected` values (`ParentTarget`, …) win over the
+/// targeting descriptor so a `target: Typed(Creature)` + `affected:
+/// ParentTarget` pair binds to the chosen creature, not every creature.
+fn generic_effect_application_filter<'a>(
+    target_filter: Option<&'a TargetFilter>,
+    static_affected: Option<&'a TargetFilter>,
+) -> Option<&'a TargetFilter> {
+    if static_affected.is_some_and(generic_effect_affected_uses_inherited_targets) {
+        static_affected
+    } else {
+        target_filter.or(static_affected)
+    }
 }
 
 fn snapshot_transient_modifications(
@@ -415,6 +558,10 @@ fn snapshot_resolution_context_quantity(expr: &QuantityExpr, events: &[GameEvent
             inner: Box::new(snapshot_resolution_context_quantity(inner, events)),
             offset: *offset,
         },
+        QuantityExpr::ClampMin { inner, minimum } => QuantityExpr::ClampMin {
+            inner: Box::new(snapshot_resolution_context_quantity(inner, events)),
+            minimum: *minimum,
+        },
         QuantityExpr::Multiply { factor, inner } => QuantityExpr::Multiply {
             factor: *factor,
             inner: Box::new(snapshot_resolution_context_quantity(inner, events)),
@@ -445,9 +592,10 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::types::ability::{
         ContinuousModification, ControllerRef, Duration, QuantityExpr, QuantityRef,
-        StaticDefinition, TypedFilter,
+        StaticDefinition, TargetFilter, TypedFilter,
     };
     use crate::types::card_type::CoreType;
+    use crate::types::events::GameEvent;
     use crate::types::identifiers::{CardId, TrackedSetId};
     use crate::types::keywords::Keyword;
     use crate::types::player::PlayerId;
@@ -784,6 +932,222 @@ mod tests {
         );
     }
 
+    /// Issue #2013: Judith's modal mode binds `target: TriggeringSource` with no
+    /// chosen targets; the grant must reach the cast instant/sorcery on the stack.
+    #[test]
+    fn triggering_source_grant_binds_cast_spell_without_targets() {
+        let mut state = GameState::new_two_player(42);
+        let judith = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Judith, Carnage Connoisseur".to_string(),
+            Zone::Battlefield,
+        );
+        let cast_spell = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Lightning Bolt".to_string(),
+            Zone::Stack,
+        );
+        state
+            .objects
+            .get_mut(&cast_spell)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Instant);
+        state.current_trigger_event = Some(GameEvent::SpellCast {
+            card_id: CardId(2),
+            controller: PlayerId(0),
+            object_id: cast_spell,
+        });
+
+        let static_def = StaticDefinition::continuous()
+            .affected(TargetFilter::ParentTarget)
+            .modifications(vec![
+                ContinuousModification::AddKeyword {
+                    keyword: Keyword::Deathtouch,
+                },
+                ContinuousModification::AddKeyword {
+                    keyword: Keyword::Lifelink,
+                },
+            ]);
+        let ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![static_def],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: Some(TargetFilter::TriggeringSource),
+            },
+            vec![],
+            judith,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilEndOfTurn);
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.transient_continuous_effects.len(), 1);
+        let tce = &state.transient_continuous_effects[0];
+        assert_eq!(
+            tce.affected,
+            TargetFilter::SpecificObject { id: cast_spell }
+        );
+        assert!(tce
+            .modifications
+            .contains(&ContinuousModification::AddKeyword {
+                keyword: Keyword::Deathtouch,
+            }));
+        assert!(tce
+            .modifications
+            .contains(&ContinuousModification::AddKeyword {
+                keyword: Keyword::Lifelink,
+            }));
+    }
+
+    /// Issue #2378 class: a non-targeted trigger whose SequentialSibling continuous
+    /// grant carries `affected: TriggeringSource` with `target: None` and no chosen
+    /// targets ("put a +1/+1 counter on it. It gains haste until end of turn" —
+    /// Surrak and Goreclaw) must bind the grant to the triggering object via the
+    /// event-context resolver (CR 611.2c). Pre-fix this fell through to the
+    /// broadcast arm, which `return`ed early on the inherited-reference filter and
+    /// dropped the grant entirely. Distinct from the Earthbender test above, which
+    /// has the same affected/target shape *with* a chosen target to inherit.
+    #[test]
+    fn triggering_source_affected_without_target_or_chosen_targets_binds_trigger_source() {
+        use crate::types::game_state::ZoneChangeRecord;
+
+        let mut state = GameState::new_two_player(42);
+        let surrak = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Surrak and Goreclaw".to_string(),
+            Zone::Battlefield,
+        );
+        let entering = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Grizzly Bears".to_string(),
+            Zone::Battlefield,
+        );
+        // The trigger fired from the creature's enter-the-battlefield event;
+        // `TriggeringSource` resolves to `entering` through this record.
+        state.current_trigger_event = Some(GameEvent::ZoneChanged {
+            object_id: entering,
+            from: None,
+            to: Zone::Battlefield,
+            record: Box::new(ZoneChangeRecord::test_minimal(
+                entering,
+                None,
+                Zone::Battlefield,
+            )),
+        });
+
+        let static_def = StaticDefinition::continuous()
+            .affected(TargetFilter::TriggeringSource)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Haste,
+            }]);
+        // No chosen targets: a non-targeted "it gains haste" sibling clause.
+        let ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![static_def],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+            },
+            vec![],
+            surrak,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilEndOfTurn);
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.transient_continuous_effects.len(),
+            1,
+            "the haste grant must bind to exactly the triggering creature"
+        );
+        let tce = &state.transient_continuous_effects[0];
+        assert_eq!(tce.affected, TargetFilter::SpecificObject { id: entering });
+        assert!(tce
+            .modifications
+            .contains(&ContinuousModification::AddKeyword {
+                keyword: Keyword::Haste,
+            }));
+    }
+
+    /// Issue #323 class: propagated `ability.targets` must not override TriggeringSource.
+    #[test]
+    fn triggering_source_short_circuits_when_targets_propagated() {
+        let mut state = GameState::new_two_player(42);
+        let judith = create_object(
+            &mut state,
+            CardId(10),
+            PlayerId(0),
+            "Judith, Carnage Connoisseur".to_string(),
+            Zone::Battlefield,
+        );
+        let cast_spell = create_object(
+            &mut state,
+            CardId(11),
+            PlayerId(0),
+            "Shock".to_string(),
+            Zone::Stack,
+        );
+        let wrong_target = create_object(
+            &mut state,
+            CardId(12),
+            PlayerId(0),
+            "Wrong".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&cast_spell)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Instant);
+        state.current_trigger_event = Some(GameEvent::SpellCast {
+            card_id: CardId(11),
+            controller: PlayerId(0),
+            object_id: cast_spell,
+        });
+
+        let static_def = StaticDefinition::continuous()
+            .affected(TargetFilter::ParentTarget)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Lifelink,
+            }]);
+        let ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![static_def],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: Some(TargetFilter::TriggeringSource),
+            },
+            vec![TargetRef::Object(wrong_target)],
+            judith,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilEndOfTurn);
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.transient_continuous_effects.len(), 1);
+        assert_eq!(
+            state.transient_continuous_effects[0].affected,
+            TargetFilter::SpecificObject { id: cast_spell },
+            "TriggeringSource must bind to the cast spell, not propagated targets"
+        );
+    }
+
     #[test]
     fn generic_effect_inherited_object_binding_ignores_sibling_player_target() {
         let mut state = GameState::new_two_player(42);
@@ -973,6 +1337,275 @@ mod tests {
                 id: target_creature
             }
         );
+    }
+
+    /// Issue #2922: `target: Typed(Creature)` names the targeting slot while
+    /// `affected: ParentTarget` binds the grant to the chosen creature. The
+    /// application filter must follow `ParentTarget`, not broadcast through the
+    /// creature targeting descriptor.
+    #[test]
+    fn parent_target_affected_with_creature_target_slot_binds_chosen_creature_only() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Mu Yanling, Sky Dancer".to_string(),
+            Zone::Battlefield,
+        );
+        let target_creature = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Chosen Target".to_string(),
+            Zone::Battlefield,
+        );
+        let other_creature = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Other Creature".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [target_creature, other_creature] {
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_power = Some(3);
+            obj.base_toughness = Some(3);
+            obj.power = Some(3);
+            obj.toughness = Some(3);
+            obj.keywords.push(Keyword::Flying);
+        }
+
+        let static_def = StaticDefinition::continuous()
+            .affected(TargetFilter::ParentTarget)
+            .modifications(vec![
+                ContinuousModification::AddPower { value: -2 },
+                ContinuousModification::AddToughness { value: 0 },
+                ContinuousModification::RemoveKeyword {
+                    keyword: Keyword::Flying,
+                },
+            ]);
+        let ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![static_def],
+                duration: Some(Duration::UntilNextTurnOf {
+                    player: crate::types::ability::PlayerScope::Controller,
+                }),
+                target: Some(TargetFilter::Typed(TypedFilter::creature())),
+            },
+            vec![TargetRef::Object(target_creature)],
+            source,
+            PlayerId(0),
+        )
+        .duration(Duration::UntilNextTurnOf {
+            player: crate::types::ability::PlayerScope::Controller,
+        });
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.transient_continuous_effects.len(),
+            1,
+            "exactly one TCE for the chosen target"
+        );
+        assert_eq!(
+            state.transient_continuous_effects[0].affected,
+            TargetFilter::SpecificObject {
+                id: target_creature
+            }
+        );
+
+        crate::game::layers::evaluate_layers(&mut state);
+        assert_eq!(
+            state.objects.get(&target_creature).unwrap().power,
+            Some(1),
+            "chosen creature gets -2/-0"
+        );
+        assert!(
+            !state
+                .objects
+                .get(&target_creature)
+                .unwrap()
+                .keywords
+                .contains(&Keyword::Flying),
+            "chosen creature loses flying"
+        );
+        assert_eq!(
+            state.objects.get(&other_creature).unwrap().power,
+            Some(3),
+            "non-target creature must not be debuffed"
+        );
+        assert!(
+            state
+                .objects
+                .get(&other_creature)
+                .unwrap()
+                .keywords
+                .contains(&Keyword::Flying),
+            "non-target creature must keep flying"
+        );
+    }
+
+    /// Issue #2922 guard: when no target was chosen ("up to one" → zero),
+    /// `ParentTarget` must not fall through to a creature-broadcast arm.
+    #[test]
+    fn parent_target_affected_with_creature_target_slot_empty_targets_does_not_broadcast() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Mu Yanling, Sky Dancer".to_string(),
+            Zone::Battlefield,
+        );
+        let creature_a = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Creature A".to_string(),
+            Zone::Battlefield,
+        );
+        let creature_b = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Creature B".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [creature_a, creature_b] {
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_power = Some(2);
+            obj.power = Some(2);
+        }
+
+        let static_def = StaticDefinition::continuous()
+            .affected(TargetFilter::ParentTarget)
+            .modifications(vec![ContinuousModification::AddPower { value: -2 }]);
+        let mut ability = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![static_def],
+                duration: Some(Duration::UntilNextTurnOf {
+                    player: crate::types::ability::PlayerScope::Controller,
+                }),
+                target: Some(TargetFilter::Typed(TypedFilter::creature())),
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        ability.optional_targeting = true;
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(
+            state.transient_continuous_effects.is_empty(),
+            "zero targets must not register battlefield-wide debuffs"
+        );
+        crate::game::layers::evaluate_layers(&mut state);
+        assert_eq!(state.objects.get(&creature_a).unwrap().power, Some(2));
+        assert_eq!(state.objects.get(&creature_b).unwrap().power, Some(2));
+    }
+
+    /// Issue #2922 end-to-end: parser output for Mu Yanling's +2 resolves onto
+    /// the single chosen creature only.
+    #[test]
+    fn mu_yanling_plus_two_pump_and_lose_flying_parses_and_resolves_to_target_only() {
+        use crate::game::layers::evaluate_layers;
+        use crate::parser::oracle_effect::parse_effect_chain;
+        use crate::types::ability::AbilityKind;
+
+        let mut state = GameState::new_two_player(42);
+        let yanling = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Mu Yanling, Sky Dancer".to_string(),
+            Zone::Battlefield,
+        );
+        let target_creature = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Target".to_string(),
+            Zone::Battlefield,
+        );
+        let bystander = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Bystander".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [target_creature, bystander] {
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_power = Some(4);
+            obj.base_toughness = Some(4);
+            obj.power = Some(4);
+            obj.toughness = Some(4);
+            obj.keywords.push(Keyword::Flying);
+        }
+
+        let parsed = parse_effect_chain(
+            "up to one target creature gets -2/-0 and loses flying",
+            AbilityKind::Activated,
+        );
+        let ability = ResolvedAbility::new(
+            (*parsed.effect).clone(),
+            vec![TargetRef::Object(target_creature)],
+            yanling,
+            PlayerId(0),
+        )
+        .duration(parsed.duration.clone().unwrap_or(Duration::UntilEndOfTurn));
+
+        let Effect::GenericEffect {
+            static_abilities,
+            target,
+            ..
+        } = &ability.effect
+        else {
+            panic!("expected single GenericEffect, got {:?}", ability.effect);
+        };
+        assert!(
+            target.is_some(),
+            "targeting slot must be present on the parsed GenericEffect"
+        );
+        assert_eq!(
+            static_abilities[0].affected,
+            Some(TargetFilter::ParentTarget),
+            "per-static affected must bind to ParentTarget"
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.transient_continuous_effects.len(), 1);
+        assert_eq!(
+            state.transient_continuous_effects[0].affected,
+            TargetFilter::SpecificObject {
+                id: target_creature
+            }
+        );
+
+        evaluate_layers(&mut state);
+        assert_eq!(state.objects.get(&target_creature).unwrap().power, Some(2));
+        assert!(!state
+            .objects
+            .get(&target_creature)
+            .unwrap()
+            .keywords
+            .contains(&Keyword::Flying));
+        assert_eq!(state.objects.get(&bystander).unwrap().power, Some(4));
+        assert!(state
+            .objects
+            .get(&bystander)
+            .unwrap()
+            .keywords
+            .contains(&Keyword::Flying));
     }
 
     // CR 305.1 + CR 611.1 + CR 611.2c + CR 115.1: A `GenericEffect` whose target
@@ -1263,6 +1896,215 @@ mod tests {
         );
     }
 
+    /// CR 119.7 + CR 119.8: Teferi's-Protection-style life-lock.
+    /// Parse "your life total can't change", feed the parsed effect into
+    /// `resolve`, and verify the single-authority queries report the controller
+    /// as both can't-gain-life and can't-lose-life. The parser emits these
+    /// player-scoped statics with `affected: Typed(controller: You)`; the
+    /// runtime registration must bind them to `SpecificPlayer { controller }`
+    /// so the transient-table queries used by life-gain/loss/cost enforcement
+    /// can find them. Without that, "your life total can't change" silently
+    /// never applies for an instant (Teferi's Protection).
+    #[test]
+    fn parse_and_resolve_your_life_total_cant_change_locks_controller_life() {
+        use crate::parser::oracle_effect::parse_effect_chain;
+        use crate::types::ability::AbilityKind;
+
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Teferi's Protection".to_string(),
+            Zone::Battlefield,
+        );
+
+        let parsed = parse_effect_chain("your life total can't change", AbilityKind::Spell);
+        let ability = ResolvedAbility::new((*parsed.effect).clone(), vec![], source, PlayerId(0))
+            .duration(Duration::UntilEndOfTurn);
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(
+            crate::game::static_abilities::player_has_cant_gain_life(&state, PlayerId(0)),
+            "controller must be locked against life gain after resolution"
+        );
+        assert!(
+            crate::game::static_abilities::player_has_cant_lose_life(&state, PlayerId(0)),
+            "controller must be locked against life loss after resolution"
+        );
+        assert!(
+            !crate::game::static_abilities::player_has_cant_gain_life(&state, PlayerId(1)),
+            "opponent must NOT be locked — scoping is per-controller"
+        );
+        assert!(
+            !crate::game::static_abilities::player_has_cant_lose_life(&state, PlayerId(1)),
+            "opponent must NOT be locked — scoping is per-controller"
+        );
+
+        // CR 119.7 + CR 119.8 end-to-end: a subsequent life gain and life loss
+        // on the locked controller are both suppressed — the user-visible
+        // behavior the report was about.
+        let life_before = state.players[0].life;
+        let gain = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 5 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        crate::game::effects::life::resolve_gain(&mut state, &gain, &mut events).unwrap();
+        let lose = ResolvedAbility::new(
+            Effect::LoseLife {
+                amount: QuantityExpr::Fixed { value: 3 },
+                target: None,
+            },
+            vec![TargetRef::Player(PlayerId(0))],
+            source,
+            PlayerId(0),
+        );
+        crate::game::effects::life::resolve_lose(&mut state, &lose, &mut events).unwrap();
+        assert_eq!(
+            state.players[0].life, life_before,
+            "locked controller's life total must not change"
+        );
+    }
+
+    /// CR 119.7: An *opponent*-scoped life-lock ("your opponents' life totals
+    /// can't change") binds to each opponent — exercising the same player-scope
+    /// `Typed` registration arm with `ControllerRef::Opponent`.
+    #[test]
+    fn parse_and_resolve_opponents_life_total_cant_change_locks_opponents() {
+        use crate::parser::oracle_effect::parse_effect_chain;
+        use crate::types::ability::AbilityKind;
+
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Opponent Life Lock".to_string(),
+            Zone::Battlefield,
+        );
+
+        let parsed = parse_effect_chain(
+            "your opponents' life totals can't change",
+            AbilityKind::Spell,
+        );
+        let ability = ResolvedAbility::new((*parsed.effect).clone(), vec![], source, PlayerId(0))
+            .duration(Duration::UntilEndOfTurn);
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(
+            crate::game::static_abilities::player_has_cant_gain_life(&state, PlayerId(1)),
+            "opponent must be locked against life gain"
+        );
+        assert!(
+            crate::game::static_abilities::player_has_cant_lose_life(&state, PlayerId(1)),
+            "opponent must be locked against life loss"
+        );
+        assert!(
+            !crate::game::static_abilities::player_has_cant_gain_life(&state, PlayerId(0)),
+            "controller must NOT be locked — opponent scope excludes the controller"
+        );
+    }
+
+    /// CR 119.7 + CR 608.2c: Screaming Nemesis's rider end-to-end. A
+    /// `GenericEffect { affected: ParentTarget, CantGainLife }` whose parent
+    /// (the redirect) targeted a PLAYER must lock exactly that player against
+    /// life gain; the same effect whose parent targeted a CREATURE must lock
+    /// NO player (CR 119.7 governs players only). This proves the player-gating
+    /// is intrinsic to the `ParentTarget`->TargetRef binding, not a parser
+    /// guess.
+    #[test]
+    fn parent_target_cant_gain_life_locks_player_target_only() {
+        use crate::types::ability::TargetFilter;
+        use crate::types::statics::StaticMode;
+
+        let make_def = || {
+            StaticDefinition::new(StaticMode::CantGainLife)
+                .affected(TargetFilter::ParentTarget)
+                .modifications(vec![ContinuousModification::AddStaticMode {
+                    mode: StaticMode::CantGainLife,
+                }])
+        };
+        let make_effect = || Effect::GenericEffect {
+            static_abilities: vec![make_def()],
+            duration: Some(Duration::Permanent),
+            target: None,
+        };
+
+        // Case 1: parent target is a player -> that player is locked.
+        {
+            let mut state = GameState::new_two_player(42);
+            let source = create_object(
+                &mut state,
+                CardId(1),
+                PlayerId(0),
+                "Screaming Nemesis".to_string(),
+                Zone::Battlefield,
+            );
+            let ability = ResolvedAbility::new(
+                make_effect(),
+                vec![TargetRef::Player(PlayerId(1))],
+                source,
+                PlayerId(0),
+            )
+            .duration(Duration::Permanent);
+            let mut events = Vec::new();
+            resolve(&mut state, &ability, &mut events).unwrap();
+            assert!(
+                crate::game::static_abilities::player_has_cant_gain_life(&state, PlayerId(1)),
+                "player redirect target must be locked against life gain"
+            );
+            assert!(
+                !crate::game::static_abilities::player_has_cant_gain_life(&state, PlayerId(0)),
+                "the source's controller must NOT be locked"
+            );
+        }
+
+        // Case 2: parent target is a creature -> NO player is locked (CR 119.7).
+        {
+            let mut state = GameState::new_two_player(42);
+            let source = create_object(
+                &mut state,
+                CardId(1),
+                PlayerId(0),
+                "Screaming Nemesis".to_string(),
+                Zone::Battlefield,
+            );
+            let creature = create_object(
+                &mut state,
+                CardId(2),
+                PlayerId(1),
+                "Grizzly Bears".to_string(),
+                Zone::Battlefield,
+            );
+            let ability = ResolvedAbility::new(
+                make_effect(),
+                vec![TargetRef::Object(creature)],
+                source,
+                PlayerId(0),
+            )
+            .duration(Duration::Permanent);
+            let mut events = Vec::new();
+            resolve(&mut state, &ability, &mut events).unwrap();
+            assert!(
+                !crate::game::static_abilities::player_has_cant_gain_life(&state, PlayerId(0)),
+                "creature redirect target must not lock its controller (CR 119.7)"
+            );
+            assert!(
+                !crate::game::static_abilities::player_has_cant_gain_life(&state, PlayerId(1)),
+                "creature redirect target must not lock its controller (CR 119.7)"
+            );
+        }
+    }
+
     #[test]
     fn generic_effect_binds_tracked_set_sentinel_to_latest_chain_set() {
         let mut state = GameState::new_two_player(42);
@@ -1502,7 +2344,7 @@ mod tests {
             GameEvent::DieRolled {
                 player_id: PlayerId(0),
                 sides: 6,
-                result: 4,
+                result: Some(4),
             },
             GameEvent::EffectResolved {
                 kind: EffectKind::RollDie,
@@ -1525,7 +2367,7 @@ mod tests {
         let events = vec![GameEvent::DieRolled {
             player_id: PlayerId(0),
             sides: 6,
-            result: 4,
+            result: Some(4),
         }];
         let expr = QuantityExpr::Ref {
             qty: QuantityRef::ObjectCount {
@@ -1596,6 +2438,7 @@ mod tests {
         );
         let ability = ResolvedAbility::new(
             Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 1 },
                 sides: 6,
                 results: vec![],
                 modifier: None,
@@ -1612,7 +2455,7 @@ mod tests {
         let roll = events
             .iter()
             .find_map(|e| match e {
-                GameEvent::DieRolled { result, .. } => Some(*result as i32),
+                GameEvent::DieRolled { result, .. } => result.map(i32::from),
                 _ => None,
             })
             .expect("RollDie must emit a DieRolled event");

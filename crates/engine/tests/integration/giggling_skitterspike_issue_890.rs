@@ -9,6 +9,7 @@ use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::phase::Phase;
 
 use super::rules::AttackTarget;
+use engine::types::game_state::CastPaymentMode;
 
 const SKITTERSPIKE_ORACLE: &str = "Indestructible\n\
 Whenever this creature attacks, blocks, or becomes the target of a spell, it \
@@ -40,6 +41,7 @@ fn issue_890_attack_trigger_deals_damage() {
     runner
         .act(GameAction::DeclareAttackers {
             attacks: vec![(skitterspike, AttackTarget::Player(P1))],
+            bands: vec![],
         })
         .expect("declaring Giggling Skitterspike as attacker should succeed");
     runner.advance_until_stack_empty();
@@ -73,6 +75,7 @@ fn issue_890_block_trigger_deals_damage() {
     runner
         .act(GameAction::DeclareAttackers {
             attacks: vec![(attacker, AttackTarget::Player(P0))],
+            bands: vec![],
         })
         .expect("declaring P1 attacker should succeed");
     runner.pass_both_players();
@@ -113,6 +116,8 @@ fn issue_890_targeted_by_spell_trigger_deals_damage() {
             object_id: bolt,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("casting Lightning Bolt should succeed");
 

@@ -13,6 +13,68 @@ use crate::types::player::PlayerId;
 /// CR 107.4a: The five colors are white ({W}), blue ({U}), black ({B}), red ({R}), green ({G}).
 pub type ColorDemand = [u32; 5];
 
+/// Units of each mana type kept in a debug "infinite mana" pool. Large enough to
+/// cover any single resolution's worth of spends, small enough that the pool's
+/// linear spend scan (`ManaPool` is a `Vec<ManaUnit>`) stays cheap.
+const INFINITE_MANA_PER_TYPE: usize = 100;
+
+/// The six mana types an infinite-mana pool is seeded with: the five colors
+/// (CR 105.1) plus colorless (CR 107.4c).
+const INFINITE_MANA_TYPES: [ManaType; 6] = [
+    ManaType::White,
+    ManaType::Blue,
+    ManaType::Black,
+    ManaType::Red,
+    ManaType::Green,
+    ManaType::Colorless,
+];
+
+/// Debug-only: top every player in `GameState::debug_infinite_mana` back up to
+/// `INFINITE_MANA_PER_TYPE` unrestricted, non-expiring units of each mana type.
+///
+/// Idempotent — only the shortfall is added — and returns immediately when no
+/// player is flagged, so it is cheap to call after every action. Paired with the
+/// `UnitDisposition::Keep` override in `turns::drain_pending_phase_transition_progress`
+/// (which suppresses the CR 500.4 end-of-step empty for flagged players), this
+/// keeps the pool continuously full. Both the affordability check
+/// (`reduce_cost_by_pool`) and the real payment path read the same
+/// `player.mana_pool`, so a flagged player can pay any cost without divergence
+/// between "shows castable" and "actually pays".
+///
+/// NOT a rules-legal effect — a developer convenience gated behind the same
+/// debug-action permission as every other `DebugAction`.
+pub fn refill_infinite_mana(state: &mut GameState) {
+    if state.debug_infinite_mana.is_empty() {
+        return;
+    }
+    let flagged: Vec<PlayerId> = state.debug_infinite_mana.iter().copied().collect();
+    for &player_id in &flagged {
+        let Some(player) = state.players.iter_mut().find(|p| p.id == player_id) else {
+            continue;
+        };
+        for color in INFINITE_MANA_TYPES {
+            // Count only the units this top-up owns (unrestricted, non-expiring)
+            // so card-produced restricted/expiring mana never suppresses a refill.
+            let have = player
+                .mana_pool
+                .mana
+                .iter()
+                .filter(|u| u.color == color && u.restrictions.is_empty() && u.expiry.is_none())
+                .count();
+            for _ in have..INFINITE_MANA_PER_TYPE {
+                player
+                    .mana_pool
+                    .add(ManaUnit::new(color, ObjectId(0), false, Vec::new()));
+            }
+        }
+    }
+    // Mark display dirty only after the mutable-player borrow above is released.
+    for &player_id in &flagged {
+        super::public_state::mark_public_state_player_dirty(state, player_id);
+    }
+    super::public_state::mark_mana_display_dirty(state);
+}
+
 fn mana_type_to_demand_index(mt: ManaType) -> Option<usize> {
     match mt {
         ManaType::White => Some(0),
@@ -199,7 +261,7 @@ pub(crate) fn produce_mana_with_attributes_from_source_quality(
         let unit = ManaUnit {
             color: final_mana_type,
             source_id,
-            snow: false,
+            supertype: None,
             source_could_produce_two_or_more_colors,
             restrictions: restrictions.to_vec(),
             grants: grants.to_vec(),
@@ -219,6 +281,9 @@ pub(crate) fn produce_mana_with_attributes_from_source_quality(
             source_id,
             tap_state: ManaTapState::from_tap(tapped_for_mana),
         });
+    }
+    if final_count > 0 {
+        state.layers_dirty.mark_full();
     }
 }
 
@@ -515,7 +580,11 @@ pub fn can_pay_for_spell(
 ///
 /// CR 601.2h: The player pays the total cost. Partial payments are not allowed.
 /// Unpayable costs can't be paid.
-pub fn pay_cost(
+///
+/// Pool-level arithmetic only — the ability-cost payment authority
+/// (`game/costs.rs::pay_cost`, see `.planning/cost-payment-unification/`)
+/// sits above this and owns `AbilityCost` dispatch.
+pub fn pay_from_pool(
     pool: &mut ManaPool,
     cost: &ManaCost,
 ) -> Result<(Vec<ManaUnit>, Vec<LifePayment>), PaymentError> {
@@ -1745,7 +1814,7 @@ fn spend_snow(pool: &mut ManaPool) -> bool {
 
 /// CR 107.4h: Snow mana {S} — paid with one mana of any type from a snow source.
 fn spend_snow_unit(pool: &mut ManaPool) -> Option<ManaUnit> {
-    if let Some(pos) = pool.mana.iter().position(|m| m.snow) {
+    if let Some(pos) = pool.mana.iter().position(|m| m.is_snow()) {
         Some(pool.mana.swap_remove(pos))
     } else {
         None
@@ -1849,7 +1918,7 @@ mod tests {
         ManaUnit {
             color,
             source_id: ObjectId(1),
-            snow: false,
+            supertype: None,
             source_could_produce_two_or_more_colors: false,
             restrictions: Vec::new(),
             grants: vec![],
@@ -1884,7 +1953,7 @@ mod tests {
             generic: 1,
         };
 
-        let (spent, life_payments) = pay_cost(&mut pool, &cost).unwrap();
+        let (spent, life_payments) = pay_from_pool(&mut pool, &cost).unwrap();
 
         assert_eq!(spent.len(), 2);
         assert!(spent
@@ -1903,7 +1972,7 @@ mod tests {
         };
 
         assert_eq!(
-            pay_cost(&mut pool, &cost),
+            pay_from_pool(&mut pool, &cost),
             Err(PaymentError::InsufficientMana)
         );
         assert_eq!(pool.total(), 2);
@@ -1919,7 +1988,7 @@ mod tests {
             generic: 0,
         };
 
-        let (spent, _) = pay_cost(&mut pool, &cost).unwrap();
+        let (spent, _) = pay_from_pool(&mut pool, &cost).unwrap();
 
         assert_eq!(spent.len(), 2);
         assert_eq!(pool.total(), 0);
@@ -2320,7 +2389,7 @@ mod tests {
             shards: vec![ManaCostShard::White, ManaCostShard::Blue],
             generic: 0,
         };
-        let (spent, life) = pay_cost(&mut pool, &cost).unwrap();
+        let (spent, life) = pay_from_pool(&mut pool, &cost).unwrap();
         assert_eq!(spent.len(), 2);
         assert!(life.is_empty());
         assert_eq!(pool.total(), 1); // 1 white left
@@ -2333,7 +2402,7 @@ mod tests {
             shards: vec![],
             generic: 2,
         };
-        let (spent, _) = pay_cost(&mut pool, &cost).unwrap();
+        let (spent, _) = pay_from_pool(&mut pool, &cost).unwrap();
         assert_eq!(spent.len(), 2);
         assert_eq!(pool.total(), 1);
     }
@@ -2346,7 +2415,7 @@ mod tests {
             shards: vec![ManaCostShard::WhiteBlue],
             generic: 0,
         };
-        let (spent, _) = pay_cost(&mut pool, &cost).unwrap();
+        let (spent, _) = pay_from_pool(&mut pool, &cost).unwrap();
         assert_eq!(spent.len(), 1);
         assert_eq!(spent[0].color, ManaType::White);
     }
@@ -2359,7 +2428,7 @@ mod tests {
             shards: vec![ManaCostShard::GreenBlue, ManaCostShard::GreenBlue],
             generic: 0,
         };
-        let (spent, _) = pay_cost(&mut pool, &cost).unwrap();
+        let (spent, _) = pay_from_pool(&mut pool, &cost).unwrap();
         assert_eq!(spent.len(), 2);
         assert!(spent.iter().all(|unit| unit.color == ManaType::Green));
     }
@@ -2372,7 +2441,7 @@ mod tests {
             shards: vec![ManaCostShard::GreenBlue, ManaCostShard::GreenBlue],
             generic: 0,
         };
-        let (spent, _) = pay_cost(&mut pool, &cost).unwrap();
+        let (spent, _) = pay_from_pool(&mut pool, &cost).unwrap();
         assert_eq!(spent.len(), 2);
         assert!(spent.iter().any(|unit| unit.color == ManaType::Green));
         assert!(spent.iter().any(|unit| unit.color == ManaType::Blue));
@@ -2385,7 +2454,7 @@ mod tests {
             shards: vec![ManaCostShard::PhyrexianRed],
             generic: 0,
         };
-        let (spent, life) = pay_cost(&mut pool, &cost).unwrap();
+        let (spent, life) = pay_from_pool(&mut pool, &cost).unwrap();
         assert_eq!(spent.len(), 1);
         assert!(life.is_empty());
     }
@@ -2397,7 +2466,7 @@ mod tests {
             shards: vec![ManaCostShard::PhyrexianBlue],
             generic: 0,
         };
-        let (spent, life) = pay_cost(&mut pool, &cost).unwrap();
+        let (spent, life) = pay_from_pool(&mut pool, &cost).unwrap();
         assert!(spent.is_empty());
         assert_eq!(life.len(), 1);
         assert_eq!(life[0].amount, 2);
@@ -2410,7 +2479,7 @@ mod tests {
             shards: vec![ManaCostShard::White],
             generic: 0,
         };
-        assert!(pay_cost(&mut pool, &cost).is_err());
+        assert!(pay_from_pool(&mut pool, &cost).is_err());
     }
 
     #[test]
@@ -2420,7 +2489,7 @@ mod tests {
             shards: vec![],
             generic: 1,
         };
-        let (spent, _) = pay_cost(&mut pool, &cost).unwrap();
+        let (spent, _) = pay_from_pool(&mut pool, &cost).unwrap();
         assert_eq!(spent[0].color, ManaType::Colorless);
     }
 
@@ -2491,7 +2560,7 @@ mod tests {
         pool.add(ManaUnit {
             color: ManaType::Green,
             source_id: ObjectId(1),
-            snow: false,
+            supertype: None,
             source_could_produce_two_or_more_colors: false,
             restrictions: vec![ManaRestriction::OnlyForCreatureType("Elf".to_string())],
             grants: vec![],
@@ -2511,6 +2580,7 @@ mod tests {
             keyword_kinds: vec![],
             cast_from_zone: None,
             mana_value: None,
+            color_count: None,
         };
         let elf_ctx = PaymentContext::Spell(&elf);
         assert!(can_pay_for_spell(
@@ -2531,6 +2601,7 @@ mod tests {
             keyword_kinds: vec![],
             cast_from_zone: None,
             mana_value: None,
+            color_count: None,
         };
         let goblin_ctx = PaymentContext::Spell(&goblin);
         assert!(!can_pay_for_spell(
@@ -2552,11 +2623,12 @@ mod tests {
             pool.add(ManaUnit {
                 color: ManaType::Colorless,
                 source_id: ObjectId(1),
-                snow: false,
+                supertype: None,
                 source_could_produce_two_or_more_colors: false,
-                restrictions: vec![ManaRestriction::OnlyForTypeSpellsOrAbilities(
-                    "Colorless Eldrazi".to_string(),
-                )],
+                restrictions: vec![ManaRestriction::OnlyForTypeSpellsOrAbilities {
+                    spell_type: "Colorless Eldrazi".to_string(),
+                    ability: crate::types::mana::AbilityActivationScope::OfSpellType,
+                }],
                 grants: vec![],
                 expiry: None,
             });
@@ -2575,6 +2647,7 @@ mod tests {
             keyword_kinds: vec![],
             cast_from_zone: None,
             mana_value: None,
+            color_count: None,
         };
         let thought_knot_ctx = PaymentContext::Spell(&thought_knot);
         assert!(can_pay_for_spell(
@@ -2594,6 +2667,7 @@ mod tests {
             keyword_kinds: vec![],
             cast_from_zone: None,
             mana_value: None,
+            color_count: None,
         };
         let colored_eldrazi_ctx = PaymentContext::Spell(&colored_eldrazi);
         assert!(!can_pay_for_spell(
@@ -2609,12 +2683,62 @@ mod tests {
     }
 
     #[test]
+    fn can_pay_any_ability_activation_with_generic_activation_restricted_mana() {
+        let mut pool = ManaPool::default();
+        pool.add(ManaUnit {
+            color: ManaType::Colorless,
+            source_id: ObjectId(1),
+            supertype: None,
+            source_could_produce_two_or_more_colors: false,
+            restrictions: vec![ManaRestriction::OnlyForTypeSpellsOrAbilities {
+                spell_type: "Colorless".to_string(),
+                ability: crate::types::mana::AbilityActivationScope::Any,
+            }],
+            grants: vec![],
+            expiry: None,
+        });
+
+        let cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::Colorless],
+            generic: 0,
+        };
+        let source_types = vec!["Creature".to_string()];
+        let source_subtypes = vec!["Goblin".to_string()];
+        let goblin_activation = PaymentContext::Activation {
+            source_types: &source_types,
+            source_subtypes: &source_subtypes,
+        };
+        assert!(can_pay_for_spell(
+            &pool,
+            &cost,
+            Some(&goblin_activation),
+            crate::types::mana::CostPermissionContext::default(),
+        ));
+
+        let colored_spell = SpellMeta {
+            types: vec!["Creature".to_string()],
+            subtypes: vec![],
+            keyword_kinds: vec![],
+            cast_from_zone: None,
+            mana_value: None,
+            color_count: None,
+        };
+        let colored_spell_ctx = PaymentContext::Spell(&colored_spell);
+        assert!(!can_pay_for_spell(
+            &pool,
+            &cost,
+            Some(&colored_spell_ctx),
+            crate::types::mana::CostPermissionContext::default(),
+        ));
+    }
+
+    #[test]
     fn can_pay_for_spell_respects_flashback_keyword_restriction() {
         let mut pool = ManaPool::default();
         pool.add(ManaUnit {
             color: ManaType::Colorless,
             source_id: ObjectId(1),
-            snow: false,
+            supertype: None,
             source_could_produce_two_or_more_colors: false,
             restrictions: vec![ManaRestriction::OnlyForSpellWithKeywordKind(
                 crate::types::keywords::KeywordKind::Flashback,
@@ -2634,6 +2758,7 @@ mod tests {
             keyword_kinds: vec![crate::types::keywords::KeywordKind::Flashback],
             cast_from_zone: Some(crate::types::zones::Zone::Graveyard),
             mana_value: None,
+            color_count: None,
         };
         let flashback_ctx = PaymentContext::Spell(&flashback_spell);
         assert!(can_pay_for_spell(
@@ -2653,6 +2778,7 @@ mod tests {
             keyword_kinds: vec![],
             cast_from_zone: Some(crate::types::zones::Zone::Hand),
             mana_value: None,
+            color_count: None,
         };
         let normal_ctx = PaymentContext::Spell(&normal_spell);
         assert!(!can_pay_for_spell(
@@ -2673,7 +2799,7 @@ mod tests {
         pool.add(ManaUnit {
             color: ManaType::Colorless,
             source_id: ObjectId(1),
-            snow: false,
+            supertype: None,
             source_could_produce_two_or_more_colors: false,
             restrictions: vec![ManaRestriction::OnlyForSpellWithKeywordKindFromZone(
                 crate::types::keywords::KeywordKind::Flashback,
@@ -2694,6 +2820,7 @@ mod tests {
             keyword_kinds: vec![crate::types::keywords::KeywordKind::Flashback],
             cast_from_zone: Some(crate::types::zones::Zone::Graveyard),
             mana_value: None,
+            color_count: None,
         };
         let gy_ctx = PaymentContext::Spell(&graveyard_flashback_spell);
         assert!(can_pay_for_spell(
@@ -2713,6 +2840,7 @@ mod tests {
             keyword_kinds: vec![crate::types::keywords::KeywordKind::Flashback],
             cast_from_zone: Some(crate::types::zones::Zone::Hand),
             mana_value: None,
+            color_count: None,
         };
         let hand_ctx = PaymentContext::Spell(&hand_flashback_spell);
         assert!(!can_pay_for_spell(
@@ -2734,7 +2862,7 @@ mod tests {
         pool.add(ManaUnit {
             color: ManaType::Green,
             source_id: ObjectId(1),
-            snow: false,
+            supertype: None,
             source_could_produce_two_or_more_colors: false,
             restrictions: vec![],
             grants: vec![],
@@ -2766,7 +2894,7 @@ mod tests {
         pool.add(ManaUnit {
             color: ManaType::Red,
             source_id: ObjectId(1),
-            snow: false,
+            supertype: None,
             source_could_produce_two_or_more_colors: false,
             restrictions: vec![],
             grants: vec![],
@@ -3016,5 +3144,106 @@ mod tests {
                 life_colors: crate::types::mana::LifePaymentColors::EMPTY
             }
         ));
+    }
+
+    /// `refill_infinite_mana` is the debug "infinite mana" building block. It must
+    /// seed every flagged player's pool to `INFINITE_MANA_PER_TYPE` units of each
+    /// of the six mana types, restore that cap after a spend without unbounded
+    /// growth (idempotent), no-op when no player is flagged, and never touch an
+    /// unflagged player.
+    #[test]
+    fn refill_infinite_mana_seeds_tops_up_and_isolates_players() {
+        let mut state = GameState::new_two_player(0);
+        let p1 = state.players[1].id;
+
+        // No player flagged → cheap no-op.
+        refill_infinite_mana(&mut state);
+        assert!(state.players[0].mana_pool.mana.is_empty());
+
+        // Flag P0 → seeded to the cap for each of the six types; P1 untouched.
+        state.debug_infinite_mana.insert(state.players[0].id);
+        refill_infinite_mana(&mut state);
+        for color in INFINITE_MANA_TYPES {
+            let n = state.players[0]
+                .mana_pool
+                .mana
+                .iter()
+                .filter(|u| u.color == color)
+                .count();
+            assert_eq!(n, INFINITE_MANA_PER_TYPE, "{color:?} seeded to cap");
+        }
+        let p1_pool = state.players.iter().find(|p| p.id == p1).unwrap();
+        assert!(
+            p1_pool.mana_pool.mana.is_empty(),
+            "unflagged player untouched"
+        );
+
+        // Spend two units, refill restores to the cap — idempotent, no growth.
+        assert!(state.players[0].mana_pool.spend(ManaType::White).is_some());
+        assert!(state.players[0].mana_pool.spend(ManaType::Green).is_some());
+        refill_infinite_mana(&mut state);
+        let total: usize = INFINITE_MANA_TYPES
+            .iter()
+            .map(|&c| {
+                state.players[0]
+                    .mana_pool
+                    .mana
+                    .iter()
+                    .filter(|u| u.color == c)
+                    .count()
+            })
+            .sum();
+        assert_eq!(
+            total,
+            INFINITE_MANA_PER_TYPE * INFINITE_MANA_TYPES.len(),
+            "topped back up to cap with no unbounded growth"
+        );
+    }
+
+    /// The `SetInfiniteMana` debug handler must add the player to
+    /// `debug_infinite_mana` and seed the pool immediately on enable (so the next
+    /// affordability probe reads full), and remove the flag on disable.
+    #[test]
+    fn set_infinite_mana_handler_toggles_flag_and_seeds() {
+        use crate::game::engine_debug::apply_debug_action;
+        use crate::types::actions::DebugAction;
+
+        let mut state = GameState::new_two_player(0);
+        let p0 = state.players[0].id;
+        let mut events = Vec::new();
+
+        apply_debug_action(
+            &mut state,
+            p0,
+            DebugAction::SetInfiniteMana {
+                player_id: p0,
+                enabled: true,
+            },
+            &mut events,
+        )
+        .expect("enable infinite mana");
+        assert!(state.debug_infinite_mana.contains(&p0));
+        for color in INFINITE_MANA_TYPES {
+            assert!(
+                state.players[0]
+                    .mana_pool
+                    .mana
+                    .iter()
+                    .any(|u| u.color == color),
+                "{color:?} seeded on enable"
+            );
+        }
+
+        apply_debug_action(
+            &mut state,
+            p0,
+            DebugAction::SetInfiniteMana {
+                player_id: p0,
+                enabled: false,
+            },
+            &mut events,
+        )
+        .expect("disable infinite mana");
+        assert!(!state.debug_infinite_mana.contains(&p0));
     }
 }

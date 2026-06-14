@@ -1,9 +1,12 @@
 use std::collections::HashSet;
 
 use crate::game::replacement::{self, ReplacementResult};
-use crate::game::zones;
+use crate::game::zone_pipeline::{
+    self, ApprovedZoneChange, DeliveryCtx, ExileLinkSpec, ZoneDeliveryResult,
+};
 use crate::types::ability::{
-    Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter, TargetRef, TypedFilter,
+    Effect, EffectError, EffectKind, FilterProp, ResolvedAbility, TargetFilter, TargetRef,
+    TypedFilter,
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::GameState;
@@ -38,12 +41,14 @@ pub fn apply_destroy_after_replacement(
                 ProposedEvent::zone_change(object_id, Zone::Battlefield, Zone::Graveyard, source);
             match replacement::replace_event(state, zone_proposed, events) {
                 ReplacementResult::Execute(zone_event) => {
-                    if let ProposedEvent::ZoneChange {
-                        object_id: oid, to, ..
-                    } = zone_event
-                    {
-                        zones::move_to_zone(state, oid, to, events);
-                        crate::game::layers::mark_layers_full(state);
+                    // CR 701.8a + CR 614: the inner ZoneChange already cleared the
+                    // replacement consult — seal it as a proof token and deliver
+                    // through the single pipeline tail so a destruction redirected
+                    // to the battlefield (e.g. "would die → return tapped/with
+                    // counters") gets the same enter_tapped / enter_with_counters /
+                    // ETB-counter-static treatment as any other entry.
+                    if !deliver_destruction_zone_change(state, zone_event, source, events) {
+                        return false;
                     }
                 }
                 ReplacementResult::Prevented => {}
@@ -55,14 +60,47 @@ pub fn apply_destroy_after_replacement(
             events.push(GameEvent::CreatureDestroyed { object_id });
             true
         }
-        ProposedEvent::ZoneChange { object_id, to, .. } => {
-            // Destroy replacement redirected directly to a zone change.
-            zones::move_to_zone(state, object_id, to, events);
-            crate::game::layers::mark_layers_full(state);
-            true
+        ProposedEvent::ZoneChange { .. } => {
+            // CR 614.6: the outer Destroy replacement redirected directly to a
+            // zone change. Deliver through the pipeline tail so a redirect to the
+            // battlefield gets the full delivery treatment, not a bare move.
+            deliver_destruction_zone_change(state, event, None, events)
         }
         _ => true,
     }
+}
+
+/// CR 701.8a + CR 614.6: Deliver a post-replacement destruction `ZoneChange`
+/// through the single zone-pipeline tail (`zone_pipeline::deliver`).
+///
+/// The event has already cleared the replacement consult, so it is sealed via
+/// the `approve_post_replacement` proof token (which preserves its `applied`
+/// set and re-validates that it is a ZoneChange). Routing through `deliver`
+/// gives a destruction redirected to the battlefield the full enter-tapped /
+/// enter-with-counters / ETB-counter-static delivery tail instead of a bare
+/// `move_to_zone`. Returns `true` on completion, `false` if the delivery tail
+/// itself surfaced a replacement choice (`state.waiting_for` is already set).
+fn deliver_destruction_zone_change(
+    state: &mut GameState,
+    zone_event: ProposedEvent,
+    source: Option<ObjectId>,
+    events: &mut Vec<GameEvent>,
+) -> bool {
+    let Ok(approved) = ApprovedZoneChange::approve_post_replacement(zone_event) else {
+        // Defensive: the inner proposal is always a ZoneChange.
+        return true;
+    };
+    let ctx = DeliveryCtx {
+        source_id: source,
+        exile_links: ExileLinkSpec::default(),
+        drain: crate::types::game_state::PostReplacementDrainOwner::DeliveryTail,
+        // Destroy delivers to the graveyard — never a library placement.
+        library_placement: None,
+    };
+    !matches!(
+        zone_pipeline::deliver(state, approved, ctx, events),
+        ZoneDeliveryResult::NeedsChoice(_)
+    )
 }
 
 /// Outcome of destroying a single object through the guarded path.
@@ -194,6 +232,29 @@ pub fn resolve(
     Ok(())
 }
 
+/// Does this destroy filter carry the "other" qualifier? A spell that creates
+/// tokens and then destroys "all other creatures" must spare its own freshly-
+/// created tokens. This behavior is the official Martial Coup / White Sun's
+/// Twilight Gatherer ruling ("creatures that are not [tokens] created by this
+/// copy"); the Comprehensive Rules have no numbered entry for the "other"
+/// qualifier itself. The parsed marker for "other" is `FilterProp::Another` on a
+/// `Typed` filter. Recurse through the boolean combinators so a compound filter
+/// ("all other creatures and all other artifacts" → `And`/`Or`) still trips the
+/// exclusion when any branch is "other".
+fn filter_excludes_other(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(tf) => tf
+            .properties
+            .iter()
+            .any(|p| matches!(p, FilterProp::Another)),
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+            filters.iter().any(filter_excludes_other)
+        }
+        TargetFilter::Not { filter } => filter_excludes_other(filter),
+        _ => false,
+    }
+}
+
 /// Destroy all permanents matching the filter.
 /// CR 701.8: Routes each destruction through the replacement pipeline
 /// so regeneration shields and other replacements can intercept.
@@ -221,6 +282,42 @@ pub fn resolve_all(
         crate::game::effects::resolved_object_filter(ability, &target_filter)
     };
 
+    // CR 701.7 (create) + CR 701.8 (destroy), per the Martial Coup / White Sun's
+    // Twilight ruling: "destroy all OTHER creatures" on a token-creating spell does
+    // NOT destroy the tokens that same spell just created — they are not "other"
+    // creatures. `FilterProp::Another` is the parsed "other" marker.
+    //
+    // The ruling spares only tokens "created by this copy". Each `TokenCreated`
+    // event carries the `source_id` of the effect that made the token, so the spared
+    // set is exactly the tokens whose creator is THIS resolving ability's source —
+    // the same `source_id` shared by the spell's own create and destroy steps. A
+    // token an opponent's (or anyone's) replacement effect produces earlier in the
+    // same resolution (e.g. Kalitas, Traitor of Ghet turning a creature's death into
+    // a Zombie during an earlier "each player sacrifices" instruction) carries that
+    // replacement source's id, not this spell's, so it remains an "other" creature
+    // and is destroyed. Scanning `events` is resolution-scoped: `resolve_next`
+    // resolves exactly one stack object per `apply` (priority resets afterward), so
+    // no stale cross-resolution token leaks in.
+    //
+    // When the filter has no `Another` marker (plain "destroy all creatures") or this
+    // spell created no tokens this resolution, the exclusion set is empty and behavior
+    // is unchanged.
+    let spare_self_created: HashSet<ObjectId> = if filter_excludes_other(&effective_filter) {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                GameEvent::TokenCreated {
+                    object_id,
+                    source_id,
+                    ..
+                } if *source_id == ability.source_id => Some(*object_id),
+                _ => None,
+            })
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
     // Collect matching object IDs that are on the battlefield and not indestructible.
     // CR 107.3a + CR 601.2b: ability-context filter evaluation.
     let ctx = crate::game::filter::FilterContext::from_ability(ability);
@@ -234,6 +331,7 @@ pub fn resolve_all(
                 .map(|obj| obj.has_keyword(&crate::types::keywords::Keyword::Indestructible))
                 .unwrap_or(false);
             !is_indestructible
+                && !spare_self_created.contains(id)
                 && crate::game::filter::matches_target_filter(state, **id, &effective_filter, &ctx)
         })
         .copied()
@@ -283,10 +381,16 @@ pub fn resolve_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::effects::resolve_ability_chain;
     use crate::game::zones::create_object;
-    use crate::types::ability::TargetFilter;
+    use crate::types::ability::{
+        AbilityCondition, PtValue, QuantityExpr, SubAbilityLink, TargetFilter,
+    };
     use crate::types::card_type::CoreType;
+    use crate::types::counter::CounterType;
+    use crate::types::game_state::WaitingFor;
     use crate::types::identifiers::{CardId, ObjectId};
+    use crate::types::keywords::Keyword;
     use crate::types::player::PlayerId;
 
     #[test]
@@ -313,6 +417,254 @@ mod tests {
         resolve(&mut state, &ability, &mut events).unwrap();
 
         assert!(!state.battlefield.contains(&obj_id));
+        assert!(state.players[0].graveyard.contains(&obj_id));
+    }
+
+    /// Spawn a battlefield creature for the "destroy all other creatures" tests.
+    fn battlefield_creature(state: &mut GameState, name: &str) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(1),
+            PlayerId(0),
+            name.to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&id).unwrap().card_types.core_types = vec![CoreType::Creature];
+        id
+    }
+
+    /// A `DestroyAll` over creatures carrying the `FilterProp::Another` ("other")
+    /// marker — the parsed shape of "destroy all other creatures".
+    fn destroy_all_other_creatures() -> ResolvedAbility {
+        ResolvedAbility::new(
+            Effect::DestroyAll {
+                target: TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![crate::types::ability::TypeFilter::Creature],
+                    controller: None,
+                    properties: vec![FilterProp::Another],
+                }),
+                cant_regenerate: false,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        )
+    }
+
+    /// Martial Coup / White Sun's Twilight ruling: "destroy all OTHER creatures"
+    /// spares the tokens this spell created earlier in the same resolution. Those
+    /// tokens are identified by a `TokenCreated` event whose `source_id` matches the
+    /// resolving ability's source (`ObjectId(100)`, per `destroy_all_other_creatures`);
+    /// a creature with no such event is destroyed.
+    #[test]
+    fn destroy_all_other_creatures_spares_same_resolution_tokens() {
+        let mut state = GameState::new_two_player(42);
+        let token = battlefield_creature(&mut state, "Mite");
+        let other = battlefield_creature(&mut state, "Grizzly Bears");
+
+        // The event buffer carries the spell's earlier token creation, exactly as a
+        // token-then-wrath chain produces it during a single resolution.
+        let mut events = vec![GameEvent::TokenCreated {
+            object_id: token,
+            name: "Mite".to_string(),
+            source_id: ObjectId(100),
+        }];
+
+        resolve_all(&mut state, &destroy_all_other_creatures(), &mut events).unwrap();
+
+        assert!(
+            state.battlefield.contains(&token),
+            "a token created this resolution is not 'other' and must survive"
+        );
+        assert!(
+            !state.battlefield.contains(&other),
+            "a creature not created this resolution is destroyed"
+        );
+    }
+
+    /// The "this copy" clause of the Martial Coup ruling: only the tokens THIS
+    /// spell created are spared. A token a replacement effect makes earlier in the
+    /// same resolution (e.g. Kalitas turning a death into a Zombie) carries a
+    /// `TokenCreated` event too, but with that replacement's `source_id` — not this
+    /// spell's — so it is still an "other" creature and is destroyed.
+    ///
+    /// The foreign token is deliberately given the SAME controller as the resolving
+    /// spell (`PlayerId(0)`): identity here is the creating SOURCE, not the
+    /// controller, so a caster-controlled replacement token is correctly destroyed —
+    /// the case a controller-only check would miss.
+    #[test]
+    fn destroy_all_other_creatures_does_not_spare_foreign_replacement_token() {
+        let mut state = GameState::new_two_player(42);
+        let own = battlefield_creature(&mut state, "Mite");
+        let foreign = battlefield_creature(&mut state, "Zombie");
+
+        let mut events = vec![
+            // `own` was created by the resolving spell (source ObjectId(100)).
+            GameEvent::TokenCreated {
+                object_id: own,
+                name: "Mite".to_string(),
+                source_id: ObjectId(100),
+            },
+            // `foreign` was created this resolution by a DIFFERENT source (a
+            // replacement effect, ObjectId(200)) — same controller, different creator.
+            GameEvent::TokenCreated {
+                object_id: foreign,
+                name: "Zombie".to_string(),
+                source_id: ObjectId(200),
+            },
+        ];
+
+        resolve_all(&mut state, &destroy_all_other_creatures(), &mut events).unwrap();
+
+        assert!(
+            state.battlefield.contains(&own),
+            "the spell's own token is not 'other' and survives"
+        );
+        assert!(
+            !state.battlefield.contains(&foreign),
+            "a token created by a different source is not 'this copy' and must be destroyed, \
+             even under the spell's own controller"
+        );
+    }
+
+    /// The "other" marker is recognized through boolean filter combinators, so a
+    /// compound "destroy all other creatures and all other artifacts" (`And`/`Or` of
+    /// `Another`-bearing `Typed` filters) still triggers the self-token exclusion. A
+    /// compound filter with no `Another` does not.
+    #[test]
+    fn filter_excludes_other_recurses_through_compound_filters() {
+        let other = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![crate::types::ability::TypeFilter::Creature],
+            controller: None,
+            properties: vec![FilterProp::Another],
+        });
+        assert!(filter_excludes_other(&other));
+        assert!(filter_excludes_other(&TargetFilter::Or {
+            filters: vec![other.clone()],
+        }));
+        assert!(filter_excludes_other(&TargetFilter::And {
+            filters: vec![other.clone()],
+        }));
+        assert!(filter_excludes_other(&TargetFilter::Not {
+            filter: Box::new(other),
+        }));
+
+        let plain = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![crate::types::ability::TypeFilter::Creature],
+            controller: None,
+            properties: vec![],
+        });
+        assert!(!filter_excludes_other(&TargetFilter::And {
+            filters: vec![plain],
+        }));
+    }
+
+    /// Negative control: with no `TokenCreated` event in the buffer (the destroy
+    /// did not create anything this resolution), "destroy all other creatures"
+    /// destroys every matching creature — the exclusion set is empty.
+    #[test]
+    fn destroy_all_other_creatures_without_self_tokens_destroys_all() {
+        let mut state = GameState::new_two_player(42);
+        let a = battlefield_creature(&mut state, "Bear A");
+        let b = battlefield_creature(&mut state, "Bear B");
+
+        resolve_all(&mut state, &destroy_all_other_creatures(), &mut Vec::new()).unwrap();
+
+        assert!(!state.battlefield.contains(&a));
+        assert!(!state.battlefield.contains(&b));
+    }
+
+    /// Negative control: a plain "destroy all creatures" (no `FilterProp::Another`
+    /// marker) destroys even a same-resolution token — the exclusion is gated on
+    /// the "other" qualifier, so it must not fire here.
+    #[test]
+    fn destroy_all_creatures_without_other_marker_destroys_self_token() {
+        let mut state = GameState::new_two_player(42);
+        let token = battlefield_creature(&mut state, "Mite");
+
+        let mut events = vec![GameEvent::TokenCreated {
+            object_id: token,
+            name: "Mite".to_string(),
+            source_id: ObjectId(100),
+        }];
+
+        let ability = ResolvedAbility::new(
+            Effect::DestroyAll {
+                target: TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![crate::types::ability::TypeFilter::Creature],
+                    controller: None,
+                    properties: vec![],
+                }),
+                cant_regenerate: false,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+
+        resolve_all(&mut state, &ability, &mut events).unwrap();
+
+        assert!(
+            !state.battlefield.contains(&token),
+            "without the 'other' marker, a same-resolution token is destroyed too"
+        );
+    }
+
+    /// CR 122.1c: a permanent with shield counters is not destroyed by a
+    /// destruction effect; one shield counter is removed instead, per use.
+    #[test]
+    fn shield_counter_prevents_destruction_and_is_consumed_per_use() {
+        let mut state = GameState::new_two_player(42);
+        let obj_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Shielded Bear".to_string(),
+            Zone::Battlefield,
+        );
+        // CR 122.1c: one or more shield counters share a single replacement.
+        state
+            .objects
+            .get_mut(&obj_id)
+            .unwrap()
+            .counters
+            .insert(CounterType::Shield, 2);
+
+        let ability = ResolvedAbility::new(
+            Effect::Destroy {
+                target: TargetFilter::Any,
+                cant_regenerate: false,
+            },
+            vec![TargetRef::Object(obj_id)],
+            ObjectId(100),
+            PlayerId(0),
+        );
+
+        // First destruction: prevented, one shield counter removed (2 -> 1).
+        resolve(&mut state, &ability, &mut Vec::new()).unwrap();
+        assert!(
+            state.battlefield.contains(&obj_id),
+            "shield counter must prevent destruction"
+        );
+        assert_eq!(
+            state.objects[&obj_id].counters.get(&CounterType::Shield),
+            Some(&1)
+        );
+
+        // Second destruction: removes the last counter (1 -> 0); still alive.
+        resolve(&mut state, &ability, &mut Vec::new()).unwrap();
+        assert!(state.battlefield.contains(&obj_id));
+        assert_eq!(
+            state.objects[&obj_id].counters.get(&CounterType::Shield),
+            None
+        );
+
+        // Third destruction: no shield left -> destroyed.
+        resolve(&mut state, &ability, &mut Vec::new()).unwrap();
+        assert!(
+            !state.battlefield.contains(&obj_id),
+            "with no shield counter, the permanent is destroyed"
+        );
         assert!(state.players[0].graveyard.contains(&obj_id));
     }
 
@@ -374,6 +726,101 @@ mod tests {
         resolve(&mut state, &ability, &mut events).unwrap();
 
         assert!(state.battlefield.contains(&obj_id));
+    }
+
+    fn make_if_you_do_token_rider(source_id: ObjectId) -> ResolvedAbility {
+        let mut rider = ResolvedAbility::new(
+            Effect::Token {
+                name: "Destroy Rider Token".to_string(),
+                power: PtValue::Fixed(1),
+                toughness: PtValue::Fixed(1),
+                types: vec!["Creature".to_string()],
+                colors: Vec::new(),
+                keywords: Vec::new(),
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                owner: TargetFilter::Controller,
+                attach_to: None,
+                enters_attacking: false,
+                supertypes: Vec::new(),
+                static_abilities: Vec::new(),
+                enter_with_counters: Vec::new(),
+            },
+            Vec::new(),
+            source_id,
+            PlayerId(0),
+        )
+        .condition(AbilityCondition::effect_performed());
+        rider.sub_link = SubAbilityLink::SequentialSibling;
+        rider
+    }
+
+    fn destroy_with_if_you_do_rider(target: ObjectId) -> ResolvedAbility {
+        let mut ability = ResolvedAbility::new(
+            Effect::Destroy {
+                target: TargetFilter::Any,
+                cant_regenerate: false,
+            },
+            vec![TargetRef::Object(target)],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        ability.sub_ability = Some(Box::new(make_if_you_do_token_rider(ObjectId(100))));
+        ability
+    }
+
+    /// CR 608.2c + CR 701.8a: a mandatory destroy instruction that actually
+    /// moves the target satisfies its following "if you do" rider.
+    #[test]
+    fn mandatory_destroy_if_you_do_rider_fires_when_destroyed() {
+        let mut state = GameState::new_two_player(42);
+        let obj_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Mortal Bear".to_string(),
+            Zone::Battlefield,
+        );
+        let ability = destroy_with_if_you_do_rider(obj_id);
+        let mut events = Vec::new();
+
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        assert!(!state.battlefield.contains(&obj_id));
+        assert!(state
+            .objects
+            .values()
+            .any(|obj| obj.is_token && obj.name == "Destroy Rider Token"));
+    }
+
+    /// CR 608.2c + CR 702.12b: a skipped destroy instruction did not happen,
+    /// so it must not satisfy a following "if you do" rider.
+    #[test]
+    fn mandatory_destroy_if_you_do_rider_skips_when_indestructible() {
+        let mut state = GameState::new_two_player(42);
+        let obj_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Indestructible Bear".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&obj_id)
+            .unwrap()
+            .keywords
+            .push(crate::types::keywords::Keyword::Indestructible);
+        let ability = destroy_with_if_you_do_rider(obj_id);
+        let mut events = Vec::new();
+
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        assert!(state.battlefield.contains(&obj_id));
+        assert!(!state
+            .objects
+            .values()
+            .any(|obj| obj.is_token && obj.name == "Destroy Rider Token"));
     }
 
     #[test]
@@ -463,6 +910,150 @@ mod tests {
         assert!(!state.battlefield.contains(&bear2));
         // Land survives
         assert_eq!(state.battlefield.len(), 1);
+    }
+
+    /// CR 122.1c: a shield counter replaces destruction from a mass-destruction
+    /// effect (board wipe), not just single-target destruction. The shielded
+    /// creature survives (one counter removed); an unshielded creature dies.
+    #[test]
+    fn shield_counter_prevents_destroy_all_and_is_consumed() {
+        let mut state = GameState::new_two_player(42);
+
+        let shielded = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Shielded Bear".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&shielded).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.counters.insert(CounterType::Shield, 1);
+        }
+
+        let plain = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Plain Bear".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&plain)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+
+        let ability = ResolvedAbility::new(
+            Effect::DestroyAll {
+                target: TargetFilter::None,
+                cant_regenerate: false,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        resolve_all(&mut state, &ability, &mut Vec::new()).unwrap();
+
+        assert!(
+            state.battlefield.contains(&shielded),
+            "shield counter must save the creature from a board wipe"
+        );
+        assert_eq!(
+            state.objects[&shielded].counters.get(&CounterType::Shield),
+            None,
+            "the shield counter is consumed"
+        );
+        assert!(
+            !state.battlefield.contains(&plain),
+            "unshielded creature is destroyed by the board wipe"
+        );
+    }
+
+    #[test]
+    fn destroy_all_shield_counter_and_umbra_prompt_for_order() {
+        let mut state = GameState::new_two_player(42);
+
+        let shielded = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Shielded Bear".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&shielded).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.counters.insert(CounterType::Shield, 1);
+        }
+
+        let umbra = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Hyena Umbra".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let aura = state.objects.get_mut(&umbra).unwrap();
+            aura.card_types.core_types.push(CoreType::Enchantment);
+            aura.card_types.subtypes.push("Aura".to_string());
+            aura.keywords.push(Keyword::TotemArmor);
+            aura.attached_to = Some(shielded.into());
+        }
+        state
+            .objects
+            .get_mut(&shielded)
+            .unwrap()
+            .attachments
+            .push(umbra);
+
+        let ability = ResolvedAbility::new(
+            Effect::DestroyAll {
+                target: TargetFilter::None,
+                cant_regenerate: false,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+
+        resolve_all(&mut state, &ability, &mut events).unwrap();
+
+        let WaitingFor::ReplacementChoice {
+            player,
+            candidate_count,
+            candidate_descriptions,
+        } = &state.waiting_for
+        else {
+            panic!(
+                "shield counter plus umbra armor under DestroyAll must prompt for CR 616 \
+                 order, got {:?}",
+                state.waiting_for
+            );
+        };
+        assert_eq!(*player, PlayerId(0));
+        assert_eq!(*candidate_count, 2);
+        assert_eq!(
+            candidate_descriptions.as_slice(),
+            &[
+                "Remove a shield counter".to_string(),
+                "Umbra armor: destroy Hyena Umbra instead".to_string(),
+            ]
+        );
+        assert_eq!(
+            state.objects[&shielded].counters.get(&CounterType::Shield),
+            Some(&1),
+            "the shield counter must not be consumed before the replacement choice"
+        );
+        assert!(
+            state.battlefield.contains(&umbra),
+            "the Umbra must not be destroyed before the replacement choice"
+        );
     }
 
     #[test]
@@ -747,8 +1338,7 @@ mod tests {
     // `QuantityRef::TrackedSetSize` resolve against the correct count.
     // ---------------------------------------------------------------------
 
-    use crate::game::effects::resolve_ability_chain;
-    use crate::types::ability::{QuantityExpr, QuantityRef, TypeFilter, TypedFilter};
+    use crate::types::ability::{QuantityRef, TypeFilter, TypedFilter};
 
     /// Builds the Fumigate-shape chain: `DestroyAll(creatures)` followed by
     /// `GainLife(amount = TrackedSetSize, player = Controller)`.

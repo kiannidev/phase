@@ -26,7 +26,8 @@
 //! - `Pump` — every candidate target already has an active
 //!   `UntilEndOfTurn` pump from this same source with matching P/T.
 //! - `GainLife` — controller's life ≥ `LIFE_DIMINISHING_RETURNS`.
-//! - `DealDamage` / `Draw` — the `QuantityExpr` resolves to 0.
+//! - `DealDamage` / `Draw` / `AddCounter` — the `QuantityExpr` (`amount`/
+//!   `count`) resolves to 0, so the effect is a strict no-op.
 //! - `GenericEffect` granting a keyword — every candidate target already
 //!   has that keyword effectively.
 //! - `Animate` granting keywords — every candidate target already has all
@@ -34,9 +35,11 @@
 //!
 //! TODOs for follow-up shipments (exhaustive-match arms intentionally
 //! return `None` for these categories today):
-//! - `AddCounter` — accumulating +1/+1 counters is almost always
-//!   beneficial; would need a deeper "counter-doubling payoff absent"
-//!   check before penalising.
+//! - `AddCounter` — the strictly-redundant zero-count sub-case ships above
+//!   (count `QuantityExpr` resolves to 0). The broader case — accumulating
+//!   +1/+1 counters is almost always beneficial — is still deferred; it would
+//!   need a deeper "counter-doubling payoff absent" check before penalising a
+//!   nonzero grant.
 //! - `Discard` — penalise "opponent discards" when opponent's hand is
 //!   known-empty (requires information-asymmetry handling).
 //! - Multi-turn projection (draw into a full hand when discard is coming).
@@ -54,16 +57,19 @@
 //!   to short-circuit casts. Tracked separately as an oracle-parser issue.
 
 use engine::game::filter::{matches_target_filter, FilterContext};
-use engine::game::keywords::has_keyword;
+use engine::game::keywords::{has_flash, has_keyword};
 use engine::game::quantity::resolve_quantity;
 use engine::types::ability::{
-    ContinuousModification, Duration, Effect, QuantityExpr, StaticDefinition, TargetFilter,
+    ContinuousModification, Duration, Effect, EffectScope, QuantityExpr, StaticDefinition,
+    TapStateChange, TargetFilter,
 };
 use engine::types::actions::GameAction;
+use engine::types::card_type::CoreType;
 use engine::types::game_state::{GameState, TransientContinuousEffect};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
 use engine::types::player::PlayerId;
+use engine::types::statics::StaticMode;
 use engine::types::zones::Zone;
 
 use super::activation::turn_only;
@@ -71,6 +77,8 @@ use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
 use crate::cast_facts::collect_definition_effects;
 use crate::features::DeckFeatures;
+#[cfg(test)]
+use engine::types::game_state::CastPaymentMode;
 
 /// Life threshold at which further life gain is treated as redundant.
 /// Chosen well above any opening-life total (20) so we never penalise early
@@ -131,6 +139,14 @@ const KIND_UNTAP: i64 = 7;
 /// positive-scoring loop because `EtbValuePolicy` rewards the bounce without
 /// distinguishing self-undo from genuine blink value.
 const KIND_BOUNCE_SELF_UNDO: i64 = 8;
+/// CR 122.1: An `AddCounter` whose count `QuantityExpr` resolves to 0 places
+/// no counters — a strict no-op, mirroring the `DealDamage`/`Draw` zero-quantity
+/// arms. The broader "diminishing returns on +1/+1 counters" case stays deferred
+/// (see the module TODOs); only the strictly-redundant zero-count sub-case fires.
+const KIND_ADD_COUNTER_ZERO: i64 = 9;
+/// CR 601.3b: Activating a flash-cast permission (Alchemist's Refuge class)
+/// when no hand spell would gain instant-speed timing.
+const KIND_FLASH_CAST_PERMISSION: i64 = 10;
 
 pub struct RedundancyAvoidancePolicy;
 
@@ -240,7 +256,7 @@ impl TacticalPolicy for RedundancyAvoidancePolicy {
 ///   - Tap/Untap: count of matched tapped/untapped targets
 ///   - Pump: `power * 100 + toughness` (power dominates; tolerates ±99)
 ///   - GainLife: current life total
-///   - DealDamage/Draw: resolved quantity (0)
+///   - DealDamage/Draw/AddCounter: resolved quantity (0)
 ///   - Generic/Animate keyword: count of granted keywords already present
 ///   - Bounce self-undo: candidate-set size (0 = trigger fizzles, 1 = source-only)
 ///
@@ -256,8 +272,19 @@ fn redundancy_delta(
     origin: EffectOrigin,
 ) -> Option<(f64, i64, i64)> {
     match effect {
-        Effect::Tap { target } => tap_redundancy(state, source_id, target),
-        Effect::Untap { target } => untap_redundancy(state, source_id, target),
+        // CR 701.26a/b: single-target tap/untap have redundancy checks; the
+        // mass (`All`) scope has none (see the no-op list below), matching the
+        // legacy `Tap`/`Untap` vs `TapAll`/`UntapAll` split.
+        Effect::SetTapState {
+            target,
+            scope: EffectScope::Single,
+            state: TapStateChange::Tap,
+        } => tap_redundancy(state, source_id, target),
+        Effect::SetTapState {
+            target,
+            scope: EffectScope::Single,
+            state: TapStateChange::Untap,
+        } => untap_redundancy(state, source_id, target),
         Effect::Pump {
             power,
             toughness,
@@ -282,11 +309,29 @@ fn redundancy_delta(
             KIND_DRAW_ZERO,
             /* delta= */ -3.0,
         ),
+        // CR 122.1: An AddCounter whose count resolves to 0 places no counters
+        // — a strict no-op, exactly like DealDamage(0)/Draw(0). Dynamic counts
+        // (e.g. "a +1/+1 counter for each artifact you control" with no
+        // artifacts) are reachable and resolve to 0 via `resolve_quantity`. The
+        // broader "+1/+1 counters are almost always beneficial" / diminishing-
+        // returns case remains deferred (see module TODOs) — only this strictly
+        // redundant zero-count sub-case fires here.
+        Effect::PutCounter { count, .. } => zero_quantity_redundancy(
+            state,
+            source_id,
+            ai_player,
+            count,
+            KIND_ADD_COUNTER_ZERO,
+            /* delta= */ -3.0,
+        ),
         Effect::GenericEffect {
             static_abilities,
             target,
             ..
-        } => generic_effect_keyword_redundancy(state, source_id, static_abilities, target.as_ref()),
+        } => generic_effect_keyword_redundancy(state, source_id, static_abilities, target.as_ref())
+            .or_else(|| {
+                generic_effect_flash_cast_permission_redundancy(state, ai_player, static_abilities)
+            }),
         Effect::Animate {
             keywords, target, ..
         } => animate_keyword_redundancy(state, source_id, keywords, target),
@@ -319,9 +364,12 @@ fn redundancy_delta(
         | Effect::Counter { .. }
         | Effect::Token { .. }
         | Effect::LoseLife { .. }
-        | Effect::TapAll { .. }
-        | Effect::UntapAll { .. }
-        | Effect::AddCounter { .. }
+        // CR 701.26a/b: mass tap/untap (legacy `TapAll`/`UntapAll`) has no
+        // shipped redundancy check.
+        | Effect::SetTapState {
+            scope: EffectScope::All,
+            ..
+        }
         | Effect::RemoveCounter { .. }
         | Effect::Sacrifice { .. }
         | Effect::DiscardCard { .. }
@@ -337,6 +385,7 @@ fn redundancy_delta(
         | Effect::ChangeZoneAll { .. }
         | Effect::Dig { .. }
         | Effect::GainControl { .. }
+        | Effect::GainControlAll { .. }
         | Effect::ControlNextTurn { .. }
         | Effect::Attach { .. }
         | Effect::UnattachAll { .. }
@@ -349,19 +398,39 @@ fn redundancy_delta(
         | Effect::BecomeMonarch
         | Effect::Proliferate
         | Effect::EndTheTurn
+        | Effect::EndCombatPhase
         | Effect::Populate
         | Effect::Clash
         | Effect::Vote { .. }
         | Effect::SeparateIntoPiles { .. }
         | Effect::SwitchPT { .. }
         | Effect::CopySpell { .. }
+        | Effect::EpicCopy { .. }
         | Effect::CastCopyOfCard { .. }
         | Effect::CopyTokenOf { .. }
         | Effect::Myriad
+        // CR 702.141a: Encore makes per-opponent copy tokens — like Myriad, it is
+        // not a "redundant if already controlled" effect.
+        | Effect::Encore
+        // CR 701.42a: Meld exiles both halves of a meld pair and materializes a
+        // single combined permanent — not a "redundant if already controlled" one.
+        | Effect::Meld { .. }
+        // CR 702.75a: HideawayConceal is an internal continuation step of the
+        // Hideaway ETB trigger (turn the just-exiled card face down + link it);
+        // it is never independently chosen, so it carries no redundancy signal.
+        | Effect::HideawayConceal { .. }
+        // CR 702.55a: ExileHaunting (the haunt ability — exile this card haunting
+        // target creature) is a triggered death/resolution effect, not a
+        // "redundant if already controlled" one.
+        | Effect::ExileHaunting { .. }
+        // CR 614.1a + CR 607.2b: Rod of Absorption's trigger stamps a resolving
+        // spell with an exile-instead/linked-source rider. Its value is realized
+        // by the stack resolution replacement path, so this policy has no static
+        // redundancy signal to score.
+        | Effect::ExileResolvingSpellInsteadOfGraveyard
         | Effect::CopyTokenBlockingAttacker { .. }
         | Effect::BecomeCopy { .. }
         | Effect::ChooseCard { .. }
-        | Effect::PutCounter { .. }
         | Effect::PutCounterAll { .. }
         | Effect::MultiplyCounter { .. }
         | Effect::DoublePT { .. }
@@ -386,6 +455,7 @@ fn redundancy_delta(
         | Effect::PhaseOut { .. }
         | Effect::PhaseIn { .. }
         | Effect::ForceBlock { .. }
+        | Effect::ForceAttack { .. }
         | Effect::SolveCase
         | Effect::SetClassLevel { .. }
         | Effect::CreateDelayedTrigger { .. }
@@ -396,9 +466,10 @@ fn redundancy_delta(
         | Effect::CreateEmblem { .. }
         | Effect::PayCost { .. }
         | Effect::CastFromZone { .. }
+        | Effect::FreeCastFromZones { .. }
         | Effect::PreventDamage { .. }
-        | Effect::LoseTheGame
-        | Effect::WinTheGame
+        | Effect::LoseTheGame { .. }
+        | Effect::WinTheGame { .. }
         | Effect::RollDie { .. }
         | Effect::FlipCoin { .. }
         | Effect::FlipCoins { .. }
@@ -407,6 +478,7 @@ fn redundancy_delta(
         | Effect::VentureIntoDungeon
         | Effect::VentureInto { .. }
         | Effect::TakeTheInitiative
+        | Effect::Planeswalk
         | Effect::GrantCastingPermission { .. }
         | Effect::ChooseFromZone { .. }
         | Effect::ChooseObjectsIntoTrackedSet { .. }
@@ -427,6 +499,8 @@ fn redundancy_delta(
         | Effect::ChangeTargets { .. }
         | Effect::Manifest { .. }
         | Effect::ManifestDread
+        | Effect::Cloak { .. }
+        | Effect::TurnFaceUp { .. }
         | Effect::ExtraTurn { .. }
         | Effect::GrantExtraLoyaltyActivations { .. }
         | Effect::SkipNextTurn { .. }
@@ -437,6 +511,7 @@ fn redundancy_delta(
         | Effect::Incubate { .. }
         | Effect::Amass { .. }
         | Effect::Monstrosity { .. }
+        | Effect::Specialize
         | Effect::Renown { .. }
         | Effect::Bolster { .. }
         | Effect::Adapt { .. }
@@ -451,12 +526,15 @@ fn redundancy_delta(
         | Effect::GiveControl { .. }
         | Effect::RemoveFromCombat { .. }
         | Effect::Conjure { .. }
+        | Effect::Intensify { .. }
+        | Effect::DraftFromSpellbook { .. }
         | Effect::Tribute { .. }
         | Effect::Unimplemented { .. }
         // CR 702.85a: Cascade has no targets or redundancy — the redundancy
         // policy treats it as a no-op here; the cascade resolver handles the
         // cast-or-decline choice through its own WaitingFor state.
         | Effect::Cascade
+        | Effect::Ripple { .. }
         | Effect::Reveal { .. }
         // CR 702.xxx: Prepare (Strixhaven) — no redundancy detection.
         | Effect::BecomePrepared { .. }
@@ -503,6 +581,10 @@ fn redundancy_delta(
         // CR 701.51 + CR 701.52: Attraction open/visit — deck state dependent.
         | Effect::OpenAttractions { .. }
         | Effect::RollToVisitAttractions
+        // CR 701.34a + CR 122.1: targeted proliferate adds one counter of each
+        // kind already present — adding counters is virtually always beneficial,
+        // so there is no "does nothing" static-redundancy signal here.
+        | Effect::ProliferateTarget { .. }
         | Effect::ProcessRadCounters => None,
     }
 }
@@ -755,9 +837,9 @@ fn gain_life_redundancy(
     Some((-0.5, KIND_GAIN_LIFE, life as i64))
 }
 
-/// Zero-quantity detector for damage/draw effects: the `QuantityExpr`
-/// resolves to 0 given the current state. Applies equally to `DealDamage`
-/// and `Draw` because both degenerate to no-ops at quantity 0.
+/// Zero-quantity detector for damage/draw/counter effects: the `QuantityExpr`
+/// resolves to 0 given the current state. Applies equally to `DealDamage`,
+/// `Draw`, and `AddCounter` because each degenerates to a no-op at quantity 0.
 fn zero_quantity_redundancy(
     state: &GameState,
     source_id: ObjectId,
@@ -781,19 +863,35 @@ fn zero_quantity_redundancy(
 
 /// `GenericEffect` redundancy: the effect's static abilities grant one or
 /// more keywords (via `ContinuousModification::AddKeyword`), and every
-/// candidate target already effectively has each granted keyword.
+/// recipient already effectively has each granted keyword.
+///
+/// Recipients are resolved by layer (CR 611.2 — a continuous effect's
+/// affected set is defined by the ability, which may or may not be a chosen
+/// target):
+/// - A chosen `target` (e.g. "target creature gains flying") drives the set
+///   directly — at decision time the legal-target *filter* stands in for the
+///   not-yet-chosen object.
+/// - A self/affected-scoped grant carries `target: None` (e.g. Prognostic
+///   Sphinx's "~ gains hexproof until end of turn", whose lowered form has
+///   `target: None` and a `StaticDefinition` with `affected: Some(SelfRef)`).
+///   The recipients are then the union of each keyword-granting static's
+///   `affected` filter. Without this fallback the policy is blind to redundant
+///   self-buffs — the AI re-pays the cost (here: discarding a card) to grant a
+///   keyword it already has (issue #1966).
 fn generic_effect_keyword_redundancy(
     state: &GameState,
     source_id: ObjectId,
     static_abilities: &[StaticDefinition],
     target: Option<&TargetFilter>,
 ) -> Option<(f64, i64, i64)> {
-    let target = target?;
     let granted = collect_keyword_grants(static_abilities);
     if granted.is_empty() {
         return None;
     }
-    let candidates = resolved_candidate_targets(state, source_id, target);
+    let candidates = match target {
+        Some(target) => resolved_candidate_targets(state, source_id, target),
+        None => resolve_affected_candidates(state, source_id, static_abilities),
+    };
     if candidates.is_empty() {
         return None;
     }
@@ -807,6 +905,94 @@ fn generic_effect_keyword_redundancy(
         Some((-2.0, KIND_GENERIC_KEYWORD, granted.len() as i64))
     } else {
         None
+    }
+}
+
+/// Resolve the recipients of a keyword-granting `GenericEffect` that carries
+/// no chosen `target` — the self/affected-scoped case (Prognostic Sphinx's
+/// "~ gains hexproof until end of turn"). Returns the dedup-preserving union of
+/// objects matched by the `affected` filter of every static ability that
+/// grants at least one keyword. A static whose `affected` is `None` defines no
+/// recipient set and contributes nothing.
+fn resolve_affected_candidates(
+    state: &GameState,
+    source_id: ObjectId,
+    static_abilities: &[StaticDefinition],
+) -> Vec<ObjectId> {
+    let mut out = Vec::new();
+    for stat in static_abilities {
+        let grants_keyword = stat
+            .modifications
+            .iter()
+            .any(|m| matches!(m, ContinuousModification::AddKeyword { .. }));
+        if !grants_keyword {
+            continue;
+        }
+        let Some(affected) = stat.affected.as_ref() else {
+            continue;
+        };
+        for id in resolved_candidate_targets(state, source_id, affected) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+fn static_grants_flash_cast(mode: &StaticMode) -> bool {
+    matches!(
+        mode,
+        StaticMode::CastWithKeyword {
+            keyword: Keyword::Flash,
+            ..
+        } | StaticMode::CastWithFlash
+    )
+}
+
+/// A sorcery-speed hand spell gains timing value from a flash-cast grant.
+fn hand_spell_benefits_from_flash_grant(obj: &engine::game::game_object::GameObject) -> bool {
+    if obj.card_types.core_types.contains(&CoreType::Land) {
+        return false;
+    }
+    if obj.card_types.core_types.contains(&CoreType::Instant) {
+        return false;
+    }
+    !has_flash(obj)
+}
+
+/// Issue #1528 — penalise activating Alchemist's Refuge-style flash grants
+/// when the AI's hand has no spell that would actually gain instant speed.
+fn generic_effect_flash_cast_permission_redundancy(
+    state: &GameState,
+    ai_player: PlayerId,
+    static_abilities: &[StaticDefinition],
+) -> Option<(f64, i64, i64)> {
+    let flash_stats: Vec<_> = static_abilities
+        .iter()
+        .filter(|s| static_grants_flash_cast(&s.mode))
+        .collect();
+    if flash_stats.is_empty() {
+        return None;
+    }
+    let player = state.players.iter().find(|p| p.id == ai_player)?;
+    let has_beneficiary = player.hand.iter().any(|&id| {
+        let Some(obj) = state.objects.get(&id) else {
+            return false;
+        };
+        if !hand_spell_benefits_from_flash_grant(obj) {
+            return false;
+        }
+        flash_stats.iter().any(|stat| {
+            stat.affected.as_ref().is_none_or(|filter| {
+                matches_target_filter(state, id, filter, &FilterContext::from_source(state, id))
+            })
+        })
+    });
+    if has_beneficiary {
+        None
+    } else {
+        Some((-2.0, KIND_FLASH_CAST_PERMISSION, 0))
     }
 }
 
@@ -874,6 +1060,7 @@ mod tests {
         AbilityDefinition, AbilityKind, BounceSelection, PtValue, QuantityExpr, TargetFilter,
     };
     use engine::types::card_type::CoreType;
+    use engine::types::counter::CounterType;
     use engine::types::game_state::WaitingFor;
     use engine::types::identifiers::CardId;
     use engine::types::statics::StaticMode;
@@ -941,8 +1128,10 @@ mod tests {
         let obj_id = make_creature_with_ability(
             &mut state,
             "Tapper",
-            Effect::Tap {
+            Effect::SetTapState {
                 target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
+                state: TapStateChange::Tap,
             },
         );
         state.objects.get_mut(&obj_id).unwrap().tapped = true;
@@ -965,8 +1154,10 @@ mod tests {
         let obj_id = make_creature_with_ability(
             &mut state,
             "Tapper",
-            Effect::Tap {
+            Effect::SetTapState {
                 target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
+                state: TapStateChange::Tap,
             },
         );
         // default tapped = false
@@ -989,8 +1180,10 @@ mod tests {
         let obj_id = make_creature_with_ability(
             &mut state,
             "Untapper",
-            Effect::Untap {
+            Effect::SetTapState {
                 target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
+                state: TapStateChange::Untap,
             },
         );
         // default tapped = false -- so untap is a no-op on this target set
@@ -1013,8 +1206,10 @@ mod tests {
         let obj_id = make_creature_with_ability(
             &mut state,
             "Untapper",
-            Effect::Untap {
+            Effect::SetTapState {
                 target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
+                state: TapStateChange::Untap,
             },
         );
         state.objects.get_mut(&obj_id).unwrap().tapped = true;
@@ -1084,6 +1279,63 @@ mod tests {
             panic!("expected Score verdict");
         };
         assert_eq!(delta, -3.0, "DealDamage(0) should emit -3.0 delta");
+    }
+
+    #[test]
+    fn add_counter_zero_penalized() {
+        // An AddCounter whose count resolves to 0 places no counters — a strict
+        // no-op, exactly like DealDamage(0)/Draw(0). Must emit the -3.0 delta.
+        let mut state = GameState::new_two_player(0);
+        let obj_id = make_creature_with_ability(
+            &mut state,
+            "Zero Counters",
+            Effect::PutCounter {
+                counter_type: CounterType::Plus1Plus1,
+                count: QuantityExpr::Fixed { value: 0 },
+                target: TargetFilter::SelfRef,
+            },
+        );
+
+        let config = AiConfig::default();
+        let ai_ctx = AiContext::empty(&config.weights);
+        let decision = priority_decision();
+        let candidate = activate_candidate(obj_id);
+        let ctx = mk_ctx(&state, &decision, &candidate, &config, &ai_ctx);
+
+        let PolicyVerdict::Score { delta, .. } = RedundancyAvoidancePolicy.verdict(&ctx) else {
+            panic!("expected Score verdict");
+        };
+        assert_eq!(delta, -3.0, "AddCounter(0) should emit -3.0 delta");
+    }
+
+    #[test]
+    fn add_counter_nonzero_not_penalized() {
+        // A nonzero AddCounter places real counters — the zero-count arm must
+        // NOT fire (the broader diminishing-returns case stays deferred).
+        let mut state = GameState::new_two_player(0);
+        let obj_id = make_creature_with_ability(
+            &mut state,
+            "Real Counters",
+            Effect::PutCounter {
+                counter_type: CounterType::Plus1Plus1,
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::SelfRef,
+            },
+        );
+
+        let config = AiConfig::default();
+        let ai_ctx = AiContext::empty(&config.weights);
+        let decision = priority_decision();
+        let candidate = activate_candidate(obj_id);
+        let ctx = mk_ctx(&state, &decision, &candidate, &config, &ai_ctx);
+
+        let PolicyVerdict::Score { delta, .. } = RedundancyAvoidancePolicy.verdict(&ctx) else {
+            panic!("expected Score verdict");
+        };
+        assert_eq!(
+            delta, 0.0,
+            "nonzero AddCounter must not be flagged by the zero-count arm"
+        );
     }
 
     #[test]
@@ -1177,6 +1429,137 @@ mod tests {
     }
 
     #[test]
+    fn flash_cast_permission_without_sorcery_speed_hand_spell_penalized() {
+        let mut state = GameState::new_two_player(0);
+        let refuge_id = make_creature_with_ability(
+            &mut state,
+            "Alchemist's Refuge",
+            Effect::GenericEffect {
+                static_abilities: vec![StaticDefinition::new(StaticMode::CastWithKeyword {
+                    keyword: Keyword::Flash,
+                })],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+            },
+        );
+        let instant = create_object(
+            &mut state,
+            CardId(900),
+            PlayerId(0),
+            "Shock".to_string(),
+            Zone::Hand,
+        );
+        state
+            .objects
+            .get_mut(&instant)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Instant);
+        state.players[0].hand.push_back(instant);
+
+        let config = AiConfig::default();
+        let ai_ctx = AiContext::empty(&config.weights);
+        let decision = priority_decision();
+        let candidate = activate_candidate(refuge_id);
+        let ctx = mk_ctx(&state, &decision, &candidate, &config, &ai_ctx);
+
+        let PolicyVerdict::Score { delta, .. } = RedundancyAvoidancePolicy.verdict(&ctx) else {
+            panic!("expected Score verdict");
+        };
+        assert_eq!(
+            delta, -2.0,
+            "flash permission with only instants in hand should be redundant"
+        );
+    }
+
+    #[test]
+    fn flash_cast_permission_with_sorcery_in_hand_not_penalized() {
+        let mut state = GameState::new_two_player(0);
+        let refuge_id = make_creature_with_ability(
+            &mut state,
+            "Alchemist's Refuge",
+            Effect::GenericEffect {
+                static_abilities: vec![StaticDefinition::new(StaticMode::CastWithKeyword {
+                    keyword: Keyword::Flash,
+                })],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+            },
+        );
+        let sorcery = create_object(
+            &mut state,
+            CardId(901),
+            PlayerId(0),
+            "Divination".to_string(),
+            Zone::Hand,
+        );
+        state
+            .objects
+            .get_mut(&sorcery)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Sorcery);
+        state.players[0].hand.push_back(sorcery);
+
+        let config = AiConfig::default();
+        let ai_ctx = AiContext::empty(&config.weights);
+        let decision = priority_decision();
+        let candidate = activate_candidate(refuge_id);
+        let ctx = mk_ctx(&state, &decision, &candidate, &config, &ai_ctx);
+
+        let PolicyVerdict::Score { delta, .. } = RedundancyAvoidancePolicy.verdict(&ctx) else {
+            panic!("expected Score verdict");
+        };
+        assert_eq!(
+            delta, 0.0,
+            "flash permission should remain viable when a sorcery can use it"
+        );
+    }
+
+    #[test]
+    fn flash_cast_permission_with_already_flash_permanent_penalized() {
+        let mut state = GameState::new_two_player(0);
+        let refuge_id = make_creature_with_ability(
+            &mut state,
+            "Alchemist's Refuge",
+            Effect::GenericEffect {
+                static_abilities: vec![StaticDefinition::new(StaticMode::CastWithKeyword {
+                    keyword: Keyword::Flash,
+                })],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+            },
+        );
+        let artifact = create_object(
+            &mut state,
+            CardId(902),
+            PlayerId(0),
+            "Shimmer Myr".to_string(),
+            Zone::Hand,
+        );
+        let obj = state.objects.get_mut(&artifact).unwrap();
+        obj.card_types.core_types.push(CoreType::Artifact);
+        obj.keywords.push(Keyword::Flash);
+        state.players[0].hand.push_back(artifact);
+
+        let config = AiConfig::default();
+        let ai_ctx = AiContext::empty(&config.weights);
+        let decision = priority_decision();
+        let candidate = activate_candidate(refuge_id);
+        let ctx = mk_ctx(&state, &decision, &candidate, &config, &ai_ctx);
+
+        let PolicyVerdict::Score { delta, .. } = RedundancyAvoidancePolicy.verdict(&ctx) else {
+            panic!("expected Score verdict");
+        };
+        assert_eq!(
+            delta, -2.0,
+            "flash permission should be redundant when the only affected permanent already has flash"
+        );
+    }
+
+    #[test]
     fn generic_effect_new_keyword_not_penalized() {
         let mut state = GameState::new_two_player(0);
         let stat = StaticDefinition::new(StaticMode::Continuous).modifications(vec![
@@ -1205,6 +1588,90 @@ mod tests {
             panic!("expected Score verdict");
         };
         assert_eq!(delta, 0.0, "new keyword grant should not penalise");
+    }
+
+    /// Issue #1966 (Prognostic Sphinx): a self-scoped keyword grant lowers to
+    /// `GenericEffect { target: None, static_abilities: [.. affected: SelfRef ..] }`.
+    /// When the source already has the keyword, re-activating (paying the
+    /// discard cost) is redundant and must be penalised. Before the
+    /// `affected`-fallback fix the `target: None` shape returned `None`,
+    /// blinding the policy to the redundant self-buff.
+    #[test]
+    fn generic_effect_self_scoped_already_has_keyword_penalized() {
+        let mut state = GameState::new_two_player(0);
+        let stat = StaticDefinition::new(StaticMode::Continuous)
+            .affected(TargetFilter::SelfRef)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Hexproof,
+            }]);
+        let obj_id = make_creature_with_ability(
+            &mut state,
+            "Prognostic Sphinx",
+            Effect::GenericEffect {
+                static_abilities: vec![stat],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+            },
+        );
+        // Hexproof already active from a prior activation this turn — re-granting
+        // is pure redundancy.
+        state
+            .objects
+            .get_mut(&obj_id)
+            .unwrap()
+            .keywords
+            .push(Keyword::Hexproof);
+
+        let config = AiConfig::default();
+        let ai_ctx = AiContext::empty(&config.weights);
+        let decision = priority_decision();
+        let candidate = activate_candidate(obj_id);
+        let ctx = mk_ctx(&state, &decision, &candidate, &config, &ai_ctx);
+
+        let PolicyVerdict::Score { delta, .. } = RedundancyAvoidancePolicy.verdict(&ctx) else {
+            panic!("expected Score verdict");
+        };
+        assert_eq!(
+            delta, -2.0,
+            "redundant self-scoped keyword grant should emit -2.0 delta"
+        );
+    }
+
+    /// Companion to the issue #1966 case: the first activation, when the source
+    /// does not yet have the keyword, grants real value and must NOT be
+    /// penalised (otherwise the AI never gains hexproof at all).
+    #[test]
+    fn generic_effect_self_scoped_new_keyword_not_penalized() {
+        let mut state = GameState::new_two_player(0);
+        let stat = StaticDefinition::new(StaticMode::Continuous)
+            .affected(TargetFilter::SelfRef)
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Hexproof,
+            }]);
+        let obj_id = make_creature_with_ability(
+            &mut state,
+            "Prognostic Sphinx",
+            Effect::GenericEffect {
+                static_abilities: vec![stat],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+            },
+        );
+        // No pre-existing hexproof — the grant is new value.
+
+        let config = AiConfig::default();
+        let ai_ctx = AiContext::empty(&config.weights);
+        let decision = priority_decision();
+        let candidate = activate_candidate(obj_id);
+        let ctx = mk_ctx(&state, &decision, &candidate, &config, &ai_ctx);
+
+        let PolicyVerdict::Score { delta, .. } = RedundancyAvoidancePolicy.verdict(&ctx) else {
+            panic!("expected Score verdict");
+        };
+        assert_eq!(
+            delta, 0.0,
+            "first self-scoped keyword grant should not penalise"
+        );
     }
 
     #[test]
@@ -1394,6 +1861,8 @@ mod tests {
                 object_id,
                 card_id,
                 targets: Vec::new(),
+
+                payment_mode: CastPaymentMode::Auto,
             },
             metadata: ActionMetadata {
                 actor: Some(PlayerId(0)),
@@ -1451,8 +1920,10 @@ mod tests {
         let _other = make_creature_with_ability(
             &mut state,
             "Other Creature",
-            Effect::Tap {
+            Effect::SetTapState {
                 target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
+                state: TapStateChange::Tap,
             },
         );
 

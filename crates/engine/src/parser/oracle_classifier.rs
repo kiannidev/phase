@@ -2,6 +2,7 @@ use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::combinator::verify;
+use nom::sequence::terminated;
 use nom::Parser;
 
 use super::oracle_nom::primitives as nom_primitives;
@@ -64,6 +65,53 @@ pub(crate) fn is_spells_alternative_cost_pattern(lower: &str) -> bool {
         && scan_contains(lower, "rather than pay")
         && scan_contains(lower, "mana cost for")
         && scan_contains(lower, "spells you cast")
+}
+
+/// CR 118.9 + CR 701.59a: Collect-evidence alternative-cost grant static —
+/// "You may collect evidence N rather than pay the mana cost for [filter]
+/// spells you cast." Conspiracy Unraveler class. Separate from
+/// `is_spells_alternative_cost_pattern` because the verb is "collect evidence",
+/// not "pay". Verified: CR 118.9 (docs/MagicCompRules.txt:1014).
+pub(crate) fn is_collect_evidence_alt_cost_pattern(lower: &str) -> bool {
+    lower_starts_with(lower, "you may collect evidence ")
+        && scan_contains(lower, "rather than pay")
+        && scan_contains(lower, "mana cost for")
+        && scan_contains(lower, "spells you cast")
+}
+
+/// CR 107.4f: K'rrik-class payment substitution — "For each {C} in a cost,
+/// you may pay 2 life rather than pay that mana." Routes to
+/// `parse_pay_life_as_colored_mana`.
+/// Verified: CR 107.4f (docs/MagicCompRules.txt:507).
+pub(crate) fn is_pay_life_as_colored_mana_pattern(lower: &str) -> bool {
+    lower_starts_with(lower, "for each {")
+        && scan_contains(lower, "in a cost")
+        && scan_contains(lower, "you may pay")
+        && scan_contains(lower, "rather than pay that mana")
+}
+
+/// CR 118.9 + CR 702.29a + CR 702.122a: Alternative keyword-cost grant static —
+/// "[As long as <cond>, ]You may [cost] rather than pay [card-ref's] [keyword] cost[s]."
+/// New Perspectives (cycling) / Heart of Kiran (crew) / Gavi class. Accepts an
+/// optional leading "as long as " gate (New Perspectives); the lowering
+/// (`parse_alternative_keyword_cost`) splits and types the condition, strict-failing
+/// when the gate is unrecognized.
+/// Verified: CR 702.29a (docs/MagicCompRules.txt:4202), CR 702.122a (docs/MagicCompRules.txt:4870).
+pub(crate) fn is_alternative_keyword_cost_pattern(lower: &str) -> bool {
+    (lower_starts_with(lower, "you may ")
+        || (lower_starts_with(lower, "as long as ") && scan_contains(lower, "you may ")))
+        && scan_contains(lower, "rather than pay")
+        && (scan_contains(lower, "cycling cost") || scan_contains(lower, "crew cost"))
+}
+
+/// CR 118.9: Alternative-cost grant — "You may cast [filter] by paying {cost}
+/// rather than paying their mana costs." Primal Prayers class. Structural
+/// pre-filter; lowering is `parse_cast_spells_alternative_cost_multi`.
+pub(crate) fn is_cast_spells_alternative_cost_pattern(lower: &str) -> bool {
+    lower_starts_with(lower, "you may cast ")
+        && scan_contains(lower, "by paying ")
+        && scan_contains(lower, "rather than paying")
+        && (scan_contains(lower, "their mana costs") || scan_contains(lower, "its mana cost"))
 }
 
 pub(crate) fn is_enters_tapped_cant_untap_compound(lower: &str) -> bool {
@@ -178,7 +226,16 @@ const STATIC_CONTAINS_PATTERNS: &[&str] = &[
     "have ",
     "has ",
     "can't be blocked",
+    // CR 301.5 + CR 303.4 + CR 701.3a: positive attachment restriction on an
+    // Aura/Equipment ("~ can be attached only to {filter}") — Strata Scythe,
+    // Brass Knuckles, Konda's Banner. Routes to parse_static_line so it lowers
+    // to StaticMode::AttachmentRestriction instead of an effect.
+    "can be attached only to",
     "can't attack",
+    // CR 506.5 + CR 508.1c: Master of Cruelties — "~ can only attack alone"
+    // must route to the static parser (CombatAlone MustBeSole), not the effect
+    // pipeline where it previously lowered to Unimplemented.
+    "can only attack alone",
     "can't block",
     "can't be countered",
     "can't be copied",
@@ -193,6 +250,11 @@ const STATIC_CONTAINS_PATTERNS: &[&str] = &[
     "no maximum hand size",
     "may choose not to untap",
     "play with the top card",
+    // CR 400.2 + CR 701.20a: Telepathy/Revelation class. Keep this narrower
+    // than generic hand-reveal effects ("reveal a card from your hand") by
+    // matching the continuous "hand(s) revealed" wording.
+    "hands revealed",
+    "hand revealed",
     "cost {",
     "costs {",
     "cost less",
@@ -247,6 +309,9 @@ const STATIC_CONTAINS_PATTERNS: &[&str] = &[
     "activated abilities of ",
     // CR 701.23 + CR 609.3: Ashiok-class search prohibition.
     "can't cause their controller to search their library",
+    // CR 603.2 + CR 609.3: The Master, Multiplied-class sacrifice/exile prohibition.
+    "triggered abilities ",
+    "can't cause you to sacrifice or exile",
     // CR 701.23 + CR 609.3: Mindlock Orb-class search prohibition.
     "can't search libraries",
     "cannot search libraries",
@@ -283,6 +348,17 @@ const STATIC_CONTAINS_PATTERNS: &[&str] = &[
     // false-positive into other pattern classes.
     "is every creature type",
     "are every creature type",
+    // CR 502.3 + CR 113.6: Seedborn-class untap permission — "untap <subject>
+    // during each other player's untap step" is always a continuous static, so
+    // route it to `parse_static_line` regardless of subject (covers the self-ref
+    // form "Untap this artifact …" on Bender's Waterskin, not just the "untap
+    // all <type> you control" subject that already matched other patterns).
+    // Lines that merely *trigger* at an untap step lead with "at the beginning
+    // of …" and are caught by the trigger-prefix check before this point, so
+    // this contains-scan stays specific to the static body. Both apostrophe
+    // forms are listed because the source text is not apostrophe-normalized.
+    "during each other player's untap step",
+    "during each other player\u{2019}s untap step",
 ];
 
 const STATIC_PREFIX_PATTERNS: &[&str] = &[
@@ -362,6 +438,19 @@ fn is_static_compound_pattern(lower: &str) -> bool {
     {
         return true;
     }
+    // CR 608.2g + CR 601.2: The one-shot free-cast window class —
+    // "you may cast up to N [filter] spells ... from your graveyard and/or hand
+    // without paying their mana costs" — is a SPELL-RESOLUTION effect, not a
+    // continuous static permission. The diagnostic combination "up to" +
+    // "without paying" never appears on the standing graveyard/exile permission
+    // statics (Muldrotha, Gisa+Geralf, etc.), so route this form to effect
+    // parsing (`try_parse_free_cast_from_zones`) instead of the static classifier.
+    if scan_contains(lower, "you may cast up to")
+        && scan_contains(lower, "from your")
+        && scan_contains(lower, "without paying")
+    {
+        return false;
+    }
     if alt((
         tag::<_, _, OracleError<'_>>("you may play"),
         tag("you may cast"),
@@ -376,7 +465,36 @@ fn is_static_compound_pattern(lower: &str) -> bool {
             // Vivien on the Hunt static). Routes the line to `parse_static_line`
             // so it lowers to `StaticMode::TopOfLibraryCastPermission` instead
             // of falling through to `try_parse_cast_effect`'s impulse-draw flow.
-            || scan_contains(lower, "from the top of your library"))
+            || scan_contains(lower, "from the top of your library")
+            // CR 113.6b + CR 406.6: "you may play lands and cast spells from
+            // among cards exiled with ~" — persistent, name-anchored exile-play
+            // permission (The Matrix of Time). Routes to `parse_static_line` so
+            // it lowers to `StaticMode::ExileCastPermission { pool: Persistent }`
+            // instead of falling through to the imperative impulse-draw flow.
+            || scan_contains(lower, "from among cards exiled with"))
+    {
+        return true;
+    }
+    // CR 117.1c + CR 113.6b: The Matrix-of-Time form leads with the timing
+    // qualifier ("During your turn, you may play lands and cast spells from
+    // among cards exiled with ~."), so the "you may [play|cast]" prefix is not
+    // at the head of the line. The "play lands and cast spells from among cards
+    // exiled with" anchor is the diagnostic substring; route it to the static
+    // parser regardless of leading text.
+    if scan_contains(
+        lower,
+        "play lands and cast spells from among cards exiled with",
+    ) {
+        return true;
+    }
+    // CR 601.3f + CR 406.6: The "look-at" variant leads with "you may look at
+    // cards exiled with ~, and you may play lands and cast spells from among
+    // those cards." — the play/cast clause uses "those cards" (a back-reference
+    // to the exiled-with set) rather than repeating "cards exiled with". Require
+    // both the source-anchored exile anchor and the play/cast clause so this
+    // stays specific to the persistent exile-play permission.
+    if scan_contains(lower, "cards exiled with")
+        && scan_contains(lower, "play lands and cast spells from among those cards")
     {
         return true;
     }
@@ -444,17 +562,13 @@ const REPLACEMENT_CONTAINS_PATTERNS: &[&str] = &[
     // `parse_replacement_line` even when its suffix carries a static keyword
     // pattern like "has haste" that would otherwise classify it as static.
     "become a copy of",
-    // CR 614.6 + CR 614.7 + CR 122.1: Self-targeted counter-prohibition
-    // replacements ("~ can't have counters put on it." — Melira's Keepers
-    // class). The line lacks "would"/"instead" so it does not match the
-    // damage/destroy/draw replacement surface phrases, and the static
-    // classifier's `can't have ` pattern (if any) would otherwise miscategorize
-    // it as a static. Routing it as a replacement keeps it in the CR 614
-    // pipeline where `add_counter_applier` short-circuits the proposed event.
-    "can't have counters put on",
 ];
 
 pub(crate) fn is_replacement_pattern(lower: &str) -> bool {
+    if is_counter_prohibition_replacement_pattern(lower) {
+        return true;
+    }
+
     if REPLACEMENT_CONTAINS_PATTERNS
         .iter()
         .any(|pattern| scan_contains(lower, pattern))
@@ -496,7 +610,26 @@ fn is_replacement_compound_pattern(lower: &str) -> bool {
     {
         return true;
     }
+    if scan_contains(lower, "an effect causes you to discard a card")
+        && scan_contains(lower, "instead of into your graveyard")
+    {
+        return true;
+    }
     false
+}
+
+fn is_counter_prohibition_replacement_pattern(lower: &str) -> bool {
+    // CR 614.17 + CR 122.1: Counter-prohibition effects lack "would" or
+    // "instead" but still route through the replacement pipeline.
+    nom_primitives::scan_at_word_boundaries(lower, |input| {
+        alt((
+            tag::<_, _, OracleError>("can't have counters put on"),
+            tag("players can't get counters"),
+            tag("counters can't be put on"),
+        ))
+        .parse(input)
+    })
+    .is_some()
 }
 
 fn is_as_enters_choose_pattern(lower: &str) -> bool {
@@ -516,6 +649,24 @@ fn is_as_enters_choose_pattern(lower: &str) -> bool {
     })
     .is_some();
     has_as && has_enters && has_choose
+}
+
+/// CR 603.2 vs CR 614.1c: "Whenever <subject> enters with a counter on it, <consequence>"
+/// is an ETB-with-counter triggered ability (it watches for ANY counter, hence the
+/// untyped "a counter"), NOT a CR 614.1c self/granted enters-with replacement (which
+/// always specifies a typed/counted counter: "a +1/+1 counter", "X +1/+1 counters",
+/// "an additional loyalty counter", ...). Recognizing the untyped form lets the
+/// Priority 5-pre replacement interceptor exclude Murderous Redcap Avatar and cousins
+/// while still capturing the typed/counted replacements.
+pub(crate) fn is_enters_with_counter_trigger(lower: &str) -> bool {
+    nom_primitives::scan_at_word_boundaries(lower, |i| {
+        terminated(
+            tag::<_, _, OracleError<'_>>("enters with a counter on it"),
+            tag(","),
+        )
+        .parse(i)
+    })
+    .is_some()
 }
 
 const EFFECT_IMPERATIVE_PREFIXES: &[&str] = &[
@@ -568,7 +719,59 @@ pub(crate) fn is_effect_sentence_candidate(lower: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::nom_primitives::strip_double_quoted_spans;
     use super::*;
+
+    #[test]
+    fn masked_white_suns_twilight_is_not_static() {
+        // The only static-shaped marker ("can't block") lives INSIDE the token's
+        // quoted ability text; masking it must yield a non-static spell line.
+        let line = "you gain x life. create x 1/1 colorless phyrexian mite artifact \
+            creature tokens with toxic 1 and \"this token can't block.\" if x is 5 or more, \
+            destroy all other creatures.";
+        assert!(!is_static_pattern(&strip_double_quoted_spans(line)));
+    }
+
+    #[test]
+    fn masked_brood_birthing_stays_static() {
+        // Brood Birthing invariant: the "have " grant marker is OUTSIDE the quote,
+        // so masking the quoted span must NOT flip the line off static.
+        let line = "they have \"sacrifice this token: add {c}.\"";
+        assert!(is_static_pattern(&strip_double_quoted_spans(line)));
+    }
+
+    #[test]
+    fn unquoted_cant_block_static_unchanged() {
+        // No quotes → fast path → classification unchanged.
+        assert!(is_static_pattern("creatures you control can't block"));
+    }
+
+    #[test]
+    fn classifies_enters_with_counter_trigger() {
+        // CR 603.2: untyped "enters with a counter on it," — ETB trigger.
+        assert!(is_enters_with_counter_trigger(
+            "whenever a creature you control enters with a counter on it, you may have it deal damage"
+        ));
+        assert!(is_enters_with_counter_trigger(
+            "when a permanent you control enters with a counter on it, draw a card"
+        ));
+        // CR 614.1c: typed/counted forms are replacements, NOT triggers.
+        assert!(!is_enters_with_counter_trigger(
+            "this creature enters with x +1/+1 counters on it"
+        ));
+        assert!(!is_enters_with_counter_trigger(
+            "that creature enters with a +1/+1 counter on it."
+        ));
+        assert!(!is_enters_with_counter_trigger(
+            "that planeswalker enters with an additional loyalty counter on it."
+        ));
+        assert!(!is_enters_with_counter_trigger(
+            "the token enters with x +1/+1 counters on it"
+        ));
+        assert!(!is_enters_with_counter_trigger(
+            "it enters with twice that many +1/+1 counters on it"
+        ));
+    }
 
     /// CR 118.9: the mana-cost-alternative-grant classifier must recognize the
     /// Rooftop Storm / Fist of Suns shape and reject flash-permission text.
@@ -582,6 +785,19 @@ mod tests {
         ));
         assert!(!is_spells_alternative_cost_pattern(
             "you may cast this spell as though it had flash."
+        ));
+    }
+
+    /// CR 118.9 + CR 107.14: Primal Prayers "you may cast ... by paying {E}"
+    /// shape must route to the cast-by-paying alt-cost parser.
+    #[test]
+    fn classifies_cast_spells_alternative_cost_pattern() {
+        assert!(is_cast_spells_alternative_cost_pattern(
+            "you may cast creature spells with mana value 3 or less by paying {e} \
+             rather than paying their mana costs."
+        ));
+        assert!(!is_cast_spells_alternative_cost_pattern(
+            "you may pay {0} rather than pay the mana cost for zombie creature spells you cast."
         ));
     }
 }

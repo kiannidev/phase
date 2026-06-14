@@ -8,7 +8,7 @@ use engine::game::zones::move_to_zone;
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
-use engine::types::game_state::WaitingFor;
+use engine::types::game_state::{CastPaymentMode, WaitingFor};
 use engine::types::mana::{ManaCost, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::replacements::ReplacementEvent;
@@ -97,6 +97,7 @@ fn ulamog_enters_with_counters_equal_to_greatest_exiled_mana_value() {
             object_id: ulamog,
             card_id,
             targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("begin casting Ulamog");
 

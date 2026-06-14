@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use super::counter::CounterType;
 
-use super::ability::{AbilityTag, EffectKind, TargetRef};
+use super::ability::{AbilityTag, CostPaidObjectSnapshot, EffectKind, TargetRef};
 use super::game_state::ZoneChangeRecord;
 use super::identifiers::{CardId, ObjectId};
 use super::mana::ManaType;
@@ -99,6 +99,15 @@ pub enum ClashResult {
     Tied,
 }
 
+/// CR 103.1 / CR 706: one round of the starting-player d20 roll-off.
+/// `rolls` are in seat order; round 1 contains every seat, and each later
+/// round contains exactly the previous round's tied-max group (CR 103.1
+/// reroll). The high roller of the final round becomes the starting player.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContestRound {
+    pub rolls: Vec<(PlayerId, u8)>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum GameEvent {
@@ -117,6 +126,19 @@ pub enum GameEvent {
         card_id: CardId,
         controller: PlayerId,
         object_id: ObjectId, // CR 601.2a: The spell object on the stack
+    },
+    /// CR 702.140c + CR 730.2: A mutating creature spell merged with a target
+    /// creature, forming a mutated permanent. Emitted by
+    /// `merge::merge_object_onto`. `merged_id` is the surviving permanent's
+    /// `ObjectId` (the target creature's, kept per CR 730.2c); `merging_id` is the
+    /// component card/token that merged onto it; `controller` is the merging
+    /// spell's controller. "Whenever this creature mutates" triggers (CR 702.140d)
+    /// listen here — downstream condition handling is deferred (no Phase-1 card
+    /// needs it), but the event is observable now.
+    Mutated {
+        merged_id: ObjectId,
+        merging_id: ObjectId,
+        controller: PlayerId,
     },
     /// CR 707.10: A spell was copied onto the stack. A copy of a spell isn't
     /// cast, so this is a distinct event from `SpellCast` — copy-sensitive
@@ -231,6 +253,19 @@ pub enum GameEvent {
     CreatureExerted {
         object_id: ObjectId,
     },
+    /// CR 702.154c: A creature enlisted another creature as it attacked. Fires
+    /// the linked `TriggerMode::Enlisted` "when you do" trigger and carries the
+    /// tapped creature's LKI snapshot for CR 608.2h resolution.
+    CreatureEnlisted {
+        attacker: ObjectId,
+        tapped: ObjectId,
+        tapped_snapshot: Box<CostPaidObjectSnapshot>,
+    },
+    /// CR 702.143a: A player foretold a card from their hand.
+    Foretold {
+        player_id: PlayerId,
+        object_id: ObjectId,
+    },
     PlayerLost {
         player_id: PlayerId,
     },
@@ -305,6 +340,17 @@ pub enum GameEvent {
     GameOver {
         winner: Option<PlayerId>,
     },
+    /// CR 732.2: A mandatory auto-resolution sequence hit the engine's resource
+    /// ceiling without settling — a net-progress loop the engine cannot
+    /// shortcut (CR 732.2 resolves these by a player-declared iteration count
+    /// the engine can't infer). Resolution is paused and priority returned to
+    /// the active player. NOT a draw: distinct from CR 104.4b, which requires a
+    /// *repeating* state (a true loop is detected separately and ends the game).
+    /// `involved` carries the in-flight cascade's distinct stack-source ids for
+    /// diagnostics only — never read by game logic.
+    ResolutionHalted {
+        involved: Vec<ObjectId>,
+    },
     DamageDealt {
         source_id: ObjectId,
         target: TargetRef,
@@ -334,6 +380,13 @@ pub enum GameEvent {
         counter_type: CounterType,
         count: u32,
     },
+    /// Digital-only Alchemy (no CR entry): a card's intensity increased by
+    /// `amount`. Emitted per affected card so consumers (triggers that watch for
+    /// intensifying, frontend animation) can see exactly which cards changed.
+    ObjectIntensified {
+        object_id: ObjectId,
+        amount: u32,
+    },
     /// CR 702.100b: A creature evolved because one or more +1/+1 counters were
     /// put on it as a result of its evolve ability resolving.
     Evolved {
@@ -347,6 +400,12 @@ pub enum GameEvent {
     TokenCreated {
         object_id: ObjectId,
         name: String,
+        /// CR 111.1: the object id of the ability/spell that created this token
+        /// (the creating effect's `source_id`). Lets consumers attribute a token
+        /// to its creator — e.g. "destroy all OTHER creatures" sparing only the
+        /// tokens the resolving spell itself made, distinct from tokens a
+        /// replacement effect produced during the same resolution.
+        source_id: ObjectId,
     },
     /// Digital-only: A card was conjured from outside the game into a zone.
     ObjectConjured {
@@ -359,6 +418,12 @@ pub enum GameEvent {
     PermanentSacrificed {
         object_id: ObjectId,
         player_id: PlayerId,
+    },
+    /// CR 613.1b: A continuous effect changed an object's controller in layer 2.
+    ControllerChanged {
+        object_id: ObjectId,
+        old_controller: PlayerId,
+        new_controller: PlayerId,
     },
     EffectResolved {
         kind: EffectKind,
@@ -428,6 +493,11 @@ pub enum GameEvent {
     },
     Transformed {
         object_id: ObjectId,
+    },
+    /// Digital-only Specialize: a permanent became a color-specific specialized face.
+    Specialized {
+        object_id: ObjectId,
+        color: crate::types::mana::ManaColor,
     },
     DayNightChanged {
         new_state: String,
@@ -525,11 +595,25 @@ pub enum GameEvent {
     CityBlessingGained {
         player_id: PlayerId,
     },
-    /// CR 706: A die was rolled.
+    /// CR 706: A die was rolled. `result` is `None` when the roll has no numeric
+    /// face value — the symbolic planar die (CR 901.9d / CR 706.7): the
+    /// `RolledDie` trigger still fires, but numeric-result consumers ignore it.
     DieRolled {
         player_id: PlayerId,
         sides: u8,
-        result: u8,
+        result: Option<u8>,
+    },
+    /// CR 103.1 / CR 706: The game-1 starting-player roll-off, emitted as one
+    /// authoritative structured event so the contest can be rendered round by
+    /// round (including tie rerolls) with no downstream re-derivation. `rounds`
+    /// preserves the round boundaries the engine computes; `winner` is the
+    /// engine's authoritative starting player (unique max of the final round, or
+    /// the lowest-seat fallback when tied at the reroll cap). Replaces the prior
+    /// flat per-roll `DieRolled` batch on the starting-player contest path; in-game
+    /// die rolls still emit `DieRolled`.
+    StartingPlayerContest {
+        rounds: Vec<ContestRound>,
+        winner: PlayerId,
     },
     /// CR 705: A coin was flipped.
     CoinFlipped {
@@ -564,7 +648,25 @@ pub enum GameEvent {
         player_id: PlayerId,
         dungeon: crate::game::dungeon::DungeonId,
     },
-    /// CR 725: A player took the initiative.
+    /// CR 701.31 / CR 901.11: The planar controller planeswalked — the active
+    /// plane/phenomenon (`from`) is put on the bottom of the planar deck face
+    /// down and the new top card (`to`) is turned face up.
+    Planeswalked {
+        player_id: PlayerId,
+        from: Option<ObjectId>,
+        to: Option<ObjectId>,
+    },
+    /// CR 311.7 / CR 901.9b: Chaos ensued — the active plane's chaos-triggered
+    /// ability triggers.
+    ChaosEnsued {
+        plane_id: ObjectId,
+    },
+    /// CR 901.9: The planar die was rolled, landing on the given face.
+    PlanarDieRolled {
+        player_id: PlayerId,
+        face: crate::game::planechase::PlanarDieFace,
+    },
+    /// CR 726.2: A player took the initiative.
     InitiativeTaken {
         player_id: PlayerId,
     },

@@ -25,21 +25,79 @@ pub(crate) fn parse_self_chosen_type_static(input: &str) -> OracleResult<'_, Cho
     Ok((input, kind))
 }
 
-pub(crate) fn parse_arcane_adaptation_chosen_type_static(
+pub(crate) fn parse_enchanted_land_chosen_type_static(
     tp: &TextPair<'_>,
     description: &str,
 ) -> Option<StaticDefinition> {
     let ((), _) = nom_on_lower(
         tp.original,
         tp.lower,
-        parse_chosen_creature_type_static_sentence,
+        parse_enchanted_land_chosen_type_static_sentence,
     )?;
 
     Some(
         StaticDefinition::continuous()
             .affected(TargetFilter::Typed(
-                TypedFilter::creature().controller(ControllerRef::You),
+                TypedFilter::land().properties(vec![FilterProp::EnchantedBy]),
             ))
+            .modifications(vec![ContinuousModification::SetChosenBasicLandType])
+            .description(description.to_string()),
+    )
+}
+
+pub(crate) fn parse_enchanted_land_chosen_type_static_sentence(
+    input: &str,
+) -> OracleResult<'_, ()> {
+    let (input, _) = tag("enchanted land is the chosen type").parse(input)?;
+    let (input, _) = opt(alt((
+        tag(" and loses its other land types"),
+        tag(" and loses its other types"),
+    )))
+    .parse(input)?;
+    let (input, _) = opt(tag(".")).parse(input)?;
+    eof.parse(input)?;
+    Ok((input, ()))
+}
+
+/// CR 607.2d: Subject scope for "<[scope]> are/is the chosen [creature] type in
+/// addition to [their/its] other types" statics (Arcane Adaptation, Lifecraft
+/// Engine, Xenograft, …).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChosenCreatureTypeStaticScope {
+    Creatures,
+    EachCreature,
+    VehicleCreatures,
+}
+
+impl ChosenCreatureTypeStaticScope {
+    fn target_filter(self) -> TargetFilter {
+        match self {
+            Self::Creatures | Self::EachCreature => {
+                TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You))
+            }
+            // CR 301.7 + CR 607.2d: Lifecraft Engine grants a creature subtype to
+            // Vehicle permanents you control — not the Creature card type.
+            Self::VehicleCreatures => TargetFilter::Typed(
+                TypedFilter::new(TypeFilter::Subtype("Vehicle".to_string()))
+                    .controller(ControllerRef::You),
+            ),
+        }
+    }
+}
+
+pub(crate) fn parse_arcane_adaptation_chosen_type_static(
+    tp: &TextPair<'_>,
+    description: &str,
+) -> Option<StaticDefinition> {
+    let (scope, _) = nom_on_lower(
+        tp.original,
+        tp.lower,
+        parse_chosen_creature_type_static_sentence_with_scope,
+    )?;
+
+    Some(
+        StaticDefinition::continuous()
+            .affected(scope.target_filter())
             .modifications(vec![ContinuousModification::AddChosenSubtype {
                 kind: ChosenSubtypeKind::CreatureType,
             }])
@@ -47,27 +105,49 @@ pub(crate) fn parse_arcane_adaptation_chosen_type_static(
     )
 }
 
-pub(crate) fn parse_chosen_creature_type_static_sentence(input: &str) -> OracleResult<'_, ()> {
-    let (input, _) = parse_chosen_creature_type_static_prefix(input)?;
-    let (input, _) = eof.parse(input)?;
-    Ok((input, ()))
+fn parse_chosen_creature_type_static_sentence_with_scope(
+    input: &str,
+) -> OracleResult<'_, ChosenCreatureTypeStaticScope> {
+    let (input, scope) = parse_chosen_creature_type_static_scope_body(input)?;
+    Ok((input, scope))
 }
 
 pub(crate) fn parse_chosen_creature_type_static_prefix(input: &str) -> OracleResult<'_, ()> {
-    let (input, pronoun) = parse_chosen_creature_type_static_subject(input)?;
-    let (input, _) = tag(" the chosen type in addition to ").parse(input)?;
+    let (input, _) = parse_chosen_creature_type_static_scope_body(input)?;
+    Ok((input, ()))
+}
+
+fn parse_chosen_creature_type_static_scope_body(
+    input: &str,
+) -> OracleResult<'_, ChosenCreatureTypeStaticScope> {
+    let (input, (pronoun, scope)) = parse_chosen_creature_type_static_subject(input)?;
+    let (input, _) = alt((
+        tag(" the chosen type in addition to "),
+        tag(" the chosen creature type in addition to "),
+    ))
+    .parse(input)?;
     let (input, _) = tag(pronoun).parse(input)?;
     let (input, _) = tag(" other types").parse(input)?;
     let (input, _) = opt(tag(".")).parse(input)?;
-    Ok((input, ()))
+    Ok((input, scope))
 }
 
 pub(crate) fn parse_chosen_creature_type_static_subject(
     input: &str,
-) -> OracleResult<'_, &'static str> {
+) -> OracleResult<'_, (&'static str, ChosenCreatureTypeStaticScope)> {
     alt((
-        value("their", tag("creatures you control are")),
-        value("its", tag("each creature you control is")),
+        value(
+            ("their", ChosenCreatureTypeStaticScope::Creatures),
+            tag("creatures you control are"),
+        ),
+        value(
+            ("its", ChosenCreatureTypeStaticScope::EachCreature),
+            tag("each creature you control is"),
+        ),
+        value(
+            ("their", ChosenCreatureTypeStaticScope::VehicleCreatures),
+            tag("vehicle creatures you control are"),
+        ),
     ))
     .parse(input)
 }
@@ -108,7 +188,7 @@ pub(crate) fn parse_every_creature_type_static_sentence(input: &str) -> OracleRe
 }
 
 pub(crate) fn parse_every_creature_type_static_prefix(input: &str) -> OracleResult<'_, ()> {
-    let (input, _pronoun) = parse_chosen_creature_type_static_subject(input)?;
+    let (input, _) = parse_chosen_creature_type_static_subject(input)?;
     let (input, _) = tag(" every creature type").parse(input)?;
     let (input, _) = opt(tag(".")).parse(input)?;
     Ok((input, ()))
@@ -207,7 +287,7 @@ pub(crate) fn parse_additive_type_clause_modifications(
     // chosen-type statics). Let those branches produce the correct modification.
     if matches!(
         normalized_type_words,
-        "every basic land type" | "the chosen type"
+        "every basic land type" | "the chosen type" | "the chosen creature type"
     ) {
         return None;
     }
@@ -241,11 +321,13 @@ pub(crate) fn parse_additive_type_clause_modifications(
         let lower_word = word.to_lowercase();
         // CR 105.2 + CR 613.1e: a color word ("black", "white", …) adds that
         // color (layer 5), e.g. Rise from the Grave's "black Zombie".
-        if let Ok((rest, color)) = nom_primitives::parse_color(lower_word.as_str()) {
-            if rest.is_empty() {
-                modifications.push(ContinuousModification::AddColor { color });
-                continue;
-            }
+        // `all_consuming` asserts the whole token is the color word, matching
+        // the sibling guard idiom rather than a manual `rest.is_empty()` check.
+        if let Ok((_, color)) =
+            all_consuming(nom_primitives::parse_color).parse(lower_word.as_str())
+        {
+            modifications.push(ContinuousModification::AddColor { color });
+            continue;
         }
         if let Some(core_type) = core_type_from_additive_word(lower_word.as_str()) {
             modifications.push(ContinuousModification::AddType { core_type });
@@ -840,70 +922,124 @@ pub(crate) fn parse_bare_becomes_type_replacement_modifications(
     modifications
 }
 
-/// CR 613.1d + CR 613.1g: "[pronoun]'s a/an <types> with power and toughness
-/// each equal to its mana value [as long as <condition>]" — a self-referential
-/// conditional animation static. Covers Animate Artifact and the class of
-/// dynamic-P/T-by-mana-value "it's a/an X creature" become-creature statics.
+/// CR 613.1d + CR 613.1g: "[pronoun]'s a/an <descriptor> [as long as <condition>]"
+/// — self-referential conditional animation static. Covers:
+///   - Dynamic-P/T-by-mana-value: "it's an artifact creature with power and
+///     toughness each equal to its mana value" (Animate Artifact)
+///   - Fixed P/T + types + keywords: "he's a 7/7 Dragon God creature with flying
+///     and indestructible" (Grand Master of Flowers — CR 613.4b fixed P/T,
+///     CR 613.1d type grant, CR 613.1g keyword grant)
 ///
-/// Scoped to the dynamic-P/T-by-MV case only. Fixed-literal P/T (`it's a 3/4
-/// …`) and keyword tails (`with flying`) are deliberately deferred to a
-/// FOLLOWUP — this function does NOT reuse `parse_animation_modifications`
-/// (which rejects `it's an` and drops the P/T clause).
+/// Accepts gender-neutral and gendered pronouns ("it's", "~'s", "they're",
+/// "he's", "she's"). Delegates body parsing to
+/// `parse_animation_spec` + `animation_modifications` (which handles fixed P/T,
+/// dynamic P/T-by-MV, types, subtypes, and keyword tails in one pass), falling
+/// back to the prior type-only + MV-dynamic-P/T path if the spec parser returns
+/// None.
 pub(crate) fn parse_pronoun_becomes_type_static(
     tp: &TextPair<'_>,
     text: &str,
 ) -> Option<StaticDefinition> {
+    // STEP A.0 — peel an optional leading "during your turn, " timing clause.
+    // Mirror of `parse_compound_turn_counter_animation` (anthem.rs): the
+    // alternate printing convention writes the turn restriction as a leading
+    // timing prefix ("During your turn, ~ is a 4/4 ...") rather than a trailing
+    // "as long as it's your turn" clause. The peel is Option-returning, so when
+    // absent it falls through to `*tp` unchanged and no condition is attached.
+    let (tp, turn_condition) = match nom_tag_tp(tp, "during your turn, ") {
+        Some(rest) => (rest, Some(StaticCondition::DuringYourTurn)),
+        None => (*tp, None),
+    };
+
     // STEP A — peel a trailing " as long as <condition>" FIRST. The canonical
     // inverted-form rewrite produces "<effect> as long as <condition>"; the
     // condition must come off before the effect is parsed, or it leaks into
     // the " with " tail and never becomes a StaticCondition.
     let (effect_tp, condition_tp) = match tp.split_around(" as long as ") {
         Some((before, after)) => (before, Some(after)),
-        None => (*tp, None),
+        None => (tp, None),
     };
 
-    // STEP B — pronoun + article prefix. `it's an` must be accepted alongside
-    // `it's a`; the existing `parse_animation_modifications` rejects `it's an`.
+    // STEP B — pronoun + article prefix. Accept gender-neutral ("it's", "~'s",
+    // "they're") and gendered ("he's", "she's") pronouns; planeswalker
+    // animation statics use gendered pronouns (Grand Master of Flowers, Kaito,
+    // Gideon classes). Also accept the bare "is"-copula form ("~ is a/an ...")
+    // produced when an inverted "As long as it's your turn, ~ is a ..." line
+    // (Gideon Blackblade, #1155) is split by `parse_conditional_static` and the
+    // pronoun-less effect clause "~ is a 4/4 ..." re-enters this parser.
     let body = nom_tag_tp(&effect_tp, "it's a ")
         .or_else(|| nom_tag_tp(&effect_tp, "it's an "))
         .or_else(|| nom_tag_tp(&effect_tp, "~'s a "))
-        .or_else(|| nom_tag_tp(&effect_tp, "~'s an "))?;
-    let mut modifications = Vec::new();
+        .or_else(|| nom_tag_tp(&effect_tp, "~'s an "))
+        .or_else(|| nom_tag_tp(&effect_tp, "~ is a "))
+        .or_else(|| nom_tag_tp(&effect_tp, "~ is an "))
+        .or_else(|| nom_tag_tp(&effect_tp, "they're a "))
+        .or_else(|| nom_tag_tp(&effect_tp, "they're an "))
+        .or_else(|| nom_tag_tp(&effect_tp, "he's a "))
+        .or_else(|| nom_tag_tp(&effect_tp, "he's an "))
+        .or_else(|| nom_tag_tp(&effect_tp, "she's a "))
+        .or_else(|| nom_tag_tp(&effect_tp, "she's an "))?;
 
-    // STEP C — split the type expression from the " with <P/T clause>" tail.
-    let (type_part, with_tail) = match body.split_around(" with ") {
-        Some((before, after)) => (before, Some(after)),
-        None => (body, None),
+    // STEP C — delegate body parsing to parse_animation_spec which handles
+    // fixed P/T (CR 613.4b), dynamic P/T-by-mana-value, types (CR 613.1d),
+    // subtypes (CR 205.3), and keyword tails (CR 613.1g) in one composable pass.
+    let body_text = body.original.trim().trim_end_matches('.');
+    let modifications = if let Some(spec) = super::oracle_effect::animation::parse_animation_spec(
+        body_text,
+        &mut ParseContext::default(),
+    ) {
+        super::oracle_effect::animation::animation_modifications(&spec)
+    } else {
+        // Fallback: type-token parse + mana-value dynamic P/T. Handles edge
+        // cases where parse_animation_spec returns None (e.g., unusual clause
+        // ordering not yet covered by the animation spec parser).
+        let mut mods = Vec::new();
+        let (type_part, with_tail) = match body.split_around(" with ") {
+            Some((before, after)) => (before, Some(after)),
+            None => (body, None),
+        };
+        mods.extend(
+            super::oracle_effect::animation::parse_becomes_type_modifications(type_part.original),
+        );
+        if let Some(tail) = &with_tail {
+            push_base_pt_mana_value_dynamic_modifications(&mut mods, tail.lower);
+        }
+        mods
     };
-
-    // STEP D — types: delegate to the existing animation type-token parser.
-    modifications.extend(
-        super::oracle_effect::animation::parse_becomes_type_modifications(type_part.original),
-    );
-
-    // STEP E — P/T-by-mana-value clause only (fixed/keyword tails deferred).
-    // If a " with " tail is present but is not the P/T-by-MV clause, the
-    // helper pushes nothing and the static still carries its type
-    // modifications — acceptable for this unit's class.
-    if let Some(tail) = &with_tail {
-        push_base_pt_mana_value_dynamic_modifications(&mut modifications, tail.lower);
-    }
 
     if modifications.is_empty() {
         return None;
     }
 
-    // STEP F — attach the condition peeled in STEP A.
+    // STEP D — attach the condition(s). The leading "during your turn, " timing
+    // peel (STEP A.0) and the trailing " as long as <cond>" peel (STEP A) are
+    // independent; either, both, or neither may be present.
+    // CR 205.1b + CR 613.7: "~ is a [P/T] [types] creature ... that's still a
+    // planeswalker" — additive type-change (AddType is non-replacing, so the
+    // permanent retains its Planeswalker type while it is also a creature).
+    let trailing_condition = condition_tp.map(|cond_tp| {
+        let cond_text = cond_tp.original.trim().trim_end_matches('.');
+        parse_static_condition(cond_text).unwrap_or(StaticCondition::Unrecognized {
+            text: cond_text.to_string(),
+        })
+    });
+    let condition = match (turn_condition, trailing_condition) {
+        // CR 611.3a: when both a leading turn restriction and a trailing
+        // "as long as" condition are present, compose via `And` rather than
+        // dropping one (mirrors `parse_conditional_static` in anthem.rs).
+        (Some(turn), Some(inner)) => Some(StaticCondition::And {
+            conditions: vec![turn, inner],
+        }),
+        (Some(turn), None) => Some(turn),
+        (None, Some(inner)) => Some(inner),
+        (None, None) => None,
+    };
+
     let mut def = StaticDefinition::continuous()
         .affected(TargetFilter::SelfRef)
         .modifications(modifications)
         .description(text.to_string());
-    if let Some(cond_tp) = condition_tp {
-        let cond_text = cond_tp.original.trim().trim_end_matches('.');
-        let condition =
-            parse_static_condition(cond_text).unwrap_or(StaticCondition::Unrecognized {
-                text: cond_text.to_string(),
-            });
+    if let Some(condition) = condition {
         def = def.condition(condition);
     }
     Some(def)
@@ -1170,6 +1306,63 @@ pub(crate) fn parse_land_type_change(tp: &TextPair<'_>, text: &str) -> Option<St
     None
 }
 
+/// CR 613.1d (Layer 4) + CR 613.4b (Layer 7b) + CR 205.1b: Parse a continuous
+/// static that animates a population of lands into creatures while they remain
+/// lands — "All lands are 1/1 creatures that are still lands" (Living Plane,
+/// Nature's Revolt), "Lands you control are X/X creatures that are still lands".
+///
+/// The land subject is shared with [`parse_land_type_change`]; the
+/// "[P/T] creature[s] ..." remainder is delegated to the animation building
+/// block (`parse_animation_spec` + `animation_modifications`), so power/
+/// toughness (Layer 7b), color, keyword, and creature-subtype grants all
+/// compose for free. `animation_modifications` adds the creature type
+/// additively (CR 613.1d), and card types stay additive, so the land keeps its
+/// land type — the "that are still lands" tail (CR 205.1b) merely confirms that
+/// reading and is consumed by `split_type_retention_clause`.
+///
+/// Dispatched before `parse_land_type_change`; the `"creature"` guard makes
+/// land *type* lines ("Lands you control are Plains") fall through unclaimed.
+pub(crate) fn parse_land_animation(tp: &TextPair<'_>, text: &str) -> Option<StaticDefinition> {
+    let (subject_tp, rest_tp) = tp
+        .split_around(" are ")
+        .or_else(|| tp.split_around(" is a "))
+        .or_else(|| tp.split_around(" is an "))?;
+    let affected = parse_land_type_change_subject(subject_tp.original)?;
+
+    let rest = rest_tp.original.trim().trim_end_matches('.');
+    let lower_rest = rest.to_lowercase();
+    // Only claim creature-animation remainders so land type-change lines
+    // ("Lands you control are Plains") fall through to parse_land_type_change.
+    if !nom_primitives::scan_contains(&lower_rest, "creature") {
+        return None;
+    }
+
+    // CR 205.1b: strip the "that are still land(s)" / "that's still a land"
+    // retention tail. The creature type is added additively, so retention is
+    // the default behavior; the clause is confirmatory. Split on the lowercased
+    // text and reuse the byte offset on the original to preserve subtype casing.
+    let animation_text = match super::grammar::split_type_retention_clause(&lower_rest) {
+        Some((descriptor_lower, _retained)) => &rest[..descriptor_lower.len()],
+        None => rest,
+    }
+    .trim();
+
+    let spec = super::oracle_effect::animation::parse_animation_spec(
+        animation_text,
+        &mut ParseContext::default(),
+    )?;
+    let modifications = super::oracle_effect::animation::animation_modifications(&spec);
+    if modifications.is_empty() {
+        return None;
+    }
+    Some(
+        StaticDefinition::continuous()
+            .affected(affected)
+            .modifications(modifications)
+            .description(text.to_string()),
+    )
+}
+
 /// Parse the subject of a land type-change line into a TargetFilter.
 pub(crate) fn parse_land_type_change_subject(subject: &str) -> Option<TargetFilter> {
     match subject.to_lowercase().as_str() {
@@ -1192,7 +1385,19 @@ pub(crate) fn parse_land_type_change_subject(subject: &str) -> Option<TargetFilt
             // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
             TypedFilter::land().properties(vec![FilterProp::EnchantedBy]),
         )),
-        _ => None,
+        // CR 305.7: "All <basic land type> are <type>" (Conversion, Glaciers:
+        // "All Mountains are Plains"). The subject is every permanent with the
+        // named basic land subtype; the SetBasicLandType predicate is applied by
+        // the caller. Composes over all five basic land types, not one card.
+        other => {
+            let type_word = opt(tag::<_, _, OracleError<'_>>("all "))
+                .parse(other)
+                .map(|(rest, _)| rest.trim())
+                .unwrap_or(other);
+            parse_basic_land_type_plural(type_word).map(|basic| {
+                TargetFilter::Typed(TypedFilter::land().subtype(basic.as_subtype_str().to_string()))
+            })
+        }
     }
 }
 

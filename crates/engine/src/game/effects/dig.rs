@@ -15,12 +15,13 @@ pub fn resolve(
     let (
         library_owner_filter,
         dig_num,
-        keep_num,
+        raw_keep_num,
         is_up_to,
         filter,
         kept_dest,
         rest_dest,
         is_reveal,
+        enter_tapped,
     ) = match &ability.effect {
         Effect::Dig {
             player,
@@ -31,6 +32,7 @@ pub fn resolve(
             destination,
             rest_destination,
             reveal,
+            enter_tapped,
         } => {
             let resolved_count =
                 resolve_quantity_with_targets(state, count, ability).max(0) as usize;
@@ -50,6 +52,7 @@ pub fn resolve(
                 *destination,
                 *rest_destination,
                 *reveal,
+                *enter_tapped,
             )
         }
         _ => (
@@ -60,6 +63,7 @@ pub fn resolve(
             TargetFilter::Any,
             None,
             None,
+            false,
             false,
         ),
     };
@@ -83,14 +87,23 @@ pub fn resolve(
         .take(count)
         .copied()
         .collect::<Vec<_>>();
-    let keep_count = keep_num.min(cards.len());
+    let raw_keep_count = raw_keep_num.min(cards.len());
 
-    // CR 701.20a: Pure-peek pattern (keep_count = 0): "look at the top card" with no
+    // CR 701.20e: Pure-peek pattern (keep_count = 0): "look at the top card" with no
     // player selection — the sub_ability condition decides whether to take it. Set
     // last_revealed_ids so RevealedHasCardType can evaluate, then return without
     // creating a DigChoice interaction.
-    if keep_count == 0 && !is_reveal {
+    if raw_keep_count == 0 && !is_reveal {
         state.last_revealed_ids = cards.clone();
+        // CR 701.20e: "look at" privately reveals the cards to the looking
+        // player. The looker is the ability controller (e.g. Delver of Secrets'
+        // "look at the top card of your library"). Record the looker-scoped peek
+        // window so `filter_state_for_viewer` keeps these cards visible to the
+        // looker — and only the looker — through any subsequent "you may reveal
+        // that card" optional decision, instead of leaving the looking player to
+        // choose blind.
+        state.private_look_ids = cards.clone();
+        state.private_look_player = Some(ability.controller);
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::from(&ability.effect),
             source_id: ability.source_id,
@@ -129,6 +142,37 @@ pub fn resolve(
             .copied()
             .collect()
     };
+    // CR 608.2c + CR 701.20a/701.20e: A mass "put ALL <filter> from among them
+    // onto [destination] and the rest [elsewhere]" instruction is deterministic —
+    // the controller keeps EVERY matching looked-at card with no selection step.
+    // The parser lowers this to the unbounded keep sentinel (`u32::MAX`) with
+    // `up_to == false` and a concrete kept `destination`. Resolve it directly
+    // instead of surfacing a `WaitingFor::DigChoice`, which would force a bogus
+    // "choose N" prompt (issue #2896, Muxus, Goblin Grandee). When the kept
+    // destination is `None` (the reveal-only tracked-set form, e.g. Zimone's
+    // Experiment), downstream sub_abilities route the kept cards by type, so that
+    // form still goes through the choice path below.
+    if raw_keep_num == u32::MAX as usize && !is_up_to {
+        if let Some(dest) = kept_dest {
+            resolve_mass_put_all(
+                state,
+                ability,
+                &cards,
+                &selectable_cards,
+                dest,
+                rest_dest,
+                enter_tapped,
+                events,
+            );
+            return Ok(());
+        }
+    }
+
+    let keep_count = if raw_keep_num == u32::MAX as usize {
+        selectable_cards.len()
+    } else {
+        raw_keep_count
+    };
 
     state.waiting_for = WaitingFor::DigChoice {
         player: ability.controller,
@@ -140,6 +184,7 @@ pub fn resolve(
         kept_destination: kept_dest,
         rest_destination: rest_dest,
         source_id: Some(ability.source_id),
+        enter_tapped,
     };
 
     events.push(GameEvent::EffectResolved {
@@ -148,6 +193,98 @@ pub fn resolve(
     });
 
     Ok(())
+}
+
+/// CR 608.2c + CR 701.20a/701.20e: Deterministically resolve a mass "put ALL
+/// <filter> from among them" Dig — every filter-matching looked-at card
+/// (`selectable`) goes to `dest`, every other looked-at card goes to
+/// `rest_destination` (None = bottom of library; CR 701.20a "in a random
+/// order"). No `DigChoice` interaction is surfaced because the instruction
+/// admits no player choice.
+///
+/// The rest pile is routed first (a deterministic library/zone placement), so a
+/// rare CR 303.4f/616.1 battlefield-entry pause on a kept card cannot strand it.
+/// The kept cards then move through the zone-change pipeline (CR 614.1c — ETB
+/// triggers fire, intrinsic enters-with counters seed). On a kept-card pause the
+/// remaining kept moves and the tracked-set publish are deferred onto a
+/// `RevealRestPile` completion (empty rest pile — already placed), mirroring the
+/// `DigChoice` handler's deferral contract.
+#[allow(clippy::too_many_arguments)]
+fn resolve_mass_put_all(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    cards: &[crate::types::identifiers::ObjectId],
+    selectable: &[crate::types::identifiers::ObjectId],
+    dest: Zone,
+    rest_destination: Option<Zone>,
+    enter_tapped: bool,
+    events: &mut Vec<GameEvent>,
+) {
+    let rest: Vec<_> = cards
+        .iter()
+        .filter(|id| !selectable.contains(id))
+        .copied()
+        .collect();
+
+    // Route the (deterministic) rest pile first so a kept-card pause cannot
+    // strand it. None => bottom of library (CR 701.20a "in a random order").
+    crate::game::engine_resolution_choices::route_rest_partition(
+        state,
+        &rest,
+        rest_destination.unwrap_or(Zone::Library),
+        events,
+    );
+
+    if dest == Zone::Battlefield {
+        // CR 614.1c + CR 306.5b / CR 310.4b: route battlefield entries through
+        // the batch zone-change pipeline so ETB triggers fire, intrinsic
+        // enters-with counters / tap state seed, and any CR 303.4f / CR 616.1
+        // pause preserves the remaining kept tail. CR 400.7: attribute entries
+        // to the Dig's source.
+        let reqs: Vec<_> = selectable
+            .iter()
+            .map(|&obj_id| {
+                let mut req = crate::game::zone_pipeline::ZoneMoveRequest::effect(
+                    obj_id,
+                    Zone::Battlefield,
+                    ability.source_id,
+                );
+                req.mods.enter_tapped =
+                    crate::types::zones::EtbTapState::from_legacy_bool(enter_tapped);
+                req
+            })
+            .collect();
+        match crate::game::zone_pipeline::move_objects_simultaneously(state, reqs, events) {
+            crate::game::zone_pipeline::BatchMoveResult::Done => {}
+            crate::game::zone_pipeline::BatchMoveResult::NeedsChoice => {
+                crate::game::zone_pipeline::defer_completion_on_pause(
+                    state,
+                    crate::types::game_state::BatchCompletion::RevealRestPile {
+                        player: ability.controller,
+                        rest_cards: Vec::new(),
+                        rest_destination: rest_destination.unwrap_or(Zone::Library),
+                        clear_markers: Vec::new(),
+                        publish_tracked_set: Some(selectable.to_vec()),
+                        emit_reveal_until_resolved: None,
+                    },
+                );
+                return;
+            }
+        }
+    } else {
+        for &obj_id in selectable {
+            crate::game::zones::move_to_zone(state, obj_id, dest, events);
+        }
+    }
+
+    // CR 701.20b + CR 608.2c: publish the kept (revealed) cards as a fresh
+    // tracked set so any downstream sub_ability can route them by type.
+    super::publish_fresh_tracked_set(state, selectable.to_vec());
+
+    events.push(GameEvent::EffectResolved {
+        kind: EffectKind::from(&ability.effect),
+        source_id: ability.source_id,
+    });
 }
 
 #[cfg(test)]
@@ -175,6 +312,7 @@ mod tests {
                 filter: TargetFilter::Any,
                 rest_destination: None,
                 reveal: false,
+                enter_tapped: false,
             },
             vec![],
             ObjectId(100),
@@ -255,6 +393,7 @@ mod tests {
                 filter: TargetFilter::Any,
                 rest_destination: None,
                 reveal: false,
+                enter_tapped: false,
             },
             vec![crate::types::ability::TargetRef::Player(PlayerId(1))],
             ObjectId(100),
@@ -268,6 +407,70 @@ mod tests {
         assert_eq!(state.objects[&top_card].zone, Zone::Library);
         assert_eq!(state.players[1].library.front(), Some(&top_card));
         assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+        // CR 701.20e: the looker is the ability controller, not the library
+        // owner — the peeked opponent card is visible to the controller only.
+        assert_eq!(state.private_look_ids, vec![top_card]);
+        assert_eq!(state.private_look_player, Some(PlayerId(0)));
+    }
+
+    /// CR 701.20e (issue #2021, Delver of Secrets): a bare "look at the top card
+    /// of your library" peek must privately reveal the card to the looking
+    /// player, so they can SEE it before deciding a subsequent "you may reveal
+    /// that card" optional. The peek records a looker-scoped window
+    /// (`private_look_ids` / `private_look_player`) that `filter_state_for_viewer`
+    /// surfaces to the looker and hides from opponents.
+    #[test]
+    fn look_at_top_card_makes_peek_visible_to_looker_only() {
+        use crate::game::visibility::filter_state_for_viewer;
+
+        let mut state = GameState::new_two_player(42);
+        create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Delver Top Card".to_string(),
+            Zone::Library,
+        );
+        let top_card = state.players[0].library[0];
+
+        // "look at the top card of your library" — Dig keep_count 0, no reveal.
+        let ability = ResolvedAbility::new(
+            Effect::Dig {
+                player: TargetFilter::Controller,
+                count: QuantityExpr::Fixed { value: 1 },
+                destination: None,
+                keep_count: Some(0),
+                up_to: false,
+                filter: TargetFilter::Any,
+                rest_destination: None,
+                reveal: false,
+                enter_tapped: false,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.private_look_ids, vec![top_card]);
+        assert_eq!(state.private_look_player, Some(PlayerId(0)));
+        // CR 701.20e: a private "look at" must NOT publicly reveal the card.
+        assert!(!state.revealed_cards.contains(&top_card));
+
+        // The looking player (PlayerId(0)) can see the peeked card's identity.
+        let looker_view = filter_state_for_viewer(&state, PlayerId(0));
+        assert_eq!(
+            looker_view.objects[&top_card].name, "Delver Top Card",
+            "the looking player must see the card they looked at"
+        );
+
+        // The opponent (PlayerId(1)) must NOT see it — the library card is hidden.
+        let opp_view = filter_state_for_viewer(&state, PlayerId(1));
+        assert_ne!(
+            opp_view.objects[&top_card].name, "Delver Top Card",
+            "the private look must not leak the card to opponents"
+        );
     }
 
     #[test]
@@ -292,6 +495,7 @@ mod tests {
                 filter: TargetFilter::Any,
                 rest_destination: Some(Zone::Library),
                 reveal: false,
+                enter_tapped: false,
             },
             vec![],
             ObjectId(100),
@@ -312,7 +516,7 @@ mod tests {
         }
     }
 
-    /// CR 701.33 + CR 701.18: After the player's `SelectCards` resolves a
+    /// CR 701.20b + CR 608.2c: After the player's `SelectCards` resolves a
     /// `DigChoice`, the kept (revealed) cards must be published to
     /// `state.tracked_object_sets` so downstream sub_abilities can route
     /// them by type via `TargetFilter::TrackedSetFiltered`. Zimone's
@@ -360,6 +564,7 @@ mod tests {
             kept_destination: None,
             rest_destination: Some(Zone::Library),
             source_id: Some(ObjectId(100)),
+            enter_tapped: false,
         };
         let action = GameAction::SelectCards {
             cards: kept.clone(),
@@ -370,6 +575,17 @@ mod tests {
         let outcome = handle_resolution_choice(&mut state, waiting, action, &mut events)
             .expect("DigChoice resolution must succeed");
         assert!(matches!(outcome, ResolutionChoiceOutcome::WaitingFor(_)));
+        for &obj_id in &kept {
+            assert_eq!(
+                state.objects[&obj_id].zone,
+                Zone::Library,
+                "reveal-only DigChoice must not auto-route kept cards"
+            );
+            assert!(
+                !state.players[0].hand.contains(&obj_id),
+                "reveal-only DigChoice must not move kept cards to hand"
+            );
+        }
 
         // A fresh tracked set must have been inserted with exactly the kept cards.
         let tracked_id = TrackedSetId(next_id_before);
@@ -386,6 +602,63 @@ mod tests {
             next_id_before + 1,
             "next_tracked_set_id must have advanced"
         );
+        assert_eq!(
+            state.chain_tracked_set_id,
+            Some(tracked_id),
+            "TrackedSetId(0) continuations must bind to the kept-card set"
+        );
+    }
+
+    #[test]
+    fn dig_choice_empty_selection_rebinds_fresh_tracked_set() {
+        use crate::game::engine_resolution_choices::{
+            handle_resolution_choice, ResolutionChoiceOutcome,
+        };
+        use crate::types::actions::GameAction;
+        use crate::types::identifiers::TrackedSetId;
+
+        let mut state = GameState::new_two_player(42);
+        let prior = TrackedSetId(7);
+        state.tracked_object_sets.insert(prior, vec![ObjectId(999)]);
+        state.chain_tracked_set_id = Some(prior);
+        let cards: Vec<_> = (0..2)
+            .map(|i| {
+                create_object(
+                    &mut state,
+                    CardId(i + 20),
+                    PlayerId(0),
+                    format!("Card {}", i),
+                    Zone::Library,
+                )
+            })
+            .collect();
+        let next_id_before = state.next_tracked_set_id;
+        let waiting = WaitingFor::DigChoice {
+            player: PlayerId(0),
+            library_owner: PlayerId(0),
+            selectable_cards: cards.clone(),
+            cards,
+            keep_count: 2,
+            up_to: true,
+            kept_destination: None,
+            rest_destination: Some(Zone::Library),
+            source_id: Some(ObjectId(100)),
+            enter_tapped: false,
+        };
+        let mut events = Vec::new();
+
+        let outcome = handle_resolution_choice(
+            &mut state,
+            waiting,
+            GameAction::SelectCards { cards: Vec::new() },
+            &mut events,
+        )
+        .expect("DigChoice resolution must succeed");
+
+        assert!(matches!(outcome, ResolutionChoiceOutcome::WaitingFor(_)));
+        let fresh = TrackedSetId(next_id_before);
+        assert_eq!(state.tracked_object_sets.get(&fresh), Some(&Vec::new()));
+        assert_eq!(state.chain_tracked_set_id, Some(fresh));
     }
 
     #[test]
@@ -430,6 +703,7 @@ mod tests {
             kept_destination: Some(Zone::Library),
             rest_destination: Some(Zone::Library),
             source_id: Some(ObjectId(100)),
+            enter_tapped: false,
         };
         state.pending_continuation =
             Some(PendingContinuation::new(Box::new(ResolvedAbility::new(
@@ -498,6 +772,7 @@ mod tests {
             kept_destination: Some(Zone::Library),
             rest_destination: Some(Zone::Library),
             source_id: Some(ObjectId(100)),
+            enter_tapped: false,
         };
 
         let mut events = Vec::new();
@@ -560,6 +835,7 @@ mod tests {
             kept_destination: Some(Zone::Hand),
             rest_destination: Some(Zone::Graveyard),
             source_id: Some(ObjectId(100)),
+            enter_tapped: false,
         };
 
         let mut events = Vec::new();
@@ -619,6 +895,7 @@ mod tests {
             kept_destination: Some(Zone::Hand),
             rest_destination: Some(Zone::Graveyard),
             source_id: Some(ObjectId(100)),
+            enter_tapped: false,
         };
 
         let mut events = Vec::new();
@@ -687,6 +964,7 @@ mod tests {
             kept_destination: Some(Zone::Hand),
             rest_destination: Some(Zone::Library),
             source_id: Some(ObjectId(100)),
+            enter_tapped: false,
         };
         let mut gain_life = ResolvedAbility::new(
             Effect::GainLife {
@@ -757,6 +1035,7 @@ mod tests {
             kept_destination: Some(Zone::Hand),
             rest_destination: Some(Zone::Library),
             source_id: Some(ObjectId(100)),
+            enter_tapped: false,
         };
         let mut gain_life = ResolvedAbility::new(
             Effect::GainLife {
@@ -822,6 +1101,7 @@ mod tests {
             kept_destination: Some(Zone::Hand),
             rest_destination: Some(Zone::Library),
             source_id: Some(ObjectId(100)),
+            enter_tapped: false,
         };
         let mut gain_life = ResolvedAbility::new(
             Effect::GainLife {
@@ -897,6 +1177,7 @@ mod tests {
                 filter,
                 rest_destination: None,
                 reveal: false,
+                enter_tapped: false,
             },
             vec![],
             ObjectId(100),
@@ -916,6 +1197,87 @@ mod tests {
             }
             other => panic!("Expected DigChoice, got {:?}", other),
         }
+    }
+
+    /// CR 608.2c + CR 701.20e: an unbounded ("put ALL", `keep_count == u32::MAX`,
+    /// `up_to == false`) Dig with a concrete kept `destination` is deterministic —
+    /// every filter-matching looked-at card is kept with NO `DigChoice` prompt
+    /// (issue #2896). Here "put all creature cards from among the top three into
+    /// your hand" must move exactly the two creatures to hand and bottom the
+    /// non-matching card, surfacing no choice.
+    #[test]
+    fn dig_unbounded_exact_count_resolves_all_matching_no_choice() {
+        use crate::types::card_type::CoreType;
+
+        let mut state = GameState::new_two_player(42);
+        let creature_a = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Creature A".to_string(),
+            Zone::Library,
+        );
+        let creature_b = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Creature B".to_string(),
+            Zone::Library,
+        );
+        let instant = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Instant".to_string(),
+            Zone::Library,
+        );
+        for id in [creature_a, creature_b] {
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+        }
+
+        let ability = ResolvedAbility::new(
+            Effect::Dig {
+                player: TargetFilter::Controller,
+                count: QuantityExpr::Fixed { value: 3 },
+                destination: Some(Zone::Hand),
+                keep_count: Some(u32::MAX),
+                up_to: false,
+                filter: TargetFilter::Typed(TypedFilter::creature()),
+                rest_destination: Some(Zone::Library),
+                reveal: false,
+                enter_tapped: false,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::DigChoice { .. }),
+            "a mass 'put all' Dig must not surface a DigChoice, got {:?}",
+            state.waiting_for
+        );
+        // Both creatures kept to hand; the non-matching instant bottomed.
+        for id in [creature_a, creature_b] {
+            assert!(
+                state.players[0].hand.contains(&id),
+                "every matching creature must reach the hand"
+            );
+        }
+        assert_eq!(
+            state.objects[&instant].zone,
+            Zone::Library,
+            "the non-matching card must go to the library, not the graveyard"
+        );
     }
 
     /// Runtime regression test for issue #420 (Birthing Ritual). Drives the
@@ -1090,6 +1452,7 @@ mod tests {
                 filter: filter.clone(),
                 rest_destination: Some(Zone::Library),
                 reveal: false,
+                enter_tapped: false,
             },
             vec![],
             ObjectId(200),
@@ -1143,6 +1506,7 @@ mod tests {
                 filter: filter_you,
                 rest_destination: Some(Zone::Library),
                 reveal: false,
+                enter_tapped: false,
             },
             vec![],
             ObjectId(201),
@@ -1208,6 +1572,7 @@ mod tests {
             kept_destination: Some(Zone::Battlefield),
             rest_destination: Some(Zone::Library),
             source_id: Some(ObjectId(100)),
+            enter_tapped: false,
         };
         let action = GameAction::SelectCards {
             cards: kept.clone(),
@@ -1237,6 +1602,145 @@ mod tests {
             );
             let obj = state.objects.get(id).expect("rest object exists");
             assert_eq!(obj.zone, Zone::Library);
+        }
+    }
+
+    /// Issue #2896 (Muxus, Goblin Grandee). CR 608.2c + CR 701.20a/701.20e: a
+    /// mass "put ALL <filter> from among them onto the battlefield and the rest
+    /// on the bottom of your library in a random order" Dig is a *deterministic*
+    /// instruction — there is no "choose" step. The resolver must put every
+    /// filter-matching looked-at card onto the battlefield with NO `DigChoice`
+    /// prompt, and bottom the non-matching cards (NOT graveyard).
+    ///
+    /// Pre-fix this surfaced a `WaitingFor::DigChoice` (forcing a player/AI
+    /// selection — the reported "made to choose one Goblin" bug) and routed the
+    /// rest pile to the graveyard because the parser left `rest_destination =
+    /// None`. This test drives the real parser-produced AST through the real
+    /// resolver, so it discriminates both defects at once.
+    #[test]
+    fn muxus_mass_put_all_resolves_deterministically_no_choice() {
+        use crate::parser::oracle_effect::parse_effect_chain;
+        use crate::types::ability::AbilityKind;
+        use crate::types::card_type::CoreType;
+        use crate::types::mana::ManaCost;
+
+        // Parse Muxus's ETB effect text (the portion after the trigger prefix).
+        let def = parse_effect_chain(
+            "reveal the top six cards of your library. Put all Goblin creature cards \
+             with mana value 5 or less from among them onto the battlefield and the rest \
+             on the bottom of your library in a random order.",
+            AbilityKind::Spell,
+        );
+
+        // The parser must yield a mass-put Dig: all matching Goblins to the
+        // battlefield, rest to the bottom of the library.
+        match &*def.effect {
+            Effect::Dig {
+                keep_count,
+                up_to,
+                destination,
+                rest_destination,
+                ..
+            } => {
+                assert_eq!(
+                    *keep_count,
+                    Some(u32::MAX),
+                    "'put all' must lower to the unbounded keep sentinel"
+                );
+                assert!(!*up_to, "'put all' is not an up-to choice");
+                assert_eq!(*destination, Some(Zone::Battlefield));
+                assert_eq!(
+                    *rest_destination,
+                    Some(Zone::Library),
+                    "the in-clause 'and the rest on the bottom' rider must set rest=Library, \
+                     not fall through to the graveyard default"
+                );
+            }
+            other => panic!("expected a Dig effect, got {other:?}"),
+        }
+
+        let mut state = GameState::new_two_player(42);
+
+        // Library top six: two Goblin creatures with mana value <= 5 (matching)
+        // and four non-matching cards.
+        let goblin_a = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Goblin A".into(),
+            Zone::Library,
+        );
+        let goblin_b = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Goblin B".into(),
+            Zone::Library,
+        );
+        for id in [goblin_a, goblin_b] {
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.card_types.subtypes.push("Goblin".to_string());
+            obj.mana_cost = ManaCost::generic(3);
+        }
+        let rest: Vec<_> = (0..4)
+            .map(|i| {
+                create_object(
+                    &mut state,
+                    CardId(10 + i),
+                    PlayerId(0),
+                    format!("Rest {i}"),
+                    Zone::Library,
+                )
+            })
+            .collect();
+
+        let ability =
+            ResolvedAbility::new((*def.effect).clone(), vec![], ObjectId(100), PlayerId(0));
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        // The discriminating assertion: NO player choice is surfaced.
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::DigChoice { .. }),
+            "a mass 'put all' Dig must not surface a DigChoice prompt, got {:?}",
+            state.waiting_for
+        );
+
+        // Both Goblins are on the battlefield.
+        for id in [goblin_a, goblin_b] {
+            assert_eq!(
+                state.objects[&id].zone,
+                Zone::Battlefield,
+                "every matching Goblin must enter the battlefield with no choice"
+            );
+        }
+
+        // Every non-matching card is on the bottom of the library — NOT the graveyard.
+        let library: Vec<_> = state.players[0].library.iter().copied().collect();
+        for id in &rest {
+            assert_eq!(
+                state.objects[id].zone,
+                Zone::Library,
+                "a non-matching revealed card must go to the library, not the graveyard"
+            );
+            assert!(
+                library.contains(id),
+                "non-matching card {id:?} must remain in the library"
+            );
+        }
+        let bottom: Vec<_> = library
+            .iter()
+            .rev()
+            .take(rest.len())
+            .rev()
+            .copied()
+            .collect();
+        for id in &rest {
+            assert!(
+                bottom.contains(id),
+                "non-matching card {id:?} must be at the bottom of the library"
+            );
         }
     }
 }

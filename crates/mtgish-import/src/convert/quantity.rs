@@ -6,9 +6,10 @@
 //! per-variant mapping into engine `QuantityRef` and lands in later phases.
 
 use engine::types::ability::{
-    AggregateFunction, CardTypeSetSource, CastManaObjectScope, CastManaSpentMetric, CountScope,
-    DevotionColors, FilterProp, ObjectProperty, PlayerFilter, PlayerScope, QuantityExpr,
-    QuantityRef, RoundingMode, TargetFilter, TypeFilter, TypedFilter, ZoneRef,
+    AggregateFunction, CardTypeSetSource, CastManaObjectScope, CastManaSpentMetric, ControllerRef,
+    CountScope, DamageKindFilter, DevotionColors, FilterProp, ObjectProperty, PlayerFilter,
+    PlayerScope, QuantityExpr, QuantityRef, RoundingMode, TargetFilter, TypeFilter, TypedFilter,
+    ZoneRef,
 };
 use engine::types::counter::{parse_counter_type, CounterType as EngineCounterType};
 use engine::types::player::PlayerCounterKind;
@@ -267,6 +268,7 @@ pub fn convert(g: &GameNumber) -> ConvResult<QuantityExpr> {
                 qty: QuantityRef::ZoneCardCount {
                     zone: ZoneRef::Hand,
                     card_types: Vec::new(),
+                    filter: None,
                     scope,
                 },
             }
@@ -416,6 +418,34 @@ pub fn convert(g: &GameNumber) -> ConvResult<QuantityExpr> {
             },
             other => return Err(player_gap("LifeGainedByPlayerThisTurn", other)),
         },
+
+        // CR 120.2b + CR 601.2f: Total noncombat damage dealt to opponents this
+        // turn (Chandra's Incinerator: "where X is the total amount of noncombat
+        // damage dealt to your opponents this turn").
+        GameNumber::TotalNoncombatDamageDealtToPlayersThisTurn(players) => {
+            if !matches!(players.as_ref(), Players::Opponent) {
+                return Err(players_gap(
+                    "TotalNoncombatDamageDealtToPlayersThisTurn",
+                    players,
+                ));
+            }
+            QuantityExpr::Ref {
+                qty: QuantityRef::DamageDealtThisTurn {
+                    source: Box::new(TargetFilter::Any),
+                    target: Box::new(TargetFilter::And {
+                        filters: vec![
+                            TargetFilter::Player,
+                            TargetFilter::Typed(
+                                TypedFilter::default().controller(ControllerRef::Opponent),
+                            ),
+                        ],
+                    }),
+                    aggregate: AggregateFunction::Sum,
+                    group_by: None,
+                    damage_kind: DamageKindFilter::NoncombatOnly,
+                },
+            }
+        }
 
         // CR 122.1: "the number of [counter type] counters on [permanent]".
         // Permanent variant decides between CountersOnSelf (source object)
@@ -782,6 +812,7 @@ pub fn convert(g: &GameNumber) -> ConvResult<QuantityExpr> {
                     qty: QuantityRef::ZoneCardCount {
                         zone: ZoneRef::Exile,
                         card_types: Vec::new(),
+                        filter: None,
                         scope: CountScope::All,
                     },
                 }
@@ -807,6 +838,7 @@ pub fn convert(g: &GameNumber) -> ConvResult<QuantityExpr> {
                 qty: QuantityRef::ZoneCardCount {
                     zone: ZoneRef::Library,
                     card_types: Vec::new(),
+                    filter: None,
                     scope,
                 },
             }
@@ -896,8 +928,16 @@ pub fn convert(g: &GameNumber) -> ConvResult<QuantityExpr> {
         GameNumber::NumPermanentsDestroyedThisWay(perms_filter) => {
             let filter = convert_permanents(perms_filter).unwrap_or(TargetFilter::Any);
             let qty = if filter_is_nontrivial(&filter) {
+                // CR 608.2c: `caused_by: None` is the legacy default — counts
+                // every filtered member of the tracked set regardless of the
+                // producer action. The mtgish-import `GameNumber` carries no
+                // action provenance, so we preserve the by-filter-only behavior
+                // this converter has always had. (The oracle parser emits
+                // `Some(cause)` only where it parses an explicit producer verb
+                // from the card text — #2932.)
                 QuantityRef::FilteredTrackedSetSize {
                     filter: Box::new(filter),
+                    caused_by: None,
                 }
             } else {
                 QuantityRef::TrackedSetSize
@@ -1129,6 +1169,7 @@ fn cards_in_graveyard_to_zone_card_count(cards: &CardsInGraveyard) -> Option<Qua
     Some(QuantityRef::ZoneCardCount {
         zone: ZoneRef::Graveyard,
         card_types: parts.card_types,
+        filter: None,
         scope: parts.scope.unwrap_or(CountScope::All),
     })
 }
@@ -1454,6 +1495,38 @@ mod tests {
     }
 
     #[test]
+    fn total_noncombat_damage_dealt_to_opponents_this_turn_maps_to_damage_ledger() {
+        let converted = convert(&GameNumber::TotalNoncombatDamageDealtToPlayersThisTurn(
+            Box::new(Players::Opponent),
+        ))
+        .unwrap();
+
+        match converted {
+            QuantityExpr::Ref {
+                qty:
+                    QuantityRef::DamageDealtThisTurn {
+                        damage_kind: DamageKindFilter::NoncombatOnly,
+                        target,
+                        aggregate: AggregateFunction::Sum,
+                        group_by: None,
+                        ..
+                    },
+            } => {
+                let TargetFilter::And { filters } = target.as_ref() else {
+                    panic!("expected opponent player target filter");
+                };
+                assert_eq!(filters.len(), 2);
+                assert!(matches!(filters[0], TargetFilter::Player));
+                let TargetFilter::Typed(typed) = &filters[1] else {
+                    panic!("expected opponent typed filter, got {:?}", filters[1]);
+                };
+                assert_eq!(typed.controller, Some(ControllerRef::Opponent));
+            }
+            other => panic!("expected DamageDealtThisTurn ref, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn num_permanents_destroyed_this_way_preserves_subtype_filter() {
         let converted = convert(&GameNumber::NumPermanentsDestroyedThisWay(Box::new(
             Permanents::IsCreatureType(CreatureType::Vampire),
@@ -1462,7 +1535,7 @@ mod tests {
 
         match converted {
             QuantityExpr::Ref {
-                qty: QuantityRef::FilteredTrackedSetSize { filter },
+                qty: QuantityRef::FilteredTrackedSetSize { filter, .. },
             } => match *filter {
                 TargetFilter::Typed(ref tf) => assert!(
                     tf.type_filters

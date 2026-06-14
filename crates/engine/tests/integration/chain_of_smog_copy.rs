@@ -31,22 +31,11 @@ use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
-use std::path::Path;
-use std::sync::OnceLock;
-
-use engine::database::card_db::CardDatabase;
-
 /// The third player. `scenario` only exports `P0`/`P1`.
 const P2: PlayerId = PlayerId(2);
 
-fn load_db() -> Option<&'static CardDatabase> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../client/public/card-data.json");
-    if !path.exists() {
-        return None;
-    }
-    static DB: OnceLock<CardDatabase> = OnceLock::new();
-    Some(DB.get_or_init(|| CardDatabase::from_export(&path).expect("export should load")))
-}
+use crate::support::shared_card_db as load_db;
+use engine::types::game_state::CastPaymentMode;
 
 fn add_mana(runner: &mut engine::game::scenario::GameRunner, player: PlayerId, mana: &[ManaType]) {
     let dummy = ObjectId(0);
@@ -195,6 +184,8 @@ fn chain_of_smog_copy_controlled_by_targeted_player_and_retargeted() {
             object_id: smog,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("P0 casts Chain of Smog");
 
@@ -327,6 +318,8 @@ fn chain_of_smog_nested_copy_accepted_produces_second_generation_copy() {
             object_id: smog,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("P0 casts Chain of Smog");
 
@@ -447,6 +440,8 @@ fn chain_of_smog_declined_copy_makes_no_copy() {
             object_id: smog,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("P0 casts Chain of Smog");
 

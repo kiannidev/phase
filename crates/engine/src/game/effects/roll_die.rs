@@ -6,6 +6,7 @@ use crate::types::events::GameEvent;
 use crate::types::game_state::GameState;
 
 use super::resolve_ability_chain;
+use crate::game::ability_utils::build_resolved_from_def_with_targets;
 
 /// CR 706.2: Roll a die using the game's seeded RNG and emit the authoritative
 /// die-roll event consumed by die-roll triggers and "the result" effects.
@@ -19,9 +20,9 @@ pub(crate) fn roll_die(
     events.push(GameEvent::DieRolled {
         player_id,
         sides,
-        result,
+        result: Some(result),
     });
-    state.die_result_this_resolution = Some(result);
+    state.die_result_this_resolution = Some(i32::from(result));
     result
 }
 
@@ -37,29 +38,39 @@ pub fn resolve(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let (sides, results, modifier) = match &ability.effect {
+    let (count_expr, sides, results, modifier) = match &ability.effect {
         Effect::RollDie {
+            count,
             sides,
             results,
             modifier,
-        } => (*sides, results, modifier.as_ref()),
+        } => (count, *sides, results, modifier.as_ref()),
         _ => return Err(EffectError::MissingParam("RollDie".to_string())),
     };
 
-    // CR 706.2: Roll the die using the game's seeded RNG. This is the
-    // "natural result" before any modifiers.
-    let natural = roll_die(state, ability.controller, sides, events);
+    // CR 706.1: Resolve how many dice of this kind to roll, in the ability's
+    // context; clamp at zero (a 0-count roll is a no-op). Each die is rolled
+    // independently with the same sides/modifier/results table.
+    let count =
+        resolve_quantity(state, count_expr, ability.controller, ability.source_id).max(0) as u32;
 
-    // CR 706.2: Apply the (optional) modifier to produce the actual result.
-    // The result is clamped to a u8-representable non-negative integer so a
-    // large subtract doesn't wrap; branches with `min`/`max` already in u8
-    // simply won't match when the actual result is 0.
-    let actual = if let Some(m) = modifier {
-        // Carry the sign as the saturating operation rather than negating the
-        // resolved delta: `-resolve_quantity(..)` would panic in debug builds
-        // (and wrap in release) when the quantity resolves to `i32::MIN`.
-        let combined =
-            match m {
+    let mut total_actual = 0_i32;
+    let mut rolled_any = false;
+
+    for _ in 0..count {
+        // CR 706.2: Roll the die using the game's seeded RNG. This is the
+        // "natural result" before any modifiers.
+        let natural = roll_die(state, ability.controller, sides, events);
+
+        // CR 706.2: Apply the (optional) modifier to produce the actual result.
+        // The result is clamped to a u8-representable non-negative integer so a
+        // large subtract doesn't wrap; branches with `min`/`max` already in u8
+        // simply won't match when the actual result is 0.
+        let actual = if let Some(m) = modifier {
+            // Carry the sign as the saturating operation rather than negating the
+            // resolved delta: `-resolve_quantity(..)` would panic in debug builds
+            // (and wrap in release) when the quantity resolves to `i32::MIN`.
+            let combined = match m {
                 DieRollModifier::Add { value } => (natural as i32).saturating_add(
                     resolve_quantity(state, value, ability.controller, ability.source_id),
                 ),
@@ -67,36 +78,50 @@ pub fn resolve(
                     resolve_quantity(state, value, ability.controller, ability.source_id),
                 ),
             };
-        combined.clamp(0, u8::MAX as i32) as u8
-    } else {
-        natural
-    };
+            combined.clamp(0, u8::MAX as i32) as u8
+        } else {
+            natural
+        };
 
-    if actual != natural {
-        if let Some(GameEvent::DieRolled { result, .. }) = events.last_mut() {
-            *result = actual;
+        if actual != natural {
+            if let Some(GameEvent::DieRolled { result, .. }) = events.last_mut() {
+                *result = Some(actual);
+            }
+        }
+
+        let actual_amount = i32::from(actual);
+        total_actual = total_actual.saturating_add(actual_amount);
+        rolled_any = true;
+
+        // CR 706.2 + CR 706.3a: The stored value is this die's actual result
+        // while its results-table branch resolves.
+        state.die_result_this_resolution = Some(actual_amount);
+
+        // CR 706.3a: Find the matching result branch and resolve its effect.
+        // Each die consults the same table independently.
+        if let Some(branch) = results.iter().find(|b| actual >= b.min && actual <= b.max) {
+            // CR 608.2c: Branch bodies are full `AbilityDefinition`s (player_scope,
+            // sub_abilities, conditions, etc.). `ResolvedAbility::new` with only the
+            // effect drops `player_scope`, so "each opponent loses N life" on a d20
+            // table (Herald of Hadar) incorrectly hit the controller (#2026).
+            let sub = build_resolved_from_def_with_targets(
+                &branch.effect,
+                ability.source_id,
+                ability.controller,
+                ability.targets.clone(),
+            );
+            resolve_ability_chain(state, &sub, events, 0)?;
         }
     }
 
-    // CR 706.2: The stored value is the actual die-roll result.
-    // CR 706.4: Record the actual result so an inline "equal to the
-    // result" sub_ability (no results table) reads the roll via
-    // QuantityRef::EventContextAmount instead of the triggering event's amount.
-    // Deliberately NOT cleared at this function's exit: for `results: []` cards
-    // (Ancient Copper/Gold/Silver, Adorable Kitten) the consuming effect is the
-    // RollDie's sub_ability, resolved by the outer resolve_ability_chain at depth+1
-    // AFTER this returns. Clearing here would erase the value before it is read.
-    state.die_result_this_resolution = Some(actual);
-
-    // CR 706.2: Find the matching result branch and resolve its effect.
-    if let Some(branch) = results.iter().find(|b| actual >= b.min && actual <= b.max) {
-        let sub = ResolvedAbility::new(
-            *branch.effect.effect.clone(),
-            ability.targets.clone(),
-            ability.source_id,
-            ability.controller,
-        );
-        resolve_ability_chain(state, &sub, events, 0)?;
+    if rolled_any {
+        // CR 706.4: For no-table rolls, the outer sub_ability is resolved by
+        // the caller after this function returns. Leave the aggregate result
+        // available so "equal to the result(s)" reads all dice, not just the
+        // last one.
+        state.die_result_this_resolution = Some(total_actual);
+    } else {
+        state.die_result_this_resolution = None;
     }
 
     events.push(GameEvent::EffectResolved {
@@ -130,6 +155,7 @@ mod tests {
         };
         let ability = ResolvedAbility::new(
             Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 1 },
                 sides: 20,
                 results: vec![branch],
                 modifier: None,
@@ -176,6 +202,7 @@ mod tests {
         };
         let ability = ResolvedAbility::new(
             Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 1 },
                 sides: 20,
                 results: vec![branch],
                 modifier: None,
@@ -198,6 +225,7 @@ mod tests {
         let mut state = GameState::new_two_player(42);
         let ability = ResolvedAbility::new(
             Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 1 },
                 sides: 6,
                 results: vec![],
                 modifier: None,
@@ -249,6 +277,7 @@ mod tests {
         );
         let ability = ResolvedAbility::new(
             Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 1 },
                 sides: 20,
                 results: vec![branch],
                 modifier: Some(DieRollModifier::Add {
@@ -268,7 +297,7 @@ mod tests {
         let result = events
             .iter()
             .find_map(|e| match e {
-                GameEvent::DieRolled { result, .. } => Some(*result),
+                GameEvent::DieRolled { result, .. } => *result,
                 _ => None,
             })
             .expect("DieRolled event should be present");
@@ -294,6 +323,7 @@ mod tests {
         }
         let ability = ResolvedAbility::new(
             Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 1 },
                 sides: 20,
                 results: vec![],
                 modifier: Some(DieRollModifier::Subtract {
@@ -313,7 +343,7 @@ mod tests {
         let result = events
             .iter()
             .find_map(|e| match e {
-                GameEvent::DieRolled { result, .. } => Some(*result),
+                GameEvent::DieRolled { result, .. } => *result,
                 _ => None,
             })
             .expect("DieRolled event should be present");
@@ -330,6 +360,7 @@ mod tests {
         let ability = |state_seed: PlayerId| {
             ResolvedAbility::new(
                 Effect::RollDie {
+                    count: QuantityExpr::Fixed { value: 1 },
                     sides: 20,
                     results: vec![],
                     modifier: None,
@@ -346,14 +377,14 @@ mod tests {
         let r_a = ev_a
             .iter()
             .find_map(|e| match e {
-                GameEvent::DieRolled { result, .. } => Some(*result),
+                GameEvent::DieRolled { result, .. } => *result,
                 _ => None,
             })
             .unwrap();
         let r_b = ev_b
             .iter()
             .find_map(|e| match e {
-                GameEvent::DieRolled { result, .. } => Some(*result),
+                GameEvent::DieRolled { result, .. } => *result,
                 _ => None,
             })
             .unwrap();
@@ -370,6 +401,7 @@ mod tests {
             let mut state = GameState::new_two_player(sides as u64);
             let ability = ResolvedAbility::new(
                 Effect::RollDie {
+                    count: QuantityExpr::Fixed { value: 1 },
                     sides,
                     results: vec![],
                     modifier: None,
@@ -385,7 +417,7 @@ mod tests {
                 let r = events
                     .iter()
                     .find_map(|e| match e {
-                        GameEvent::DieRolled { result, .. } => Some(*result),
+                        GameEvent::DieRolled { result, .. } => *result,
                         _ => None,
                     })
                     .unwrap();
@@ -406,6 +438,7 @@ mod tests {
         // No modifier: actual result == natural ∈ 1..=20, always > 0.
         let ability = ResolvedAbility::new(
             Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 1 },
                 sides: 20,
                 results: vec![],
                 modifier: None,
@@ -419,7 +452,7 @@ mod tests {
         let result = events
             .iter()
             .find_map(|e| match e {
-                GameEvent::DieRolled { result, .. } => Some(*result as i32),
+                GameEvent::DieRolled { result, .. } => result.map(i32::from),
                 _ => None,
             })
             .expect("DieRolled event must be present");
@@ -479,7 +512,7 @@ mod tests {
                     },
                 },
                 target: TargetFilter::Controller,
-                random: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
                 unless_filter: None,
                 filter: None,
             },
@@ -493,6 +526,7 @@ mod tests {
         });
         let ability = ResolvedAbility::new(
             Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 1 },
                 sides: 20,
                 results: vec![],
                 modifier: Some(DieRollModifier::Subtract {
@@ -550,7 +584,7 @@ mod tests {
                     },
                 },
                 target: TargetFilter::Controller,
-                random: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
                 unless_filter: None,
                 filter: None,
             },
@@ -564,6 +598,7 @@ mod tests {
         });
         let ability = ResolvedAbility::new(
             Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 1 },
                 sides: 20,
                 results: vec![],
                 modifier: Some(DieRollModifier::Subtract {
@@ -601,6 +636,7 @@ mod tests {
         let mut state = GameState::new_two_player(7);
         let ability = ResolvedAbility::new(
             Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 1 },
                 sides: 20,
                 results: vec![],
                 modifier: None,
@@ -614,13 +650,13 @@ mod tests {
         let result = events
             .iter()
             .find_map(|e| match e {
-                GameEvent::DieRolled { result, .. } => Some(*result),
+                GameEvent::DieRolled { result, .. } => *result,
                 _ => None,
             })
             .expect("DieRolled event must be present");
         assert_eq!(
             state.die_result_this_resolution,
-            Some(result),
+            Some(i32::from(result)),
             "die_result_this_resolution must mirror the actual rolled result"
         );
     }
@@ -667,6 +703,7 @@ mod tests {
         );
         let ability = ResolvedAbility::new(
             Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 1 },
                 sides: 20,
                 results: vec![],
                 modifier: None,
@@ -681,7 +718,7 @@ mod tests {
         let rolled = events
             .iter()
             .find_map(|e| match e {
-                GameEvent::DieRolled { result, .. } => Some(*result as usize),
+                GameEvent::DieRolled { result, .. } => result.map(usize::from),
                 _ => None,
             })
             .expect("DieRolled event must be present");
@@ -693,6 +730,266 @@ mod tests {
             state.players[0].hand.len(),
             rolled,
             "sub_ability must draw cards equal to the rolled result ({rolled}), not the combat damage (6)"
+        );
+    }
+
+    /// CR 706.4: For a no-table effect that rolls multiple dice, an inline
+    /// `EventContextAmount` consumer reads the total of all die results, not
+    /// the final die's result.
+    #[test]
+    fn roll_die_multi_count_subability_reads_total_results() {
+        use crate::types::ability::{QuantityRef, TargetFilter, TargetRef};
+        let mut state = GameState::new_two_player(7);
+        for i in 0..12 {
+            crate::game::zones::create_object(
+                &mut state,
+                crate::types::identifiers::CardId(6000 + i as u64),
+                PlayerId(0),
+                format!("Card {i}"),
+                crate::types::zones::Zone::Library,
+            );
+        }
+        state.current_trigger_event = Some(GameEvent::DamageDealt {
+            source_id: ObjectId(1),
+            target: TargetRef::Player(PlayerId(1)),
+            amount: 20,
+            is_combat: true,
+            excess: 0,
+        });
+        let draw = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+        let ability = ResolvedAbility::new(
+            Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 2 },
+                sides: 6,
+                results: vec![],
+                modifier: None,
+            },
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        )
+        .sub_ability(draw);
+        let mut events = Vec::new();
+        crate::game::effects::resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        let rolls: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                GameEvent::DieRolled {
+                    result: Some(result),
+                    sides: 6,
+                    ..
+                } => Some(usize::from(*result)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rolls.len(), 2, "count == 2 must emit two rolls");
+        let total: usize = rolls.iter().sum();
+        assert_eq!(
+            state.die_result_this_resolution,
+            Some(total as i32),
+            "resolution context must retain the aggregate die result"
+        );
+        assert_eq!(
+            state.players[0].hand.len(),
+            total,
+            "sub_ability must draw the total of {rolls:?}, not the last die or the triggering damage"
+        );
+    }
+
+    /// CR 706.1: If the requested number of dice resolves to 0, no die result
+    /// exists for an inline `EventContextAmount` consumer.
+    #[test]
+    fn roll_die_count_zero_clears_stale_die_result() {
+        use crate::types::ability::{QuantityRef, TargetFilter};
+        let mut state = GameState::new_two_player(7);
+        for i in 0..10 {
+            crate::game::zones::create_object(
+                &mut state,
+                crate::types::identifiers::CardId(7000 + i as u64),
+                PlayerId(0),
+                format!("Card {i}"),
+                crate::types::zones::Zone::Library,
+            );
+        }
+        state.die_result_this_resolution = Some(9);
+        let draw = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+        let ability = ResolvedAbility::new(
+            Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 0 },
+                sides: 6,
+                results: vec![],
+                modifier: None,
+            },
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        )
+        .sub_ability(draw);
+        let mut events = Vec::new();
+        crate::game::effects::resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, GameEvent::DieRolled { .. })),
+            "count 0 must not emit a die roll"
+        );
+        assert_eq!(state.die_result_this_resolution, None);
+        assert_eq!(
+            state.players[0].hand.len(),
+            0,
+            "zero dice must not leak a stale die result into the sub_ability"
+        );
+    }
+
+    /// Issue #2026 (Herald of Hadar): d20 table branches with `player_scope:
+    /// Opponent` must drain opponents, not the activator.
+    #[test]
+    fn roll_die_result_branch_preserves_opponent_player_scope() {
+        use crate::parser::oracle_effect::parse_effect_chain;
+        use crate::types::ability::PlayerFilter;
+        use crate::types::format::FormatConfig;
+
+        let branch_def = parse_effect_chain("each opponent loses 2 life", AbilityKind::Spell);
+        assert_eq!(
+            branch_def.player_scope,
+            Some(PlayerFilter::Opponent),
+            "parser must stamp Opponent scope on each-opponent lose life"
+        );
+
+        let mut state = GameState::new(FormatConfig::standard(), 3, 42);
+        let branch = DieResultBranch {
+            min: 1,
+            max: 20,
+            effect: Box::new(branch_def),
+        };
+        let ability = ResolvedAbility::new(
+            Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 1 },
+                sides: 20,
+                results: vec![branch],
+                modifier: None,
+            },
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.players[0].life, 20,
+            "activator must not lose life from opponent-scoped branch"
+        );
+        assert_eq!(
+            (state.players[1].life, state.players[2].life),
+            (18, 18),
+            "each opponent must lose 2 life"
+        );
+    }
+
+    /// CR 706.1: "Roll two six-sided dice" rolls `count` independent dice,
+    /// emitting one `DieRolled` event per die, each in 1..=sides.
+    #[test]
+    fn roll_die_count_two_emits_two_rolls() {
+        let mut state = GameState::new_two_player(42);
+        let ability = ResolvedAbility::new(
+            Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 2 },
+                sides: 6,
+                results: vec![],
+                modifier: None,
+            },
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+        let rolls: Vec<u8> = events
+            .iter()
+            .filter_map(|e| match e {
+                GameEvent::DieRolled {
+                    result: Some(result),
+                    sides: 6,
+                    ..
+                } => Some(*result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rolls.len(), 2, "count == 2 must emit two DieRolled events");
+        assert!(
+            rolls.iter().all(|r| (1..=6).contains(r)),
+            "every die result must be in 1..=6, got {rolls:?}"
+        );
+    }
+
+    /// CR 706.1: Each die independently consults the results table, so a
+    /// count-2 roll resolves the matching branch twice. With a branch covering
+    /// the entire 1..=6 face range and a Draw effect, the controller draws once
+    /// per die — two cards total.
+    #[test]
+    fn roll_die_count_two_resolves_branch_per_die() {
+        let mut state = GameState::new_two_player(42);
+        let branch = DieResultBranch {
+            min: 1,
+            max: 6,
+            effect: Box::new(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: crate::types::ability::TargetFilter::Controller,
+                },
+            )),
+        };
+        // Seed enough library cards for both draws.
+        for i in 0..5 {
+            crate::game::zones::create_object(
+                &mut state,
+                crate::types::identifiers::CardId(5000 + i as u64),
+                PlayerId(0),
+                format!("Card {i}"),
+                crate::types::zones::Zone::Library,
+            );
+        }
+        let ability = ResolvedAbility::new(
+            Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 2 },
+                sides: 6,
+                results: vec![branch],
+                modifier: None,
+            },
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+        // Branch covers all faces, so it fires once per die — two draws.
+        assert_eq!(
+            state.players[0].hand.len(),
+            2,
+            "each of the two dice must resolve the 1..=6 branch, drawing one card per die"
         );
     }
 }

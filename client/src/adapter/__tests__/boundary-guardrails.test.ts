@@ -64,6 +64,33 @@ function tsUnionVariantTypes(source: string, typeName: string, followingHeader: 
   );
 }
 
+function alternativeCastKeywordTypes(source: string): string[] {
+  const marker = '{ type: "AlternativeCastChoice"; data:';
+  const alternativeCastChoiceStart = source.indexOf(marker);
+  expect(
+    alternativeCastChoiceStart,
+    "AlternativeCastChoice waiting payload should exist",
+  ).toBeGreaterThanOrEqual(0);
+
+  const keywordStart = source.indexOf("keyword:", alternativeCastChoiceStart);
+  expect(keywordStart, "AlternativeCastChoice keyword field should exist").toBeGreaterThan(
+    alternativeCastChoiceStart,
+  );
+
+  const keywordEnd = source.indexOf("; normal_cost:", keywordStart);
+  expect(
+    keywordEnd,
+    "AlternativeCastChoice keyword field should end before normal_cost",
+  ).toBeGreaterThan(keywordStart);
+
+  return Array.from(
+    source
+      .slice(keywordStart, keywordEnd)
+      .matchAll(/\{ type: "([A-Z][A-Za-z0-9]+)" \}/g),
+    (match) => match[1],
+  );
+}
+
 describe("adapter boundary guardrails", () => {
   it("adapter modules do not import stores or use localStorage directly", () => {
     const adapterDir = dirname(fileURLToPath(import.meta.url));
@@ -88,6 +115,20 @@ describe("adapter boundary guardrails", () => {
     expect(new Set(tsVariants)).toEqual(new Set(rustVariants));
   });
 
+  it("keeps the alternative-cast keyword payload in lockstep with the engine enum", () => {
+    const root = repoRoot();
+    const rustSource = readFileSync(
+      resolve(root, "crates/engine/src/types/game_state.rs"),
+      "utf8",
+    );
+    const tsSource = readFileSync(resolve(root, "client/src/adapter/types.ts"), "utf8");
+
+    const rustVariants = rustEnumVariants(rustSource, "AlternativeCastKeyword");
+    const tsVariants = alternativeCastKeywordTypes(tsSource);
+
+    expect(new Set(tsVariants)).toEqual(new Set(rustVariants));
+  });
+
   it("handles the discard-for-mana-ability pay-cost waiting payload", () => {
     const waitingFor: WaitingFor = {
       type: "PayCost",
@@ -99,6 +140,15 @@ describe("adapter boundary guardrails", () => {
         min_count: 0,
         resume: { type: "ManaAbility", ManaAbility: {} },
       },
+    };
+
+    expect(isWaitingForHandled(waitingFor)).toBe(true);
+  });
+
+  it("handles the populate creature-token choice waiting payload", () => {
+    const waitingFor: WaitingFor = {
+      type: "PopulateChoice",
+      data: { player: 0, source_id: 1, valid_tokens: [10, 11] },
     };
 
     expect(isWaitingForHandled(waitingFor)).toBe(true);
@@ -116,6 +166,22 @@ describe("adapter boundary guardrails", () => {
             legal_alternatives: [{ Object: 43 }, { Player: 1 }],
           },
         ],
+      },
+    };
+
+    expect(isWaitingForHandled(waitingFor)).toBe(true);
+  });
+
+  it("handles the splice offer waiting payload", () => {
+    const waitingFor: WaitingFor = {
+      type: "SpliceOffer",
+      data: {
+        player: 0,
+        pending_cast: {} as Extract<
+          WaitingFor,
+          { type: "SpliceOffer" }
+        >["data"]["pending_cast"],
+        eligible: [2],
       },
     };
 

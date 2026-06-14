@@ -4,6 +4,8 @@ import { useTranslation } from "react-i18next";
 import { usePerspectivePlayerId } from "../../hooks/usePlayerId.ts";
 import { usePlayerDesignations } from "../../hooks/usePlayerDesignations.ts";
 import { useSeatColor } from "../../hooks/useSeatColor.ts";
+import { useIsCompactHeight } from "../../hooks/useIsCompactHeight.ts";
+import { useIsMobile } from "../../hooks/useIsMobile.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { getPlayerDisplayName, useMultiplayerStore } from "../../stores/multiplayerStore.ts";
 import { ScoreBadge } from "../draft/ScoreBadge.tsx";
@@ -35,6 +37,9 @@ export function PlayerHud() {
   const showMatchScore = useGameStore((s) => s.gameState?.match_config?.match_type === "Bo3");
   const waitingFor = useGameStore((s) => s.waitingFor);
   const dispatch = useGameStore((s) => s.dispatch);
+  const isMobile = useIsMobile();
+  const isCompactHeight = useIsCompactHeight();
+  const compact = isMobile || isCompactHeight;
 
   const isHumanTargetSelection =
     (waitingFor?.type === "TargetSelection" || waitingFor?.type === "TriggerTargetSelection")
@@ -50,9 +55,16 @@ export function PlayerHud() {
     && waitingFor.data.player === playerId
     && waitingFor.data.scope.type === "Single"
     && waitingFor.data.legal_new_targets.some((t) => "Player" in t && t.Player === playerId);
+  // CR 303.4g + CR 115.1: a returned / non-spell Aura that can enchant a player
+  // (a Curse) is hosted by a board pick — the picker's controller may attach it
+  // to this player when they appear in `legal_targets`. Click dispatches the
+  // same `ChooseTarget { Player }` the engine accepts (engine.rs ~2984).
+  const returnAsAuraHasMe = waitingFor?.type === "ReturnAsAuraTarget"
+    && waitingFor.data.player === playerId
+    && waitingFor.data.legal_targets.some((t) => "Player" in t && t.Player === playerId);
   const isValidTarget = (isHumanTargetSelection && (waitingFor.data.selection?.current_legal_targets ?? []).some(
     (target) => "Player" in target && target.Player === playerId,
-  )) || copyRetargetCurrentSlotHasMe || retargetChoiceHasMe;
+  )) || copyRetargetCurrentSlotHasMe || retargetChoiceHasMe || returnAsAuraHasMe;
 
   const handleTargetClick = useCallback(() => {
     if (isValidTarget) {
@@ -68,7 +80,7 @@ export function PlayerHud() {
     <div
       data-player-hud={playerId}
       data-phased-out={isPhasedOut ? "true" : undefined}
-      className={`relative z-20 flex shrink-0 flex-row flex-nowrap items-center justify-center gap-1.5 px-1 py-1 lg:gap-2 lg:px-2 ${
+      className={`relative z-20 flex shrink-0 flex-row flex-nowrap items-center justify-center ${compact ? "gap-1 px-0.5 py-0.5" : "gap-1.5 px-1 py-1 lg:gap-2 lg:px-2"} ${
         isPhasedOut ? "opacity-40 grayscale" : ""
       }`}
     >
@@ -81,6 +93,7 @@ export function PlayerHud() {
         underAttack={isUnderAttack}
         avatarUrl={avatarUrl}
         playerId={playerId}
+        density={compact ? "compact" : "default"}
         onClick={isValidTarget ? handleTargetClick : undefined}
         trailing={
           <>
@@ -108,9 +121,9 @@ export function PlayerHud() {
           </>
         }
       >
-        <div className="flex min-w-0 items-center gap-2">
-          <LifeTotal playerId={playerId} size="lg" hideLabel />
-          <ManaPoolSummary playerId={playerId} />
+        <div className={`flex min-w-0 items-center ${compact ? "gap-1" : "gap-2"}`}>
+          <LifeTotal playerId={playerId} size={compact ? "sm" : "lg"} hideLabel />
+          <ManaPoolSummary playerId={playerId} size={compact ? "sm" : "default"} />
         </div>
       </HudPlate>
       <PhaseIndicatorRight />

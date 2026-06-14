@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import type { ChosenAttribute, GameObject, ManaCost, Zone } from "../../adapter/types.ts";
+import type { ChosenAttribute, GameObject, Keyword, ManaCost, Zone } from "../../adapter/types.ts";
 import { collectObjectActions } from "../../viewmodel/cardActionChoice.ts";
 import { abilityLabel } from "../../viewmodel/costLabel.ts";
 import { useCardImage } from "../../hooks/useCardImage.ts";
@@ -333,10 +333,26 @@ function CardPreviewInner({
   }
 
   const style: React.CSSProperties = position
-    ? {
-        left: Math.min(position.x + 16, window.innerWidth - 488),
-        top: Math.min(position.y - 200, window.innerHeight - 736),
-      }
+    ? (() => {
+        const estimatedWidth = Math.min(previewWidth, viewportWidth - margin * 2);
+        const estimatedHeight = Math.min(previewHeight, viewportHeight - margin * 2);
+        const unclampedLeft =
+          position.x > viewportWidth / 2
+            ? position.x - previewWidth - gap
+            : position.x + gap;
+        const unclampedTop = altHeld ? margin : position.y - estimatedHeight / 2;
+
+        return {
+          left: Math.min(
+            Math.max(margin, unclampedLeft),
+            Math.max(margin, viewportWidth - estimatedWidth - margin),
+          ),
+          top: Math.min(
+            Math.max(margin, unclampedTop),
+            Math.max(margin, viewportHeight - estimatedHeight - margin),
+          ),
+        };
+      })()
     : defaultDesktopStyle;
 
   return (
@@ -350,6 +366,7 @@ function CardPreviewInner({
         <ParsedAbilitiesPanel
           name={showOtherFace ? (engineBackFace?.name ?? backFaceName ?? "") : (obj?.name ?? engineFrontFace?.name ?? frontFaceName)}
           cardTypes={showOtherFace ? engineBackFace?.card_type : (obj?.card_types ?? engineFrontFace?.card_type)}
+          keywords={showOtherFace ? undefined : obj?.keywords}
           localizedTypeLine={showOtherFace ? engineBackFace?.localized_type_line : engineFrontFace?.localized_type_line}
           parseDetails={showOtherFace && backParseDetails ? backParseDetails : frontParseDetails}
           maxHeight={viewportHeight - margin * 2}
@@ -400,6 +417,9 @@ function MobilePreviewOverlay({
   const { src, isRotated, isFlip } = useCardImage(cardName, {
     size: "normal",
     faceIndex,
+    isToken: obj?.display_source === "Token",
+    tokenFilters: obj?.display_source === "Token" ? tokenFiltersForObject(obj) : undefined,
+    tokenImageRef: obj?.display_source === "Token" ? obj.token_image_ref : undefined,
     oracleId: obj?.printed_ref?.oracle_id,
     faceName: obj?.printed_ref?.face_name,
     sourcePrinting,
@@ -723,6 +743,9 @@ function SupportSummary({ items }: { items: ParsedItem[] }) {
 interface ParsedAbilitiesPanelProps {
   name: string;
   cardTypes?: { supertypes: string[]; core_types: string[]; subtypes: string[] } | null;
+  /** Live object keywords, used to collapse a Changeling's expanded subtype
+   *  list to "Changeling" in the type line (CR 702.73a). */
+  keywords?: Keyword[];
   /** Localized type line from the content sidecar; preferred over formatting
    *  `cardTypes` when present (non-English locale with a translated card). */
   localizedTypeLine?: string | null;
@@ -730,11 +753,11 @@ interface ParsedAbilitiesPanelProps {
   maxHeight?: number;
 }
 
-function ParsedAbilitiesPanel({ name, cardTypes, localizedTypeLine, parseDetails, maxHeight }: ParsedAbilitiesPanelProps) {
+function ParsedAbilitiesPanel({ name, cardTypes, keywords, localizedTypeLine, parseDetails, maxHeight }: ParsedAbilitiesPanelProps) {
   const { t } = useTranslation("game");
   const items = parseDetails ?? [];
   const rulings = useCardRulings(name);
-  const typeLine = localizedTypeLine ?? (cardTypes ? formatTypeLine(cardTypes) : null);
+  const typeLine = localizedTypeLine ?? (cardTypes ? formatTypeLine(cardTypes, keywords) : null);
 
   return (
     <div
@@ -857,7 +880,7 @@ function CardInfoPanel({
       )}
       {/* Type line */}
       <div className="font-semibold text-gray-300">
-        {formatTypeLine(obj.card_types)}
+        {formatTypeLine(obj.card_types, obj.keywords)}
       </div>
 
       {activateLabels.length > 0 && (

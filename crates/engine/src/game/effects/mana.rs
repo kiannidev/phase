@@ -272,9 +272,13 @@ pub(crate) fn resolve_restrictions(
                 .and_then(|obj| obj.chosen_creature_type())
                 .map(|ct| ManaRestriction::OnlyForCreatureType(ct.to_string())),
             // CR 106.6: Combined spell type + ability activation restriction.
-            ManaSpendRestriction::SpellTypeOrAbilityActivation(t) => {
-                Some(ManaRestriction::OnlyForTypeSpellsOrAbilities(t.clone()))
-            }
+            ManaSpendRestriction::SpellTypeOrAbilityActivation {
+                spell_type,
+                ability,
+            } => Some(ManaRestriction::OnlyForTypeSpellsOrAbilities {
+                spell_type: spell_type.clone(),
+                ability: *ability,
+            }),
             ManaSpendRestriction::ActivateOnly => Some(ManaRestriction::OnlyForActivation),
             ManaSpendRestriction::XCostOnly => Some(ManaRestriction::OnlyForXCosts),
             ManaSpendRestriction::SpellWithKeywordKind(kind) => {
@@ -287,6 +291,14 @@ pub(crate) fn resolve_restrictions(
                 Some(ManaRestriction::OnlyForSpellWithManaValue {
                     comparator: *comparator,
                     value: *value,
+                })
+            }
+            // CR 105.2 + CR 106.6: Lower color-count spend restrictions into the
+            // runtime gate checked against `SpellMeta.color_count`.
+            ManaSpendRestriction::SpellWithColorCount { comparator, count } => {
+                Some(ManaRestriction::OnlyForSpellWithColorCount {
+                    comparator: *comparator,
+                    count: *count,
                 })
             }
             ManaSpendRestriction::SpellFromZone(zone) => {
@@ -502,10 +514,22 @@ fn resolve_mana_types_impl(
         // found among permanents matching `filter`. Used by Faeburrow Elder.
         // Returns empty when no colored permanent matches (CR 106.5).
         ManaProduction::DistinctColorsAmongPermanents { filter } => {
-            distinct_colors_among_permanents(state, ability, controller, source_id, filter)
+            distinct_colors_among_permanents(state, ability, source_id, filter)
                 .into_iter()
                 .map(|c| mana_color_to_type(&c))
                 .collect()
+        }
+        // CR 106.1 + CR 109.1: Mox Amber — one chosen color from among matching
+        // permanents. Without a color_override, produce the first listed color
+        // (mirrors ChoiceAmongExiledColors / AnyOneColor). CR 106.5: empty set
+        // → no mana.
+        ManaProduction::AnyOneColorAmongPermanents { count, filter, .. } => {
+            let amount = resolve_count(count, state, ability, controller, source_id);
+            let color_options = distinct_colors_among_permanents(state, ability, source_id, filter);
+            let Some(first) = color_options.first().copied() else {
+                return Vec::new();
+            };
+            vec![mana_color_to_type(&first); amount]
         }
         // CR 603.7c + CR 106.3 + CR 106.5 + CR 106.12a: Vorinclex / Dictate of
         // Karametra — "add one mana of any type that land produced." The set of
@@ -548,12 +572,10 @@ fn resolve_mana_types_impl(
 pub(crate) fn distinct_colors_among_permanents(
     state: &GameState,
     ability: Option<&ResolvedAbility>,
-    controller: crate::types::player::PlayerId,
     source_id: crate::types::identifiers::ObjectId,
     filter: &crate::types::ability::TargetFilter,
 ) -> Vec<crate::types::mana::ManaColor> {
     use crate::game::filter::{matches_target_filter, FilterContext};
-    let _ = controller;
     let filter_ctx = match ability {
         Some(a) => FilterContext::from_ability(a),
         None => FilterContext::from_source(state, source_id),

@@ -207,6 +207,7 @@ mod issue_691_sheoldred_saga_lore;
 mod issue_709_regression;
 mod issue_859_weathered_wayfarer;
 mod issue_860_luminarch_aspirant;
+mod issue_1023_oversold_cemetery;
 mod issue_861_first_sliver_cascade;
 mod issue_861_tree_of_perdition;
 mod issue_864_phyrexian_dreadnought;

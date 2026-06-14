@@ -584,6 +584,15 @@ fn extract_when_next_spell_filter(payload: &str) -> Option<TargetFilter> {
 
     let post_filter = if post.is_empty() {
         None
+    } else if post.eq_ignore_ascii_case(
+        "with {x} in its mana cost or activate an ability with {x} in its activation cost",
+    ) {
+        use crate::types::ability::{FilterProp, TypedFilter};
+        // Magus Lucea Kane — spell branch of the disjunction; ability branch is
+        // the same one-shot delayed trigger in practice for X spells like Nature's Rhythm.
+        Some(TargetFilter::Typed(
+            TypedFilter::default().properties(vec![FilterProp::HasXInManaCost]),
+        ))
     } else {
         // Unknown post-spell modifier → reject the whole pattern rather than
         // silently dropping it. The caller falls through to other parsers.
@@ -41729,6 +41738,63 @@ mod tests {
         assert_eq!(trigger.valid_target, Some(TargetFilter::Controller));
         // Inner effect should parse as a draw.
         assert!(matches!(&*effect.effect, Effect::Draw { .. }));
+    }
+
+    /// CR 603.7 + CR 707.10: Magus Lucea Kane Psychic Stimulus delayed copy.
+    #[test]
+    fn magus_lucea_kane_psychic_stimulus_parses_delayed_copy() {
+        use crate::types::ability::{
+            CopyRetargetPermission, DelayedTriggerCondition, FilterProp, TypedFilter,
+        };
+        let def = parse_effect_chain(
+            "When you next cast a spell with {X} in its mana cost or activate an ability with {X} in its activation cost this turn, copy that spell or ability. You may choose new targets for the copy.",
+            AbilityKind::Activated,
+        );
+        let Effect::CreateDelayedTrigger {
+            condition, effect, ..
+        } = &*def.effect
+        else {
+            panic!("expected CreateDelayedTrigger, got {:?}", def.effect);
+        };
+        let DelayedTriggerCondition::WhenNextEvent { trigger } = condition else {
+            panic!("expected WhenNextEvent, got {:?}", condition);
+        };
+        assert_eq!(
+            trigger.valid_card.as_ref(),
+            Some(&TargetFilter::Typed(
+                TypedFilter::default().properties(vec![FilterProp::HasXInManaCost]),
+            )),
+        );
+        assert!(
+            matches!(
+                *effect.effect,
+                Effect::CopySpell {
+                    target: TargetFilter::TriggeringSource,
+                    retarget: CopyRetargetPermission::MayChooseNewTargets,
+                    ..
+                }
+            ),
+            "expected CopySpell on triggering source, got {:?}",
+            effect.effect
+        );
+    }
+
+    /// CR 605.1a: Magus tap ability is not a mana ability once the delayed copy
+    /// clause is parsed onto the sub_ability chain.
+    #[test]
+    fn magus_lucea_kane_tap_ability_is_not_mana_ability() {
+        let parsed = crate::parser::parse_oracle_text(
+            "Psychic Stimulus — {T}: Add {C}{C}. When you next cast a spell with {X} in its mana cost or activate an ability with {X} in its activation cost this turn, copy that spell or ability. You may choose new targets for the copy.",
+            "Magus Lucea Kane",
+            &[],
+            &["Creature".to_string()],
+            &[],
+        );
+        let ability = parsed.abilities.last().expect("tap ability");
+        assert!(
+            !crate::game::mana_abilities::is_mana_ability(ability),
+            "mana plus delayed copy must use the stack"
+        );
     }
 
     /// CR 201.2: "Destroy target nonland permanent and all other permanents

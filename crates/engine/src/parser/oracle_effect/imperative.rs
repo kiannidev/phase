@@ -3160,6 +3160,21 @@ pub(super) fn parse_utility_imperative_ast(
             }),
             "copy" => {
                 let rest_lower = &lower[lower.len() - rest.len()..];
+                if let Some(suffix_lower) = rest_lower.strip_prefix("that spell or ability") {
+                    let consumed = rest.len() - suffix_lower.len();
+                    let rem = &rest[consumed..];
+                    let retarget = if super::sequence::recognize_copy_retarget_clause(rem.trim()) {
+                        CopyRetargetPermission::MayChooseNewTargets
+                    } else {
+                        #[cfg(debug_assertions)]
+                        assert_no_compound_remainder(rem, text);
+                        CopyRetargetPermission::KeepOriginalTargets
+                    };
+                    return Some(UtilityImperativeAst::Copy {
+                        target: TargetFilter::TriggeringSource,
+                        retarget,
+                    });
+                }
                 let (target, _rem) = if let Some((target, rem_lower)) =
                     parse_copy_stack_ability_target(rest_lower)
                 {

@@ -7,6 +7,19 @@ use crate::types::game_state::GameState;
 use crate::types::identifiers::TrackedSetId;
 use crate::types::player::PlayerId;
 
+#[cfg(test)]
+use crate::game::casting::{can_pay_cost_after_auto_tap, spell_objects_available_to_cast};
+#[cfg(test)]
+use crate::types::ability::{AbilityDefinition, AbilityKind, ManaSpendPermission, QuantityExpr};
+#[cfg(test)]
+use crate::types::card_type::CoreType;
+#[cfg(test)]
+use crate::types::identifiers::ObjectId;
+#[cfg(test)]
+use crate::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
+#[cfg(test)]
+use std::sync::Arc;
+
 /// Grant a CastingPermission to the target object (CR 604.6).
 ///
 /// Implements static abilities that modify where/how a card can be cast, such as
@@ -917,16 +930,6 @@ mod tests {
     /// to cast the exiled spell.
     #[test]
     fn parent_target_controller_any_mana_allows_off_color_cast_payment() {
-        use crate::game::casting::{can_pay_cost_after_auto_tap, spell_objects_available_to_cast};
-        use crate::types::ability::{
-            AbilityDefinition, AbilityKind, ManaSpendPermission, QuantityExpr, ResolvedAbility,
-            TargetRef,
-        };
-        use crate::types::card_type::CoreType;
-        use crate::types::identifiers::ObjectId;
-        use crate::types::mana::{ManaCost, ManaCostShard, ManaType, ManaUnit};
-        use std::sync::Arc;
-
         let mut state = GameState::new_two_player(1);
         let exiled = create_object(
             &mut state,

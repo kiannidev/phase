@@ -1953,9 +1953,10 @@ pub(super) fn parse_search_and_creation_ast(
             QuantityExpr::Fixed { value: 1 }
         };
         let player = parse_dig_library_owner(rest_lower);
-        // CR 406.3 + CR 701.16a: "look at the top card ... and exiles it face
-        // down" (Gonti, Night Minister) — fuse into ExileTop so the card leaves
-        // the library and the trailing play grant can bind to the tracked set.
+        // CR 701.20e + CR 701.13a + CR 406.3: "look at the top card ... and
+        // exiles it face down" (Gonti, Night Minister) — fuse into ExileTop so
+        // the card leaves the library and the trailing play grant can bind to
+        // the tracked set.
         if preceded(
             take_until::<_, _, OracleError<'_>>("and exiles it face down"),
             tag::<_, _, OracleError<'_>>("and exiles it face down"),

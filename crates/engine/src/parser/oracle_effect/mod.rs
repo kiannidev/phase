@@ -27221,10 +27221,10 @@ mod tests {
         );
     }
 
-    /// CR 406.3 + CR 701.16a: "look at the top card of <player>'s library, then
-    /// exile it face down" is the Gonti, Canny Acquisitor impulse idiom. The
-    /// private `Dig` look step (CR 701.16a) only inspects the top card; the
-    /// "then exile it face down" clause must rewrite it into a face-down
+    /// CR 701.20e + CR 701.13a + CR 406.3: "look at the top card of <player>'s
+    /// library, then exile it face down" is the Gonti, Canny Acquisitor impulse
+    /// idiom. The private `Dig` look step (CR 701.20e) only inspects the top
+    /// card; the "then exile it face down" clause must rewrite it into a face-down
     /// `Effect::ExileTop` so the card actually leaves the library (issue #1316).
     /// Building-block coverage independent of any trigger context — a bare chain
     /// resolves "that player's library" to `ParentTarget`.

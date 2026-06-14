@@ -891,7 +891,7 @@ pub(crate) enum SearchCreationImperativeAst {
         reveal: bool,
         player: TargetFilter,
     },
-    /// CR 406.3 + CR 701.16a: Fused "look at the top N ... and exiles it face down".
+    /// CR 701.20e + CR 701.13a + CR 406.3: Fused "look at the top N ... and exiles it face down".
     ExileTopLookedAt {
         player: TargetFilter,
         count: QuantityExpr,

@@ -5836,9 +5836,6 @@ pub struct GameState {
     pub players_who_discarded_card_this_turn: HashSet<PlayerId>,
     #[serde(default)]
     pub cards_discarded_this_turn_by_player: HashMap<PlayerId, u32>,
-    /// CR 702.187b: Object IDs discarded this turn — Mayhem eligibility gate.
-    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
-    pub discarded_object_ids_this_turn: HashSet<ObjectId>,
     #[serde(default)]
     pub players_who_sacrificed_artifact_this_turn: HashSet<PlayerId>,
     /// CR 701.21a: Sacrificed permanent snapshots this turn, preserving
@@ -6836,7 +6833,6 @@ impl GameState {
             counter_added_this_turn: Vec::new(),
             players_who_discarded_card_this_turn: HashSet::new(),
             cards_discarded_this_turn_by_player: HashMap::new(),
-            discarded_object_ids_this_turn: HashSet::new(),
             players_who_sacrificed_artifact_this_turn: HashSet::new(),
             sacrificed_permanents_this_turn: Vec::new(),
             zone_changes_this_turn: Vec::new(),
@@ -7262,7 +7258,6 @@ impl PartialEq for GameState {
             && self.players_who_discarded_card_this_turn
                 == other.players_who_discarded_card_this_turn
             && self.cards_discarded_this_turn_by_player == other.cards_discarded_this_turn_by_player
-            && self.discarded_object_ids_this_turn == other.discarded_object_ids_this_turn
             && self.players_who_sacrificed_artifact_this_turn
                 == other.players_who_sacrificed_artifact_this_turn
             && self.sacrificed_permanents_this_turn == other.sacrificed_permanents_this_turn

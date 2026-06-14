@@ -7604,9 +7604,9 @@ mod tests {
     #[test]
     fn resolve_quantity_cards_discarded_this_turn_sum_opponents() {
         let mut state = GameState::new_two_player(42);
-        crate::game::restrictions::record_discard(&mut state, PlayerId(0), ObjectId(9003));
-        crate::game::restrictions::record_discard(&mut state, PlayerId(1), ObjectId(9004));
-        crate::game::restrictions::record_discard(&mut state, PlayerId(1), ObjectId(9005));
+        crate::game::restrictions::record_discard(&mut state, PlayerId(0));
+        crate::game::restrictions::record_discard(&mut state, PlayerId(1));
+        crate::game::restrictions::record_discard(&mut state, PlayerId(1));
 
         let expr = QuantityExpr::Ref {
             qty: QuantityRef::CardsDiscardedThisTurn {

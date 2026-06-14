@@ -265,17 +265,12 @@ pub fn record_attackers_declared(
         .extend(state.players_attacked_this_step.iter().copied());
 }
 
-pub fn record_discard(
-    state: &mut crate::types::game_state::GameState,
-    player: PlayerId,
-    object_id: ObjectId,
-) {
+pub fn record_discard(state: &mut crate::types::game_state::GameState, player: PlayerId) {
     state.players_who_discarded_card_this_turn.insert(player);
     *state
         .cards_discarded_this_turn_by_player
         .entry(player)
         .or_insert(0) += 1;
-    state.discarded_object_ids_this_turn.insert(object_id);
 }
 
 /// CR 702.187b: Stamp a card that was just put into a graveyard by a discard

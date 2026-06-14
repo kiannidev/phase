@@ -20868,14 +20868,14 @@ mod dedup_regression_tests {
         );
 
         // Only the controller discarded → still no opponent discard → condition unmet.
-        crate::game::restrictions::record_discard(&mut state, controller, ObjectId(9001));
+        crate::game::restrictions::record_discard(&mut state, controller);
         assert!(
             !check_trigger_condition(&state, &condition, controller, None, None),
             "self-discard must not satisfy 'an opponent discarded a card this turn'"
         );
 
         // Opponent discarded → condition met.
-        crate::game::restrictions::record_discard(&mut state, opponent, ObjectId(9002));
+        crate::game::restrictions::record_discard(&mut state, opponent);
         assert!(
             check_trigger_condition(&state, &condition, controller, None, None),
             "opponent-discard must satisfy 'an opponent discarded a card this turn'"
@@ -20936,7 +20936,7 @@ mod dedup_regression_tests {
         }
 
         // Record that opponent discarded a card
-        crate::game::restrictions::record_discard(&mut state, opponent, ObjectId(9001));
+        crate::game::restrictions::record_discard(&mut state, opponent);
 
         // Verify the condition is met
         let condition = TriggerCondition::QuantityComparison {

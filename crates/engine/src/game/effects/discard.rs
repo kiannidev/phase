@@ -104,7 +104,7 @@ pub(crate) fn complete_discard_to_graveyard(
             return DiscardOutcome::NeedsReplacementChoice(player);
         }
     }
-    crate::game::restrictions::record_discard(state, player_id, object_id);
+    crate::game::restrictions::record_discard(state, player_id);
     // CR 701.9c + CR 702.187b: stamp the Mayhem discard marker only if the card
     // actually landed in the graveyard — a redirect (RIP → exile) leaves it
     // elsewhere, matching the Madness → exile path.
@@ -232,7 +232,7 @@ pub fn resolve(
                             );
                             // CR 702.35: The card was still discarded — record and emit event
                             // so "whenever you discard" triggers fire.
-                            crate::game::restrictions::record_discard(state, player_id, oid);
+                            crate::game::restrictions::record_discard(state, player_id);
                             events.push(GameEvent::Discarded {
                                 player_id,
                                 object_id: oid,
@@ -427,7 +427,7 @@ fn route_discard(
                     None,
                     events,
                 );
-                crate::game::restrictions::record_discard(state, player, oid);
+                crate::game::restrictions::record_discard(state, player);
                 events.push(GameEvent::Discarded {
                     player_id: player,
                     object_id: oid,

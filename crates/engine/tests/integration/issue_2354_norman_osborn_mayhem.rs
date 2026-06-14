@@ -118,7 +118,7 @@ fn mayhem_allows_cast_from_graveyard_after_discard_this_turn() {
         "direct CastSpell must reject a Mayhem card that was not discarded this turn"
     );
 
-    record_discard(runner.state_mut(), P0, spell);
+    record_discard(runner.state_mut(), P0);
     record_card_discarded(runner.state_mut(), spell);
     evaluate_layers(runner.state_mut());
 

@@ -25,6 +25,8 @@ export function TargetingOverlay() {
   const isCopyRetarget = waitingFor?.type === "CopyRetarget";
   const canKeepCurrentTargets = isCopyRetarget && waitingFor.data.target_slots.every((slot) => slot.current != null);
   const isExploreChoice = waitingFor?.type === "ExploreChoice";
+  // CR 701.36a: Populate — choose a creature token you control to copy.
+  const isPopulateChoice = waitingFor?.type === "PopulateChoice";
   // CR 303.4 + CR 303.4g + CR 115.1: Return-as-Aura attach pick. Picker is a
   // CHOICE (not a target), but the action shape mirrors ExploreChoice
   // (`GameAction::ChooseTarget` with the chosen ObjectId).
@@ -51,6 +53,8 @@ export function TargetingOverlay() {
     : waitingFor?.type === "TargetSelection"
       ? waitingFor.data.pending_cast?.object_id
       : waitingFor?.type === "ExploreChoice"
+        ? waitingFor.data.source_id
+      : waitingFor?.type === "PopulateChoice"
         ? waitingFor.data.source_id
       : waitingFor?.type === "ReturnAsAuraTarget"
         ? waitingFor.data.source_id
@@ -99,7 +103,7 @@ export function TargetingOverlay() {
     return () => clearSelectedCards();
   }, [clearSelectedCards, isTapCreatureChoice]);
 
-  if (!isTargetSelection && !isCopyTargetChoice && !isCopyRetarget && !isExploreChoice && !isReturnAsAuraTarget && !isRetargetChoice && !isTapCreatureChoice) return null;
+  if (!isTargetSelection && !isCopyTargetChoice && !isCopyRetarget && !isExploreChoice && !isPopulateChoice && !isReturnAsAuraTarget && !isRetargetChoice && !isTapCreatureChoice) return null;
 
   // Only show targeting UI for the human player
   if (!canActForWaitingState) return null;
@@ -116,8 +120,11 @@ export function TargetingOverlay() {
         {/* Semi-transparent overlay (click-through so board cards remain clickable) */}
         <div className="absolute inset-0 bg-black/30" />
 
-        {/* Instruction text */}
-        <div className="absolute left-0 right-0 top-4 flex flex-col items-center gap-1">
+        {/* Instruction text. Pinned to the very top so it overlaps only the
+            opponent's face-down hand (low-value space) and clears the
+            opponent-HUD tab rail below it — the rail carries life/creature/land
+            counts that must stay readable and clickable during targeting. */}
+        <div className="absolute left-0 right-0 top-1 flex flex-col items-center gap-1">
           {sourceName && (
             <div className="rounded-md bg-gray-800/90 px-4 py-1 text-sm font-medium text-amber-300 shadow">
               {sourceName}
@@ -138,6 +145,8 @@ export function TargetingOverlay() {
                   })()
               : isExploreChoice
                 ? t("targeting.chooseCreatureToExplore")
+              : isPopulateChoice
+                ? t("targeting.chooseCreatureTokenToPopulate")
               : isReturnAsAuraTarget
                 ? t("targeting.chooseReturnAsAuraTarget")
               : isRetargetChoice
@@ -284,6 +293,11 @@ function inferTargetNoun(
     return t("targeting.nounTarget");
   }
   if (objectTargets.length === 0) return t("targeting.nounTarget");
+  // CR 112.1: Spells on the stack are not permanents; infer from zone so
+  // Counterspell-style targeting does not fall through to "nonland permanent".
+  if (objectTargets.every((obj) => obj.zone === "Stack")) {
+    return t("targeting.nounSpell");
+  }
   if (objectTargets.every((obj) => !obj.card_types.core_types.includes("Land"))) {
     return t("targeting.nounNonlandPermanent");
   }

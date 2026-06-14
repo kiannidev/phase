@@ -15,24 +15,28 @@ import type { DeckCardCount, GameFormat, MatchConfig, SerializedAbilityCost } fr
 import { useDraftStore } from "../stores/draftStore";
 import { loadActiveQuickDraft } from "../services/quickDraftPersistence";
 import type { DraftMatchResult } from "../services/quickDraftPersistence";
-import { useIsCompactHeight } from "../hooks/useIsCompactHeight.ts";
+import { useResolvedGridRows } from "../hooks/useResolvedGridRows.ts";
 import { useIsMobile } from "../hooks/useIsMobile.ts";
+import { FlexEditOverlay } from "../components/flexlayout/FlexEditOverlay.tsx";
+import { DraggableWidget } from "../components/flexlayout/DraggableWidget.tsx";
 import { BetweenGamesSideboardModal } from "../components/multiplayer/BetweenGamesSideboardModal.tsx";
 import { audioManager } from "../audio/AudioManager.ts";
 import { useAudioContext } from "../audio/useAudioContext.ts";
 import { AnimationOverlay } from "../components/animation/AnimationOverlay.tsx";
+import { RevealOverlay } from "../components/animation/RevealOverlay.tsx";
 import { TurnBanner } from "../components/animation/TurnBanner.tsx";
 import { DiceRollOverlay } from "../components/animation/DiceRollOverlay.tsx";
 import { flashStartingPlayerContest } from "../game/diceContest.ts";
 import { BattlefieldBackground } from "../components/board/BattlefieldBackground.tsx";
 import { BoardContextMenu } from "../components/board/BoardContextMenu.tsx";
 import { DebugCardContextMenu } from "../components/chrome/DebugCardContextMenu.tsx";
+import { DebugLibraryViewer } from "../components/chrome/DebugLibraryViewer.tsx";
 import { AttackTargetLines } from "../components/board/AttackTargetLines.tsx";
 import { BlockAssignmentLines } from "../components/board/BlockAssignmentLines.tsx";
 import { BlockRequirementBadges } from "../components/combat/BlockRequirementBadges.tsx";
 import { GameBoard } from "../components/board/GameBoard.tsx";
 import { CardImage } from "../components/card/CardImage.tsx";
-import { CardPreview } from "../components/card/CardPreview.tsx";
+import { GameCardPreview } from "../components/card/GameCardPreview.tsx";
 import { ActionButton } from "../components/board/ActionButton.tsx";
 import { FullControlToggle } from "../components/controls/FullControlToggle.tsx";
 import { CombatPhaseIndicator } from "../components/controls/PhaseStopBar.tsx";
@@ -45,6 +49,7 @@ import { SandboxToolsNudge } from "../components/help/SandboxToolsNudge.tsx";
 import { HelpSheet } from "../components/help/HelpSheet.tsx";
 import { GameLogPanel } from "../components/log/GameLogPanel.tsx";
 import { ChooseXValueUI } from "../components/mana/ChooseXValueUI.tsx";
+import { AssistPaymentUI } from "../components/mana/AssistPaymentUI.tsx";
 import { ManaPaymentUI } from "../components/mana/ManaPaymentUI.tsx";
 import { PayAmountChoiceUI } from "../components/mana/PayAmountChoiceUI.tsx";
 import { RichLabel } from "../components/mana/RichLabel.tsx";
@@ -52,10 +57,12 @@ import { CardDataMissingModal } from "../components/modal/CardDataMissingModal.t
 import { UnhandledWaitingForModal } from "../components/modal/UnhandledWaitingForModal.tsx";
 import { AdventureCastModal } from "../components/modal/AdventureCastModal.tsx";
 import { CascadeChoiceModal } from "../components/modal/CascadeChoiceModal.tsx";
+import { FreeCastWindowModal } from "../components/modal/FreeCastWindowModal.tsx";
 import { ModalFaceModal } from "../components/modal/ModalFaceModal.tsx";
 import { AlternativeCostModal } from "../components/modal/AlternativeCostModal.tsx";
 import { CastingVariantModal } from "../components/modal/CastingVariantModal.tsx";
 import { MiracleRevealModal } from "../components/modal/MiracleRevealModal.tsx";
+import { SpliceOfferModal } from "../components/modal/SpliceOfferModal.tsx";
 import { CardChoiceModal } from "../components/modal/CardChoiceModal.tsx";
 import { ChoiceModal } from "../components/modal/ChoiceModal.tsx";
 import { OptionalEffectModalContent } from "../components/modal/OptionalEffectModal.tsx";
@@ -64,11 +71,17 @@ import { ChooseOneOfBranchModal } from "../components/modal/ChooseOneOfBranchMod
 import { ModeChoiceModal } from "../components/modal/ModeChoiceModal.tsx";
 import { ReplacementModal } from "../components/modal/ReplacementModal.tsx";
 import { TriggerOrderModal } from "../components/modal/TriggerOrderModal.tsx";
+import { PeekTab } from "../components/modal/DialogShell.tsx";
+import { PeekRestoreTab } from "../components/modal/DialogHost.tsx";
+import { useModalPeek } from "../components/modal/useModalPeek.ts";
 import { BattleProtectorModal } from "../components/modal/BattleProtectorModal.tsx";
+import { AssistChoosePlayerModal } from "../components/modal/AssistChoosePlayerModal.tsx";
 import { ClashOpponentModal } from "../components/modal/ClashOpponentModal.tsx";
 import { TributeModal } from "../components/modal/TributeModal.tsx";
 import { CombatTaxModal } from "../components/modal/CombatTaxModal.tsx";
 import { TopOrBottomChoiceModalContent } from "../components/modal/TopOrBottomChoiceModal.tsx";
+import { MutateMergeChoiceModalContent } from "../components/modal/MutateMergeChoiceModal.tsx";
+import { CipherEncodeChoiceModalContent } from "../components/modal/CipherEncodeChoiceModal.tsx";
 import { DialogHost, isClickThroughWaitingFor } from "../components/modal/DialogHost.tsx";
 import { PermanentTypeSlotModal } from "../components/modal/PermanentTypeSlotModal.tsx";
 import { StackDisplay } from "../components/stack/StackDisplay.tsx";
@@ -103,7 +116,7 @@ import { MANA_PAYMENT_WAITING_FOR_TYPES } from "../game/waitingForRegistry.ts";
 import { useGameDispatch } from "../hooks/useGameDispatch.ts";
 import { useInspectHoverProps } from "../hooks/useInspectHoverProps.ts";
 import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts.ts";
-import { usePreviewDismiss } from "../hooks/usePreviewDismiss.ts";
+import { clearPromptOverlayState } from "../game/sessionCleanup.ts";
 import { clearGame, loadActiveGame, useGameStore } from "../stores/gameStore.ts";
 import { useUiStore } from "../stores/uiStore.ts";
 import { usePreferencesStore } from "../stores/preferencesStore.ts";
@@ -116,17 +129,26 @@ import {
   type PlayerSlot,
 } from "../stores/multiplayerStore.ts";
 import { useMultiplayerDraftStore } from "../stores/multiplayerDraftStore.ts";
+import { SpectatorChrome } from "../components/spectator/SpectatorChrome.tsx";
+import { useSpectatorMode } from "../hooks/useSpectatorMode.ts";
 import { GameProvider } from "../providers/GameProvider.tsx";
 import { useCanActForWaitingState, usePerspectivePlayerId, usePlayerId } from "../hooks/usePlayerId.ts";
 import { abilityChoiceLabel, formatAbilityCost } from "../viewmodel/costLabel.ts";
-import { getWaitingForObjectChoiceIds } from "../viewmodel/gameStateView.ts";
+import {
+  getCastableZoneViewerTarget,
+  getWaitingForObjectChoiceIds,
+  type ZoneViewerTarget,
+} from "../viewmodel/gameStateView.ts";
 import { gameButtonClass } from "../components/ui/buttonStyles.ts";
-import { cardImageLookup } from "../services/cardImageLookup.ts";
 
 type ZoneRailStyle = CSSProperties & {
   "--card-w": string;
   "--card-h": string;
 };
+
+function castableZoneViewerAutoOpenKey(target: ZoneViewerTarget): string {
+  return `${target.zone}:${target.playerId}:${target.objectIds.join(",")}`;
+}
 
 /**
  * i18n keys for user-facing messages keyed by
@@ -200,18 +222,20 @@ export function GamePage() {
   );
 
   // Map URL modes to GameProvider modes
-  const mode: "ai" | "online" | "local" | "p2p-host" | "p2p-join" | "draft-match" =
+  const mode: "ai" | "online" | "local" | "p2p-host" | "p2p-join" | "draft-match" | "spectate" =
     rawMode === "p2p-host"
       ? "p2p-host"
       : rawMode === "p2p-join"
         ? "p2p-join"
         : rawMode === "draft-match"
           ? "draft-match"
-          : rawMode === "host" || rawMode === "join"
-            ? "online"
-            : rawMode === "ai"
-              ? "ai"
-              : "local";
+          : rawMode === "spectate"
+            ? "spectate"
+            : rawMode === "host" || rawMode === "join"
+              ? "online"
+              : rawMode === "ai"
+                ? "ai"
+                : "local";
 
   const [showCardDataMissing, setShowCardDataMissing] = useState(false);
 
@@ -300,7 +324,8 @@ export function GamePage() {
         // If WE conceded, navigate to menu immediately
         if (event.player === useMultiplayerStore.getState().activePlayerId) {
           hasConcededRef.current = true;
-          if (gameId) clearGame(gameId);
+          clearPromptOverlayState();
+          if (gameId) void clearGame(gameId);
           navigate("/");
         }
         break;
@@ -372,7 +397,11 @@ export function GamePage() {
         // Store-level side effects (isSpectator, toast) already handled in ws-adapter
         break;
       case "spectatorJoined":
-        // Could show a toast, but not critical — no UI for this yet
+        useMultiplayerStore.setState((s) => ({
+          spectators: s.spectators.includes(event.name)
+            ? s.spectators
+            : [...s.spectators, event.name],
+        }));
         break;
       case "error":
         useMultiplayerStore.getState().showToast(event.message);
@@ -581,12 +610,12 @@ export function GamePage() {
       roomName={roomNameParam ?? undefined}
       source={sourceParam}
       draftId={draftIdParam}
-      onWsEvent={mode === "online" ? handleWsEvent : undefined}
+      onWsEvent={mode === "online" || mode === "spectate" ? handleWsEvent : undefined}
       onP2PEvent={
         mode === "p2p-host" || mode === "p2p-join" ? handleP2PEvent : undefined
       }
       onReady={
-        mode === "online" || mode === "p2p-host" || mode === "p2p-join"
+        mode === "online" || mode === "spectate" || mode === "p2p-host" || mode === "p2p-join"
           ? handleReady
           : undefined
       }
@@ -597,7 +626,7 @@ export function GamePage() {
       <GamePageContent
         gameId={gameId}
         mode={rawMode}
-        isOnlineMode={mode === "online"}
+        isOnlineMode={mode === "online" || mode === "spectate"}
         hostGameCode={hostGameCode}
         waitingForOpponent={waitingForOpponent}
         opponentDisconnected={opponentDisconnected}
@@ -691,9 +720,9 @@ function GamePageContent({
   const lobbyProgress = useGameStore((s) => s.lobbyProgress);
   const dispatch = useGameDispatch();
   const isMobile = useIsMobile();
-  const isCompactHeight = useIsCompactHeight();
-  const inspectedObjectId = useUiStore((s) => s.inspectedObjectId);
+  const gridTemplateRows = useResolvedGridRows();
   const objects = useGameStore((s) => s.gameState?.objects);
+  const legalActionsByObject = useGameStore((s) => s.legalActionsByObject);
   const seatOrder = useGameStore((s) => s.gameState?.seat_order);
   const players = useGameStore((s) => s.gameState?.players);
   const eliminatedPlayers = useGameStore((s) => s.gameState?.eliminated_players);
@@ -731,9 +760,11 @@ function GamePageContent({
   const [showAiHand, setShowAiHand] = useState(false);
   const [showDebugBounds, setShowDebugBounds] = useState(false);
   const [viewingZone, setViewingZone] = useState<{
-    zone: "graveyard" | "exile";
+    zone: "graveyard" | "exile" | "library";
     playerId: number;
+    autoOpenKey?: string;
   } | null>(null);
+  const dismissedCastableZoneViewerKeyRef = useRef<string | null>(null);
   const [preferencesOpen, setPreferencesOpen] = useState<
     null | { tab?: SettingsTabId; highlight?: SettingsHighlight }
   >(null);
@@ -741,6 +772,7 @@ function GamePageContent({
 
   const playerId = usePlayerId();
   const perspectivePlayerId = usePerspectivePlayerId();
+  const isSpectatorMode = useSpectatorMode();
   const canActForWaitingState = useCanActForWaitingState();
   const helpSheetOpen = useUiStore((s) => s.helpSheetOpen);
   const setHelpSheetOpen = useUiStore((s) => s.setHelpSheetOpen);
@@ -757,6 +789,31 @@ function GamePageContent({
   }, [eliminatedPlayers, perspectivePlayerId, players, seatOrder]);
   const activeOpponentId =
     focusedOpponent ?? opponents[0] ?? (perspectivePlayerId === 0 ? 1 : 0);
+
+  // Memoize the HUD elements passed to GameBoard. GameBoard is wrapped in
+  // React.memo, which shallow-compares props; without stable element
+  // references these inline JSX nodes would be new on every GamePageContent
+  // render, defeating the memo. Stable refs let GameBoard skip re-rendering
+  // when GamePageContent re-renders for reasons that don't touch these props.
+  const oppHud = useMemo(
+    () => (
+      <OpponentHud
+        opponentName={isOnlineMode ? opponentDisplayName : undefined}
+        onKickPlayer={
+          isP2PHost
+            ? (pid) => {
+                const adapter = useGameStore.getState().adapter as
+                  | { kickPlayer?: (pid: number) => Promise<void> }
+                  | null;
+                void adapter?.kickPlayer?.(pid);
+              }
+            : undefined
+        }
+      />
+    ),
+    [isOnlineMode, opponentDisplayName, isP2PHost],
+  );
+  const playerHud = useMemo(() => <PlayerHud />, []);
 
   useAudioContext("battlefield");
 
@@ -798,41 +855,14 @@ function GamePageContent({
       handleConcede();
       return;
     }
+    clearPromptOverlayState();
     if (gameId) {
-      clearGame(gameId);
+      void clearGame(gameId);
     }
     navigate("/");
   }, [isOnlineMode, gameId, handleConcede, navigate]);
 
-  const isDragging = useUiStore((s) => s.isDragging);
-  const inspectedFaceIndex = useUiStore((s) => s.inspectedFaceIndex);
-  // Card-preview behavior preference (item: hover preview side/Shift). In
-  // "shift" mode the preview only renders while Shift is held; in "side" mode
-  // it docks to the screen edge instead of following the cursor.
-  const cardPreviewMode = usePreferencesStore((s) => s.cardPreviewMode);
-  const shiftHeld = useUiStore((s) => s.shiftHeld);
-  const previewSuppressed = cardPreviewMode === "shift" && !shiftHeld;
-  const inspectedObj =
-    !isDragging && inspectedObjectId != null && objects
-      ? (objects[inspectedObjectId] ?? null)
-      : null;
-  // Scryfall lookups must use the front-face name (scryfall-data.json indexes
-  // only front faces). When a permanent has transformed, the engine swaps
-  // obj.name to the back-face name — cardImageLookup recovers the front name
-  // from obj.back_face. See services/cardImageLookup.ts (issue #90).
-  const inspectedLookup = inspectedObj ? cardImageLookup(inspectedObj) : null;
-  const inspectedCardName = inspectedObj && !inspectedObj.face_down
-    ? inspectedFaceIndex === 1 && inspectedObj.back_face
-      ? inspectedObj.back_face.name
-      : inspectedLookup?.name ?? inspectedObj.name
-    : null;
-  // The "other" face: when viewing front, this is back_face; when viewing back, this is the front
-  const inspectedOtherFaceName = inspectedObj?.back_face && !inspectedObj.face_down
-    ? inspectedFaceIndex === 1 ? inspectedObj.name : inspectedObj.back_face.name
-    : null;
-
   useKeyboardShortcuts();
-  usePreviewDismiss();
 
   // Toggle debug layout bounds with Ctrl+Shift+D
   useEffect(() => {
@@ -848,6 +878,9 @@ function GamePageContent({
 
   // Sync card size preference to CSS custom properties
   const cardSize = usePreferencesStore((s) => s.cardSize);
+  // Keys BattlefieldBackground so a mode/seat change remounts it with a fresh
+  // lock (see BattlefieldBackground) instead of resetting refs during render.
+  const boardBackground = usePreferencesStore((s) => s.boardBackground);
   useEffect(() => {
     const root = document.documentElement;
     const scale = cardSize === "small" ? 0.8 : cardSize === "large" ? 1.25 : 1;
@@ -861,11 +894,18 @@ function GamePageContent({
     }
   }, []);
 
-  // Auto-open graveyard/exile viewer when the engine is waiting for an object choice in that zone.
+  // Auto-open graveyard/exile viewer when the engine is waiting for an object
+  // choice in that zone, or when Priority surfaces cast/play actions on cards
+  // in a single graveyard/exile pile (Retrace, Flashback, etc.).
   useEffect(() => {
-    if (!objects) return;
+    if (!objects) {
+      dismissedCastableZoneViewerKeyRef.current = null;
+      return;
+    }
     const wf = engineWaitingFor;
-    if (!canActForWaitingState) return;
+    if (!canActForWaitingState) {
+      return;
+    }
 
     // Collect distinct (zone, owner) groupings so we don't trap the user in one
     // graveyard when the effect can target either player's graveyard (e.g. Soul-Guide Lantern).
@@ -882,9 +922,37 @@ function GamePageContent({
     // Only auto-open when there's a single zone+owner to open. Otherwise the
     // zone control glow prompts the user to pick.
     if (groups.size === 1 && firstHit) {
+      dismissedCastableZoneViewerKeyRef.current = null;
       setViewingZone(firstHit);
+      return;
     }
-  }, [canActForWaitingState, engineWaitingFor, objects]);
+
+    const castableTarget = getCastableZoneViewerTarget(
+      wf,
+      objects,
+      legalActionsByObject,
+    );
+    if (castableTarget) {
+      const autoOpenKey = castableZoneViewerAutoOpenKey(castableTarget);
+      if (dismissedCastableZoneViewerKeyRef.current !== autoOpenKey) {
+        setViewingZone({
+          zone: castableTarget.zone,
+          playerId: castableTarget.playerId,
+          autoOpenKey,
+        });
+      }
+      return;
+    }
+
+    dismissedCastableZoneViewerKeyRef.current = null;
+  }, [canActForWaitingState, engineWaitingFor, legalActionsByObject, objects]);
+
+  const handleZoneViewerClose = useCallback(() => {
+    if (viewingZone?.autoOpenKey) {
+      dismissedCastableZoneViewerKeyRef.current = viewingZone.autoOpenKey;
+    }
+    setViewingZone(null);
+  }, [viewingZone]);
 
   const handleDeclareCompanion = useCallback(
     (cardIndex: number | null) => {
@@ -1017,7 +1085,8 @@ function GamePageContent({
         setBoardContextMenu({ x: e.clientX, y: e.clientY });
       }}
     >
-      <BattlefieldBackground />
+      <SpectatorChrome />
+      <BattlefieldBackground key={`${boardBackground}-${playerId}`} />
       <StackDisplay />
 
       {/* Persistent Sandbox banner — visible to all players whenever the
@@ -1064,18 +1133,21 @@ function GamePageContent({
         className={`relative z-10 grid min-w-0 h-full${isReconnecting ? " pointer-events-none" : ""}`}
         style={{
           paddingTop: "var(--game-top-overlay-offset, 0px)",
-          gridTemplateRows: isCompactHeight
-            ? "minmax(0,12%) 1fr minmax(0,18%)"
-            : "minmax(0,min(12%,100px)) 1fr minmax(0,min(18%,150px))",
+          gridTemplateRows,
           gridTemplateColumns: "1fr",
         }}
       >
         {/* Row 1: Opponent hand + zone piles (flow layout — piles take real space) */}
-        <div className="relative z-20 min-w-0 flex w-full overflow-visible">
+        <div
+          className="relative z-20 min-w-0 flex w-full overflow-visible"
+          data-flex-zone="opp-row"
+        >
           <div className="min-w-0 flex-1">
             <OpponentHand showCards={showAiHand} />
           </div>
-          <div
+          <DraggableWidget
+            target={{ kind: "widget", key: "opponentPiles" }}
+            flexZone="opponentPiles"
             className="flex shrink-0 items-start gap-1.5 px-1 py-1"
             style={playerZoneRailStyle}
           >
@@ -1084,7 +1156,11 @@ function GamePageContent({
               size={pileSize}
               onClick={() => setViewingZone({ zone: "exile", playerId: activeOpponentId })}
             />
-            <LibraryPile playerId={activeOpponentId} size={pileSize} />
+            <LibraryPile
+              playerId={activeOpponentId}
+              size={pileSize}
+              onView={() => setViewingZone({ zone: "library", playerId: activeOpponentId })}
+            />
             <GraveyardPile
               playerId={activeOpponentId}
               size={pileSize}
@@ -1092,39 +1168,24 @@ function GamePageContent({
                 setViewingZone({ zone: "graveyard", playerId: activeOpponentId })
               }
             />
-          </div>
+          </DraggableWidget>
         </div>
 
         {/* Row 2: Battlefield — takes remaining space; HUDs passed inline to PlayerAreas */}
         <div className="relative z-30 flex min-h-0 min-w-0 flex-col">
-          <GameBoard
-            oppHud={
-              <OpponentHud
-                opponentName={isOnlineMode ? opponentDisplayName : undefined}
-                onKickPlayer={
-                  isP2PHost
-                    ? (pid) => {
-                        const adapter = useGameStore.getState().adapter as
-                          | { kickPlayer?: (pid: number) => Promise<void> }
-                          | null;
-                        void adapter?.kickPlayer?.(pid);
-                      }
-                    : undefined
-                }
-              />
-            }
-            playerHud={<PlayerHud />}
-          />
+          <GameBoard oppHud={oppHud} playerHud={playerHud} />
         </div>
 
         {/* Row 3: Player hand + zones */}
-        <div className="relative min-w-0 overflow-visible">
+        <div className="relative min-w-0 overflow-visible" data-flex-zone="player-row">
           <div className="flex items-end justify-center">
             <ZoneHand zone="exile" />
             <PlayerHand />
             <ZoneHand zone="graveyard" />
           </div>
-          <div
+          <DraggableWidget
+            target={{ kind: "widget", key: "playerPiles" }}
+            flexZone="playerPiles"
             className="pointer-events-none absolute left-0 top-0 bottom-0 z-10 flex w-fit flex-col items-start justify-end gap-0.5 p-1 lg:gap-1 lg:p-3 [&>*]:pointer-events-auto [&>div>*]:pointer-events-auto"
             style={playerZoneRailStyle}
           >
@@ -1139,9 +1200,13 @@ function GamePageContent({
                 size={pileSize}
                 onClick={() => setViewingZone({ zone: "graveyard", playerId: perspectivePlayerId })}
               />
-              <LibraryPile playerId={perspectivePlayerId} size={pileSize} />
+              <LibraryPile
+                playerId={perspectivePlayerId}
+                size={pileSize}
+                onView={() => setViewingZone({ zone: "library", playerId: perspectivePlayerId })}
+              />
             </div>
-          </div>
+          </DraggableWidget>
           <div
             className="pointer-events-none absolute right-0 top-0 bottom-0 z-10 flex w-fit flex-col items-end justify-end gap-0.5 p-1 lg:gap-1 lg:p-3 [&>*]:pointer-events-auto"
             style={playerZoneRailStyle}
@@ -1152,7 +1217,9 @@ function GamePageContent({
       </div>
 
       {/* Right-side fixed UI stack: combat phases → full control → action buttons → log */}
-      <div
+      <DraggableWidget
+        target={{ kind: "widget", key: "actionRail" }}
+        flexZone="actionRail"
         className="fixed z-30 flex flex-col items-end gap-1.5"
         style={{
           bottom: "calc(env(safe-area-inset-bottom) + var(--action-btn-bottom))",
@@ -1162,15 +1229,20 @@ function GamePageContent({
         {showFlowHelpNudge && <FlowHelpNudge />}
         {showSandboxToolsNudge && <SandboxToolsNudge />}
         <CombatPhaseIndicator />
-        <div className="flex items-center gap-1.5">
-          <HandBadge />
-          <FullControlToggle />
-        </div>
-        <ActionButton />
-      </div>
+        {!isSpectatorMode && (
+          <>
+            <div className="flex items-center gap-1.5">
+              <HandBadge />
+              <FullControlToggle />
+            </div>
+            <ActionButton />
+          </>
+        )}
+      </DraggableWidget>
 
       <GameLogPanel />
       <MobileHandDrawer />
+      <FlexEditOverlay />
 
       {/* Game menu — top-left hamburger */}
       <GameMenu
@@ -1314,14 +1386,6 @@ function GamePageContent({
       <DebugPanel />
       <ResolutionProgressOverlay />
 
-      {viewingZone && (
-        <ZoneViewer
-          zone={viewingZone.zone}
-          playerId={viewingZone.playerId}
-          onClose={() => setViewingZone(null)}
-        />
-      )}
-
       {preferencesOpen && (
         <PreferencesModal
           onClose={() => setPreferencesOpen(null)}
@@ -1338,15 +1402,19 @@ function GamePageContent({
           onChangeBackground={() =>
             setPreferencesOpen({ tab: "gameplay", highlight: "board-background" })
           }
+          onCustomizeLayout={() => useUiStore.getState().setFlexEditMode(true)}
           onToggleGameLog={() => useUiStore.getState().toggleLogPanel()}
           onToggleDebugLog={() => useUiStore.getState().toggleDebugPanel()}
         />
       )}
 
       <DebugCardContextMenu />
+      <DebugLibraryViewer />
 
       {/* Animation overlay (above board, below modals) */}
       <AnimationOverlay containerRef={containerRef} />
+      {/* Multi-card top-of-library reveal (CR 701.20b), e.g. Lead the Stampede */}
+      <RevealOverlay />
       <TurnBanner />
       <DiceRollOverlay />
 
@@ -1358,12 +1426,9 @@ function GamePageContent({
           to attackers that carry a minimum-blocker requirement. */}
       <BlockRequirementBadges />
 
-      {/* Card preview overlay */}
-      <CardPreview
-        cardName={previewSuppressed ? null : inspectedCardName}
-        backFaceName={previewSuppressed ? null : inspectedOtherFaceName}
-        dockSide={cardPreviewMode === "side"}
-      />
+      {/* Card preview overlay. Owns its own inspect-state subscriptions so a
+          hover doesn't re-render GamePageContent (and the whole battlefield). */}
+      <GameCardPreview />
 
       {/* WaitingFor-driven prompt overlays (only for human player).
           Wrapped in DialogHost so any active dialog can be peeked away to
@@ -1380,11 +1445,14 @@ function GamePageContent({
           canActForWaitingState && <ChooseXValueUI />}
         {waitingFor?.type === "PayAmountChoice" &&
           canActForWaitingState && <PayAmountChoiceUI />}
+        {waitingFor?.type === "AssistPayment" &&
+          canActForWaitingState && <AssistPaymentUI />}
         {waitingFor?.type === "ReplacementChoice" &&
           canActForWaitingState && <ReplacementModal />}
         {waitingFor?.type === "OrderTriggers" &&
           canActForWaitingState && <TriggerOrderModal />}
         <BattleProtectorModal />
+        <AssistChoosePlayerModal />
         <ClashOpponentModal />
         <TributeModal />
         <CombatTaxModal />
@@ -1395,8 +1463,14 @@ function GamePageContent({
         <ChooseOneOfBranchModal />
         <AdventureCastModal />
         <CascadeChoiceModal />
+        <SpellbookDraftModal />
+        <FreeCastWindowModal />
         <ModalFaceModal />
         <MiracleRevealModal />
+        {waitingFor?.type === "SpliceOffer" &&
+          canActForWaitingState && (
+            <SpliceOfferModal />
+          )}
 
         {/* Scry/Dig/Surveil card choice modal */}
         <CardChoiceModal />
@@ -1434,6 +1508,18 @@ function GamePageContent({
             <TopOrBottomModal />
           )}
 
+        {/* CR 702.140c + CR 730.2a: mutate spell controller chooses top/bottom */}
+        {waitingFor?.type === "MutateMergeChoice" &&
+          canActForWaitingState && (
+            <MutateMergeModal />
+          )}
+
+        {/* CR 702.99a: cipher spell controller chooses a creature to encode on */}
+        {waitingFor?.type === "CipherEncodeChoice" &&
+          canActForWaitingState && (
+            <CipherEncodeModal />
+          )}
+
         {waitingFor?.type === "UntapChoice" &&
           canActForWaitingState && (
             <UntapChoiceModal />
@@ -1443,6 +1529,12 @@ function GamePageContent({
         {waitingFor?.type === "ExertChoice" &&
           canActForWaitingState && (
             <ExertChoiceModal />
+          )}
+
+        {/* CR 702.154a: Optional Enlist tap choice during declare attackers. */}
+        {waitingFor?.type === "EnlistChoice" &&
+          canActForWaitingState && (
+            <EnlistChoiceModal />
           )}
 
         {/* Unless payment choice ("Counter unless you pay {X}") */}
@@ -1461,6 +1553,16 @@ function GamePageContent({
             <ActivationCostOneOfChoiceModal />
           )}
       </DialogHost>
+
+      {/* Graveyard/exile viewer mounts after DialogHost so its z-[60] shell
+          paints above prompt overlays (issue #2387: retrace / graveyard cast). */}
+      {viewingZone && (
+        <ZoneViewer
+          zone={viewingZone.zone}
+          playerId={viewingZone.playerId}
+          onClose={handleZoneViewerClose}
+        />
+      )}
 
       {waitingFor?.type === "CompanionReveal" &&
         waitingFor.data.player === playerId && (
@@ -1568,10 +1670,12 @@ function GamePageContent({
             onConfirm={handleConcede}
             onCancel={onHideConcedeDialog}
           />
-          <EmoteOverlay
-            onSendEmote={handleSendEmote}
-            receivedEmote={receivedEmote}
-          />
+          {!isSpectatorMode && (
+            <EmoteOverlay
+              onSendEmote={handleSendEmote}
+              receivedEmote={receivedEmote}
+            />
+          )}
           {/* Per-player timer display */}
           {Object.entries(timerRemaining).map(([pid, secs]) =>
             secs > 0 ? (
@@ -1643,38 +1747,66 @@ function MulliganPanel({
   children,
   footer,
 }: MulliganPanelProps) {
+  // Reuse the DialogHost peek affordance so the player can slide the (large)
+  // mulligan modal out of the way to see the table — identical collapse
+  // muscle-memory to engine dialogs, via the shared slide math + tab components.
+  const { peeked, togglePeek, setPeeked, isNarrow, slideTransform } = useModalPeek();
+
   return (
-    <div className="fixed inset-0 z-50 overflow-y-auto px-2 py-2 lg:px-4 lg:py-6">
-      <div className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(31,41,55,0.55),rgba(2,6,23,0.92)_58%,rgba(2,6,23,0.98))]" />
+    <>
+    <div
+      className="fixed inset-0 z-50 overflow-x-hidden overflow-y-auto px-2 py-2 lg:px-4 lg:py-6"
+      style={{ pointerEvents: peeked ? "none" : undefined }}
+    >
+      <motion.div
+        className="absolute inset-0 bg-[radial-gradient(circle_at_top,rgba(31,41,55,0.55),rgba(2,6,23,0.92)_58%,rgba(2,6,23,0.98))]"
+        animate={{ opacity: peeked ? 0 : 1 }}
+        transition={{ duration: 0.24, ease: "easeOut" }}
+      />
       <div className="relative flex min-h-full items-center justify-center pb-[env(safe-area-inset-bottom)] pt-[env(safe-area-inset-top)]">
         <motion.div
-          className="card-scale-reset relative z-10 flex w-full max-w-6xl flex-col overflow-hidden rounded-[14px] lg:rounded-[28px] border border-white/10 bg-[#0b1020]/94 shadow-[0_32px_90px_rgba(0,0,0,0.48)] backdrop-blur-md"
+          className="card-scale-reset pointer-events-auto relative z-10 w-full max-w-6xl"
           initial={{ opacity: 0, y: 18, scale: 0.98 }}
-          animate={{ opacity: 1, y: 0, scale: 1 }}
+          animate={{ opacity: 1, scale: 1, ...slideTransform }}
           transition={{ duration: 0.24, ease: "easeOut" }}
         >
-          <div className="modal-header-compact border-b border-white/10">
-            <div className="modal-eyebrow uppercase tracking-[0.24em] text-slate-500">
-              {eyebrow}
+          <div className="flex w-full flex-col overflow-hidden rounded-[14px] lg:rounded-[28px] border border-white/10 bg-[#0b1020]/94 shadow-[0_32px_90px_rgba(0,0,0,0.48)] backdrop-blur-md">
+            <div className="modal-header-compact border-b border-white/10">
+              <div className="modal-eyebrow uppercase tracking-[0.24em] text-slate-500">
+                {eyebrow}
+              </div>
+              <h2 className="font-semibold text-white">
+                {title}
+              </h2>
+              <p className="modal-subtitle max-w-2xl text-slate-400">
+                {subtitle}
+              </p>
             </div>
-            <h2 className="font-semibold text-white">
-              {title}
-            </h2>
-            <p className="modal-subtitle max-w-2xl text-slate-400">
-              {subtitle}
-            </p>
+
+            <div className="flex flex-1 flex-col px-2 py-2 lg:px-5 lg:py-5">{children}</div>
+
+            {footer && (
+              <div className="border-t border-white/10 bg-black/15 px-3 py-2 lg:px-6 lg:py-4">
+                {footer}
+              </div>
+            )}
           </div>
-
-          <div className="flex flex-1 flex-col px-2 py-2 lg:px-5 lg:py-5">{children}</div>
-
-          {footer && (
-            <div className="border-t border-white/10 bg-black/15 px-3 py-2 lg:px-6 lg:py-4">
-              {footer}
-            </div>
-          )}
+          <PeekTab
+            direction={isNarrow ? "bottom" : "right"}
+            onClick={togglePeek}
+          />
         </motion.div>
       </div>
     </div>
+    {/* Sibling of the (pointer-events:none while peeked) overlay so the restore
+        tab itself stays clickable and board taps pass through behind it. */}
+    {peeked && (
+      <PeekRestoreTab
+        direction={isNarrow ? "bottom" : "right"}
+        onClick={() => setPeeked(false)}
+      />
+    )}
+    </>
   );
 }
 
@@ -1821,8 +1953,8 @@ function MulliganDecisionPrompt({
         className="modal-card-area flex min-h-0 flex-1 items-center justify-center"
         style={
           {
-            "--card-w": "clamp(100px, 14vw, 180px)",
-            "--card-h": "clamp(140px, 19.6vw, 252px)",
+            "--card-w": "clamp(140px, 18vw, 257px)",
+            "--card-h": "clamp(196px, 25.2vw, 360px)",
           } as React.CSSProperties
         }
       >
@@ -1851,7 +1983,7 @@ function MulliganDecisionPrompt({
                 <CardImage
                   cardName={obj.name}
                   size="normal"
-                  className="h-[clamp(160px,28vh,252px)] w-[clamp(114px,20vh,180px)]"
+                  className="h-[clamp(200px,40vh,360px)] w-[clamp(143px,28.6vh,257px)]"
                 />
               </motion.div>
             ))}
@@ -1914,8 +2046,8 @@ function CompanionRevealPrompt({
         className="modal-card-area flex min-h-0 flex-1 items-center justify-center"
         style={
           {
-            "--card-w": "clamp(100px, 14vw, 180px)",
-            "--card-h": "clamp(140px, 19.6vw, 252px)",
+            "--card-w": "clamp(140px, 18vw, 257px)",
+            "--card-h": "clamp(196px, 25.2vw, 360px)",
           } as React.CSSProperties
         }
       >
@@ -1944,7 +2076,7 @@ function CompanionRevealPrompt({
                 <CardImage
                   cardName={name}
                   size="normal"
-                  className="h-[clamp(160px,28vh,252px)] w-[clamp(114px,20vh,180px)]"
+                  className="h-[clamp(200px,40vh,360px)] w-[clamp(143px,28.6vh,257px)]"
                 />
               </motion.div>
             ))}
@@ -2033,8 +2165,8 @@ function MulliganBottomCardsPrompt({
         className="modal-card-area flex min-h-0 flex-1 items-center justify-center"
         style={
           {
-            "--card-w": "clamp(100px, 14vw, 180px)",
-            "--card-h": "clamp(140px, 19.6vw, 252px)",
+            "--card-w": "clamp(140px, 18vw, 257px)",
+            "--card-h": "clamp(196px, 25.2vw, 360px)",
           } as React.CSSProperties
         }
       >
@@ -2067,7 +2199,7 @@ function MulliganBottomCardsPrompt({
                   <CardImage
                     cardName={obj.name}
                     size="normal"
-                    className="h-[clamp(160px,28vh,252px)] w-[clamp(114px,20vh,180px)]"
+                    className="h-[clamp(200px,40vh,360px)] w-[clamp(143px,28.6vh,257px)]"
                   />
                 </motion.button>
               );
@@ -2434,6 +2566,38 @@ function AbilityChoiceModal() {
   );
 }
 
+function SpellbookDraftModal() {
+  const { t } = useTranslation("game");
+  const canActForWaitingState = useCanActForWaitingState();
+  const dispatch = useGameDispatch();
+  const waitingFor = useGameStore((s) => s.gameState?.waiting_for);
+  const source = useGameStore((s) =>
+    waitingFor?.type === "SpellbookDraft"
+      ? s.gameState?.objects[waitingFor.data.source_id]
+      : undefined,
+  );
+
+  if (waitingFor?.type !== "SpellbookDraft") return null;
+  if (!canActForWaitingState) return null;
+
+  return (
+    <ChoiceModal
+      title={t("cardChoice.dig.title")}
+      subtitle={source?.name}
+      previewCardName={source?.name}
+      previewCardTypes={source?.card_types}
+      previewObjectId={waitingFor.data.source_id}
+      options={waitingFor.data.options.map((name) => ({
+        id: name,
+        label: name,
+      }))}
+      onChoose={(card) =>
+        dispatch({ type: "SubmitSpellbookDraft", data: { card } })
+      }
+    />
+  );
+}
+
 // ── Optional Cost Choice Modal ──────────────────────────────────────────
 
 function OptionalCostModal() {
@@ -2494,6 +2658,28 @@ function TopOrBottomModal() {
   if (waitingFor?.type !== "TopOrBottomChoice" && waitingFor?.type !== "ClashCardPlacement") return null;
 
   return <TopOrBottomChoiceModalContent waitingFor={waitingFor} objects={objects} dispatch={dispatch} />;
+}
+
+// ── Mutate Merge Choice Modal (CR 702.140c + CR 730.2a) ────────────────
+
+function MutateMergeModal() {
+  const dispatch = useGameDispatch();
+  const waitingFor = useGameStore((s) => s.gameState?.waiting_for);
+  const objects = useGameStore((s) => s.gameState?.objects);
+
+  if (waitingFor?.type !== "MutateMergeChoice") return null;
+
+  return <MutateMergeChoiceModalContent waitingFor={waitingFor} objects={objects} dispatch={dispatch} />;
+}
+
+function CipherEncodeModal() {
+  const dispatch = useGameDispatch();
+  const waitingFor = useGameStore((s) => s.gameState?.waiting_for);
+  const objects = useGameStore((s) => s.gameState?.objects);
+
+  if (waitingFor?.type !== "CipherEncodeChoice") return null;
+
+  return <CipherEncodeChoiceModalContent waitingFor={waitingFor} objects={objects} dispatch={dispatch} />;
 }
 
 // ── Untap Choice Modal ─────────────────────────────────────────────────
@@ -2577,6 +2763,55 @@ function ExertChoiceModal() {
         dispatch({
           type: "ChooseExert",
           data: { exert: id === "exert" },
+        })
+      }
+    />
+  );
+}
+
+// ── Enlist Choice Modal (CR 702.154a: enlist as it attacks) ─────────────
+
+function EnlistChoiceModal() {
+  const { t } = useTranslation("game");
+  const dispatch = useGameDispatch();
+  const waitingFor = useGameStore((s) => s.gameState?.waiting_for);
+  const objects = useGameStore((s) => s.gameState?.objects);
+
+  if (waitingFor?.type !== "EnlistChoice") return null;
+
+  const attackerId = waitingFor.data.attacker;
+  const attacker = objects?.[attackerId];
+  const attackerName = attacker?.name ?? t("gamePage.enlist.attackerFallback");
+  const creatureFallback = t("gamePage.enlist.creatureFallback");
+  const options = [
+    ...waitingFor.data.eligible.map((id) => {
+      const enlisted = objects?.[id];
+      const name = enlisted?.name ?? creatureFallback;
+      return {
+        id: String(id),
+        label: name,
+        description: t("gamePage.enlist.tapDescription", { name, attacker: attackerName }),
+      };
+    }),
+    {
+      id: "decline",
+      label: t("gamePage.enlist.decline"),
+      description: t("gamePage.enlist.declineDescription", { attacker: attackerName }),
+    },
+  ];
+
+  return (
+    <ChoiceModal
+      title={t("gamePage.enlist.title", { name: attackerName })}
+      subtitle={t("gamePage.enlist.subtitle")}
+      previewCardName={attacker?.name}
+      previewCardTypes={attacker?.card_types}
+      previewObjectId={attackerId}
+      options={options}
+      onChoose={(id) =>
+        dispatch({
+          type: "ChooseEnlist",
+          data: { target: id === "decline" ? null : Number(id) },
         })
       }
     />

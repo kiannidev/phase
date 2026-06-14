@@ -250,8 +250,8 @@ function DebugCardContextMenuInner({
         <div className="border-b border-gray-800 py-0.5">
           {isCreature && (
             <>
-              <CounterRow label="+1/+1" objectId={objectId} counterType="p1p1" current={obj.counters?.p1p1 ?? 0} onDispatch={dispatchDebugKeepOpen} />
-              <CounterRow label="-1/-1" objectId={objectId} counterType="m1m1" current={obj.counters?.m1m1 ?? 0} onDispatch={dispatchDebugKeepOpen} />
+              <CounterRow label="+1/+1" objectId={objectId} counterType="P1P1" current={obj.counters?.P1P1 ?? 0} onDispatch={dispatchDebugKeepOpen} />
+              <CounterRow label="-1/-1" objectId={objectId} counterType="M1M1" current={obj.counters?.M1M1 ?? 0} onDispatch={dispatchDebugKeepOpen} />
             </>
           )}
           {isPlaneswalker && (
@@ -271,6 +271,18 @@ function DebugCardContextMenuInner({
             objectId={objectId}
             currentKeywords={currentKeywords}
             onDispatch={dispatchDebugKeepOpen}
+          />
+        </div>
+      )}
+
+      {/* Sacrifice — routes through the engine's CR 701.21 sacrifice pipeline so
+          dies / leaves-the-battlefield triggers fire, unlike "Remove" which
+          deletes the object outright. Offered for any battlefield permanent. */}
+      {onBattlefield && (
+        <div className="border-b border-gray-800 py-0.5">
+          <MenuItem
+            label="Sacrifice"
+            onClick={() => dispatchDebug({ type: "Sacrifice", data: { object_id: objectId } })}
           />
         </div>
       )}

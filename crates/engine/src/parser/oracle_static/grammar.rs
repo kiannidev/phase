@@ -1,9 +1,11 @@
 // CR 604 / CR 613 - shared static parser grammar utilities.
 
+use super::oracle_trigger::NthEventTimingKind;
 #[allow(unused_imports)]
 use super::prelude::*;
 #[allow(unused_imports)]
 use super::support::*;
+use crate::types::ability::PlayerFilter;
 
 /// Lower a parsed rule-static predicate into the runtime static mode.
 pub(crate) fn lower_rule_static(
@@ -26,6 +28,18 @@ pub(crate) fn lower_rule_static(
                 .affected(affected)
                 .description(description.to_string())
         }
+        RuleStaticPredicate::CantCrew => StaticDefinition::new(StaticMode::CantCrew)
+            .affected(affected)
+            .description(description.to_string()),
+        RuleStaticPredicate::CantBeActivated => {
+            StaticDefinition::new(StaticMode::CantBeActivated {
+                who: ProhibitionScope::AllPlayers,
+                source_filter: TargetFilter::SelfRef,
+                exemption: ActivationExemption::None,
+            })
+            .affected(affected)
+            .description(description.to_string())
+        }
         RuleStaticPredicate::CantBeSacrificed => {
             StaticDefinition::new(StaticMode::Other("CantBeSacrificed".to_string()))
                 .affected(affected)
@@ -44,9 +58,11 @@ pub(crate) fn lower_rule_static(
             .affected(affected)
             .description(description.to_string()),
         RuleStaticPredicate::BlockOnlyCreaturesWithFlying => {
-            StaticDefinition::new(StaticMode::BlockRestriction)
-                .affected(affected)
-                .description(description.to_string())
+            StaticDefinition::new(StaticMode::BlockRestriction {
+                filter: crate::types::statics::block_only_creatures_with_flying_filter(),
+            })
+            .affected(affected)
+            .description(description.to_string())
         }
         RuleStaticPredicate::Shroud if rule_static_affected_is_player_scope(&affected) => {
             StaticDefinition::new(StaticMode::Shroud)
@@ -176,6 +192,38 @@ pub(crate) fn parse_zone_names_from_tp(tp: &TextPair) -> Vec<Zone> {
     zones
 }
 
+/// CR 601.3 + CR 601.2a: Parse a "from anywhere other than <zone>" casting
+/// restriction into the explicit list of *prohibited* zones.
+///
+/// "Anywhere other than [hand]" is the inverse of `parse_zone_names_from_tp`'s
+/// "from [zone-list]" form: it names the single zone a spell *may* be cast from,
+/// so the prohibited set is "every cast-capable zone except that one". The only
+/// zones a spell can be cast from are Hand, Graveyard, Library, Exile, and
+/// Command (Stack/Battlefield are never cast-from zones — CR 601.2a moves a card
+/// "from where it is to the stack"), so the complement of `allowed` over that set
+/// is the prohibited list. Drannith Magistrate ("anywhere other than their
+/// hands") and the static half of the Avatar's Wrath class collapse here.
+///
+/// Returns `None` when the restriction is not of the "anywhere other than" form,
+/// so the caller falls back to the explicit zone-list parser.
+pub(crate) fn parse_cast_from_anywhere_other_than_tp(tp: &TextPair) -> Option<Vec<Zone>> {
+    if !nom_primitives::scan_contains(tp.lower, "from anywhere other than") {
+        return None;
+    }
+    // Currently only the "their hand(s)" allowed-zone phrasing is printed. The
+    // allowed zone is the hand; the prohibited set is its complement.
+    let allowed = if nom_primitives::scan_contains(tp.lower, "their hand")
+        || nom_primitives::scan_contains(tp.lower, "your hand")
+    {
+        Zone::Hand
+    } else {
+        return None;
+    };
+    Some(crate::parser::oracle_target::cast_capable_zones_except(
+        allowed,
+    ))
+}
+
 /// Parse a color name from Oracle text, delegating to the shared nom color combinator.
 ///
 /// Accepts leading/trailing whitespace and requires complete consumption (no trailing text
@@ -191,17 +239,13 @@ pub(crate) fn parse_named_color(text: &str) -> Option<ManaColor> {
 }
 
 /// CR 614.1b: Parse a step name from Oracle text using nom combinators.
-pub(crate) fn parse_step_name(input: &str) -> Option<Phase> {
-    use crate::parser::oracle_nom::error::OracleError;
-    let result: Result<(&str, Phase), nom::Err<OracleError<'_>>> = alt((
+pub(crate) fn parse_step_name_nom(input: &str) -> OracleResult<'_, Phase> {
+    alt((
         value(Phase::Draw, tag("draw step")),
         value(Phase::Untap, tag("untap step")),
         value(Phase::Upkeep, tag("upkeep step")),
     ))
-    .parse(input);
-    result
-        .ok()
-        .and_then(|(rest, phase)| rest.is_empty().then_some(phase))
+    .parse(input)
 }
 
 /// CR 205.2a: Check if a lowercase descriptor names a core card type that can modify
@@ -533,20 +577,24 @@ pub(crate) fn parse_enchanted_equipped_predicate(
     }
 
     // CR 509.1b: "can't be blocked" on enchanted/equipped creature
-    let (body_tp, suffix_condition) =
-        if let Some((body_tp, condition_tp)) = pred_tp.split_around(" as long as ") {
-            let condition_text = condition_tp.original.trim().trim_end_matches('.');
-            (
-                body_tp,
-                Some(parse_attached_static_condition(condition_text).unwrap_or(
-                    StaticCondition::Unrecognized {
-                        text: condition_text.to_string(),
-                    },
-                )),
-            )
-        } else {
-            (pred_tp, None)
-        };
+    let (body_tp, suffix_condition) = if let Some((body_tp, _)) = pred_tp.split_around(" unless ") {
+        (
+            body_tp,
+            super::shared::parse_unless_static_condition(&pred_tp),
+        )
+    } else if let Some((body_tp, condition_tp)) = pred_tp.split_around(" as long as ") {
+        let condition_text = condition_tp.original.trim().trim_end_matches('.');
+        (
+            body_tp,
+            Some(parse_attached_static_condition(condition_text).unwrap_or(
+                StaticCondition::Unrecognized {
+                    text: condition_text.to_string(),
+                },
+            )),
+        )
+    } else {
+        (pred_tp, None)
+    };
     let body_lower = body_tp.lower;
 
     if nom_tag_lower(body_lower, body_lower, "can't be blocked").is_some() {
@@ -803,6 +851,13 @@ pub(crate) fn parse_type_retention_clause(input: &str) -> OracleResult<'_, CoreT
     let (input, is_plural) = alt((
         value(false, alt((tag("it's still "), tag("that's still ")))),
         value(true, tag("they're still ")),
+        // CR 205.1b: relative-clause retention attached to a plural/singular
+        // subject — "[plural] that are still lands", "[singular] that is still
+        // a land". Distinct from the standalone-sentence forms above so the
+        // animation building block can keep land/artifact types when the
+        // retention rides on the same clause rather than a new sentence.
+        value(true, tag("that are still ")),
+        value(false, tag("that is still ")),
     ))
     .parse(input)?;
 
@@ -1023,8 +1078,18 @@ pub(crate) fn parse_quoted_ability(text: &str) -> AbilityDefinition {
         let cost_text = text[..colon_pos].trim();
         let effect_text = text[colon_pos + 1..].trim();
         let cost = parse_oracle_cost(cost_text);
-        let mut def = parse_effect_chain(effect_text, AbilityKind::Activated);
+        // CR 602.5c: When an object acquires an activated ability with a
+        // use restriction (e.g. "Activate only as a sorcery", "Activate only
+        // once each turn") from another object, that restriction applies to
+        // the acquired ability. The restriction lives inside the granted
+        // quoted text, so strip it with the single authority used by
+        // standalone activated abilities (CR 602.5d/602.5e timing rules)
+        // instead of leaving it as an unparsed trailing sentence.
+        let (effect_text, constraints) =
+            crate::parser::oracle::strip_activated_constraints(effect_text);
+        let mut def = parse_effect_chain(&effect_text, AbilityKind::Activated);
         def.cost = Some(cost);
+        def.activation_restrictions.extend(constraints.restrictions);
         def.description = Some(text.to_string());
         def
     } else {
@@ -1391,37 +1456,239 @@ pub(crate) fn inject_keyword_kind_filter_prop(
     }
 }
 
-pub(crate) fn parse_first_qualified_spell_filter(lower: &str) -> Option<TargetFilter> {
-    let after_prefix = nom_tag_lower(lower, lower, "the first ")?;
-    let qualifier = after_prefix
-        .split_once(" you cast during each of your turns cost") // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-        .or_else(|| after_prefix.split_once(" you cast during each of your turns costs"))? // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-        .0
-        .trim();
-
-    let (filter, remainder) = parse_type_phrase(qualifier);
-    if remainder.trim().is_empty() && !matches!(filter, TargetFilter::Any) {
-        Some(filter)
-    } else {
-        None
-    }
+/// CR 601.2f: Classification of a cost-modifier subject against the
+/// "the first <qualifier> spell <timing> costs …" template.
+///
+/// Three outcomes, kept as a typed enum rather than an `Option` so the caller
+/// can tell "not a first-spell line" apart from "a first-spell line whose
+/// qualifier we can't yet represent." The latter MUST decline the whole cost
+/// static — emitting a filterless, gateless reducer would silently drop both
+/// the printed "first … each turn" once-per-turn restriction and the qualifier
+/// (e.g. "kicked"), reducing every spell the controller casts.
+pub(crate) enum FirstQualifiedSpell {
+    /// The subject is not a "the first … spell <timing> costs …" line; the
+    /// caller proceeds with its ordinary cost-modifier parsing.
+    NotApplicable,
+    /// A representable first-spell subject: the qualifying spell filter and the
+    /// timing window over which "first" is measured.
+    Supported(TargetFilter, NthEventTimingKind),
+    /// The "the first … spell <timing>" shape is present, but the qualifier or
+    /// timing window can't be lowered to a spell filter + once-per-turn gate
+    /// (e.g. "the first kicked spell you cast each turn" — kicker-paid state is
+    /// not a representable spell-cost filter, or an opponent-/their-turn window
+    /// with no static condition). The caller must decline the cost static.
+    UnsupportedQualifier,
 }
 
-pub(crate) fn first_qualified_spell_condition(filter: &TargetFilter) -> StaticCondition {
-    StaticCondition::And {
-        conditions: vec![
-            StaticCondition::DuringYourTurn,
-            StaticCondition::QuantityComparison {
-                lhs: QuantityExpr::Ref {
-                    qty: QuantityRef::SpellsCastThisTurn {
-                        scope: CountScope::Controller,
-                        filter: Some(filter.clone()),
-                    },
-                },
-                comparator: Comparator::EQ,
-                rhs: QuantityExpr::Fixed { value: 0 },
+/// CR 601.2f + CR 107.3: Parse a "first qualified spell <timing> costs less"
+/// cost-reduction subject into the spell filter that qualifies the spell and the
+/// timing window over which "first" is measured.
+///
+/// Builds for the class, not the card. The subject decomposes into three
+/// independent axes, each parsed by a shared building block:
+///   1. Pre-spell type qualifier ("non-Lemur creature spell with flying") — via
+///      `parse_type_phrase`, which preserves keyword qualifiers.
+///   2. Post-spell modifier ("with {X} in its mana cost", CR 107.3 + CR 202.1) —
+///      via `oracle_trigger::parse_post_spell_modifier`, the same combinator the
+///      paired "whenever you cast your first spell with {X}…" trigger uses.
+///   3. Timing phrase ("each turn" vs "during each of your turns") — via
+///      `split_first_spell_timing`, which distinguishes the unrestricted
+///      ("each turn", any player's turn) from the controller-turn restricted
+///      form (reusing `NthEventTimingKind` from the paired trigger).
+///
+/// Examples this covers (previously only the "during each of your turns" form
+/// parsed; the "each turn" + "with {X}" form silently dropped its filter and
+/// once-per-turn gate):
+///   - Zimone, Infinite Analyst: "The first spell you cast with {X} in its mana
+///     cost each turn costs {1} less to cast for each +1/+1 counter on ~."
+///   - "The first non-Lemur creature spell with flying you cast during each of
+///     your turns costs {1} less to cast."
+///
+/// Returns [`FirstQualifiedSpell::UnsupportedQualifier`] when the
+/// "the first … spell <timing>" shape is present but the qualifier/timing can't
+/// be represented (e.g. "the first kicked spell you cast each turn"), so the
+/// caller declines the static instead of emitting a broad reducer.
+pub(crate) fn parse_first_qualified_spell_filter(lower: &str) -> FirstQualifiedSpell {
+    let Some(after_prefix) = nom_tag_lower(lower, lower, "the first ") else {
+        return FirstQualifiedSpell::NotApplicable;
+    };
+
+    // Split the subject at the cast infix that separates the pre-spell
+    // qualifier ("<type> spell") from the post-spell modifier + timing region
+    // ("with {X} in its mana cost each turn cost[s] ..."). CR templating always
+    // places the caster phrase between the spell noun and any post-spell modifier.
+    let Some((pre, post)) = split_first_spell_cast_region(after_prefix) else {
+        return FirstQualifiedSpell::NotApplicable;
+    };
+
+    // Scan the post-caster region for the timing phrase. Everything before
+    // it is a leading post-spell modifier ("with {X} in its mana cost"); the
+    // cost-modification verb ("costs {1} less …") follows the timing phrase and
+    // is discarded. The timing phrase — not a " cost" literal — is the anchor,
+    // because " cost" also occurs inside "in its mana cost". A missing timing
+    // phrase means this is some other "the first … you cast" construction, not
+    // the per-turn first-spell cost template.
+    let Some((timing, post_modifier_text)) = split_first_spell_timing(post.trim()) else {
+        return FirstQualifiedSpell::NotApplicable;
+    };
+
+    // From here the "the first … spell <timing> costs …" shape is confirmed, so
+    // any failure to represent the qualifier/timing is an UnsupportedQualifier
+    // (decline the whole static), never a silent fall-through to a broad reducer.
+
+    // Only the unrestricted ("each turn") and controller-turn ("during each of
+    // your turns") windows have a representable `StaticCondition` for a cost
+    // static. Opponent-/their-turn windows are not printed on cost reducers and
+    // have no static condition — decline rather than emit a reduction that drops
+    // the printed timing restriction.
+    if !matches!(
+        timing,
+        NthEventTimingKind::Unrestricted | NthEventTimingKind::Restricted(PlayerFilter::Controller)
+    ) {
+        return FirstQualifiedSpell::UnsupportedQualifier;
+    }
+
+    // Pre-spell type/keyword qualifier (strip a bare trailing "spell" noun so a
+    // post-modifier-only subject collapses to no type filter).
+    let pre_trimmed = pre.trim();
+    let pre_type = if all_consuming(tag::<_, _, OracleError<'_>>("spell"))
+        .parse(pre_trimmed)
+        .is_ok()
+    {
+        ""
+    } else if let Ok((_, stripped)) = all_consuming(terminated(
+        take_until::<_, _, OracleError<'_>>(" spell"),
+        tag(" spell"),
+    ))
+    .parse(pre_trimmed)
+    {
+        stripped
+    } else {
+        pre_trimmed
+    }
+    .trim();
+    let type_filter = if pre_type.is_empty() {
+        None
+    } else {
+        let (filter, remainder) = parse_type_phrase(pre_type);
+        if remainder.trim().is_empty() && !matches!(filter, TargetFilter::Any) {
+            Some(filter)
+        } else {
+            // Unrecognized pre-spell qualifier (e.g. "kicked") — decline rather
+            // than emit a cost reduction that ignores the printed restriction.
+            return FirstQualifiedSpell::UnsupportedQualifier;
+        }
+    };
+
+    // Post-spell modifier ("with {X} in its mana cost", etc.). Empty is allowed
+    // (bare "spell"), but non-empty text that the modifier combinator rejects
+    // means an unsupported qualifier — decline.
+    let post_filter = if post_modifier_text.is_empty() {
+        None
+    } else {
+        match super::oracle_trigger::parse_post_spell_modifier(post_modifier_text) {
+            Some(filter) => Some(filter),
+            None => return FirstQualifiedSpell::UnsupportedQualifier,
+        }
+    };
+
+    let filter = match (type_filter, post_filter) {
+        (None, None) => TargetFilter::Typed(TypedFilter::card()),
+        (Some(f), None) | (None, Some(f)) => f,
+        (Some(a), Some(b)) => TargetFilter::And {
+            filters: vec![a, b],
+        },
+    };
+    FirstQualifiedSpell::Supported(filter, timing)
+}
+
+fn split_first_spell_cast_region(subject: &str) -> Option<(&str, &str)> {
+    [
+        " you cast ",
+        " your opponents cast ",
+        " opponents cast ",
+        " each opponent casts ",
+    ]
+    .into_iter()
+    .find_map(|phrase| {
+        nom_primitives::split_once_on(subject, phrase)
+            .ok()
+            .map(|(_, split)| split)
+    })
+}
+
+/// CR 601.2 + CR 102.1: Match the timing phrase of a first-qualified-spell
+/// subject at the current position, returning the timing kind. Unlike
+/// `oracle_trigger::parse_timing_tail`, this is NOT `all_consuming` — the
+/// cost-modification verb ("costs {1} less …") follows the timing phrase mid-
+/// string. Longest alternatives are ordered first so "during each of your turns"
+/// wins over "during your turn", and the controller forms over "each turn".
+fn parse_first_spell_timing_phrase(i: &str) -> OracleResult<'_, NthEventTimingKind> {
+    alt((
+        value(
+            NthEventTimingKind::Restricted(PlayerFilter::Controller),
+            alt((tag("during each of your turns"), tag("during your turn"))),
+        ),
+        value(
+            NthEventTimingKind::Restricted(PlayerFilter::Opponent),
+            alt((
+                tag("during each opponent's turn"),
+                tag("during each opponent\u{2019}s turn"),
+            )),
+        ),
+        value(
+            NthEventTimingKind::Restricted(PlayerFilter::TriggeringPlayer),
+            alt((tag("during their turn"), tag("during each of their turns"))),
+        ),
+        value(NthEventTimingKind::Unrestricted, tag("each turn")),
+        value(NthEventTimingKind::Unrestricted, tag("in a turn")),
+    ))
+    .parse(i)
+}
+
+/// Isolate the timing phrase of a first-qualified-spell subject from any leading
+/// post-spell modifier. Word-boundary scans for the position where
+/// `parse_first_spell_timing_phrase` matches; text before that is the post-spell
+/// modifier. Returns `None` when no recognized timing phrase is present.
+fn split_first_spell_timing(text: &str) -> Option<(NthEventTimingKind, &str)> {
+    let (before, timing, _) = nom_primitives::scan_preceded(text, parse_first_spell_timing_phrase)?;
+    Some((timing, before.trim_end()))
+}
+
+/// CR 601.2f + CR 107.3: Build the "first qualified spell <timing>" gate.
+/// The reduction applies only while no matching spell has yet been cast this
+/// turn (`SpellsCastThisTurn(filter) == 0`). The timing axis adds a turn-owner
+/// restriction only for the "during each of your turns" form; "each turn" allows
+/// the first qualifying spell on any player's turn.
+pub(crate) fn first_qualified_spell_condition(
+    filter: &TargetFilter,
+    timing: &NthEventTimingKind,
+) -> StaticCondition {
+    let first_this_turn = StaticCondition::QuantityComparison {
+        lhs: QuantityExpr::Ref {
+            qty: QuantityRef::SpellsCastThisTurn {
+                scope: CountScope::Controller,
+                filter: Some(filter.clone()),
             },
-        ],
+        },
+        comparator: Comparator::EQ,
+        rhs: QuantityExpr::Fixed { value: 0 },
+    };
+
+    match timing {
+        // "each turn" — no turn-ownership restriction (CR 601.2: the first
+        // qualifying spell of the turn regardless of whose turn it is).
+        NthEventTimingKind::Unrestricted => first_this_turn,
+        // "during each of your turns" — additionally gate on the controller's
+        // turn (CR 102.1 active-player reading for a cost static).
+        NthEventTimingKind::Restricted(PlayerFilter::Controller) => StaticCondition::And {
+            conditions: vec![StaticCondition::DuringYourTurn, first_this_turn],
+        },
+        // Other player-scoped turn windows have no representable `StaticCondition`
+        // for a cost static; the caller declines these via the filter parser.
+        NthEventTimingKind::Restricted(_) => {
+            unreachable!("unsupported player-scoped turn window for cost static")
+        }
     }
 }
 
@@ -1430,7 +1697,7 @@ pub(crate) fn first_qualified_spell_condition(filter: &TargetFilter) -> StaticCo
 /// a spell reduces/raises its own cast cost (e.g., Tolarian Terror:
 /// "This spell costs {1} less to cast for each instant and sorcery card in
 /// your graveyard."). Callers use this to flag self-reference so the static
-/// is emitted with `affected = SelfRef` and `active_zones = [Hand, Stack, Command]`
+/// is emitted with `affected = SelfRef` and `active_zones = self_spell_cost_mod_active_zones()`
 /// instead of the default battlefield scope.
 pub(crate) fn parse_self_spell_cost_subject(lower: &str) -> Option<()> {
     nom_on_lower(lower, lower, |i| {
@@ -1480,14 +1747,21 @@ pub(crate) fn parse_cost_modifier_target_filter(lower: &str) -> Option<TargetFil
     let (_, target_text) = take_until::<_, _, VE>(" cost").parse(input).ok()?;
 
     let target_text = target_text.trim();
-    let target_filter = parse_commander_subject_filter(target_text).or_else(|| {
-        let (filter, remainder) = parse_type_phrase(target_text);
-        if remainder.trim().is_empty() && !matches!(filter, TargetFilter::Any) {
-            Some(filter)
-        } else {
-            None
-        }
-    })?;
+    let target_filter = if matches!(
+        target_text,
+        "this creature" | "this permanent" | "this card" | "~" | "itself"
+    ) {
+        Some(TargetFilter::SelfRef)
+    } else {
+        parse_commander_subject_filter(target_text).or_else(|| {
+            let (filter, remainder) = parse_type_phrase(target_text);
+            if remainder.trim().is_empty() && !matches!(filter, TargetFilter::Any) {
+                Some(filter)
+            } else {
+                None
+            }
+        })
+    }?;
 
     Some(TargetFilter::Typed(TypedFilter::card().properties(vec![
         FilterProp::Targets {

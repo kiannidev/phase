@@ -1,9 +1,13 @@
-//! CR 601.2b: Cost-payability pre-gate.
+//! CR 118.3 + CR 601.2h: Cost-payability pre-gate.
 //!
 //! A single predicate over `AbilityCost` that answers "can this cost be paid
-//! right now, given the current game state?" for cost variants where CR 601.2b
-//! applies — specifically, costs that require the player to *choose an object*
-//! and where no legal object exists.
+//! right now, given the current game state?" — CR 118.3 ("A player can't pay a
+//! cost without having the necessary resources to pay it fully") and CR 601.2h
+//! ("Partial payments are not allowed. Unpayable costs can't be paid"). It
+//! covers costs that require the player to *choose an object* where no legal
+//! object exists, and hard resource checks (life, energy, counters). (The prior
+//! attribution to CR 601.2b was wrong: 601.2b is modal/X *announcement*, not
+//! resource payability.)
 //!
 //! This is the authoritative gate consulted before:
 //!   - Offering an `OptionalCostChoice` prompt (if unpayable, the prompt is skipped).
@@ -15,7 +19,10 @@
 //! existing eligibility helpers in sibling modules rather than reimplementing
 //! the enumerations.
 
-use crate::types::ability::{AbilityCost, TargetFilter};
+use crate::types::ability::{
+    is_variable_remove_counter_cost_count, AbilityCost, Comparator, CounterCostSelection,
+    FilterProp, QuantityExpr, QuantityRef, TargetFilter, TypedFilter,
+};
 use crate::types::card_type::CoreType;
 use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
@@ -23,6 +30,148 @@ use crate::types::zones::Zone;
 use crate::types::GameState;
 
 use super::filter::{matches_target_filter, matches_target_filter_in_owner_zone, FilterContext};
+
+fn is_pitch_bound_cmc_eq_x_prop(prop: &FilterProp) -> bool {
+    matches!(
+        prop,
+        FilterProp::Cmc {
+            comparator: Comparator::EQ,
+            value: QuantityExpr::Ref {
+                qty: QuantityRef::Variable { name },
+            },
+        } if name == "X"
+    )
+}
+
+/// True when a cost filter uses the Shoal pattern: "with mana value X" where X
+/// is defined by the card chosen to pay the cost, not by a prior announcement.
+pub(crate) fn target_filter_has_pitch_bound_x(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(tf) => tf.properties.iter().any(is_pitch_bound_cmc_eq_x_prop),
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            filters.iter().any(target_filter_has_pitch_bound_x)
+        }
+        TargetFilter::Not { filter } | TargetFilter::TrackedSetFiltered { filter, .. } => {
+            target_filter_has_pitch_bound_x(filter)
+        }
+        TargetFilter::None
+        | TargetFilter::Any
+        | TargetFilter::Player
+        | TargetFilter::Controller
+        | TargetFilter::SelfRef
+        | TargetFilter::SourceOrPaired
+        | TargetFilter::StackAbility { .. }
+        | TargetFilter::StackSpell
+        | TargetFilter::SpecificObject { .. }
+        | TargetFilter::SpecificPlayer { .. }
+        | TargetFilter::Neighbor { .. }
+        | TargetFilter::ScopedPlayer
+        | TargetFilter::AttachedTo
+        | TargetFilter::LastCreated
+        | TargetFilter::LastRevealed
+        | TargetFilter::CostPaidObject
+        | TargetFilter::TrackedSet { .. }
+        | TargetFilter::ExiledBySource
+        | TargetFilter::TriggeringSpellController
+        | TargetFilter::TriggeringSpellOwner
+        | TargetFilter::TriggeringPlayer
+        | TargetFilter::TriggeringSource
+        | TargetFilter::ParentTarget
+        | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::ParentTargetController
+        | TargetFilter::ParentTargetOwner
+        | TargetFilter::SourceChosenPlayer
+        | TargetFilter::OriginalController
+        | TargetFilter::PostReplacementSourceController
+        | TargetFilter::PostReplacementDamageTarget
+        | TargetFilter::DefendingPlayer
+        | TargetFilter::HasChosenName
+        | TargetFilter::ChosenDamageSource
+        | TargetFilter::Named { .. }
+        | TargetFilter::Owner
+        | TargetFilter::AllPlayers => false,
+    }
+}
+
+pub(crate) fn relax_pitch_bound_x_filter(filter: &TargetFilter) -> TargetFilter {
+    match filter {
+        TargetFilter::Typed(tf) => TargetFilter::Typed(TypedFilter {
+            properties: tf
+                .properties
+                .iter()
+                .filter(|p| !is_pitch_bound_cmc_eq_x_prop(p))
+                .cloned()
+                .collect(),
+            ..tf.clone()
+        }),
+        TargetFilter::Or { filters } => TargetFilter::Or {
+            filters: filters.iter().map(relax_pitch_bound_x_filter).collect(),
+        },
+        TargetFilter::And { filters } => TargetFilter::And {
+            filters: filters.iter().map(relax_pitch_bound_x_filter).collect(),
+        },
+        TargetFilter::Not { filter } => TargetFilter::Not {
+            filter: Box::new(relax_pitch_bound_x_filter(filter)),
+        },
+        TargetFilter::TrackedSetFiltered {
+            id,
+            filter,
+            caused_by,
+        } => TargetFilter::TrackedSetFiltered {
+            id: *id,
+            filter: Box::new(relax_pitch_bound_x_filter(filter)),
+            caused_by: *caused_by,
+        },
+        TargetFilter::None
+        | TargetFilter::Any
+        | TargetFilter::Player
+        | TargetFilter::Controller
+        | TargetFilter::SelfRef
+        | TargetFilter::SourceOrPaired
+        | TargetFilter::StackAbility { .. }
+        | TargetFilter::StackSpell
+        | TargetFilter::SpecificObject { .. }
+        | TargetFilter::SpecificPlayer { .. }
+        | TargetFilter::Neighbor { .. }
+        | TargetFilter::ScopedPlayer
+        | TargetFilter::AttachedTo
+        | TargetFilter::LastCreated
+        | TargetFilter::LastRevealed
+        | TargetFilter::CostPaidObject
+        | TargetFilter::TrackedSet { .. }
+        | TargetFilter::ExiledBySource
+        | TargetFilter::TriggeringSpellController
+        | TargetFilter::TriggeringSpellOwner
+        | TargetFilter::TriggeringPlayer
+        | TargetFilter::TriggeringSource
+        | TargetFilter::ParentTarget
+        | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::ParentTargetController
+        | TargetFilter::ParentTargetOwner
+        | TargetFilter::SourceChosenPlayer
+        | TargetFilter::OriginalController
+        | TargetFilter::PostReplacementSourceController
+        | TargetFilter::PostReplacementDamageTarget
+        | TargetFilter::DefendingPlayer
+        | TargetFilter::HasChosenName
+        | TargetFilter::ChosenDamageSource
+        | TargetFilter::Named { .. }
+        | TargetFilter::Owner
+        | TargetFilter::AllPlayers => filter.clone(),
+    }
+}
+
+/// CR 107.3a + CR 118.9: Until the player chooses the pitched card, relax the
+/// CMC=X constraint for 601.2b eligibility on Shoal-style exile costs.
+pub(crate) fn exile_cost_effective_filter(filter: Option<&TargetFilter>) -> Option<TargetFilter> {
+    filter.map(|f| {
+        if target_filter_has_pitch_bound_x(f) {
+            relax_pitch_bound_x_filter(f)
+        } else {
+            f.clone()
+        }
+    })
+}
 
 impl AbilityCost {
     /// CR 605.3a + CR 602.2b + CR 601.2g-h: Payability gate for ACTIVATED
@@ -67,9 +216,12 @@ impl AbilityCost {
         }
     }
 
-    /// CR 601.2b: Returns true if this cost can be paid given the current game
-    /// state. Returns false only when the cost requires a choice of object and
-    /// no legal object exists, or a hard resource check fails (e.g., life total).
+    /// CR 118.3 + CR 601.2h: Returns true if this cost can be paid given the
+    /// current game state. Returns false only when the cost requires a choice of
+    /// object and no legal object exists, or a hard resource check fails (e.g.,
+    /// life total) — CR 118.3 "necessary resources to pay it fully" / CR 601.2h
+    /// "unpayable costs can't be paid". (CR 601.2b is modal/X announcement, not
+    /// resource payability.)
     ///
     /// Mana affordability is NOT checked here; CR 601.2g handles the mana step
     /// separately through the mana-payment flow.
@@ -98,21 +250,49 @@ impl AbilityCost {
             }
             // CR 601.2b: Sacrifice requires a choice of permanent; self-sacrifice
             // is always payable so long as the source exists on the battlefield.
-            AbilityCost::Sacrifice { target, count } => {
-                if matches!(target, TargetFilter::SelfRef) {
-                    return state
-                        .objects
-                        .get(&source)
-                        .is_some_and(|o| o.zone == Zone::Battlefield)
-                        && !super::static_abilities::player_cant_sacrifice_as_cost(
-                            state, player, source,
-                        );
+            AbilityCost::Sacrifice(cost) => match &cost.requirement {
+                crate::types::ability::SacrificeRequirement::Count { count } => {
+                    if matches!(cost.target, TargetFilter::SelfRef) {
+                        return state
+                            .objects
+                            .get(&source)
+                            .is_some_and(|o| o.zone == Zone::Battlefield)
+                            && !super::static_abilities::player_cant_sacrifice_as_cost(
+                                state, player, source,
+                            );
+                    }
+                    let eligible = super::casting::find_eligible_sacrifice_targets(
+                        state,
+                        player,
+                        source,
+                        &cost.target,
+                    );
+                    let (min_count, _) =
+                        super::casting::sacrifice_cost_bounds(*count, eligible.len());
+                    eligible.len() >= min_count
                 }
-                let eligible =
-                    super::casting::find_eligible_sacrifice_targets(state, player, source, target);
-                let (min_count, _) = super::casting::sacrifice_cost_bounds(*count, eligible.len());
-                eligible.len() >= min_count
-            }
+                crate::types::ability::SacrificeRequirement::Aggregate {
+                    stat,
+                    comparator,
+                    value,
+                } => {
+                    let eligible = super::casting::find_eligible_sacrifice_targets(
+                        state,
+                        player,
+                        source,
+                        &cost.target,
+                    );
+                    let total_positive_power: i32 = match stat {
+                        crate::types::ability::SacrificeAggregateStat::TotalPower => eligible
+                            .iter()
+                            .filter_map(|id| state.objects.get(id))
+                            .map(|obj| obj.power.unwrap_or(0))
+                            .filter(|&p| p > 0)
+                            .sum(),
+                    };
+                    comparator.evaluate(total_positive_power, *value)
+                }
+            },
             // CR 119.4 + CR 119.8 + CR 903.4: Life cost is payable iff life >= amount
             // and "can't lose life" locks do not apply. `amount` is a QuantityExpr
             // so dynamic refs (e.g. commander color identity count) resolve at
@@ -127,13 +307,13 @@ impl AbilityCost {
             AbilityCost::Discard {
                 count,
                 filter,
-                self_ref,
+                self_scope,
                 ..
             } => {
                 let Some(p) = state.players.get(player.0 as usize) else {
                     return false;
                 };
-                if *self_ref {
+                if self_scope.is_source_card() {
                     return p.hand.contains(&source);
                 }
                 let resolved =
@@ -177,9 +357,24 @@ impl AbilityCost {
                     };
                 }
                 let zone = exile_cost_effective_zone(*zone, filter.as_ref());
-                eligible_exile_cost_objects(state, player, source, zone, filter.as_ref(), *count)
-                    .len()
+                let effective_filter = exile_cost_effective_filter(filter.as_ref());
+                eligible_exile_cost_objects(
+                    state,
+                    player,
+                    source,
+                    zone,
+                    effective_filter.as_ref(),
+                    *count,
+                )
+                .len()
                     >= *count as usize
+            }
+            // CR 702.167a/b: Craft's materials cost — payable iff enough
+            // eligible objects exist across the battlefield/graveyard union
+            // (excluding the source, whose self-exile is a separate cost).
+            AbilityCost::ExileMaterials { materials, count } => {
+                eligible_craft_materials(state, player, source, materials).len()
+                    >= count.min_count()
             }
             // CR 701.59b: Can't collect evidence if graveyard total mana value
             // is less than N.
@@ -197,28 +392,46 @@ impl AbilityCost {
             // CR 601.2b: RemoveCounter requires counters on the implied target.
             // If `target` is None, the source must have the required counters.
             // Otherwise, at least one matching permanent must carry N counters.
-            // CR 107.2: `u32::MAX` encodes "any number of" — the player chooses
-            // how many counters to remove (including zero), so the cost is always
-            // payable regardless of the current counter count.
+            // CR 107.2 / CR 107.3a: variable remove-counter costs are payable
+            // before the final count is known.
             AbilityCost::RemoveCounter {
                 count,
                 counter_type,
                 target,
+                selection,
             } => {
-                if *count == u32::MAX {
+                if is_variable_remove_counter_cost_count(*count) {
                     return true;
                 }
                 match target {
-                    None => counter_on_object(state, source, counter_type) >= *count,
+                    None => {
+                        counter_on_object_for_selection(state, source, counter_type, *selection)
+                            >= *count
+                    }
                     Some(tf) => {
                         let ctx = FilterContext::from_source(state, source);
-                        state.battlefield.iter().any(|&id| {
-                            state.objects.get(&id).is_some_and(|o| {
-                                o.controller == player
-                                    && matches_target_filter(state, id, tf, &ctx)
-                                    && counter_on_object(state, id, counter_type) >= *count
+                        let matching_counts = state.battlefield.iter().filter_map(|&id| {
+                            state.objects.get(&id).and_then(|o| {
+                                (o.controller == player
+                                    && matches_target_filter(state, id, tf, &ctx))
+                                .then(|| {
+                                    counter_on_object_for_selection(
+                                        state,
+                                        id,
+                                        counter_type,
+                                        *selection,
+                                    )
+                                })
                             })
-                        })
+                        });
+                        match selection {
+                            CounterCostSelection::SingleObject => matching_counts
+                                .into_iter()
+                                .any(|available| available >= *count),
+                            CounterCostSelection::AmongObjects => {
+                                matching_counts.fold(0, u32::saturating_add) >= *count
+                            }
+                        }
                     }
                 }
             }
@@ -454,12 +667,54 @@ pub(super) fn eligible_exile_cost_objects(
                 .collect();
         }
     };
+    let effective_filter = exile_cost_effective_filter(filter);
+    let filter_ref = effective_filter.as_ref();
     let ctx = FilterContext::from_source(state, source);
     ids.filter(|&id| {
         id != source
-            && filter.is_none_or(|f| matches_target_filter_in_owner_zone(state, id, f, &ctx))
+            && filter_ref.is_none_or(|f| matches_target_filter_in_owner_zone(state, id, f, &ctx))
     })
     .collect()
+}
+
+/// CR 702.167a/b: Objects eligible to be exiled as the materials of a craft
+/// ability — the union of (a) permanents on the battlefield the player controls
+/// and (b) cards in the player's graveyard, in both cases matching `materials`
+/// and excluding `source` (whose self-exile is a separate cost component;
+/// excluding it is required for "craft with artifact" on an artifact source).
+///
+/// `materials` is the dual-zone `TargetFilter::Or` produced by
+/// `craft_materials_filter`; the battlefield leg is evaluated with the normal
+/// filter evaluator while the graveyard leg uses the owner-zone evaluator so
+/// `InZone`/`Owned` predicates resolve against non-battlefield cards. Returns
+/// every eligible object; the caller enforces the materials count via
+/// `len() >= count`.
+pub(crate) fn eligible_craft_materials(
+    state: &GameState,
+    player: PlayerId,
+    source: ObjectId,
+    materials: &TargetFilter,
+) -> Vec<ObjectId> {
+    let ctx = FilterContext::from_source(state, source);
+    let mut out: Vec<ObjectId> = state
+        .battlefield
+        .iter()
+        .copied()
+        .filter(|&id| {
+            id != source
+                && state
+                    .objects
+                    .get(&id)
+                    .is_some_and(|o| o.controller == player)
+                && matches_target_filter(state, id, materials, &ctx)
+        })
+        .collect();
+    if let Some(p) = state.players.get(player.0 as usize) {
+        out.extend(p.graveyard.iter().copied().filter(|&id| {
+            id != source && matches_target_filter_in_owner_zone(state, id, materials, &ctx)
+        }));
+    }
+    out
 }
 
 /// Count counters of the given kind on an object.
@@ -515,12 +770,29 @@ fn counter_on_object(
     }
 }
 
+fn counter_on_object_for_selection(
+    state: &GameState,
+    id: ObjectId,
+    kind: &crate::types::counter::CounterMatch,
+    selection: CounterCostSelection,
+) -> u32 {
+    match (kind, selection) {
+        (crate::types::counter::CounterMatch::Any, CounterCostSelection::SingleObject) => state
+            .objects
+            .get(&id)
+            .and_then(|obj| obj.counters.values().copied().max())
+            .unwrap_or(0),
+        _ => counter_on_object(state, id, kind),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::game::scenario::GameScenario;
     use crate::types::ability::{
-        ControllerRef, FilterProp, QuantityExpr, TargetFilter, TypeFilter, TypedFilter,
+        ControllerRef, FilterProp, QuantityExpr, SacrificeCost, TargetFilter, TypeFilter,
+        TypedFilter,
     };
     use crate::types::mana::ManaCost;
 
@@ -713,8 +985,8 @@ mod tests {
         assert!(!AbilityCost::Discard {
             count: QuantityExpr::Fixed { value: 1 },
             filter: None,
-            random: false,
-            self_ref: false,
+            selection: crate::types::ability::CardSelectionMode::Chosen,
+            self_scope: crate::types::ability::DiscardSelfScope::FromHand,
         }
         .is_payable(&state, P0, ObjectId(0)));
     }
@@ -723,10 +995,7 @@ mod tests {
     fn sacrifice_self_ref_requires_battlefield() {
         let mut scenario = GameScenario::new();
         let src = scenario.add_creature(P0, "Bear", 2, 2).id();
-        let cost = AbilityCost::Sacrifice {
-            target: TargetFilter::SelfRef,
-            count: 1,
-        };
+        let cost = AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1));
         assert!(cost.is_payable(&scenario.state, P0, src));
         // Move source off battlefield.
         scenario.state.objects.get_mut(&src).unwrap().zone = Zone::Graveyard;
@@ -737,18 +1006,16 @@ mod tests {
     fn sacrifice_non_self_requires_eligible_permanent() {
         let mut scenario = GameScenario::new();
         let src = scenario.add_creature(P0, "Source", 0, 1).id();
-        let cost = AbilityCost::Sacrifice {
-            target: TargetFilter::Typed(TypedFilter::creature()),
-            count: 1,
-        };
+        let cost = AbilityCost::Sacrifice(SacrificeCost::count(
+            TargetFilter::Typed(TypedFilter::creature()),
+            1,
+        ));
         assert!(cost.is_payable(&scenario.state, P0, src));
 
-        let another_cost = AbilityCost::Sacrifice {
-            target: TargetFilter::Typed(
-                TypedFilter::creature().properties(vec![FilterProp::Another]),
-            ),
-            count: 1,
-        };
+        let another_cost = AbilityCost::Sacrifice(SacrificeCost::count(
+            TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::Another])),
+            1,
+        ));
         assert!(!another_cost.is_payable(&scenario.state, P0, src));
 
         scenario.add_creature(P0, "Bear", 2, 2);
@@ -760,10 +1027,10 @@ mod tests {
     fn variable_sacrifice_cost_is_payable_with_zero_or_more_matches() {
         let mut scenario = GameScenario::new();
         let src = scenario.add_creature(P0, "Chatterfang", 3, 3).id();
-        let cost = AbilityCost::Sacrifice {
-            target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Subtype("Squirrel".into()))),
-            count: u32::MAX,
-        };
+        let cost = AbilityCost::Sacrifice(SacrificeCost::count(
+            TargetFilter::Typed(TypedFilter::new(TypeFilter::Subtype("Squirrel".into()))),
+            u32::MAX,
+        ));
 
         assert!(
             cost.is_payable(&scenario.state, P0, src),
@@ -847,6 +1114,7 @@ mod tests {
             count: 1,
             counter_type: crate::types::counter::CounterMatch::Any,
             target: None,
+            selection: CounterCostSelection::SingleObject,
         };
         assert!(
             cost.is_payable(&scenario.state, P0, src),
@@ -867,19 +1135,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn remove_counter_single_object_any_uses_one_concrete_stack_for_counts_above_one() {
+        use crate::types::counter::CounterType;
+
+        let mut scenario = GameScenario::new();
+        let src = scenario.add_creature(P0, "Mixed Counters", 0, 0).id();
+        {
+            let obj = scenario.state.objects.get_mut(&src).unwrap();
+            obj.counters
+                .insert(CounterType::Generic("charge".to_string()), 1);
+            obj.counters
+                .insert(CounterType::Generic("quest".to_string()), 1);
+        }
+
+        let cost = AbilityCost::RemoveCounter {
+            count: 2,
+            counter_type: crate::types::counter::CounterMatch::Any,
+            target: None,
+            selection: CounterCostSelection::SingleObject,
+        };
+
+        assert!(
+            !cost.is_payable(&scenario.state, P0, src),
+            "single-object untyped counter costs must align with payment, which removes one concrete counter type"
+        );
+    }
+
     /// CR 107.2: "Remove any number of" counters is always payable — the
     /// player may choose zero, so no minimum counter count is required.
     #[test]
     fn remove_counter_any_number_always_payable() {
+        use crate::types::ability::REMOVE_COUNTER_COST_ANY_NUMBER;
         use crate::types::counter::CounterType;
+
         let mut scenario = GameScenario::new();
         let src = scenario.add_creature(P0, "Mage-Ring Network", 0, 0).id();
         let cost = AbilityCost::RemoveCounter {
-            count: u32::MAX,
+            count: REMOVE_COUNTER_COST_ANY_NUMBER,
             counter_type: crate::types::counter::CounterMatch::OfType(CounterType::Generic(
                 "storage".to_string(),
             )),
             target: None,
+            selection: CounterCostSelection::SingleObject,
         };
         // Payable even with zero counters.
         assert!(
@@ -897,6 +1195,79 @@ mod tests {
         assert!(
             cost.is_payable(&scenario.state, P0, src),
             "'remove any number of' must be payable with counters present",
+        );
+    }
+
+    /// Issue #2372 — Nourishing Shoal: CMC=X is defined by the pitched card, so
+    /// payability must not require a pre-announced X.
+    #[test]
+    fn shoal_pitch_exile_cost_payable_with_any_green_hand_card() {
+        use crate::game::zones::create_object;
+        use crate::parser::oracle_cost::parse_oracle_cost;
+        use crate::types::card_type::CoreType;
+        use crate::types::identifiers::CardId;
+        use crate::types::mana::{ManaColor, ManaCost};
+
+        let mut state = GameState::new_two_player(42);
+        let caster = PlayerId(0);
+        let shoal = create_object(
+            &mut state,
+            CardId(700),
+            caster,
+            "Nourishing Shoal".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&shoal).unwrap();
+            obj.card_types.core_types.push(CoreType::Instant);
+            obj.mana_cost = ManaCost::Cost {
+                shards: vec![
+                    crate::types::mana::ManaCostShard::X,
+                    crate::types::mana::ManaCostShard::Green,
+                    crate::types::mana::ManaCostShard::Green,
+                ],
+                generic: 0,
+            };
+        }
+
+        let green_two_drop = create_object(
+            &mut state,
+            CardId(701),
+            caster,
+            "Green Two Drop".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&green_two_drop).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.color.push(ManaColor::Green);
+            obj.mana_cost = ManaCost::generic(2);
+        }
+
+        let cost = parse_oracle_cost("exile a green card with mana value X from your hand");
+        assert!(
+            cost.is_payable(&state, caster, shoal),
+            "Shoal pitch cost must be payable when any green card can set X"
+        );
+
+        let AbilityCost::Exile { filter, .. } = cost else {
+            panic!("expected Exile cost");
+        };
+        let eligible = super::eligible_exile_cost_objects(
+            &state,
+            caster,
+            shoal,
+            Zone::Hand,
+            filter.as_ref(),
+            1,
+        );
+        assert!(
+            eligible.contains(&green_two_drop),
+            "green hand card must be eligible regardless of CMC before X is chosen: {eligible:?}"
+        );
+        assert!(
+            !eligible.contains(&shoal),
+            "cast source must be excluded from pitch eligibility"
         );
     }
 }

@@ -17,11 +17,25 @@ expression: "&ir"
         "duration": null,
         "description": "Changeling",
         "target_prompt": null,
-        "sorcery_speed": false,
         "condition": null,
         "optional_targeting": false,
         "optional": false,
         "forward_result": false
+      }
+    },
+    {
+      "PreLoweredStatic": {
+        "mode": "CantBlock",
+        "affected": {
+          "type": "SelfRef"
+        },
+        "modifications": [],
+        "condition": null,
+        "affected_zone": null,
+        "effect_zone": null,
+        "active_zones": [],
+        "characteristic_defining": false,
+        "description": "~ can't block and can't be blocked."
       }
     },
     {

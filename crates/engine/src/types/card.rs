@@ -50,6 +50,11 @@ pub struct CardMetadata {
     /// Used only as future-facing image/catalog metadata.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_printing_ids: Vec<String>,
+    /// Alchemy "spellbook" — the fixed list of card names this card can draft
+    /// from (MTGJSON `relatedCards.spellbook`). Copied onto a game object's
+    /// `spellbook` so the `DraftFromSpellbook` resolver can present the list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spellbook: Vec<String>,
 }
 
 impl CardMetadata {
@@ -60,6 +65,7 @@ impl CardMetadata {
             && self.forge_replacements == 0
             && self.related_token_ids.is_empty()
             && self.source_printing_ids.is_empty()
+            && self.spellbook.is_empty()
     }
 }
 
@@ -168,6 +174,12 @@ pub struct CardFace {
     /// `brawl_commander` so we stay correct when MTGJSON is missing or stale.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_commander: bool,
+    /// Oathbreaker RC: Whether this card can serve as an Oathbreaker.
+    /// Derived from MTGJSON `leadershipSkills.oathbreaker` UNION type-line
+    /// analysis (legendary Planeswalker). Mirrors the `is_commander` /
+    /// `brawl_commander` synthesis pattern.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_oathbreaker: bool,
     /// CR 100.2a / CR 903.5b: Per-card override to the default constructed copy
     /// limit, parsed from deck-construction Oracle text ("A deck can have any
     /// number of cards named ~." / "A deck can have up to N cards named ~." /

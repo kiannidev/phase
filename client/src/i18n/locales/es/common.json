@@ -49,6 +49,8 @@
     "volume": "Volumen"
   },
   "hostControl": {
+    "collapse": "Contraer",
+    "expand": "Expandir panel del anfitrión",
     "seatHost": "Anfitrión",
     "seatPlayer": "Jugador",
     "seatOpen": "Abierto",
@@ -69,7 +71,9 @@
     "seatsOccupied": "{{occupied}}/{{total}} asientos ocupados",
     "startGame": "Empezar partida",
     "startNow": "Empezar ahora",
-    "fillWithAi": "Rellenar con IA"
+    "fillWithAi": "Rellenar con IA",
+    "joinLinkCopied": "Enlace de partida copiado",
+    "copyJoinLink": "Copiar enlace de partida: {{joinShare}}"
   },
   "grantDebug": {
     "heading": "Sandbox: Permisos de depuración",
@@ -201,6 +205,7 @@
   },
   "diceRoll": {
     "rollingForFirst": "Tirada para ver quién empieza",
+    "tieReroll": "Empate: ¡a tirar de nuevo!",
     "versus": "VS",
     "skip": "Toca para omitir",
     "continue": "Toca para continuar",

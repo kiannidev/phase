@@ -5,11 +5,12 @@
 //! https://github.com/phase-rs/phase/issues/2354
 
 use engine::game::layers::evaluate_layers;
-use engine::game::restrictions::record_discard;
+use engine::game::restrictions::{record_card_discarded, record_discard};
 use engine::game::scenario::{GameScenario, P0};
 use engine::game::{casting::can_cast_object_now, casting::spell_objects_available_to_cast};
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::actions::GameAction;
+use engine::types::game_state::CastPaymentMode;
 use engine::types::game_state::{CastingVariant, StackEntryKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
@@ -111,12 +112,14 @@ fn mayhem_allows_cast_from_graveyard_after_discard_this_turn() {
                 object_id: spell,
                 card_id,
                 targets: vec![],
+                payment_mode: CastPaymentMode::Auto,
             })
             .is_err(),
         "direct CastSpell must reject a Mayhem card that was not discarded this turn"
     );
 
     record_discard(runner.state_mut(), P0, spell);
+    record_card_discarded(runner.state_mut(), spell);
     evaluate_layers(runner.state_mut());
 
     assert!(
@@ -140,6 +143,7 @@ fn mayhem_allows_cast_from_graveyard_after_discard_this_turn() {
             object_id: spell,
             card_id,
             targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("begin casting via Mayhem");
 

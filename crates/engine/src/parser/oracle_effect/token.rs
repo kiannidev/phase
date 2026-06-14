@@ -3,7 +3,7 @@ use std::str::FromStr;
 use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
-use nom::combinator::{map, opt, rest, value};
+use nom::combinator::{opt, rest, value};
 use nom::Parser;
 
 use crate::parser::oracle_ir::context::ParseContext;
@@ -12,6 +12,7 @@ use crate::types::ability::{
     ContinuousModification, ControllerRef, Effect, FilterProp, PtValue, QuantityExpr, QuantityRef,
     StaticDefinition, TargetFilter,
 };
+use crate::types::card_type::Supertype;
 use crate::types::keywords::Keyword;
 use crate::types::mana::ManaColor;
 use crate::types::zones::Zone;
@@ -40,7 +41,8 @@ pub(super) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) 
     let lower = text.to_lowercase();
 
     // "create a token that's a copy of {target}"
-    if let Ok((_, (tapped, enters_attacking, count))) = parse_copy_token_entry_modifiers(&lower) {
+    if let Ok((_, (tapped, enters_attacking, mut count))) = parse_copy_token_entry_modifiers(&lower)
+    {
         let tp = TextPair::new(&text, &lower);
         let after_copy_tp = tp
             .strip_after("copy of ")
@@ -96,6 +98,24 @@ pub(super) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) 
         if let (TargetFilter::ParentTarget, Some(host)) = (&target, &ctx.host_self_reference) {
             target = host.clone();
         }
+        // CR 107.3: bind a variable "X" count to its "where X is <quantity>"
+        // clause (Devastating Onslaught, Nacatl War-Pride, Rionya), mirroring the
+        // non-copy token path. A bare X with no where-clause (Aggressive Biomancy)
+        // is left as `Variable("X")` for the spell's X cost to resolve.
+        if matches!(&count, QuantityExpr::Ref { qty: QuantityRef::Variable { ref name } } if name == "X")
+        {
+            if let Some(where_expression) = extract_token_where_x_expression(&text) {
+                count = super::parse_where_x_quantity_expression(&where_expression)
+                    .or_else(|| {
+                        crate::parser::oracle_quantity::parse_cda_quantity(&where_expression)
+                    })
+                    .unwrap_or(QuantityExpr::Ref {
+                        qty: QuantityRef::Variable {
+                            name: where_expression,
+                        },
+                    });
+            }
+        }
         return Some(Effect::CopyTokenOf {
             target,
             // CR 109.4: Default to the controller; a "target [player] creates"
@@ -127,7 +147,9 @@ pub(super) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) 
         owner: TargetFilter::Controller,
         attach_to: token.attach_to,
         enters_attacking: token.enters_attacking,
-        supertypes: vec![],
+        // CR 205.4a: Carry parsed supertypes (e.g. "legendary" for Marit Lage)
+        // onto the token so the legend rule (CR 704.5j) applies.
+        supertypes: token.supertypes,
         static_abilities: token.static_abilities,
         enter_with_counters: vec![],
     })
@@ -137,16 +159,20 @@ pub(super) fn parse_copy_token_entry_modifiers(
     input: &str,
 ) -> OracleResult<'_, (bool, bool, QuantityExpr)> {
     let (rest, _) = tag("create ").parse(input)?;
-    let (rest, count) = opt(alt((
-        value(
-            QuantityExpr::Fixed { value: 1 },
-            alt((tag("a "), tag("one "))),
-        ),
-        map(nom_primitives::parse_number, |value| QuantityExpr::Fixed {
-            value: value as i32,
-        }),
-    )))
-    .parse(rest)?;
+    // The bare article "a"/"one" → a count of 1. `parse_count_expr` intentionally
+    // excludes the article (to avoid matching the "a" in "another"), so handle it
+    // here; otherwise delegate to the shared count grammar so "X", "two", "twice
+    // X", "that many", etc. all parse uniformly — mirroring the non-copy token
+    // path's `parse_token_count_prefix`. Without this, "Create X tokens that are
+    // copies of …" failed to parse and the whole effect was dropped.
+    let (rest, count) =
+        if let Ok((rest, _)) = alt((tag::<_, _, OracleError<'_>>("a "), tag("one "))).parse(rest) {
+            (rest, Some(QuantityExpr::Fixed { value: 1 }))
+        } else if let Some((expr, rest_after)) = parse_count_expr(rest) {
+            (rest_after, Some(expr))
+        } else {
+            (rest, None)
+        };
     let (rest, _) = if count.is_some() {
         opt(tag(" ")).parse(rest)?
     } else {
@@ -262,8 +288,11 @@ pub(crate) fn parse_token_description(text: &str) -> Option<TokenDescription> {
     // `ContinuationAst::EntersTappedAttacking`.
     let lower_trimmed = text.to_lowercase();
     // Single combinator for the whole clause: relative-pronoun variants
-    // factored into one `alt`, shared tail appears once, `eof` anchors the
-    // match at the string's end.
+    // factored into one `alt`, shared tail appears once.
+    // CR 107.3: the clause may also be followed by ", where X is …" (e.g. Anim
+    // Pakal, Thousandth Moon) — accept that as a valid terminator in addition
+    // to EOF so the attacking flag is captured even when a variable-X binding
+    // trails the clause.
     let attacking_clause = |i| -> OracleResult<'_, bool> {
         let (i, _) = alt((
             tag(" that's"),
@@ -277,12 +306,12 @@ pub(crate) fn parse_token_description(text: &str) -> Option<TokenDescription> {
             value(false, tag(" attacking")),
         ))
         .parse(i)?;
-        let (i, _) = nom::combinator::eof(i)?;
+        let (i, _) = alt((value((), nom::combinator::eof), value((), tag(", where ")))).parse(i)?;
         Ok((i, tapped))
     };
     // Nom parses forward; scan byte positions (only those starting with the
     // leading space the clause requires) for the first place where the clause
-    // consumes the remainder to EOF. That byte offset is the body length.
+    // matches. That byte offset is the body length.
     let entry_clause = (0..lower_trimmed.len()).find_map(|pos| {
         (lower_trimmed.as_bytes().get(pos) == Some(&b' '))
             .then(|| {
@@ -292,6 +321,12 @@ pub(crate) fn parse_token_description(text: &str) -> Option<TokenDescription> {
             })
             .flatten()
     });
+    // When the attacking clause is detected and text is truncated at `pos`, any
+    // trailing ", where X is …" that followed the clause is cut off from the
+    // token body.  Extract and save it now (from the pre-truncation text) so
+    // the X-binding step below can still resolve a variable count.
+    let saved_where_x_expr: Option<String> =
+        entry_clause.and_then(|(pos, _)| extract_token_where_x_expression(&text[pos..]));
     let (text, enters_attacking, enters_tapped_attacking) = match entry_clause {
         Some((len, tapped)) => (&text[..len], true, tapped),
         None => (text, false, false),
@@ -328,7 +363,8 @@ pub(crate) fn parse_token_description(text: &str) -> Option<TokenDescription> {
         break;
     }
 
-    rest = strip_token_supertypes(rest);
+    let (supertypes, rest_after_supertypes) = strip_token_supertypes(rest);
+    rest = rest_after_supertypes;
 
     let (mut power, mut toughness, rest) =
         if let Ok((rest, (power, toughness))) = nom_primitives::parse_pt_value.parse(rest) {
@@ -337,9 +373,18 @@ pub(crate) fn parse_token_description(text: &str) -> Option<TokenDescription> {
             (None, None, rest)
         };
 
-    let (colors, rest) = parse_token_color_prefix(rest);
+    let (mut colors, rest) = parse_token_color_prefix(rest);
     let (descriptor, suffix) = split_token_head(rest)?;
     let (name_override, suffix) = parse_token_name_clause(suffix);
+    // CR 105.1 + CR 105.2: "that's all colors" (Mechtitan Core, etc.) makes the
+    // token each of the five colors. Strip the clause before keyword parsing so
+    // the trailing keyword ("... and haste that's all colors") still survives,
+    // then set the colors.
+    let saved_all_colors_where_x_expr = extract_token_where_x_expression(suffix);
+    let (suffix, is_all_colors) = strip_token_all_colors_suffix(suffix);
+    if is_all_colors {
+        colors = ManaColor::ALL.to_vec();
+    }
     let keywords = parse_token_keyword_clause(suffix);
     let (mut name, types) = parse_token_identity(descriptor)?;
 
@@ -347,7 +392,13 @@ pub(crate) fn parse_token_description(text: &str) -> Option<TokenDescription> {
         name = name_override;
     }
 
-    if let Some(where_expression) = extract_token_where_x_expression(suffix) {
+    // CR 107.3: when the attacking clause was stripped and took the ", where X
+    // is …" tail with it, `saved_where_x_expr` carries the expression; fall
+    // back to it so the variable count is still resolved.
+    if let Some(where_expression) = extract_token_where_x_expression(suffix)
+        .or(saved_where_x_expr)
+        .or(saved_all_colors_where_x_expr)
+    {
         // CR 107.3i + CR 117.1: The Token-effect `where X is …` rebind shares
         // the Join-Forces normalization path with non-Token effects via
         // `super::parse_where_x_quantity_expression`. This makes phrases like
@@ -445,6 +496,7 @@ pub(crate) fn parse_token_description(text: &str) -> Option<TokenDescription> {
         power,
         toughness,
         types,
+        supertypes,
         colors,
         keywords,
         tapped,
@@ -502,22 +554,72 @@ fn parse_named_token_preamble(text: &str) -> Option<(String, &str)> {
     Some((name.to_string(), rest))
 }
 
-fn strip_token_supertypes(mut text: &str) -> &str {
+/// CR 205.4a: Strip leading supertype words from the token description and
+/// return the captured supertypes alongside the remaining text. Previously the
+/// supertypes were discarded; capturing them lets legendary/snow tokens (Marit
+/// Lage etc.) carry their supertype through to `Effect::Token` — load-bearing
+/// for the legend rule (CR 704.5j).
+fn strip_token_supertypes(mut text: &str) -> (Vec<Supertype>, &str) {
+    let mut supertypes = Vec::new();
     loop {
         let trimmed = text.trim_start();
         let trimmed_lower = trimmed.to_lowercase();
-        let Some((_, stripped)) = nom_on_lower(trimmed, &trimmed_lower, |i| {
+        let Some((supertype, stripped)) = nom_on_lower(trimmed, &trimmed_lower, |i| {
             alt((
-                value((), tag("legendary ")),
-                value((), tag("snow ")),
-                value((), tag("basic ")),
+                value(Supertype::Legendary, tag("legendary ")),
+                value(Supertype::Snow, tag("snow ")),
+                value(Supertype::Basic, tag("basic ")),
             ))
             .parse(i)
         }) else {
-            return trimmed;
+            return (supertypes, trimmed);
         };
+        if !supertypes.contains(&supertype) {
+            supertypes.push(supertype);
+        }
         text = stripped;
     }
+}
+
+/// Strip a trailing "that's all colors" color clause from a token suffix.
+///
+/// CR 105.1 + CR 105.2: a token that is "all colors" is each of the five
+/// WUBRG colors. The clause appears as a relative-pronoun suffix on the token
+/// description (e.g. Mechtitan Core's "... and haste that's all colors" or a
+/// bare "... token that's all colors"), so it is detected by scanning word
+/// boundaries for the relative-pronoun variants followed by "all colors".
+/// Returns the suffix with the clause removed and a flag indicating whether it
+/// was present, so the caller can both set the five colors and keep the
+/// preceding keyword list intact.
+///
+/// Building block for the whole class of "create <token> ... that's all colors"
+/// effects, not just Mechtitan Core.
+fn strip_token_all_colors_suffix(text: &str) -> (&str, bool) {
+    fn all_colors_clause(i: &str) -> OracleResult<'_, ()> {
+        let (i, _) =
+            alt((tag("that's"), tag("that is"), tag("thats"), tag("that are"))).parse(i)?;
+        let (i, _) = value((), tag(" all colors")).parse(i)?;
+        let (i, _) = alt((value((), nom::combinator::eof), value((), tag(", where ")))).parse(i)?;
+        Ok((i, ()))
+    }
+
+    let lower = text.to_lowercase();
+    if all_colors_clause(&lower).is_ok() {
+        return ("", true);
+    }
+
+    for (pos, ch) in text.char_indices() {
+        if ch != ' ' {
+            continue;
+        }
+        let candidate = &text[pos + ch.len_utf8()..];
+        let candidate_lower = candidate.to_lowercase();
+        if all_colors_clause(&candidate_lower).is_ok() {
+            return (text[..pos].trim_end(), true);
+        }
+    }
+
+    (text, false)
 }
 
 fn parse_token_color_prefix(mut text: &str) -> (Vec<ManaColor>, &str) {
@@ -920,6 +1022,28 @@ fn known_role_token_identity(descriptor: &str) -> Option<(String, Vec<String>)> 
     ))
 }
 
+/// Strip trailing dynamic/attachment clauses from a token "with …" keyword phrase.
+fn strip_token_keyword_clause_suffixes(text: &str) -> &str {
+    let mut clause = text;
+    if let Ok((_, head)) = take_until::<_, _, nom::error::Error<&str>>("\"").parse(clause) {
+        clause = head;
+    }
+    for marker in [" where ", " equal to ", " attached "] {
+        clause = truncate_token_keyword_clause_before(clause, marker);
+    }
+    clause
+}
+
+/// Strip a token keyword clause at the first `marker` (e.g. `" equal to "`).
+fn truncate_token_keyword_clause_before<'a>(text: &'a str, marker: &str) -> &'a str {
+    let lower = text.to_ascii_lowercase();
+    let head_len = match take_until::<_, _, nom::error::Error<&str>>(marker).parse(&lower) {
+        Ok((rest, _)) => lower.len() - rest.len(),
+        Err(_) => return text,
+    };
+    &text[..head_len]
+}
+
 pub(super) fn parse_token_keyword_clause(text: &str) -> Vec<Keyword> {
     let trimmed = text.trim_start();
     let trimmed_lower = trimmed.to_lowercase();
@@ -929,16 +1053,7 @@ pub(super) fn parse_token_keyword_clause(text: &str) -> Vec<Keyword> {
         return Vec::new();
     };
 
-    let raw_clause = after_with
-        .split('"')
-        .next()
-        .unwrap_or(after_with)
-        .split(" where ")
-        .next()
-        .unwrap_or(after_with)
-        .split(" attached ")
-        .next()
-        .unwrap_or(after_with)
+    let raw_clause = strip_token_keyword_clause_suffixes(after_with)
         .trim()
         .trim_end_matches('.')
         .trim_end_matches(',')
@@ -991,8 +1106,57 @@ pub(super) fn push_unique_string(values: &mut Vec<String>, value: impl Into<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ability::{ObjectScope, QuantityExpr, QuantityRef, RoundingMode};
+    use crate::types::ability::{ObjectScope, QuantityExpr, QuantityRef, RoundingMode, TypeFilter};
     use crate::types::card_type::CoreType;
+
+    #[test]
+    fn copy_x_tokens_of_target_parses_variable_count() {
+        // CR 707.2 + CR 107.3: variable X count in copy-token creation.
+        let effect = try_parse_token(
+            "create x tokens that are copies of target creature you control",
+            "Create X tokens that are copies of target creature you control",
+            &mut ParseContext::default(),
+        )
+        .expect("expected CopyTokenOf");
+        let Effect::CopyTokenOf { count, .. } = effect else {
+            panic!("expected CopyTokenOf, got {effect:?}");
+        };
+        assert_eq!(
+            count,
+            QuantityExpr::Ref {
+                qty: QuantityRef::Variable {
+                    name: "X".to_string()
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn copy_x_tokens_binds_where_clause() {
+        // CR 107.3: X bound to a trailing "where X is <quantity>" clause.
+        let txt = "Create X tokens that are copies of target creature you control, where X is the number of Clues you control.";
+        let effect = try_parse_token(&txt.to_lowercase(), txt, &mut ParseContext::default())
+            .expect("expected CopyTokenOf");
+        let Effect::CopyTokenOf { count, .. } = effect else {
+            panic!("expected CopyTokenOf")
+        };
+        let QuantityExpr::Ref {
+            qty:
+                QuantityRef::ObjectCount {
+                    filter: TargetFilter::Typed(tf),
+                },
+        } = count
+        else {
+            panic!("expected where-clause to bind X to an ObjectCount, got {count:?}");
+        };
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+        assert!(
+            tf.type_filters
+                .contains(&TypeFilter::Subtype("Clue".to_string())),
+            "X must count controlled Clues, got {:?}",
+            tf.type_filters
+        );
+    }
 
     #[test]
     fn copy_tokens_of_exiled_cost_card_use_cost_paid_object_source() {
@@ -1078,6 +1242,38 @@ mod tests {
             additional_modifications,
             vec![ContinuousModification::AddType {
                 core_type: CoreType::Artifact,
+            }]
+        );
+    }
+
+    /// Issue #1696 — Myrkul, Lord of Bones: "create a token that's a copy of
+    /// that card, except it's an enchantment and loses all other card types."
+    /// CR 205.1a + CR 707.9d: the "loses all other card types" suffix is the
+    /// set-replacement signal, so the copy carries `SetCardTypes`, replacing
+    /// (not adding to) the copied creature's card types. The "that card"
+    /// anaphor stays `ParentTarget` here (the exile→tracked-set rewrite happens
+    /// during chain stitching, exercised by `parse_effect_chain` elsewhere).
+    #[test]
+    fn myrkul_copy_token_carries_set_card_types_enchantment() {
+        let effect = try_parse_token(
+            "create a token that's a copy of that card, except it's an enchantment and loses all other card types",
+            "Create a token that's a copy of that card, except it's an enchantment and loses all other card types.",
+            &mut ParseContext::default(),
+        )
+        .expect("expected CopyTokenOf");
+        let Effect::CopyTokenOf {
+            target,
+            additional_modifications,
+            ..
+        } = effect
+        else {
+            panic!("expected CopyTokenOf, got {effect:?}");
+        };
+        assert_eq!(target, TargetFilter::ParentTarget);
+        assert_eq!(
+            additional_modifications,
+            vec![ContinuousModification::SetCardTypes {
+                core_types: vec![CoreType::Enchantment],
             }]
         );
     }
@@ -1288,6 +1484,82 @@ mod tests {
         assert_eq!(kws, vec![Keyword::Flying]);
     }
 
+    /// Issue #2854 (Broodspinner): "with flying equal to …" must not treat the
+    /// count clause as part of the keyword name.
+    #[test]
+    fn keyword_clause_with_equal_to_count_suffix() {
+        let kws = parse_token_keyword_clause(
+            "with flying equal to the number of card types among cards in your graveyard",
+        );
+        assert_eq!(kws, vec![Keyword::Flying]);
+    }
+
+    #[test]
+    fn keyword_clause_keeps_numbered_keyword_before_quoted_static() {
+        let kws = parse_token_keyword_clause(r#"with toxic 1 and "This token can't block.""#);
+        assert_eq!(kws, vec![Keyword::Toxic(1)]);
+    }
+
+    #[test]
+    fn broodspinner_insect_tokens_with_flying_equal_to_count() {
+        let text = "Create a number of 1/1 black and green Insect creature tokens with flying equal to the number of card types among cards in your graveyard.";
+        let effect = try_parse_token(text, text, &mut ParseContext::default())
+            .expect("Broodspinner token line must parse");
+        match effect {
+            crate::types::ability::Effect::Token { keywords, .. } => {
+                assert!(
+                    keywords.contains(&Keyword::Flying),
+                    "flying insect tokens must carry Flying, got {keywords:?}"
+                );
+            }
+            other => panic!("expected Token effect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keyword_clause_keeps_keyword_before_all_colors_clause() {
+        // CR 105.1/105.2 + CR 702.10: the "that's all colors" clause is stripped
+        // before keyword parsing so the trailing keyword survives.
+        let (suffix, is_all_colors) =
+            strip_token_all_colors_suffix("with flying and haste that's all colors");
+        assert!(is_all_colors, "'that's all colors' must be detected");
+        assert_eq!(suffix, "with flying and haste");
+        let kws = parse_token_keyword_clause(suffix);
+        assert_eq!(kws, vec![Keyword::Flying, Keyword::Haste]);
+    }
+
+    #[test]
+    fn all_colors_suffix_relative_pronoun_variants() {
+        // CR 105.1/105.2: each relative-pronoun variant of the all-colors clause
+        // is recognized; non-color "that's" clauses are left untouched.
+        for clause in [
+            "that's all colors",
+            "with flying that's all colors",
+            "with flying that is all colors",
+            "with flying thats all colors",
+            "with flying that are all colors",
+        ] {
+            let (suffix, is_all_colors) = strip_token_all_colors_suffix(clause);
+            assert!(is_all_colors, "must detect all-colors in {clause:?}");
+            if clause == "that's all colors" {
+                assert_eq!(suffix, "");
+            } else {
+                assert_eq!(suffix, "with flying");
+            }
+        }
+        let (suffix, is_all_colors) =
+            strip_token_all_colors_suffix("with flying that's all colors, where X is that value");
+        assert!(is_all_colors);
+        assert_eq!(suffix, "with flying");
+        let (suffix, is_all_colors) =
+            strip_token_all_colors_suffix("with flying that's all colors and haste");
+        assert!(!is_all_colors);
+        assert_eq!(suffix, "with flying that's all colors and haste");
+        let (suffix, is_all_colors) = strip_token_all_colors_suffix("with flying");
+        assert!(!is_all_colors);
+        assert_eq!(suffix, "with flying");
+    }
+
     #[test]
     fn extract_static_cant_block_from_quoted_ability() {
         use crate::types::ability::TargetFilter;
@@ -1476,6 +1748,45 @@ mod tests {
         );
     }
 
+    /// CR 205.4a + CR 704.5j: A "legendary" (or "snow"/"basic") supertype in the
+    /// inline token grammar must be captured onto `Effect::Token.supertypes`, not
+    /// silently stripped. Covers the whole class of legendary tokens (Marit Lage
+    /// from Dark Depths, the Pia Nalaar Construct, etc.) so the legend rule
+    /// applies. Building-block-level: exercises the supertype-capture path, not a
+    /// single card's full Oracle text.
+    #[test]
+    fn token_captures_legendary_supertype() {
+        use crate::types::card_type::Supertype;
+
+        let effect = try_parse_token(
+            "create marit lage, a legendary 20/20 black avatar creature token with flying and indestructible",
+            "create Marit Lage, a legendary 20/20 black Avatar creature token with flying and indestructible",
+            &mut ParseContext::default(),
+        )
+        .expect("expected Token effect");
+        let Effect::Token {
+            name,
+            supertypes,
+            power,
+            toughness,
+            keywords,
+            ..
+        } = effect
+        else {
+            panic!("expected Token effect, got {effect:?}");
+        };
+        assert_eq!(name, "Marit Lage");
+        assert_eq!(
+            supertypes,
+            vec![Supertype::Legendary],
+            "the 'legendary' supertype must be captured, not discarded"
+        );
+        assert_eq!(power, PtValue::Fixed(20));
+        assert_eq!(toughness, PtValue::Fixed(20));
+        assert!(keywords.contains(&Keyword::Flying));
+        assert!(keywords.contains(&Keyword::Indestructible));
+    }
+
     #[test]
     fn token_with_cant_block_produces_static() {
         let effect = try_parse_token(
@@ -1499,5 +1810,150 @@ mod tests {
         } else {
             panic!("Expected Token effect, got {:?}", effect);
         }
+    }
+
+    /// CR 508.4 + CR 107.3: "tokens that are tapped and attacking, where X is
+    /// the number of +1/+1 counters on ~" (Anim Pakal, Thousandth Moon).
+    /// The ", where X is …" clause used to defeat the eof-anchored scan and
+    /// leave `tapped`/`enters_attacking` both false.
+    #[test]
+    fn tapped_and_attacking_with_trailing_where_x_clause() {
+        use crate::types::ability::ObjectScope;
+        use crate::types::counter::CounterType;
+
+        let text = "create x 1/1 colorless gnome artifact creature tokens that are tapped and attacking, where x is the number of +1/+1 counters on ~";
+        let effect = try_parse_token(
+            text,
+            "Create X 1/1 colorless Gnome artifact creature tokens that are tapped and attacking, where X is the number of +1/+1 counters on ~",
+            &mut ParseContext::default(),
+        )
+        .expect("expected Token effect");
+        let Effect::Token {
+            tapped,
+            enters_attacking,
+            count,
+            ..
+        } = effect
+        else {
+            panic!("expected Token effect, got {effect:?}");
+        };
+        assert!(tapped, "tokens must enter tapped");
+        assert!(enters_attacking, "tokens must enter attacking");
+        assert!(
+            matches!(
+                count,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::CountersOn {
+                        scope: ObjectScope::Source,
+                        counter_type: Some(CounterType::Plus1Plus1),
+                    }
+                }
+            ),
+            "X count must resolve to CountersOn(Source, P1P1), got {count:?}"
+        );
+    }
+
+    /// CR 111.3 + CR 702.10 (Haste) + CR 105.1/105.2 (all five colors):
+    /// Mechtitan Core's token has a "with <keywords> that's all colors" suffix
+    /// where the "that's all colors" color clause trails the keyword list. The
+    /// final keyword ("haste") and the all-five-colors characteristic must both
+    /// survive parsing. Building-block regression for the whole class of
+    /// "create <token> with <keywords> that's all colors" effects.
+    #[test]
+    fn token_with_keywords_then_thats_all_colors_keeps_haste_and_colors() {
+        use crate::types::mana::ManaColor;
+
+        let text = "create mechtitan, a legendary 10/10 construct artifact creature token with flying, vigilance, trample, lifelink, and haste that's all colors";
+        let effect = try_parse_token(
+            text,
+            "Create Mechtitan, a legendary 10/10 Construct artifact creature token with flying, vigilance, trample, lifelink, and haste that's all colors",
+            &mut ParseContext::default(),
+        )
+        .expect("expected Token effect");
+        let Effect::Token {
+            keywords, colors, ..
+        } = effect
+        else {
+            panic!("expected Token effect, got {effect:?}");
+        };
+        assert!(
+            keywords.contains(&Keyword::Haste),
+            "the trailing keyword before \"that's all colors\" must survive: {keywords:?}",
+        );
+        for keyword in [
+            Keyword::Flying,
+            Keyword::Vigilance,
+            Keyword::Trample,
+            Keyword::Lifelink,
+        ] {
+            assert!(
+                keywords.contains(&keyword),
+                "{keyword:?} must be present: {keywords:?}",
+            );
+        }
+        for color in ManaColor::ALL {
+            assert!(
+                colors.contains(&color),
+                "\"that's all colors\" must set {color:?}: {colors:?}",
+            );
+        }
+        assert_eq!(
+            colors.len(),
+            5,
+            "all-colors must be exactly the five WUBRG colors: {colors:?}",
+        );
+    }
+
+    /// CR 111.3 + CR 105.1/105.2: the all-colors clause may be the whole token
+    /// suffix, without a preceding `with <keyword>` list.
+    #[test]
+    fn token_thats_all_colors_without_keywords_sets_colors() {
+        use crate::types::mana::ManaColor;
+
+        let text = "create a 2/2 elemental creature token that's all colors";
+        let effect = try_parse_token(
+            text,
+            "Create a 2/2 Elemental creature token that's all colors",
+            &mut ParseContext::default(),
+        )
+        .expect("expected Token effect");
+        let Effect::Token {
+            colors, keywords, ..
+        } = effect
+        else {
+            panic!("expected Token effect, got {effect:?}");
+        };
+        assert!(keywords.is_empty());
+        assert_eq!(colors, ManaColor::ALL.to_vec());
+    }
+
+    /// CR 105.1/105.2 + CR 107.3: stripping the all-colors suffix must not drop
+    /// the trailing `where X is ...` binding for variable token counts.
+    #[test]
+    fn token_all_colors_where_clause_keeps_x_binding() {
+        use crate::types::mana::ManaColor;
+
+        let text = "Create X 1/1 Stained Glass artifact creature tokens that are all colors, where X is the number of creatures you control";
+        let effect = try_parse_token(&text.to_lowercase(), text, &mut ParseContext::default())
+            .expect("expected Token effect");
+        let Effect::Token { colors, count, .. } = effect else {
+            panic!("expected Token effect, got {effect:?}");
+        };
+        assert_eq!(colors, ManaColor::ALL.to_vec());
+        let QuantityExpr::Ref {
+            qty:
+                QuantityRef::ObjectCount {
+                    filter: TargetFilter::Typed(tf),
+                },
+        } = count
+        else {
+            panic!("expected where-clause to bind X to an ObjectCount, got {count:?}");
+        };
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+        assert!(
+            tf.type_filters.contains(&TypeFilter::Creature),
+            "X must count controlled creatures, got {:?}",
+            tf.type_filters
+        );
     }
 }

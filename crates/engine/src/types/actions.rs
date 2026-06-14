@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use super::ability::{LibraryPosition, TargetRef};
 use super::counter::CounterType;
 use super::game_state::{
-    AutoMayChoice, AutoPassRequest, CastPaymentMode, CombatDamageAssignmentMode, CounterMoveChoice,
-    ShardChoice,
+    AutoMayChoice, AutoPassRequest, CastPaymentMode, CombatDamageAssignmentMode, CounterCostChoice,
+    CounterMoveChoice, ShardChoice,
 };
 use super::identifiers::{CardId, ObjectId};
 use super::keywords::Keyword;
@@ -117,11 +117,7 @@ pub enum GameAction {
         object_id: ObjectId,
         card_id: CardId,
         targets: Vec<ObjectId>,
-    },
-    CastSpellWithPaymentMode {
-        object_id: ObjectId,
-        card_id: CardId,
-        targets: Vec<ObjectId>,
+        #[serde(default)]
         payment_mode: CastPaymentMode,
     },
     /// CR 702.143a-b: Foretell special action — during your turn while you
@@ -138,6 +134,12 @@ pub enum GameAction {
     },
     DeclareAttackers {
         attacks: Vec<(ObjectId, AttackTarget)>,
+        /// CR 702.22c: As a player declares attackers, they may declare that one
+        /// or more attacking creatures with banding (or one with banding and any
+        /// number of others) form an attacking band. Each inner `Vec` is one band
+        /// of attacker `ObjectId`s. Empty (the default) means no bands declared.
+        #[serde(default)]
+        bands: Vec<Vec<ObjectId>>,
     },
     DeclareBlockers {
         assignments: Vec<(ObjectId, ObjectId)>,
@@ -154,11 +156,29 @@ pub enum GameAction {
     ChooseExert {
         exert: bool,
     },
+    /// CR 508.1g + CR 702.154a: The active player's decision whether to pay
+    /// the pending Enlist optional attack cost by tapping one eligible
+    /// creature. `None` declines because Enlist allows tapping "up to one."
+    ChooseEnlist {
+        target: Option<ObjectId>,
+    },
     /// CR 701.30b: The clashing player's choice of which opponent to clash with,
     /// answering a pending `WaitingFor::ClashChooseOpponent`. `opponent` must be
     /// one of that prompt's `candidates`.
     ChooseClashOpponent {
         opponent: PlayerId,
+    },
+    /// CR 702.132a: Assist — the caster's answer to `WaitingFor::AssistChoosePlayer`.
+    /// `Some(p)` chooses player `p` (one of the prompt's `candidates`) to help pay
+    /// the generic mana; `None` declines and proceeds to normal payment.
+    ChooseAssistPlayer {
+        player: Option<PlayerId>,
+    },
+    /// CR 702.132a: Assist — the chosen player's answer to `WaitingFor::AssistPayment`.
+    /// `generic` is how much of the spell's generic mana they pay (0 = nothing),
+    /// capped at the prompt's `max_generic`.
+    CommitAssistPayment {
+        generic: u32,
     },
     /// CR 103.5 + 103.5b: A player's decision at a `WaitingFor::MulliganDecision`
     /// prompt. See [`MulliganChoice`] for the three branches.
@@ -187,6 +207,11 @@ pub enum GameAction {
     },
     SelectCards {
         cards: Vec<ObjectId>,
+    },
+    /// CR 118.3 + CR 122.1: Choose exactly how many counters each selected
+    /// object contributes to a remove-counter cost that says "from among".
+    ChooseRemoveCounterCostDistribution {
+        distribution: Vec<CounterCostChoice>,
     },
     /// CR 705.1: Krark's Thumb keep-choice — indices into `results` the player
     /// keeps (ignoring the rest, CR 614.1a). Length must equal `keep_count`.
@@ -263,6 +288,12 @@ pub enum GameAction {
     },
     ChooseOption {
         choice: String,
+    },
+    /// Alchemy spellbook draft: the player's chosen card name in response to
+    /// `WaitingFor::SpellbookDraft`. The named card is conjured into the
+    /// pending destination.
+    SubmitSpellbookDraft {
+        card: String,
     },
     /// CR 700.3 + CR 700.3a: Submit one pile (pile A) of a
     /// `SeparateIntoPiles` partition. Pile B is derived by the engine as
@@ -349,11 +380,7 @@ pub enum GameAction {
         hand_object: ObjectId,
         card_id: CardId,
         creature_to_return: ObjectId,
-    },
-    CastSpellAsSneakWithPaymentMode {
-        hand_object: ObjectId,
-        card_id: CardId,
-        creature_to_return: ObjectId,
+        #[serde(default)]
         payment_mode: CastPaymentMode,
     },
     /// CR 702.188a: Cast a spell from HAND via the Web-slinging alternative cost.
@@ -362,11 +389,7 @@ pub enum GameAction {
         hand_object: ObjectId,
         card_id: CardId,
         creature_to_return: ObjectId,
-    },
-    CastSpellAsWebSlingingWithPaymentMode {
-        hand_object: ObjectId,
-        card_id: CardId,
-        creature_to_return: ObjectId,
+        #[serde(default)]
         payment_mode: CastPaymentMode,
     },
     /// CR 601.2b + CR 118.9a: Cast a spell from hand for free via a
@@ -383,11 +406,7 @@ pub enum GameAction {
         object_id: ObjectId,
         card_id: CardId,
         source_id: ObjectId,
-    },
-    CastSpellForFreeWithPaymentMode {
-        object_id: ObjectId,
-        card_id: CardId,
-        source_id: ObjectId,
+        #[serde(default)]
         payment_mode: CastPaymentMode,
     },
     /// CR 702.94a + CR 603.11: Accept a pending `WaitingFor::MiracleReveal`
@@ -398,10 +417,7 @@ pub enum GameAction {
     CastSpellAsMiracle {
         object_id: ObjectId,
         card_id: CardId,
-    },
-    CastSpellAsMiracleWithPaymentMode {
-        object_id: ObjectId,
-        card_id: CardId,
+        #[serde(default)]
         payment_mode: CastPaymentMode,
     },
     /// CR 702.35a: Accept a pending `WaitingFor::CastOffer` (Madness) and cast
@@ -410,15 +426,19 @@ pub enum GameAction {
     CastSpellAsMadness {
         object_id: ObjectId,
         card_id: CardId,
-    },
-    CastSpellAsMadnessWithPaymentMode {
-        object_id: ObjectId,
-        card_id: CardId,
+        #[serde(default)]
         payment_mode: CastPaymentMode,
     },
     /// CR 609.3: Accept or decline an optional effect ("You may X").
     DecideOptionalEffect {
         accept: bool,
+    },
+    /// CR 702.47a–e: Respond to a `WaitingFor::SpliceOffer`. `Some(card)` splices
+    /// that card from hand onto the spell being cast (re-presenting the offer for
+    /// any remaining eligible cards, CR 702.47e); `None` declines/finishes
+    /// splicing and proceeds to target selection.
+    RespondToSpliceOffer {
+        card: Option<ObjectId>,
     },
     DecideOptionalEffectAndRemember {
         choice: AutoMayChoice,
@@ -495,9 +515,37 @@ pub enum GameAction {
     CascadeChoice {
         choice: CastChoice,
     },
+    /// CR 702.60a: Choose to cast a revealed same-named ripple card for free.
+    RippleChoice {
+        choice: CastChoice,
+    },
+    /// CR 608.2g + CR 601.2: Pick one candidate to cast for free from an open
+    /// `WaitingFor::CastOffer { FreeCastWindow }` (Invoke Calamity), or `None`
+    /// to finish the window without casting (further) spells. Distinct from the
+    /// binary `CastChoice` used by Cascade/Discover/Ripple because the player
+    /// chooses *which* of several offered cards to cast, not merely whether to
+    /// cast a single pre-selected one.
+    FreeCastWindowChoice {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selection: Option<crate::types::identifiers::ObjectId>,
+    },
     /// CR 401.4: Choose top or bottom of library.
     ChooseTopOrBottom {
         top: bool,
+    },
+    /// CR 702.140c + CR 730.2a: As a mutating creature spell resolves with a
+    /// legal target, the spell's controller chooses whether the spell is placed
+    /// on top of or under the target creature. Resolved by
+    /// `merge::handle_mutate_merge_choice`.
+    ChooseMutateMergeSide {
+        side: crate::game::merge::MergeSide,
+    },
+    /// CR 702.99a: As a Cipher spell resolves, the controller chooses a creature
+    /// to encode the card on (`Some`) or declines (`None`, card → graveyard).
+    /// Resolved by `cipher::handle_encode_choice`.
+    CipherEncode {
+        #[serde(default)]
+        creature: Option<ObjectId>,
     },
     /// CR 704.5j: Choose which legendary permanent to keep.
     ChooseLegend {
@@ -531,6 +579,16 @@ pub enum GameAction {
         /// CR 702.19c: Damage to PW controller when trample-over-PW spills past loyalty.
         #[serde(default)]
         controller_damage: u32,
+    },
+    /// CR 510.1d + CR 702.22k: Assign a blocking creature's combat damage,
+    /// divided as the active player chooses, among the creatures it is blocking.
+    /// Answers a `WaitingFor::AssignBlockerDamage` prompt. Each `(ObjectId, u32)`
+    /// is `(attacker_being_blocked, damage)`; the amounts must sum to the
+    /// blocker's combat power. Unlike `AssignCombatDamage`, there is no lethal,
+    /// trample, or planeswalker dimension — a blocker only ever assigns to the
+    /// attackers it blocks.
+    AssignBlockerDamage {
+        assignments: Vec<(ObjectId, u32)>,
     },
     /// CR 601.2d: Distribute N among targets at casting time.
     DistributeAmong {
@@ -605,6 +663,10 @@ pub enum GameAction {
     CastPreparedCopy {
         source: ObjectId,
     },
+    /// Digital-only Specialize: pick the color specialization to apply.
+    ChooseSpecializeColor {
+        color: super::mana::ManaColor,
+    },
     /// CR 702.xxx: Paradigm (Strixhaven) — accept the turn-based offer during
     /// `WaitingFor::CastOffer` (Paradigm), casting a token copy of the exiled
     /// source spell without paying its mana cost. The exiled source stays in
@@ -658,6 +720,13 @@ pub enum LearnOption {
     Skip,
 }
 
+/// Serde default for debug spawn `run_etb` flags: omitting the field means
+/// "run the ETB pipeline", preserving the historical always-ETB behavior for
+/// any payload that predates the toggle.
+fn default_true() -> bool {
+    true
+}
+
 /// Direct game-state manipulation actions for debugging, testing, and remediation.
 /// Bypasses `WaitingFor` validation — fires from any game state without disrupting
 /// the current prompt. Gated on `GameState::debug_mode`.
@@ -689,14 +758,30 @@ pub enum DebugAction {
         zone: Zone,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attach_to: Option<AttachTarget>,
+        /// When `true`, route a `Battlefield` spawn through the real ETB pipeline
+        /// (replacements → ETB triggers → SBAs). When `false`, place the card raw
+        /// with no entry effects — mirrors `MoveToZone { simulate: false }`. Only
+        /// consulted for `zone == Battlefield`; ignored for other destinations.
+        #[serde(default = "default_true")]
+        run_etb: bool,
     },
     /// Remove an object from the game entirely.
     RemoveObject { object_id: ObjectId },
+    /// CR 701.21: Sacrifice a permanent — route through the single sacrifice
+    /// authority so the replacement pipeline and dies/leaves-the-battlefield
+    /// triggers fire. Distinct from `RemoveObject`, which deletes the object
+    /// outright with no triggers. The sacrificing player is the permanent's
+    /// controller.
+    Sacrifice { object_id: ObjectId },
     /// Draw N cards using the real draw pipeline (CR 121.1).
     /// Routes through replacement effects and emits CardDrawn events.
     DrawCards { player_id: PlayerId, count: u32 },
     /// Mill N cards from library to graveyard.
     Mill { player_id: PlayerId, count: u32 },
+    /// CR 701.20a: Reveal the top N card(s) of a player's library using the real
+    /// `Effect::RevealTop` resolver — marks them revealed and emits
+    /// `CardsRevealed` without moving the cards (CR 701.20b).
+    Reveal { player_id: PlayerId, count: u32 },
     /// Shuffle a player's library.
     ShuffleLibrary { player_id: PlayerId },
     /// Start a proliferate choice for a player using the real proliferate
@@ -776,6 +861,12 @@ pub enum DebugAction {
         player_id: PlayerId,
         mana: Vec<ManaType>,
     },
+    /// Toggle "infinite mana" for a player (debug-only). While `enabled`, the
+    /// engine keeps the player's mana pool topped up after every action and
+    /// suppresses the end-of-step empty (CR 500.5) for that player, so any cost
+    /// is payable. Setting `enabled = false` clears the toggle; the pool then
+    /// empties normally on the next step transition. Off by default.
+    SetInfiniteMana { player_id: PlayerId, enabled: bool },
 
     // ── Game Flow ─────────────────────────────────────────────────────────
     /// Advance or rewind to a specific phase/step.
@@ -797,7 +888,16 @@ pub enum DebugAction {
     /// `TokenSpec::enter_with_counters` — same semantics, real pipeline.
     /// CR 122.6a (counters placed at ETB), CR 614.1 (replacement window),
     /// CR 704.5f (0-toughness SBA — why this field exists).
-    CreateToken { request: DebugTokenRequest },
+    ///
+    /// When `run_etb` is `true`, the created token's ETB triggers are placed on
+    /// the stack and SBAs run; when `false`, the token is still created (with its
+    /// replacement-window counters) but its "when ~ enters" triggers and the SBA
+    /// pass are skipped — mirrors `MoveToZone { simulate: false }`.
+    CreateToken {
+        request: DebugTokenRequest,
+        #[serde(default = "default_true")]
+        run_etb: bool,
+    },
     /// Create a token copy of an existing object using the real copy-token
     /// resolver (CR 707.2).
     CreateTokenCopy {
@@ -892,6 +992,7 @@ impl DebugAction {
                 owner,
                 zone,
                 attach_to,
+                run_etb,
             } => {
                 let attach_suffix = match attach_to {
                     Some(AttachTarget::Object(id)) => format!(" attached to {}", obj(*id)),
@@ -900,16 +1001,24 @@ impl DebugAction {
                     }
                     None => String::new(),
                 };
+                let etb_suffix = if *run_etb { "" } else { " (no ETB)" };
                 format!(
-                    "CreateCard ({} for {} in {:?}{})",
+                    "CreateCard ({} for {} in {:?}{}{})",
                     card_name,
                     player_label(*owner),
                     zone,
                     attach_suffix,
+                    etb_suffix,
                 )
             }
             DebugAction::RemoveObject { object_id } => {
                 format!("RemoveObject ({})", obj(*object_id))
+            }
+            DebugAction::Sacrifice { object_id } => {
+                format!("Sacrifice ({})", obj(*object_id))
+            }
+            DebugAction::Reveal { player_id, count } => {
+                format!("Reveal (top {} of {})", count, player_label(*player_id))
             }
             DebugAction::DrawCards { player_id, count } => {
                 format!("DrawCards ({} draws {})", player_label(*player_id), count)
@@ -1016,6 +1125,11 @@ impl DebugAction {
             DebugAction::AddMana { player_id, mana } => {
                 format!("AddMana ({} gains {:?})", player_label(*player_id), mana)
             }
+            DebugAction::SetInfiniteMana { player_id, enabled } => format!(
+                "SetInfiniteMana ({} {})",
+                player_label(*player_id),
+                if *enabled { "on" } else { "off" }
+            ),
             DebugAction::SetPhase {
                 phase,
                 active_player,
@@ -1025,7 +1139,7 @@ impl DebugAction {
                 player_label(*active_player)
             ),
             DebugAction::RunStateBasedActions => "RunStateBasedActions".to_string(),
-            DebugAction::CreateToken { request } => {
+            DebugAction::CreateToken { request, run_etb } => {
                 let counters = if request.enter_with_counters().is_empty() {
                     String::new()
                 } else {
@@ -1042,11 +1156,13 @@ impl DebugAction {
                         characteristics, ..
                     } => characteristics.display_name.as_str(),
                 };
+                let etb_suffix = if *run_etb { "" } else { " (no ETB)" };
                 format!(
-                    "CreateToken ({} for {}{})",
+                    "CreateToken ({} for {}{}{})",
                     token_label,
                     player_label(request.owner()),
-                    counters
+                    counters,
+                    etb_suffix
                 )
             }
             DebugAction::CreateTokenCopy { source_id, owner } => format!(
@@ -1101,24 +1217,16 @@ impl GameAction {
     pub fn source_object(&self) -> Option<ObjectId> {
         match self {
             GameAction::PlayLand { object_id, .. } => Some(*object_id),
-            GameAction::CastSpell { object_id, .. }
-            | GameAction::CastSpellWithPaymentMode { object_id, .. } => Some(*object_id),
+            GameAction::CastSpell { object_id, .. } => Some(*object_id),
             GameAction::Foretell { object_id, .. } => Some(*object_id),
-            GameAction::CastSpellAsSneak { hand_object, .. }
-            | GameAction::CastSpellAsSneakWithPaymentMode { hand_object, .. } => Some(*hand_object),
-            GameAction::CastSpellAsWebSlinging { hand_object, .. }
-            | GameAction::CastSpellAsWebSlingingWithPaymentMode { hand_object, .. } => {
-                Some(*hand_object)
-            }
+            GameAction::CastSpellAsSneak { hand_object, .. } => Some(*hand_object),
+            GameAction::CastSpellAsWebSlinging { hand_object, .. } => Some(*hand_object),
             GameAction::ActivateNinjutsu {
                 ninjutsu_object_id, ..
             } => Some(*ninjutsu_object_id),
             GameAction::CastSpellForFree { object_id, .. }
-            | GameAction::CastSpellForFreeWithPaymentMode { object_id, .. }
             | GameAction::CastSpellAsMiracle { object_id, .. }
-            | GameAction::CastSpellAsMiracleWithPaymentMode { object_id, .. }
-            | GameAction::CastSpellAsMadness { object_id, .. }
-            | GameAction::CastSpellAsMadnessWithPaymentMode { object_id, .. } => Some(*object_id),
+            | GameAction::CastSpellAsMadness { object_id, .. } => Some(*object_id),
             GameAction::ActivateAbility { source_id, .. } => Some(*source_id),
             GameAction::TapLandForMana { object_id } => Some(*object_id),
             GameAction::UntapLandForMana { object_id } => Some(*object_id),
@@ -1134,6 +1242,7 @@ impl GameAction {
             GameAction::ChoosePair { partner } => *partner,
             GameAction::ChooseDamageSource { source } => Some(*source),
             GameAction::ChooseUntap { object_id, .. } => Some(*object_id),
+            GameAction::ChooseEnlist { target } => *target,
             GameAction::TapForConvoke { object_id, .. } => Some(*object_id),
             GameAction::ChooseLegend { keep } => Some(*keep),
             GameAction::CastPreparedCopy { source } => Some(*source),
@@ -1146,6 +1255,7 @@ impl GameAction {
             | GameAction::MulliganDecision { .. }
             | GameAction::ReorderHand { .. }
             | GameAction::SelectCards { .. }
+            | GameAction::ChooseRemoveCounterCostDistribution { .. }
             | GameAction::SelectCoinFlips { .. }
             | GameAction::ChooseOutsideGameCards { .. }
             | GameAction::SelectTargets { .. }
@@ -1156,11 +1266,13 @@ impl GameAction {
             | GameAction::SubmitSideboard { .. }
             | GameAction::ChoosePlayDraw { .. }
             | GameAction::ChooseOption { .. }
+            | GameAction::SubmitSpellbookDraft { .. }
             | GameAction::SubmitPilePartition { .. }
             | GameAction::ChoosePile { .. }
             | GameAction::ChooseBranch { .. }
             | GameAction::SelectModes { .. }
             | GameAction::DecideOptionalCost { .. }
+            | GameAction::RespondToSpliceOffer { .. }
             | GameAction::ChooseAdventureFace { .. }
             | GameAction::ChooseModalFace { .. }
             | GameAction::ChooseAlternativeCast { .. }
@@ -1174,18 +1286,26 @@ impl GameAction {
             | GameAction::PayCombatTax { .. }
             | GameAction::ChooseDungeon { .. }
             | GameAction::ChooseDungeonRoom { .. }
+            | GameAction::ChooseSpecializeColor { .. }
             | GameAction::HarmonizeTap { .. }
             | GameAction::DeclareCompanion { .. }
             | GameAction::CompanionToHand
             | GameAction::DiscoverChoice { .. }
             | GameAction::CascadeChoice { .. }
+            | GameAction::RippleChoice { .. }
+            | GameAction::FreeCastWindowChoice { .. }
             | GameAction::ChooseTopOrBottom { .. }
+            | GameAction::ChooseMutateMergeSide { .. }
+            | GameAction::CipherEncode { .. }
             | GameAction::ChooseClashOpponent { .. }
+            | GameAction::ChooseAssistPlayer { .. }
+            | GameAction::CommitAssistPayment { .. }
             | GameAction::ChooseBattleProtector { .. }
             | GameAction::SetAutoPass { .. }
             | GameAction::CancelAutoPass
             | GameAction::SetPhaseStops { .. }
             | GameAction::AssignCombatDamage { .. }
+            | GameAction::AssignBlockerDamage { .. }
             | GameAction::DistributeAmong { .. }
             | GameAction::ChooseCounterMoveDistribution { .. }
             | GameAction::SubmitPayAmount { .. }
@@ -1235,6 +1355,8 @@ mod tests {
             object_id: ObjectId(5),
             card_id: CardId(1),
             targets: vec![ObjectId(10), ObjectId(20)],
+
+            payment_mode: crate::types::game_state::CastPaymentMode::Auto,
         };
         let json = serde_json::to_value(&action).unwrap();
         assert_eq!(json["type"], "CastSpell");
@@ -1269,6 +1391,7 @@ mod tests {
                 (ObjectId(1), AttackTarget::Player(PlayerId(1))),
                 (ObjectId(2), AttackTarget::Planeswalker(ObjectId(99))),
             ],
+            bands: vec![],
         };
         let serialized = serde_json::to_string(&action).unwrap();
         let deserialized: GameAction = serde_json::from_str(&serialized).unwrap();
@@ -1295,6 +1418,7 @@ mod tests {
     fn declare_attackers_empty_attacks_roundtrips() {
         let action = GameAction::DeclareAttackers {
             attacks: Vec::new(),
+            bands: vec![],
         };
         let serialized = serde_json::to_string(&action).unwrap();
         let deserialized: GameAction = serde_json::from_str(&serialized).unwrap();
@@ -1318,6 +1442,8 @@ mod tests {
                     object_id: oid,
                     card_id: cid,
                     targets: vec![],
+
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto,
                 },
                 Some(oid),
             ),
@@ -1347,6 +1473,8 @@ mod tests {
                     hand_object: oid,
                     card_id: cid,
                     creature_to_return: ObjectId(99),
+
+                    payment_mode: crate::types::game_state::CastPaymentMode::Auto,
                 },
                 Some(oid),
             ),

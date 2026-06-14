@@ -1,10 +1,21 @@
 import type { GroupedPermanent } from "../../viewmodel/battlefieldProps.ts";
 
-export type BattlefieldRowType = "creatures" | "lands" | "support" | "other";
+export type BattlefieldRowType = "creatures" | "lands" | "support" | "planeswalkers" | "other";
 export type GroupRenderMode = "single" | "staggered" | "expanded" | "collapsed";
 
 export const GROUP_COLLAPSE_THRESHOLD = 5;
-export const GROUP_STAGGER_PX = 20;
+
+const GROUP_STAGGER_PX_BY_ROW: Record<BattlefieldRowType, number> = {
+  creatures: 20,
+  lands: 10,
+  support: 14,
+  planeswalkers: 14,
+  other: 14,
+};
+
+export function groupStaggerPx(rowType: BattlefieldRowType): number {
+  return GROUP_STAGGER_PX_BY_ROW[rowType];
+}
 
 interface GroupRenderOptions {
   manualExpanded: boolean;

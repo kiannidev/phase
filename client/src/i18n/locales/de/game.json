@@ -81,11 +81,73 @@
   "board": {
     "regroupCreatures": "Doppelte Kreaturengruppen neu gruppieren",
     "changeBackground": "Hintergrund ändern…",
+    "customizeLayout": "Layout anpassen…",
     "gameLog": "Spielprotokoll",
     "debugLog": "Debug-Protokoll",
     "waitingForGame": "Warten auf Spiel...",
     "clickOpponent": "Klicke auf einen Gegner, um sein Spielfeld anzusehen",
     "undo": "Rückgängig"
+  },
+  "battlefieldOverflow": {
+    "close": "Close",
+    "groupCount_one": "{{count}} group",
+    "groupCount_other": "{{count}} groups",
+    "noAvailablePips": "No pips",
+    "lands": {
+      "label": "Lands",
+      "open_one": "Open lands drawer ({{count}} land)",
+      "open_other": "Open lands drawer ({{count}} lands)",
+      "pipTooltip_one": "{{count}} hidden land can currently produce",
+      "pipTooltip_other": "{{count}} hidden lands can currently produce",
+      "pipAvailability": "{{untapped}} von {{total}} ungetappt",
+      "title_one": "Lands ({{count}})",
+      "title_other": "Lands ({{count}})"
+    },
+    "creatures": {
+      "label": "Creatures",
+      "open_one": "Open creatures drawer ({{count}} creature)",
+      "open_other": "Open creatures drawer ({{count}} creatures)",
+      "title_one": "Creatures ({{count}})",
+      "title_other": "Creatures ({{count}})",
+      "totalPower": "{{power}}/{{toughness}} total power and toughness",
+      "viewAll": "Click to view all",
+      "scrollHint": "Scroll"
+    },
+    "support": {
+      "label": "Support",
+      "open_one": "Open support drawer ({{count}} permanent)",
+      "open_other": "Open support drawer ({{count}} permanents)",
+      "title_one": "Support ({{count}})",
+      "title_other": "Support ({{count}})",
+      "artifacts": "Art",
+      "enchantments": "Ench",
+      "planeswalkers": "PW",
+      "other": "Other"
+    },
+    "supportTooltips": {
+      "artifacts": "Hidden artifact permanents in this support drawer.",
+      "enchantments": "Hidden enchantment permanents in this support drawer.",
+      "planeswalkers": "Hidden planeswalkers in this support drawer.",
+      "other": "Other hidden nonland permanents in this support drawer."
+    },
+    "badges": {
+      "activate": "act",
+      "attack": "atk",
+      "attacking": "atk",
+      "incoming": "in",
+      "mana": "mana",
+      "selected": "sel",
+      "target": "target"
+    },
+    "badgeTooltips": {
+      "activate": "Hidden objects with activated abilities available.",
+      "attack": "Hidden creatures eligible to attack.",
+      "attacking": "Hidden creatures currently attacking.",
+      "incoming": "Attacks currently aimed at hidden objects in this drawer.",
+      "mana": "Hidden objects that can be tapped for mana.",
+      "selected": "Hidden objects currently selected for the active choice.",
+      "target": "Hidden objects that are legal targets."
+    }
   },
   "permanent": {
     "expandGroup": "{{name}}-Gruppe aufklappen",
@@ -113,6 +175,7 @@
     "creaturesAbbr": "Krt",
     "landsAbbr": "Lnd",
     "otherAbbr": "Snst",
+    "manaAvailable": "{{untapped}} von {{total}} Ländern ungetappt",
     "out": "RAUS",
     "eliminated": "Ausgeschieden",
     "phasedOut": "Ausgephast",
@@ -243,6 +306,20 @@
     "experienceTooltip": "Erfahrungsmarken: {{count}}",
     "speedAriaLabel": "Tempo {{value}}",
     "speedTooltip": "Tempo: {{value}}",
+    "condCantWin": "Kann das Spiel nicht gewinnen",
+    "condCantGainLife": "Kann keine Lebenspunkte dazugewinnen",
+    "condCantLoseLife": "Kann keine Lebenspunkte verlieren",
+    "condCantPayLife": "Kann keine Lebenspunkte als Kosten bezahlen",
+    "condCantCast": "Kann keine Zauber wirken",
+    "condCantActivate": "Kann keine Fähigkeiten aktivieren",
+    "condCastOnlyFromZones": "Kann nur aus bestimmten Zonen wirken",
+    "condFromSource": "{{condition}} — von {{name}}",
+    "pendingSpell": "Nächster Zauber",
+    "pendingCantBeCountered": "Nächster Zauber kann nicht neutralisiert werden",
+    "pendingHasKeyword": "Nächster Zauber hat {{keyword}}",
+    "pendingFlash": "Nächster Zauber kann gewirkt werden, als hätte er Blitz",
+    "pendingFree": "Nächster Zauber, ohne seine Manakosten zu bezahlen",
+    "pendingCheaper": "Nächster Zauber kostet {{amount}} weniger",
     "companion": "Gefährte"
   },
   "avatar": {
@@ -264,6 +341,7 @@
     "grantsProperty": "Verleiht dem Zauberspruch eine Eigenschaft"
   },
   "zone": {
+    "commandZone": "Kommandozone",
     "emblem": "Emblem",
     "emblemFallback": "Emblem",
     "commander": "Kommandeur",
@@ -283,6 +361,8 @@
     "graveyardShort": "FH",
     "graveyardTitle": "Friedhof ({{count}})",
     "libraryAlt": "Bibliothek",
+    "library": "Bibliothek",
+    "libraryLower": "Bibliothek",
     "libraryCount_one": "Bibliothek ({{count}} Karte)",
     "libraryCount_other": "Bibliothek ({{count}} Karten)",
     "playFromTop": "{{name}} von oben aus der Bibliothek spielen",
@@ -308,6 +388,7 @@
     "convokeHint": "Tappe Kreaturen, um die Bezahlung zu unterstützen.",
     "improviseHint": "Tappe Artefakte, um die Bezahlung zu unterstützen.",
     "convokeOrImproviseHint": "Tappe Kreaturen oder Artefakte, um die Bezahlung zu unterstützen.",
+    "convokeStaged": "Getappt:",
     "lifeAmount": "2 Leben",
     "lifeCostSummary": "({{count}} Leben)",
     "paymentPending": "Die Bezahlung steht noch aus. Tappe bleibende Karten oder brich diese Aktion ab.",
@@ -318,7 +399,8 @@
     "chooseAmountAria": "Wähle die zu zahlende Menge",
     "payAmount": "{{value}} {{resource}} bezahlen",
     "resourceEnergy": "Energie",
-    "resourceMana": "Mana"
+    "resourceMana": "Mana",
+    "resourceCounters": "Marken"
   },
   "hand": {
     "viewFullHand_one": "Volle Hand ansehen ({{count}} Karte)",
@@ -354,6 +436,8 @@
     "expandHud": "Gegner-HUD erweitern. Zeigt die Handkarten und die Spielfeldaufschlüsselung jedes Gegners."
   },
   "combat": {
+    "band": "Bande",
+    "banded": "Bande ✓",
     "attackAll": "Alle angreifen",
     "skip": "Überspringen",
     "confirmAttackers": "Angreifer bestätigen ({{count}})",
@@ -409,6 +493,7 @@
     "chooseNewTargetForCopy": "Wähle ein neues Ziel für die Kopie",
     "chooseTargetForCopy": "Wähle ein Ziel für die Kopie",
     "chooseCreatureToExplore": "Wähle, welche Kreatur als Nächstes erkundet",
+    "chooseCreatureTokenToPopulate": "Wähle einen Kreaturspielstein zum Populieren",
     "chooseReturnAsAuraTarget": "Wähle eine bleibende Karte zum Verzaubern",
     "tapUntappedCreatures_one": "Tappe {{count}} ungetappte Kreatur",
     "tapUntappedCreatures_other": "Tappe {{count}} ungetappte Kreaturen",
@@ -420,6 +505,7 @@
     "one": "eine {{target}}",
     "nounPlayer": "Spieler",
     "nounNonlandPermanent": "bleibende Nichtländer-Karte",
+    "nounSpell": "Spruch",
     "nounCreature": "Kreatur",
     "nounPlaneswalker": "Planeswalker",
     "nounTargetPermanent": "bleibende Karte als Ziel",
@@ -480,7 +566,26 @@
     "companionRevealed": "{{player}} hat den Gefährten aufgedeckt: {{cardName}}",
     "companionMovedToHand": "{{player}} hat den Gefährten {{cardName}} auf die Hand genommen",
     "powerToughnessChanged": "Objekt {{objectId}} ist jetzt {{power}}/{{toughness}} ({{powerDelta}}/{{toughnessDelta}})",
-    "genericEvent": "Ereignis: {{type}}"
+    "genericEvent": "Ereignis: {{type}}",
+    "searchPlaceholder": "Search log…",
+    "allTurns": "All turns",
+    "turnChip": "T{{turn}}",
+    "entryCount": "{{count}} entries",
+    "copy": "Copy",
+    "export": "Export",
+    "categoryGame": "Game",
+    "categoryTurn": "Turn",
+    "categoryStack": "Stack",
+    "categoryCombat": "Combat",
+    "categoryZone": "Zone",
+    "categoryLife": "Life",
+    "categoryMana": "Mana",
+    "categoryState": "State",
+    "categoryToken": "Token",
+    "categoryTrigger": "Trigger",
+    "categorySpecial": "Special",
+    "categoryDestroy": "Destroy",
+    "categoryDebug": "Debug"
   },
   "coverage": {
     "engineTools": "Engine-Werkzeuge",
@@ -684,6 +789,15 @@
       "decline": "Nicht anstrengen",
       "declineDescription": "{{name}} greift normal an und enttappt wie üblich."
     },
+    "enlist": {
+      "attackerFallback": "Attacker",
+      "creatureFallback": "Creature",
+      "title": "Enlist for {{name}}?",
+      "subtitle": "Choose a creature to tap for this Enlist instance.",
+      "tapDescription": "Tap {{name}} so {{attacker}} gets power from it.",
+      "decline": "Don't enlist",
+      "declineDescription": "{{attacker}} attacks without enlisting a creature."
+    },
     "cost": {
       "discardCard": "eine Karte abwerfen",
       "life": "{{amount}} Leben",
@@ -702,6 +816,14 @@
       "titleChooseOne": "{{effect}}, sofern du nicht eines bezahlst",
       "dontPay": "Nicht bezahlen",
       "takeEffect": "Den Effekt hinnehmen"
+    },
+    "spliceOffer": {
+      "title": "An Arkan koppeln?",
+      "subtitle": "Wähle eine Karte, die du vorzeigst und in diesen Zauberspruch einkoppelst, oder wirke ohne Kopplung.",
+      "spliceCard": "{{name}} einkoppeln",
+      "decline": "Nicht einkoppeln",
+      "declineDescription": "Wirke den Zauberspruch, ohne den Text einer anderen Karte hinzuzufügen.",
+      "unknownCard": "Karte #{{id}}"
     },
     "activationCost": {
       "title": "Aktivierungskosten wählen"
@@ -817,6 +939,12 @@
       "title": "Ringträger wählen",
       "subtitle": "Wähle eine Kreatur, die du kontrollierst"
     },
+    "learn": {
+      "title": "Learn",
+      "subtitle": "Discard a card to draw a card, or skip",
+      "labelRummage": "Discard & draw",
+      "labelSkip": "Skip"
+    },
     "reorderHint": "Zum Umsortieren ziehen · die oberste Karte wird zuerst gezogen",
     "scry": {
       "title": "Hellsicht",
@@ -892,6 +1020,7 @@
       "titleSacrifice": "Opfern",
       "titleTopdeck": "Auf die Bibliothek legen",
       "titleBattlefield": "Auf das Schlachtfeld legen",
+      "titleHand": "Zurückgeben",
       "subtitleSacrificeExact_one": "Wähle {{count}} bleibende Karte zum Opfern",
       "subtitleSacrificeExact_other": "Wähle {{count}} bleibende Karten zum Opfern",
       "subtitleSacrificeUpTo_one": "Wähle bis zu {{count}} bleibende Karte zum Opfern",
@@ -910,12 +1039,19 @@
       "subtitleBattlefieldUpTo_other": "Wähle bis zu {{count}} Karten, um sie auf das Schlachtfeld zu legen",
       "subtitleBattlefieldRange_one": "Wähle {{min}}-{{count}} Karte, um sie auf das Schlachtfeld zu legen",
       "subtitleBattlefieldRange_other": "Wähle {{min}}-{{count}} Karten, um sie auf das Schlachtfeld zu legen",
+      "subtitleHandExact_one": "Wähle {{count}} bleibende Karte, um sie in die Hand ihres Besitzers zurückzugeben",
+      "subtitleHandExact_other": "Wähle {{count}} bleibende Karten, um sie in die Hand ihrer Besitzer zurückzugeben",
+      "subtitleHandUpTo_one": "Wähle bis zu {{count}} bleibende Karte, um sie in die Hand ihres Besitzers zurückzugeben",
+      "subtitleHandUpTo_other": "Wähle bis zu {{count}} bleibende Karten, um sie in die Hand ihrer Besitzer zurückzugeben",
+      "subtitleHandRange_one": "Wähle {{min}}-{{count}} bleibende Karte, um sie in die Hand ihres Besitzers zurückzugeben",
+      "subtitleHandRange_other": "Wähle {{min}}-{{count}} bleibende Karten, um sie in die Hand ihrer Besitzer zurückzugeben",
       "labelSkip": "Überspringen",
       "labelDecline": "Ablehnen",
       "labelPutOnTop": "Oben drauflegen ({{order}})",
       "labelConfirm": "Bestätigen ({{selected}}/{{count}})",
       "labelTop": "Oben ({{selected}}/{{count}})",
       "labelPut": "Legen ({{selected}}/{{count}})",
+      "labelReturn": "Zurückgeben ({{selected}}/{{count}})",
       "orderTop": "Oben"
     },
     "drawnThisTurn": {
@@ -1011,6 +1147,12 @@
       "subtitle_one": "Schicke {{count}} Karte aus {{source}} ins Exil",
       "subtitle_other": "Schicke {{count}} Karten aus {{source}} ins Exil"
     },
+    "craft": {
+      "title": "Herstellen",
+      "subtitle_one": "Schicke {{count}} Material zum Herstellen ins Exil",
+      "subtitle_other": "Schicke {{count}} Materialien zum Herstellen ins Exil",
+      "subtitleRange": "Schicke {{min}} bis {{count}} Materialien zum Herstellen ins Exil"
+    },
     "behold": {
       "title": "Erblicken",
       "subtitleExile": "Schicke eine passende bleibende Karte oder Karte ins Exil",
@@ -1093,6 +1235,16 @@
       "subtitle": "Wähle, welche Manakombination erzeugt wird"
     }
   },
+  "specializeColor": {
+    "title": "Spezialisierung wählen",
+    "subtitle": "Wähle eine Farbe, die zur abgeworfenen Karte passt",
+    "confirm": "Spezialisieren",
+    "white": "Weiß",
+    "blue": "Blau",
+    "black": "Schwarz",
+    "red": "Rot",
+    "green": "Grün"
+  },
   "dialogShell": {
     "eyebrow": "Spielentscheidung",
     "restoreDialog": "Dialog wiederherstellen",
@@ -1118,16 +1270,45 @@
     "adventureTag": "(Abenteuer)"
   },
   "alternativeCost": {
+    "blitzEyebrow": "Blitz",
+    "blitzNormalLabel": "Cast Normally",
+    "blitzAltLabel": "Blitz",
+    "blitzSubtitle": "Cast {{name}} normally, or pay its Blitz cost — it gains haste and \"when it dies, draw a card\", but is sacrificed at the beginning of the next end step.",
+    "mutateEyebrow": "Mutate",
+    "mutateNormalLabel": "Cast Normally",
+    "mutateAltLabel": "Mutate",
+    "mutateSubtitle": "Cast {{name}} normally, or pay its Mutate cost to merge it with a non-Human creature you own.",
     "title": "Wirkkosten wählen",
     "warpEyebrow": "Warp",
     "warpNormalLabel": "Normal wirken",
     "warpAltLabel": "Mit Warp wirken",
     "warpAltSuffix": "(wird im Endschritt ins Exil geschickt)",
     "warpSubtitle": "Wirke {{name}} normal oder nutze seine Warp-Kosten.",
+    "dashEyebrow": "Dash",
+    "dashNormalLabel": "Normal wirken",
+    "dashAltLabel": "Mit Dash wirken",
+    "dashAltSuffix": "(erhält Eile, kehrt im Endschritt auf die Hand zurück)",
+    "dashSubtitle": "Wirke {{name}} normal oder nutze seine Dash-Kosten.",
     "evokeEyebrow": "Herbeirufen",
     "evokeNormalLabel": "Normal wirken",
     "evokeAltLabel": "Mit Herbeirufen wirken",
     "evokeSubtitle": "Wirke {{name}} normal oder wirke es für seine Herbeirufen-Kosten.",
+    "emergeEyebrow": "Auftauchen",
+    "emergeNormalLabel": "Normal wirken",
+    "emergeAltLabel": "Mit Auftauchen wirken",
+    "emergeSubtitle": "Wirke {{name}} normal oder zahle seine Auftauchen-Kosten, reduziert um den Manawert einer Kreatur, die du opferst.",
+    "impendingEyebrow": "Drohend",
+    "impendingNormalLabel": "Als Kreatur wirken",
+    "impendingAltLabel": "Mit Drohend wirken",
+    "impendingSubtitle": "Wirke {{name}} normal als Kreatur oder zahle seine Drohend-Kosten – es kommt mit Zeitmarken ins Spiel und ist keine Kreatur, bis die letzte entfernt wurde.",
+    "prototypeEyebrow": "Prototyp",
+    "prototypeNormalLabel": "Normal wirken",
+    "prototypeAltLabel": "Mit Prototyp wirken",
+    "prototypeSubtitle": "Wirke {{name}} normal oder zahle seine Prototyp-Kosten, um es mit seiner Prototyp-Farbe, seinem Prototyp-Manawert, seiner Prototyp-Stärke und -Widerstandskraft zu wirken.",
+    "spectacleEyebrow": "Spektakel",
+    "spectacleNormalLabel": "Normal wirken",
+    "spectacleAltLabel": "Mit Spektakel wirken",
+    "spectacleSubtitle": "Wirke {{name}} normal oder zahle seine Spektakel-Kosten (verfügbar, weil ein Gegner in diesem Zug Lebenspunkte verloren hat).",
     "overloadEyebrow": "Überladen",
     "overloadNormalLabel": "Normal wirken",
     "overloadAltLabel": "Mit Überladen wirken",
@@ -1148,6 +1329,22 @@
     "mtmteNormalLabel": "Cast Normally",
     "mtmteAltLabel": "Cast Converted",
     "mtmteSubtitle": "Cast {{name}} normally, or pay its More Than Meets the Eye cost to cast it converted (transformed, back face up).",
+    "emergeEyebrow": "Auftauchen",
+    "emergeNormalLabel": "Normal wirken",
+    "emergeAltLabel": "Mit Auftauchen wirken",
+    "emergeSubtitle": "Wirke {{name}} normal oder zahle seine Auftauchen-Kosten, indem du eine Kreatur opferst, was die Kosten um den Manawert dieser Kreatur reduziert.",
+    "impendingEyebrow": "Drohend",
+    "impendingNormalLabel": "Normal wirken",
+    "impendingAltLabel": "Mit Drohend wirken",
+    "impendingSubtitle": "Wirke {{name}} normal oder zahle seine Drohend-Kosten — es kommt mit Zeitmarken ins Spiel und ist keine Kreatur, bis die letzte entfernt wurde.",
+    "prototypeEyebrow": "Prototyp",
+    "prototypeNormalLabel": "Normal wirken",
+    "prototypeAltLabel": "Mit Prototyp wirken",
+    "prototypeSubtitle": "Wirke {{name}} normal oder zahle seine Prototyp-Kosten, um es mit seiner geringeren Stärke, Widerstandskraft und Farbe zu wirken.",
+    "spectacleEyebrow": "Spektakel",
+    "spectacleNormalLabel": "Normal wirken",
+    "spectacleAltLabel": "Mit Spektakel wirken",
+    "spectacleSubtitle": "Wirke {{name}} normal oder zahle seine Spektakel-Kosten (verfügbar, weil ein Gegner in diesem Zug Lebenspunkte verloren hat).",
     "additionalExile": "+ Eine Karte ins Exil schicken",
     "additionalSacrifice": "+ Eine bleibende Karte opfern",
     "additionalPayLife": "+ Leben bezahlen",
@@ -1164,6 +1361,18 @@
     "title": "Kampf-Gegner wählen",
     "subtitle": "Wähle, welcher Gegner mit dir kämpft."
   },
+  "assist": {
+    "choose": {
+      "title": "Choose a Player to Assist",
+      "subtitle": "Choose another player who may pay up to {{max}} generic mana for this spell.",
+      "decline": "Decline"
+    },
+    "payment": {
+      "title": "Assist: Pay Generic Mana",
+      "commit": "Pay {{value}}",
+      "decline": "Pay nothing"
+    }
+  },
   "cardDataMissing": {
     "title": "Kartendaten fehlen",
     "body": "<code>card-data.json</code> wurde nicht gefunden. Das Spiel benötigt Kartendefinitionen, um mit echten Karten zu spielen.",
@@ -1174,15 +1383,27 @@
   "cascadeChoice": {
     "cascadeEyebrow": "Kaskade",
     "discoverEyebrow": "Entdecken",
+    "rippleEyebrow": "Ripple",
     "title": "{{name}} wirken?",
     "subtitleCascade": "Kaskade hat {{name}} ins Exil geschickt (Manawert unter {{sourceMv}}). Wirke es, ohne seine Manakosten zu bezahlen, oder lehne ab und mische alle {{total}} ins Exil geschickten Karten unter deine Bibliothek.",
     "subtitleDiscover": "Entdecken hat {{name}} ins Exil geschickt. Wirke es, ohne seine Manakosten zu bezahlen, oder nimm es auf deine Hand und mische die anderen {{missCount}} ins Exil geschickten Karten unter deine Bibliothek.",
+    "subtitleRipple": "Ripple hat {{name}} aufgedeckt. Wirke es, ohne seine Manakosten zu bezahlen, oder lehne ab und lege alle {{total}} aufgedeckten Karten in zufälliger Reihenfolge unter deine Bibliothek.",
     "castNamed": "{{name}} wirken",
     "castSuffix": "(ohne seine Manakosten zu bezahlen)",
     "putIntoHand": "Auf die Hand nehmen",
     "decline": "Ablehnen",
     "discoverDeclineSuffix": "(den Rest unter die Bibliothek legen)",
     "cascadeDeclineSuffix": "(alle ins Exil geschickten Karten unter die Bibliothek mischen)"
+  },
+  "freeCastWindow": {
+    "eyebrow": "Kostenlos wirken",
+    "title": "Wirke einen Zauberspruch kostenlos",
+    "subtitle": "Wähle einen Zauberspruch, den du ohne Bezahlung seiner Manakosten wirken möchtest ({{remaining}} übrig). Verbleibender Gesamtmanawert: {{budget}}.",
+    "subtitleNoBudget": "Wähle einen Zauberspruch, den du ohne Bezahlung seiner Manakosten wirken möchtest ({{remaining}} übrig).",
+    "castNamed": "{{name}} wirken",
+    "castSuffix": "(ohne seine Manakosten zu bezahlen)",
+    "done": "Fertig",
+    "doneSuffix": "(keine weiteren Zaubersprüche auf diese Weise wirken)"
   },
   "castingVariant": {
     "eyebrow": "Wirken",
@@ -1194,6 +1415,7 @@
     "variantEscape": "Mit Entrinnen wirken",
     "variantRetrace": "Mit Zurückverfolgen wirken",
     "variantHarmonize": "Mit Harmonisieren wirken",
+    "variantMayhem": "Mit Mayhem wirken",
     "variantFlashback": "Mit Flashback wirken",
     "variantAftermath": "Mit Nachwirkung wirken",
     "variantGraveyardPermission": "Aus dem Friedhof wirken",
@@ -1206,6 +1428,7 @@
     "variantForetell": "Aus Vorhersagen wirken",
     "variantOverload": "Mit Überladen wirken",
     "variantBestow": "Mit Verleihen wirken",
+    "variantFuse": "Mit Verschmelzen wirken",
     "variantFallback": "Mit {{type}} wirken"
   },
   "categoryChoice": {
@@ -1219,6 +1442,7 @@
     "eyebrow": "Wahl",
     "title": "Wähle eines",
     "subtitle": "Wähle die Option zum Auflösen.",
+    "subtitleBinary": "Wähle eine der beiden Optionen unten.",
     "optionFallback": "Option {{number}}"
   },
   "combatTax": {
@@ -1327,6 +1551,14 @@
     "reportTitle": "Nicht fataler Engine-Panic: {{summary}}",
     "reportWhatHappened": "**Was ist passiert**\n_beschreibe kurz, was du gerade getan hast_\n\n**Diagnose**\n```\n{{diagnostic}}\n```"
   },
+  "stuckDecision": {
+    "heading": "Game appears stuck",
+    "dismiss": "Dismiss",
+    "body": "phase.rs is waiting on a decision that has no available action, so the game can’t continue. This is a bug. Please <report>report it</report> so we can investigate.",
+    "dontShowAgain": "Don’t show again this session",
+    "reportTitle": "Stuck decision: {{kind}}",
+    "reportWhatHappened": "**What happened**\n_briefly describe what you were doing_\n\n**Diagnostic**\n```\n{{diagnostic}}\n```"
+  },
   "optionalEffect": {
     "sourceFallback": "Effekt",
     "title": "{{name}} - Optionaler Effekt",
@@ -1340,6 +1572,24 @@
     "top": "Top of library",
     "bottom": "Bottom of library"
   },
+  "mutateMerge": {
+    "cardFallback": "the mutating creature",
+    "title": "Mutate: {{name}}",
+    "subtitle": "Put the mutating creature on top of or under the target creature.",
+    "top": "On top",
+    "topDesc": "The merged creature uses the mutating creature's name, types, and power/toughness.",
+    "bottom": "On bottom",
+    "bottomDesc": "The merged creature keeps the target creature's name, types, and power/toughness."
+  },
+  "cipher": {
+    "cardFallback": "this card",
+    "creatureFallback": "a creature",
+    "title": "Cipher: {{name}}",
+    "subtitle": "Exile this card encoded on a creature you control, or decline.",
+    "encodeDesc": "Encode here. Whenever this creature deals combat damage to a player, you may cast a copy of the encoded card without paying its mana cost.",
+    "decline": "Don't encode",
+    "declineDesc": "Put this card into its owner's graveyard."
+  },
   "permanentTypeSlot": {
     "eyebrow": "Permanenttyp",
     "title": "Typ-Slot wählen",
@@ -1348,6 +1598,9 @@
   "proliferate": {
     "proliferateTitle": "Wuchern",
     "proliferateSubtitle": "Wähle eine beliebige Anzahl bleibender Karten und Spieler mit Marken. Jedes gewählte Ziel erhält eine weitere Marke jeder Art, die bereits dort vorhanden ist.",
+    "timeTravelTitle": "Zeitreise",
+    "timeTravelRemoveSubtitle": "Wähle eine beliebige Anzahl gültiger Objekte, von denen eine Zeitmarke entfernt werden soll.",
+    "timeTravelAddSubtitle": "Wähle eine beliebige Anzahl verbleibender gültiger Objekte, auf die eine Zeitmarke gelegt werden soll.",
     "chooseObjectsTitle": "Bleibende Karten wählen",
     "chooseObjectsSubtitle": "Wähle eine beliebige Anzahl bleibender Karten. Du zahlst für jede gewählte Karte Kosten.",
     "selectAll": "Alle",
@@ -1367,7 +1620,9 @@
     "scopeMulti": "Wähle neue Ziele für den Zauberspruch",
     "subtitle": "{{scope}}. Aktuell: {{current}}",
     "confirm": "Bestätigen",
-    "badgeNewTarget": "Neues Ziel"
+    "badgeNewTarget": "Neues Ziel",
+    "slotLabel": "Ziel {{index}}: {{current}} → {{chosen}}",
+    "unselected": "unverändert"
   },
   "separatePiles": {
     "chooserName": "Spieler {{number}}",
@@ -1465,5 +1720,10 @@
     "buttons": {
       "keep": "Keep this"
     }
+  },
+  "spectator": {
+    "banner": "Spectating — read only",
+    "leave": "Leave",
+    "watchingWith": "Also watching: {{names}}"
   }
 }

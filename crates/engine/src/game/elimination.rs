@@ -237,6 +237,24 @@ fn do_eliminate(state: &mut GameState, player: PlayerId, events: &mut Vec<GameEv
     // CR 800.4a: Remove spells they control from the stack
     state.stack.retain(|entry| entry.controller != player);
 
+    // CR 800.4a: Abandon any not-yet-resolved cast this player controls. A spell
+    // paused mid-cast (e.g. a convoke spell awaiting `WaitingFor::ManaPayment`)
+    // is held in `state.pending_cast`, not as a stack entry, so the stack retain
+    // above does not clear it. Left behind, the in-progress cast lingers in the
+    // GameState after the player leaves — and because the WASM engine is a
+    // singleton reused across games, it can resurface as a stuck mana-payment
+    // window in a later game. Only clear a pending cast the *leaving* player
+    // controls; another living player's mid-cast must survive an opponent's
+    // departure, so key off the spell object's controller (the caster).
+    if state
+        .pending_cast
+        .as_ref()
+        .and_then(|pc| state.objects.get(&pc.object_id))
+        .is_some_and(|obj| obj.controller == player)
+    {
+        state.pending_cast = None;
+    }
+
     // CR 800.4a: Exile permanents they own from the battlefield
     let to_exile: Vec<_> = state
         .battlefield
@@ -251,8 +269,14 @@ fn do_eliminate(state: &mut GameState, player: PlayerId, events: &mut Vec<GameEv
         })
         .collect();
 
+    // CR 800.4a: route the owner's objects to exile through the zone pipeline
+    // under the `PlayerLeftGame` exempt cause — "This is not a state-based
+    // action", and no replacement effect applies to a player leaving the game,
+    // so the consult is skipped while the unconditional primitive guards still
+    // run (PLAN §3).
     for id in to_exile {
-        super::zones::move_to_zone(state, id, Zone::Exile, events);
+        let req = crate::game::zone_pipeline::ZoneMoveRequest::player_left_game(id, Zone::Exile);
+        crate::game::zone_pipeline::move_object(state, req, events);
     }
 
     state.auto_pass.remove(&player);
@@ -340,6 +364,29 @@ fn do_eliminate(state: &mut GameState, player: PlayerId, events: &mut Vec<GameEv
         }
     }
 
+    // CR 901.10 / CR 311.5 / CR 312.4: If the planar controller leaves the game,
+    // the next player in turn order that isn't leaving becomes the planar
+    // controller (the active player normally, unless they're the one leaving).
+    // This is NOT a state-based action — it happens immediately on leave.
+    if state.planar_controller == Some(player) {
+        let any_alive = state
+            .players
+            .iter()
+            .any(|p| !p.is_eliminated && p.id != player);
+
+        if !any_alive {
+            state.planar_controller = None;
+        } else {
+            let new_controller =
+                if players::is_alive(state, state.active_player) && state.active_player != player {
+                    state.active_player
+                } else {
+                    players::next_player(state, player)
+                };
+            crate::game::planechase::set_planar_controller(state, new_controller, events);
+        }
+    }
+
     events.push(GameEvent::PlayerEliminated { player_id: player });
 }
 
@@ -400,9 +447,11 @@ pub(super) fn ensure_game_over_if_terminal(state: &mut GameState, events: &mut V
 mod tests {
     use super::*;
     use crate::game::zones::create_object;
+    use crate::types::ability::{Effect, ResolvedAbility};
     use crate::types::format::FormatConfig;
-    use crate::types::game_state::{CastingVariant, StackEntry, StackEntryKind};
-    use crate::types::identifiers::CardId;
+    use crate::types::game_state::{CastingVariant, PendingCast, StackEntry, StackEntryKind};
+    use crate::types::identifiers::{CardId, ObjectId};
+    use crate::types::mana::ManaCost;
 
     fn setup_two_player() -> GameState {
         let mut state = GameState::new_two_player(42);
@@ -613,6 +662,74 @@ mod tests {
         // Permanent should be exiled, not on battlefield
         assert!(!state.battlefield.contains(&id));
         assert!(state.exile.contains(&id));
+    }
+
+    /// Build a mid-cast spell (on the stack, awaiting payment) controlled by
+    /// `caster` and stash it in `state.pending_cast`, mirroring the engine state
+    /// during `WaitingFor::ManaPayment` (e.g. a convoke spell awaiting taps).
+    fn stash_pending_cast(state: &mut GameState, caster: PlayerId) -> ObjectId {
+        let obj_id = create_object(
+            state,
+            CardId(99),
+            caster,
+            "Convoke Spell".to_string(),
+            Zone::Stack,
+        );
+        if let Some(obj) = state.objects.get_mut(&obj_id) {
+            obj.controller = caster;
+        }
+        let ability = ResolvedAbility::new(
+            Effect::Unimplemented {
+                name: "test".to_string(),
+                description: None,
+            },
+            vec![],
+            obj_id,
+            caster,
+        );
+        state.pending_cast = Some(Box::new(PendingCast::new(
+            obj_id,
+            CardId(99),
+            ability,
+            ManaCost::NoCost,
+        )));
+        obj_id
+    }
+
+    // --- CR 800.4a: abandon the leaving player's in-progress cast ---
+
+    #[test]
+    fn elimination_abandons_leaving_players_pending_cast() {
+        // Repro: conceding mid-convoke (WaitingFor::ManaPayment) must not strand
+        // the in-progress cast in the (singleton) GameState, where it would
+        // resurface as a stuck mana-payment window in a later game.
+        let mut state = setup_three_player();
+        stash_pending_cast(&mut state, PlayerId(1));
+        assert!(state.pending_cast.is_some());
+
+        let mut events = Vec::new();
+        eliminate_player(&mut state, PlayerId(1), &mut events);
+
+        assert!(
+            state.pending_cast.is_none(),
+            "the leaving player's mid-cast must be abandoned"
+        );
+    }
+
+    #[test]
+    fn elimination_preserves_other_players_pending_cast() {
+        // A living player's mid-cast must survive an opponent's departure —
+        // pending_cast is keyed off the spell's controller, not cleared blindly.
+        let mut state = setup_three_player();
+        stash_pending_cast(&mut state, PlayerId(0));
+
+        let mut events = Vec::new();
+        eliminate_player(&mut state, PlayerId(1), &mut events);
+
+        assert!(
+            state.pending_cast.is_some(),
+            "an opponent leaving must not abandon the caster's in-progress spell"
+        );
     }
 
     #[test]

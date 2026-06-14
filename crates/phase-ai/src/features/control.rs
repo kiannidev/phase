@@ -35,6 +35,7 @@ use engine::types::card_type::CoreType;
 use engine::types::zones::Zone;
 
 use crate::ability_chain::collect_chain_effects;
+use crate::features::commitment;
 
 /// Per-deck control classification.
 ///
@@ -178,7 +179,10 @@ pub fn detect(deck: &[DeckEntry]) -> ControlFeature {
         + 2.0 * sweeper_instant_count as f32)
         / f32::max(total_nonland as f32, 1.0);
 
-    let commitment = clamp01(2.0 * interaction_density + 1.0 * draw_density);
+    let commitment = commitment::weighted_sum(&[
+        (2.0 / 60.0, interaction_density * 60.0),
+        (1.0 / 60.0, draw_density * 60.0),
+    ]);
     // reactive_tempo intentionally sums two overlapping signals:
     //   1. instant-only interaction density (counts each interaction spell once)
     //   2. raw instant ratio (counts every instant in the deck — interaction OR not)
@@ -208,13 +212,17 @@ pub fn detect(deck: &[DeckEntry]) -> ControlFeature {
 /// CR 701.6: countering removes the spell from the stack without it resolving.
 /// Only `AbilityKind::Spell` is checked — activated tap-for-counter abilities
 /// (e.g., Ertai) have `AbilityKind::Activated` and are excluded.
-fn is_counterspell(face: &CardFace) -> bool {
-    face.abilities.iter().any(|ability| {
+pub(crate) fn is_counterspell_parts(abilities: &[AbilityDefinition]) -> bool {
+    abilities.iter().any(|ability| {
         ability.kind == AbilityKind::Spell
             && collect_chain_effects(ability)
                 .iter()
                 .any(|e| matches!(e, Effect::Counter { .. }))
     })
+}
+
+fn is_counterspell(face: &CardFace) -> bool {
+    is_counterspell_parts(&face.abilities)
 }
 
 /// Parts-based sweeper classifier. Exported `pub(crate)` so `SweeperTimingPolicy`
@@ -377,10 +385,11 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             },
         )
     }
@@ -512,6 +521,7 @@ mod tests {
                 filter: TargetFilter::Any,
                 rest_destination: None,
                 reveal: false,
+                enter_tapped: false,
             },
         ));
         let deck = vec![entry(face, 4)];
@@ -537,6 +547,7 @@ mod tests {
                 filter: TargetFilter::Any,
                 rest_destination: None,
                 reveal: false,
+                enter_tapped: false,
             },
         ));
         let deck = vec![entry(face, 4)];

@@ -182,8 +182,15 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
             // CR 701.43a: exerting adds a CantUntap transient (which sets
             // layers_dirty → Gate 1); mark the exerted object directly so its
             // display reflects the exert even on the layers-clean path.
-            GameEvent::CreatureExerted { object_id } => {
+            GameEvent::CreatureExerted { object_id }
+            | GameEvent::Foretold { object_id, .. } => {
                 mark_public_state_object_dirty(state, *object_id);
+            }
+            GameEvent::CreatureEnlisted {
+                attacker, tapped, ..
+            } => {
+                mark_public_state_object_dirty(state, *attacker);
+                mark_public_state_object_dirty(state, *tapped);
             }
             GameEvent::ManaAdded { player_id, .. }
             | GameEvent::ManaPoolEmptied { player_id, .. }
@@ -204,8 +211,18 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
                 mark_public_state_player_dirty(state, *player_id);
                 mark_mana_display_dirty(state);
             }
+            // CR 702.140c + CR 730.2: a merge changes the surviving permanent's
+            // displayed characteristics. `merge_object_onto` already marks
+            // `layers_dirty` (Gate 1 caught it), but mark the merged object here
+            // too so this arm is sound even if a future caller skips the full mark.
+            GameEvent::Mutated { merged_id, .. } => {
+                mark_object_dirty_with_mana(state, *merged_id);
+                mark_battlefield_display_dirty(state);
+            }
             GameEvent::CounterAdded { object_id, .. }
+            | GameEvent::ObjectIntensified { object_id, .. }
             | GameEvent::CounterRemoved { object_id, .. }
+            | GameEvent::ControllerChanged { object_id, .. }
             | GameEvent::Evolved { object_id } => {
                 // +1/+1 counters set `layers_dirty` (counters.rs) → Gate 1 caught
                 // them; this arm fires only for counters that did not touch
@@ -290,6 +307,7 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
             // Transform changes copiable values (Layer 1) and can flip statics
             // on/off; conservatively all-dirty.
             | GameEvent::Transformed { .. }
+            | GameEvent::Specialized { .. }
             | GameEvent::TurnedFaceUp { .. } => {
                 mark_public_state_all_dirty(state);
                 return;
@@ -320,6 +338,8 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
             | GameEvent::StackPushed { .. }
             | GameEvent::StackResolved { .. }
             | GameEvent::GameOver { .. }
+            // CR 732.2: a halted-resolution notification dirties no display state.
+            | GameEvent::ResolutionHalted { .. }
             | GameEvent::SpellCountered { .. }
             | GameEvent::EffectResolved { .. }
             | GameEvent::Unattached { .. }
@@ -346,10 +366,18 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
             | GameEvent::ClassLevelGained { .. }
             | GameEvent::DieRolled { .. }
             | GameEvent::CoinFlipped { .. }
+            // CR 103.1: starting-player contest carries no public-state delta;
+            // it is rendered from the structured event log, not derived state.
+            | GameEvent::StartingPlayerContest { .. }
             | GameEvent::RoomEntered { .. }
             | GameEvent::RoomDoorUnlocked { .. }
             | GameEvent::BecomesPlotted { .. }
             | GameEvent::DungeonCompleted { .. }
+            // Planechase events: the planar deck / controller are authoritative
+            // state serialized directly; they carry no per-object display delta.
+            | GameEvent::Planeswalked { .. }
+            | GameEvent::ChaosEnsued { .. }
+            | GameEvent::PlanarDieRolled { .. }
             | GameEvent::Firebend { .. }
             | GameEvent::Airbend { .. }
             | GameEvent::Earthbend { .. }

@@ -13,11 +13,7 @@
 //!   - the hand-cast gate (`can_cast_object_now` / `handle_cast_spell`) never
 //!     rejected no-mana-cost cards.
 
-use std::path::Path;
-use std::sync::OnceLock;
-
 use engine::ai_support::legal_actions;
-use engine::database::card_db::CardDatabase;
 use engine::game::casting::can_cast_object_now;
 use engine::game::scenario::{GameScenario, P0};
 use engine::game::scenario_db::GameScenarioDbExt;
@@ -27,14 +23,8 @@ use engine::types::mana::{ManaCost, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
-fn load_db() -> Option<&'static CardDatabase> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../client/public/card-data.json");
-    if !path.exists() {
-        return None;
-    }
-    static DB: OnceLock<CardDatabase> = OnceLock::new();
-    Some(DB.get_or_init(|| CardDatabase::from_export(&path).expect("export should load")))
-}
+use crate::support::shared_card_db as load_db;
+use engine::types::game_state::CastPaymentMode;
 
 /// Core regression: a no-mana-cost card can't be cast normally from hand, a real
 /// {0} card still can, and the no-mana-cost card is NOT bricked — its Suspend
@@ -111,6 +101,8 @@ fn inevitable_betrayal_no_mana_cost_blocks_normal_cast_but_keeps_suspend() {
         object_id: betrayal,
         card_id,
         targets: vec![],
+
+        payment_mode: CastPaymentMode::Auto,
     });
     assert!(
         res.is_err(),

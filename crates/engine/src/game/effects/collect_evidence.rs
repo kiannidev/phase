@@ -162,6 +162,11 @@ pub(crate) fn handle_choice(
     }
 
     for &id in chosen {
+        // Phase E tranche 2: collect-evidence exile is a COST payment
+        // (CR 701.59a) routed via `handle_choice`, which has no source object in
+        // scope (the paying spell/ability lives nested in `resume`). Migrating it
+        // needs `Cause::Cost` with the source extracted from the resume — left for
+        // the cost-payment tranche.
         super::super::zones::move_to_zone(state, id, Zone::Exile, events);
     }
 
@@ -174,6 +179,7 @@ pub(crate) fn handle_choice(
         CollectEvidenceResume::Casting { pending_cast } => {
             let mut pending = pending_cast.as_ref().clone();
             pending.ability.context.additional_cost_paid = true;
+            let base_cost = pending.base_cost.clone();
             super::super::casting_costs::pay_and_push(
                 state,
                 player,
@@ -181,6 +187,7 @@ pub(crate) fn handle_choice(
                 pending.card_id,
                 pending.ability,
                 &pending.cost,
+                base_cost,
                 pending.casting_variant,
                 pending.cast_timing_permission,
                 pending.distribute,

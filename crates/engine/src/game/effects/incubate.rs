@@ -1,4 +1,6 @@
-use crate::game::effects::counters::add_counter_with_replacement;
+use crate::game::effects::counters::{
+    add_counter_with_replacement, stash_pending_counter_completion_with_actions,
+};
 use crate::game::game_object::DisplaySource;
 use crate::game::quantity::resolve_quantity_with_targets;
 use crate::game::zones;
@@ -7,7 +9,7 @@ use crate::types::card_type::CardType;
 use crate::types::card_type::CoreType;
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
-use crate::types::game_state::GameState;
+use crate::types::game_state::{GameState, PendingCounterPostAction};
 use crate::types::identifiers::CardId;
 use crate::types::zones::Zone;
 
@@ -19,8 +21,7 @@ use crate::types::zones::Zone;
 /// Its back face is a 0/0 colorless Phyrexian artifact creature named
 /// "Phyrexian Token."
 ///
-/// Note: The transform activated ability is not yet wired — the Incubator
-/// is created as a colorless artifact with the correct counters.
+/// The transform activated ability is attached via `inject_predefined_token_abilities`.
 pub fn resolve(
     state: &mut GameState,
     ability: &ResolvedAbility,
@@ -60,16 +61,26 @@ pub fn resolve(
     }
 
     // CR 701.53a: The Incubator enters with N +1/+1 counters.
-    if n > 0 {
-        add_counter_with_replacement(
+    if n > 0
+        && !add_counter_with_replacement(
             state,
             ability.controller,
             obj_id,
             CounterType::Plus1Plus1,
             n,
             events,
+        )
+    {
+        stash_pending_counter_completion_with_actions(
+            state,
+            EffectKind::Incubate,
+            ability.source_id,
+            vec![PendingCounterPostAction::InjectPredefinedTokenAbilities { object_id: obj_id }],
         );
+        return Ok(());
     }
+
+    super::token::inject_predefined_token_abilities(state, obj_id);
 
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::Incubate,
@@ -82,7 +93,7 @@ pub fn resolve(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ability::QuantityExpr;
+    use crate::types::ability::{Effect, QuantityExpr};
     use crate::types::identifiers::ObjectId;
     use crate::types::player::PlayerId;
 
@@ -119,6 +130,9 @@ mod tests {
         assert_eq!(inc.name, "Incubator");
         // 3 +1/+1 counters
         assert_eq!(inc.counters.get(&CounterType::Plus1Plus1).copied(), Some(3));
+        assert_eq!(inc.abilities.len(), 1);
+        assert!(matches!(*inc.abilities[0].effect, Effect::Transform { .. }));
+        assert!(inc.back_face.is_some());
     }
 
     #[test]

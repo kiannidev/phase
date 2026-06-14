@@ -7,9 +7,10 @@
 
 use engine::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, ChoiceType, ContinuousModification, ControllerRef,
-    DamageModification, DamageTargetFilter, DamageTargetPlayerScope, Effect, FilterProp,
-    ManaReplacementScope, QuantityExpr, QuantityModification, QuantityRef, ReplacementCondition,
-    ReplacementDefinition, ReplacementMode, RestrictionExpiry, TargetFilter, TypedFilter,
+    DamageModification, DamageTargetFilter, DamageTargetPlayerScope, Effect, EffectScope,
+    FilterProp, ManaReplacementScope, QuantityExpr, QuantityModification, QuantityRef,
+    ReplacementCondition, ReplacementDefinition, ReplacementMode, RestrictionExpiry,
+    TapStateChange, TargetFilter, TypedFilter,
 };
 use engine::types::card_type::Supertype;
 use engine::types::counter::{parse_counter_type, CounterType as EngineCounterType};
@@ -26,7 +27,7 @@ use crate::convert::quantity;
 use crate::convert::result::{ConvResult, ConversionGap};
 use crate::convert::static_effect;
 use crate::schema::types::{
-    Condition, CopyEffect, CopyEffects, CounterType, Expiration,
+    Condition, CopyEffect, CopyEffects, CounterType, DamageRecipientsList, Expiration,
     FutureReplacableEventWouldDealDamage, GameNumber, Permanent, Permanents, Player, Players,
     ReplacableEventWouldDealDamage, ReplacableEventWouldDraw, ReplacableEventWouldEnter,
     ReplacableEventWouldGainLife, ReplacableEventWouldPutCounters,
@@ -95,6 +96,7 @@ pub fn convert_as_enters(
             additional_token_spec: None,
             ensure_token_specs: None,
             counter_match: None,
+            enters_under: None,
         });
     }
     Ok(out)
@@ -174,6 +176,7 @@ pub fn convert_replace_would_enter(
             additional_token_spec: None,
             ensure_token_specs: None,
             counter_match: None,
+            enters_under: None,
         });
     }
     Ok(out)
@@ -236,6 +239,7 @@ pub fn convert_replace_would_deal_damage(
             additional_token_spec: None,
             ensure_token_specs: None,
             counter_match: None,
+            enters_under: None,
         });
     }
     Ok(out)
@@ -607,6 +611,7 @@ pub fn convert_replace_would_draw(
             additional_token_spec: None,
             ensure_token_specs: None,
             counter_match: None,
+            enters_under: None,
         });
     }
     Ok(out)
@@ -694,10 +699,11 @@ pub fn convert_replace_would_put_into_graveyard(
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: Vec::new(),
+                face_down_profile: None,
             },
         );
         out.push(ReplacementDefinition {
@@ -726,6 +732,7 @@ pub fn convert_replace_would_put_into_graveyard(
             additional_token_spec: None,
             ensure_token_specs: None,
             counter_match: None,
+            enters_under: None,
         });
     }
     Ok(out)
@@ -938,10 +945,11 @@ pub fn convert_as_put_into_graveyard_from_anywhere(
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: engine::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: Vec::new(),
+                face_down_profile: None,
             },
         );
         out.push(ReplacementDefinition {
@@ -970,6 +978,7 @@ pub fn convert_as_put_into_graveyard_from_anywhere(
             additional_token_spec: None,
             ensure_token_specs: None,
             counter_match: None,
+            enters_under: None,
         });
     }
     Ok(out)
@@ -1057,6 +1066,7 @@ pub fn convert_replace_would_put_counters(
             additional_token_spec: None,
             ensure_token_specs: None,
             counter_match: counter_match.clone(),
+            enters_under: None,
         });
     }
     Ok(out)
@@ -1238,6 +1248,7 @@ pub fn convert_replace_would_gain_life(
             additional_token_spec: None,
             ensure_token_specs: None,
             counter_match: None,
+            enters_under: None,
         });
     }
     Ok(out)
@@ -1356,6 +1367,7 @@ fn try_build_may_cost_pair(
         additional_token_spec: None,
         ensure_token_specs: None,
         counter_match: None,
+        enters_under: None,
     }))
 }
 
@@ -1557,13 +1569,15 @@ fn build_replacement_exec(
         return Ok((None, ReplacementMode::Optional { decline: None }, exec));
     }
     let effect = match act {
-        // CR 614.12 + CR 121.6: Enters tapped — direct Effect::Tap.
-        A::EntersTapped => Effect::Tap {
+        // CR 614.12 + CR 121.6: Enters tapped — single-target tap of the source.
+        A::EntersTapped => Effect::SetTapState {
             target: target.clone(),
+            scope: EffectScope::Single,
+            state: TapStateChange::Tap,
         },
         // CR 614.12 + CR 122.1: Enters with a counter (default 1) /
         // enters with N counters of a typed kind.
-        A::EntersWithACounter(ct) => Effect::AddCounter {
+        A::EntersWithACounter(ct) => Effect::PutCounter {
             counter_type: counter_type_name(ct),
             count: QuantityExpr::Fixed { value: 1 },
             target: target.clone(),
@@ -1582,7 +1596,7 @@ fn build_replacement_exec(
         A::EntersWithNumberCounters(g, ct) => {
             let mut count = quantity::convert(g)?;
             rewrite_variable_x_to_cost_x_paid(&mut count);
-            Effect::AddCounter {
+            Effect::PutCounter {
                 counter_type: counter_type_name(ct),
                 count,
                 target: target.clone(),
@@ -1627,9 +1641,8 @@ fn build_replacement_exec(
                 needed_variant: format!("ETB counter-action shape ({})", variant_tag(act)),
             });
         }
-        // CR 614.12: Untapped-instead replacement — needs an engine
-        // "force-untapped" override since `enter_tapped: false` is the
-        // default (no replacement fires for the default).
+        // CR 614.12: Untapped-instead replacement needs an explicit
+        // force-untapped override, distinct from the default/no-modifier state.
         A::EntersUntapped => {
             return Err(ConversionGap::EnginePrerequisiteMissing {
                 engine_type: "ReplacementDefinition",
@@ -1704,7 +1717,7 @@ fn build_replacement_exec(
         A::ChooseAPlayer(players) => {
             let choice_type = match crate::convert::filter::players_to_controller(players.as_ref())
             {
-                Ok(ControllerRef::Opponent) => ChoiceType::Opponent,
+                Ok(ControllerRef::Opponent) => ChoiceType::Opponent { restriction: None },
                 _ => ChoiceType::Player,
             };
             Effect::Choose {
@@ -2575,7 +2588,7 @@ fn variant_tag(a: &ReplacementActionWouldEnter) -> String {
 /// permanent's own `cost_x_paid` field — populated by `finalize_cast` and
 /// preserved across the stack → battlefield zone change. Walks the
 /// expression tree so wrapped forms (`Multiply`, `DivideRounded`, `Offset`,
-/// `Sum`, `UpTo`) all rewrite correctly.
+/// `ClampMin`, `Sum`, `UpTo`) all rewrite correctly.
 ///
 /// Mirrors `engine::parser::oracle_replacement::rewrite_variable_x_to_cost_x_paid`
 /// (which is `pub(crate)` to the engine crate). Replicated here so the
@@ -2590,6 +2603,7 @@ fn rewrite_variable_x_to_cost_x_paid(expr: &mut QuantityExpr) {
         }
         QuantityExpr::Fixed { .. } => {}
         QuantityExpr::DivideRounded { inner, .. }
+        | QuantityExpr::ClampMin { inner, .. }
         | QuantityExpr::Offset { inner, .. }
         | QuantityExpr::Multiply { inner, .. } => rewrite_variable_x_to_cost_x_paid(inner),
         QuantityExpr::Sum { exprs } => {
@@ -2642,13 +2656,16 @@ pub fn convert_create_replace_would_deal_damage_until(
         });
     }
     let amount = single_prevent_amount(actions)?;
-    let (scope, source_filter) = damage_event_to_prevent_scope(event)?;
+    let (scope, source_filter, target) = damage_event_to_prevent_params(event)?;
     Ok(engine::types::ability::Effect::PreventDamage {
         amount,
         amount_dynamic: None,
-        target: engine::types::ability::TargetFilter::Any,
+        target,
         scope,
         damage_source_filter: source_filter,
+        // CR 514.2: EOT expiration is the only shape this converter accepts
+        // (guarded above), so no explicit "this combat" window applies.
+        prevention_duration: None,
     })
 }
 
@@ -2685,6 +2702,8 @@ pub fn convert_create_future_replace_would_deal_damage(
         target: engine::types::ability::TargetFilter::Any,
         scope,
         damage_source_filter: source_filter,
+        // CR 514.2: future-damage shields are EOT-scoped; no "this combat" window.
+        prevention_duration: None,
     })
 }
 
@@ -2758,53 +2777,200 @@ fn require_prevention_only(actions: &[ReplacementActionWouldDealDamage]) -> Conv
     }
 }
 
+/// CR 614.2: Map a `DamageRecipientsList` onto the `Effect::PreventDamage`
+/// recipient axis. The engine's `prevent_damage::resolve` routes typed
+/// permanent filters through the shield's `valid_card` slot (Losheel /
+/// Pack Leader class).
+fn damage_recipients_list_to_prevent_target(
+    recipients: &DamageRecipientsList,
+) -> ConvResult<TargetFilter> {
+    use DamageRecipientsList as R;
+    Ok(match recipients {
+        R::APermanent(perms) => convert_permanents(perms)?,
+        R::APlayer(players) => players_to_prevent_target(players)?,
+        R::APlayerOrAPermanent(_, _) => {
+            return Err(ConversionGap::EnginePrerequisiteMissing {
+                engine_type: "Effect::PreventDamage::target",
+                needed_variant: "combined player-plus-permanent damage recipient".into(),
+            });
+        }
+    })
+}
+
+fn players_to_prevent_target(players: &Players) -> ConvResult<TargetFilter> {
+    match players {
+        Players::SinglePlayer(player) => player_to_prevent_target(player),
+        // CR 614.1a: "a player" is a damage-recipient class, not an object
+        // controller filter. `prevent_damage::resolve` maps `TargetFilter::Player`
+        // to `DamageTargetPlayerScope::Any` when no target slot is present.
+        Players::AnyPlayer => Ok(TargetFilter::Player),
+        other => Err(ConversionGap::EnginePrerequisiteMissing {
+            engine_type: "Effect::PreventDamage::target",
+            needed_variant: format!("player damage recipient {other:?}"),
+        }),
+    }
+}
+
+fn player_to_prevent_target(player: &Player) -> ConvResult<TargetFilter> {
+    match player {
+        Player::You | Player::HostPlayer | Player::HostController | Player::SelfPlayer => {
+            Ok(TargetFilter::Controller)
+        }
+        Player::Ref_TargetPlayer
+        | Player::Ref_TargetPlayer1
+        | Player::Ref_TargetPlayer2
+        | Player::Ref_TargetPlayer3 => Ok(TargetFilter::Player),
+        other => Err(ConversionGap::EnginePrerequisiteMissing {
+            engine_type: "Effect::PreventDamage::target",
+            needed_variant: format!("player damage recipient {other:?}"),
+        }),
+    }
+}
+
+/// CR 614.2: Map a `SingleDamageRecipient` onto the `Effect::PreventDamage`
+/// recipient axis.
+fn single_damage_recipient_to_prevent_target(
+    recipient: &SingleDamageRecipient,
+) -> ConvResult<TargetFilter> {
+    match recipient {
+        SingleDamageRecipient::Permanent(p) => convert_permanent(p),
+        SingleDamageRecipient::Player(p) => player_to_prevent_target(p),
+        other => Err(ConversionGap::EnginePrerequisiteMissing {
+            engine_type: "Effect::PreventDamage::target",
+            needed_variant: format!("SingleDamageRecipient::{other:?}"),
+        }),
+    }
+}
+
 /// CR 615 + CR 614.1a: Decompose a `ReplacableEventWouldDealDamage` into
-/// the `(scope, damage_source_filter)` tuple expected by
+/// the `(scope, damage_source_filter, target)` tuple expected by
 /// `Effect::PreventDamage`. Combat-prefixed variants set
 /// `PreventionScope::CombatDamage`; others remain `AllDamage`. When the
 /// event names a typed source (`...ByACreature(perms)` /
 /// `...ByAPermanent(perms)`), convert via `convert_permanents` and use
 /// it as the source filter; otherwise leave the source slot `None`.
-fn damage_event_to_prevent_scope(
+/// Recipient-bearing variants populate `target` from the event's damage
+/// recipient description.
+fn damage_event_to_prevent_params(
     event: &ReplacableEventWouldDealDamage,
 ) -> ConvResult<(
     engine::types::ability::PreventionScope,
     Option<engine::types::ability::TargetFilter>,
+    engine::types::ability::TargetFilter,
 )> {
     use engine::types::ability::PreventionScope;
     use ReplacableEventWouldDealDamage as E;
     Ok(match event {
-        E::CombatDamageWouldBeDealt
-        | E::CombatDamageWouldBeDealtToARecipient(_)
-        | E::CombatDamageWouldBeDealtToRecipient(_) => (PreventionScope::CombatDamage, None),
-        E::CombatDamageWouldBeDealtByACreature(perms)
-        | E::CombatDamageWouldBeDealtByACreatureToARecipient(perms, _)
-        | E::CombatDamageWouldBeDealtByACreatureToASetOfRecipients(perms, _)
-        | E::CombatDamageWouldBeDealtByACreatureToRecipient(perms, _) => (
+        E::CombatDamageWouldBeDealt => (PreventionScope::CombatDamage, None, TargetFilter::Any),
+        E::CombatDamageWouldBeDealtToARecipient(recipients) => (
+            PreventionScope::CombatDamage,
+            None,
+            damage_recipients_list_to_prevent_target(recipients)?,
+        ),
+        E::CombatDamageWouldBeDealtToRecipient(recipient) => (
+            PreventionScope::CombatDamage,
+            None,
+            single_damage_recipient_to_prevent_target(recipient)?,
+        ),
+        E::CombatDamageWouldBeDealtByACreature(perms) => (
             PreventionScope::CombatDamage,
             Some(convert_permanents(perms)?),
+            TargetFilter::Any,
         ),
-        E::CombatDamageWouldBeDealtByCreature(perm)
-        | E::CombatDamageWouldBeDealtByCreatureToARecipient(perm, _)
-        | E::CombatDamageWouldBeDealtByCreatureToRecipient(perm, _) => (
+        E::CombatDamageWouldBeDealtByACreatureToARecipient(perms, recipients) => (
+            PreventionScope::CombatDamage,
+            Some(convert_permanents(perms)?),
+            damage_recipients_list_to_prevent_target(recipients)?,
+        ),
+        E::CombatDamageWouldBeDealtByACreatureToASetOfRecipients(perms, recipients) => (
+            PreventionScope::CombatDamage,
+            Some(convert_permanents(perms)?),
+            damage_recipients_list_to_prevent_target(recipients)?,
+        ),
+        E::CombatDamageWouldBeDealtByACreatureToRecipient(perms, recipient) => (
+            PreventionScope::CombatDamage,
+            Some(convert_permanents(perms)?),
+            single_damage_recipient_to_prevent_target(recipient)?,
+        ),
+        E::CombatDamageWouldBeDealtByCreature(perm) => (
             PreventionScope::CombatDamage,
             Some(convert_permanent(perm)?),
+            TargetFilter::Any,
         ),
-        E::DamageWouldBeDealtByAPermanent(perms)
-        | E::DamageWouldBeDealtByAPermanentToARecipient(perms, _)
-        | E::DamageWouldBeDealtByAPermanentToRecipient(perms, _) => {
-            (PreventionScope::AllDamage, Some(convert_permanents(perms)?))
-        }
-        E::DamageWouldBeDealtByASource(sources)
-        | E::DamageWouldBeDealtByASourceToARecipient(sources, _)
-        | E::DamageWouldBeDealtByASourceToRecipient(sources, _) => (
+        E::CombatDamageWouldBeDealtByCreatureToARecipient(perm, recipients) => (
+            PreventionScope::CombatDamage,
+            Some(convert_permanent(perm)?),
+            damage_recipients_list_to_prevent_target(recipients)?,
+        ),
+        E::CombatDamageWouldBeDealtByCreatureToRecipient(perm, recipient) => (
+            PreventionScope::CombatDamage,
+            Some(convert_permanent(perm)?),
+            single_damage_recipient_to_prevent_target(recipient)?,
+        ),
+        E::DamageWouldBeDealtToARecipient(recipients) => (
+            PreventionScope::AllDamage,
+            None,
+            damage_recipients_list_to_prevent_target(recipients)?,
+        ),
+        E::DamageWouldBeDealtToRecipient(recipient) => (
+            PreventionScope::AllDamage,
+            None,
+            single_damage_recipient_to_prevent_target(recipient)?,
+        ),
+        E::DamageWouldBeDealtByAPermanent(perms) => (
+            PreventionScope::AllDamage,
+            Some(convert_permanents(perms)?),
+            TargetFilter::Any,
+        ),
+        E::DamageWouldBeDealtByAPermanentToARecipient(perms, recipients) => (
+            PreventionScope::AllDamage,
+            Some(convert_permanents(perms)?),
+            damage_recipients_list_to_prevent_target(recipients)?,
+        ),
+        E::DamageWouldBeDealtByAPermanentToRecipient(perms, recipient) => (
+            PreventionScope::AllDamage,
+            Some(convert_permanents(perms)?),
+            single_damage_recipient_to_prevent_target(recipient)?,
+        ),
+        E::DamageWouldBeDealtByASource(sources) => (
             PreventionScope::AllDamage,
             Some(damage_sources_to_filter(sources)?),
+            TargetFilter::Any,
         ),
-        E::DamageWouldBeDealtBySource(source)
-        | E::DamageWouldBeDealtBySourceToRecipient(source, _) => (
+        E::DamageWouldBeDealtByASourceToARecipient(sources, recipients) => (
+            PreventionScope::AllDamage,
+            Some(damage_sources_to_filter(sources)?),
+            damage_recipients_list_to_prevent_target(recipients)?,
+        ),
+        E::DamageWouldBeDealtByASourceToRecipient(sources, recipient) => (
+            PreventionScope::AllDamage,
+            Some(damage_sources_to_filter(sources)?),
+            single_damage_recipient_to_prevent_target(recipient)?,
+        ),
+        E::DamageWouldBeDealtBySource(source) => (
             PreventionScope::AllDamage,
             Some(single_damage_source_to_filter(source)),
+            TargetFilter::Any,
+        ),
+        E::DamageWouldBeDealtBySourceToRecipient(source, recipient) => (
+            PreventionScope::AllDamage,
+            Some(single_damage_source_to_filter(source)),
+            single_damage_recipient_to_prevent_target(recipient)?,
+        ),
+        E::NoncombatDamageWouldBeDealtToARecipient(recipients) => (
+            PreventionScope::AllDamage,
+            None,
+            damage_recipients_list_to_prevent_target(recipients)?,
+        ),
+        E::NoncombatDamageWouldBeDealtToRecipient(recipient) => (
+            PreventionScope::AllDamage,
+            None,
+            single_damage_recipient_to_prevent_target(recipient)?,
+        ),
+        E::NoncombatDamageWouldBeDealtByASourceToARecipient(sources, recipients) => (
+            PreventionScope::AllDamage,
+            Some(damage_sources_to_filter(sources)?),
+            damage_recipients_list_to_prevent_target(recipients)?,
         ),
         // CR 614.x: `Or` over a list of inner events — the engine has no
         // OR slot on `Effect::PreventDamage`. Strict-fail (rather than
@@ -2979,7 +3145,115 @@ mod tests {
                     amount: QuantityExpr::Fixed { value: 2 }
                 },
                 decline: Some(decline),
-            } if matches!(&*decline.effect, Effect::Tap { target } if *target == TargetFilter::SelfRef)
+            } if matches!(
+                &*decline.effect,
+                Effect::SetTapState {
+                    target,
+                    scope: EffectScope::Single,
+                    state: TapStateChange::Tap,
+                } if *target == TargetFilter::SelfRef
+            )
+        ));
+    }
+
+    #[test]
+    fn pack_leader_prevent_damage_scopes_to_dogs_you_control() {
+        use crate::schema::types::{
+            CreatureType, DamageRecipientsList, ReplacableEventWouldDealDamage,
+        };
+        use engine::types::ability::{
+            ControllerRef, PreventionAmount, PreventionScope, TypeFilter,
+        };
+
+        let effect = convert_create_replace_would_deal_damage_until(
+            &ReplacableEventWouldDealDamage::CombatDamageWouldBeDealtToARecipient(
+                DamageRecipientsList::APermanent(Box::new(Permanents::And(vec![
+                    Permanents::IsCreatureType(CreatureType::Dog),
+                    Permanents::ControlledByAPlayer(Box::new(Players::SinglePlayer(Box::new(
+                        Player::You,
+                    )))),
+                ]))),
+            ),
+            &[ReplacementActionWouldDealDamage::PreventThatDamage],
+            &Expiration::UntilEndOfTurn,
+        )
+        .unwrap();
+
+        let Effect::PreventDamage {
+            amount,
+            target,
+            scope,
+            damage_source_filter,
+            ..
+        } = effect
+        else {
+            panic!("expected PreventDamage, got {effect:?}");
+        };
+        assert_eq!(amount, PreventionAmount::All);
+        assert_eq!(scope, PreventionScope::CombatDamage);
+        assert!(damage_source_filter.is_none());
+        assert_eq!(
+            target,
+            TargetFilter::Typed(
+                TypedFilter::creature()
+                    .with_type(TypeFilter::Subtype("Dog".into()))
+                    .controller(ControllerRef::You)
+            )
+        );
+    }
+
+    #[test]
+    fn player_damage_recipient_maps_to_player_target_filter() {
+        use crate::schema::types::DamageRecipientsList;
+
+        assert_eq!(
+            damage_recipients_list_to_prevent_target(&DamageRecipientsList::APlayer(Box::new(
+                Players::AnyPlayer
+            )))
+            .unwrap(),
+            TargetFilter::Player
+        );
+        assert_eq!(
+            damage_recipients_list_to_prevent_target(&DamageRecipientsList::APlayer(Box::new(
+                Players::SinglePlayer(Box::new(Player::You))
+            )))
+            .unwrap(),
+            TargetFilter::Controller
+        );
+    }
+
+    #[test]
+    fn mixed_player_or_permanent_damage_recipient_strict_fails() {
+        use crate::schema::types::DamageRecipientsList;
+
+        let err =
+            damage_recipients_list_to_prevent_target(&DamageRecipientsList::APlayerOrAPermanent(
+                Box::new(Players::AnyPlayer),
+                Box::new(Permanents::AnyPermanent),
+            ))
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ConversionGap::EnginePrerequisiteMissing {
+                engine_type: "Effect::PreventDamage::target",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unrecognized_single_damage_recipient_strict_fails() {
+        let err =
+            single_damage_recipient_to_prevent_target(&SingleDamageRecipient::DistributedAnyTarget)
+                .unwrap_err();
+
+        assert!(matches!(
+            err,
+            ConversionGap::EnginePrerequisiteMissing {
+                engine_type: "Effect::PreventDamage::target",
+                ..
+            }
         ));
     }
 
@@ -3192,7 +3466,7 @@ mod tests {
 
         let execute = defs[0].execute.as_ref().expect("ETB AddCounter execute");
         match &*execute.effect {
-            Effect::AddCounter {
+            Effect::PutCounter {
                 counter_type,
                 count,
                 target,
@@ -3229,7 +3503,7 @@ mod tests {
 
         let execute = defs[0].execute.as_ref().unwrap();
         match &*execute.effect {
-            Effect::AddCounter { count, .. } => match count {
+            Effect::PutCounter { count, .. } => match count {
                 QE::Offset { inner, offset } => {
                     assert_eq!(*offset, 1);
                     assert!(

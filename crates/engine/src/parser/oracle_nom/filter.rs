@@ -95,7 +95,9 @@ pub fn parse_property_filter(input: &str) -> OracleResult<'_, FilterProp> {
     alt((
         value(FilterProp::Tapped, tag("tapped")),
         value(FilterProp::Untapped, tag("untapped")),
-        value(FilterProp::Attacking, tag("attacking")),
+        // CR 702.171b: "saddled Mount/creature" selector.
+        value(FilterProp::IsSaddled, tag("saddled")),
+        value(FilterProp::Attacking { defender: None }, tag("attacking")),
         value(FilterProp::Blocking, tag("blocking")),
         value(FilterProp::Token, tag("token")),
         value(FilterProp::NonToken, tag("nontoken")),
@@ -120,6 +122,15 @@ pub fn parse_property_filter(input: &str) -> OracleResult<'_, FilterProp> {
 /// "with defender", etc. Returns the FilterProp extracted from the clause.
 pub fn parse_with_property(input: &str) -> OracleResult<'_, FilterProp> {
     preceded((tag("with"), space1), parse_with_inner).parse(input)
+}
+
+/// CR 113.1 + CR 113.3: an object with none of the four ability categories
+/// (spell, activated, triggered, static) — i.e. "no abilities". Narrow primitive
+/// shared by the target-suffix scanner (oracle_target.rs) and the search-library
+/// filter scanner (oracle_effect/search.rs); each call site supplies its own
+/// surrounding "with " grammar, so this matches the bare predicate only.
+pub fn parse_no_abilities(input: &str) -> OracleResult<'_, FilterProp> {
+    value(FilterProp::HasNoAbilities, tag("no abilities")).parse(input)
 }
 
 /// Parse the inner content of a "with" clause.
@@ -395,10 +406,18 @@ mod tests {
         assert_eq!(rest, " creatures");
     }
 
+    // CR 702.171b: "saddled Mount/creature" selector → FilterProp::IsSaddled.
+    #[test]
+    fn test_parse_property_filter_saddled() {
+        let (rest, p) = parse_property_filter("saddled Mount you control").unwrap();
+        assert_eq!(p, FilterProp::IsSaddled);
+        assert_eq!(rest, " Mount you control");
+    }
+
     #[test]
     fn test_parse_property_filter_attacking() {
         let (rest, p) = parse_property_filter("attacking").unwrap();
-        assert_eq!(p, FilterProp::Attacking);
+        assert_eq!(p, FilterProp::Attacking { defender: None });
         assert_eq!(rest, "");
     }
 
@@ -426,6 +445,29 @@ mod tests {
     #[test]
     fn test_parse_property_filter_failure() {
         assert!(parse_property_filter("flying").is_err());
+    }
+
+    #[test]
+    fn test_parse_no_abilities() {
+        // CR 113.1 + CR 113.3: bare "no abilities" predicate → HasNoAbilities,
+        // fully consumed.
+        let (rest, prop) = parse_no_abilities("no abilities").unwrap();
+        assert_eq!(prop, FilterProp::HasNoAbilities);
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn test_parse_no_abilities_residual() {
+        // Only the bare predicate is consumed; trailing grammar is left for the
+        // call site's scanner.
+        let (rest, prop) = parse_no_abilities("no abilities and more").unwrap();
+        assert_eq!(prop, FilterProp::HasNoAbilities);
+        assert_eq!(rest, " and more");
+    }
+
+    #[test]
+    fn test_parse_no_abilities_failure() {
+        assert!(parse_no_abilities("flying").is_err());
     }
 
     #[test]

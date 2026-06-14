@@ -18,11 +18,19 @@ export type DiceRollPayload =
       kind: "die";
       /** d-sides (e.g. 20 for the first-player contest, dN for card rolls). */
       sides: number;
-      /** One entry per physical die shown — one per player for the contest. */
+      /** One entry per physical die shown. For the contest this is the FINAL
+       *  (decisive) round — kept for the no-rounds fallback and overlay keying. */
       rolls: { playerId: PlayerId; value: number }[];
       context: "startingPlayer" | "ability";
       /** Starting-player contest: the high roller who takes the first turn. */
       winner?: PlayerId;
+      /** Starting-player contest only (CR 103.1): the roll-off by round. Round 0
+       *  is every seat; each later round is the previous round's tied-max group
+       *  that rerolled. Rendered round-by-round so the winner is always the high
+       *  roller of the round shown — never conflated across rounds (the bug that
+       *  made an eliminated seat's higher earlier die look like it beat the
+       *  winner's lower reroll). Absent for in-game `ability` rolls. */
+      rounds?: { playerId: PlayerId; value: number }[][];
     }
   | {
       kind: "coin";
@@ -107,6 +115,9 @@ interface UiStoreState {
   autoPass: boolean;
   combatMode: "attackers" | "blockers" | null;
   selectedAttackers: ObjectId[];
+  /** CR 702.22c: attacking bands declared this combat (each inner array is one
+   *  band of attacker ids). Empty when no bands are declared. */
+  attackerBands: ObjectId[][];
   blockerAssignments: Map<ObjectId, ObjectId>;
   combatClickHandler: ((id: ObjectId) => void) | null;
   previewSticky: boolean;
@@ -138,6 +149,10 @@ interface UiStoreState {
   debugPanelTab: "console" | "actions";
   debugInteractionMode: boolean;
   debugContextMenu: { objectId: ObjectId; x: number; y: number } | null;
+  /** Debug-only library browser: when set, a modal lists the player's full
+   *  library (in a stable randomized order) so individual cards can be moved to
+   *  any zone via the standard debug context menu. `null` when closed. */
+  debugLibraryViewer: { playerId: number } | null;
   helpSheetOpen: boolean;
   /** Object currently being "previewed" by a debug-panel control (e.g. an
    *  ObjectSelect dropdown option under the cursor). Drives a distinct,
@@ -148,6 +163,11 @@ interface UiStoreState {
   debugHighlightedObjectId: ObjectId | null;
   debugHighlightedPlayerId: number | null;
   logPanelOpen: boolean;
+  /** Whether Flex Layout edit mode is active. Ephemeral (never persisted) — the
+   *  layout DATA lives in `preferencesStore.flexLayout`; this is just the
+   *  transient "the user is currently rearranging the board" toggle that gates
+   *  the edit overlay, widget dragging, and resize grabbers. */
+  flexEditMode: boolean;
 }
 
 interface UiStoreActions {
@@ -170,6 +190,7 @@ interface UiStoreActions {
   toggleAttacker: (id: ObjectId) => void;
   setGroupSelectedAttackers: (groupIds: ObjectId[], selectedIds: ObjectId[]) => void;
   selectAllAttackers: (ids: ObjectId[]) => void;
+  setAttackerBands: (bands: ObjectId[][]) => void;
   assignBlocker: (blockerId: ObjectId, attackerId: ObjectId) => void;
   removeBlockerAssignment: (blockerId: ObjectId) => void;
   clearCombatSelection: () => void;
@@ -197,6 +218,8 @@ interface UiStoreActions {
   toggleDebugInteractionMode: () => void;
   openDebugContextMenu: (menu: { objectId: ObjectId; x: number; y: number }) => void;
   closeDebugContextMenu: () => void;
+  openDebugLibraryViewer: (playerId: number) => void;
+  closeDebugLibraryViewer: () => void;
   setHelpSheetOpen: (open: boolean) => void;
   toggleHelpSheet: () => void;
   /** Set or clear the debug-panel preview highlight for an object. */
@@ -205,6 +228,8 @@ interface UiStoreActions {
   setDebugHighlightedPlayerId: (id: number | null) => void;
   setLogPanelOpen: (open: boolean) => void;
   toggleLogPanel: () => void;
+  setFlexEditMode: (active: boolean) => void;
+  toggleFlexEditMode: () => void;
 }
 
 export type UiStore = UiStoreState & UiStoreActions;
@@ -221,6 +246,7 @@ export const useUiStore = create<UiStore>()((set, get) => ({
   autoPass: false,
   combatMode: null,
   selectedAttackers: [],
+  attackerBands: [],
   blockerAssignments: new Map(),
   combatClickHandler: null,
   previewSticky: false,
@@ -238,10 +264,12 @@ export const useUiStore = create<UiStore>()((set, get) => ({
   debugPanelTab: "console",
   debugInteractionMode: false,
   debugContextMenu: null,
+  debugLibraryViewer: null,
   helpSheetOpen: false,
   debugHighlightedObjectId: null,
   debugHighlightedPlayerId: null,
   logPanelOpen: false,
+  flexEditMode: false,
 
   selectObject: (id) => set({ selectedObjectId: id }),
   hoverObject: (id) => set({ hoveredObjectId: id }),
@@ -396,6 +424,8 @@ export const useUiStore = create<UiStore>()((set, get) => ({
 
   selectAllAttackers: (ids) => set({ selectedAttackers: ids }),
 
+  setAttackerBands: (bands) => set({ attackerBands: bands }),
+
   assignBlocker: (blockerId, attackerId) =>
     set((state) => {
       const next = new Map(state.blockerAssignments);
@@ -414,6 +444,7 @@ export const useUiStore = create<UiStore>()((set, get) => ({
     set({
       combatMode: null,
       selectedAttackers: [],
+      attackerBands: [],
       blockerAssignments: new Map(),
       combatClickHandler: null,
     }),
@@ -485,8 +516,12 @@ export const useUiStore = create<UiStore>()((set, get) => ({
   })),
   openDebugContextMenu: (menu) => set({ debugContextMenu: menu, selectedObjectId: menu.objectId }),
   closeDebugContextMenu: () => set({ debugContextMenu: null }),
+  openDebugLibraryViewer: (playerId) => set({ debugLibraryViewer: { playerId } }),
+  closeDebugLibraryViewer: () => set({ debugLibraryViewer: null }),
   setHelpSheetOpen: (open) => set({ helpSheetOpen: open }),
   toggleHelpSheet: () => set((state) => ({ helpSheetOpen: !state.helpSheetOpen })),
   setLogPanelOpen: (open) => set({ logPanelOpen: open }),
   toggleLogPanel: () => set((state) => ({ logPanelOpen: !state.logPanelOpen })),
+  setFlexEditMode: (active) => set({ flexEditMode: active }),
+  toggleFlexEditMode: () => set((state) => ({ flexEditMode: !state.flexEditMode })),
 }));

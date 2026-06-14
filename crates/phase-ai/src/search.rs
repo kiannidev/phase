@@ -1,21 +1,29 @@
+use std::cmp::Ordering;
+use std::sync::Arc;
+
 use rand::Rng;
 
 use engine::ai_support::build_decision_context;
 use engine::types::actions::{AlternativeCastDecision, GameAction, MulliganChoice};
 use engine::types::card_type::CoreType;
 use engine::types::game_state::{CastOfferKind, CostResume, GameState, WaitingFor};
+use engine::types::identifiers::ObjectId;
 use engine::types::player::PlayerId;
 
 use crate::cast_facts::cast_facts_for_action;
 use crate::combat_ai::{choose_attackers_with_targets_with_profile, choose_blockers_with_profile};
 use crate::config::{AiConfig, ThreatAwareness};
 use crate::context::AiContext;
+use crate::features::DeckFeatures;
+use crate::plan::PlanSnapshot;
 use crate::planner::{
     apply_candidate, build_continuation_planner, PlannerServices, RankedCandidate, SearchBudget,
 };
 use crate::policies::context::PolicyContext;
+use crate::policies::copy_value::score_legend_rule_keep;
 use crate::policies::tutor::{score_search_choice_cards, score_search_choice_selection};
 use crate::policies::{PolicyId, PolicyRegistry, PolicyVerdict};
+use crate::session::AiSession;
 use crate::tactical_gate::gate_candidates;
 use crate::threat_profile::{
     build_threat_profile_multiplayer, ArchetypeBaseProbabilities, ThreatProfile,
@@ -68,6 +76,19 @@ const MAX_ACTIVATIONS_PER_SOURCE_PER_TURN: u32 = 4;
 /// thousands-of-iterations pathology observed in #563.
 const MAX_CASTS_OF_SAME_CARD_PER_TURN: usize = 3;
 
+fn pick_lowest_value_sacrifices(
+    state: &GameState,
+    cards: &[ObjectId],
+    count: usize,
+) -> Vec<ObjectId> {
+    let mut scored: Vec<_> = cards
+        .iter()
+        .map(|&id| (id, evaluate_card_value(state, id)))
+        .collect();
+    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.into_iter().take(count).map(|(id, _)| id).collect()
+}
+
 /// Choose the best action for the AI player given the current game state.
 ///
 /// - For 0 or 1 legal actions, returns immediately.
@@ -79,6 +100,18 @@ pub fn choose_action(
     ai_player: PlayerId,
     config: &AiConfig,
     rng: &mut impl Rng,
+) -> Option<GameAction> {
+    let session = AiSession::arc_from_game(state);
+    choose_action_with_session(state, ai_player, config, rng, &session)
+}
+
+/// Choose the best action using a caller-owned per-game session cache.
+pub fn choose_action_with_session(
+    state: &GameState,
+    ai_player: PlayerId,
+    config: &AiConfig,
+    rng: &mut impl Rng,
+    session: &Arc<AiSession>,
 ) -> Option<GameAction> {
     // CR 103.5: For simultaneous mulligan states, the AI controller's only
     // job is to act on behalf of `ai_player`. If `ai_player` is not in the
@@ -123,16 +156,20 @@ pub fn choose_action(
     // the dedicated scorer). The deterministic path returns the chosen
     // SelectCards directly; only fall through if it produces nothing.
     if matches!(state.waiting_for, WaitingFor::SearchChoice { .. }) {
-        if let Some(action) = deterministic_choice(state, ai_player, config, &[], None) {
+        let context = build_ai_context_with_session(state, ai_player, config, Arc::clone(session));
+        if let Some(action) = deterministic_choice(state, ai_player, config, &[], Some(&context)) {
             return Some(action);
         }
     }
 
-    let scored = score_candidates(state, ai_player, config);
+    let mut scored = score_candidates_with_session(state, ai_player, config, session);
     if scored.is_empty() {
         // No valid candidates from search — fall back to a safe escape action
         // so the game never deadlocks waiting for the AI.
         return fallback_action(state);
+    }
+    if config.execution_mode.is_measurement() {
+        scored.sort_by_cached_key(|(action, _)| action_order_key(action));
     }
     let chosen = if scored.len() == 1 {
         Some(scored[0].0.clone())
@@ -140,7 +177,7 @@ pub fn choose_action(
         softmax_select_pairs(&scored, config.temperature, rng)
     };
     if let Some(action) = &chosen {
-        emit_decision_trace(state, ai_player, config, action);
+        emit_decision_trace(state, ai_player, config, action, session);
     }
     chosen
 }
@@ -159,6 +196,7 @@ fn emit_decision_trace(
     ai_player: PlayerId,
     config: &AiConfig,
     action: &GameAction,
+    session: &Arc<AiSession>,
 ) {
     if !tracing::event_enabled!(target: "phase_ai::decision_trace", tracing::Level::DEBUG) {
         return;
@@ -176,7 +214,7 @@ fn emit_decision_trace(
         return;
     };
 
-    let context = build_ai_context(state, ai_player, config);
+    let context = build_ai_context_with_session(state, ai_player, config, Arc::clone(session));
     emit_trace_for_candidate(state, &ctx, candidate, ai_player, config, &context);
 }
 
@@ -318,6 +356,9 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
         // declines (never has a downside). Real exert decisions come from the
         // evaluated candidate actions.
         WaitingFor::ExertChoice { .. } => Some(GameAction::ChooseExert { exert: false }),
+        // CR 508.1g + CR 702.154a: Enlist is optional; the conservative
+        // fallback declines while normal search evaluates legal tap choices.
+        WaitingFor::EnlistChoice { .. } => Some(GameAction::ChooseEnlist { target: None }),
 
         // Target selection: skip optional slots, fizzle mandatory ones.
         // TriggerTargetSelection is not a pending cast — the trigger is
@@ -326,6 +367,19 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
         WaitingFor::TargetSelection { .. } | WaitingFor::TriggerTargetSelection { .. } => {
             Some(GameAction::ChooseTarget { target: None })
         }
+
+        // CR 701.21a: Mandatory spell-effect sacrifices (Deadly Brew, Edict
+        // riders) must pick a legal permanent — an empty SelectCards fails
+        // validation when `count > 0` and `up_to` is false.
+        WaitingFor::EffectZoneChoice {
+            cards,
+            count,
+            up_to,
+            effect_kind: engine::types::ability::EffectKind::Sacrifice,
+            ..
+        } if !cards.is_empty() && !*up_to && *count > 0 => Some(GameAction::SelectCards {
+            cards: pick_lowest_value_sacrifices(state, cards, *count),
+        }),
 
         // Selection states: empty selection is a valid "choose nothing".
         WaitingFor::ScryChoice { .. }
@@ -500,6 +554,11 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
             })
         }
 
+        // Spellbook draft: pick the first card in the list.
+        WaitingFor::SpellbookDraft { options, .. } => options
+            .first()
+            .map(|card| GameAction::SubmitSpellbookDraft { card: card.clone() }),
+
         // Damage source choice: pick the first option.
         WaitingFor::DamageSourceChoice { options, .. } => options
             .first()
@@ -531,6 +590,20 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
         } => Some(GameAction::CascadeChoice {
             choice: engine::types::actions::CastChoice::Decline,
         }),
+        // CR 702.60a: Ripple — decline as the default; candidates explore casting.
+        WaitingFor::CastOffer {
+            kind: CastOfferKind::Ripple { .. },
+            ..
+        } => Some(GameAction::RippleChoice {
+            choice: engine::types::actions::CastChoice::Decline,
+        }),
+        // CR 608.2g + CR 601.2: Invoke Calamity's free-cast window — finish the
+        // window (cast nothing) as the conservative default; the candidate
+        // generator still explores casting each eligible spell.
+        WaitingFor::CastOffer {
+            kind: CastOfferKind::FreeCastWindow { .. },
+            ..
+        } => Some(GameAction::FreeCastWindowChoice { selection: None }),
         // CR 107.1c: "repeat this process" — stop as the forced-action default;
         // the candidate generator still explores repeating.
         WaitingFor::RepeatDecision { .. } => {
@@ -546,6 +619,18 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
         WaitingFor::TopOrBottomChoice { .. } | WaitingFor::ClashCardPlacement { .. } => {
             Some(GameAction::ChooseTopOrBottom { top: true })
         }
+
+        // CR 702.140c + CR 730.2a: mutate merge side — default to placing the
+        // mutating spell on top (the candidate generator still explores bottom).
+        WaitingFor::MutateMergeChoice { .. } => Some(GameAction::ChooseMutateMergeSide {
+            side: engine::game::merge::MergeSide::Top,
+        }),
+
+        // CR 702.99a: cipher encode — default to encoding on the first legal host
+        // (the candidate generator still explores declining and other hosts).
+        WaitingFor::CipherEncodeChoice { creatures, .. } => Some(GameAction::CipherEncode {
+            creature: creatures.first().copied(),
+        }),
 
         // CR 701.30b: clash opponent choice — fall back to the first candidate.
         WaitingFor::ClashChooseOpponent { candidates, .. } => candidates
@@ -624,6 +709,10 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
         WaitingFor::ChooseDungeonRoom { options, .. } => options
             .first()
             .map(|&room_index| GameAction::ChooseDungeonRoom { room_index }),
+        WaitingFor::SpecializeColor { options, .. } => options
+            .first()
+            .copied()
+            .map(|color| GameAction::ChooseSpecializeColor { color }),
 
         // Paradigm: pass.
         WaitingFor::CastOffer {
@@ -668,9 +757,14 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
             choice_text.map(|choice| GameAction::ChooseOption { choice })
         }
 
-        // Legend choice: pick the first candidate.
+        // CR 704.5j: keep the commander / original over ephemeral copy tokens.
         WaitingFor::ChooseLegend { candidates, .. } => candidates
-            .first()
+            .iter()
+            .max_by(|&&left, &&right| {
+                score_legend_rule_keep(state, left)
+                    .partial_cmp(&score_legend_rule_keep(state, right))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
             .map(|&keep| GameAction::ChooseLegend { keep }),
 
         // Battle protector: pick the first candidate.
@@ -683,23 +777,45 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
             targets: Vec::new(),
         }),
 
+        // CR 701.56a: Time travel — default to changing nothing this phase
+        // (an empty selection is legal: "choose any number").
+        WaitingFor::TimeTravelChoice { .. } => Some(GameAction::SelectTargets {
+            targets: Vec::new(),
+        }),
+
+        // CR 702.132a: Assist — default to not seeking help (decline the offer)
+        // and, if asked to contribute, contribute nothing.
+        WaitingFor::AssistChoosePlayer { .. } => {
+            Some(GameAction::ChooseAssistPlayer { player: None })
+        }
+        WaitingFor::AssistPayment { .. } => Some(GameAction::CommitAssistPayment { generic: 0 }),
+
         // ChooseObjectsIntoTrackedSet: default to declining (empty selection).
         WaitingFor::ChooseObjectsSelection { .. } => Some(GameAction::SelectTargets {
             targets: Vec::new(),
         }),
 
-        // Copy retarget: keep current targets when present; freshly cast
-        // prepare/paradigm copies start empty, so choose the first legal target.
-        WaitingFor::CopyRetarget { target_slots, .. } => {
-            let targets: Option<Vec<_>> = target_slots
-                .iter()
-                .map(|slot| {
-                    slot.current
-                        .clone()
-                        .or_else(|| slot.legal_alternatives.first().cloned())
-                })
-                .collect();
-            targets.map(|new_targets| GameAction::RetargetSpell { new_targets })
+        // Copy retarget: keep copied targets when all slots already have a
+        // current value; freshly cast prepare/paradigm copies start empty, so
+        // choose the first legal target for the current slot.
+        WaitingFor::CopyRetarget {
+            target_slots,
+            current_slot,
+            ..
+        } => {
+            let slot = target_slots.get(*current_slot)?;
+            if target_slots.iter().all(|slot| slot.current.is_some()) {
+                Some(GameAction::KeepAllCopyTargets)
+            } else if slot.current.is_some() {
+                Some(GameAction::ChooseTarget { target: None })
+            } else {
+                slot.legal_alternatives
+                    .first()
+                    .cloned()
+                    .map(|target| GameAction::ChooseTarget {
+                        target: Some(target),
+                    })
+            }
         }
 
         // Assign combat damage: greedy lethal-to-each, mirroring the engine's
@@ -752,6 +868,21 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
                 controller_damage,
             })
         }
+
+        // CR 510.1d + CR 702.22k: a banded blocker's damage is divided by the
+        // ACTIVE player among the attackers it blocks. There is no lethal rule
+        // (CR 510.1d), so the simplest legal division dumps the blocker's full
+        // power onto the first blocked attacker — mirroring the engine's
+        // ai_support::candidates AssignBlockerDamage arm.
+        WaitingFor::AssignBlockerDamage {
+            total_damage,
+            attackers,
+            ..
+        } => attackers
+            .first()
+            .map(|first| GameAction::AssignBlockerDamage {
+                assignments: vec![(*first, *total_damage)],
+            }),
 
         // X value: pick max (CR 107.1c + CR 601.2f). The engine has already
         // capped `max` to the maximum legally-payable X for this cast (see
@@ -899,9 +1030,10 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
         // for exhaustive match. ManaPayment is a pending-cast state.
         WaitingFor::ManaPayment { .. }
         | WaitingFor::OptionalCostChoice { .. }
+        | WaitingFor::SpliceOffer { .. }
         | WaitingFor::DefilerPayment { .. }
         | WaitingFor::PayCost {
-            resume: CostResume::Spell { .. },
+            resume: CostResume::Spell { .. } | CostResume::SpellCost { .. },
             ..
         }
         | WaitingFor::BlightChoice { .. }
@@ -924,9 +1056,19 @@ pub fn score_candidates(
     ai_player: PlayerId,
     config: &AiConfig,
 ) -> Vec<(GameAction, f64)> {
+    let session = AiSession::arc_from_game(state);
+    score_candidates_with_session(state, ai_player, config, &session)
+}
+
+fn score_candidates_with_session(
+    state: &GameState,
+    ai_player: PlayerId,
+    config: &AiConfig,
+    session: &Arc<AiSession>,
+) -> Vec<(GameAction, f64)> {
     let ctx = build_decision_context(state);
     let policies = PolicyRegistry::shared();
-    let context = build_ai_context(state, ai_player, config);
+    let context = build_ai_context_with_session(state, ai_player, config, Arc::clone(session));
 
     // Combat decisions bypass the candidate pipeline entirely — the combat AI
     // reads directly from game state and never uses generated candidates.
@@ -973,7 +1115,7 @@ pub fn score_candidates(
     //
     // `cancelled_casts` and `pending_activations` clear on PassPriority;
     // `activated_abilities_this_turn` clears on turn change.
-    let gated: Vec<_> = gated
+    let mut gated: Vec<_> = gated
         .into_iter()
         .filter(|g| match &g.candidate.action {
             GameAction::CastSpell { object_id, .. } => {
@@ -1025,6 +1167,9 @@ pub fn score_candidates(
             _ => true,
         })
         .collect();
+    if config.execution_mode.is_measurement() {
+        gated.sort_by_cached_key(|g| action_order_key(&g.candidate.action));
+    }
 
     let actions: Vec<GameAction> = gated
         .iter()
@@ -1046,10 +1191,13 @@ pub fn score_candidates(
 
     // Score actions via search or heuristics
     if config.search.enabled {
-        // Deterministic mode ignores the wall-clock time budget so search is
+        // Measurement mode ignores the wall-clock time budget so search is
         // bounded solely by max_nodes — integration tests and ai-duel regression
         // runs rely on this to eliminate wall-clock flake.
-        let mut budget = match (config.search.deterministic, config.search.time_budget_ms) {
+        let mut budget = match (
+            config.execution_mode.is_measurement(),
+            config.search.time_budget_ms,
+        ) {
             (false, Some(ms)) => SearchBudget::with_time_limit(
                 config.search.max_nodes,
                 web_time::Duration::from_millis(ms as u64),
@@ -1106,7 +1254,11 @@ pub fn score_candidates(
         ranked.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| {
+                    action_order_key(&a.candidate.action)
+                        .cmp(&action_order_key(&b.candidate.action))
+                })
         });
         ranked.truncate(branching);
 
@@ -1137,63 +1289,65 @@ pub fn score_candidates(
             out.push((r.candidate.action, score));
         }
         let _ = deadline_hit;
+        if config.execution_mode.is_measurement() {
+            out.sort_by_cached_key(|(action, _)| action_order_key(action));
+        }
         out
     } else {
         // Heuristic-only scoring
-        gated
+        let mut out: Vec<_> = gated
             .into_iter()
             .map(|candidate| {
                 let score = services.tactical_score(state, &ctx, &candidate.candidate, ai_player)
                     + candidate.penalty;
                 (candidate.candidate.action, score)
             })
-            .collect()
+            .collect();
+        if config.execution_mode.is_measurement() {
+            out.sort_by_cached_key(|(action, _)| action_order_key(action));
+        }
+        out
     }
 }
 
-/// Build AI context from the player's deck pool, or a neutral default if unavailable.
-fn build_ai_context(state: &GameState, player: PlayerId, config: &AiConfig) -> AiContext {
-    let ai_pool = state.deck_pools.iter().find(|p| p.player == player);
-    let deck = ai_pool.map(|p| p.current_main.as_slice()).unwrap_or(&[]);
-    if deck.is_empty() {
-        let mut ctx = AiContext::empty(&config.weights);
-        ctx.player = player;
-        return ctx;
-    }
-    // `analyze_for_player` keys the session's synergy/features/plan maps under
-    // the actual AI player up-front, so no `Arc::make_mut` + HashMap rekey is
-    // needed when the AI isn't in seat 0.
-    let mut ctx =
-        AiContext::analyze_for_player(deck, &config.weights, &config.archetype_multipliers, player);
-    // Populate opponent features so archetype lookups hit the cache instead
-    // of re-running `DeckProfile::analyze` per search call.
-    let session = std::sync::Arc::make_mut(&mut ctx.session);
-    // `analyze_for_player` defaults the AI player's bracket tier to `Core`
-    // (it has no `state` access). Read the declared tier from the AI's
-    // `PlayerDeckPool` and refresh the session features with it so
-    // `DeckFeatures::is_cedh` (and any future tier-gated feature) reflects
-    // the real bracket — without this, `ComboLinePolicy::activation()` would
-    // never fire for cEDH decks.
-    if let Some(pool) = ai_pool {
-        if pool.bracket_tier != engine::game::bracket_estimate::CommanderBracketTier::Core {
-            session.invalidate_player_features(player);
-            session.ensure_player_features(player, deck, pool.bracket_tier);
-        }
-    }
-    for pool in &state.deck_pools {
-        if pool.player != player {
-            session.ensure_player_features(pool.player, &pool.current_main, pool.bracket_tier);
-        }
-    }
+fn action_order_key(action: &GameAction) -> String {
+    format!("{action:?}")
+}
 
+/// Build AI context from the player's deck pool, or a neutral default if unavailable.
+fn build_ai_context_with_session(
+    state: &GameState,
+    player: PlayerId,
+    config: &AiConfig,
+    session: Arc<AiSession>,
+) -> AiContext {
+    let deck_profile = session
+        .deck_profile
+        .get(&player)
+        .cloned()
+        .unwrap_or_default();
+    let adjusted_weights = crate::eval::EvalWeightSet {
+        early: deck_profile
+            .adjust_weights_with(&config.archetype_multipliers, &config.weights.early),
+        mid: deck_profile.adjust_weights_with(&config.archetype_multipliers, &config.weights.mid),
+        late: deck_profile.adjust_weights_with(&config.archetype_multipliers, &config.weights.late),
+    };
+    let strategy = session.strategy.get(&player).cloned().unwrap_or_default();
+    let mut ctx = AiContext {
+        deck_profile,
+        adjusted_weights,
+        strategy,
+        opponent_threat: None,
+        session,
+        player,
+        deadline: engine::util::Deadline::none(),
+    };
     // Compute opponent threat profile based on difficulty setting.
     ctx.opponent_threat = match config.search.threat_awareness {
         ThreatAwareness::None => None,
         ThreatAwareness::ArchetypeOnly => {
-            // Use fixed archetype-based probabilities (no per-card analysis).
-            // Archetype is cached on `AiSession` (populated above via
-            // `ensure_player_features`), so this is a HashMap lookup — not a
-            // `DeckProfile::analyze` pass per search call.
+            // Use fixed archetype-based probabilities. Archetype is cached on
+            // `AiSession`, so this is a HashMap lookup.
             let opponents = engine::game::players::opponents(state, player);
             let opp_archetype = opponents
                 .first()
@@ -1211,6 +1365,10 @@ fn build_ai_context(state: &GameState, player: PlayerId, config: &AiConfig) -> A
     };
 
     ctx
+}
+
+fn build_ai_context(state: &GameState, player: PlayerId, config: &AiConfig) -> AiContext {
+    build_ai_context_with_session(state, player, config, AiSession::arc_from_game(state))
 }
 
 /// Handle deterministic decisions that don't benefit from search or parallelism.
@@ -1313,19 +1471,30 @@ pub(crate) fn deterministic_choice(
     // authorized submitter (seat order) rather than `ai_player` — so without
     // this branch the AI can pick a selection sized for a different player and
     // the engine rejects it ("Expected N cards to bottom, got M"). Bottom the
-    // N least valuable cards, mirroring the DiscardToHandSize heuristic below.
+    // N least valuable cards, using the cached plan to preserve expected land
+    // count and structurally detected payoff cards.
     if let WaitingFor::MulliganBottomCards { pending }
     | WaitingFor::OpeningHandBottomCards { pending, .. } = &state.waiting_for
     {
         let entry = pending.iter().find(|e| e.player == ai_player)?;
         let count = entry.count as usize;
-        let mut scored: Vec<_> = state.players[ai_player.0 as usize]
-            .hand
-            .iter()
-            .map(|&id| (id, evaluate_card_value(state, id)))
-            .collect();
-        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-        let to_bottom: Vec<_> = scored.iter().take(count).map(|(id, _)| *id).collect();
+        let owned_ctx;
+        let ctx = match context {
+            Some(c) => c,
+            None => {
+                owned_ctx = build_ai_context(state, ai_player, config);
+                &owned_ctx
+            }
+        };
+        let default_features = DeckFeatures::default();
+        let default_plan = PlanSnapshot::default();
+        let features = ctx
+            .session
+            .features
+            .get(&ai_player)
+            .unwrap_or(&default_features);
+        let plan = ctx.session.plan.get(&ai_player).unwrap_or(&default_plan);
+        let to_bottom = plan_aware_bottom_cards(state, ai_player, count, features, plan);
         return Some(GameAction::SelectCards { cards: to_bottom });
     }
 
@@ -1386,6 +1555,25 @@ pub(crate) fn deterministic_choice(
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         if let Some((best, _)) = scored.first() {
             return Some(GameAction::SelectCards { cards: vec![*best] });
+        }
+    }
+
+    if let WaitingFor::EffectZoneChoice {
+        cards,
+        count,
+        up_to,
+        effect_kind,
+        ..
+    } = &state.waiting_for
+    {
+        if matches!(effect_kind, engine::types::ability::EffectKind::Sacrifice)
+            && !cards.is_empty()
+            && !*up_to
+            && *count > 0
+        {
+            return Some(GameAction::SelectCards {
+                cards: pick_lowest_value_sacrifices(state, cards, *count),
+            });
         }
     }
 
@@ -1558,7 +1746,7 @@ pub(crate) fn deterministic_choice(
             }
             // Non-mana optional costs: sacrifice → usually worth it for the upgrade
             engine::types::ability::AdditionalCost::Optional {
-                cost: engine::types::ability::AbilityCost::Sacrifice { .. },
+                cost: engine::types::ability::AbilityCost::Sacrifice(_),
                 ..
             } => false, // Conservative: don't sacrifice unless search says so
             engine::types::ability::AdditionalCost::Optional {
@@ -1738,7 +1926,10 @@ fn validated_declare_attackers(
         engine::game::combat::AttackTarget,
     )>,
 ) -> GameAction {
-    let candidate = GameAction::DeclareAttackers { attacks };
+    let candidate = GameAction::DeclareAttackers {
+        attacks,
+        bands: vec![],
+    };
     let mut sim = state.clone();
     if engine::game::engine::apply_as_current(&mut sim, candidate.clone()).is_ok() {
         return candidate;
@@ -1748,6 +1939,7 @@ fn validated_declare_attackers(
         .find(|action| matches!(action, GameAction::DeclareAttackers { .. }))
         .unwrap_or(GameAction::DeclareAttackers {
             attacks: Vec::new(),
+            bands: vec![],
         })
 }
 
@@ -1808,6 +2000,85 @@ fn evaluate_card_value(state: &GameState, obj_id: engine::types::identifiers::Ob
     }
 
     value
+}
+
+fn plan_aware_bottom_cards(
+    state: &GameState,
+    player: PlayerId,
+    count: usize,
+    features: &DeckFeatures,
+    plan: &PlanSnapshot,
+) -> Vec<ObjectId> {
+    let hand: Vec<_> = state.players[player.0 as usize]
+        .hand
+        .iter()
+        .copied()
+        .collect();
+    let final_hand_size = hand.len().saturating_sub(count);
+    let land_target = plan_bottoming_land_target(plan, final_hand_size);
+    let land_count = hand
+        .iter()
+        .filter(|id| {
+            state
+                .objects
+                .get(id)
+                .is_some_and(|obj| obj.card_types.core_types.contains(&CoreType::Land))
+        })
+        .count();
+    let mut surplus_lands = land_count.saturating_sub(land_target);
+    let mut scored = Vec::with_capacity(hand.len());
+
+    for id in hand {
+        let score = state.objects.get(&id).map_or(0.0, |obj| {
+            if is_plan_payoff_name(features, &obj.name) {
+                25.0 + evaluate_card_value(state, id)
+            } else if obj.card_types.core_types.contains(&CoreType::Land) {
+                if surplus_lands > 0 {
+                    surplus_lands -= 1;
+                    -5.0
+                } else {
+                    30.0
+                }
+            } else {
+                evaluate_card_value(state, id)
+            }
+        });
+        scored.push((id, score));
+    }
+
+    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+    scored.into_iter().take(count).map(|(id, _)| id).collect()
+}
+
+fn plan_bottoming_land_target(plan: &PlanSnapshot, final_hand_size: usize) -> usize {
+    let target = plan
+        .expected_lands
+        .get(2)
+        .copied()
+        .filter(|lands| *lands > 0)
+        .unwrap_or(3) as usize;
+    target.min(final_hand_size)
+}
+
+fn is_plan_payoff_name(features: &DeckFeatures, name: &str) -> bool {
+    features.landfall.payoff_names.iter().any(|n| n == name)
+        || features.aristocrats.outlet_names.iter().any(|n| n == name)
+        || features
+            .aristocrats
+            .death_trigger_names
+            .iter()
+            .any(|n| n == name)
+        || features.tokens_wide.payoff_names.iter().any(|n| n == name)
+        || features
+            .plus_one_counters
+            .payoff_names
+            .iter()
+            .any(|n| n == name)
+        || features
+            .spellslinger_prowess
+            .payoff_names
+            .iter()
+            .any(|n| n == name)
 }
 
 /// AI-local combination enumerator. Mirrors `engine::ai_support::candidates::combinations`
@@ -1886,7 +2157,9 @@ mod tests {
     use super::*;
     use engine::ai_support::{ActionMetadata, AiDecisionContext, CandidateAction, TacticalClass};
     use engine::game::zones::create_object;
-    use engine::types::ability::{CategoryChooserScope, TargetFilter, TargetRef, TypedFilter};
+    use engine::types::ability::{
+        CategoryChooserScope, EffectKind, TargetFilter, TargetRef, TypedFilter,
+    };
     use engine::types::card_type::CoreType;
     use engine::types::identifiers::{CardId, ObjectId};
     use engine::types::mana::{ManaType, ManaUnit};
@@ -1937,7 +2210,7 @@ mod tests {
             p.mana_pool.add(ManaUnit {
                 color,
                 source_id: ObjectId(0),
-                snow: false,
+                supertype: None,
                 source_could_produce_two_or_more_colors: false,
                 restrictions: Vec::new(),
                 grants: vec![],
@@ -1965,6 +2238,39 @@ mod tests {
         let mut rng = SmallRng::seed_from_u64(1);
         let action = choose_action(&state, PlayerId(0), &config, &mut rng);
         assert_eq!(action, Some(GameAction::PassPriority));
+    }
+
+    #[test]
+    fn session_policy_memory_survives_consecutive_decisions() {
+        let state = make_state();
+        let config = create_config(AiDifficulty::Medium, Platform::Native);
+        let session = AiSession::arc_from_game(&state);
+        session.memory.write().unwrap().by_policy.insert(
+            PolicyId::LandfallTiming,
+            crate::session::PolicyState::LandfallTiming {
+                held_fetch_count: 7,
+                last_held_turn: state.turn_number,
+            },
+        );
+
+        let mut rng = SmallRng::seed_from_u64(1);
+        assert_eq!(
+            choose_action_with_session(&state, PlayerId(0), &config, &mut rng, &session),
+            Some(GameAction::PassPriority)
+        );
+        assert_eq!(
+            choose_action_with_session(&state, PlayerId(0), &config, &mut rng, &session),
+            Some(GameAction::PassPriority)
+        );
+
+        let memory = session.memory.read().unwrap();
+        assert!(matches!(
+            memory.by_policy.get(&PolicyId::LandfallTiming),
+            Some(crate::session::PolicyState::LandfallTiming {
+                held_fetch_count: 7,
+                last_held_turn: 2,
+            })
+        ));
     }
 
     #[test]
@@ -2441,6 +2747,7 @@ mod tests {
                 defending_player: PlayerId(0),
                 attack_target: AttackTarget::Player(PlayerId(0)),
                 blocked: false,
+                band_id: None,
             }],
             blocker_assignments: HashMap::new(),
             blocker_to_attacker: HashMap::new(),
@@ -2530,7 +2837,7 @@ mod tests {
         let action = validated_declare_attackers(&state, vec![(creature, target)]);
 
         match action {
-            GameAction::DeclareAttackers { attacks } => assert!(
+            GameAction::DeclareAttackers { attacks, .. } => assert!(
                 !attacks.iter().any(|(id, _)| *id == creature),
                 "guard must drop the illegal (tapped) attacker, got {attacks:?}"
             ),
@@ -2539,13 +2846,21 @@ mod tests {
     }
 
     /// CR 608.2c + CR 701.23: Gifts Ungiven scaling regression — with a
-    /// large library (80 cards), a count-4 search must complete in well
-    /// under 100 ms via the BEAM_K-bounded path. The pre-fix Cartesian
-    /// enumerator (~C(80, 4) ≈ 1.5M combos × per-combo scoring) stalled
-    /// the AI; the beam reduces to C(BEAM_K, 4) candidates. The DistinctNames
-    /// constraint is honored by the engine candidate filter and re-checked
-    /// inside the AI beam, so the returned selection must contain only
-    /// uniquely-named cards.
+    /// large library (80 cards), a count-4 search must complete via the
+    /// BEAM_K-bounded path rather than the pre-fix Cartesian enumerator
+    /// (~C(80, 4) ≈ 1.5M combos × per-combo scoring) that stalled the AI.
+    /// The beam reduces this to C(BEAM_K, 4) ≈ 794 scored selections.
+    ///
+    /// The ceiling is a *blowup* guard, not a tight micro-benchmark: the
+    /// healthy beam path runs in ~60–130 ms (machine- and load-dependent —
+    /// this runs in CI and alongside concurrent Tilt rebuilds), while a
+    /// reversion to Cartesian enumeration costs *tens of seconds*. A 1 s
+    /// ceiling cleanly separates the two — ~8× headroom over the loaded
+    /// healthy path, ~1000× below a Cartesian regression — so it catches the
+    /// regression it exists to catch without flaking on contention. The
+    /// DistinctNames constraint is honored by the engine candidate filter and
+    /// re-checked inside the AI beam, so the returned selection must contain
+    /// only uniquely-named cards.
     #[test]
     fn gifts_ungiven_search_choice_returns_quickly_with_distinct_names() {
         use engine::types::ability::{SearchSelectionConstraint, SharedQuality};
@@ -2594,8 +2909,10 @@ mod tests {
         let action = choose_action(&state, PlayerId(0), &config, &mut rng);
         let elapsed = started.elapsed();
         assert!(
-            elapsed.as_millis() < 100,
-            "AI search-choice took {elapsed:?}; beam path must keep it under 100ms"
+            elapsed.as_millis() < 1000,
+            "AI search-choice took {elapsed:?}; a Cartesian-enumeration regression \
+             (C(80,4) ≈ 1.5M combos) costs tens of seconds — the BEAM_K path must \
+             stay well under the 1s blowup ceiling"
         );
 
         match action {
@@ -2673,6 +2990,89 @@ mod tests {
             matches!(action, GameAction::ChooseOption { ref choice } if choice == "foe"),
             "AI labeling opponent must pick foe, got {action:?}"
         );
+    }
+
+    #[test]
+    fn copy_retarget_fallback_keeps_existing_targets_with_legal_action() {
+        let mut state = make_state();
+        let original_target = TargetRef::Object(ObjectId(10));
+        state.waiting_for = WaitingFor::CopyRetarget {
+            player: PlayerId(0),
+            copy_id: ObjectId(20),
+            target_slots: vec![engine::types::game_state::CopyTargetSlot {
+                current: Some(original_target),
+                legal_alternatives: vec![TargetRef::Object(ObjectId(11))],
+            }],
+            effect_kind: EffectKind::CopySpell,
+            effect_source_id: Some(ObjectId(20)),
+            current_slot: 0,
+        };
+
+        let action = fallback_action(&state).expect("fallback returns an action");
+        assert_eq!(action, GameAction::KeepAllCopyTargets);
+        assert!(engine::game::engine::apply_as_current(&mut state, action).is_ok());
+        assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+    }
+
+    #[test]
+    fn copy_retarget_fallback_keeps_current_slot_before_later_empty_slot() {
+        let mut state = make_state();
+        let current_target = TargetRef::Object(ObjectId(10));
+        state.waiting_for = WaitingFor::CopyRetarget {
+            player: PlayerId(0),
+            copy_id: ObjectId(20),
+            target_slots: vec![
+                engine::types::game_state::CopyTargetSlot {
+                    current: Some(current_target),
+                    legal_alternatives: vec![TargetRef::Object(ObjectId(11))],
+                },
+                engine::types::game_state::CopyTargetSlot {
+                    current: None,
+                    legal_alternatives: vec![TargetRef::Object(ObjectId(12))],
+                },
+            ],
+            effect_kind: EffectKind::CopySpell,
+            effect_source_id: Some(ObjectId(20)),
+            current_slot: 0,
+        };
+
+        let action = fallback_action(&state).expect("fallback returns an action");
+        assert_eq!(action, GameAction::ChooseTarget { target: None });
+        assert!(engine::game::engine::apply_as_current(&mut state, action).is_ok());
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::CopyRetarget {
+                current_slot: 1,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn copy_retarget_fallback_selects_first_target_for_fresh_copy_cast() {
+        let mut state = make_state();
+        let first_target = TargetRef::Object(ObjectId(10));
+        state.waiting_for = WaitingFor::CopyRetarget {
+            player: PlayerId(0),
+            copy_id: ObjectId(20),
+            target_slots: vec![engine::types::game_state::CopyTargetSlot {
+                current: None,
+                legal_alternatives: vec![first_target.clone(), TargetRef::Object(ObjectId(11))],
+            }],
+            effect_kind: EffectKind::CopySpell,
+            effect_source_id: Some(ObjectId(20)),
+            current_slot: 0,
+        };
+
+        let action = fallback_action(&state).expect("fallback returns an action");
+        assert_eq!(
+            action,
+            GameAction::ChooseTarget {
+                target: Some(first_target),
+            }
+        );
+        assert!(engine::game::engine::apply_as_current(&mut state, action).is_ok());
+        assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
     }
 
     /// A classic vote (`actor == player`) keeps the pre-existing "first
@@ -2884,7 +3284,7 @@ mod tests {
                         generic: 2,
                     },
                 }],
-                repeatable: true,
+                repeatability: engine::types::ability::AdditionalCostRepeatability::Repeatable,
             },
             times_kicked: 0,
             pending_cast: Box::new(pending),
@@ -2926,8 +3326,24 @@ mod tests {
 
     /// Create a vanilla (zero-value) card directly in `owner`'s hand.
     fn vanilla_in_hand(state: &mut GameState, owner: PlayerId) -> ObjectId {
+        named_vanilla_in_hand(state, owner, "Card")
+    }
+
+    fn named_vanilla_in_hand(state: &mut GameState, owner: PlayerId, name: &str) -> ObjectId {
         let id = CardId(state.next_object_id);
-        create_object(state, id, owner, "Card".to_string(), Zone::Hand)
+        create_object(state, id, owner, name.to_string(), Zone::Hand)
+    }
+
+    fn land_in_hand(state: &mut GameState, owner: PlayerId) -> ObjectId {
+        let id = named_vanilla_in_hand(state, owner, "Land");
+        state
+            .objects
+            .get_mut(&id)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Land);
+        id
     }
 
     /// Create a creature (high `evaluate_card_value`) directly in `owner`'s hand.
@@ -3052,6 +3468,53 @@ mod tests {
             }
             other => panic!("expected SelectCards, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn plan_aware_bottoming_cuts_surplus_lands_to_plan_target() {
+        let mut state = make_state();
+        let lands: Vec<_> = (0..5)
+            .map(|_| land_in_hand(&mut state, PlayerId(1)))
+            .collect();
+        creature_in_hand(&mut state, PlayerId(1));
+        creature_in_hand(&mut state, PlayerId(1));
+
+        let mut plan = PlanSnapshot::default();
+        plan.expected_lands[2] = 3;
+        let bottoms =
+            plan_aware_bottom_cards(&state, PlayerId(1), 2, &DeckFeatures::default(), &plan);
+        let land_set: std::collections::HashSet<_> = lands.iter().copied().collect();
+
+        assert_eq!(bottoms.len(), 2);
+        assert!(
+            bottoms.iter().all(|id| land_set.contains(id)),
+            "bottoming should cut surplus lands before real threats"
+        );
+    }
+
+    #[test]
+    fn plan_aware_bottoming_protects_feature_payoff_names() {
+        let mut state = make_state();
+        let payoff = named_vanilla_in_hand(&mut state, PlayerId(1), "Landfall Payoff");
+        let filler_a = vanilla_in_hand(&mut state, PlayerId(1));
+        let filler_b = vanilla_in_hand(&mut state, PlayerId(1));
+        let features = DeckFeatures {
+            landfall: crate::features::LandfallFeature {
+                payoff_names: vec!["Landfall Payoff".to_string()],
+                commitment: 1.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let bottoms =
+            plan_aware_bottom_cards(&state, PlayerId(1), 1, &features, &PlanSnapshot::default());
+
+        assert_ne!(bottoms, vec![payoff]);
+        assert!(
+            bottoms == vec![filler_a] || bottoms == vec![filler_b],
+            "bottoming should protect structurally detected payoff names"
+        );
     }
 
     /// Build a single-blocker AssignCombatDamage prompt and run the AI fallback.

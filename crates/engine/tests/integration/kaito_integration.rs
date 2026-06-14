@@ -63,6 +63,7 @@ fn ninja_pump_static() -> StaticDefinition {
         active_zones: vec![],
         characteristic_defining: false,
         description: None,
+        attack_defended: None,
     }
 }
 
@@ -336,21 +337,10 @@ fn kaito_emblem_creation() {
         id
     };
 
-    // Activate +1 loyalty ability (CreateEmblem)
-    let result = runner.act(GameAction::ActivateAbility {
-        source_id: kaito_id,
-        ability_index: 0,
-    });
-    assert!(
-        result.is_ok(),
-        "Emblem ability activation should succeed: {:?}",
-        result.err()
-    );
+    // Activate +1 loyalty ability (CreateEmblem) and drive it to resolution.
+    let outcome = runner.activate(kaito_id, 0).resolve();
 
-    // Resolve the ability on the stack
-    runner.resolve_top();
-
-    let state = runner.state();
+    let state = outcome.state();
 
     // An emblem should exist in command zone
     assert!(

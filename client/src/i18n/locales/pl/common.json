@@ -49,6 +49,8 @@
     "volume": "Głośność"
   },
   "hostControl": {
+    "collapse": "Zwiń",
+    "expand": "Rozwiń panel gospodarza",
     "seatHost": "Gospodarz",
     "seatPlayer": "Gracz",
     "seatOpen": "Wolne",
@@ -69,7 +71,9 @@
     "seatsOccupied": "{{occupied}}/{{total}} miejsc zajętych",
     "startGame": "Rozpocznij grę",
     "startNow": "Rozpocznij teraz",
-    "fillWithAi": "Wypełnij przez AI"
+    "fillWithAi": "Wypełnij przez AI",
+    "joinLinkCopied": "Skopiowano link dołączenia",
+    "copyJoinLink": "Kopiuj link dołączenia: {{joinShare}}"
   },
   "grantDebug": {
     "heading": "Piaskownica: uprawnienia debugowania",
@@ -201,6 +205,7 @@
   },
   "diceRoll": {
     "rollingForFirst": "Rzut o pierwszego gracza",
+    "tieReroll": "Remis — rzut ponownie!",
     "versus": "VS",
     "skip": "Dotknij, aby pominąć",
     "continue": "Dotknij, aby kontynuować",

@@ -15,10 +15,15 @@ use nom::combinator::value;
 use nom::Parser;
 
 use super::error::OracleResult;
-use crate::types::ability::{ControllerRef, TargetFilter, TypeFilter, TypedFilter};
+use crate::parser::oracle_util::parse_subtype;
+use crate::types::ability::{
+    AttachmentKind, ControllerRef, FilterProp, TargetFilter, TypeFilter, TypedFilter,
+};
+use crate::types::card_type::{noncreature_subtype_set, SubtypeSet};
 
-/// CR 702.5a: One enchantable core-type or land-subtype token. Driven by
-/// `value()` + `alt()` so additional types slot in as one-line extensions.
+/// CR 702.5a: One enchantable core-type or supported subtype token. Core
+/// types and established basic-land subtype legs stay as literal nom arms;
+/// artifact subtypes delegate to the canonical subtype classifier below.
 ///
 /// Basic land subtypes (Forest, Plains, Island, Swamp, Mountain) are included
 /// per CR 205.3i — basic land types are the canonical Aura targets for
@@ -29,8 +34,12 @@ use crate::types::ability::{ControllerRef, TargetFilter, TypeFilter, TypedFilter
 pub(crate) fn parse_enchant_type_leg(input: &str) -> OracleResult<'_, TypeFilter> {
     alt((
         value(TypeFilter::Creature, tag("creature")),
-        value(TypeFilter::Land, tag("land")),
         value(TypeFilter::Artifact, tag("artifact")),
+        // CR 205.3g + CR 702.5a: Artifact subtype legs use the canonical
+        // subtype registry. This must precede `land` so `Lander` is not
+        // short-matched as the core Land type.
+        parse_artifact_subtype_enchant_leg,
+        value(TypeFilter::Land, tag("land")),
         value(TypeFilter::Enchantment, tag("enchantment")),
         value(TypeFilter::Planeswalker, tag("planeswalker")),
         value(TypeFilter::Permanent, tag("permanent")),
@@ -47,6 +56,27 @@ pub(crate) fn parse_enchant_type_leg(input: &str) -> OracleResult<'_, TypeFilter
         value(TypeFilter::Subtype("Mountain".to_string()), tag("mountain")),
     ))
     .parse(input)
+}
+
+fn parse_artifact_subtype_enchant_leg(input: &str) -> OracleResult<'_, TypeFilter> {
+    let Some((subtype, consumed)) = parse_subtype(input) else {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    };
+
+    if !matches!(
+        noncreature_subtype_set(&subtype),
+        Some(SubtypeSet::Artifact)
+    ) {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    }
+
+    Ok((&input[consumed..], TypeFilter::Subtype(subtype)))
 }
 
 /// Separator between enchant list legs. Covers serial-comma (", or "/", and "),
@@ -92,6 +122,42 @@ pub(crate) fn parse_enchant_controller_suffix(input: &str) -> OracleResult<'_, C
     .parse(input)
 }
 
+/// CR 303.4 + CR 702.5a + CR 301.5: Optional trailing attachment qualifier on an
+/// "Enchant <type>" line — "with another Aura attached to it" (Daybreak Coronet)
+/// further restricts the legal target set to objects that already carry an
+/// attachment of the named kind. "Another" is material once SBA attachment
+/// legality rechecks the Aura already attached to its host, so preserve it as a
+/// source-exclusion axis on the `HasAttachment` filter prop. The leading space
+/// ensures the qualifier only matches after a preceding type leg (never as a
+/// standalone clause).
+pub(crate) fn parse_enchant_attachment_qualifier(input: &str) -> OracleResult<'_, FilterProp> {
+    let (input, _) = tag(" with ").parse(input)?;
+    let (input, exclude_source) = alt((
+        value(true, tag("another ")),
+        value(false, tag("an ")),
+        value(false, tag("a ")),
+    ))
+    .parse(input)?;
+    let (input, kind) = alt((
+        value(AttachmentKind::Aura, tag("aura")),
+        value(AttachmentKind::Equipment, tag("equipment")),
+    ))
+    .parse(input)?;
+    let (input, _) = tag(" attached to it").parse(input)?;
+    Ok((
+        input,
+        FilterProp::HasAttachment {
+            kind,
+            controller: None,
+            exclude_source: if exclude_source {
+                crate::types::ability::SourceExclusion::Exclude
+            } else {
+                crate::types::ability::SourceExclusion::Include
+            },
+        },
+    ))
+}
+
 /// CR 702.5d: "Enchant player" / "Enchant opponent" — the player-axis Aura.
 /// The two legs yield the typed `TargetFilter` the rest of the cast pipeline
 /// expects. "Enchant player" → `TargetFilter::Player` (any player at the
@@ -122,6 +188,7 @@ pub(crate) fn parse_enchant_target_full(input: &str) -> OracleResult<'_, TargetF
 
     let (input, type_legs) = parse_enchant_type_list(input)?;
     let (input, controller) = opt(parse_enchant_controller_suffix).parse(input)?;
+    let (input, attachment) = opt(parse_enchant_attachment_qualifier).parse(input)?;
 
     let mut typed = TypedFilter {
         type_filters: type_legs,
@@ -129,6 +196,9 @@ pub(crate) fn parse_enchant_target_full(input: &str) -> OracleResult<'_, TargetF
     };
     if let Some(c) = controller {
         typed.controller = Some(c);
+    }
+    if let Some(prop) = attachment {
+        typed.properties.push(prop);
     }
     Ok((input, TargetFilter::Typed(typed)))
 }

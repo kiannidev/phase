@@ -6,28 +6,17 @@
 //! Elusive Otter (creature: Otter with Prowess + a CantBlock static; adventure:
 //! Grove's Bounty, sorcery) is the canonical reproducer.
 
-use std::path::Path;
-use std::sync::OnceLock;
-
-use engine::database::card_db::CardDatabase;
 use engine::game::scenario::{GameScenario, P0};
 use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::actions::GameAction;
 use engine::types::game_state::CastingVariant;
-use engine::types::game_state::{CastOfferKind, StackEntryKind, WaitingFor};
+use engine::types::game_state::{CastOfferKind, CastPaymentMode, StackEntryKind, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
-fn load_db() -> Option<&'static CardDatabase> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../client/public/card-data.json");
-    if !path.exists() {
-        return None;
-    }
-    static DB: OnceLock<CardDatabase> = OnceLock::new();
-    Some(DB.get_or_init(|| CardDatabase::from_export(&path).expect("export should load")))
-}
+use crate::support::shared_card_db as load_db;
 
 fn add_mana(runner: &mut engine::game::scenario::GameRunner, mana: &[ManaType]) {
     let dummy = ObjectId(0);
@@ -63,6 +52,8 @@ fn elusive_otter_creature_face_cast_does_not_panic() {
             object_id: otter_id,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("cast should be accepted");
     assert!(
@@ -124,6 +115,8 @@ fn elusive_otter_adventure_face_cast_does_not_panic() {
             object_id: otter_id,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("cast should be accepted");
     runner

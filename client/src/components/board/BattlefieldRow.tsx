@@ -1,4 +1,4 @@
-import { useRef, useState, useEffect } from "react";
+import { Fragment, useRef, useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 
 import { useIsCompactHeight } from "../../hooks/useIsCompactHeight.ts";
@@ -8,8 +8,8 @@ import type { GroupedPermanent } from "../../viewmodel/battlefieldProps";
 import { useBoardInteractionState } from "./BoardInteractionContext.tsx";
 import { GroupedPermanentDisplay } from "./GroupedPermanent.tsx";
 import {
-  GROUP_STAGGER_PX,
   getGroupRenderMode,
+  groupStaggerPx,
   type BattlefieldRowType,
   visibleCardSlotCount,
   visibleStaggerCount,
@@ -19,12 +19,22 @@ interface BattlefieldRowProps {
   groups: GroupedPermanent[];
   rowType: BattlefieldRowType;
   className?: string;
+  /** Render a thin vertical divider immediately before the group at this index,
+   *  keeping two sub-clusters (e.g. enchantments|planeswalkers) on one wrapping
+   *  line while visually separating them. Omit for no divider. */
+  dividerBeforeIndex?: number;
+  /** Creatures only: render at the card size inherited from the parent's CSS
+   *  vars and wrap top-down, skipping the measure-based shrink-to-fit. Lets a
+   *  scrollable parent present a fixed, readable size and scroll the overflow
+   *  (used by the crowded-creature overview) instead of cramming the row. */
+  fixedSize?: boolean;
 }
 
 const ROW_JUSTIFY: Record<string, string> = {
   creatures: "justify-center",
   lands: "justify-start",
   support: "justify-end",
+  planeswalkers: "justify-end",
   other: "justify-end",
 };
 
@@ -56,7 +66,7 @@ function getCreatureScale(groupCount: number, display: "art_crop" | "full_card")
   return Math.max(min, 1 / Math.sqrt(1 + excess * 0.15));
 }
 
-export function BattlefieldRow({ groups, rowType, className }: BattlefieldRowProps) {
+export function BattlefieldRow({ groups, rowType, className, dividerBeforeIndex, fixedSize = false }: BattlefieldRowProps) {
   const { t } = useTranslation("game");
   const battlefieldCardDisplay = usePreferencesStore((s) => s.battlefieldCardDisplay);
   const isCompactHeight = useIsCompactHeight();
@@ -70,7 +80,9 @@ export function BattlefieldRow({ groups, rowType, className }: BattlefieldRowPro
   // non-empty render (the early return below means the ref is null when empty).
   const hasGroups = groups.length > 0;
   useEffect(() => {
-    if (rowType !== "creatures" || !hasGroups) return;
+    // fixedSize inherits its card dimensions from the parent's CSS vars and lets
+    // the parent scroll, so the measure-based sizing observer is unnecessary.
+    if (rowType !== "creatures" || !hasGroups || fixedSize) return;
     const el = containerRef.current?.parentElement;
     if (!el) return;
     const observer = new ResizeObserver(([entry]) => {
@@ -81,7 +93,7 @@ export function BattlefieldRow({ groups, rowType, className }: BattlefieldRowPro
     });
     observer.observe(el);
     return () => observer.disconnect();
-  }, [rowType, hasGroups]);
+  }, [rowType, hasGroups, fixedSize]);
 
   useEffect(() => {
     const currentGroupIds = new Set(groups.map((group) => group.ids[0]));
@@ -133,11 +145,15 @@ export function BattlefieldRow({ groups, rowType, className }: BattlefieldRowPro
     0,
   );
   const totalVisibleStagger = renderedGroups.reduce(
-    (total, { group, renderMode }) => total + visibleStaggerCount(renderMode, group) * GROUP_STAGGER_PX,
+    (total, { group, renderMode }) => total + visibleStaggerCount(renderMode, group) * groupStaggerPx(rowType),
     0,
   );
 
-  if (rowType === "creatures") {
+  if (rowType === "creatures" && fixedSize) {
+    // Inherit card size from the parent's CSS vars; wrap top-down and let the
+    // parent scroll. No rowStyle override.
+    creatureWrap = true;
+  } else if (rowType === "creatures") {
     if (containerSize && containerSize.height > 0) {
       // Measure-based sizing: fill available space
       const { width: cw, height: ch } = containerSize;
@@ -203,14 +219,24 @@ export function BattlefieldRow({ groups, rowType, className }: BattlefieldRowPro
     }
   }
 
-  const creatureClass = creatureWrap
-    ? "flex-wrap items-end content-end"
-    : "flex-nowrap items-end";
+  const creatureClass = fixedSize
+    ? "flex-wrap items-start content-start"
+    : creatureWrap
+      ? "flex-wrap items-end content-end"
+      : "flex-nowrap items-end";
+
+  // Planeswalkers stay on a single horizontal line — wrapping them stacks
+  // vertically and warps the surrounding board rows. Every other non-creature
+  // row (lands, support enchantments/artifacts, other) wraps to multiple rows
+  // when crowded, shrinking via the column's count-based zoneScale.
+  const nonCreatureClass = rowType === "planeswalkers"
+    ? "flex-nowrap items-center gap-2"
+    : "flex-wrap items-center gap-2";
 
   return (
     <div
       ref={containerRef}
-      className={`relative flex ${minH} ${rowType === "creatures" ? `${creatureClass} ${creatureWrap ? "gap-x-2 gap-y-3" : "gap-2"}` : "flex-wrap items-center gap-2"} ${ROW_JUSTIFY[rowType]} ${className ?? ""}`}
+      className={`relative flex ${minH} ${rowType === "creatures" ? `${creatureClass} ${creatureWrap ? "gap-x-2 gap-y-3" : "gap-2"}` : nonCreatureClass} ${ROW_JUSTIFY[rowType]} ${className ?? ""}`}
       style={rowStyle}
     >
       {rowType === "creatures" && expandedGroupIds.size > 0 && (
@@ -228,24 +254,28 @@ export function BattlefieldRow({ groups, rowType, className }: BattlefieldRowPro
           </span>
         </button>
       )}
-      {renderedGroups.map(({ group, manualExpanded }) => (
-        <GroupedPermanentDisplay
-          key={group.ids[0]}
-          group={group}
-          rowType={rowType}
-          manualExpanded={manualExpanded}
-          onExpand={() => {
-            setExpandedGroupIds((previous) => {
-              const next = new Set(previous);
-              if (next.has(group.ids[0])) {
-                next.delete(group.ids[0]);
-              } else {
-                next.add(group.ids[0]);
-              }
-              return next;
-            });
-          }}
-        />
+      {renderedGroups.map(({ group, manualExpanded }, index) => (
+        <Fragment key={group.ids[0]}>
+          {index === dividerBeforeIndex && (
+            <div aria-hidden className="mx-1 w-px self-stretch rounded bg-white/15" />
+          )}
+          <GroupedPermanentDisplay
+            group={group}
+            rowType={rowType}
+            manualExpanded={manualExpanded}
+            onExpand={() => {
+              setExpandedGroupIds((previous) => {
+                const next = new Set(previous);
+                if (next.has(group.ids[0])) {
+                  next.delete(group.ids[0]);
+                } else {
+                  next.add(group.ids[0]);
+                }
+                return next;
+              });
+            }}
+          />
+        </Fragment>
       ))}
     </div>
   );

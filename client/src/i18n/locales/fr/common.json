@@ -49,6 +49,8 @@
     "volume": "Volume"
   },
   "hostControl": {
+    "collapse": "Réduire",
+    "expand": "Développer le panneau d'hôte",
     "seatHost": "Hôte",
     "seatPlayer": "Joueur",
     "seatOpen": "Libre",
@@ -69,7 +71,9 @@
     "seatsOccupied": "{{occupied}}/{{total}} sièges occupés",
     "startGame": "Démarrer la partie",
     "startNow": "Démarrer maintenant",
-    "fillWithAi": "Compléter avec des IA"
+    "fillWithAi": "Compléter avec des IA",
+    "joinLinkCopied": "Lien d'invitation copié",
+    "copyJoinLink": "Copier le lien d'invitation : {{joinShare}}"
   },
   "grantDebug": {
     "heading": "Bac à sable : permissions de débogage",
@@ -201,6 +205,7 @@
   },
   "diceRoll": {
     "rollingForFirst": "Tirage pour savoir qui commence",
+    "tieReroll": "Égalité — on relance !",
     "versus": "VS",
     "skip": "Toucher pour passer",
     "continue": "Toucher pour continuer",

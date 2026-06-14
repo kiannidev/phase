@@ -38,28 +38,17 @@
 //! The new `effect_context_object` path and the `last_revealed_ids` target
 //! injection therefore do not double-bind for this card.
 
-use std::path::Path;
-use std::sync::OnceLock;
-
-use engine::database::card_db::CardDatabase;
 use engine::game::scenario::{GameScenario, P0};
 use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::ability::TargetRef;
 use engine::types::actions::GameAction;
-use engine::types::game_state::WaitingFor;
+use engine::types::game_state::{CastPaymentMode, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
-fn load_db() -> Option<&'static CardDatabase> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../client/public/card-data.json");
-    if !path.exists() {
-        return None;
-    }
-    static DB: OnceLock<CardDatabase> = OnceLock::new();
-    Some(DB.get_or_init(|| CardDatabase::from_export(&path).expect("export should load")))
-}
+use crate::support::shared_card_db as load_db;
 
 /// CR 608.2c — Dark Confidant's upkeep trigger reveals the top card of P0's
 /// library and P0 loses life equal to *that revealed card's* mana value.
@@ -195,6 +184,8 @@ fn conclave_mentor_dies_trigger_gains_life_equal_to_its_power() {
             object_id: bolt,
             card_id: bolt_card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("cast Lightning Bolt");
     if matches!(result.waiting_for, WaitingFor::TargetSelection { .. }) {

@@ -53,10 +53,6 @@
 //!   - CR 202.3: an object's mana value is the converted total of its mana
 //!     cost — the quantity the resolver reads off the revealed card.
 
-use std::path::Path;
-use std::sync::OnceLock;
-
-use engine::database::card_db::CardDatabase;
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::phase::Phase;
@@ -64,14 +60,7 @@ use engine::types::zones::Zone;
 
 use super::rules::run_combat;
 
-fn load_db() -> Option<&'static CardDatabase> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../client/public/card-data.json");
-    if !path.exists() {
-        return None;
-    }
-    static DB: OnceLock<CardDatabase> = OnceLock::new();
-    Some(DB.get_or_init(|| CardDatabase::from_export(&path).expect("export should load")))
-}
+use crate::support::shared_card_db as load_db;
 
 /// Primary regression — Yuriko herself attacks unblocked and deals combat
 /// damage to P1. The combat-damage trigger reveals the top card of P0's
@@ -166,8 +155,8 @@ fn yuriko_attacks_loses_opponent_life_equal_to_revealed_card_mana_value() {
 }
 
 /// Secondary regression — a *different* Ninja deals the combat damage. The
-/// CMC of the attacking Ninja must NOT be read; the revealed card is what
-/// counts.
+/// mana value of the attacking Ninja must NOT be read; the revealed card is
+/// what counts.
 ///
 /// Discriminator: the attacker is Thousand-Faced Shadow (a 1/1 Ninja, mana
 /// value 1), and the revealed library top is a 2-CMC `Counterspell`. Combat

@@ -12,8 +12,251 @@ use super::support::*;
 /// 3. Global taxing: "Noncreature spells cost {1} more to cast" (Thalia)
 /// 4. Broad: "Spells you cast cost {1} less to cast"
 /// 5. Self-spell: "This spell costs {N} less to cast for each ..." (Tolarian Terror)
-///    — emitted with `affected = SelfRef`, `active_zones = [Hand, Stack, Command]`.
+///    — emitted with `affected = SelfRef`, `active_zones = self_spell_cost_mod_active_zones()`.
 ///
+/// CR 601.2f: Parse the spell-type prefix of a cost-modification line before
+/// `"cost"`. Handles compound subjects such as Goblin Anarchomancer's
+/// "Each spell you cast that's red or green" via `parse_that_clause_suffix`.
+fn parse_cost_mod_spell_type_prefix(type_desc: &str) -> Option<TargetFilter> {
+    let base = type_desc.trim();
+    let base = tag::<_, _, OracleError<'_>>("each ")
+        .parse(base)
+        .map_or(base, |(rest, _)| rest);
+
+    let that_split: Result<(&str, (&str, &str)), nom::Err<OracleError<'_>>> = all_consuming(alt((
+        (
+            take_until(" that's "),
+            recognize((tag::<_, _, OracleError<'_>>(" that's "), rest)),
+        ),
+        (
+            take_until(" that is "),
+            recognize((tag::<_, _, OracleError<'_>>(" that is "), rest)),
+        ),
+        (
+            take_until(" that are "),
+            recognize((tag::<_, _, OracleError<'_>>(" that are "), rest)),
+        ),
+        (
+            take_until(" that "),
+            recognize((tag::<_, _, OracleError<'_>>(" that "), rest)),
+        ),
+    )))
+    .parse(base);
+
+    let (base_part, qual_props) = if let Ok((_, (before, suffix))) = that_split {
+        let suffix = suffix.trim_start();
+        let (props, consumed) =
+            crate::parser::oracle_target::parse_that_clause_suffix(suffix, None)?;
+        if !suffix[consumed..].trim().is_empty() {
+            return None;
+        }
+        (before.trim(), props)
+    } else {
+        (base, Vec::new())
+    };
+
+    let base_part = strip_cost_mod_cast_scope_suffix(base_part);
+    let base_part = strip_cost_mod_spell_noun_suffix(base_part);
+
+    let typed_filter = if base_part.is_empty() {
+        None
+    } else {
+        let (filter, remainder) = parse_type_phrase(base_part);
+        let remainder = remainder.trim();
+        match &filter {
+            TargetFilter::Typed(tf)
+                if (!tf.type_filters.is_empty() || !tf.properties.is_empty())
+                    && remainder.is_empty() =>
+            {
+                Some(filter)
+            }
+            TargetFilter::Or { filters } if !filters.is_empty() && remainder.is_empty() => {
+                Some(filter)
+            }
+            // Bare color words ("white", "red") are not consumed by parse_type_phrase
+            // because color prefixes require a trailing type word ("white creature").
+            _ if remainder.is_empty() || remainder.eq_ignore_ascii_case(base_part) => {
+                parse_named_color(base_part).map(|color| {
+                    TargetFilter::Typed(
+                        TypedFilter::card().properties(vec![FilterProp::HasColor { color }]),
+                    )
+                })
+            }
+            _ => None,
+        }
+    };
+
+    let filter = match (typed_filter, qual_props.is_empty()) {
+        (filter, true) => filter,
+        (Some(TargetFilter::Typed(mut tf)), false) => {
+            tf.properties.extend(qual_props);
+            Some(TargetFilter::Typed(tf))
+        }
+        (Some(other), false) => Some(TargetFilter::And {
+            filters: vec![
+                other,
+                TargetFilter::Typed(TypedFilter::card().properties(qual_props)),
+            ],
+        }),
+        (None, false) => Some(TargetFilter::Typed(
+            TypedFilter::card().properties(qual_props),
+        )),
+    };
+    filter.map(remap_cost_mod_imprint_exile_reference)
+}
+
+/// CR 607.2a + CR 607.3: Cost-mod lines such as Semblance Anvil reference
+/// "the exiled card" as the imprinted card exiled by the source permanent. The
+/// shared-quality nom parser emits `TrackedSet` for that phrase; remap to
+/// `ExiledBySource` so live `exile_links` resolve the reference at cast time.
+fn remap_cost_mod_imprint_exile_reference(filter: TargetFilter) -> TargetFilter {
+    match filter {
+        TargetFilter::Typed(mut tf) => {
+            for prop in &mut tf.properties {
+                remap_shares_quality_imprint_reference(prop);
+            }
+            TargetFilter::Typed(tf)
+        }
+        TargetFilter::And { filters } => TargetFilter::And {
+            filters: filters
+                .into_iter()
+                .map(remap_cost_mod_imprint_exile_reference)
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+fn remap_shares_quality_imprint_reference(prop: &mut FilterProp) {
+    if let FilterProp::SharesQuality { reference, .. } = prop {
+        if matches!(reference.as_deref(), Some(TargetFilter::TrackedSet { .. })) {
+            *reference = Some(Box::new(TargetFilter::ExiledBySource));
+        }
+    }
+}
+
+fn strip_cost_mod_cast_scope_suffix(input: &str) -> &str {
+    let (_, stripped) = all_consuming(alt((
+        terminated(
+            take_until(" your opponents cast"),
+            (tag::<_, _, OracleError<'_>>(" your opponents cast"), eof),
+        ),
+        terminated(take_until(" opponents cast"), (tag(" opponents cast"), eof)),
+        terminated(take_until(" you cast"), (tag(" you cast"), eof)),
+        rest,
+    )))
+    .parse(input)
+    .expect("rest fallback makes cast-scope suffix stripping infallible");
+    stripped.trim()
+}
+
+fn strip_cost_mod_spell_noun_suffix(input: &str) -> &str {
+    let (_, stripped) = all_consuming(alt((
+        value("", terminated(tag::<_, _, OracleError<'_>>("spells"), eof)),
+        value("", terminated(tag("spell"), eof)),
+        terminated(take_until(" spells"), (tag(" spells"), eof)),
+        terminated(take_until(" spell"), (tag(" spell"), eof)),
+        rest,
+    )))
+    .parse(input)
+    .expect("rest fallback makes spell-noun suffix stripping infallible");
+    stripped.trim()
+}
+
+/// CR 601.2f + CR 118.8: Parse static-imposed additional non-mana costs such as
+/// Terror of the Peaks ("cost an additional 3 life to cast").
+pub(crate) fn try_parse_impose_additional_cost(
+    text: &str,
+    lower: &str,
+) -> Option<StaticDefinition> {
+    type VE<'a> = OracleError<'a>;
+
+    let (_prefix, (life_amount, action), _) = nom_primitives::scan_preceded(lower, |i| {
+        let (i, _) = tag::<_, _, VE>("cost an additional ").parse(i)?;
+        let (i, life_amount) = alt((
+            map(nom_primitives::parse_number, |n| QuantityExpr::Fixed {
+                value: n as i32,
+            }),
+            value(
+                QuantityExpr::Ref {
+                    qty: QuantityRef::Variable {
+                        name: "X".to_string(),
+                    },
+                },
+                tag("x"),
+            ),
+            value(
+                QuantityExpr::Ref {
+                    qty: QuantityRef::Variable {
+                        name: "X".to_string(),
+                    },
+                },
+                tag("{x}"),
+            ),
+        ))
+        .parse(i)?;
+        let (i, action) = value(AdditionalCostTaxAction::Cast, tag(" life to cast")).parse(i)?;
+        Ok((i, (life_amount, action)))
+    })?;
+
+    let cost = AbilityCost::PayLife {
+        amount: life_amount,
+    };
+
+    let controller = if nom_primitives::scan_contains(lower, "your opponents cast")
+        || nom_primitives::scan_contains(lower, "opponents cast")
+        || nom_primitives::scan_contains(lower, "each opponent casts")
+    {
+        Some(ControllerRef::Opponent)
+    } else if nom_primitives::scan_contains(lower, "you cast")
+        || nom_primitives::scan_contains(lower, " you activate")
+        || nom_primitives::scan_contains(lower, " you may activate")
+    {
+        Some(ControllerRef::You)
+    } else {
+        None
+    };
+
+    let target_cost_filter = parse_cost_modifier_target_filter(lower)?;
+    let spell_filter = Some(target_cost_filter);
+
+    let is_self_scoped = nom_primitives::scan_contains(lower, "of this land")
+        || nom_primitives::scan_contains(lower, "of this creature")
+        || nom_primitives::scan_contains(lower, "of this permanent")
+        || nom_primitives::scan_contains(lower, "of ~");
+
+    let affected = if is_self_scoped {
+        TargetFilter::SelfRef
+    } else {
+        match controller {
+            Some(ControllerRef::You) => {
+                TargetFilter::Typed(TypedFilter::card().controller(ControllerRef::You))
+            }
+            Some(ControllerRef::Opponent) => {
+                TargetFilter::Typed(TypedFilter::card().controller(ControllerRef::Opponent))
+            }
+            Some(ControllerRef::ScopedPlayer) => TargetFilter::Typed(TypedFilter::card()),
+            Some(ControllerRef::TargetPlayer) => TargetFilter::Typed(TypedFilter::card()),
+            Some(ControllerRef::ParentTargetController) => TargetFilter::Typed(TypedFilter::card()),
+            Some(ControllerRef::DefendingPlayer) => TargetFilter::Typed(TypedFilter::card()),
+            Some(ControllerRef::SourceChosenPlayer) => TargetFilter::Typed(TypedFilter::card()),
+            Some(ControllerRef::ChosenPlayer { .. }) => TargetFilter::Typed(TypedFilter::card()),
+            Some(ControllerRef::TriggeringPlayer) => TargetFilter::Typed(TypedFilter::card()),
+            None => TargetFilter::Typed(TypedFilter::card()),
+        }
+    };
+
+    Some(
+        StaticDefinition::new(StaticMode::ImposeAdditionalCost {
+            cost,
+            spell_filter,
+            action,
+        })
+        .affected(affected)
+        .description(text.to_string()),
+    )
+}
+
 /// Dynamic "for each" counts are extracted when present.
 pub(crate) fn try_parse_cost_modification(text: &str, lower: &str) -> Option<StaticDefinition> {
     let is_raise = nom_primitives::scan_contains(lower, "more to cast")
@@ -24,14 +267,12 @@ pub(crate) fn try_parse_cost_modification(text: &str, lower: &str) -> Option<Sta
         return None;
     }
 
-    // CR 601.2f + CR 117.7: Detect self-spell cost reduction ("this spell costs {N} less ...").
+    // CR 601.2f: Detect self-spell cost reduction ("this spell costs {N} less ...").
     // Distinct from battlefield cost modification (e.g., "creature spells you cast cost {1} less")
     // because the static must apply to the card while it is in hand (or on the stack during
     // casting), not once it has entered the battlefield. The caller wires this into
-    // `active_zones = [Hand, Stack, Command]` with `affected = SelfRef` so
-    // the casting-time scanner finds it on the spell being cast from normal
-    // hand casting, the cost-determination stack step, and commander casting
-    // from the command zone.
+    // `active_zones = self_spell_cost_mod_active_zones()` with `affected =
+    // SelfRef` so the casting-time scanner finds it on the spell being cast.
     let is_self_spell = parse_self_spell_cost_subject(lower).is_some();
 
     let amount_is_variable_x = nom_primitives::scan_contains(lower, "{x}");
@@ -49,6 +290,7 @@ pub(crate) fn try_parse_cost_modification(text: &str, lower: &str) -> Option<Sta
     // Determine player scope from "you cast", "your opponents cast", or bare
     let controller = if nom_primitives::scan_contains(lower, "your opponents cast")
         || nom_primitives::scan_contains(lower, "opponents cast")
+        || nom_primitives::scan_contains(lower, "each opponent casts")
     {
         Some(ControllerRef::Opponent)
     } else if nom_primitives::scan_contains(lower, "you cast") {
@@ -60,7 +302,19 @@ pub(crate) fn try_parse_cost_modification(text: &str, lower: &str) -> Option<Sta
         None
     };
 
-    let first_qualified_spell_filter = parse_first_qualified_spell_filter(lower);
+    let first_qualified_spell = match parse_first_qualified_spell_filter(lower) {
+        // CR 601.2f: A recognized "the first … spell <timing> costs …" subject
+        // whose qualifier/timing can't be lowered to a filter + once-per-turn
+        // gate (e.g. "the first kicked spell you cast each turn costs {1} less").
+        // Declining here is mandatory — falling through to the generic
+        // cost-modifier path would emit a filterless, conditionless reducer that
+        // drops both the printed "first … each turn" restriction and the
+        // qualifier, reducing every spell the controller casts.
+        FirstQualifiedSpell::UnsupportedQualifier => return None,
+        FirstQualifiedSpell::NotApplicable => None,
+        FirstQualifiedSpell::Supported(filter, timing) => Some((filter, timing)),
+    };
+    let first_qualified_spell_filter = first_qualified_spell.as_ref().map(|(filter, _)| filter);
     let target_cost_filter = parse_cost_modifier_target_filter(lower);
 
     // Extract "from [zone(s)]" clause between player scope and "cost".
@@ -104,7 +358,7 @@ pub(crate) fn try_parse_cost_modification(text: &str, lower: &str) -> Option<Sta
     // E.g., "Creature spells you cast" → Creature, "Instant and sorcery spells" → AnyOf(Instant, Sorcery)
     let spell_filter = if is_self_spell {
         parse_self_spell_target_cost_filter(lower)
-    } else if let Some(filter) = first_qualified_spell_filter.clone() {
+    } else if let Some(filter) = first_qualified_spell_filter.cloned() {
         Some(filter)
     // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
     } else if let Some(cost_idx) = lower.find(" cost") {
@@ -164,26 +418,7 @@ pub(crate) fn try_parse_cost_modification(text: &str, lower: &str) -> Option<Sta
         {
             None
         } else {
-            // First try parse_type_phrase for standard type patterns
-            let (filter, _) = parse_type_phrase(type_desc);
-            match &filter {
-                // Single type: "creature", "noncreature", "artifact"
-                TargetFilter::Typed(tf)
-                    if !tf.type_filters.is_empty() || !tf.properties.is_empty() =>
-                {
-                    Some(filter)
-                }
-                // Combined types: "instant and sorcery", "artifact or enchantment"
-                TargetFilter::Or { filters } if !filters.is_empty() => Some(filter),
-                _ => {
-                    // Fallback: check for bare color names ("white", "blue", etc.)
-                    parse_named_color(type_desc).map(|color| {
-                        TargetFilter::Typed(
-                            TypedFilter::card().properties(vec![FilterProp::HasColor { color }]),
-                        )
-                    })
-                }
-            }
+            parse_cost_mod_spell_type_prefix(type_desc)
         };
         // CR 205.2a: Re-attach the chosen-type discriminator stripped above. A
         // creature-typed base ("Creature spells ... of the chosen type",
@@ -327,7 +562,7 @@ pub(crate) fn try_parse_cost_modification(text: &str, lower: &str) -> Option<Sta
     // Build the affected filter for the static definition.
     // This controls which objects are "affected" — for cost modification statics,
     // this is the source permanent's controller scope (used by the registry).
-    // CR 117.7: Self-spell cost reduction ("This spell costs {N} less ...") uses
+    // CR 601.2f: Self-spell cost reduction ("This spell costs {N} less ...") uses
     // SelfRef so the casting-time self-cost scanner matches it on the spell itself.
     let affected = if is_self_spell {
         TargetFilter::SelfRef
@@ -346,6 +581,8 @@ pub(crate) fn try_parse_cost_modification(text: &str, lower: &str) -> Option<Sta
             Some(ControllerRef::TargetPlayer) => TargetFilter::Typed(TypedFilter::card()),
             Some(ControllerRef::ParentTargetController) => TargetFilter::Typed(TypedFilter::card()),
             Some(ControllerRef::DefendingPlayer) => TargetFilter::Typed(TypedFilter::card()),
+            // CR 613.1: chosen-player scope is not emitted for cost statics.
+            Some(ControllerRef::SourceChosenPlayer) => TargetFilter::Typed(TypedFilter::card()),
             // CR 109.4: Chosen-player scope is not emitted for cost statics.
             Some(ControllerRef::ChosenPlayer { .. }) => TargetFilter::Typed(TypedFilter::card()),
             // CR 603.2 + CR 109.4: Triggering-player scope is not emitted for
@@ -359,17 +596,17 @@ pub(crate) fn try_parse_cost_modification(text: &str, lower: &str) -> Option<Sta
         .affected(affected)
         .description(text.to_string());
 
-    // CR 117.7 + CR 601.2f: A self-spell cost reduction must apply while the
+    // CR 601.2f: A self-spell cost reduction must apply while the
     // card is in hand (pre-cast affordability checks), in the command zone
-    // (commander casting), and on the stack (final cost determination during
-    // casting). Without opting in via `active_zones`, layer collection would
-    // ignore the static outside the battlefield, and the card would never
-    // reduce its own cost.
+    // (commander casting), in the graveyard or exile (alternative-zone casting),
+    // and on the stack (final cost determination during casting). Without opting
+    // in via `active_zones`, layer collection would ignore the static outside
+    // the battlefield, and the card would never reduce its own cost.
     if is_self_spell {
-        definition.active_zones = vec![Zone::Hand, Zone::Stack, Zone::Command];
+        definition.active_zones = crate::types::zones::self_spell_cost_mod_active_zones();
     }
-    if let Some(filter) = first_qualified_spell_filter.as_ref() {
-        definition.condition = Some(first_qualified_spell_condition(filter));
+    if let Some((filter, timing)) = first_qualified_spell.as_ref() {
+        definition.condition = Some(first_qualified_spell_condition(filter, timing));
     }
 
     // Extract trailing "if [condition]" / "as long as [condition]" clause from
@@ -393,11 +630,36 @@ pub(crate) fn try_parse_cost_modification(text: &str, lower: &str) -> Option<Sta
                 if rest.trim().is_empty() || rest.trim() == "." {
                     definition.condition = Some(sc);
                 }
+            } else if is_nested_stack_target_condition(cond_text) {
+                let filter = parse_it_targets_that_targets_spell_filter(cond_text)?;
+                // CR 115.9b: "if it targets a spell or ability that targets a [type]
+                // you control [with power N or greater]" — wire the parsed nested
+                // target filter into spell_filter so the reduction only applies when
+                // NOOW's target is a qualifying stack object (e.g. "Not of This World").
+                if let StaticMode::ModifyCost { spell_filter, .. } = &mut definition.mode {
+                    *spell_filter = Some(filter);
+                }
             }
         }
     }
 
     Some(definition)
+}
+
+fn is_nested_stack_target_condition(cond_text: &str) -> bool {
+    preceded(
+        tag::<_, _, OracleError<'_>>("it targets "),
+        preceded(
+            opt(alt((tag("a "), tag("an "), tag("one or more ")))),
+            alt((
+                tag("spell or ability that targets "),
+                tag("spell that targets "),
+                tag("ability that targets "),
+            )),
+        ),
+    )
+    .parse(cond_text)
+    .is_ok()
 }
 
 pub(crate) fn parse_cost_modifier_condition(cond_text: &str) -> Option<StaticCondition> {
@@ -483,6 +745,130 @@ pub(crate) fn parse_basic_land_type_plural(name: &str) -> Option<BasicLandType> 
     // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
     parse_basic_land_type(name).or_else(|| name.strip_suffix('s').and_then(parse_basic_land_type))
     // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
+}
+
+/// CR 601.2f + CR 115.9b: Parse "it targets [spell/ability] that targets [creature filter]"
+/// as a `spell_filter` for `StaticMode::ModifyCost`.
+///
+/// Returns a `TargetFilter` expressing the two-level targeting constraint:
+/// the self-spell must be targeting something (a spell or ability) that itself
+/// targets a creature matching the parsed filter. Used by cards like Not of This
+/// World whose cost reduction is conditioned on which stack entry they target.
+///
+/// `cond_text` is already lowercase.
+fn parse_it_targets_that_targets_spell_filter(cond_text: &str) -> Option<TargetFilter> {
+    // Consume "it targets "
+    let (i, _) = tag::<_, _, OracleError<'_>>("it targets ")
+        .parse(cond_text)
+        .ok()?;
+
+    // Parse what the self-spell targets — a spell and/or ability on the stack.
+    let (i, intermediate_filter) = alt((
+        value(
+            TargetFilter::Or {
+                filters: vec![
+                    TargetFilter::StackSpell,
+                    TargetFilter::StackAbility {
+                        controller: None,
+                        tag: None,
+                    },
+                ],
+            },
+            tag::<_, _, OracleError<'_>>("a spell or ability"),
+        ),
+        value(
+            TargetFilter::StackSpell,
+            tag::<_, _, OracleError<'_>>("a spell"),
+        ),
+        value(
+            TargetFilter::StackAbility {
+                controller: None,
+                tag: None,
+            },
+            alt((
+                tag::<_, _, OracleError<'_>>("an activated or triggered ability"),
+                tag("a triggered or activated ability"),
+                tag("a triggered ability"),
+                tag("an activated ability"),
+                tag("an ability"),
+            )),
+        ),
+    ))
+    .parse(i)
+    .ok()?;
+
+    // "that targets "
+    let (i, _) = tag::<_, _, OracleError<'_>>(" that targets ")
+        .parse(i)
+        .ok()?;
+
+    // Article
+    let (i, _) = alt((tag::<_, _, OracleError<'_>>("a "), tag("an ")))
+        .parse(i)
+        .ok()?;
+
+    // Type of the final target (creature is the canonical case for this pattern)
+    let (i, type_filter) = alt((
+        value(
+            TypeFilter::Creature,
+            tag::<_, _, OracleError<'_>>("creature"),
+        ),
+        value(TypeFilter::Permanent, tag("permanent")),
+    ))
+    .parse(i)
+    .ok()?;
+
+    // Optional controller suffix
+    let (i, controller) = opt(alt((
+        value(
+            ControllerRef::You,
+            tag::<_, _, OracleError<'_>>(" you control"),
+        ),
+        value(ControllerRef::Opponent, tag(" an opponent controls")),
+    )))
+    .parse(i)
+    .ok()?;
+
+    // Optional P/T comparison ("with power 7 or greater" etc.).
+    // parse_pt_comparison handles the "with " prefix itself; trim leading whitespace first.
+    let trimmed = i.trim_start();
+    let power_prop = if trimmed.is_empty() {
+        None
+    } else {
+        let (rest, prop) = nom_filter::parse_pt_comparison(trimmed).ok()?;
+        if !rest.trim().is_empty() {
+            return None;
+        }
+        Some(prop)
+    };
+
+    // Build the innermost creature/permanent filter
+    let mut creature_typed = TypedFilter::new(type_filter);
+    if let Some(ctrl) = controller {
+        creature_typed = creature_typed.controller(ctrl);
+    }
+    if let Some(prop) = power_prop {
+        creature_typed = creature_typed.properties(vec![prop]);
+    }
+    let creature_filter = TargetFilter::Typed(creature_typed);
+
+    // The intermediate (spell/ability on the stack) must itself target the creature.
+    // CR 115.9b: "targets" is satisfied when ANY of its targets match.
+    let inner_filter = TargetFilter::And {
+        filters: vec![
+            intermediate_filter,
+            TargetFilter::Typed(TypedFilter::default().properties(vec![FilterProp::Targets {
+                filter: Box::new(creature_filter),
+            }])),
+        ],
+    };
+
+    // The self-spell must target something matching inner_filter.
+    Some(TargetFilter::Typed(TypedFilter::default().properties(
+        vec![FilterProp::Targets {
+            filter: Box::new(inner_filter),
+        }],
+    )))
 }
 
 /// CR 305.7: Parse a comma-and-separated list of basic land types.
@@ -699,6 +1085,7 @@ pub(crate) fn extract_cant_untap_condition(lower: &str) -> Option<StaticConditio
         "its controller's untap step",
         "its controller\u{2019}s untap step",
         "their controllers' untap steps",
+        "their controllers\u{2019} untap steps",
         "your untap step",
     ];
     let mut after_untap = None;

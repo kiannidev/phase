@@ -1,10 +1,13 @@
 import type { PlayerId } from "../adapter/types";
-import { PLAYER_ID } from "../constants/game";
+import { PLAYER_ID, SPECTATOR_PLAYER_ID } from "../constants/game";
 import { useGameStore } from "../stores/gameStore";
 import { useMultiplayerStore } from "../stores/multiplayerStore";
 
 function currentLocalPlayerId(): PlayerId {
   const gameMode = useGameStore.getState().gameMode;
+  if (gameMode === "spectate") {
+    return SPECTATOR_PLAYER_ID;
+  }
   if (gameMode && (gameMode === "online" || gameMode === "p2p-host" || gameMode === "p2p-join")) {
     return useMultiplayerStore.getState().activePlayerId ?? PLAYER_ID;
   }
@@ -42,6 +45,13 @@ function waitingPlayer(waitingFor: ReturnType<typeof useGameStore.getState>["wai
     const { actor, player } = waitingFor.data;
     return actor.type === "Delegated" ? actor.data : player;
   }
+  // CR 702.132a: Assist payment — the CHOSEN helper acts on this step, not the
+  // caster. The prompt carries `caster`/`chosen` (no `player` field), so route
+  // authorization to `chosen` here. (`AssistChoosePlayer` carries `player` =
+  // caster and falls through to the default below.)
+  if (waitingFor.type === "AssistPayment") {
+    return waitingFor.data.chosen;
+  }
   return "player" in waitingFor.data ? waitingFor.data.player : null;
 }
 
@@ -53,11 +63,17 @@ export function usePerspectivePlayerId(): PlayerId {
 }
 
 export function useCanActForWaitingState(): boolean {
+  const gameMode = useGameStore((s) => s.gameMode);
+  const isSpectator = useMultiplayerStore((s) => s.isSpectator);
   const playerId = usePlayerId();
   const gameState = useGameStore((s) => s.gameState);
   const waitingFor = useGameStore((s) => s.waitingFor);
+
+  if (gameMode === "spectate" || isSpectator) return false;
+
   const semanticPlayer = waitingPlayer(waitingFor);
   if (!gameState || semanticPlayer == null) return false;
+  if (playerId === SPECTATOR_PLAYER_ID) return false;
   if (semanticPlayer === playerId) return true;
   return gameState.turn_decision_controller === playerId && semanticPlayer === gameState.active_player;
 }

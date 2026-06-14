@@ -12,6 +12,7 @@ import { ArtCropCard } from "../card/ArtCropCard.tsx";
 import { CardImage } from "../card/CardImage.tsx";
 import { PTBox } from "./PTBox.tsx";
 import { useCardHover } from "../../hooks/useCardHover.ts";
+import { useCanHover } from "../../hooks/useCanHover.ts";
 import { useIsCompactHeight } from "../../hooks/useIsCompactHeight.ts";
 import { useIsMobile } from "../../hooks/useIsMobile.ts";
 import { useLongPress } from "../../hooks/useLongPress.ts";
@@ -110,6 +111,7 @@ function objectIdFromRelatedTarget(target: EventTarget | null): number | null {
 export const PermanentCard = memo(function PermanentCard({ objectId, attachmentsLiftedByAncestor = false, onPrimaryClickOverride, coveredIds }: PermanentCardProps) {
   const { t } = useTranslation("game");
   const isMobile = useIsMobile();
+  const canHover = useCanHover();
   const playerId = usePlayerId();
   const gameObjects = useGameStore((s) => s.gameState?.objects);
   const obj = useGameStore((s) => s.gameState?.objects[objectId]);
@@ -163,7 +165,6 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
 
   const {
     selectedObjectId, selectObject, hoverObject, inspectObject,
-    hoveredObjectId,
     debugHighlightedObjectId,
     combatMode, selectedAttackers, toggleAttacker,
     blockerAssignments, combatClickHandler, selectedCardIds, toggleSelectedCard,
@@ -172,7 +173,6 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
     selectObject: s.selectObject,
     hoverObject: s.hoverObject,
     inspectObject: s.inspectObject,
-    hoveredObjectId: s.hoveredObjectId,
     debugHighlightedObjectId: s.debugHighlightedObjectId,
     combatMode: s.combatMode,
     selectedAttackers: s.selectedAttackers,
@@ -182,6 +182,18 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
     selectedCardIds: s.selectedCardIds,
     toggleSelectedCard: s.toggleSelectedCard,
   })));
+  // Hover is read as derived booleans, NOT the raw hoveredObjectId, so hovering
+  // any permanent re-renders only the card whose hovered/lifted state actually
+  // flips — not every PermanentCard on the board. O(1) per hover, not O(N).
+  const isHovered = useUiStore((s) => s.hoveredObjectId === objectId);
+  // Lifting a host's attachments only applies to cards that HAVE attachments;
+  // for the common (unattached) card this selector is a constant `false`, so it
+  // never re-renders on hover. Attached cards re-render only when their lifted
+  // state changes. Mirrors the `obj.attachments.length > 0` gate below.
+  const hasAttachments = (obj?.attachments.length ?? 0) > 0;
+  const isInHoveredAttachmentTree = useUiStore((s) =>
+    hasAttachments ? attachmentTreeContains(gameObjects, objectId, s.hoveredObjectId) : false,
+  );
   // Debug-panel preview highlight: lights up only when the user is hovering
   // an ObjectSelect option (or otherwise dispatching `setDebugHighlightedObjectId`).
   // Deliberately distinct from the standard hover-lift so the debug signal
@@ -224,20 +236,20 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
 
   const isUndoableTap = undoableTapObjectIds.has(objectId);
 
-  // On mobile, skip mouse events — synthesized mouseenter from touch fires
+  // On touch-only devices, skip mouse events — synthesized mouseenter from touch fires
   // inspectObject every touch, opening the full-screen MobilePreviewOverlay
   // and blocking combat interactions (blocker/attacker selection).
   const handleMouseEnter = useCallback(() => {
-    if (isMobile) return;
+    if (isMobile || !canHover) return;
     hoverObject(objectId); inspectObject(objectId);
-  }, [isMobile, hoverObject, inspectObject, objectId]);
+  }, [canHover, hoverObject, inspectObject, isMobile, objectId]);
 
   const handleMouseLeave = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
-    if (isMobile) return;
+    if (isMobile || !canHover) return;
     const nextObjectId = objectIdFromRelatedTarget(event.relatedTarget);
     hoverObject(nextObjectId);
     inspectObject(nextObjectId);
-  }, [isMobile, hoverObject, inspectObject]);
+  }, [canHover, hoverObject, inspectObject, isMobile]);
 
   const setPreviewSticky = useUiStore((s) => s.setPreviewSticky);
   const { handlers: longPressHandlers, firedRef: longPressFired } = useLongPress(
@@ -268,10 +280,7 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
   const isSelected = selectedObjectId === objectId;
   const attachmentsLifted =
     obj.attachments.length > 0
-    && (
-      attachmentsLiftedByAncestor
-      || attachmentTreeContains(gameObjects, objectId, hoveredObjectId)
-    );
+    && (attachmentsLiftedByAncestor || isInHoveredAttachmentTree);
 
   // Combat state — check both UI selection and committed combat state
   const isSelectingAttacker =
@@ -461,6 +470,7 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
   };
 
   const useArtCrop = battlefieldCardDisplay === "art_crop";
+  const highlightRadiusClass = useArtCrop ? "rounded-[6px]" : "rounded-lg";
 
   return (
     <motion.div
@@ -471,7 +481,7 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
       layoutId={`permanent-${objectId}`}
       className="relative inline-flex w-fit cursor-pointer overflow-visible rounded-lg self-end select-none"
       style={{
-        zIndex: attachmentsLifted ? HOVERED_ATTACHMENT_HOST_Z_INDEX : hoveredObjectId === objectId ? HOVERED_CARD_Z_INDEX : isAttacking ? 50 : undefined,
+        zIndex: attachmentsLifted ? HOVERED_ATTACHMENT_HOST_Z_INDEX : isHovered ? HOVERED_CARD_Z_INDEX : isAttacking ? 50 : undefined,
         transformOrigin: "center center",
         // Reserve space below for exile ghost cards
         marginBottom:
@@ -657,7 +667,7 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
         <div
           aria-hidden
           data-card-affordance-highlight="true"
-          className={`pointer-events-none absolute inset-[-3px] z-30 rounded-xl ${glowClass}`}
+          className={`pointer-events-none absolute inset-0 z-30 ${highlightRadiusClass} ${glowClass}`}
         />
       )}
 

@@ -4,7 +4,7 @@ use engine::game::apply_as_current;
 use engine::game::combat::AttackTarget;
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::types::actions::GameAction;
-use engine::types::game_state::{GameState, WaitingFor};
+use engine::types::game_state::{CastPaymentMode, GameState, WaitingFor};
 use engine::types::zones::Zone;
 use proptest::prelude::*;
 
@@ -20,6 +20,8 @@ fn target_selection_state() -> GameState {
             object_id: bolt_id,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("cast should succeed");
     assert_matches!(result.waiting_for, WaitingFor::TargetSelection { .. });
@@ -50,6 +52,7 @@ fn declare_blockers_state() -> GameState {
     runner
         .act(GameAction::DeclareAttackers {
             attacks: vec![(attacker, AttackTarget::Player(P1))],
+            bands: vec![],
         })
         .expect("declare attackers should succeed");
     runner.pass_both_players();
@@ -75,6 +78,7 @@ fn assign_combat_damage_state() -> GameState {
     runner
         .act(GameAction::DeclareAttackers {
             attacks: vec![(attacker, AttackTarget::Player(P1))],
+            bands: vec![],
         })
         .expect("declare attackers should succeed");
     runner.pass_both_players();

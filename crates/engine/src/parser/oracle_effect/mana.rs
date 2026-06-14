@@ -2,7 +2,7 @@ use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::char;
-use nom::combinator::{all_consuming, map, opt, rest as nom_rest, value};
+use nom::combinator::{all_consuming, map, map_opt, not, opt, rest as nom_rest, value};
 use nom::multi::many1;
 use nom::sequence::{delimited, preceded, separated_pair, terminated};
 use nom::Parser;
@@ -10,11 +10,11 @@ use nom::Parser;
 use crate::parser::oracle_nom::error::OracleResult;
 use crate::parser::oracle_nom::primitives as nom_primitives;
 use crate::types::ability::{
-    Comparator, Effect, LinkedExileScope, ManaContribution, ManaProduction, ManaSpendRestriction,
-    QuantityExpr, QuantityRef,
+    AbilityKind, Comparator, Effect, LinkedExileScope, ManaContribution, ManaProduction,
+    ManaSpendRestriction, QuantityExpr, QuantityRef,
 };
 use crate::types::keywords::KeywordKind;
-use crate::types::mana::{ManaColor, ManaRestriction, ManaSpellGrant};
+use crate::types::mana::{AbilityActivationScope, ManaColor, ManaRestriction, ManaSpellGrant};
 use crate::types::zones::Zone;
 
 use super::super::oracle_keyword::parse_keyword_from_oracle;
@@ -39,6 +39,30 @@ where
 pub(super) fn try_parse_for_each_color_mana_public(text: &str) -> Option<Effect> {
     let lower = text.to_lowercase();
     try_parse_for_each_color_mana(text, &lower)
+}
+
+/// CR 106.1 + CR 109.1: Parse the permanent filter tail of
+/// "mana of any color among [type-phrase]" (Mox Amber class).
+fn try_parse_any_color_among_permanents_filter(
+    after_color: &str,
+    after_lower: &str,
+) -> Option<TargetFilter> {
+    let trimmed_lower = after_lower.trim().trim_end_matches('.').trim();
+    let (rest, _) = tag::<_, _, OracleError<'_>>("among ")
+        .parse(trimmed_lower)
+        .ok()?;
+    let type_lower = rest.trim();
+    if type_lower.is_empty() {
+        return None;
+    }
+    let prefix_len = trimmed_lower.len() - rest.len();
+    let trimmed_original = after_color.trim().trim_end_matches('.').trim();
+    let type_text = trimmed_original.get(prefix_len..)?.trim();
+    let (filter, remainder) = parse_type_phrase(type_text);
+    if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
+        return None;
+    }
+    Some(filter)
 }
 
 /// CR 106.1 + CR 109.1: Recognize "For each color among [type-phrase], add one
@@ -140,7 +164,7 @@ pub(super) fn try_parse_add_mana_effect(text: &str) -> Option<Effect> {
     // `parse_mana_production_clause` so the where-X count is resolved here,
     // co-located with `apply_where_x_count_expression`.
     if let Some((count, color_options)) = parse_repeated_count_color_choice(clause) {
-        let count = apply_where_x_count_expression(count, where_x_expression.as_deref());
+        let (count, target) = apply_where_x_count_expression(count, where_x_expression.as_deref());
         return Some(Effect::Mana {
             produced: ManaProduction::AnyOneColor {
                 count,
@@ -150,8 +174,41 @@ pub(super) fn try_parse_add_mana_effect(text: &str) -> Option<Effect> {
             restrictions: vec![],
             grants: vec![],
             expiry: None,
-            target: None,
+            target,
         });
+    }
+
+    // CR 106.1 + CR 106.3: disjunctive color choice scaled by a "for each"
+    // count -- "{C1} or {C2} [...] for each [clause]" (Culling Ritual: "Add
+    // {B} or {G} for each permanent destroyed this way"). Each unit is chosen
+    // independently from the color set, so this is AnyCombination, not
+    // AnyOneColor. The single-color "{C} for each X" form is handled by
+    // parse_mana_production_clause; this branch covers the >1-color set, which
+    // parse_mana_color_set rejects today because of the trailing "for each".
+    if let Ok((for_each_rest, before)) = terminated(
+        take_until::<_, _, OracleError<'_>>(" for each "),
+        tag::<_, _, OracleError<'_>>(" for each "),
+    )
+    .parse(clause)
+    {
+        if let Some(color_options) = parse_mana_color_set(before.trim()) {
+            if color_options.len() > 1 {
+                if let Some(qty) =
+                    super::super::oracle_quantity::parse_for_each_clause(for_each_rest.trim())
+                {
+                    return Some(Effect::Mana {
+                        produced: ManaProduction::AnyCombination {
+                            count: QuantityExpr::Ref { qty },
+                            color_options,
+                        },
+                        restrictions: vec![],
+                        grants: vec![],
+                        expiry: None,
+                        target: for_each_clause_target_filter(for_each_rest.trim()),
+                    });
+                }
+            }
+        }
     }
 
     if let Some((produced, target)) = parse_mana_production_clause(clause, contribution) {
@@ -185,7 +242,8 @@ pub(super) fn try_parse_add_mana_effect(text: &str) -> Option<Effect> {
     }
 
     if let Some((count, rest)) = parse_mana_count_prefix(clause) {
-        let count = apply_where_x_count_expression(count, where_x_expression.as_deref());
+        let (count, where_x_target) =
+            apply_where_x_count_expression(count, where_x_expression.as_deref());
         let rest = rest.trim().trim_end_matches(['.', '"']).trim();
         let rest_lower = rest.to_lowercase();
 
@@ -251,7 +309,7 @@ pub(super) fn try_parse_add_mana_effect(text: &str) -> Option<Effect> {
                 restrictions: vec![],
                 grants: vec![],
                 expiry: None,
-                target: None,
+                target: where_x_target,
             });
         }
 
@@ -286,6 +344,20 @@ pub(super) fn try_parse_add_mana_effect(text: &str) -> Option<Effect> {
                 ManaProduction::ChoiceAmongExiledColors {
                     source: LinkedExileScope::ThisObject,
                 }
+            } else if let Some(filter) =
+                try_parse_any_color_among_permanents_filter(after_color.trim(), &after_lower)
+            {
+                ManaProduction::AnyOneColorAmongPermanents {
+                    count,
+                    filter,
+                    contribution,
+                }
+            } else if nom_on_lower(after_color.trim(), &after_lower, |i| {
+                value((), tag("among ")).parse(i)
+            })
+            .is_some()
+            {
+                return None;
             } else if nom_on_lower(after_color.trim(), &after_lower, |i| {
                 // CR 903.4 + CR 903.4f: "any color in your commander('s/s')
                 // color identity" — Path of Ancestry, Study Hall. Colors
@@ -338,7 +410,7 @@ pub(super) fn try_parse_add_mana_effect(text: &str) -> Option<Effect> {
                 restrictions: vec![],
                 grants: vec![],
                 expiry: None,
-                target: mana_target,
+                target: mana_target.or(where_x_target),
             });
         }
 
@@ -353,8 +425,31 @@ pub(super) fn try_parse_add_mana_effect(text: &str) -> Option<Effect> {
                 restrictions: vec![],
                 grants: vec![],
                 expiry: None,
-                target: None,
+                target: where_x_target,
             });
+        }
+
+        // CR 106.1: "{fixed} or one mana of the chosen color" after a count
+        // prefix must retain the fixed-color alternative. Scan `rest` before
+        // the bare chosen-color arm so a leading count token does not drop the
+        // `{B}`/`{G}` branch (Gate lands with a count-qualified tail).
+        if let Some(produced) = scan_mana_production_type(&rest_lower, count.clone(), contribution)
+        {
+            if matches!(
+                produced,
+                ManaProduction::ChosenColor {
+                    fixed_alternative: Some(_),
+                    ..
+                }
+            ) {
+                return Some(Effect::Mana {
+                    produced,
+                    restrictions: vec![],
+                    grants: vec![],
+                    expiry: None,
+                    target: where_x_target,
+                });
+            }
         }
 
         if let Some((_, after_color)) = nom_on_lower(rest, &rest_lower, |i| {
@@ -383,7 +478,7 @@ pub(super) fn try_parse_add_mana_effect(text: &str) -> Option<Effect> {
                 restrictions: vec![],
                 grants: vec![],
                 expiry: None,
-                target: mana_target,
+                target: mana_target.or(where_x_target),
             });
         }
 
@@ -402,7 +497,7 @@ pub(super) fn try_parse_add_mana_effect(text: &str) -> Option<Effect> {
                         restrictions: vec![],
                         grants: vec![],
                         expiry: None,
-                        target: None,
+                        target: where_x_target,
                     });
                 }
             }
@@ -421,7 +516,7 @@ pub(super) fn try_parse_add_mana_effect(text: &str) -> Option<Effect> {
                     restrictions: vec![],
                     grants: vec![],
                     expiry: None,
-                    target: None,
+                    target: where_x_target,
                 });
             }
         }
@@ -431,7 +526,7 @@ pub(super) fn try_parse_add_mana_effect(text: &str) -> Option<Effect> {
     let fallback_count = parse_mana_count_prefix(clause)
         .map(|(count, _)| count)
         .unwrap_or(QuantityExpr::Fixed { value: 1 });
-    let fallback_count =
+    let (fallback_count, fallback_target) =
         apply_where_x_count_expression(fallback_count, where_x_expression.as_deref());
 
     // Scan for mana production type at word boundaries using nom combinators.
@@ -441,7 +536,7 @@ pub(super) fn try_parse_add_mana_effect(text: &str) -> Option<Effect> {
         restrictions: vec![],
         grants: vec![],
         expiry: None,
-        target: None,
+        target: fallback_target,
     })
 }
 
@@ -721,7 +816,7 @@ pub(super) fn parse_mana_count_prefix(text: &str) -> Option<(QuantityExpr, &str)
 pub(super) fn apply_where_x_count_expression(
     count: QuantityExpr,
     where_x_expression: Option<&str>,
-) -> QuantityExpr {
+) -> (QuantityExpr, Option<TargetFilter>) {
     match (&count, where_x_expression) {
         (
             QuantityExpr::Ref {
@@ -729,16 +824,30 @@ pub(super) fn apply_where_x_count_expression(
             },
             Some(expression),
         ) if name.eq_ignore_ascii_case("X") => {
-            crate::parser::oracle_quantity::parse_cda_quantity(expression).unwrap_or_else(|| {
+            if let Some(count) = super::parse_where_x_quantity_expression(expression) {
+                return (count, where_x_expression_target_filter(expression));
+            }
+            (
                 QuantityExpr::Ref {
                     qty: QuantityRef::Variable {
                         name: expression.to_string(),
                     },
-                }
-            })
+                },
+                None,
+            )
         }
-        _ => count,
+        _ => (count, None),
     }
+}
+
+/// CR 115.1: Extract target player filters from where-X expressions.
+fn where_x_expression_target_filter(expression: &str) -> Option<TargetFilter> {
+    let lower = expression.to_ascii_lowercase();
+    let clause = tag::<_, _, OracleError<'_>>("the number of ")
+        .parse(lower.as_str())
+        .map(|(rest, _)| rest)
+        .unwrap_or(lower.as_str());
+    for_each_clause_target_filter(clause)
 }
 
 /// CR 106.1: Recognize a count-prefixed disjunctive color choice of the shape
@@ -997,13 +1106,37 @@ fn scan_mana_production_type(
                     tag("mana of any color among the exiled cards"),
                 )),
             ),
+            // CR 106.1 + CR 109.1: Parse "mana of any [one] color among [permanents]"
+            map_opt(
+                preceded(
+                    alt((
+                        tag::<_, _, OracleError<'_>>("mana of any one color among "),
+                        tag("mana of any color among "),
+                    )),
+                    nom_rest,
+                ),
+                |type_text: &str| {
+                    let (filter, remainder) = parse_type_phrase(type_text.trim());
+                    if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
+                        return None;
+                    }
+                    Some(ManaProduction::AnyOneColorAmongPermanents {
+                        count: count.clone(),
+                        filter,
+                        contribution,
+                    })
+                },
+            ),
             value(
                 ManaProduction::AnyOneColor {
                     count: count.clone(),
                     color_options: all_mana_colors(),
                     contribution,
                 },
-                alt((tag("mana of any one color"), tag("mana of any color"))),
+                terminated(
+                    alt((tag("mana of any one color"), tag("mana of any color"))),
+                    not(tag(" among ")),
+                ),
             ),
             value(
                 ManaProduction::AnyCombination {
@@ -1104,27 +1237,50 @@ fn parse_activation_source_quality(input: &str) -> OracleResult<'_, String> {
     Ok((rest, normalize_restricted_source_phrase(phrase.trim())))
 }
 
-fn split_restricted_spell_and_activation(rest: &str) -> (&str, Option<String>) {
-    all_consuming(alt((
+fn parse_activation_tail_after_or(input: &str) -> OracleResult<'_, Option<String>> {
+    let (input, _) = opt(tag("to ")).parse(input)?;
+    let (input, _) = tag("activate ").parse(input)?;
+    let (input, _) = alt((tag("an ability"), tag("abilities"))).parse(input)?;
+    let (input, source_quality) =
+        opt(preceded(tag(" of "), parse_activation_source_quality)).parse(input)?;
+    Ok((input, source_quality))
+}
+
+/// The ability-activation tail of a "cast [X] spell …" spend restriction.
+enum ActivationTail {
+    /// No "or activate …" tail — a plain spell-type restriction.
+    None,
+    /// "… or (to) activate an ability" with no type qualifier — any ability.
+    Any,
+    /// "… or activate abilities of [source quality]" — abilities of that type.
+    OfType(String),
+}
+
+fn split_restricted_spell_and_activation(rest: &str) -> (&str, ActivationTail) {
+    // Anchor on the activation suffix prefix instead of the first " or " so
+    // spell type unions ("instant or sorcery") stay inside the spell half.
+    let activation_tail = all_consuming(alt((
         separated_pair(
-            take_until::<_, _, OracleError<'_>>(" or activate abilities of "),
-            tag(" or activate abilities of "),
-            parse_activation_source_quality,
+            take_until::<_, _, OracleError<'_>>(" or to activate "),
+            tag(" or "),
+            parse_activation_tail_after_or,
         ),
         separated_pair(
-            take_until::<_, _, OracleError<'_>>(" or activate an ability of "),
-            tag(" or activate an ability of "),
-            parse_activation_source_quality,
-        ),
-        separated_pair(
-            take_until::<_, _, OracleError<'_>>(" or to activate an ability of "),
-            tag(" or to activate an ability of "),
-            parse_activation_source_quality,
+            take_until::<_, _, OracleError<'_>>(" or activate "),
+            tag(" or "),
+            parse_activation_tail_after_or,
         ),
     )))
     .parse(rest)
-    .map(|(_, (spell_part, source_quality))| (spell_part.trim(), Some(source_quality)))
-    .unwrap_or((rest.trim(), None))
+    .map(|(_, (spell_part, source_quality))| (spell_part.trim(), source_quality));
+    if let Ok((spell_part, source_quality)) = activation_tail {
+        return (
+            spell_part,
+            source_quality.map_or(ActivationTail::Any, ActivationTail::OfType),
+        );
+    }
+
+    (rest.trim(), ActivationTail::None)
 }
 
 /// Parse a "Spend this mana only to cast..." clause into a `ManaSpendRestriction`.
@@ -1197,6 +1353,15 @@ pub(crate) fn parse_mana_spend_restriction(
         ));
     }
 
+    // CR 105.2 + CR 106.6: "spells with exactly N colors" / "a spell with N or
+    // more colors" — parameterized over Comparator by the color-count suffix.
+    if let Some((comparator, count)) = parse_color_count(rest) {
+        return Some((
+            ManaSpendRestriction::SpellWithColorCount { comparator, count },
+            grants,
+        ));
+    }
+
     if matches!(rest, "spells with flashback" | "a spell with flashback") {
         return Some((
             ManaSpendRestriction::SpellWithKeywordKind(KeywordKind::Flashback),
@@ -1237,9 +1402,10 @@ pub(crate) fn parse_mana_spend_restriction(
         return Some((ManaSpendRestriction::SpellFromZone(zone), grants));
     }
 
-    // CR 106.6: Check for "or activate abilities of [type]" suffix.
-    // If present, emit a combined SpellTypeOrAbilityActivation restriction.
-    let (spell_part, activation_source_quality) = split_restricted_spell_and_activation(rest);
+    // CR 106.6: Check for an "or activate …" ability-activation suffix. If
+    // present, emit a combined SpellTypeOrAbilityActivation restriction whose
+    // `ability` scope is `OfSpellType` (typed suffix) or `Any` (generic suffix).
+    let (spell_part, activation_tail) = split_restricted_spell_and_activation(rest);
 
     if spell_part.contains("of the chosen type") {
         return Some((ManaSpendRestriction::ChosenCreatureType, grants));
@@ -1253,13 +1419,29 @@ pub(crate) fn parse_mana_spend_restriction(
 
     let type_phrase = parse_restricted_spell_type_phrase(spell_part)?;
 
-    match activation_source_quality {
-        Some(source_quality) if source_quality.eq_ignore_ascii_case(&type_phrase) => Some((
-            ManaSpendRestriction::SpellTypeOrAbilityActivation(type_phrase),
+    match activation_tail {
+        ActivationTail::OfType(source_quality)
+            if source_quality.eq_ignore_ascii_case(&type_phrase) =>
+        {
+            Some((
+                ManaSpendRestriction::SpellTypeOrAbilityActivation {
+                    spell_type: type_phrase,
+                    ability: AbilityActivationScope::OfSpellType,
+                },
+                grants,
+            ))
+        }
+        // A typed activation suffix whose source quality differs from the spell
+        // type is an unsupported compound — gap it rather than guess.
+        ActivationTail::OfType(_) => None,
+        ActivationTail::Any => Some((
+            ManaSpendRestriction::SpellTypeOrAbilityActivation {
+                spell_type: type_phrase,
+                ability: AbilityActivationScope::Any,
+            },
             grants,
         )),
-        Some(_) => None,
-        None => Some((ManaSpendRestriction::SpellType(type_phrase), grants)),
+        ActivationTail::None => Some((ManaSpendRestriction::SpellType(type_phrase), grants)),
     }
 }
 
@@ -1344,6 +1526,81 @@ fn parse_mana_value_threshold(rest: &str) -> Option<(Comparator, u32)> {
     Some((comparator, value_n))
 }
 
+/// CR 105.2 + CR 106.6: Parse the "[spells|a spell] with [exactly] N [or more|or
+/// fewer] color(s)" tail of a spend restriction into a `(Comparator, count)`.
+/// "exactly N color(s)" and bare "N color(s)" read as exact (`EQ`); "or more /
+/// or greater color(s)" reads as `GE`; "or fewer / or less color(s)" reads as `LE`.
+/// Colorless spells have a color count of 0, so `count` may be 0.
+///
+/// This file's `nom_on_lower` returns `(value, remainder)`, so the consumed
+/// remainder is the second tuple element. Mirrors `parse_mana_value_threshold`.
+fn parse_color_count(rest: &str) -> Option<(Comparator, u32)> {
+    let rest_lower = rest.to_lowercase();
+    let (_, after_prefix) = nom_on_lower(rest, &rest_lower, |i| {
+        value((), alt((tag("spells with "), tag("a spell with ")))).parse(i)
+    })?;
+    // Optional "exactly " forces an exact (EQ) reading regardless of suffix.
+    let after_prefix_lower = after_prefix.to_lowercase();
+    let (exactly, after_exactly) = nom_on_lower(after_prefix, &after_prefix_lower, |i| {
+        opt(value((), tag("exactly "))).parse(i)
+    })
+    .map(|(exactly, rest)| (exactly.is_some(), rest))?;
+    // parse_number consumes the leading integer N (returns u32, handles word numbers).
+    let after_exactly_lower = after_exactly.to_lowercase();
+    let (count, after_num) = nom_on_lower(
+        after_exactly,
+        &after_exactly_lower,
+        nom_primitives::parse_number,
+    )?;
+    let after_num = after_num.trim();
+    let after_num_lower = after_num.to_lowercase();
+    // Suffix -> comparator. Bare "color(s)" or "exactly N color(s)" = exact (EQ).
+    let comparator = if exactly {
+        if nom_on_lower(after_num, &after_num_lower, |i| {
+            all_consuming(parse_color_word).parse(i)
+        })
+        .is_some()
+        {
+            Comparator::EQ
+        } else {
+            return None;
+        }
+    } else if nom_on_lower(after_num, &after_num_lower, |i| {
+        all_consuming(parse_color_word).parse(i)
+    })
+    .is_some()
+    {
+        Comparator::EQ
+    } else if nom_on_lower(after_num, &after_num_lower, |i| {
+        all_consuming(alt((
+            value((), (tag("or more "), parse_color_word)),
+            value((), (tag("or greater "), parse_color_word)),
+        )))
+        .parse(i)
+    })
+    .is_some()
+    {
+        Comparator::GE
+    } else if nom_on_lower(after_num, &after_num_lower, |i| {
+        all_consuming(alt((
+            value((), (tag("or fewer "), parse_color_word)),
+            value((), (tag("or less "), parse_color_word)),
+        )))
+        .parse(i)
+    })
+    .is_some()
+    {
+        Comparator::LE
+    } else {
+        return None;
+    };
+    Some((comparator, count))
+}
+
+fn parse_color_word(input: &str) -> OracleResult<'_, ()> {
+    value((), (tag("color"), opt(tag("s")))).parse(input)
+}
+
 /// CR 106.6: Parse a standalone "that spell can't be countered" clause.
 ///
 /// Used when comma-splitting separates the grant from the restriction text,
@@ -1394,6 +1651,83 @@ fn parse_conditional_keyword_grant(lower: &str) -> Option<ManaSpellGrant> {
             subtype.trim(),
         ))),
     })
+}
+
+/// CR 106.6 + CR 603.3: Parse a "When you spend this mana to cast a [filter]
+/// spell, [effect]" clause (the unparsed sub-ability of a mana ability — Lapis
+/// Orb of Dragonkind, Scaled Nurturer, Gilanra) into a
+/// `ManaSpellGrant::TriggerOnSpend`. `lower` is the lowercased clause text.
+///
+/// First pass recognizes two spell filters — "[a] [subtype] creature spell" and
+/// "a spell with mana value N or greater/less" — and parses the effect via the
+/// standard effect-chain parser. Returns `None` for unsupported filters or when
+/// the effect is unparseable, so the clause stays a loud gap.
+pub(crate) fn parse_mana_spend_trigger(lower: &str) -> Option<ManaSpellGrant> {
+    let (rest, _) = tag::<_, _, OracleError<'_>>("when you spend this mana to cast ")
+        .parse(lower.trim())
+        .ok()?;
+    // Split "[filter], [effect]" on the first ", ".
+    let (after, filter_part) = terminated(
+        take_until::<_, _, OracleError<'_>>(", "),
+        tag::<_, _, OracleError<'_>>(", "),
+    )
+    .parse(rest)
+    .ok()?;
+    let restriction = parse_spend_trigger_filter(filter_part.trim())?;
+    let effect_text = after.trim().trim_end_matches('.').trim();
+    if effect_text.is_empty() {
+        return None;
+    }
+    // Parse the reflexive effect (scry N, gain N life, draw a card, …).
+    let ability = super::parse_effect_chain(effect_text, AbilityKind::Activated);
+    // First pass: accept only controller-scoped reflexive effects whose parse
+    // fully consumes the clause. Anything else — notably spell-referencing
+    // effects like Jade Orb's "it enters with an additional +1/+1 counter on it",
+    // which `parse_effect_chain` parses *partially* (silently swallowing the
+    // counter clause) — is rejected so the whole clause stays a loud gap rather
+    // than flipping the card to "supported" with a swallowed clause (follow-ups).
+    if !matches!(
+        *ability.effect,
+        Effect::Scry { .. } | Effect::GainLife { .. } | Effect::Draw { .. }
+    ) {
+        return None;
+    }
+    if ability.sub_ability.is_some() {
+        return None;
+    }
+    Some(ManaSpellGrant::TriggerOnSpend {
+        restriction: Some(restriction),
+        ability: Box::new(ability),
+    })
+}
+
+/// Parse the spell-filter portion of a "when you spend this mana to cast …"
+/// clause into a `ManaRestriction`. First pass: mana-value thresholds and
+/// "[subtype] creature spell". Returns `None` for unsupported filters.
+fn parse_spend_trigger_filter(filter: &str) -> Option<ManaRestriction> {
+    // "a spell with mana value N or greater/less" (keeps its article).
+    if let Some((comparator, value)) = parse_mana_value_threshold(filter) {
+        return Some(ManaRestriction::OnlyForSpellWithManaValue { comparator, value });
+    }
+    // "[a|an] [subtype] creature spell".
+    let (rest, _) = opt(alt((
+        tag::<_, _, OracleError<'_>>("a "),
+        tag::<_, _, OracleError<'_>>("an "),
+    )))
+    .parse(filter)
+    .ok()?;
+    let (rest, subtype) = terminated(
+        take_until::<_, _, OracleError<'_>>(" creature spell"),
+        tag::<_, _, OracleError<'_>>(" creature spell"),
+    )
+    .parse(rest)
+    .ok()?;
+    if !rest.trim().is_empty() || subtype.trim().is_empty() {
+        return None;
+    }
+    Some(ManaRestriction::OnlyForCreatureType(super::capitalize(
+        subtype.trim(),
+    )))
 }
 
 /// CR 106.6: Extract trailing spell grants from a mana restriction clause.
@@ -1601,6 +1935,7 @@ fn try_parse_amount_equal_to(clause: &str, contribution: ManaContribution) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ability::{ControllerRef, TypeFilter};
 
     fn extract_combinations(oracle: &str) -> Option<Vec<Vec<ManaColor>>> {
         match try_parse_add_mana_effect(oracle) {
@@ -2061,6 +2396,55 @@ mod tests {
         }
     }
 
+    /// CR 106.1 + CR 115.1: Carpet of Flowers class — the `where X is …`
+    /// quantity can itself reference a target player. The mana effect must
+    /// surface that player target so `ControllerRef::TargetPlayer` has a
+    /// selected player at resolution time.
+    #[test]
+    fn any_one_color_where_x_target_opponent_controlled_land_count() {
+        let effect = try_parse_add_mana_effect(
+            "Add X mana of any one color, where X is the number of Islands target opponent controls.",
+        )
+        .expect("target-opponent where-X mana count must parse");
+        let Effect::Mana {
+            produced, target, ..
+        } = effect
+        else {
+            panic!("expected Effect::Mana, got something else");
+        };
+        let ManaProduction::AnyOneColor {
+            count,
+            color_options,
+            ..
+        } = produced
+        else {
+            panic!("expected AnyOneColor, got {produced:?}");
+        };
+        assert_eq!(color_options, all_mana_colors());
+        let QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount { filter },
+        } = count
+        else {
+            panic!("expected ObjectCount ref for X, got {count:?}");
+        };
+        let TargetFilter::Typed(typed) = filter else {
+            panic!("expected typed object-count filter, got {filter:?}");
+        };
+        assert_eq!(typed.controller, Some(ControllerRef::TargetPlayer));
+        assert!(
+            typed
+                .type_filters
+                .contains(&TypeFilter::Subtype("Island".to_string())),
+            "expected Island subtype in object-count filter, got {:?}",
+            typed.type_filters
+        );
+
+        let Some(TargetFilter::Typed(target_typed)) = target else {
+            panic!("expected target opponent filter, got {target:?}");
+        };
+        assert_eq!(target_typed.controller, Some(ControllerRef::Opponent));
+    }
+
     /// CR 106.1: Three-color count-prefixed choice — the combinator builds for
     /// the class (any number of disjuncts), not just Brigid's two colors.
     #[test]
@@ -2095,6 +2479,35 @@ mod tests {
 
     /// CR 106.1: Fixed-count count-prefixed choice — `"Add 2 {G} or 2 {W}"`
     /// also routes through the combinator (the count prefix is a number).
+    /// CR 106.1 + CR 106.3: "Add {B} or {G} for each permanent destroyed this
+    /// way" (Culling Ritual). A >1-color disjunction scaled by a dynamic
+    /// "for each" count lowers to AnyCombination (each unit chosen
+    /// independently) with the count taken from the for-each clause -- not a
+    /// fixed 1-mana AnyOneColor. Building-block test for the whole
+    /// "<color set> for each <clause>" mana family.
+    #[test]
+    fn color_set_for_each_clause_scales_combination() {
+        let effect =
+            try_parse_add_mana_effect("Add {B} or {G} for each permanent destroyed this way")
+                .expect("must parse");
+        let Effect::Mana { produced, .. } = effect else {
+            panic!("expected Effect::Mana, got {effect:?}");
+        };
+        let ManaProduction::AnyCombination {
+            count,
+            color_options,
+        } = produced
+        else {
+            panic!("expected AnyCombination, got {produced:?}");
+        };
+        assert!(color_options.contains(&ManaColor::Black));
+        assert!(color_options.contains(&ManaColor::Green));
+        assert!(
+            matches!(count, QuantityExpr::Ref { .. }),
+            "count must be a dynamic for-each ref, got {count:?}"
+        );
+    }
+
     #[test]
     fn fixed_count_prefixed_color_choice() {
         let effect = try_parse_add_mana_effect("Add 2 {G} or 2 {W}")
@@ -2191,6 +2604,37 @@ mod tests {
         }
     }
 
+    /// Issue #2900: Blinkmoth Urn effect body after the intervening-if clause.
+    #[test]
+    fn parse_add_mana_that_player_for_each_artifact_they_control() {
+        let effect =
+            try_parse_add_mana_effect("that player adds {C} for each artifact they control.")
+                .expect("Blinkmoth Urn mana body must parse");
+        match effect {
+            Effect::Mana {
+                produced: ManaProduction::Colorless { count },
+                target,
+                ..
+            } => {
+                assert_eq!(
+                    target,
+                    Some(TargetFilter::ScopedPlayer),
+                    "recipient must be the scoped phase player"
+                );
+                assert!(
+                    matches!(
+                        count,
+                        QuantityExpr::Ref {
+                            qty: QuantityRef::ObjectCount { .. }
+                        }
+                    ),
+                    "count must be ObjectCount, got {count:?}"
+                );
+            }
+            other => panic!("expected Effect::Mana, got {other:?}"),
+        }
+    }
+
     /// CR 106.1: `{C}{C} for each X` preserves the literal symbol count as a
     /// `Multiply` factor; `{C} for each X` emits a bare `Ref` (no `Multiply`).
     #[test]
@@ -2226,5 +2670,26 @@ mod tests {
             ),
             other => panic!("expected colorless Mana, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_black_dragon_gate_mana_ability() {
+        // Issue #2933: "Add {B} or one mana of the chosen color" must retain
+        // the fixed Black alternative through `try_parse_add_mana_effect`.
+        let effect = try_parse_add_mana_effect("Add {B} or one mana of the chosen color.")
+            .expect("Black Dragon Gate mana line must parse");
+        assert!(
+            matches!(
+                effect,
+                Effect::Mana {
+                    produced: ManaProduction::ChosenColor {
+                        fixed_alternative: Some(ManaColor::Black),
+                        ..
+                    },
+                    ..
+                }
+            ),
+            "expected ChosenColor with fixed_alternative Black, got {effect:?}"
+        );
     }
 }

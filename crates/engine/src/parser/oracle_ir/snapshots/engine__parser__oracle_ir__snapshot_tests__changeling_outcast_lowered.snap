@@ -16,7 +16,6 @@ expression: "&lowered"
       "duration": null,
       "description": "Changeling",
       "target_prompt": null,
-      "sorcery_speed": false,
       "condition": null,
       "optional_targeting": false,
       "optional": false,
@@ -25,6 +24,19 @@ expression: "&lowered"
   ],
   "triggers": [],
   "statics": [
+    {
+      "mode": "CantBlock",
+      "affected": {
+        "type": "SelfRef"
+      },
+      "modifications": [],
+      "condition": null,
+      "affected_zone": null,
+      "effect_zone": null,
+      "active_zones": [],
+      "characteristic_defining": false,
+      "description": "~ can't block and can't be blocked."
+    },
     {
       "mode": "CantBeBlocked",
       "affected": {

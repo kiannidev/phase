@@ -13,6 +13,7 @@ use engine::types::ability::{AbilityDefinition, AbilityKind, Effect, QuantityExp
 use engine::types::actions::GameAction;
 use engine::types::card::CardFace;
 use engine::types::card_type::{CardType, CoreType};
+use engine::types::game_state::CastPaymentMode;
 use engine::types::game_state::{PlayerDeckPool, WaitingFor};
 use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
@@ -232,8 +233,16 @@ fn ai_vs_ai_completes_combat_sequence() {
     let ai_players: HashSet<PlayerId> = [P0, P1].into_iter().collect();
     let config = create_config(AiDifficulty::Medium, Platform::Native);
     let ai_configs = HashMap::from([(P0, config.clone()), (P1, config)]);
+    let mut ai_rng = SmallRng::seed_from_u64(42);
+    let ai_session = phase_ai::session::AiSession::arc_from_game(runner.state());
 
-    let results = run_ai_actions(runner.state_mut(), &ai_players, &ai_configs);
+    let results = run_ai_actions(
+        runner.state_mut(),
+        &ai_players,
+        &ai_configs,
+        &mut ai_rng,
+        &ai_session,
+    );
 
     // Should take at least the DeclareBlockers action
     assert!(!results.is_empty(), "AI should take at least one action");
@@ -312,7 +321,7 @@ fn attacks_when_opponent_is_at_lethal() {
 
     for (diff, action) in ai_choose_at_all_difficulties(runner.state()) {
         match &action {
-            GameAction::DeclareAttackers { attacks } => {
+            GameAction::DeclareAttackers { attacks, .. } => {
                 assert!(
                     !attacks.is_empty(),
                     "{diff:?}: should attack when opponent is at lethal"
@@ -360,6 +369,8 @@ fn casts_creature_when_mana_available() {
             object_id: harvester,
             card_id: runner.state().objects[&harvester].card_id,
             targets: Vec::new(),
+
+            payment_mode: CastPaymentMode::Auto,
         },
         "Should cast creature with strong ETB"
     );
@@ -390,7 +401,7 @@ fn attacks_with_evasive_creatures() {
     // The flyer can't be blocked by a ground creature — AI should attack
     let action = ai_choose(runner.state(), AiDifficulty::VeryHard);
     match &action {
-        GameAction::DeclareAttackers { attacks } => {
+        GameAction::DeclareAttackers { attacks, .. } => {
             assert!(
                 attacks.iter().any(|(id, _)| *id == flyer),
                 "Should attack with evasive flyer that can't be blocked"

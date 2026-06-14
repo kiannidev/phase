@@ -19,10 +19,6 @@
 //!  - return nothing -> `ZoneChangedThisWay` false -> `Draw` gated true  -> 1
 //!    card drawn.
 
-use std::path::Path;
-use std::sync::OnceLock;
-
-use engine::database::card_db::CardDatabase;
 use engine::game::scenario::{GameScenario, P0};
 use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::actions::GameAction;
@@ -32,14 +28,7 @@ use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
-fn load_db() -> Option<&'static CardDatabase> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../client/public/card-data.json");
-    if !path.exists() {
-        return None;
-    }
-    static DB: OnceLock<CardDatabase> = OnceLock::new();
-    Some(DB.get_or_init(|| CardDatabase::from_export(&path).expect("export should load")))
-}
+use crate::support::shared_card_db as load_db;
 
 fn add_mana(runner: &mut engine::game::scenario::GameRunner, mana: &[ManaType]) {
     let dummy = ObjectId(0);
@@ -72,6 +61,8 @@ fn resolve_roots_of_wisdom<F>(
             object_id: roots_id,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("Roots of Wisdom cast should be accepted");
 
@@ -169,6 +160,7 @@ use engine::types::ability::{
     AbilityCondition, BounceSelection, ControllerRef, Effect, FilterProp, QuantityExpr,
     ResolvedAbility, TargetFilter, TypedFilter,
 };
+use engine::types::game_state::CastPaymentMode;
 use engine::types::identifiers::CardId;
 use engine::types::player::PlayerId;
 

@@ -165,12 +165,14 @@ pub(crate) fn put_face_up_exile_into(
         origin: Some(Zone::Exile),
         destination,
         enter_transformed: false,
-        enter_tapped: false,
+        enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         enters_under_player: None,
         enters_attacking: false,
         enter_with_counters: Vec::new(),
         duration: None,
         track_exiled_by_source: false,
+        // Search-from-outside brings cards in face up.
+        face_down_profile: None,
     };
     Ok(change_zone::process_one_zone_move(
         state, &ctx, object_id, events,
@@ -365,10 +367,11 @@ mod tests {
                 owner_library: false,
                 enter_transformed: false,
                 enters_under: None,
-                enter_tapped: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                face_down_profile: None,
             },
             vec![],
             source_id,

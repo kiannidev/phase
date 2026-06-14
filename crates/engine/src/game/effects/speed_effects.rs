@@ -48,6 +48,12 @@ fn players_for_filter(
             .filter(|player| player.id != controller && player.life_gained_this_turn > 0)
             .map(|player| player.id)
             .collect(),
+        // CR 104.5 / CR 800.4: Players who lost have left the game; this
+        // filter is quantity-only and has no live speed-effect recipient.
+        PlayerFilter::HasLostTheGame => Vec::new(),
+        // CR 506.2 + CR 508.6: Count-only filter (Suppressor Skyguard); it has
+        // no live speed-effect recipient meaning.
+        PlayerFilter::OpponentOfTriggeringPlayerNotAttacked => Vec::new(),
         // CR 120.1 + CR 510.1 + CR 120.9 + CR 608.2i: Each opponent who was
         // dealt combat damage this turn, optionally restricted to a matching
         // source.
@@ -62,22 +68,14 @@ fn players_for_filter(
             })
             .map(|player| player.id)
             .collect(),
-        // CR 508.6: each opponent this player attacked this turn.
-        PlayerFilter::OpponentAttackedThisTurn => state
-            .players
-            .iter()
-            .filter(|player| !player.is_eliminated)
-            .filter(|player| player.id != controller && state.has_attacked(controller, player.id))
-            .map(|player| player.id)
-            .collect(),
-        // CR 508.6: each opponent this source creature attacked this turn.
-        PlayerFilter::OpponentAttackedBySourceThisTurn => state
+        // CR 508.6: each opponent the subject attacked within scope.
+        PlayerFilter::OpponentAttacked { subject, scope } => state
             .players
             .iter()
             .filter(|player| !player.is_eliminated)
             .filter(|player| {
                 player.id != controller
-                    && state.creature_attacked_player_this_turn(source_id, player.id)
+                    && state.opponent_attacked(*subject, *scope, controller, source_id, player.id)
             })
             .map(|player| player.id)
             .collect(),
@@ -124,7 +122,7 @@ fn players_for_filter(
             .iter()
             .filter(|player| !player.is_eliminated)
             .filter(|player| {
-                crate::game::players::matches_relation(player.id, controller, *relation)
+                crate::game::players::matches_relation(state, player.id, controller, *relation)
                     && crate::game::players::performed_action_this_way(state, player.id, *action)
             })
             .map(|player| player.id)
@@ -154,7 +152,10 @@ fn players_for_filter(
             state
                 .players
                 .iter()
-                .filter(|player| !player.is_eliminated && player.id != controller)
+                .filter(|player| {
+                    !player.is_eliminated
+                        && crate::game::players::is_opponent(state, controller, player.id)
+                })
                 .filter(|player| triggering.is_none_or(|pid| pid != player.id))
                 .map(|player| player.id)
                 .collect()
@@ -188,6 +189,32 @@ fn players_for_filter(
                 .into_iter()
                 .collect()
         }
+        // CR 108.3 + CR 109.4: the owner of the first object target — owner-axis
+        // sibling of `ParentObjectTargetController`.
+        PlayerFilter::ParentObjectTargetOwner => {
+            crate::game::ability_utils::parent_target_owner(ability, state)
+                .filter(|pid| {
+                    state
+                        .players
+                        .iter()
+                        .any(|player| player.id == *pid && !player.is_eliminated)
+                })
+                .into_iter()
+                .collect()
+        }
+        // CR 608.2c + CR 109.4: the resolution-scoped chosen player at `index`.
+        PlayerFilter::ChosenPlayer { index } => ability
+            .chosen_players
+            .get(*index as usize)
+            .copied()
+            .filter(|pid| {
+                state
+                    .players
+                    .iter()
+                    .any(|player| player.id == *pid && !player.is_eliminated)
+            })
+            .into_iter()
+            .collect(),
         // CR 109.4 + CR 109.5: "each [player class] who controls [comparator]
         // [count] [filter]" — candidates satisfying both `relation` and the
         // controlled-permanent count comparison.
@@ -204,7 +231,7 @@ fn players_for_filter(
                 .iter()
                 .filter(|player| !player.is_eliminated)
                 .filter(|player| {
-                    crate::game::players::matches_relation(player.id, controller, *relation)
+                    crate::game::players::matches_relation(state, player.id, controller, *relation)
                         && crate::game::effects::player_control_count_compares(
                             state,
                             player.id,
@@ -235,7 +262,7 @@ fn players_for_filter(
                 .iter()
                 .filter(|player| !player.is_eliminated)
                 .filter(|player| {
-                    crate::game::players::matches_relation(player.id, controller, *relation)
+                    crate::game::players::matches_relation(state, player.id, controller, *relation)
                         && crate::game::effects::candidate_player_scalar(player, attr)
                             .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
                 })

@@ -748,6 +748,28 @@ pub fn build_prompt(
             );
             "chooseCombatDamageAssignment"
         }
+        // CR 510.1d + CR 702.22k: a blocker is blocking a banding attacker, so the
+        // active player divides the blocker's damage among the attackers it
+        // blocks. Mirrors `AssignCombatDamage`, minus the lethal/trample/PW axes
+        // that don't apply to a blocker's outgoing damage.
+        WaitingFor::AssignBlockerDamage {
+            blocker_id,
+            total_damage,
+            attackers,
+            ..
+        } => {
+            insert_json(&mut fields, "blockerId", encode_object_id(*blocker_id));
+            insert_json(&mut fields, "totalDamage", *total_damage as i32);
+            insert_json(
+                &mut fields,
+                "attackerIds",
+                attackers
+                    .iter()
+                    .map(|id| encode_object_id(*id))
+                    .collect::<Vec<_>>(),
+            );
+            "chooseBlockerDamageAssignment"
+        }
         WaitingFor::CombatTaxPayment {
             per_creature,
             total_cost,
@@ -1211,21 +1233,13 @@ fn playable_objects(actions: &[GameAction]) -> HashSet<ObjectId> {
         .filter_map(|action| match action {
             GameAction::PlayLand { object_id, .. }
             | GameAction::CastSpell { object_id, .. }
-            | GameAction::CastSpellWithPaymentMode { object_id, .. }
             | GameAction::CastSpellForFree { object_id, .. }
-            | GameAction::CastSpellForFreeWithPaymentMode { object_id, .. }
             | GameAction::CastSpellAsMiracle { object_id, .. }
-            | GameAction::CastSpellAsMiracleWithPaymentMode { object_id, .. }
             | GameAction::CastSpellAsMadness { object_id, .. }
-            | GameAction::CastSpellAsMadnessWithPaymentMode { object_id, .. }
             | GameAction::PlayFaceDown { object_id, .. }
             | GameAction::Foretell { object_id, .. } => Some(*object_id),
             GameAction::CastSpellAsSneak { hand_object, .. }
-            | GameAction::CastSpellAsSneakWithPaymentMode { hand_object, .. }
-            | GameAction::CastSpellAsWebSlinging { hand_object, .. }
-            | GameAction::CastSpellAsWebSlingingWithPaymentMode { hand_object, .. } => {
-                Some(*hand_object)
-            }
+            | GameAction::CastSpellAsWebSlinging { hand_object, .. } => Some(*hand_object),
             GameAction::CastPreparedCopy { source } | GameAction::CastParadigmCopy { source } => {
                 Some(*source)
             }
@@ -1621,6 +1635,7 @@ fn waiting_for_type(waiting_for: &WaitingFor) -> &'static str {
         WaitingFor::UnlessPaymentChooseCost { .. } => "UnlessPaymentChooseCost",
         WaitingFor::NamedChoice { .. } => "NamedChoice",
         WaitingFor::AssignCombatDamage { .. } => "AssignCombatDamage",
+        WaitingFor::AssignBlockerDamage { .. } => "AssignBlockerDamage",
         WaitingFor::CombatTaxPayment { .. } => "CombatTaxPayment",
         WaitingFor::ChooseManaColor { .. } => "ChooseManaColor",
         WaitingFor::PayManaAbilityMana { .. } => "PayManaAbilityMana",
@@ -1634,7 +1649,8 @@ mod tests {
     use super::*;
     use engine::game::zones::create_object;
     use engine::types::ability::{
-        AbilityCost, CategoryChooserScope, Effect, ModalChoice, ResolvedAbility, TargetFilter,
+        AbilityCost, CategoryChooserScope, Effect, EffectKind, ModalChoice, ResolvedAbility,
+        TargetFilter,
     };
     use engine::types::card_type::CoreType;
     use engine::types::counter::CounterMatch;
@@ -1682,6 +1698,7 @@ mod tests {
             chosen_tappers: Vec::new(),
             chosen_discards: Vec::new(),
             chosen_mana_payment: None,
+            chosen_counter_count: None,
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
@@ -1865,6 +1882,7 @@ mod tests {
                     permanents: vec![ObjectId(22)],
                     pending_effect: Box::new(dummy_ability()),
                     remaining: 1,
+                    min_total_power: None,
                 },
                 PlayerId(0),
             ),
@@ -1902,6 +1920,8 @@ mod tests {
                             TargetRef::Player(PlayerId(1)),
                         ],
                     }],
+                    effect_kind: EffectKind::CopySpell,
+                    effect_source_id: Some(ObjectId(1)),
                     current_slot: 0,
                 },
                 PlayerId(0),
@@ -1957,6 +1977,8 @@ mod tests {
                     player: PlayerId(0),
                     kind: PayCostKind::RemoveCounter {
                         counter_type: CounterMatch::Any,
+                        count: 1,
+                        selection: engine::types::ability::CounterCostSelection::SingleObject,
                     },
                     choices: vec![ObjectId(29)],
                     count: 1,
@@ -2194,6 +2216,7 @@ mod tests {
                     kept_destination: None,
                     rest_destination: None,
                     source_id: None,
+                    enter_tapped: false,
                 },
             ),
             (
@@ -2327,7 +2350,10 @@ mod tests {
                     context: engine::types::game_state::CombatTaxContext::Attacking,
                     total_cost: ManaCost::NoCost,
                     per_creature: vec![],
-                    pending: CombatTaxPending::Attack { attacks: vec![] },
+                    pending: CombatTaxPending::Attack {
+                        attacks: vec![],
+                        bands: vec![],
+                    },
                 },
             ),
             ("gameOver", WaitingFor::GameOver { winner: None }),

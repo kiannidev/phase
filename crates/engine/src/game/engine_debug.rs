@@ -32,26 +32,20 @@ pub fn apply_debug_action(
             simulate,
         } => {
             validate_object(state, object_id)?;
+            // Debug forces a zone change — route through the zone pipeline under
+            // the `DebugCommand` exempt cause, which is FULLY inert: it skips
+            // both the replacement consult and the delivery tail (no
+            // enters-with-counter statics, no pending-ETB-counter consumption,
+            // no devour snapshot), while the unconditional primitive guards
+            // still run. DebugCommand is non-pausing by construction (always
+            // `Done`), so the result is safely discarded. The library-position
+            // arm folds the raw `move_to_library_position` / `_at_index`
+            // siblings in via the placement request.
+            let mut req = crate::game::zone_pipeline::ZoneMoveRequest::debug(object_id, to_zone);
             if to_zone == Zone::Library {
-                match library_position.unwrap_or(LibraryPosition::Bottom) {
-                    LibraryPosition::Top => {
-                        zones::move_to_library_position(state, object_id, true, events);
-                    }
-                    LibraryPosition::Bottom => {
-                        zones::move_to_library_position(state, object_id, false, events);
-                    }
-                    LibraryPosition::NthFromTop { n } => {
-                        zones::move_to_library_at_index(
-                            state,
-                            object_id,
-                            Some(n.saturating_sub(1) as usize),
-                            events,
-                        );
-                    }
-                }
-            } else {
-                zones::move_to_zone(state, object_id, to_zone, events);
+                req = req.at_library_position(library_position.unwrap_or(LibraryPosition::Bottom));
             }
+            crate::game::zone_pipeline::move_object(state, req, events);
             if simulate {
                 super::sba::check_state_based_actions(state, events);
                 super::triggers::process_triggers(state, events);
@@ -91,6 +85,28 @@ pub fn apply_debug_action(
             crate::game::layers::mark_layers_full(state);
         }
 
+        DebugAction::Sacrifice { object_id } => {
+            validate_object(state, object_id)?;
+            // CR 701.21: A player sacrifices a permanent they control. Route
+            // through the single sacrifice authority so the replacement pipeline
+            // (e.g. Rest in Peace → exile) and dies/leaves-the-battlefield
+            // triggers fire — unlike `RemoveObject`, which deletes the object
+            // outright with no triggers.
+            let controller = state.objects[&object_id].controller;
+            match super::sacrifice::sacrifice_permanent(state, object_id, controller, events)
+                .map_err(|err| EngineError::InvalidAction(format!("{err:?}")))?
+            {
+                super::sacrifice::SacrificeOutcome::Complete => {
+                    super::triggers::process_triggers(state, events); // CR 603: dies/LTB triggers
+                    super::sba::check_state_based_actions(state, events); // CR 704
+                }
+                super::sacrifice::SacrificeOutcome::NeedsReplacementChoice(player) => {
+                    state.waiting_for =
+                        super::replacement::replacement_choice_waiting_for(player, state);
+                }
+            }
+        }
+
         DebugAction::DrawCards { player_id, count } => {
             validate_player(state, player_id)?;
             // CR 614.6 + CR 614.11 + CR 704.3: route through the single-authority
@@ -114,9 +130,33 @@ pub fn apply_debug_action(
                 .take(count as usize)
                 .copied()
                 .collect();
+            // Debug mill — route through the pipeline under `DebugCommand`
+            // (fully inert: no consult, no delivery tail; non-pausing by
+            // construction, so the result is safely discarded).
             for id in top_ids {
-                zones::move_to_zone(state, id, Zone::Graveyard, events);
+                let req = crate::game::zone_pipeline::ZoneMoveRequest::debug(id, Zone::Graveyard);
+                crate::game::zone_pipeline::move_object(state, req, events);
             }
+        }
+
+        DebugAction::Reveal { player_id, count } => {
+            validate_player(state, player_id)?;
+            // CR 701.20a/b: Reveal the top `count` cards of the player's library
+            // via the real `Effect::RevealTop` resolver — marks them revealed and
+            // emits `CardsRevealed` without moving the cards. `TargetFilter::Any`
+            // + an explicit `TargetRef::Player` makes the resolver reveal exactly
+            // the requested library (see `reveal_top::resolve`).
+            let ability = ResolvedAbility::new(
+                Effect::RevealTop {
+                    player: TargetFilter::Any,
+                    count,
+                },
+                vec![TargetRef::Player(player_id)],
+                ObjectId(0),
+                player_id,
+            );
+            super::effects::reveal_top::resolve(state, &ability, events)
+                .map_err(|err| EngineError::InvalidAction(format!("{err:?}")))?;
         }
 
         DebugAction::ShuffleLibrary { player_id } => {
@@ -329,6 +369,17 @@ pub fn apply_debug_action(
             }
         }
 
+        DebugAction::SetInfiniteMana { player_id, enabled } => {
+            validate_player(state, player_id)?;
+            if enabled {
+                state.debug_infinite_mana.insert(player_id);
+                // Seed immediately so the pool reads full before the next probe.
+                super::mana_payment::refill_infinite_mana(state);
+            } else {
+                state.debug_infinite_mana.remove(&player_id);
+            }
+        }
+
         DebugAction::SetPhase {
             phase,
             active_player,
@@ -349,7 +400,7 @@ pub fn apply_debug_action(
             super::triggers::process_triggers(state, events);
         }
 
-        DebugAction::CreateToken { request } => {
+        DebugAction::CreateToken { request, run_etb } => {
             let (owner, characteristics, enter_with_counters, preset_image_ref) = match request {
                 DebugTokenRequest::Preset {
                     preset_id,
@@ -398,6 +449,7 @@ pub fn apply_debug_action(
             let proposed = ProposedEvent::CreateToken {
                 owner,
                 spec: Box::new(spec),
+                copy: None,
                 enter_tapped: crate::types::proposed_event::EtbTapState::Unspecified,
                 count: 1,
                 applied: HashSet::new(),
@@ -415,8 +467,14 @@ pub fn apply_debug_action(
                             }
                         }
                     }
-                    super::triggers::process_triggers(state, events); // CR 603: Process triggers
-                    super::sba::check_state_based_actions(state, events); // CR 704: Check SBAs
+                    // "Run ETB effects" unchecked: the token is still created
+                    // (with its replacement-window counters) but its ETB triggers
+                    // and the SBA pass are skipped — mirrors the raw placement of
+                    // `MoveToZone { simulate: false }`.
+                    if run_etb {
+                        super::triggers::process_triggers(state, events); // CR 603: Process triggers
+                        super::sba::check_state_based_actions(state, events); // CR 704: Check SBAs
+                    }
                 }
                 super::replacement::ReplacementResult::Prevented => {}
                 super::replacement::ReplacementResult::NeedsChoice(player) => {
@@ -533,10 +591,35 @@ fn apply_energy_delta(
 pub fn route_debug_create_to_battlefield(
     state: &mut GameState,
     object_id: ObjectId,
+    run_etb: bool,
 ) -> ActionResult {
     use super::replacement::{self, ReplacementResult};
 
     let mut events: Vec<GameEvent> = vec![];
+
+    // "Run ETB effects" unchecked: place the staged object on the battlefield
+    // raw — no replacement window, no ETB triggers, no SBA pass. This mirrors
+    // `MoveToZone { simulate: false }`, letting a board position be staged
+    // without the entering permanent's "when ~ enters" abilities going on the
+    // stack.
+    if !run_etb {
+        // Debug staging — route through the pipeline under `DebugCommand`,
+        // which is FULLY inert: no replacement consult AND no delivery tail
+        // (no intrinsic or statics-derived enters-with counters, no
+        // pending-ETB-counter consumption, no devour snapshot), matching the
+        // prior raw placement exactly. ETB triggers / SBA are NOT run here;
+        // that is `run_etb`'s job below. DebugCommand is non-pausing by
+        // construction (always `Done`), so the result is safely discarded.
+        let req = crate::game::zone_pipeline::ZoneMoveRequest::debug(object_id, Zone::Battlefield);
+        crate::game::zone_pipeline::move_object(state, req, &mut events);
+        crate::game::layers::mark_layers_full(state);
+        return ActionResult {
+            events,
+            waiting_for: state.waiting_for.clone(),
+            log_entries: vec![],
+        };
+    }
+
     let from = state
         .objects
         .get(&object_id)
@@ -553,20 +636,32 @@ pub fn route_debug_create_to_battlefield(
         enter_with_counters: vec![],
         controller_override: None,
         enter_transformed: false,
+        face_down_profile: None,
         applied: HashSet::new(),
     };
 
     let mut waiting_for = state.waiting_for.clone();
     match replacement::replace_event(state, proposed, &mut events) {
         ReplacementResult::Execute(event) => {
-            super::effects::change_zone::deliver_replaced_zone_change(
+            // CR 614.12a: a Devour as-enters sacrifice may surface its own
+            // `EffectZoneChoice`; park on it so the debug-place flow keeps the
+            // pending sacrifice prompt instead of overwriting it.
+            match super::effects::change_zone::deliver_replaced_zone_change(
                 state,
                 event,
                 None,
                 None,
                 false,
+                crate::types::game_state::PostReplacementDrainOwner::DeliveryTail,
+                None,
                 &mut events,
-            );
+            ) {
+                super::effects::change_zone::ZoneDeliveryResult::Done => {}
+                super::effects::change_zone::ZoneDeliveryResult::NeedsChoice(player) => {
+                    replacement::park_waiting_for(state, player);
+                    waiting_for = state.waiting_for.clone();
+                }
+            }
             super::triggers::process_triggers(state, &events); // CR 603: Process triggers
             super::sba::check_state_based_actions(state, &mut events); // CR 704: Check SBAs
         }
@@ -693,6 +788,7 @@ mod tests {
                 characteristics: zero_zero_creature(),
                 enter_with_counters: vec![(CounterType::Plus1Plus1, 2)],
             },
+            run_etb: true,
         });
         let result = crate::game::engine::apply(&mut state, PlayerId(0), action)
             .expect("debug CreateToken should succeed");
@@ -1062,6 +1158,57 @@ mod tests {
         assert_eq!(state.players[0].library.back(), Some(&to_bottom));
     }
 
+    /// Phase D review fix: a `DebugCommand` zone change is FULLY inert — it
+    /// skips the delivery tail, not just the replacement consult. Pending ETB
+    /// counters from delayed triggers ("that creature enters with an
+    /// additional +1/+1 counter") must NOT be applied to or consumed by a
+    /// debug-staged battlefield entry. Pre-fix, the exempt path delivered
+    /// through the full tail: the staged object entered with the pending
+    /// counters and the `pending_etb_counters` entry was consumed (the same
+    /// tail arm would also mint Kalain-class `EntersWithAdditionalCounters`
+    /// statics onto staged creatures).
+    #[test]
+    fn debug_move_to_battlefield_skips_delivery_tail_counters() {
+        use crate::game::zones::create_object;
+        use crate::types::identifiers::CardId;
+
+        let mut state = sandbox_state();
+        let staged = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Staged Creature".to_string(),
+            Zone::Hand,
+        );
+        state
+            .pending_etb_counters
+            .push((staged, CounterType::Plus1Plus1, 2));
+
+        crate::game::engine::apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::Debug(DebugAction::MoveToZone {
+                object_id: staged,
+                to_zone: Zone::Battlefield,
+                library_position: None,
+                simulate: false,
+            }),
+        )
+        .expect("debug MoveToZone battlefield should succeed");
+
+        let obj = &state.objects[&staged];
+        assert_eq!(obj.zone, Zone::Battlefield);
+        assert!(
+            obj.counters.is_empty(),
+            "a debug-staged entry must not receive delivery-tail counters"
+        );
+        assert_eq!(
+            state.pending_etb_counters.len(),
+            1,
+            "a debug-staged entry must not consume pending ETB counters"
+        );
+    }
+
     #[test]
     fn debug_modify_player_counters_routes_poison_to_dedicated_field() {
         let mut state = sandbox_state();
@@ -1222,6 +1369,7 @@ mod tests {
                 characteristics: zero_zero_creature(),
                 enter_with_counters: Vec::new(),
             },
+            run_etb: true,
         });
         let result = crate::game::engine::apply(&mut state, PlayerId(0), action)
             .expect("debug CreateToken should succeed");

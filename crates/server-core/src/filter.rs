@@ -203,6 +203,7 @@ mod tests {
                 parse_warnings: vec![],
                 brawl_commander: false,
                 is_commander: false,
+                is_oathbreaker: false,
                 deck_copy_limit: None,
                 metadata: Default::default(),
                 rarities: Default::default(),
@@ -333,12 +334,13 @@ mod tests {
             effect_kind: engine::types::ability::EffectKind::ChangeZone,
             zone: Zone::Hand,
             destination: Some(Zone::Battlefield),
-            enter_tapped: false,
+            enter_tapped: engine::types::zones::EtbTapState::Unspecified,
             enter_transformed: false,
             enters_under_player: None,
             enters_attacking: false,
             owner_library: false,
             track_exiled_by_source: false,
+            face_down_profile: None,
             count_param: 0,
         };
 

@@ -10,9 +10,9 @@
 //! type-system lookup; there is no semantic translation. Cost/filter
 //! keywords need real conversion logic, so they land with their phase.
 
-use engine::types::ability::{AbilityCost, QuantityExpr};
+use engine::types::ability::{AbilityCost, CostObjectCount, QuantityExpr};
 use engine::types::keywords::{
-    ActivationCadence, BloodthirstValue, BuybackCost, CyclingCost, FlashbackCost, HexproofFilter,
+    BestowCost, BloodthirstValue, BuybackCost, CyclingCost, FlashbackCost, HexproofFilter,
     ProtectionTarget, WardCost,
 };
 use engine::types::mana::{ManaColor, ManaCost};
@@ -114,7 +114,8 @@ pub fn try_convert(rule: &Rule, path: &str) -> ConvResult<Option<Keyword>> {
         Rule::Afflict(n) => Keyword::Afflict(non_negative(*n)?),
         Rule::Crew(n) => Keyword::Crew {
             power: non_negative(*n)?,
-            once_per_turn: ActivationCadence::Unlimited,
+            // mtgish encodes only plain Crew N; no once-each-turn cadence.
+            once_per_turn: None,
         },
         Rule::Fabricate(n) => Keyword::Fabricate(non_negative(*n)?),
         Rule::Fading(n) => Keyword::Fading(non_negative(*n)?),
@@ -139,50 +140,45 @@ pub fn try_convert(rule: &Rule, path: &str) -> ConvResult<Option<Keyword>> {
         Rule::Dredge(g) => Keyword::Dredge(int_or_gap(g, "Rule::Dredge", path)?),
         Rule::Modular(g) => Keyword::Modular(int_or_gap(g, "Rule::Modular", path)?),
         Rule::Mobilize(g) => Keyword::Mobilize(quantity::convert(g)?),
-        // CR 702.60a: Ripple N. The engine keyword is currently the fixed
-        // Oracle corpus shape (Ripple 4), so strict-fail any non-4 payload
-        // instead of dropping semantic data.
-        Rule::Ripple(g) => {
-            let count = int_or_gap(g, "Rule::Ripple", path)?;
-            if count != 4 {
-                return Err(ConversionGap::EnginePrerequisiteMissing {
-                    engine_type: "Keyword::Ripple",
-                    needed_variant: format!("parameterized Ripple {count}"),
-                });
-            }
-            Keyword::Ripple
-        }
+        // CR 702.60a: Ripple N — engine now carries the parameterized count.
+        Rule::Ripple(g) => Keyword::Ripple(int_or_gap(g, "Rule::Ripple", path)?),
         Rule::Saddle(g) => Keyword::Saddle(int_or_gap(g, "Rule::Saddle", path)?),
         Rule::Soulshift(g) => Keyword::Soulshift(int_or_gap(g, "Rule::Soulshift", path)?),
         Rule::Poisonous(n) => Keyword::Poisonous(non_negative(*n)?),
 
         // === Phase 4b: ManaCost-payload keywords (Cost::PayMana only) ===
         // CR 702.103a: Bestow [cost] — alternative casting cost. The engine
-        // `Keyword::Bestow(ManaCost)` carries the alt cost; the cast-as-Aura
-        // type-changing on the stack (CR 702.103b) and the unattach exception
-        // (CR 702.103f vs CR 704.5n) are not yet wired to runtime. The keyword
-        // is preserved for display/coverage so the card surfaces in card-data
-        // export with its bestow cost; the alt-cost cast lane (which would
-        // require a `CastingVariant::Bestow` arm parallel to Evoke/Madness)
-        // remains a deferred Phase 2. The card is still playable for its
-        // printed mana cost as a vanilla creature spell.
-        Rule::Bestow(c) => Keyword::Bestow(pure_mana(c, "Rule::Bestow", path)?),
+        // `Keyword::Bestow(BestowCost::Mana(_))` carries the alt cost used by
+        // the bestow casting lane; cast-as-Aura type-changing happens at runtime
+        // (CR 702.103b), with the unattach exception covered by CR 702.103f /
+        // CR 704.5m.
+        Rule::Bestow(c) => Keyword::Bestow(BestowCost::Mana(pure_mana(c, "Rule::Bestow", path)?)),
         // CR 702.103a + CR 107.3a: BestowX is the X-cost variant — cost
         // contains an `{X}` shard. `pure_mana` accepts ManaCostX shards via
         // `cost_conv::as_pure_mana`, producing a `ManaCost` with `shards`
         // including `ManaCostShard::X`. The X-coupling between the cast and
         // any "enters with X +1/+1 counters" replacement is wired by the
         // replacement converter (see `convert/replacement.rs`).
-        Rule::BestowX(c) => Keyword::Bestow(pure_mana(c, "Rule::BestowX", path)?),
+        Rule::BestowX(c) => Keyword::Bestow(BestowCost::Mana(pure_mana(c, "Rule::BestowX", path)?)),
         Rule::Blitz(c) => Keyword::Blitz(pure_mana(c, "Rule::Blitz", path)?),
         Rule::Dash(c) => Keyword::Dash(pure_mana(c, "Rule::Dash", path)?),
         Rule::Disturb(c) => Keyword::Disturb(pure_mana(c, "Rule::Disturb", path)?),
         Rule::Disguise(c) => Keyword::Disguise(pure_mana(c, "Rule::Disguise", path)?),
-        Rule::Echo(c) => Keyword::Echo(pure_mana(c, "Rule::Echo", path)?),
-        Rule::Embalm(c) => Keyword::Embalm(pure_mana(c, "Rule::Embalm", path)?),
+        Rule::Echo(c) => Keyword::Echo(engine::types::keywords::EchoCost::Mana(pure_mana(
+            c,
+            "Rule::Echo",
+            path,
+        )?)),
+        Rule::Embalm(c) => Keyword::Embalm(engine::types::keywords::EmbalmCost::Mana(pure_mana(
+            c,
+            "Rule::Embalm",
+            path,
+        )?)),
         Rule::Emerge(c) => Keyword::Emerge(pure_mana(c, "Rule::Emerge", path)?),
         Rule::Encore(c) => Keyword::Encore(pure_mana(c, "Rule::Encore", path)?),
-        Rule::Eternalize(c) => Keyword::Eternalize(pure_mana(c, "Rule::Eternalize", path)?),
+        Rule::Eternalize(c) => Keyword::Eternalize(engine::types::keywords::EternalizeCost::Mana(
+            pure_mana(c, "Rule::Eternalize", path)?,
+        )),
         Rule::Evoke(c) => Keyword::Evoke(engine::types::keywords::EvokeCost::Mana(pure_mana(
             c,
             "Rule::Evoke",
@@ -298,10 +294,13 @@ pub fn try_convert(rule: &Rule, path: &str) -> ConvResult<Option<Keyword>> {
         // the cost as `Box<Cost>`; engine takes only the mana cost.
         Rule::WebSlinging(c) => Keyword::WebSlinging(pure_mana(c, "Rule::WebSlinging", path)?),
 
-        // CR 702.47a: Splice onto [quality] [cost]. The engine keyword
-        // stores the quality string only (matching the native parser);
-        // splice-cost payment is not represented in the current keyword type.
-        Rule::SpliceOnto(spells, _cost) => Keyword::Splice(splice_quality(spells, path)?),
+        // CR 702.47a: Splice onto [quality] [cost]. The engine keyword carries
+        // both the quality string and the splice cost paid as an additional
+        // cost when the card is spliced onto a host spell.
+        Rule::SpliceOnto(spells, cost) => Keyword::Splice {
+            subtype: splice_quality(spells, path)?,
+            cost: pure_mana(cost, "Rule::SpliceOnto", path)?,
+        },
 
         // CR 702.56a: Replicate {cost} — additional-cost-on-cast copy
         // mechanic. Engine carries only the mana cost.
@@ -331,9 +330,8 @@ pub fn try_convert(rule: &Rule, path: &str) -> ConvResult<Option<Keyword>> {
         // CR 702.81: Devour N — engine encodes only N (the "creatures you
         // sacrifice" filter is implicit).
         Rule::Devour(_perm, g) => Keyword::Devour(int_or_gap(g, "Rule::Devour", path)?),
-        // CR 702.163: Prototype — alt-cost cast for a smaller body. The
-        // engine keyword carries only the alt mana cost; the alt-PT is
-        // synthesized separately. CardManaCost is a Vec<ManaSymbolX>.
+        // CR 702.160a: Prototype — alt-cost cast that uses the secondary
+        // power/toughness and mana cost characteristics.
         // CR 702.176a: Impending N—{cost} — alternative cost. "You may
         // choose to pay [cost] rather than pay this spell's mana cost"
         // + "If you chose to pay this permanent's impending cost, it
@@ -365,15 +363,20 @@ pub fn try_convert(rule: &Rule, path: &str) -> ConvResult<Option<Keyword>> {
             Keyword::Specialize(pure_mana(c, "Rule::SpecializeWithModifiers", path)?)
         }
 
-        // CR 702.167a: Craft with [materials] [cost]. The engine keyword
-        // carries only the activation mana cost, matching the native parser;
-        // material requirements are not represented in `Keyword::Craft`.
+        // CR 702.167a/b: Craft with [materials] [cost]. The engine keyword now
+        // carries the materials class and count alongside the activation cost.
+        // This dormant import crate defaults materials to the creature class and
+        // count to 1 (the native Oracle-line parser supplies the precise class);
+        // the goal here is to keep the workspace compiling under the struct
+        // migration.
         Rule::CraftWithACraftable(_, cost)
         | Rule::CraftWithCraftables(_, cost)
         | Rule::CraftWithANumberOfCraftables(_, _, cost)
-        | Rule::CraftWithANumberOfGroupCraftables(_, _, _, cost) => {
-            Keyword::Craft(crate::convert::mana::convert(cost)?)
-        }
+        | Rule::CraftWithANumberOfGroupCraftables(_, _, _, cost) => Keyword::Craft {
+            cost: crate::convert::mana::convert(cost)?,
+            materials: engine::types::keywords::craft_materials_default(),
+            count: CostObjectCount::exactly(1),
+        },
 
         // CR 702.48a: "[Quality] offering" — additional-cost-on-cast
         // sacrificing a permanent of the named quality. The schema's
@@ -393,9 +396,11 @@ pub fn try_convert(rule: &Rule, path: &str) -> ConvResult<Option<Keyword>> {
         // (`Keyword::TotemArmor`) per the documented Oracle erratum.
         Rule::UmbraArmor => Keyword::TotemArmor,
 
-        Rule::Prototype { mana_cost, .. } => {
-            Keyword::Prototype(crate::convert::mana::convert_x(mana_cost)?)
-        }
+        Rule::Prototype { mana_cost, card_pt } => Keyword::Prototype {
+            cost: crate::convert::mana::convert_x(mana_cost)?,
+            power: Some(card_pt.power),
+            toughness: Some(card_pt.toughness),
+        },
 
         // CR 702.138a: Escape — alternative casting cost from graveyard.
         // mtgish encodes the cost as `Cost::And([PayMana, ExileNumberGraveyardCards(N, ...)])`;
@@ -906,6 +911,7 @@ mod tests {
                     QuantityRef::ZoneCardCount {
                         zone: ZoneRef::Graveyard,
                         card_types,
+                        filter: None,
                         scope: CountScope::Controller,
                     },
             }) => assert_eq!(card_types, vec![TypeFilter::Creature]),
@@ -914,7 +920,7 @@ mod tests {
     }
 
     /// CR 702.103a: `Rule::Bestow(Cost::PayMana(...))` lowers to
-    /// `Keyword::Bestow(ManaCost)` carrying the alt mana cost.
+    /// `Keyword::Bestow(BestowCost::Mana(_))` carrying the alt mana cost.
     #[test]
     fn bestow_with_pure_mana_cost_lowers_to_keyword() {
         use crate::schema::types::{Cost, ManaSymbol};
@@ -926,7 +932,7 @@ mod tests {
             .expect("conversion should succeed")
             .expect("rule should be recognized as a keyword");
         match keyword {
-            Keyword::Bestow(mc) => {
+            Keyword::Bestow(BestowCost::Mana(mc)) => {
                 use engine::types::mana::ManaCostShard;
                 use engine::types::ManaCost;
                 assert_eq!(
@@ -960,7 +966,7 @@ mod tests {
             .expect("conversion should succeed")
             .expect("rule should be recognized as a keyword");
         match keyword {
-            Keyword::Bestow(mc) => {
+            Keyword::Bestow(BestowCost::Mana(mc)) => {
                 use engine::types::mana::ManaCostShard;
                 use engine::types::ManaCost;
                 assert_eq!(

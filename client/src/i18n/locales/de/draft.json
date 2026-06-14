@@ -44,7 +44,8 @@
     "endDraftConfirm": "Diesen Draft fuer alle beenden? Das kann nicht rueckgaengig gemacht werden."
   },
   "manaCurve": {
-    "title": "Manakurve"
+    "title": "Manakurve",
+    "bucketLabel": "Manawert {{bucket}}"
   },
   "pickTimer": {
     "label": "Pick-Timer",
@@ -111,6 +112,8 @@
   },
   "landing": {
     "title": "Draft",
+    "eyebrow": "Draft",
+    "description": "Schneller Draft gegen die KI, baue einen Cube oder veranstalte einen Pod mit Freunden.",
     "startNew": "Neu starten",
     "quickDraft": {
       "title": "Quick Draft",
@@ -332,5 +335,22 @@
     "leave": "Verlassen",
     "startDraft": "Draft starten",
     "waitingForHost": "Warten, bis der Host den Draft startet..."
+  },
+  "spectator": {
+    "eyebrow": "Draft spectator",
+    "title": "Watching draft {{code}}",
+    "missingCode": "Enter a draft code",
+    "connecting": "Connecting to draft…",
+    "errorGeneric": "Could not connect as spectator",
+    "backToLobby": "Back to lobby",
+    "banner": "Spectating this draft pod",
+    "omniscient": "Omniscient view",
+    "seats": "Seats",
+    "deckSubmitted": "deck in",
+    "standings": "Standings",
+    "pairings": "Pairings",
+    "pools": "Pools (omniscient)",
+    "poolSize": "{{count}} cards picked",
+    "seat": "Seat {{index}}"
   }
 }

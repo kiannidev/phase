@@ -47,16 +47,12 @@
 //! breaks integration coverage) and then drive each mode through the real
 //! `apply()` pipeline.
 
-use std::path::Path;
-use std::sync::OnceLock;
-
-use engine::database::card_db::CardDatabase;
 use engine::game::layers::evaluate_layers;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::scenario_db::GameScenarioDbExt;
 use engine::types::ability::{ChoiceType, Effect};
 use engine::types::actions::GameAction;
-use engine::types::game_state::WaitingFor;
+use engine::types::game_state::{CastPaymentMode, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaType, ManaUnit};
@@ -67,14 +63,7 @@ use engine::types::zones::Zone;
 
 use super::rules::run_combat;
 
-fn load_db() -> Option<&'static CardDatabase> {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../client/public/card-data.json");
-    if !path.exists() {
-        return None;
-    }
-    static DB: OnceLock<CardDatabase> = OnceLock::new();
-    Some(DB.get_or_init(|| CardDatabase::from_export(&path).expect("export should load")))
-}
+use crate::support::shared_card_db as load_db;
 
 /// Drive the as-enters labeled choice for an already-placed Frostcliff Siege
 /// through the real `apply()` pipeline so `ChosenAttribute::Label(<chosen>)`
@@ -83,10 +72,9 @@ fn load_db() -> Option<&'static CardDatabase> {
 /// Poking `chosen_attributes` directly would bypass the very mapping under
 /// test.
 ///
-/// `add_real_card` to Battlefield (`scenario_db.rs`) bypasses the
-/// zone-change pipeline, so the as-enters replacement doesn't fire on its
-/// own — we drive the prompt manually here while still routing the answer
-/// through the production resolution choice handler.
+/// The scenario helper may already have raised the as-enters prompt; this
+/// helper still routes the answer through the production choice handler so the
+/// label persistence mapping stays under test.
 fn drive_siege_choice(
     runner: &mut engine::game::scenario::GameRunner,
     siege: ObjectId,
@@ -336,6 +324,12 @@ fn no_choice_persisted_means_neither_linked_ability_functions() {
     let _f2 = scenario.add_real_card(P0, "Plains", Zone::Library, db);
     let mut runner = scenario.build();
 
+    assert!(
+        matches!(runner.state().waiting_for, WaitingFor::NamedChoice { .. }),
+        "battlefield entry should raise Frostcliff Siege's as-enters choice before this no-choice fixture suppresses it"
+    );
+    runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
+
     // CR 614.12c precondition: NO `ChosenAttribute::Label` on the Siege
     // (simulating a copied/cloned permanent that never made the as-enters
     // choice).
@@ -489,6 +483,8 @@ fn cast_siege_from_hand(runner: &mut GameRunner, siege: ObjectId, chosen_label: 
             object_id: siege,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("P0 must be able to cast Frostcliff Siege from hand");
 

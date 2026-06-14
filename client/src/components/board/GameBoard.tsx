@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 
 import type { PlayerId } from "../../adapter/types.ts";
@@ -16,13 +16,14 @@ import {
 import { BoardInteractionContext } from "./BoardInteractionContext.tsx";
 import { CombatLine } from "./CombatLine.tsx";
 import { PlayerArea } from "./PlayerArea.tsx";
+import { DraggableWidget } from "../flexlayout/DraggableWidget.tsx";
 
 interface GameBoardProps {
   oppHud?: React.ReactNode;
   playerHud?: React.ReactNode;
 }
 
-export function GameBoard({ oppHud, playerHud }: GameBoardProps) {
+export const GameBoard = memo(function GameBoard({ oppHud, playerHud }: GameBoardProps) {
   const { t } = useTranslation("game");
   const gameState = useGameStore((s) => s.gameState);
   const waitingFor = useGameStore((s) => s.waitingFor);
@@ -242,8 +243,17 @@ export function GameBoard({ oppHud, playerHud }: GameBoardProps) {
           )
         ) : (
           <div className="flex min-h-0 flex-1 flex-col">
-            {/* Keep opponent controls above overflowing command-zone cards. */}
-            <div className="relative z-40 shrink-0">{oppHud}</div>
+            {/* Keep opponent controls above overflowing command-zone cards.
+                The multiplayer opponent HUD is the table-size-keyed widget —
+                repositioning it stores under the "multiplayer" slot, distinct
+                from the 1v1 opponent HUD (wired in PlayerArea). */}
+            <DraggableWidget
+              target={{ kind: "opponentHud", tableSize: "multiplayer" }}
+              flexZone="opponentHud"
+              className="relative z-40 shrink-0"
+            >
+              {oppHud}
+            </DraggableWidget>
             {focusedId != null ? (
               <PlayerArea
                 battlefieldView={focusedBattlefieldView ?? undefined}
@@ -271,4 +281,4 @@ export function GameBoard({ oppHud, playerHud }: GameBoardProps) {
       </div>
     </BoardInteractionContext.Provider>
   );
-}
+});

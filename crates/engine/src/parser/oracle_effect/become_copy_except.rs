@@ -36,12 +36,14 @@
 //! - `it has {keyword[, keyword, ...]}`
 //!   → [`ContinuousModification::AddKeyword`] per recognised keyword.
 //! - `<subject pronoun> has this ability`
-//!   → [`ContinuousModification::RetainPrintedTriggerFromSource`] referencing
-//!   the trigger that contains the BecomeCopy effect (CR 707.9a). The
-//!   subject pronoun accepts `he`/`she`/`it` so cards from any gender print
-//!   route through the same arm. Requires `current_trigger_index` to be set
-//!   in the parse context — when absent, the arm declines (no modification
-//!   produced) so the rest of the except clause still parses.
+//!   → [`ContinuousModification::RetainPrintedTriggerFromSource`] when
+//!   `current_trigger_index` is set (triggered abilities), or
+//!   [`ContinuousModification::RetainPrintedAbilityFromSource`] when
+//!   `current_ability_index` is set (activated abilities). Both reference
+//!   the ability containing the BecomeCopy effect (CR 707.9a). The subject
+//!   pronoun accepts `he`/`she`/`it` so cards from any gender print route
+//!   through the same arm. When neither index is set, the arm declines (no
+//!   modification produced) so the rest of the except clause still parses.
 //!
 //! # Fail-soft semantics
 //!
@@ -151,7 +153,8 @@ pub(crate) fn parse_except_clause<'a>(
 ///   - `<subject> power/toughness is half <copy source> power/toughness`
 ///     → SetPowerDynamic + SetToughnessDynamic using copied source values
 ///   - `<subject pronoun> has this ability`
-///     → RetainPrintedTriggerFromSource (when ctx provides the index)
+///     → RetainPrintedTriggerFromSource or RetainPrintedAbilityFromSource
+///     (when ctx provides the trigger or activated-ability index)
 ///   - `it's a(n) {core_type} in addition to its other types`  → AddType
 ///   - `it's a(n) {subtype} in addition to its other types`    → AddSubtype
 ///   - `it has "<triggered/activated/static ability>"`         → GrantTrigger/GrantAbility/etc.
@@ -182,6 +185,12 @@ pub(crate) fn parse_except_body<'a>(
     if let Some((rest, modification)) = parse_enters_with_additional_counter(input) {
         return Some((rest, vec![modification]));
     }
+    // CR 707.9d: the replacement form ("… and loses all other card types")
+    // must be tried before the additive form, which would otherwise leave the
+    // "and loses all other card types" tail unconsumed.
+    if let Some((rest, modification)) = parse_its_a_type_loses_others(input) {
+        return Some((rest, vec![modification]));
+    }
     if let Some((rest, subtype)) = parse_its_a_type_in_addition(input) {
         return Some((rest, vec![subtype]));
     }
@@ -191,7 +200,28 @@ pub(crate) fn parse_except_body<'a>(
     if let Some((rest, keywords)) = parse_it_has_keywords(input) {
         return Some((rest, keywords));
     }
+    if let Some((rest, keywords)) = parse_has_keywords(input) {
+        return Some((rest, keywords));
+    }
     None
+}
+
+/// CR 707.9a: "except … and has defender" — keyword grant without the "it has "
+/// subject (Wall of Stolen Identity). Distinct from [`parse_it_has_keywords`],
+/// which requires the explicit "it has " anaphor.
+fn parse_has_keywords(input: &str) -> Option<(&str, Vec<ContinuousModification>)> {
+    let (rest, _) = tag::<_, _, OracleError<'_>>("has ").parse(input).ok()?;
+    let (kw_text, remainder) = split_at_body_boundary(rest);
+    let mut modifications = Vec::new();
+    for part in split_keyword_list(kw_text) {
+        if let Some(keyword) = parse_keyword_from_oracle(part.trim()) {
+            modifications.push(ContinuousModification::AddKeyword { keyword });
+        }
+    }
+    if modifications.is_empty() {
+        return None;
+    }
+    Some((remainder, modifications))
 }
 
 /// CR 707.9b + CR 707.2: "his/her/its name is ~" — emit a `SetName` override
@@ -505,23 +535,23 @@ fn append_color_and_type_modifications(
     mods.extend(type_mods);
 }
 
-/// CR 707.9a: "<subject pronoun> has this ability" — emit a
-/// [`ContinuousModification::RetainPrintedTriggerFromSource`] keyed to the
-/// printed trigger that contains the `BecomeCopy` effect.
+/// CR 707.9a: "<subject pronoun> has this ability" — emit a retain modification
+/// keyed to the printed ability that contains the `BecomeCopy` effect.
 ///
 /// "this ability" inside a triggered ability's body refers to that very
-/// trigger (CR 603.1). For the copy to retain it, the runtime must reach back
-/// into the *source* object's printed triggers (by index) at Layer 1 and push
-/// a clone onto the copied object's triggers — `GrantTrigger` would require a
-/// pre-built `TriggerDefinition`, which we cannot construct mid-parse without
-/// a forward reference to the partial trigger.
+/// trigger (CR 603.1); inside an activated ability it refers to that activated
+/// ability (CR 602.1). For the copy to retain it, the runtime must reach back
+/// into the *source* object's printed triggers or abilities (by index) at
+/// Layer 1 and push a clone onto the copied object — `GrantTrigger` /
+/// `GrantAbility` would require a pre-built definition, which we cannot
+/// construct mid-parse without a forward reference to the partial ability.
 ///
-/// When `ctx.current_trigger_index` is `None` (e.g. parsing inside a
-/// replacement effect or a non-trigger spell body), the arm declines so the
+/// When neither `ctx.current_trigger_index` nor `ctx.current_ability_index`
+/// is set (e.g. parsing inside a replacement effect), the arm declines so the
 /// surrounding except clause continues parsing.
 ///
 /// Subject pronouns accepted: `he`, `she`, `it` (and `they` for plural). All
-/// are treated identically — this clause is a self-reference to the trigger
+/// are treated identically — this clause is a self-reference to the ability
 /// containing it.
 fn parse_has_this_ability<'a>(
     input: &'a str,
@@ -535,11 +565,19 @@ fn parse_has_this_ability<'a>(
     ))
     .parse(input)
     .ok()?;
-    let source_trigger_index = ctx.current_trigger_index?;
+    if let Some(source_trigger_index) = ctx.current_trigger_index {
+        return Some((
+            rest,
+            ContinuousModification::RetainPrintedTriggerFromSource {
+                source_trigger_index,
+            },
+        ));
+    }
+    let source_ability_index = ctx.current_ability_index?;
     Some((
         rest,
-        ContinuousModification::RetainPrintedTriggerFromSource {
-            source_trigger_index,
+        ContinuousModification::RetainPrintedAbilityFromSource {
+            source_ability_index,
         },
     ))
 }
@@ -571,6 +609,45 @@ fn parse_its_a_type_in_addition(input: &str) -> Option<(&str, ContinuousModifica
         ContinuousModification::AddSubtype { subtype: canonical }
     };
     Some((rest, modification))
+}
+
+/// CR 205.1a + CR 613.1d + CR 707.9d: "it's a(n) {type} and loses all other
+/// card types" — REPLACES the copied card's entire core card-type set with the
+/// single named type (set-replacement, not addition). Myrkul, Lord of Bones:
+/// "create a token that's a copy of that card, except it's an enchantment and
+/// loses all other card types." Distinct from `parse_its_a_type_in_addition`
+/// (which ADDS the type, keeping the copied types); the "and loses all other
+/// card types" suffix is the replacement signal. `SetCardTypes` names only the
+/// replacement core types; supertype retention and CR 205.1a subtype
+/// correlation are applied downstream when the modification resolves. Emits
+/// [`ContinuousModification::SetCardTypes`].
+fn parse_its_a_type_loses_others(input: &str) -> Option<(&str, ContinuousModification)> {
+    let (rest, _) = alt((
+        tag::<_, _, OracleError<'_>>("it's an "),
+        tag("it's a "),
+        tag("it\u{2019}s an "),
+        tag("it\u{2019}s a "),
+    ))
+    .parse(input)
+    .ok()?;
+    let (type_word, rest) = nom_primitives::split_once_on(rest, " and loses all other card types")
+        .ok()
+        .map(|(_, pair)| pair)?;
+    let type_word = type_word.trim();
+    if type_word.is_empty() {
+        return None;
+    }
+    // Only a recognised core type can replace the card-type set; a subtype
+    // ("loses all other card types" is a card-type statement, CR 205.1b) would
+    // be a malformed clause, so decline rather than guess.
+    let canonical = canonicalize_subtype_name(type_word);
+    let core_type = CoreType::from_str(&canonical).ok()?;
+    Some((
+        rest,
+        ContinuousModification::SetCardTypes {
+            core_types: vec![core_type],
+        },
+    ))
 }
 
 /// "it has {keyword[, keyword, ...]}" — each keyword becomes `AddKeyword`.
@@ -1156,6 +1233,38 @@ mod tests {
     }
 
     #[test]
+    fn it_has_this_ability_with_ability_index_emits_retain_ability() {
+        let ctx = ParseContext {
+            current_ability_index: Some(1),
+            ..Default::default()
+        };
+        let (_, mods) =
+            parse_except_clause(", except it has this ability", "Thespian's Stage", &ctx).unwrap();
+        assert_eq!(
+            mods,
+            vec![ContinuousModification::RetainPrintedAbilityFromSource {
+                source_ability_index: 1,
+            }]
+        );
+    }
+
+    #[test]
+    fn trigger_index_takes_precedence_over_ability_index() {
+        let ctx = ParseContext {
+            current_trigger_index: Some(0),
+            current_ability_index: Some(1),
+            ..Default::default()
+        };
+        let (_, mods) = parse_except_clause(", except it has this ability", "Card", &ctx).unwrap();
+        assert_eq!(
+            mods,
+            vec![ContinuousModification::RetainPrintedTriggerFromSource {
+                source_trigger_index: 0,
+            }]
+        );
+    }
+
+    #[test]
     fn name_and_has_this_ability_compose() {
         let ctx = ParseContext {
             current_trigger_index: Some(0),
@@ -1221,6 +1330,44 @@ mod tests {
             m,
             ContinuousModification::AddSubtype { subtype } if subtype == "Spider"
         )));
+    }
+
+    /// CR 205.1a + CR 613.1d + CR 707.9d: Myrkul, Lord of Bones — "it's an
+    /// enchantment and loses all other card types" REPLACES the copied core
+    /// card-type set (set-replacement), distinct from the additive "in addition
+    /// to its other types" form. Emits `SetCardTypes`, not `AddType`.
+    #[test]
+    fn its_an_enchantment_loses_others_emits_set_card_types() {
+        let (_, mods) = parse_except_clause(
+            ", except it's an enchantment and loses all other card types",
+            "Card",
+            &ParseContext::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            mods,
+            vec![ContinuousModification::SetCardTypes {
+                core_types: vec![CoreType::Enchantment],
+            }]
+        );
+    }
+
+    /// The additive "in addition to its other types" form must still emit
+    /// `AddType` — the new replacement arm must not steal it.
+    #[test]
+    fn its_an_artifact_in_addition_still_emits_add_type() {
+        let (_, mods) = parse_except_clause(
+            ", except it's an artifact in addition to its other types",
+            "Card",
+            &ParseContext::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            mods,
+            vec![ContinuousModification::AddType {
+                core_type: CoreType::Artifact,
+            }]
+        );
     }
 
     #[test]
@@ -1596,6 +1743,34 @@ mod tests {
             vec![ContinuousModification::AddSupertype {
                 supertype: Supertype::Legendary,
             }]
+        );
+    }
+
+    /// CR 707.9a: Wall of Stolen Identity — "and has defender" without "it has ".
+    #[test]
+    fn except_and_has_defender_shorthand() {
+        let (_, mods) = parse_except_clause(
+            ", except it's a Wall in addition to its other types and has defender. \
+             When you do, tap the copied creature.",
+            "Wall of Stolen Identity",
+            &ParseContext::default(),
+        )
+        .unwrap();
+        use crate::types::keywords::Keyword;
+        assert!(
+            mods.iter().any(
+                |m| matches!(m, ContinuousModification::AddSubtype { subtype } if subtype == "Wall")
+            ),
+            "expected AddSubtype Wall, got {mods:?}"
+        );
+        assert!(
+            mods.iter().any(|m| matches!(
+                m,
+                ContinuousModification::AddKeyword {
+                    keyword: Keyword::Defender
+                }
+            )),
+            "expected AddKeyword Defender, got {mods:?}"
         );
     }
 

@@ -59,7 +59,7 @@ fn optional_cost_paid_sets_flag() {
         })
         .with_additional_cost(AdditionalCost::Optional {
             cost: AbilityCost::Blight { count: 1 },
-            repeatable: false,
+            repeatability: engine::types::ability::AdditionalCostRepeatability::Once,
         })
         .id();
 
@@ -71,6 +71,8 @@ fn optional_cost_paid_sets_flag() {
             object_id: spell_id,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("cast should succeed");
 
@@ -149,7 +151,7 @@ fn optional_cost_skipped_clears_flag() {
         })
         .with_additional_cost(AdditionalCost::Optional {
             cost: AbilityCost::Blight { count: 1 },
-            repeatable: false,
+            repeatability: engine::types::ability::AdditionalCostRepeatability::Once,
         })
         .id();
 
@@ -161,6 +163,8 @@ fn optional_cost_skipped_clears_flag() {
             object_id: spell_id,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("cast should succeed");
 
@@ -221,7 +225,7 @@ fn bargain_additional_cost_paid_reduces_self_spell_cost() {
                 cost: AbilityCost::PayLife {
                     amount: QuantityExpr::Fixed { value: 1 },
                 },
-                repeatable: false,
+                repeatability: engine::types::ability::AdditionalCostRepeatability::Once,
             })
             .with_static_definition(reduce_static)
             .id();
@@ -245,6 +249,8 @@ fn bargain_additional_cost_paid_reduces_self_spell_cost() {
                 object_id: spell_id,
                 card_id,
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             })
             .expect("cast should succeed at base cost");
         assert!(
@@ -274,6 +280,8 @@ fn bargain_additional_cost_paid_reduces_self_spell_cost() {
                 object_id: spell_id,
                 card_id,
                 targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
             })
             .expect("cast should succeed at base cost");
         runner
@@ -304,6 +312,8 @@ fn no_additional_cost_skips_choice() {
             object_id: spell_id,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("cast should succeed");
 
@@ -334,7 +344,7 @@ fn cancel_cast_at_optional_cost_choice() {
         })
         .with_additional_cost(AdditionalCost::Optional {
             cost: AbilityCost::Blight { count: 1 },
-            repeatable: false,
+            repeatability: engine::types::ability::AdditionalCostRepeatability::Once,
         })
         .id();
 
@@ -346,6 +356,8 @@ fn cancel_cast_at_optional_cost_choice() {
             object_id: spell_id,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("cast should succeed");
 
@@ -467,6 +479,8 @@ fn escape_full_casting_flow() {
             object_id: escape_id,
             card_id: escape_card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("CastSpell should succeed");
 
@@ -597,6 +611,8 @@ fn escape_variant_preserved_through_mana_payment() {
             object_id: escape_id,
             card_id: escape_card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("CastSpell should succeed");
 
@@ -679,6 +695,8 @@ fn escape_cancel_returns_to_priority() {
             object_id: escape_id,
             card_id: escape_card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("CastSpell should succeed");
 
@@ -786,6 +804,8 @@ fn pitch_full_casting_flow() {
             object_id: spell_id,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("CastSpell should succeed");
 
@@ -872,6 +892,8 @@ fn pitch_cancel_returns_to_priority() {
             object_id: spell_id,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("CastSpell should succeed");
 
@@ -968,6 +990,8 @@ fn raise_cost_from_exile_does_not_tax_hand_cast() {
         object_id: spell_id,
         card_id,
         targets: vec![],
+
+        payment_mode: CastPaymentMode::Auto,
     });
 
     assert!(
@@ -979,9 +1003,9 @@ fn raise_cost_from_exile_does_not_tax_hand_cast() {
 
 // --- Graveyard land play permission tests ---
 
-use engine::types::ability::{CardPlayMode, StaticDefinition, TypeFilter};
+use engine::types::ability::{CardPlayMode, StaticDefinition, TypeFilter, TypedFilter};
 use engine::types::card_type::CoreType;
-use engine::types::statics::{CastFrequency, StaticMode};
+use engine::types::statics::{CastFreeOrigin, CastFrequency, StaticMode};
 
 /// CR 604.2 + CR 305.1: A permanent with GraveyardCastPermission { play_mode: Play }
 /// allows playing lands from the graveyard.
@@ -1266,7 +1290,7 @@ fn optional_blight_with_no_creatures_skips_prompt() {
         })
         .with_additional_cost(AdditionalCost::Optional {
             cost: AbilityCost::Blight { count: 1 },
-            repeatable: false,
+            repeatability: engine::types::ability::AdditionalCostRepeatability::Once,
         })
         .id();
 
@@ -1278,6 +1302,8 @@ fn optional_blight_with_no_creatures_skips_prompt() {
             object_id: spell_id,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("cast should succeed");
 
@@ -1327,6 +1353,8 @@ fn required_blight_with_no_creatures_rejects_cast() {
         object_id: spell_id,
         card_id,
         targets: vec![],
+
+        payment_mode: CastPaymentMode::Auto,
     });
 
     // CastSpell may enter TargetSelection first. The gate fires once the
@@ -1383,6 +1411,8 @@ fn choice_cost_falls_through_when_preferred_unpayable() {
             object_id: spell_id,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("cast should succeed");
 
@@ -1422,10 +1452,9 @@ fn zaffai_once_per_turn_hand_free_casts_with_no_mana() {
         .with_static_definition(
             StaticDefinition::new(StaticMode::CastFromHandFree {
                 frequency: CastFrequency::OncePerTurn,
+                origin: CastFreeOrigin::Hand,
             })
-            .affected(TargetFilter::Typed(
-                engine::types::ability::TypedFilter::new(TypeFilter::Instant),
-            )),
+            .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant))),
         )
         .id();
     let bolt_id = scenario.add_bolt_to_hand(P0);
@@ -1456,6 +1485,8 @@ fn zaffai_once_per_turn_hand_free_casts_with_no_mana() {
             object_id: bolt_id,
             card_id,
             source_id,
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("CastSpellForFree should succeed");
 
@@ -1515,10 +1546,9 @@ fn zaffai_second_cast_is_suppressed_same_turn() {
         .with_static_definition(
             StaticDefinition::new(StaticMode::CastFromHandFree {
                 frequency: CastFrequency::OncePerTurn,
+                origin: CastFreeOrigin::Hand,
             })
-            .affected(TargetFilter::Typed(
-                engine::types::ability::TypedFilter::new(TypeFilter::Instant),
-            )),
+            .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant))),
         )
         .id();
     let _bolt_id = scenario.add_bolt_to_hand(P0);
@@ -1537,6 +1567,257 @@ fn zaffai_second_cast_is_suppressed_same_turn() {
     assert!(
         !found,
         "consumed once-per-turn slot must suppress further CastSpellForFree candidates"
+    );
+}
+
+/// CR 601.2b + CR 118.9a: When multiple once-per-turn sources admit the same
+/// hand spell, the selected `CastSpellForFree` action must validate that named
+/// source directly rather than re-deriving the first matching source.
+#[test]
+fn cast_spell_for_free_uses_the_named_permission_source() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let first_source = scenario
+        .add_creature(P0, "First Zaffai Stand-In", 0, 0)
+        .with_static_definition(
+            StaticDefinition::new(StaticMode::CastFromHandFree {
+                frequency: CastFrequency::OncePerTurn,
+                origin: CastFreeOrigin::Hand,
+            })
+            .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant))),
+        )
+        .id();
+    let second_source = scenario
+        .add_creature(P0, "Second Zaffai Stand-In", 0, 0)
+        .with_static_definition(
+            StaticDefinition::new(StaticMode::CastFromHandFree {
+                frequency: CastFrequency::OncePerTurn,
+                origin: CastFreeOrigin::Hand,
+            })
+            .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant))),
+        )
+        .id();
+    let bolt_id = scenario.add_bolt_to_hand(P0);
+
+    let mut runner = scenario.build();
+    let card_id = runner.state().objects[&bolt_id].card_id;
+    let actions = engine::ai_support::legal_actions(runner.state());
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            GameAction::CastSpellForFree {
+                object_id,
+                source_id,
+                ..
+            } if *object_id == bolt_id && *source_id == first_source
+        )),
+        "first source should be advertised"
+    );
+    assert!(
+        actions.iter().any(|a| matches!(
+            a,
+            GameAction::CastSpellForFree {
+                object_id,
+                source_id,
+                ..
+            } if *object_id == bolt_id && *source_id == second_source
+        )),
+        "second source should be advertised"
+    );
+
+    let result = runner
+        .act(GameAction::CastSpellForFree {
+            object_id: bolt_id,
+            card_id,
+            source_id: second_source,
+
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("selected second source should authorize the free cast");
+    handle_target_selection(&mut runner, &result);
+
+    assert!(
+        runner
+            .state()
+            .hand_cast_free_permissions_used
+            .contains(&second_source),
+        "selected source should be the consumed source"
+    );
+    assert!(
+        !runner
+            .state()
+            .hand_cast_free_permissions_used
+            .contains(&first_source),
+        "earlier matching source must not be consumed"
+    );
+}
+
+fn add_expensive_dragon_commander(scenario: &mut GameScenario) -> ObjectId {
+    let commander_id = scenario
+        .add_creature_to_hand(P0, "Niv-Mizzet, Dragon Commander", 5, 5)
+        .with_subtypes(vec!["Dragon"])
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![
+                ManaCostShard::Blue,
+                ManaCostShard::Blue,
+                ManaCostShard::Red,
+                ManaCostShard::Red,
+            ],
+            generic: 2,
+        })
+        .id();
+    scenario.with_commander(commander_id);
+    commander_id
+}
+
+/// CR 114.4 + CR 601.2b + CR 118.9a (issue #1355): Tamiyo, Field Researcher's
+/// emblem functions from the command zone and waives mana for hand spells.
+#[test]
+fn tamiyo_emblem_allows_free_cast_from_hand() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let source_id = scenario
+        .add_creature(P0, "Tamiyo, Field Researcher", 0, 0)
+        .id();
+    let bolt_id = scenario.add_bolt_to_hand(P0);
+
+    let mut runner = scenario.build();
+    let emblem_static = engine::parser::oracle_static::parse_static_line(
+        "You may cast spells from your hand without paying their mana costs.",
+    )
+    .expect("Tamiyo emblem static should parse");
+    let ability = engine::types::ability::ResolvedAbility::new(
+        Effect::CreateEmblem {
+            statics: vec![emblem_static],
+            triggers: Vec::new(),
+        },
+        vec![],
+        source_id,
+        P0,
+    );
+    let mut events = Vec::<GameEvent>::new();
+    engine::game::effects::create_emblem::resolve(runner.state_mut(), &ability, &mut events)
+        .expect("Tamiyo emblem should be created");
+    let emblem_id = *runner
+        .state()
+        .command_zone
+        .last()
+        .expect("CreateEmblem should put an emblem in the command zone");
+    assert!(runner.state().objects[&emblem_id].is_emblem);
+
+    let card_id = runner.state().objects[&bolt_id].card_id;
+    let mana_before = runner.state().players[0].mana_pool.clone();
+
+    let result = runner
+        .act(GameAction::CastSpell {
+            object_id: bolt_id,
+            card_id,
+            targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("Tamiyo emblem should allow casting a hand spell");
+    handle_target_selection(&mut runner, &result);
+
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "bolt should be on the stack after a free cast"
+    );
+    assert_eq!(
+        runner.state().players[0].mana_pool,
+        mana_before,
+        "no mana should have been paid under Tamiyo emblem"
+    );
+}
+
+/// CR 601.2a + CR 118.9a + CR 903.8: A hand-qualified free-cast static
+/// (Omniscience class) does not replace the mana cost for a commander cast from
+/// the command zone.
+#[test]
+fn hand_only_free_cast_source_does_not_apply_to_command_zone_commander() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario
+        .add_creature(P0, "Omniscience Stand-In", 0, 0)
+        .with_static_definition(
+            StaticDefinition::new(StaticMode::CastFromHandFree {
+                frequency: CastFrequency::Unlimited,
+                origin: CastFreeOrigin::Hand,
+            })
+            .affected(TargetFilter::Any),
+        );
+    let commander_id = add_expensive_dragon_commander(&mut scenario);
+
+    let mut runner = scenario.build();
+    runner.state_mut().format_config.command_zone = true;
+    let card_id = runner.state().objects[&commander_id].card_id;
+
+    assert!(
+        runner
+            .act(GameAction::CastSpell {
+                object_id: commander_id,
+                card_id,
+                targets: vec![],
+
+                payment_mode: CastPaymentMode::Auto,
+            })
+            .is_err(),
+        "hand-only free-cast source must not waive a command-zone commander's mana cost"
+    );
+}
+
+/// CR 601.2a + CR 118.9a + CR 903.8: An unqualified free-cast static
+/// (Dracogenesis class) applies to a Dragon commander that is already castable
+/// from the command zone. A hand-only source that appears earlier on the
+/// battlefield must not mask the later command-zone-capable source.
+#[test]
+fn unqualified_free_cast_source_applies_to_dragon_commander_after_hand_only_source() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    scenario
+        .add_creature(P0, "Omniscience Stand-In", 0, 0)
+        .with_static_definition(
+            StaticDefinition::new(StaticMode::CastFromHandFree {
+                frequency: CastFrequency::Unlimited,
+                origin: CastFreeOrigin::Hand,
+            })
+            .affected(TargetFilter::Any),
+        );
+    scenario
+        .add_creature(P0, "Dracogenesis Stand-In", 0, 0)
+        .with_static_definition(
+            StaticDefinition::new(StaticMode::CastFromHandFree {
+                frequency: CastFrequency::Unlimited,
+                origin: CastFreeOrigin::DefaultCastPermission,
+            })
+            .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Subtype(
+                "Dragon".to_string(),
+            )))),
+        );
+
+    let commander_id = add_expensive_dragon_commander(&mut scenario);
+
+    let mut runner = scenario.build();
+    runner.state_mut().format_config.command_zone = true;
+    let card_id = runner.state().objects[&commander_id].card_id;
+
+    runner
+        .act(GameAction::CastSpell {
+            object_id: commander_id,
+            card_id,
+            targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("Dragon commander should cast without mana through Dracogenesis-class source");
+
+    assert_eq!(
+        runner.state().stack.len(),
+        1,
+        "Dragon commander should be on the stack after the free cast"
     );
 }
 
@@ -1724,6 +2005,8 @@ fn miracle_accept_casts_for_miracle_cost() {
         .act(GameAction::CastSpellAsMiracle {
             object_id: miracle_obj,
             card_id,
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("Reveal should succeed");
 
@@ -1767,6 +2050,8 @@ fn miracle_accept_casts_for_miracle_cost() {
         .act(GameAction::CastSpellAsMiracle {
             object_id: miracle_obj,
             card_id,
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("Miracle cast should succeed");
 
@@ -1848,6 +2133,8 @@ fn miracle_sorcery_casts_during_draw_step() {
         .act(GameAction::CastSpellAsMiracle {
             object_id: miracle_obj,
             card_id,
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("Reveal should succeed during draw step");
 
@@ -1871,6 +2158,8 @@ fn miracle_sorcery_casts_during_draw_step() {
         .act(GameAction::CastSpellAsMiracle {
             object_id: miracle_obj,
             card_id,
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("Sorcery miracle cast should succeed during draw step (CR 608.2g)");
 
@@ -1959,6 +2248,8 @@ fn rooftop_storm_grants_alternative_zero_cost_to_zombie_spells() {
             object_id: zombie_id,
             card_id: zombie_card,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("casting a Zombie should succeed");
     handle_target_selection(&mut runner, &result);
@@ -2014,6 +2305,8 @@ fn rooftop_storm_grants_alternative_zero_cost_to_zombie_spells() {
         object_id: elf_id,
         card_id: elf_card,
         targets: vec![],
+
+        payment_mode: CastPaymentMode::Auto,
     });
     // The Elf has a {2} cost and no mana available, so the cast may fail at
     // payment — but it must NEVER enter the OptionalCostChoice grant prompt.

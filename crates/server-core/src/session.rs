@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use engine::ai_support::{auto_pass_recommended, legal_actions_full as engine_legal_actions_full};
@@ -18,6 +19,7 @@ use engine::types::mana::ManaCost;
 use engine::types::match_config::MatchConfig;
 use engine::types::player::PlayerId;
 use phase_ai::config::{AiConfig, AiDifficulty, Platform};
+use phase_ai::session::AiSession;
 use rand::{Rng, SeedableRng};
 use seat_reducer::types::{DeckChoice, SeatDelta, SeatKind, SeatState};
 use tracing::{debug, info, warn};
@@ -102,6 +104,9 @@ pub struct GameSession {
     pub ai_seats: HashSet<PlayerId>,
     /// Per-AI-player configuration (difficulty, search params, etc.).
     pub ai_configs: HashMap<PlayerId, AiConfig>,
+    /// Runtime-only per-game AI cache. Rebuilt from `state.deck_pools` on
+    /// start/restore, not persisted.
+    pub ai_session: Option<Arc<AiSession>>,
     /// Lobby metadata for games waiting for players. Set at creation, cleared when game fills.
     /// Stored here so it's available during shutdown flush without querying the LobbyManager.
     pub lobby_meta: Option<PersistedLobbyMeta>,
@@ -116,10 +121,10 @@ pub struct GameSession {
     /// Ranked rooms apply rating updates when a match completes.
     pub ranked: bool,
     /// Engine events produced by `start_game` (the d20 first-player contest's
-    /// `DieRolled` batch). Captured here so the INITIAL post-start broadcast can
-    /// surface them to clients; cleared after that broadcast so late joiners and
-    /// reconnects do not re-receive the contest dice. Empty when the game has
-    /// not started or the events have already been broadcast.
+    /// `StartingPlayerContest` event). Captured here so the INITIAL post-start
+    /// broadcast can surface them to clients; cleared after that broadcast so
+    /// late joiners and reconnects do not re-receive the contest. Empty when the
+    /// game has not started or the events have already been broadcast.
     pub start_events: Vec<GameEvent>,
 }
 
@@ -375,6 +380,7 @@ impl GameSession {
                 sideboard: deck.sideboard.clone(),
                 commander: deck.commander.clone(),
                 attraction_deck: deck.attraction_deck.clone(),
+                signature_spell: deck.signature_spell.clone(),
                 bracket_tier: deck.bracket_tier,
             };
             // The resolver (`ServerDeckResolver::resolve` in phase-server)
@@ -471,6 +477,7 @@ impl GameSession {
         let result = start_game(&mut self.state);
         self.start_events = result.events;
         self.game_started = true;
+        self.ai_session = Some(AiSession::arc_from_game(&self.state));
         self.lobby_meta = None;
         Ok(())
     }
@@ -485,8 +492,17 @@ impl GameSession {
             return vec![];
         }
 
-        let ai_results =
-            phase_ai::auto_play::run_ai_actions(&mut self.state, &self.ai_seats, &self.ai_configs);
+        let mut rng = rand::rng();
+        let ai_session = self
+            .ai_session
+            .get_or_insert_with(|| AiSession::arc_from_game(&self.state));
+        let ai_results = phase_ai::auto_play::run_ai_actions(
+            &mut self.state,
+            &self.ai_seats,
+            &self.ai_configs,
+            &mut rng,
+            ai_session,
+        );
 
         if !ai_results.is_empty() {
             debug!(game = %self.game_code, ai_actions = ai_results.len(), "AI actions computed");
@@ -573,6 +589,11 @@ impl GameSession {
             .collect();
 
         let pc = ps.player_count as usize;
+        let ai_session = if ps.game_started {
+            Some(AiSession::arc_from_game(&state))
+        } else {
+            None
+        };
 
         GameSession {
             game_code: ps.game_code,
@@ -586,6 +607,7 @@ impl GameSession {
             player_count: ps.player_count,
             ai_seats,
             ai_configs,
+            ai_session,
             lobby_meta: ps.lobby_meta,
             game_started: ps.game_started,
             start_when_full: ps.start_when_full,
@@ -694,6 +716,7 @@ impl SessionManager {
             player_count,
             ai_seats: HashSet::new(),
             ai_configs: HashMap::new(),
+            ai_session: None,
             lobby_meta: None,
             game_started: false,
             start_when_full: true,
@@ -1087,7 +1110,16 @@ impl SessionManager {
                 && session
                     .state
                     .waiting_for
-                    .accepts_freeform_combat_damage_assignment());
+                    .accepts_freeform_combat_damage_assignment())
+            // CR 510.1d + CR 702.22k: a banded blocker's free damage division
+            // has too many legal splits to enumerate as candidates, so the
+            // server bypasses its legality gate and the engine handler
+            // (handle_assign_blocker_damage) validates the submission.
+            || (matches!(action, GameAction::AssignBlockerDamage { .. })
+                && session
+                    .state
+                    .waiting_for
+                    .accepts_freeform_blocker_damage_assignment());
         if !skip_legality {
             let (legal_actions, _, _) = engine_legal_actions_full(&session.state);
             if !legal_actions.contains(&action) {
@@ -1304,6 +1336,7 @@ mod tests {
                     parse_warnings: vec![],
                     brawl_commander: false,
                     is_commander: false,
+                    is_oathbreaker: false,
                     deck_copy_limit: None,
                     metadata: Default::default(),
                     rarities: Default::default(),
@@ -1954,6 +1987,7 @@ mod tests {
             player_count: pc as u8,
             ai_seats: [ai_pid].into_iter().collect(),
             ai_configs: [(ai_pid, cedh_config)].into_iter().collect(),
+            ai_session: None,
             lobby_meta: None,
             game_started: false,
             start_when_full: true,
@@ -2098,6 +2132,7 @@ mod tests {
             kept_destination: Some(Zone::Library),
             rest_destination: Some(Zone::Library),
             source_id: None,
+            enter_tapped: false,
         };
 
         // Non-canonical permutation [c, a, b] — not an enumerated candidate.

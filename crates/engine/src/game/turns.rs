@@ -1,11 +1,13 @@
 use std::collections::HashSet;
 
 use crate::game::replacement::{self, ReplacementResult};
-use crate::types::ability::{ReplacementDefinition, RestrictionExpiry};
+use crate::types::ability::{EffectKind, ReplacementDefinition, RestrictionExpiry};
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
 use crate::types::format::GameFormat;
-use crate::types::game_state::{AutoPassMode, GameState, WaitingFor};
+use crate::types::game_state::{
+    AutoPassMode, GameState, PendingCounterAddition, PendingEffectResolved, WaitingFor,
+};
 use crate::types::identifiers::ObjectId;
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
@@ -39,7 +41,7 @@ pub fn next_phase(phase: Phase) -> Phase {
     PHASE_ORDER[(idx + 1) % PHASE_ORDER.len()]
 }
 
-/// CR 500.4: Advance to the next phase/step, clearing mana pools.
+/// CR 500.5: Advance to the next phase/step, clearing mana pools.
 pub fn advance_phase(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // CR 500.8: Extra phases are inserted *directly after* their anchor phase
     // (e.g., Aurelia's "after this phase" extra combat is inserted after the
@@ -93,6 +95,34 @@ pub fn end_turn_to_cleanup(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // cleanup step" — drop scheduled extra phases for this (now-ending) turn.
     state.extra_phases.clear();
     enter_phase(state, Phase::Cleanup, events);
+}
+
+/// CR 724.2d: End the current combat phase by removing everything from combat,
+/// expiring "until end of combat" effects, and skipping straight to the
+/// postcombat main phase. Mirrors the end-of-combat teardown the `EndCombat`
+/// step performs (see the `Phase::EndCombat` arm of `advance_phase`), but skips
+/// the intervening end-of-combat step so its "at end of combat" triggers do not
+/// fire (CR 724.2e). Drives `Effect::EndCombatPhase` (Mandate of Peace).
+pub fn end_combat_phase_to_postcombat(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    // CR 724.2d / CR 511.3: Remove all creatures and planeswalkers from combat.
+    state.combat = None;
+    // CR 724.2d: Effects that last "until end of combat" expire — continuous
+    // effects, replacement definitions, and pending damage replacements alike,
+    // matching the normal end-of-combat prune.
+    super::layers::prune_end_of_combat_effects(state);
+    for obj in state.objects.iter_mut().map(|(_, v)| v) {
+        obj.replacement_definitions
+            .retain(|r| !matches!(r.expiry, Some(RestrictionExpiry::EndOfCombat)));
+    }
+    state
+        .pending_damage_replacements
+        .retain(|r| !matches!(r.expiry, Some(RestrictionExpiry::EndOfCombat)));
+
+    // CR 724.2d: Skip straight to the postcombat main phase, skipping any
+    // intervening steps (including the end-of-combat step — CR 724.2e). Any
+    // extra combat phases scheduled for this turn are also skipped.
+    state.extra_phases.clear();
+    enter_phase(state, Phase::PostCombatMain, events);
 }
 
 /// Enter a phase directly: set phase, run the CR 703.4q step-end empty
@@ -202,6 +232,12 @@ pub(super) fn drain_pending_phase_transition_progress(
         // decisions. The `enumerate` runs over the full pool so `pool_index`
         // stays aligned with the retained expiry units that remain in
         // `mana_pool.mana`.
+        // Debug-only: CR 500.5 end-of-step empty is suppressed for a player with
+        // the infinite-mana toggle active — every non-expiry unit is dispositioned
+        // `Keep` instead of `Drop` so the pool survives the step transition. This
+        // is the partner of `mana_payment::refill_infinite_mana`; together they
+        // keep a flagged player's pool continuously full.
+        let keep_for_infinite_mana = state.debug_infinite_mana.contains(&player_id);
         let units: Vec<crate::types::mana::UnitDecision> = state
             .players
             .iter()
@@ -215,7 +251,11 @@ pub(super) fn drain_pending_phase_transition_progress(
                     .map(|(idx, u)| crate::types::mana::UnitDecision {
                         pool_index: idx,
                         color: u.color,
-                        disposition: crate::types::mana::UnitDisposition::Drop,
+                        disposition: if keep_for_infinite_mana {
+                            crate::types::mana::UnitDisposition::Keep
+                        } else {
+                            crate::types::mana::UnitDisposition::Drop
+                        },
                     })
                     .collect()
             })
@@ -375,6 +415,9 @@ fn finish_enter_phase(state: &mut GameState, next: Phase, events: &mut Vec<GameE
     state.players_attacked_this_step.clear();
     // CR 400.7: LKI persists within a step but is invalidated on step transition.
     state.lki_cache.clear();
+    // CR 607.2b + CR 603.10e: linked-exile LKI is likewise step-scoped — it only
+    // needs to outlive the resolution of the ability whose source just left.
+    state.linked_exile_lki.clear();
 
     events.push(GameEvent::PhaseChanged { phase: next });
 }
@@ -451,6 +494,13 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // CR 500: Track per-player turn count for "your Nth turn of the game" conditions.
     state.players[state.active_player.0 as usize].turns_taken += 1;
 
+    // CR 311.5 / CR 312.4 / CR 901.6: the planar controller is normally whoever
+    // the active player is. The turn has committed here (past both turn-skip
+    // early-returns above), so `active_player` is final for this invocation —
+    // sync the planar controller (and the active plane's `.controller`) to it.
+    // No-op outside a Planechase game.
+    crate::game::planechase::set_planar_controller(state, state.active_player, events);
+
     if let Some(scheduled) = state
         .scheduled_turn_controls
         .iter()
@@ -474,6 +524,7 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
     state.spells_cast_this_turn = 0;
     state.triggers_fired_this_turn.clear();
     state.trigger_fire_counts_this_turn.clear();
+    state.triggers_fired_this_turn_per_opponent.clear();
     state.activated_abilities_this_turn.clear();
     // CR 602.5b: "Activate only once each turn" crew restriction resets each turn.
     state.crew_activated_this_turn.clear();
@@ -521,6 +572,7 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // a card drawn last turn.
     state.pending_miracle_offers.clear();
     state.spells_cast_this_turn_by_player.clear();
+    state.lands_played_this_turn_by_player.clear();
     state.players_who_searched_library_this_turn.clear();
     state.player_actions_this_turn.clear();
     state.players_attacked_this_step.clear();
@@ -530,6 +582,7 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
     state.creature_attacked_defenders_this_turn.clear();
     state.combat_phases_started_this_turn = 0;
     state.creatures_attacked_this_turn.clear();
+    state.attacker_declarations_this_turn.clear();
     state.creatures_blocked_this_turn.clear();
     state.players_who_created_token_this_turn.clear();
     state.created_tokens_this_turn.clear();
@@ -542,6 +595,15 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
     state.zone_changes_this_turn.clear();
     state.battlefield_entries_this_turn.clear();
     state.damage_dealt_this_turn.clear();
+    // CR 702.173a + CR 514: Clear the Freerunning eligibility ledger at
+    // cleanup. CR 702.173a's "was dealt combat damage this turn" predicate
+    // is turn-scoped, so the ledger must reset on the turn boundary.
+    state
+        .assassin_or_commander_dealt_combat_damage_this_turn
+        .clear();
+    // CR 702.76a + CR 514: Clear the Prowl creature-type ledger at cleanup — its
+    // "was dealt combat damage this turn" predicate is turn-scoped too.
+    state.creature_types_dealt_combat_damage_this_turn.clear();
     // CR 500.8: Clear any leftover extra phases from the previous turn.
     state.extra_phases.clear();
     // CR 700.14: Reset cumulative mana spent on spells for Expend triggers.
@@ -668,27 +730,21 @@ pub fn execute_untap_with_choices(
         })
         .collect();
 
-    // CR 302.6: Also check intrinsic CantUntap statics on objects
-    // (permanent "doesn't untap" from auras/enchantments).
+    // CR 502.3 + CR 604.1: Also check permanent-sourced CantUntap
+    // statics, including attached-subject restrictions from Auras/enchantments.
     let intrinsic_cant_untap: HashSet<ObjectId> = state
         .battlefield
         .iter()
         .copied()
         .filter(|id| {
             state.objects.get(id).is_some_and(|obj| {
-                // CR 702.26b + CR 604.1: `active_static_definitions` owns the gating.
                 obj.controller == active
-                    && super::functioning_abilities::active_static_definitions(state, obj).any(
-                        |sd| {
-                            sd.mode == StaticMode::CantUntap
-                                && super::static_abilities::check_static_ability(
-                                    state,
-                                    StaticMode::CantUntap,
-                                    &super::static_abilities::StaticCheckContext {
-                                        target_id: Some(*id),
-                                        ..Default::default()
-                                    },
-                                )
+                    && super::static_abilities::check_static_ability(
+                        state,
+                        StaticMode::CantUntap,
+                        &super::static_abilities::StaticCheckContext {
+                            target_id: Some(*id),
+                            ..Default::default()
                         },
                     )
             })
@@ -1028,7 +1084,8 @@ pub fn execute_cleanup(state: &mut GameState, events: &mut Vec<GameEvent>) -> Op
             )
     });
 
-    // CR 730.2: Check day/night transition at cleanup.
+    // CR 502.2 / CR 731.2: Check the prior active player's day/night transition
+    // before advancing the active player.
     day_night::check_day_night_transition(state, events);
 
     let active = state.active_player;
@@ -1093,7 +1150,9 @@ pub fn execute_cleanup(state: &mut GameState, events: &mut Vec<GameEvent>) -> Op
     // at cleanup (CR 514).
     for obj in state.objects.iter_mut().map(|(_, v)| v) {
         if obj.is_saddled {
+            // CR 702.171b: the designation (and the saddling-creature record) ends at end of turn.
             obj.is_saddled = false;
+            obj.saddled_by.clear();
         }
     }
 
@@ -1241,16 +1300,28 @@ pub fn should_skip_draw(state: &GameState) -> bool {
         || should_skip_step_static(state, Phase::Draw)
 }
 
-/// CR 614.1b + CR 614.10: Check whether the active player should skip the given step
-/// due to a "skip your [step] step" static ability on a permanent they control.
+/// CR 614.1b + CR 614.10: Check whether the active player should skip the given
+/// step due to a static step-skip replacement that affects them.
 fn should_skip_step_static(state: &GameState, step: Phase) -> bool {
     let active = state.active_player;
+    let context = super::static_abilities::StaticCheckContext {
+        player_id: Some(active),
+        ..Default::default()
+    };
     // CR 702.26b + CR 604.1: `active_static_definitions` owns the gating.
     state.battlefield.iter().any(|id| {
         state.objects.get(id).is_some_and(|obj| {
-            obj.controller == active
-                && super::functioning_abilities::active_static_definitions(state, obj)
-                    .any(|sd| sd.mode == StaticMode::SkipStep { step })
+            super::functioning_abilities::active_static_definitions(state, obj).any(|sd| {
+                if sd.mode != (StaticMode::SkipStep { step }) {
+                    return false;
+                }
+
+                if let Some(ref affected) = sd.affected {
+                    super::static_abilities::static_filter_matches(state, &context, affected, *id)
+                } else {
+                    obj.controller == active
+                }
+            })
         })
     })
 }
@@ -1281,7 +1352,7 @@ fn should_skip_step_now(state: &mut GameState, step: Phase) -> bool {
 
 /// CR 714.3b: As the precombat main phase begins, put a lore counter on each Saga
 /// the active player controls. This is a turn-based action, not a triggered ability.
-fn add_lore_counters_to_sagas(state: &mut GameState, events: &mut Vec<GameEvent>) {
+fn add_lore_counters_to_sagas(state: &mut GameState, events: &mut Vec<GameEvent>) -> bool {
     let active = state.active_player;
     let saga_ids: Vec<_> = state
         .battlefield
@@ -1299,16 +1370,38 @@ fn add_lore_counters_to_sagas(state: &mut GameState, events: &mut Vec<GameEvent>
         .collect();
 
     // CR 614.1: Route through replacement pipeline so Vorinclex-class effects apply.
-    for saga_id in saga_ids {
-        super::effects::counters::add_counter_with_replacement(
+    for (index, saga_id) in saga_ids.iter().copied().enumerate() {
+        if !super::effects::counters::add_counter_with_replacement(
             state,
             active,
             saga_id,
             CounterType::Lore,
             1,
             events,
-        );
+        ) {
+            let remaining = saga_ids[index + 1..]
+                .iter()
+                .copied()
+                .map(|object_id| PendingCounterAddition::Object {
+                    actor: active,
+                    object_id,
+                    counter_type: CounterType::Lore,
+                    count: 1,
+                })
+                .collect();
+            super::effects::counters::stash_pending_counter_additions(
+                state,
+                remaining,
+                PendingEffectResolved::with_post_actions_without_effect(
+                    EffectKind::GenericEffect,
+                    saga_id,
+                    Vec::new(),
+                ),
+            );
+            return false;
+        }
     }
+    true
 }
 
 /// CR 503.1 / CR 504.2 / CR 507.1 / CR 513.1: Process phase triggers for the current step.
@@ -1319,24 +1412,16 @@ fn add_lore_counters_to_sagas(state: &mut GameState, events: &mut Vec<GameEvent>
 ///   target selection, or are awaiting CR 603.3b ordering. The combat arms
 ///   (BeginCombat / EndCombat) use this to decide whether to set up / tear down
 ///   combat and grant a priority window.
-/// * `ordering_prompt` is `Some(WaitingFor::OrderTriggers { .. })` when 2+
-///   simultaneous triggers controlled by the same player fired and that player
-///   must order them (CR 603.3b) before anyone receives priority. The caller
-///   MUST surface this prompt instead of granting priority — `process_triggers`
-///   populated `state.pending_trigger_order` and set `state.waiting_for` to the
-///   prompt, but the phase arm's return value is what `apply` writes back to
-///   `state.waiting_for`. Returning `Priority` here would overwrite the prompt
-///   and strand the queued triggers in `pending_trigger_order` forever (they
-///   never reach the stack). Single-trigger steps take the `NoChoiceNeeded`
-///   path with no prompt and fall through to the normal priority grant. The
-///   prompt is rebuilt from the AUTHORITATIVE `pending_trigger_order` state via
-///   `build_next_order_triggers_prompt_public`, not cloned from
-///   `state.waiting_for` — so a stale `waiting_for` left by an upstream
-///   phase-advance can't re-surface and hang, and already-corrupted saves
-///   recover by surfacing the real ordering prompt.
+/// * `ordering_prompt` is `Some(...)` when the phase must pause before priority:
+///   - `WaitingFor::OrderTriggers { .. }` when 2+ simultaneous triggers controlled
+///     by the same player fired and that player must order them (CR 603.3b), or
+///   - an active trigger prompt (`TriggerTargetSelection`, etc.) when
+///     `pending_trigger` / `deferred_triggers` still hold unresolved work (CR
+///     603.3). The caller MUST surface this prompt instead of granting priority.
 fn process_phase_triggers(state: &mut GameState) -> (bool, Option<WaitingFor>) {
     let phase_event = [GameEvent::PhaseChanged { phase: state.phase }];
     let stack_before = state.stack.len();
+    let waiting_before = state.waiting_for.clone();
     super::triggers::process_triggers(state, &phase_event);
     // CR 603.3b: an unresolved ordering pass keeps its triggers in
     // `pending_trigger_order` (not on the stack, not in `pending_trigger`), so it
@@ -1348,11 +1433,33 @@ fn process_phase_triggers(state: &mut GameState) -> (bool, Option<WaitingFor>) {
     // surfacing the real ordering prompt. Note `pending_trigger_order.is_some()` no
     // longer blindly implies `waiting_for == OrderTriggers`, which is exactly why
     // the prior `.then(|| clone)` idiom was unsafe.
-    let ordering_prompt = super::triggers::build_next_order_triggers_prompt_public(state);
+    let order_triggers_prompt = super::triggers::build_next_order_triggers_prompt_public(state);
+    let active_trigger_prompt = (order_triggers_prompt.is_none()
+        && (state.pending_trigger.is_some() || !state.deferred_triggers.is_empty()))
+    .then(|| state.waiting_for.clone());
+    // CR 117.5 + CR 118.12a: Unless-pay and other inline resolution prompts arm
+    // `waiting_for` without `pending_trigger` after the trigger has reached the
+    // stack and begun resolving. Surface any non-priority prompt
+    // `process_triggers` left behind so auto_advance does not clobber it with an
+    // upkeep/draw/main priority window (Tabernacle #1326). The prompt must be
+    // newly produced by trigger processing; stale turn-action prompts from an
+    // earlier phase (DeclareAttackers, etc.) are not phase-trigger work.
+    let inline_resolution_prompt = (order_triggers_prompt.is_none()
+        && active_trigger_prompt.is_none()
+        && state.waiting_for != waiting_before
+        && !matches!(
+            state.waiting_for,
+            WaitingFor::Priority { .. } | WaitingFor::GameOver { .. }
+        ))
+    .then(|| state.waiting_for.clone());
+    let prompt = order_triggers_prompt
+        .or(active_trigger_prompt)
+        .or(inline_resolution_prompt);
     let fired = state.stack.len() > stack_before
         || state.pending_trigger.is_some()
-        || ordering_prompt.is_some();
-    (fired, ordering_prompt)
+        || !state.deferred_triggers.is_empty()
+        || prompt.is_some();
+    (fired, prompt)
 }
 
 pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> WaitingFor {
@@ -1365,6 +1472,7 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
         // trips through `GameAction::ChooseReplacement`; the drain resumes
         // via the `EmptyManaPool` arm of `handle_replacement_choice`.
         if state.pending_phase_transition_progress.is_some() {
+            state.deferred_step_trigger_resume = Some(state.phase);
             return state.waiting_for.clone();
         }
 
@@ -1398,6 +1506,17 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
                 if should_skip_step_now(state, Phase::Upkeep) {
                     advance_phase(state, events);
                     continue;
+                }
+                // CR 704.3: Check SBAs before beginning-of-upkeep triggers so that
+                // city blessing (CR 702.131b) and other SBA-granted designations are
+                // applied before trigger conditions like "if you have the city's blessing"
+                // are evaluated (Twilight Prophet #1375).
+                let waiting_before_sba = state.waiting_for.clone();
+                super::sba::check_state_based_actions(state, events);
+                if state.waiting_for != waiting_before_sba
+                    && !matches!(state.waiting_for, WaitingFor::Priority { .. })
+                {
+                    return state.waiting_for.clone();
                 }
                 // CR 503.1a: "At the beginning of [your] upkeep" triggers fire here.
                 // CR 603.3b: 2+ same-controller upkeep triggers (multiple suspended
@@ -1449,7 +1568,9 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
                 // CR 714.3b: As the precombat main phase begins, add a lore counter
                 // to each Saga the active player controls (turn-based action).
                 if state.phase == Phase::PreCombatMain {
-                    add_lore_counters_to_sagas(state, events);
+                    if !add_lore_counters_to_sagas(state, events) {
+                        return state.waiting_for.clone();
+                    }
                     super::attractions::perform_roll_to_visit_turn_based_action(state, events);
                     // CR 702.xxx: Paradigm (Strixhaven) — turn-based action at
                     // the start of the active player's first precombat main
@@ -1553,6 +1674,12 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
                 }
             }
             Phase::CombatDamage => {
+                // CR 510.1a + CR 613.4c: Combat damage equals a creature's power as determined
+                // by the layer system (layer 7c applies P/T counters). Flush here so
+                // combat_damage_amount reads evaluated power, not stale base power. commit_attackers
+                // (combat.rs) marks layers dirty; the post-action pipeline flush runs after
+                // resolve_combat_damage returns — too late without this pre-flush.
+                super::layers::flush_layers(state);
                 // CR 510.1 / CR 510.2: Combat damage assigned and dealt as a turn-based action.
                 // resolve_combat_damage may pause for interactive assignment (2+ blockers).
                 if let Some(waiting) = combat_damage::resolve_combat_damage(state, events) {
@@ -1656,6 +1783,7 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
 mod tests {
     use super::*;
     use crate::game::zones::create_object;
+    use crate::types::card_type::Supertype;
     use crate::types::identifiers::CardId;
     use crate::types::player::PlayerId;
     use std::sync::Arc;
@@ -1896,7 +2024,7 @@ mod tests {
         state.players[0].mana_pool.add(ManaUnit {
             color: ManaType::Green,
             source_id: ObjectId(1),
-            snow: false,
+            supertype: None,
             source_could_produce_two_or_more_colors: false,
             restrictions: Vec::new(),
             grants: vec![],
@@ -3112,6 +3240,65 @@ mod tests {
             .any(|e| matches!(e, GameEvent::PermanentUntapped { object_id } if *object_id == id)));
     }
 
+    #[test]
+    fn execute_untap_honors_attached_subject_cant_untap_from_parser() {
+        use crate::game::effects::attach::attach_to;
+        use crate::types::card_type::CoreType;
+
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        let host = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Locked Bear".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&host).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.tapped = true;
+        }
+
+        let aura = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Flood the Engine".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let defs = crate::parser::oracle_static::parse_static_line_multi(
+                "Enchanted permanent loses all abilities and doesn't untap during its controller's untap step.",
+            );
+            let obj = state.objects.get_mut(&aura).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.card_types.subtypes.push("Aura".to_string());
+            obj.base_card_types = obj.card_types.clone();
+            for def in defs.iter().cloned() {
+                obj.static_definitions.push(def);
+            }
+            Arc::make_mut(&mut obj.base_static_definitions).extend(defs);
+        }
+        attach_to(&mut state, aura, host);
+
+        let mut events = Vec::new();
+        execute_untap(&mut state, &mut events);
+
+        assert!(
+            state.objects[&host].tapped,
+            "attached CantUntap static must keep the enchanted permanent tapped"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                matches!(event, GameEvent::PermanentUntapped { object_id } if *object_id == host)
+            }),
+            "skipped untap must not emit PermanentUntapped"
+        );
+    }
+
     fn install_may_choose_not_to_untap_static(state: &mut GameState, source_id: ObjectId) {
         use crate::types::ability::StaticDefinition;
         let def = StaticDefinition::new(StaticMode::MayChooseNotToUntap);
@@ -3663,6 +3850,320 @@ mod tests {
     }
 
     #[test]
+    fn auto_advance_returns_upkeep_sba_waiting_state() {
+        let mut state = setup();
+        state.phase = Phase::Untap;
+        state.turn_number = 2;
+        state.active_player = PlayerId(0);
+
+        for card_id in [1, 2] {
+            let legend = create_object(
+                &mut state,
+                CardId(card_id),
+                PlayerId(0),
+                "Mirror Legend".to_string(),
+                Zone::Battlefield,
+            );
+            state
+                .objects
+                .get_mut(&legend)
+                .unwrap()
+                .card_types
+                .supertypes
+                .push(Supertype::Legendary);
+        }
+
+        let mut events = Vec::new();
+        let waiting = auto_advance(&mut state, &mut events);
+
+        assert_eq!(state.phase, Phase::Upkeep);
+        assert!(matches!(
+            waiting,
+            WaitingFor::ChooseLegend {
+                player: PlayerId(0),
+                ..
+            }
+        ));
+    }
+
+    /// Regression for #1375: Twilight Prophet's upkeep trigger requires the city's blessing.
+    /// The city blessing is granted by SBAs (CR 702.131b), so SBAs must run before
+    /// beginning-of-upkeep triggers are collected. This test verifies that when a player
+    /// controls 10 permanents with an Ascend permanent, the city blessing is granted
+    /// before upkeep triggers are evaluated.
+    #[test]
+    fn city_blessing_granted_before_upkeep_triggers() {
+        let mut state = setup();
+        state.phase = Phase::Untap;
+        state.turn_number = 2;
+        state.active_player = PlayerId(0);
+
+        // Player controls 10 permanents including one with Ascend
+        let ascend_permanent = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Ascend Permanent".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&ascend_permanent)
+            .unwrap()
+            .keywords
+            .push(crate::types::keywords::Keyword::Ascend);
+
+        for i in 1..10 {
+            create_object(
+                &mut state,
+                CardId(i),
+                PlayerId(0),
+                format!("Permanent {}", i),
+                Zone::Battlefield,
+            );
+        }
+
+        // Add Twilight Prophet with an upkeep trigger that checks for city blessing
+        let prophet = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Twilight Prophet".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&prophet)
+            .unwrap()
+            .trigger_definitions
+            .push(
+                crate::types::ability::TriggerDefinition::new(
+                    crate::types::triggers::TriggerMode::Phase,
+                )
+                .condition(crate::types::ability::TriggerCondition::HasCityBlessing)
+                .description("Test trigger".to_string()),
+            );
+
+        // Untap step: no priority, just advance to Upkeep
+        let mut events = Vec::new();
+        auto_advance(&mut state, &mut events);
+
+        // Should be in Upkeep now
+        assert_eq!(state.phase, Phase::Upkeep);
+
+        // City blessing should be granted by SBAs before upkeep triggers
+        assert!(state.city_blessing.contains(&PlayerId(0)));
+    }
+
+    /// Regression for #1305: Thalisse's end step trigger counts tokens created this turn.
+    /// This test verifies that tokens created during the turn are correctly counted
+    /// when the end step trigger fires.
+    #[test]
+    fn thalisse_token_counting_at_end_step() {
+        let mut state = setup();
+        state.phase = Phase::Untap;
+        state.turn_number = 2;
+        state.active_player = PlayerId(0);
+
+        // Add Thalisse with an end step trigger that counts tokens created this turn
+        let thalisse = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Thalisse, Reverent Medium".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&thalisse)
+            .unwrap()
+            .trigger_definitions
+            .push(
+                crate::types::ability::TriggerDefinition::new(
+                    crate::types::triggers::TriggerMode::Phase,
+                )
+                .phase(Phase::End)
+                .condition(
+                    crate::types::ability::TriggerCondition::QuantityComparison {
+                        lhs: crate::types::ability::QuantityExpr::Ref {
+                            qty: crate::types::ability::QuantityRef::TokensCreatedThisTurn {
+                                player: crate::types::ability::PlayerScope::Controller,
+                                filter: crate::types::ability::TargetFilter::Any,
+                            },
+                        },
+                        comparator: crate::types::ability::Comparator::GE,
+                        rhs: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                    },
+                )
+                .description("Test trigger".to_string()),
+            );
+
+        // Create 3 tokens during the turn
+        for i in 0..3 {
+            let token = create_object(
+                &mut state,
+                CardId(i),
+                PlayerId(0),
+                format!("Token {}", i),
+                Zone::Battlefield,
+            );
+            state.objects.get_mut(&token).unwrap().is_token = true;
+            crate::game::restrictions::record_token_created(&mut state, token);
+        }
+
+        // Advance to end step
+        state.phase = Phase::PostCombatMain;
+        advance_phase(&mut state, &mut Vec::new()); // PostCombatMain → End
+        let mut events = Vec::new();
+        auto_advance(&mut state, &mut events);
+
+        // Should be in End phase now
+        assert_eq!(state.phase, Phase::End);
+
+        // Verify tokens created this turn is 3
+        assert_eq!(state.created_tokens_this_turn.len(), 3);
+    }
+
+    /// Regression for #1307: Moseo's trigger checks life gained this turn.
+    /// This test verifies that life gained during the turn is correctly tracked
+    /// and the trigger condition evaluates correctly.
+    #[test]
+    fn moseo_life_gained_trigger_condition() {
+        let mut state = setup();
+        state.phase = Phase::Untap;
+        state.turn_number = 2;
+        state.active_player = PlayerId(0);
+
+        // Add Moseo with a trigger that checks life gained this turn
+        let moseo = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Moseo, Vein's New Dean".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&moseo)
+            .unwrap()
+            .trigger_definitions
+            .push(
+                crate::types::ability::TriggerDefinition::new(
+                    crate::types::triggers::TriggerMode::LifeGained,
+                )
+                .condition(
+                    crate::types::ability::TriggerCondition::QuantityComparison {
+                        lhs: crate::types::ability::QuantityExpr::Ref {
+                            qty: crate::types::ability::QuantityRef::LifeGainedThisTurn {
+                                player: crate::types::ability::PlayerScope::Controller,
+                            },
+                        },
+                        comparator: crate::types::ability::Comparator::GE,
+                        rhs: crate::types::ability::QuantityExpr::Fixed { value: 3 },
+                    },
+                )
+                .description("Test trigger".to_string()),
+            );
+
+        // Simulate gaining 5 life this turn
+        state.players[0].life_gained_this_turn = 5;
+
+        // Check that the condition evaluates correctly
+        let condition = crate::types::ability::TriggerCondition::QuantityComparison {
+            lhs: crate::types::ability::QuantityExpr::Ref {
+                qty: crate::types::ability::QuantityRef::LifeGainedThisTurn {
+                    player: crate::types::ability::PlayerScope::Controller,
+                },
+            },
+            comparator: crate::types::ability::Comparator::GE,
+            rhs: crate::types::ability::QuantityExpr::Fixed { value: 3 },
+        };
+        assert!(
+            crate::game::triggers::check_trigger_condition(
+                &state,
+                &condition,
+                PlayerId(0),
+                Some(moseo),
+                None
+            ),
+            "Condition should be true when 5 life gained (>= 3)"
+        );
+    }
+
+    /// Regression for #1356: Tinybones end step trigger checks opponent discards.
+    /// This test verifies that cards discarded by opponents are correctly tracked
+    /// and the trigger condition evaluates correctly.
+    #[test]
+    fn tinybones_opponent_discard_trigger_condition() {
+        let mut state = setup();
+        state.phase = Phase::Untap;
+        state.turn_number = 2;
+        state.active_player = PlayerId(0);
+
+        // Add Tinybones with an end step trigger that checks opponent discards
+        let tinybones = create_object(
+            &mut state,
+            CardId(100),
+            PlayerId(0),
+            "Tinybones, Trinket Thief".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&tinybones)
+            .unwrap()
+            .trigger_definitions
+            .push(
+                crate::types::ability::TriggerDefinition::new(
+                    crate::types::triggers::TriggerMode::Phase,
+                )
+                .phase(Phase::End)
+                .condition(
+                    crate::types::ability::TriggerCondition::QuantityComparison {
+                        lhs: crate::types::ability::QuantityExpr::Ref {
+                            qty: crate::types::ability::QuantityRef::CardsDiscardedThisTurn {
+                                player: crate::types::ability::PlayerScope::Opponent {
+                                    aggregate: crate::types::ability::AggregateFunction::Sum,
+                                },
+                            },
+                        },
+                        comparator: crate::types::ability::Comparator::GE,
+                        rhs: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                    },
+                )
+                .description("Test trigger".to_string()),
+            );
+
+        // Simulate opponent discarding 2 cards this turn
+        state
+            .cards_discarded_this_turn_by_player
+            .insert(PlayerId(1), 2);
+
+        // Check that the condition evaluates correctly
+        let condition = crate::types::ability::TriggerCondition::QuantityComparison {
+            lhs: crate::types::ability::QuantityExpr::Ref {
+                qty: crate::types::ability::QuantityRef::CardsDiscardedThisTurn {
+                    player: crate::types::ability::PlayerScope::Opponent {
+                        aggregate: crate::types::ability::AggregateFunction::Sum,
+                    },
+                },
+            },
+            comparator: crate::types::ability::Comparator::GE,
+            rhs: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+        };
+        assert!(
+            crate::game::triggers::check_trigger_condition(
+                &state,
+                &condition,
+                PlayerId(0),
+                Some(tinybones),
+                None
+            ),
+            "Condition should be true when opponent discarded 2 cards (>= 1)"
+        );
+    }
+
+    #[test]
     fn auto_advance_processes_precombat_main_triggers_before_priority() {
         let mut state = setup();
         // Start mid-turn at the boundary entering PreCombatMain. `auto_advance`
@@ -3830,6 +4331,66 @@ mod tests {
     }
 
     #[test]
+    fn all_player_static_step_skip_affects_noncontroller_active_player() {
+        use crate::types::ability::TargetFilter;
+        use crate::types::statics::StaticMode;
+
+        let mut state = setup();
+        state.active_player = PlayerId(1);
+
+        let hub_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Eon Hub".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&hub_id)
+            .unwrap()
+            .static_definitions
+            .push(
+                crate::types::ability::StaticDefinition::new(StaticMode::SkipStep {
+                    step: Phase::Upkeep,
+                })
+                .affected(TargetFilter::Player),
+            );
+
+        assert!(should_skip_step_static(&state, Phase::Upkeep));
+    }
+
+    #[test]
+    fn controller_static_step_skip_does_not_affect_opponent() {
+        use crate::types::ability::TargetFilter;
+        use crate::types::statics::StaticMode;
+
+        let mut state = setup();
+        state.active_player = PlayerId(1);
+
+        let enchant_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Necropotence".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&enchant_id)
+            .unwrap()
+            .static_definitions
+            .push(
+                crate::types::ability::StaticDefinition::new(StaticMode::SkipStep {
+                    step: Phase::Draw,
+                })
+                .affected(TargetFilter::Controller),
+            );
+
+        assert!(!should_skip_step_static(&state, Phase::Draw));
+    }
+
+    #[test]
     fn one_shot_step_skip_consumes_matching_step() {
         let mut state = setup();
         state.active_player = PlayerId(0);
@@ -3975,6 +4536,77 @@ mod tests {
             "state.waiting_for should be GameOver, got {:?}",
             state.waiting_for
         );
+    }
+
+    #[test]
+    fn auto_advance_combat_damage_flushes_layers_before_reading_power() {
+        use crate::game::combat::{AttackTarget, AttackerInfo, CombatState};
+        use crate::types::card_type::CoreType;
+        use crate::types::counter::CounterType;
+
+        let mut state = GameState::new_two_player(42);
+        state.turn_number = 2;
+        state.active_player = PlayerId(0);
+        state.phase = Phase::CombatDamage;
+
+        let attacker = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Counter Beast".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&attacker).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(1);
+            obj.toughness = Some(3);
+            obj.base_power = Some(1);
+            obj.base_toughness = Some(3);
+            obj.base_characteristics_initialized = true;
+            obj.counters.insert(CounterType::Plus1Plus1, 8);
+            obj.entered_battlefield_turn = Some(1);
+        }
+
+        let planeswalker = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Professor Onyx".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&planeswalker).unwrap();
+            obj.card_types.core_types.push(CoreType::Planeswalker);
+            // CR 306.5b: loyalty field and counter map mirror each other.
+            obj.loyalty = Some(10);
+            obj.counters.insert(CounterType::Loyalty, 10);
+        }
+
+        state.layers_dirty.mark_full();
+        assert_eq!(
+            state.objects.get(&attacker).unwrap().power,
+            Some(1),
+            "precondition: attacker power is stale before the CombatDamage phase arm runs"
+        );
+
+        state.combat = Some(CombatState {
+            attackers: vec![AttackerInfo::new(
+                attacker,
+                AttackTarget::Planeswalker(planeswalker),
+                PlayerId(1),
+            )],
+            ..Default::default()
+        });
+
+        let mut events = Vec::new();
+        let _ = auto_advance(&mut state, &mut events);
+
+        // CR 510.1a + CR 120.3c + CR 613.4c: combat damage uses evaluated power,
+        // including +1/+1 counters from layer 7c. Without the CombatDamage pre-flush
+        // in auto_advance, this remains at 9 because stale base power dealt only 1.
+        assert_eq!(state.objects[&planeswalker].loyalty, Some(1));
+        assert_eq!(state.players[1].life, 20);
     }
 
     /// CR 800.4: When the active player is eliminated mid-turn in multiplayer,

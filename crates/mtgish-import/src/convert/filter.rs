@@ -7,7 +7,7 @@
 
 use engine::types::ability::{
     ChoiceType, Comparator, ControllerRef, FilterProp, PtStat, PtValueScope, QuantityExpr,
-    TargetFilter, TypeFilter, TypedFilter,
+    SharedQuality, SharedQualityRelation, TargetFilter, TypeFilter, TypedFilter,
 };
 use engine::types::counter::CounterMatch;
 use engine::types::keywords::{Keyword, KeywordKind};
@@ -16,9 +16,9 @@ use engine::types::mana::ManaColor;
 use crate::convert::quantity::convert as convert_quantity;
 use crate::convert::result::{ConvResult, ConversionGap};
 use crate::schema::types::{
-    ArtifactType, CardType, CardtypeVariable, CheckHasable, ChoosableColor, Color, Comparison,
-    CounterType, CreatureType, CreatureTypeVariable, DamageSources, EnchantmentType, LandType,
-    NameFilter, Permanent, Permanents, PlaneswalkerType, Player, Players, SuperType,
+    ArtifactType, CardInExile, CardType, CardtypeVariable, CheckHasable, ChoosableColor, Color,
+    Comparison, CounterType, CreatureType, CreatureTypeVariable, DamageSources, EnchantmentType,
+    LandType, NameFilter, Permanent, Permanents, PlaneswalkerType, Player, Players, SuperType,
 };
 
 fn color_count_prop(comparator: Comparator, count: u8) -> FilterProp {
@@ -193,7 +193,7 @@ pub fn convert(p: &Permanents) -> ConvResult<TargetFilter> {
         Permanents::IsUntapped => prop_filter(FilterProp::Untapped),
 
         // CR 508.1k: a creature is "attacking" once declared as an attacker.
-        Permanents::IsAttacking => prop_filter(FilterProp::Attacking),
+        Permanents::IsAttacking => prop_filter(FilterProp::Attacking { defender: None }),
         // CR 509.1g: a creature is "blocking" once declared as a blocker.
         Permanents::IsBlocking => prop_filter(FilterProp::Blocking),
         // CR 509.1h: an attacking creature with no blockers is "unblocked".
@@ -250,6 +250,7 @@ pub fn convert(p: &Permanents) -> ConvResult<TargetFilter> {
             FilterProp::HasAttachment {
                 kind: engine::types::ability::AttachmentKind::Aura,
                 controller: None,
+                exclude_source: engine::types::ability::SourceExclusion::Include,
             },
         ])),
         // CR 301.5: equipped creature — has at least one Equipment attached.
@@ -257,6 +258,7 @@ pub fn convert(p: &Permanents) -> ConvResult<TargetFilter> {
             FilterProp::HasAttachment {
                 kind: engine::types::ability::AttachmentKind::Equipment,
                 controller: None,
+                exclude_source: engine::types::ability::SourceExclusion::Include,
             },
         ])),
 
@@ -377,7 +379,7 @@ pub fn convert(p: &Permanents) -> ConvResult<TargetFilter> {
         // -------------------------------------------------------------------
         // CR 508.1k: "isn't attacking" — negation of the attacking status.
         Permanents::IsntAttacking => TargetFilter::Not {
-            filter: Box::new(prop_filter(FilterProp::Attacking)),
+            filter: Box::new(prop_filter(FilterProp::Attacking { defender: None })),
         },
         // CR 509.1g: "isn't blocking" — negation of the blocking status.
         Permanents::IsntBlocking => TargetFilter::Not {
@@ -392,15 +394,17 @@ pub fn convert(p: &Permanents) -> ConvResult<TargetFilter> {
             filter: Box::new(prop_filter(FilterProp::EnteredThisTurn)),
         },
 
-        // CR 508.1b: "attacking you" — `FilterProp::AttackingController` matches
-        // attackers whose defending player equals the filter's source controller.
+        // CR 508.1b: "attacking you" — `FilterProp::Attacking { defender: Some(You) }`
+        // matches attackers whose defending player equals the filter's source controller.
         // Only safely expressible when the player axis is `You`; other player
         // axes (specific opponent / chosen player) need source-relative defender
         // resolution we don't have a primitive for, so they strict-fail.
         Permanents::IsAttackingPlayer(player) => match player_to_controller(player)? {
-            ControllerRef::You => TargetFilter::Typed(
-                TypedFilter::creature().properties(vec![FilterProp::AttackingController]),
-            ),
+            ControllerRef::You => TargetFilter::Typed(TypedFilter::creature().properties(vec![
+                FilterProp::Attacking {
+                    defender: Some(ControllerRef::You),
+                },
+            ])),
             other => {
                 return Err(ConversionGap::MalformedIdiom {
                     idiom: "Permanents/convert",
@@ -411,12 +415,14 @@ pub fn convert(p: &Permanents) -> ConvResult<TargetFilter> {
         },
         // CR 508.1b: "attacking a player" with a Players axis. Same source-
         // controller restriction as the singular form — we can express
-        // "attacking you" via `AttackingController`, but a free-standing
+        // "attacking you" via `Attacking { defender: Some(You) }`, but a free-standing
         // attacker filter (any defending player) has no engine primitive.
         Permanents::IsAttackingAPlayer(players) => match players_to_controller(players)? {
-            ControllerRef::You => TargetFilter::Typed(
-                TypedFilter::creature().properties(vec![FilterProp::AttackingController]),
-            ),
+            ControllerRef::You => TargetFilter::Typed(TypedFilter::creature().properties(vec![
+                FilterProp::Attacking {
+                    defender: Some(ControllerRef::You),
+                },
+            ])),
             other => {
                 return Err(ConversionGap::MalformedIdiom {
                     idiom: "Permanents/convert",
@@ -426,7 +432,7 @@ pub fn convert(p: &Permanents) -> ConvResult<TargetFilter> {
             }
         },
         // CR 508.1b + CR 506.3: "attacking you or a planeswalker you control."
-        // `FilterProp::AttackingController` matches any attacker whose recorded
+        // `FilterProp::Attacking { defender: Some(You) }` matches any attacker whose recorded
         // defending side equals the source controller — and the engine records
         // an attacker's defending player as the controller of the attacked
         // planeswalker/battle, so the player- and permanent-defended cases both
@@ -434,9 +440,13 @@ pub fn convert(p: &Permanents) -> ConvResult<TargetFilter> {
         // an opponent-relative defended axis needs a primitive we don't have.
         Permanents::IsAttackingAPlayerOrPlaneswalkerTheyControl(players) => {
             match players_to_controller(players)? {
-                ControllerRef::You => TargetFilter::Typed(
-                    TypedFilter::creature().properties(vec![FilterProp::AttackingController]),
-                ),
+                ControllerRef::You => {
+                    TargetFilter::Typed(TypedFilter::creature().properties(vec![
+                        FilterProp::Attacking {
+                            defender: Some(ControllerRef::You),
+                        },
+                    ]))
+                }
                 other => {
                     return Err(ConversionGap::MalformedIdiom {
                         idiom: "Permanents/convert",
@@ -890,221 +900,239 @@ fn damage_sources_variant_tag(s: &DamageSources) -> String {
 /// so the report tracks the work queue.
 pub(crate) fn spells_to_filter(s: &crate::schema::types::Spells) -> ConvResult<TargetFilter> {
     use crate::schema::types::Spells as S;
-    let filter =
-        match s {
-            S::AnySpell => TargetFilter::Typed(TypedFilter::default()),
-            S::IsCardtype(ct) => TargetFilter::Typed(TypedFilter::new(card_type(ct))),
-            S::IsNonCardtype(ct) => {
-                TargetFilter::Typed(TypedFilter::new(TypeFilter::Non(Box::new(card_type(ct)))))
-            }
-            S::IsCreatureType(ct) => TargetFilter::Typed(
-                TypedFilter::new(TypeFilter::Creature)
-                    .with_type(TypeFilter::Subtype(creature_type_name(ct))),
-            ),
-            S::IsNonCreatureType(ct) => {
-                TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature).with_type(
-                    TypeFilter::Non(Box::new(TypeFilter::Subtype(creature_type_name(ct)))),
-                ))
-            }
-            S::IsNonSupertype(st) => TargetFilter::Typed(TypedFilter::default().properties(vec![
-                FilterProp::NotSupertype {
+    let filter = match s {
+        S::AnySpell => TargetFilter::Typed(TypedFilter::default()),
+        S::IsCardtype(ct) => TargetFilter::Typed(TypedFilter::new(card_type(ct))),
+        S::IsNonCardtype(ct) => {
+            TargetFilter::Typed(TypedFilter::new(TypeFilter::Non(Box::new(card_type(ct)))))
+        }
+        S::IsCreatureType(ct) => TargetFilter::Typed(
+            TypedFilter::new(TypeFilter::Creature)
+                .with_type(TypeFilter::Subtype(creature_type_name(ct))),
+        ),
+        S::IsNonCreatureType(ct) => TargetFilter::Typed(
+            TypedFilter::new(TypeFilter::Creature).with_type(TypeFilter::Non(Box::new(
+                TypeFilter::Subtype(creature_type_name(ct)),
+            ))),
+        ),
+        S::IsNonSupertype(st) => {
+            TargetFilter::Typed(
+                TypedFilter::default().properties(vec![FilterProp::NotSupertype {
                     value: supertype_to_engine(st),
-                },
-            ])),
-            S::IsNonEnchantmentType(et) => TargetFilter::Typed(
-                TypedFilter::default()
-                    .with_type(TypeFilter::Enchantment)
-                    .with_type(TypeFilter::Non(Box::new(TypeFilter::Subtype(
-                        enchantment_type_name(et),
-                    )))),
-            ),
+                }]),
+            )
+        }
+        S::IsNonEnchantmentType(et) => TargetFilter::Typed(
+            TypedFilter::default()
+                .with_type(TypeFilter::Enchantment)
+                .with_type(TypeFilter::Non(Box::new(TypeFilter::Subtype(
+                    enchantment_type_name(et),
+                )))),
+        ),
 
-            // CR 205.3: Subtype predicates on spells (cards on the stack still
-            // carry their printed subtypes, so the typed-filter shape mirrors the
-            // Permanents arms).
-            S::IsArtifactType(at) => TargetFilter::Typed(
-                TypedFilter::default()
-                    .with_type(TypeFilter::Artifact)
-                    .with_type(TypeFilter::Subtype(artifact_type_name(at))),
-            ),
-            S::IsEnchantmentType(et) => TargetFilter::Typed(
-                TypedFilter::default()
-                    .with_type(TypeFilter::Enchantment)
-                    .with_type(TypeFilter::Subtype(enchantment_type_name(et))),
-            ),
-            S::IsPlaneswalkerType(pt) => TargetFilter::Typed(
-                TypedFilter::default()
-                    .with_type(TypeFilter::Planeswalker)
-                    .with_type(TypeFilter::Subtype(planeswalker_type_name(pt))),
-            ),
-            // CR 205.4a: nonbasic / nonlegendary / etc.
-            S::IsSupertype(st) => TargetFilter::Typed(TypedFilter::default().properties(vec![
-                FilterProp::HasSupertype {
+        // CR 205.3: Subtype predicates on spells (cards on the stack still
+        // carry their printed subtypes, so the typed-filter shape mirrors the
+        // Permanents arms).
+        S::IsArtifactType(at) => TargetFilter::Typed(
+            TypedFilter::default()
+                .with_type(TypeFilter::Artifact)
+                .with_type(TypeFilter::Subtype(artifact_type_name(at))),
+        ),
+        S::IsEnchantmentType(et) => TargetFilter::Typed(
+            TypedFilter::default()
+                .with_type(TypeFilter::Enchantment)
+                .with_type(TypeFilter::Subtype(enchantment_type_name(et))),
+        ),
+        S::IsPlaneswalkerType(pt) => TargetFilter::Typed(
+            TypedFilter::default()
+                .with_type(TypeFilter::Planeswalker)
+                .with_type(TypeFilter::Subtype(planeswalker_type_name(pt))),
+        ),
+        // CR 205.4a: nonbasic / nonlegendary / etc.
+        S::IsSupertype(st) => {
+            TargetFilter::Typed(
+                TypedFilter::default().properties(vec![FilterProp::HasSupertype {
                     value: supertype_to_engine(st),
-                },
-            ])),
-            // CR 110.1: spells that resolve to permanents (artifact/creature/
-            // enchantment/land/planeswalker/battle). Engine TypedFilter has no
-            // boolean "permanent" axis on a card-on-stack scope, so we inherit
-            // the Permanents-side `permanent()` typed filter — the type set is
-            // the same.
-            S::IsPermanent => TargetFilter::Typed(TypedFilter::permanent()),
+                }]),
+            )
+        }
+        // CR 110.1: spells that resolve to permanents (artifact/creature/
+        // enchantment/land/planeswalker/battle). Engine TypedFilter has no
+        // boolean "permanent" axis on a card-on-stack scope, so we inherit
+        // the Permanents-side `permanent()` typed filter — the type set is
+        // the same.
+        S::IsPermanent => TargetFilter::Typed(TypedFilter::permanent()),
 
-            // CR 105.1 / CR 105.2c: Color predicates over spells. Non-concrete
-            // colors strict-fail (chosen-color requires runtime binding).
-            S::IsColor(c) => match concrete_color(c) {
-                Some(color) => TargetFilter::Typed(
-                    TypedFilter::default().properties(vec![FilterProp::HasColor { color }]),
-                ),
-                None => {
-                    return Err(ConversionGap::MalformedIdiom {
-                        idiom: "Spells/IsColor",
-                        path: String::new(),
-                        detail: format!("non-concrete color: {c:?}"),
-                    });
-                }
-            },
-            S::IsNonColor(c) => match concrete_color(c) {
-                Some(color) => TargetFilter::Not {
-                    filter: Box::new(TargetFilter::Typed(
-                        TypedFilter::default().properties(vec![FilterProp::HasColor { color }]),
-                    )),
-                },
-                None => {
-                    return Err(ConversionGap::MalformedIdiom {
-                        idiom: "Spells/IsNonColor",
-                        path: String::new(),
-                        detail: format!("non-concrete color: {c:?}"),
-                    });
-                }
-            },
-            S::IsColorless => {
-                TargetFilter::Typed(TypedFilter::default().properties(vec![colorless_prop()]))
-            }
-            S::IsMulticolored => {
-                TargetFilter::Typed(TypedFilter::default().properties(vec![multicolored_prop()]))
-            }
-            // CR 700.6: "historic" — legendary, artifact, or Saga.
-            S::IsHistoric => {
-                TargetFilter::Typed(TypedFilter::default().properties(vec![FilterProp::Historic]))
-            }
-
-            // CR 202.3 / CR 208: Numeric comparisons on the cast spell. Reuse
-            // the same comparison helpers Permanents uses; they emit
-            // FilterProp::Cmc / FilterProp::PtComparison which evaluate against
-            // the card's printed/current values regardless of zone.
-            S::ManaValueIs(cmp) => cmc_comparison_filter(cmp)?,
-            S::PowerIs(cmp) => power_comparison_filter(cmp)?,
-            S::ToughnessIs(cmp) => toughness_comparison_filter(cmp)?,
-            // CR 107.3 + CR 202.1: spell with {X} in its mana cost.
-            S::HasXInManaCost => TargetFilter::Typed(
-                TypedFilter::default().properties(vec![FilterProp::HasXInManaCost]),
+        // CR 105.1 / CR 105.2c: Color predicates over spells. Non-concrete
+        // colors strict-fail (chosen-color requires runtime binding).
+        S::IsColor(c) => match concrete_color(c) {
+            Some(color) => TargetFilter::Typed(
+                TypedFilter::default().properties(vec![FilterProp::HasColor { color }]),
             ),
-
-            // CR 201.2: name predicate. Reuses the shared NameFilter helper,
-            // which strict-fails for non-static name shapes.
-            S::IsNamed(nf) => name_filter_to_filter(nf)?,
-
-            // CR 702: Keyword presence / absence on a spell. Reuses the same
-            // CheckHasable helper as Permanents — composite shapes strict-fail.
-            S::HasAbility(check) => has_ability_filter(check)?,
-            S::DoesntHaveAbility(check) => TargetFilter::Not {
-                filter: Box::new(has_ability_filter(check)?),
-            },
-
-            // CR 903.3: "your commander" — controller-scoped commander predicate.
-            S::IsYourCommander => TargetFilter::Typed(
-                TypedFilter::default()
-                    .controller(ControllerRef::You)
-                    .properties(vec![FilterProp::IsCommander]),
-            ),
-            // CR 903.3: "a commander" — any commander on the stack.
-            S::IsACommander => TargetFilter::Typed(
-                TypedFilter::default().properties(vec![FilterProp::IsCommander]),
-            ),
-
-            // CR 601.2 / CR 109.4: caster / owner / controller axis. The engine
-            // tracks the stack-object controller via ControllerRef; "cast by
-            // player X" maps directly. Compound `Players` (multi-player sets)
-            // strict-fail through `players_to_controller`.
-            S::CastByAPlayer(players) => {
-                let ctrl = players_to_controller(players)?;
-                TargetFilter::Typed(TypedFilter::default().controller(ctrl))
-            }
-            S::CastByPlayer(player) => {
-                let ctrl = player_to_controller(player)?;
-                TargetFilter::Typed(TypedFilter::default().controller(ctrl))
-            }
-            S::ControlledByAPlayer(players) => {
-                let ctrl = players_to_controller(players)?;
-                TargetFilter::Typed(TypedFilter::default().controller(ctrl))
-            }
-            S::OwnedByAPlayer(players) => {
-                let ctrl = players_to_controller(players)?;
-                TargetFilter::Typed(
-                    TypedFilter::default().properties(vec![FilterProp::Owned { controller: ctrl }]),
-                )
-            }
-
-            // CR 115.9c: "spell that targets only ~" — the inner Permanent /
-            // Permanents filter constrains every target of the spell.
-            S::TargetsOnlySinglePermanent(inner) => {
-                TargetFilter::Typed(TypedFilter::default().properties(vec![
-                    FilterProp::TargetsOnly {
-                        filter: Box::new(convert_permanent(inner)?),
-                    },
-                ]))
-            }
-            S::CanTargetOnly(inner) => {
-                TargetFilter::Typed(TypedFilter::default().properties(vec![
-                    FilterProp::TargetsOnly {
-                        filter: Box::new(convert(inner)?),
-                    },
-                ]))
-            }
-            // CR 115.9b: "spell that targets ~" (ANY target satisfies the inner
-            // filter). `TargetsAPermanent` carries a `Permanents`; `TargetsPermanent`
-            // carries a singular `Permanent`. Both reduce to FilterProp::Targets.
-            S::TargetsAPermanent(inner) => {
-                TargetFilter::Typed(TypedFilter::default().properties(vec![FilterProp::Targets {
-                    filter: Box::new(convert(inner)?),
-                }]))
-            }
-            S::TargetsPermanent(inner) => {
-                TargetFilter::Typed(TypedFilter::default().properties(vec![FilterProp::Targets {
-                    filter: Box::new(convert_permanent(inner)?),
-                }]))
-            }
-            // CR 115.7: spell with exactly one target.
-            S::HasASingleTarget => TargetFilter::Typed(
-                TypedFilter::default().properties(vec![FilterProp::HasSingleTarget]),
-            ),
-
-            S::And(parts) => {
-                let mut filters = Vec::with_capacity(parts.len());
-                for part in parts {
-                    filters.push(spells_to_filter(part)?);
-                }
-                TargetFilter::And { filters }
-            }
-            S::Or(parts) => {
-                let mut filters = Vec::with_capacity(parts.len());
-                for part in parts {
-                    filters.push(spells_to_filter(part)?);
-                }
-                TargetFilter::Or { filters }
-            }
-            S::Not(inner) => TargetFilter::Not {
-                filter: Box::new(spells_to_filter(inner)?),
-            },
-
-            other => {
-                return Err(ConversionGap::EnginePrerequisiteMissing {
-                    engine_type: "TargetFilter",
-                    needed_variant: format!("Spells::{}", spells_variant_tag(other)),
+            None => {
+                return Err(ConversionGap::MalformedIdiom {
+                    idiom: "Spells/IsColor",
+                    path: String::new(),
+                    detail: format!("non-concrete color: {c:?}"),
                 });
             }
-        };
+        },
+        S::IsNonColor(c) => match concrete_color(c) {
+            Some(color) => TargetFilter::Not {
+                filter: Box::new(TargetFilter::Typed(
+                    TypedFilter::default().properties(vec![FilterProp::HasColor { color }]),
+                )),
+            },
+            None => {
+                return Err(ConversionGap::MalformedIdiom {
+                    idiom: "Spells/IsNonColor",
+                    path: String::new(),
+                    detail: format!("non-concrete color: {c:?}"),
+                });
+            }
+        },
+        S::IsColorless => {
+            TargetFilter::Typed(TypedFilter::default().properties(vec![colorless_prop()]))
+        }
+        S::IsMulticolored => {
+            TargetFilter::Typed(TypedFilter::default().properties(vec![multicolored_prop()]))
+        }
+        // CR 700.6: "historic" — legendary, artifact, or Saga.
+        S::IsHistoric => {
+            TargetFilter::Typed(TypedFilter::default().properties(vec![FilterProp::Historic]))
+        }
+
+        // CR 202.3 / CR 208: Numeric comparisons on the cast spell. Reuse
+        // the same comparison helpers Permanents uses; they emit
+        // FilterProp::Cmc / FilterProp::PtComparison which evaluate against
+        // the card's printed/current values regardless of zone.
+        S::ManaValueIs(cmp) => cmc_comparison_filter(cmp)?,
+        S::PowerIs(cmp) => power_comparison_filter(cmp)?,
+        S::ToughnessIs(cmp) => toughness_comparison_filter(cmp)?,
+        // CR 107.3 + CR 202.1: spell with {X} in its mana cost.
+        S::HasXInManaCost => {
+            TargetFilter::Typed(TypedFilter::default().properties(vec![FilterProp::HasXInManaCost]))
+        }
+
+        // CR 201.2: name predicate. Reuses the shared NameFilter helper,
+        // which strict-fails for non-static name shapes.
+        S::IsNamed(nf) => name_filter_to_filter(nf)?,
+
+        // CR 702: Keyword presence / absence on a spell. Reuses the same
+        // CheckHasable helper as Permanents — composite shapes strict-fail.
+        S::HasAbility(check) => has_ability_filter(check)?,
+        S::DoesntHaveAbility(check) => TargetFilter::Not {
+            filter: Box::new(has_ability_filter(check)?),
+        },
+
+        // CR 903.3: "your commander" — controller-scoped commander predicate.
+        S::IsYourCommander => TargetFilter::Typed(
+            TypedFilter::default()
+                .controller(ControllerRef::You)
+                .properties(vec![FilterProp::IsCommander]),
+        ),
+        // CR 903.3: "a commander" — any commander on the stack.
+        S::IsACommander => {
+            TargetFilter::Typed(TypedFilter::default().properties(vec![FilterProp::IsCommander]))
+        }
+
+        // CR 601.2 / CR 109.4: caster / owner / controller axis. The engine
+        // tracks the stack-object controller via ControllerRef; "cast by
+        // player X" maps directly. Compound `Players` (multi-player sets)
+        // strict-fail through `players_to_controller`.
+        S::CastByAPlayer(players) => {
+            let ctrl = players_to_controller(players)?;
+            TargetFilter::Typed(TypedFilter::default().controller(ctrl))
+        }
+        S::CastByPlayer(player) => {
+            let ctrl = player_to_controller(player)?;
+            TargetFilter::Typed(TypedFilter::default().controller(ctrl))
+        }
+        S::ControlledByAPlayer(players) => {
+            let ctrl = players_to_controller(players)?;
+            TargetFilter::Typed(TypedFilter::default().controller(ctrl))
+        }
+        S::OwnedByAPlayer(players) => {
+            let ctrl = players_to_controller(players)?;
+            TargetFilter::Typed(
+                TypedFilter::default().properties(vec![FilterProp::Owned { controller: ctrl }]),
+            )
+        }
+
+        // CR 115.9c: "spell that targets only ~" — the inner Permanent /
+        // Permanents filter constrains every target of the spell.
+        S::TargetsOnlySinglePermanent(inner) => TargetFilter::Typed(
+            TypedFilter::default().properties(vec![FilterProp::TargetsOnly {
+                filter: Box::new(convert_permanent(inner)?),
+            }]),
+        ),
+        S::CanTargetOnly(inner) => {
+            TargetFilter::Typed(
+                TypedFilter::default().properties(vec![FilterProp::TargetsOnly {
+                    filter: Box::new(convert(inner)?),
+                }]),
+            )
+        }
+        // CR 115.9b: "spell that targets ~" (ANY target satisfies the inner
+        // filter). `TargetsAPermanent` carries a `Permanents`; `TargetsPermanent`
+        // carries a singular `Permanent`. Both reduce to FilterProp::Targets.
+        S::TargetsAPermanent(inner) => {
+            TargetFilter::Typed(TypedFilter::default().properties(vec![FilterProp::Targets {
+                filter: Box::new(convert(inner)?),
+            }]))
+        }
+        S::TargetsPermanent(inner) => {
+            TargetFilter::Typed(TypedFilter::default().properties(vec![FilterProp::Targets {
+                filter: Box::new(convert_permanent(inner)?),
+            }]))
+        }
+        // CR 115.7: spell with exactly one target.
+        S::HasASingleTarget => TargetFilter::Typed(
+            TypedFilter::default().properties(vec![FilterProp::HasSingleTarget]),
+        ),
+
+        S::And(parts) => {
+            let mut filters = Vec::with_capacity(parts.len());
+            for part in parts {
+                filters.push(spells_to_filter(part)?);
+            }
+            TargetFilter::And { filters }
+        }
+        S::Or(parts) => {
+            let mut filters = Vec::with_capacity(parts.len());
+            for part in parts {
+                filters.push(spells_to_filter(part)?);
+            }
+            TargetFilter::Or { filters }
+        }
+        S::Not(inner) => TargetFilter::Not {
+            filter: Box::new(spells_to_filter(inner)?),
+        },
+        // CR 601.2f + CR 607.2a + CR 607.3: Semblance Anvil-style spell cost
+        // reduction compares against "the exiled card" linked to the source.
+        S::SharesACardtypeWithExiledCard(card) => {
+            if !matches!(card.as_ref(), CardInExile::TheExiledCard) {
+                return Err(ConversionGap::EnginePrerequisiteMissing {
+                    engine_type: "TargetFilter",
+                    needed_variant: format!("SharesACardtypeWithExiledCard/{:?}", card.as_ref()),
+                });
+            }
+            TargetFilter::Typed(
+                TypedFilter::card().properties(vec![FilterProp::SharesQuality {
+                    quality: SharedQuality::CardType,
+                    reference: Some(Box::new(TargetFilter::ExiledBySource)),
+                    relation: SharedQualityRelation::Shares,
+                }]),
+            )
+        }
+
+        other => {
+            return Err(ConversionGap::EnginePrerequisiteMissing {
+                engine_type: "TargetFilter",
+                needed_variant: format!("Spells::{}", spells_variant_tag(other)),
+            });
+        }
+    };
     Ok(filter.normalized())
 }
 

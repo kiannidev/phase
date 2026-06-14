@@ -5,11 +5,11 @@
 //!
 //! The bug was that deathtouch and lifelink only appeared on attacking Vampires
 //! after combat damage was dealt, instead of being active for the entire combat
-//! phase. This happened because `FilterProp::Attacking` wasn't re-evaluated
+//! phase. This happened because `FilterProp::Attacking { defender: None }` wasn't re-evaluated
 //! until after damage assignment.
 //!
 //! The fix adds `state.layers_dirty = true` after populating `combat.attackers`
-//! in `declare_attackers`, ensuring continuous effects with `FilterProp::Attacking`
+//! in `declare_attackers`, ensuring continuous effects with `FilterProp::Attacking { defender: None }`
 //! are re-evaluated immediately when creatures become attackers.
 //!
 //! CR 506.4: A creature is "attacking" from when it is declared as an attacker
@@ -35,6 +35,7 @@ fn declare_attacker(runner: &mut engine::game::scenario::GameRunner, attacker: O
     runner
         .act(GameAction::DeclareAttackers {
             attacks: vec![(attacker, AttackTarget::Player(P1))],
+            bands: vec![],
         })
         .expect("DeclareAttackers should succeed");
 }

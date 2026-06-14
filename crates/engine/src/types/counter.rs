@@ -1,6 +1,7 @@
 use crate::types::keywords::KeywordKind;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::collections::HashMap;
 
 /// Counter types serialize as flat strings so they can be used as JSON map keys
 /// in `HashMap<CounterType, u32>`. Without this, `Generic("quest")` would serialize
@@ -32,12 +33,28 @@ pub enum CounterType {
     /// removed, the suspend "play it without paying its mana cost" trigger fires
     /// (CR 702.62a) or the Vanishing sacrifice trigger fires (CR 702.63a).
     Time,
+    /// CR 702.32a + CR 122.1: Fade counters track Fading duration. "Fading N"
+    /// enters the permanent with N fade counters; at the beginning of its
+    /// controller's upkeep one is removed, and if none can be removed the
+    /// permanent is sacrificed. Distinct from `Time` (Vanishing/Suspend): a
+    /// Fading permanent is sacrificed on the upkeep where it has *no* fade
+    /// counter to remove (CR 702.32a), one upkeep later than a Vanishing
+    /// permanent with the same number, which is sacrificed when its last time
+    /// counter is removed (CR 702.63a).
+    Fade,
     /// CR 702.24a + CR 122.1: Age counters track Cumulative Upkeep
     /// duration. Each cumulative-upkeep trigger places one at the start
     /// of its controller's upkeep, and the cost is multiplied by the
     /// total age-counter count on the permanent at resolution time
     /// (CR 702.24b).
     Age,
+    /// CR 122.1c: A shield counter creates one replacement effect ("if this
+    /// permanent would be destroyed as the result of an effect, instead remove
+    /// a shield counter from it") and one prevention effect ("if damage would
+    /// be dealt to this permanent, prevent that damage and remove a shield
+    /// counter from it"). One or more shield counters share this single pair of
+    /// effects. See `game::replacement::consume_shield_counter`.
+    Shield,
     /// CR 122.1b: A keyword counter grants its keyword to the permanent (flying,
     /// first strike, deathtouch, lifelink, ...). Uses the parameterless
     /// `KeywordKind` discriminant — keyword counters never carry parameters
@@ -81,7 +98,9 @@ impl CounterType {
             CounterType::Stun => Cow::Borrowed("stun"),
             CounterType::Lore => Cow::Borrowed("lore"),
             CounterType::Time => Cow::Borrowed("time"),
+            CounterType::Fade => Cow::Borrowed("fade"),
             CounterType::Age => Cow::Borrowed("age"),
+            CounterType::Shield => Cow::Borrowed("shield"),
             CounterType::Keyword(kind) => KEYWORD_COUNTERS
                 .iter()
                 .find(|(_, k)| k == kind)
@@ -117,7 +136,9 @@ impl CounterType {
             | CounterType::Stun
             | CounterType::Lore
             | CounterType::Time
+            | CounterType::Fade
             | CounterType::Age
+            | CounterType::Shield
             | CounterType::Keyword(_)
             | CounterType::Generic(_) => None,
         }
@@ -134,6 +155,62 @@ impl<'de> serde::Deserialize<'de> for CounterType {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         Ok(parse_counter_type(&s))
+    }
+}
+
+pub(crate) mod counter_map_serde {
+    use super::*;
+    use serde::de::{self, MapAccess, Visitor};
+    use serde::ser::SerializeMap;
+    use serde::{Deserializer, Serializer};
+    use std::fmt;
+
+    pub(crate) fn serialize<S>(
+        map: &HashMap<CounterType, u32>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut ser_map = serializer.serialize_map(Some(map.len()))?;
+        for (counter_type, count) in map {
+            ser_map.serialize_entry(counter_type.as_str().as_ref(), count)?;
+        }
+        ser_map.end()
+    }
+
+    pub(crate) fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<CounterType, u32>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct CounterMapVisitor;
+
+        impl<'de> Visitor<'de> for CounterMapVisitor {
+            type Value = HashMap<CounterType, u32>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a map of counter type keys to counts")
+            }
+
+            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut map = HashMap::new();
+                while let Some((counter_type, count)) = access.next_entry::<CounterType, u32>()? {
+                    let total = map.entry(counter_type).or_insert(0_u32);
+                    let next = (*total)
+                        .checked_add(count)
+                        .ok_or_else(|| de::Error::custom("counter count overflow"))?;
+                    *total = next;
+                }
+                Ok(map)
+            }
+        }
+
+        deserializer.deserialize_map(CounterMapVisitor)
     }
 }
 
@@ -191,14 +268,18 @@ pub fn try_parse_counter_type(text: &str) -> Option<CounterType> {
         return None;
     }
     match trimmed {
-        "P1P1" | "+1/+1" | "plus1plus1" => return Some(CounterType::Plus1Plus1),
-        "M1M1" | "-1/-1" | "minus1minus1" => return Some(CounterType::Minus1Minus1),
+        // Lowercase legacy keys: the pre-fix debug menu persisted these as
+        // generic counters; alias them so saved states migrate to typed P/T counters.
+        "P1P1" | "p1p1" | "+1/+1" | "plus1plus1" => return Some(CounterType::Plus1Plus1),
+        "M1M1" | "m1m1" | "-1/-1" | "minus1minus1" => return Some(CounterType::Minus1Minus1),
         "LOYALTY" | "loyalty" => return Some(CounterType::Loyalty),
         "defense" | "DEFENSE" => return Some(CounterType::Defense),
         "stun" => return Some(CounterType::Stun),
         "lore" | "LORE" => return Some(CounterType::Lore),
         "time" | "TIME" => return Some(CounterType::Time),
+        "fade" | "FADE" => return Some(CounterType::Fade),
         "age" => return Some(CounterType::Age),
+        "shield" => return Some(CounterType::Shield),
         _ => {}
     }
     if let Some((power, toughness)) = parse_power_toughness_counter(trimmed) {
@@ -269,9 +350,42 @@ fn format_counter_delta(value: i32, paired_value: i32) -> String {
     }
 }
 
+/// CR 122.1: A counter is a marker on an object or player; an internal map
+/// entry with count zero is not a marker and must not satisfy "has a counter"
+/// checks (e.g. proliferate CR 701.34a).
+pub fn has_positive_counters(counters: &HashMap<CounterType, u32>) -> bool {
+    counters.values().any(|&count| count > 0)
+}
+
+/// Counter entries currently present on an object or LKI snapshot (count > 0 only).
+pub fn positive_counter_entries(
+    counters: &HashMap<CounterType, u32>,
+) -> impl Iterator<Item = (&CounterType, u32)> {
+    counters
+        .iter()
+        .filter_map(|(counter_type, &count)| (count > 0).then_some((counter_type, count)))
+}
+
+/// Counter types currently present on an object or LKI snapshot (count > 0 only).
+pub fn positive_counter_types(counters: &HashMap<CounterType, u32>) -> Vec<CounterType> {
+    positive_counter_entries(counters)
+        .map(|(counter_type, _)| counter_type.clone())
+        .collect()
+}
+
+/// CR 122.1: Drop zero-count entries so counter presence stays aligned with
+/// actual markers and downstream eligibility checks.
+pub fn prune_zero_counters(counters: &mut HashMap<CounterType, u32>) {
+    counters.retain(|_, count| *count > 0);
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_counter_type, CounterType};
+    use super::{
+        has_positive_counters, parse_counter_type, positive_counter_entries,
+        positive_counter_types, prune_zero_counters, try_parse_counter_type, CounterType,
+    };
+    use std::collections::HashMap;
 
     #[test]
     fn parses_legacy_power_toughness_counter_deltas() {
@@ -303,11 +417,28 @@ mod tests {
         assert_eq!(parse_counter_type("+1/+1"), CounterType::Plus1Plus1);
         assert_eq!(parse_counter_type("-1/-1"), CounterType::Minus1Minus1);
         assert_eq!(parse_counter_type("P1P1"), CounterType::Plus1Plus1);
+        assert_eq!(parse_counter_type("p1p1"), CounterType::Plus1Plus1);
         assert_eq!(parse_counter_type("M1M1"), CounterType::Minus1Minus1);
+        assert_eq!(parse_counter_type("m1m1"), CounterType::Minus1Minus1);
         assert_eq!(
             parse_counter_type("MINING"),
             CounterType::Generic("mining".to_string())
         );
+    }
+
+    #[test]
+    fn sums_legacy_duplicate_counter_keys_on_deserialize() {
+        #[derive(serde::Deserialize)]
+        struct CounterMapFixture {
+            #[serde(with = "super::counter_map_serde")]
+            counters: HashMap<CounterType, u32>,
+        }
+
+        let fixture: CounterMapFixture =
+            serde_json::from_str(r#"{"counters":{"P1P1":2,"p1p1":3,"M1M1":1,"m1m1":4}}"#).unwrap();
+
+        assert_eq!(fixture.counters.get(&CounterType::Plus1Plus1), Some(&5));
+        assert_eq!(fixture.counters.get(&CounterType::Minus1Minus1), Some(&5));
     }
 
     #[test]
@@ -331,6 +462,20 @@ mod tests {
     }
 
     #[test]
+    fn shield_counter_parses_serializes_and_has_no_pt_delta() {
+        // CR 122.1c: "shield" is a first-class counter type, not a Generic.
+        assert_eq!(parse_counter_type("shield"), CounterType::Shield);
+        assert_eq!(parse_counter_type("shield counter"), CounterType::Shield);
+        assert_eq!(try_parse_counter_type("shield"), Some(CounterType::Shield));
+        assert_eq!(CounterType::Shield.as_str().as_ref(), "shield");
+        assert_eq!(
+            serde_json::to_string(&CounterType::Shield).unwrap(),
+            "\"shield\""
+        );
+        assert_eq!(CounterType::Shield.power_toughness_delta(), None);
+    }
+
+    #[test]
     fn age_counter_serializes_as_age_and_round_trips() {
         let c = CounterType::Age;
         assert_eq!(c.as_str().as_ref(), "age");
@@ -339,5 +484,48 @@ mod tests {
         let back: CounterType = serde_json::from_str(&json).unwrap();
         assert_eq!(back, CounterType::Age);
         assert_eq!(c.power_toughness_delta(), None);
+    }
+
+    #[test]
+    fn has_positive_counters_ignores_zero_entries() {
+        let mut counters = HashMap::new();
+        counters.insert(CounterType::Plus1Plus1, 0);
+        assert!(!has_positive_counters(&counters));
+        counters.insert(CounterType::Lore, 1);
+        assert!(has_positive_counters(&counters));
+    }
+
+    #[test]
+    fn positive_counter_types_skips_zero_entries() {
+        let mut counters = HashMap::new();
+        counters.insert(CounterType::Plus1Plus1, 0);
+        counters.insert(CounterType::Generic("charge".to_string()), 2);
+        assert_eq!(
+            positive_counter_types(&counters),
+            vec![CounterType::Generic("charge".to_string())]
+        );
+    }
+
+    #[test]
+    fn positive_counter_entries_skips_zero_entries() {
+        let mut counters = HashMap::new();
+        counters.insert(CounterType::Plus1Plus1, 0);
+        counters.insert(CounterType::Generic("charge".to_string()), 2);
+        assert_eq!(
+            positive_counter_entries(&counters)
+                .map(|(counter_type, count)| (counter_type.clone(), count))
+                .collect::<Vec<_>>(),
+            vec![(CounterType::Generic("charge".to_string()), 2)]
+        );
+    }
+
+    #[test]
+    fn prune_zero_counters_drops_stale_keys() {
+        let mut counters = HashMap::new();
+        counters.insert(CounterType::Plus1Plus1, 0);
+        counters.insert(CounterType::Stun, 1);
+        prune_zero_counters(&mut counters);
+        assert!(!counters.contains_key(&CounterType::Plus1Plus1));
+        assert_eq!(counters.get(&CounterType::Stun), Some(&1));
     }
 }

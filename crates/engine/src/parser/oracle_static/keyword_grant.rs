@@ -1,4 +1,4 @@
-// CR 613.3f (Layer 6) — keyword-grant static abilities.
+// CR 613.1f (Layer 6) — keyword-grant static abilities (ability-adding effects).
 
 #[allow(unused_imports)]
 use super::prelude::*;
@@ -11,6 +11,8 @@ pub(crate) enum RuleStaticPredicate {
     CantAttack,
     CantBlock,
     CantAttackOrBlock,
+    CantCrew,
+    CantBeActivated,
     CantBeSacrificed,
     MustAttack,
     MustBlock,
@@ -44,6 +46,10 @@ pub(crate) fn try_parse_graveyard_keyword_grant_clause(
             value(GraveyardGrantedKeywordKind::Flashback, tag("flashback")),
             value(GraveyardGrantedKeywordKind::Escape, tag("escape")),
             value(GraveyardGrantedKeywordKind::Mayhem, tag("mayhem")),
+            // CR 702.97 / CR 702.141: Varolz, Young Deathclaws (scavenge);
+            // Wire Surgeons (encore) grant activated graveyard keywords.
+            value(GraveyardGrantedKeywordKind::Scavenge, tag("scavenge")),
+            value(GraveyardGrantedKeywordKind::Encore, tag("encore")),
         ))
         .parse(i)
     })?
@@ -94,8 +100,27 @@ pub(crate) fn parse_spells_have_keyword(tp: &TextPair<'_>, text: &str) -> Option
     let condition = scoped_tp.as_ref().map(|_| StaticCondition::DuringYourTurn);
     let tp = scoped_tp.as_ref().unwrap_or(tp);
 
-    // Pattern 1: "[type] spell(s) you cast [from zone] have/has [keyword]."
+    // CR 702.74a: keyword-grant lines that read "... gain <keyword> as you cast
+    // them" (Ashling, the Limitless) carry a trailing " as you cast them" after
+    // the keyword text. Strip it structurally (period then suffix) BEFORE the
+    // separator split so the keyword residue is "evoke {4}" rather than
+    // "evoke {4} as you cast them" — `parse_keyword_with_where_x` takes up to the
+    // first comma as keyword_text, and `parse_keyword_from_oracle` would reject
+    // the trailing clause. Mirror the existing trailing-period handling.
+    let trimmed_tp = tp.trim_end_matches('.');
+    let trimmed_tp = trimmed_tp
+        // allow-noncombinator: structural trailing-clause cleanup on the pre-delimited grant phrase, not parsing dispatch (mirrors the trim_end_matches period strip above).
+        .strip_suffix(" as you cast them")
+        .unwrap_or(trimmed_tp);
+    let tp = &trimmed_tp;
+
+    // Pattern 1: "[type] spell(s) you cast [from zone] have/has/gain/gains [keyword]."
     // Find the predicate separator to split subject from keyword.
+    // CR 702.74a: "... spells you cast ... gain <keyword>" (Ashling) uses "gain"/
+    // "gains" as the grant verb instead of "have"/"has". The grant verb is tried
+    // in the fixed priority order have → has → gain → gains (first verb in this
+    // list that appears anywhere wins); the real card class carries exactly one
+    // grant verb, so the order only disambiguates hypothetical mixed-verb text.
     let (have_pos, have_len) = tp
         .lower
         .match_indices(" have ")
@@ -104,6 +129,18 @@ pub(crate) fn parse_spells_have_keyword(tp: &TextPair<'_>, text: &str) -> Option
         .or_else(|| {
             tp.lower
                 .match_indices(" has ")
+                .next()
+                .map(|(pos, sep)| (pos, sep.len()))
+        })
+        .or_else(|| {
+            tp.lower
+                .match_indices(" gain ")
+                .next()
+                .map(|(pos, sep)| (pos, sep.len()))
+        })
+        .or_else(|| {
+            tp.lower
+                .match_indices(" gains ")
                 .next()
                 .map(|(pos, sep)| (pos, sep.len()))
         })?;
@@ -172,7 +209,7 @@ pub(crate) fn parse_spells_have_keyword(tp: &TextPair<'_>, text: &str) -> Option
         );
         // CR 105.2: trailing "that's one or more colors"/"that's exactly N colors" relative clause → ColorCount.
         let color_props = if let Some((props, consumed)) =
-            crate::parser::oracle_target::parse_that_clause_suffix(cursor)
+            crate::parser::oracle_target::parse_that_clause_suffix(cursor, None)
         {
             cursor = cursor[consumed..].trim_start();
             props
@@ -275,8 +312,101 @@ pub(crate) fn parse_spells_have_keyword(tp: &TextPair<'_>, text: &str) -> Option
         }
         return Some(def);
     }
-
+    // Pattern 3: "[type] cards in/from [your zone] have [keyword]"
+    // CR 702.81a (Retrace): Grants a casting keyword to cards in a specific zone.
+    // Six grants retrace to nonland permanent cards in your graveyard.
+    // Emits a Continuous static with AddKeyword so the off-zone keyword-grant
+    // path (`effective_off_zone_keywords`) sees the grant and the card becomes
+    // castable from the graveyard.
+    {
+        let (base_filter, rest) = parse_type_phrase(subject);
+        if rest.trim().is_empty() && target_filter_is_your_graveyard(&base_filter) {
+            let mut def = StaticDefinition::continuous()
+                .affected(base_filter)
+                .modifications(vec![ContinuousModification::AddKeyword { keyword }])
+                .description(text.to_string());
+            if let Some(condition) = condition.clone() {
+                def = def.condition(condition);
+            }
+            return Some(def);
+        }
+    }
     None
+}
+
+/// Parse the static permission "You may cast [type] spells as though they had
+/// flash." (Leyline of Anticipation, Vedalken Orrery, Vivien, Champion of the
+/// Wilds' first ability).
+///
+/// CR 601.3b: An effect that lets a player cast a spell "as though it had flash"
+/// lets that player begin to cast it at instant speed. CR 702.8a: flash means
+/// the spell may be cast any time its controller could cast an instant.
+///
+/// This must emit `StaticMode::CastWithKeyword { keyword: Flash }` with the
+/// spell-type filter in `affected` — that is the ONLY static mode the
+/// flash-timing path (`granted_spell_keywords` in casting.rs) actually reads.
+/// The legacy `StaticMode::CastWithFlash` carries no spell filter and is never
+/// consumed by that path, so it silently dropped both the timing grant and the
+/// "creature spells" restriction (issue #1957). Mirrors the activated/triggered
+/// `try_parse_cast_as_though_flash_permission` (oracle_effect) so the static and
+/// duration-scoped forms share one filter-construction contract.
+pub(crate) fn parse_cast_as_though_flash_static(
+    tp: &TextPair<'_>,
+    text: &str,
+) -> Option<StaticDefinition> {
+    let (type_text, all_players) = nom_on_lower(tp.original, tp.lower, |i| {
+        let (i, all_players) = alt((
+            value(false, tag::<_, _, OracleError<'_>>("you may ")),
+            value(true, tag("players may ")),
+            value(true, tag("any player may ")),
+            value(false, tag("")),
+        ))
+        .parse(i)?;
+        let (i, _) = tag("cast ").parse(i)?;
+        // "[type] spells as though they had flash" — the bare "spells" form
+        // (no type prefix) grants flash to every spell (Leyline of Anticipation).
+        let (i, type_part) = alt((
+            value("", tag("spells as though they had flash")),
+            map(
+                terminated(
+                    take_until(" spells as though they had flash"),
+                    tag(" spells as though they had flash"),
+                ),
+                str::trim,
+            ),
+        ))
+        .parse(i)?;
+        let (i, _) = opt(tag(".")).parse(i)?;
+        let (i, _) = eof.parse(i)?;
+        Ok((i, (type_part.to_string(), all_players)))
+    })?
+    .0;
+
+    // CR 601.3b: scope the grant to the spell class. A bare "spells" grant
+    // applies to every spell the controller casts; a typed grant ("creature
+    // spells") constrains to that type. "Players may" / "Any player may" forms
+    // intentionally remain unscoped, while "you may" forms recurse through
+    // `TargetFilter::Or` via `apply_spell_keyword_subject_constraints`.
+    let base_filter = if type_text.is_empty() {
+        TargetFilter::Typed(TypedFilter::card())
+    } else {
+        let phrase = format!("{type_text} spells");
+        parse_type_phrase(&phrase).0
+    };
+    let affected = if all_players {
+        base_filter
+    } else {
+        apply_spell_keyword_subject_constraints(base_filter, None, None, Vec::new())
+    };
+
+    Some(
+        StaticDefinition::new(StaticMode::CastWithKeyword {
+            keyword: Keyword::Flash,
+        })
+        .affected(affected)
+        .description(text.to_string())
+        .active_zones(vec![Zone::Battlefield]),
+    )
 }
 
 pub(crate) fn apply_spell_keyword_subject_constraints(
@@ -397,6 +527,30 @@ pub(crate) fn parse_chosen_qualifier_subject(tp: &TextPair<'_>) -> Option<Target
     Some(TargetFilter::Typed(typed))
 }
 
+/// CR 613.1f + CR 113.3: Recognize the exact `ExiledBySource` forms of "all
+/// activated abilities of [source]" and return the provider `source` filter.
+/// Returns `None` for forms not yet supported (typed "creature cards exiled with
+/// it", counter-gated exile, battlefield filters) so they stay a loud gap rather
+/// than over-granting. `lower` is the already-lowercased predicate.
+fn parse_grant_all_activated_abilities_source(
+    lower: &str,
+) -> Option<crate::types::ability::TargetFilter> {
+    let p = lower.trim().trim_end_matches('.').trim();
+    all_consuming(preceded(
+        tag::<_, _, OracleError<'_>>("all activated abilities of "),
+        alt((
+            value(TargetFilter::ExiledBySource, tag("the exiled card")),
+            value(
+                TargetFilter::ExiledBySource,
+                (tag("all cards exiled with "), alt((tag("it"), tag("~")))),
+            ),
+        )),
+    ))
+    .parse(p)
+    .ok()
+    .map(|(_, source)| source)
+}
+
 pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModification> {
     // Strip "where X is [quantity]" before parsing modifications,
     // but only if the text doesn't contain quoted abilities (which have their
@@ -413,6 +567,16 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
     let unquoted_text = strip_quoted_segments(text_stripped);
     let unquoted_lower = unquoted_text.to_lowercase();
     let unquoted_tp = TextPair::new(&unquoted_text, &unquoted_lower);
+
+    // CR 613.1f + CR 113.3: "all activated abilities of [the exiled card | all
+    // cards exiled with it]" — grant the host all activated abilities of the
+    // cards exiled with it (Myr Welder, Territory Forge). First pass recognizes
+    // only the exact `ExiledBySource` forms; typed ("creature cards exiled with
+    // it"), counter-gated, and battlefield sources stay a gap (follow-ups).
+    if let Some(source) = parse_grant_all_activated_abilities_source(unquoted_tp.lower) {
+        return vec![ContinuousModification::GrantAllActivatedAbilitiesOf { source }];
+    }
+
     let mut modifications = Vec::new();
 
     // CR 205.1a + CR 613.1d/f: "loses all [other] abilities, card types, and
@@ -466,6 +630,17 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
         modifications.push(ContinuousModification::AssignDamageFromToughness);
     }
 
+    // CR 701.15b: Positive goaded designation on token anaphors and compound
+    // statics ("The tokens are goaded for the rest of the game", Life of the
+    // Party; "Enchanted creature … is goaded").
+    if nom_primitives::scan_contains(unquoted_lower.as_str(), "is goaded")
+        || nom_primitives::scan_contains(unquoted_lower.as_str(), "are goaded")
+    {
+        modifications.push(ContinuousModification::AddStaticMode {
+            mode: StaticMode::Goaded,
+        });
+    }
+
     // CR 702.73a + CR 205.3 + CR 613.1d: Conjunctive "is/are every creature
     // type" predicate — the Changeling-class type grant when it appears as
     // one conjunct in an Aura/Equipment compound static ("Enchanted creature
@@ -508,6 +683,38 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
     }
     if let Some(toughness) = parse_base_toughness_mod(&unquoted_text) {
         modifications.push(ContinuousModification::SetToughness { value: toughness });
+    }
+
+    // CR 509.1b + CR 613.4b: "can't be blocked [this turn] and has/have base power
+    // and toughness N/N" — the restriction conjunct precedes the base-PT conjunct.
+    // `extract_keyword_clause` only recovers the trailing conjunct, so scan the
+    // leading restriction explicitly (Atomic Microsizer).
+    if let Some((restriction_text, _)) =
+        nom_primitives::scan_split_at_phrase(&unquoted_lower, |i| {
+            (
+                tag("and "),
+                alt((tag("has"), tag("have"))),
+                tag(" base power"),
+            )
+                .parse(i)
+        })
+    {
+        let restriction_text = restriction_text.trim();
+        if let Some(modes) = parse_restriction_modes(restriction_text) {
+            for mode in modes {
+                if static_mode_needs_grant_propagation(&mode)
+                    && !modifications.iter().any(|existing| {
+                        matches!(
+                            existing,
+                            ContinuousModification::AddStaticMode { mode: existing_mode }
+                                if *existing_mode == mode
+                        )
+                    })
+                {
+                    modifications.push(ContinuousModification::AddStaticMode { mode });
+                }
+            }
+        }
     }
 
     for modification in parse_quoted_ability_modifications(text_stripped) {
@@ -634,6 +841,21 @@ pub(crate) fn push_grant_clause_modifications(
         return;
     }
 
+    // CR 702.18a / 702.11a: a descriptive "can't be the target [of ...]" grant is
+    // Shroud (blanket) or Hexproof (opponents only). Emit the keyword so the
+    // existing targeting checks apply the correct controller scope, rather than a
+    // scope-less rule static.
+    if let Some(scope) =
+        crate::parser::oracle_keyword::classify_cant_be_targeted(part_lower.as_str())
+    {
+        let keyword = match scope {
+            crate::parser::oracle_keyword::CantBeTargetedScope::AnyPlayer => Keyword::Shroud,
+            crate::parser::oracle_keyword::CantBeTargetedScope::OpponentsOnly => Keyword::Hexproof,
+        };
+        modifications.push(ContinuousModification::AddKeyword { keyword });
+        return;
+    }
+
     if let Some(modes) = parse_restriction_modes(part_lower.as_str()) {
         for mode in modes {
             if static_mode_needs_grant_propagation(&mode) {
@@ -729,7 +951,11 @@ pub(crate) fn classify_quoted_inner(ability_text: &str) -> Vec<ContinuousModific
 
 /// CR 702: Split a keyword list like "flying and first strike" into individual keywords.
 pub(crate) fn split_keyword_list(text: &str) -> Vec<Cow<'_, str>> {
-    let text = text.trim().trim_end_matches('.');
+    // Strip both trailing periods and trailing commas. A comma tail arises when
+    // `strip_quoted_segments` removes `and "Whenever..."` from the end of a list
+    // like "has first strike, trample, haste, and \"Whenever...\""— the connector
+    // `, and` is dropped but the comma after the last bare keyword remains.
+    let text = text.trim().trim_end_matches(['.', ',']).trim();
     // Split on ", and/or ", ", and ", " and ", or ", " — longest-match-first
     // ordering prevents ", and " from consuming the prefix of ", and/or ".
     let mut parts: Vec<&str> = Vec::new();

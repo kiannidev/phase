@@ -19,7 +19,7 @@ use engine::types::ability::{Duration, TargetRef};
 use engine::types::actions::{AlternativeCastDecision, GameAction};
 use engine::types::card_type::CoreType;
 use engine::types::counter::CounterType;
-use engine::types::game_state::{AlternativeCastKeyword, WaitingFor};
+use engine::types::game_state::{AlternativeCastKeyword, CastPaymentMode, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::{Keyword, KeywordKind};
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
@@ -179,6 +179,8 @@ fn cast_with_awaken(runner: &mut GameRunner, spell: ObjectId, land: ObjectId, cr
             object_id: spell,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("cast Rush of Ice");
     assert!(
@@ -303,7 +305,10 @@ fn e2_awaken_animation_persists_across_turns() {
             break;
         }
         let action = match runner.state().waiting_for {
-            WaitingFor::DeclareAttackers { .. } => GameAction::DeclareAttackers { attacks: vec![] },
+            WaitingFor::DeclareAttackers { .. } => GameAction::DeclareAttackers {
+                attacks: vec![],
+                bands: vec![],
+            },
             WaitingFor::DeclareBlockers { .. } => GameAction::DeclareBlockers {
                 assignments: vec![],
             },
@@ -401,6 +406,8 @@ fn e4_normal_cast_does_not_awaken() {
             object_id: spell,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("cast");
     assert!(
@@ -497,6 +504,8 @@ fn e5_awaken_offer_suppressed_without_legal_land() {
             object_id: spell,
             card_id,
             targets: vec![],
+
+            payment_mode: CastPaymentMode::Auto,
         })
         .expect("cast");
 

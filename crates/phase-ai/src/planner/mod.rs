@@ -7,6 +7,7 @@ use engine::ai_support::{
 };
 use engine::game::engine::apply_as_current;
 use engine::game::players;
+use engine::types::counter::{has_positive_counters, positive_counter_entries};
 use engine::types::game_state::{DayNight, GameState, WaitingFor};
 use engine::types::player::PlayerId;
 
@@ -191,17 +192,21 @@ pub fn quick_state_hash(state: &GameState) -> u64 {
             obj.toughness.hash(&mut hasher);
             obj.damage_marked.hash(&mut hasher);
             obj.controller.hash(&mut hasher);
-            // Counters: HashMap iteration order is non-deterministic,
-            // so hash count + sorted entries for stability.
+            // Counters: HashMap iteration order is non-deterministic, so hash
+            // count + sorted positive-count entries for stability. Internal
+            // zero-count map keys are absent markers under the engine's counter
+            // model and must not perturb AI cache keys.
             // Sort by as_str() to break ties between Generic variants.
-            obj.counters.len().hash(&mut hasher);
-            if !obj.counters.is_empty() {
-                let mut counter_entries: Vec<_> = obj.counters.iter().collect();
-                counter_entries.sort_by_key(|(ct, _)| ct.as_str());
-                for (ct, count) in counter_entries {
-                    ct.hash(&mut hasher);
+            if has_positive_counters(&obj.counters) {
+                let mut counter_entries: Vec<_> = positive_counter_entries(&obj.counters).collect();
+                counter_entries.sort_by_key(|(counter_type, _)| counter_type.as_str());
+                counter_entries.len().hash(&mut hasher);
+                for (counter_type, count) in counter_entries {
+                    counter_type.hash(&mut hasher);
                     count.hash(&mut hasher);
                 }
+            } else {
+                0usize.hash(&mut hasher);
             }
         }
     }
@@ -216,18 +221,64 @@ pub fn quick_state_hash(state: &GameState) -> u64 {
 /// on `state.waiting_for` (e.g., `Priority` vs `TargetSelection` vs
 /// `ModeChoice`), so two states with identical boards but different
 /// `waiting_for` would collide in a hash keyed only on board state and return
-/// a cached context populated with wrong candidates. Including the full
-/// `WaitingFor` payload in the key (via its `Debug` serialization) is
-/// conservative — the Debug output is a complete structural fingerprint and
-/// is stable within a run.
+/// a cached context populated with wrong candidates. Include the full
+/// `WaitingFor` payload as a canonical structural projection; map keys are
+/// sorted so hash-equal waiting states do not depend on `HashMap` iteration
+/// order.
 pub fn candidate_cache_key(state: &GameState) -> u64 {
     let mut hasher = DefaultHasher::new();
     quick_state_hash(state).hash(&mut hasher);
-    // Hash the full Debug form of waiting_for. Debug on WaitingFor is a
-    // structural serialization (derived), so distinct variants and payloads
-    // produce distinct strings.
-    format!("{:?}", state.waiting_for).hash(&mut hasher);
+    hash_waiting_for(&state.waiting_for, &mut hasher);
     hasher.finish()
+}
+
+fn hash_waiting_for(waiting_for: &WaitingFor, hasher: &mut impl Hasher) {
+    let value = serde_json::to_value(waiting_for).expect("WaitingFor serializes");
+    hash_json_value(&value, hasher);
+}
+
+fn hash_json_value(value: &serde_json::Value, hasher: &mut impl Hasher) {
+    match value {
+        serde_json::Value::Null => 0u8.hash(hasher),
+        serde_json::Value::Bool(value) => {
+            1u8.hash(hasher);
+            value.hash(hasher);
+        }
+        serde_json::Value::Number(value) => {
+            2u8.hash(hasher);
+            if let Some(value) = value.as_i64() {
+                0u8.hash(hasher);
+                value.hash(hasher);
+            } else if let Some(value) = value.as_u64() {
+                1u8.hash(hasher);
+                value.hash(hasher);
+            } else if let Some(value) = value.as_f64() {
+                2u8.hash(hasher);
+                value.to_bits().hash(hasher);
+            }
+        }
+        serde_json::Value::String(value) => {
+            3u8.hash(hasher);
+            value.hash(hasher);
+        }
+        serde_json::Value::Array(values) => {
+            4u8.hash(hasher);
+            values.len().hash(hasher);
+            for value in values {
+                hash_json_value(value, hasher);
+            }
+        }
+        serde_json::Value::Object(entries) => {
+            5u8.hash(hasher);
+            entries.len().hash(hasher);
+            let mut entries: Vec<_> = entries.iter().collect();
+            entries.sort_by_key(|(left, _)| *left);
+            for (key, value) in entries {
+                key.hash(hasher);
+                hash_json_value(value, hasher);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -310,7 +361,10 @@ impl<'a> PlannerServices<'a> {
             OpponentModel::SampledReply => Box::new(SampledReplyUtilityReducer),
         };
 
-        let deadline = match (config.search.deterministic, config.search.time_budget_ms) {
+        let deadline = match (
+            config.execution_mode.is_measurement(),
+            config.search.time_budget_ms,
+        ) {
             (false, Some(ms)) => engine::util::Deadline::after(ms),
             _ => engine::util::Deadline::none(),
         };
@@ -403,6 +457,7 @@ impl<'a> PlannerServices<'a> {
                 // Skipping the clone+simulate eliminates ~2 state clones per mulligan step.
                 engine::types::actions::GameAction::MulliganDecision { .. } => true,
                 _ => {
+                    engine::game::perf_counters::record_state_clone_for_legality();
                     let mut sim = state.clone();
                     apply_as_current(&mut sim, candidate.action.clone()).is_ok()
                 }
@@ -911,10 +966,12 @@ mod tests {
     use engine::game::zones::create_object;
     use engine::types::actions::{GameAction, MulliganChoice};
     use engine::types::card_type::CoreType;
+    use engine::types::counter::CounterType;
     use engine::types::game_state::WaitingFor;
-    use engine::types::identifiers::CardId;
+    use engine::types::identifiers::{CardId, ObjectId};
     use engine::types::phase::Phase;
     use engine::types::zones::Zone;
+    use std::collections::HashMap;
 
     use crate::config::{create_config, AiDifficulty, Platform};
 
@@ -928,6 +985,59 @@ mod tests {
             player: PlayerId(0),
         };
         state
+    }
+
+    #[test]
+    fn candidate_cache_key_hashes_waiting_for_payload() {
+        let state = make_state();
+        let mut same = state.clone();
+        let mut different = state.clone();
+        different.waiting_for = WaitingFor::Priority {
+            player: PlayerId(1),
+        };
+
+        assert_eq!(candidate_cache_key(&state), candidate_cache_key(&same));
+        assert_ne!(candidate_cache_key(&state), candidate_cache_key(&different));
+
+        same.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        assert_eq!(candidate_cache_key(&state), candidate_cache_key(&same));
+    }
+
+    #[test]
+    fn candidate_cache_key_canonicalizes_waiting_for_maps() {
+        let mut left_targets = HashMap::new();
+        left_targets.insert(ObjectId(10), vec![ObjectId(1), ObjectId(2)]);
+        left_targets.insert(ObjectId(20), vec![ObjectId(3)]);
+        let mut left_requirements = HashMap::new();
+        left_requirements.insert(ObjectId(10), 2);
+        left_requirements.insert(ObjectId(20), 1);
+
+        let mut right_targets = HashMap::new();
+        right_targets.insert(ObjectId(20), vec![ObjectId(3)]);
+        right_targets.insert(ObjectId(10), vec![ObjectId(1), ObjectId(2)]);
+        let mut right_requirements = HashMap::new();
+        right_requirements.insert(ObjectId(20), 1);
+        right_requirements.insert(ObjectId(10), 2);
+
+        let mut left = make_state();
+        left.waiting_for = WaitingFor::DeclareBlockers {
+            player: PlayerId(0),
+            valid_blocker_ids: vec![ObjectId(30)],
+            valid_block_targets: left_targets,
+            block_requirements: left_requirements,
+        };
+
+        let mut right = make_state();
+        right.waiting_for = WaitingFor::DeclareBlockers {
+            player: PlayerId(0),
+            valid_blocker_ids: vec![ObjectId(30)],
+            valid_block_targets: right_targets,
+            block_requirements: right_requirements,
+        };
+
+        assert_eq!(candidate_cache_key(&left), candidate_cache_key(&right));
     }
 
     #[test]
@@ -995,6 +1105,44 @@ mod tests {
     }
 
     #[test]
+    fn quick_state_hash_ignores_stale_zero_count_counter_entries() {
+        let mut absent = make_state();
+        let object_id = create_object(
+            &mut absent,
+            CardId(1),
+            PlayerId(0),
+            "Creature".to_string(),
+            Zone::Battlefield,
+        );
+        absent
+            .objects
+            .get_mut(&object_id)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+
+        let mut stale = absent.clone();
+        stale
+            .objects
+            .get_mut(&object_id)
+            .unwrap()
+            .counters
+            .insert(CounterType::Plus1Plus1, 0);
+
+        let mut positive = absent.clone();
+        positive
+            .objects
+            .get_mut(&object_id)
+            .unwrap()
+            .counters
+            .insert(CounterType::Plus1Plus1, 1);
+
+        assert_eq!(quick_state_hash(&absent), quick_state_hash(&stale));
+        assert_ne!(quick_state_hash(&absent), quick_state_hash(&positive));
+    }
+
+    #[test]
     fn planner_services_produce_positive_normalized_priors() {
         let state = make_state();
         let config = create_config(AiDifficulty::VeryHard, Platform::Native);
@@ -1035,9 +1183,9 @@ mod tests {
 
         let priors = services.policy_priors(&state, &decision, &candidates, PlayerId(0));
         assert_eq!(priors.len(), 2);
-        assert!(priors
-            .iter()
-            .all(|prior| prior.prior.is_finite() && prior.prior > 0.0));
+        assert!(priors.iter().all(|prior| prior.prior.is_finite()));
+        assert!(priors.iter().any(|prior| prior.prior > 0.0));
+        assert_eq!(priors[0].prior, 0.0);
         assert!(priors[1].prior > priors[0].prior);
     }
 

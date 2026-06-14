@@ -7,6 +7,7 @@ use super::{
     anthem::*, cda::*, cost_mod::*, evasion::*, keyword_grant::*, loyalty::*, mana_transform::*,
     restriction::*, type_change::*,
 };
+use crate::types::statics::ProhibitionScope;
 
 /// Whether the inverted `"As long as <cond>, <effect>"` detector may fire.
 ///
@@ -20,6 +21,181 @@ pub(crate) enum InvertedAsLongAs {
     Allow,
     Skip,
 }
+
+/// Single authority for recognizing the speed-cap-lift sentence
+/// "Your speed can increase beyond 4" (with or without the trailing period).
+///
+/// CR 702.179d–e: a player's speed normally tops out at 4 (the inherent
+/// speed trigger stops at "less than 4", and "max speed" means exactly 4);
+/// this static lifts that cap. The routing call sites in `oracle.rs` and the
+/// semantic parse in [`parse_static_line_inner`] all delegate here — never
+/// re-encode the phrase as a string literal elsewhere.
+pub(crate) fn is_speed_unlock_sentence(lower: &str) -> bool {
+    all_consuming(terminated(
+        tag::<_, _, OracleError<'_>>("your speed can increase beyond 4"),
+        opt(tag(".")),
+    ))
+    .parse(lower)
+    .is_ok()
+}
+
+fn parse_each_other_players_untap_step_suffix(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        all_consuming((
+            space1,
+            alt((
+                tag("during each other player's untap step"),
+                tag("during each other player\u{2019}s untap step"),
+            )),
+            opt(tag(".")),
+            space0,
+        )),
+    )
+    .parse(input)
+}
+
+#[derive(Clone, Copy)]
+enum AllPlayerStepSkipSubject {
+    Players,
+    EachPlayer,
+}
+
+fn parse_all_player_step_skip_subject(input: &str) -> OracleResult<'_, AllPlayerStepSkipSubject> {
+    alt((
+        value(AllPlayerStepSkipSubject::Players, tag("players")),
+        value(AllPlayerStepSkipSubject::EachPlayer, tag("each player")),
+    ))
+    .parse(input)
+}
+
+fn parse_all_player_step_skip_verb(
+    subject: AllPlayerStepSkipSubject,
+    input: &str,
+) -> OracleResult<'_, ()> {
+    match subject {
+        AllPlayerStepSkipSubject::Players => value((), tag("skip")).parse(input),
+        AllPlayerStepSkipSubject::EachPlayer => value((), tag("skips")).parse(input),
+    }
+}
+
+fn parse_all_player_skip_step(input: &str) -> OracleResult<'_, Phase> {
+    let (input, subject) = parse_all_player_step_skip_subject(input)?;
+    let (input, _) = space1.parse(input)?;
+    let (input, _) = parse_all_player_step_skip_verb(subject, input)?;
+    let (input, _) = space1.parse(input)?;
+    let (input, _) = tag("their").parse(input)?;
+    let (input, _) = space1.parse(input)?;
+    let (input, step) = parse_step_name_nom(input)?;
+    let (input, _) = opt(tag("s")).parse(input)?;
+    Ok((input, step))
+}
+
+fn parse_skip_step_static(tp: &TextPair<'_>, text: &str) -> Option<StaticDefinition> {
+    // CR 614.1b + CR 614.10: continuous static replacement effects that
+    // replace a named step with nothing. Keep the subject axis explicit so
+    // controller-scoped "your" and all-player "players/their" text share the
+    // same StaticMode without over-broadening either one.
+    let (_, (affected, step)) = all_consuming(terminated(
+        alt((
+            map(
+                preceded(
+                    tag::<_, _, OracleError<'_>>("skip your "),
+                    parse_step_name_nom,
+                ),
+                |step| (TargetFilter::Controller, step),
+            ),
+            map(parse_all_player_skip_step, |step| {
+                (TargetFilter::Player, step)
+            }),
+        )),
+        opt(tag(".")),
+    ))
+    .parse(tp.lower)
+    .ok()?;
+
+    Some(
+        StaticDefinition::new(StaticMode::SkipStep { step })
+            .affected(affected)
+            .description(text.to_string()),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum RevealHandSubject {
+    Opponents,
+    Players,
+    AllPlayers,
+    EachPlayer,
+    Controller,
+}
+
+fn parse_reveal_hand_subject(input: &str) -> OracleResult<'_, RevealHandSubject> {
+    alt((
+        value(RevealHandSubject::Opponents, tag("your opponents")),
+        value(RevealHandSubject::AllPlayers, tag("all players")),
+        value(RevealHandSubject::Players, tag("players")),
+        value(RevealHandSubject::EachPlayer, tag("each player")),
+        map(opt(tag("you")), |_| RevealHandSubject::Controller),
+    ))
+    .parse(input)
+}
+
+fn parse_reveal_hand_verb(subject: RevealHandSubject, input: &str) -> OracleResult<'_, ()> {
+    match subject {
+        RevealHandSubject::Opponents
+        | RevealHandSubject::Players
+        | RevealHandSubject::AllPlayers
+        | RevealHandSubject::Controller => value((), tag("play with")).parse(input),
+        RevealHandSubject::EachPlayer => value((), tag("plays with")).parse(input),
+    }
+}
+
+fn parse_reveal_hand_possessive(subject: RevealHandSubject, input: &str) -> OracleResult<'_, ()> {
+    match subject {
+        RevealHandSubject::Controller => value((), tag("your")).parse(input),
+        RevealHandSubject::Opponents
+        | RevealHandSubject::Players
+        | RevealHandSubject::AllPlayers
+        | RevealHandSubject::EachPlayer => value((), tag("their")).parse(input),
+    }
+}
+
+fn reveal_hand_scope(subject: RevealHandSubject) -> ProhibitionScope {
+    match subject {
+        RevealHandSubject::Opponents => ProhibitionScope::Opponents,
+        RevealHandSubject::Players
+        | RevealHandSubject::AllPlayers
+        | RevealHandSubject::EachPlayer => ProhibitionScope::AllPlayers,
+        RevealHandSubject::Controller => ProhibitionScope::Controller,
+    }
+}
+
+fn parse_reveal_hand_scope(input: &str) -> OracleResult<'_, ProhibitionScope> {
+    let (input, subject) = parse_reveal_hand_subject(input)?;
+    let (input, _) = space0(input)?;
+    let (input, _) = parse_reveal_hand_verb(subject, input)?;
+    let (input, _) = space1(input)?;
+    let (input, _) = parse_reveal_hand_possessive(subject, input)?;
+    let (input, _) = space1(input)?;
+    let (input, _) = alt((tag("hands"), tag("hand"))).parse(input)?;
+    let (input, _) = space1(input)?;
+    let (input, _) = tag("revealed").parse(input)?;
+    Ok((input, reveal_hand_scope(subject)))
+}
+
+fn parse_reveal_hand_static(tp: &TextPair<'_>, text: &str) -> Option<StaticDefinition> {
+    let (_, who) = all_consuming(terminated(parse_reveal_hand_scope, (opt(tag(".")), space0)))
+        .parse(tp.lower)
+        .ok()?;
+
+    Some(
+        StaticDefinition::new(StaticMode::RevealHand { who })
+            .affected(TargetFilter::SelfRef)
+            .description(text.to_string()),
+    )
+}
+
 pub(crate) fn parse_static_line_inner(
     text: &str,
     inverted: InvertedAsLongAs,
@@ -44,6 +220,18 @@ pub(crate) fn parse_static_line_inner(
     }
     if let Some(def) = parse_collection_counter_play_permission_static(&tp, &text) {
         return Some(def);
+    }
+
+    // CR 601.2f + CR 118.8: Static-imposed additional non-mana costs must dispatch
+    // before generic cost-mod and restriction arms that share "cost"/"spells" tokens.
+    // Use word-boundary scans only on phrases that start a token; numeric life amounts
+    // sit immediately before "life" without a leading space ("3 life to cast").
+    if nom_primitives::scan_contains(tp.lower, "cost an additional")
+        && nom_primitives::scan_contains(tp.lower, "life to cast")
+    {
+        if let Some(def) = try_parse_impose_additional_cost(&text, &lower) {
+            return Some(def);
+        }
     }
 
     if let Some(mode) = parse_max_combat_creatures_static(&lower) {
@@ -90,8 +278,48 @@ pub(crate) fn parse_static_line_inner(
             if let Some(def) = try_parse_inverted_attached_subject_grant(&split, &text) {
                 return Some(def);
             }
+            // CR 400.2 + CR 701.20a: "As long as <condition>, all players
+            // play with their hands revealed." The generic continuous fallback
+            // can otherwise accept the canonical rewrite before this data-
+            // carrying static sees the isolated effect clause.
+            {
+                let effect_lower = split.effect_text.to_lowercase();
+                let tp_effect = TextPair::new(&split.effect_text, &effect_lower);
+                if let Some(mut def) = parse_reveal_hand_static(&tp_effect, &split.effect_text) {
+                    let condition = parse_static_condition(&split.condition_text).unwrap_or(
+                        StaticCondition::Unrecognized {
+                            text: split.condition_text.clone(),
+                        },
+                    );
+                    def.condition = Some(condition);
+                    def.description = Some(text.to_string());
+                    return Some(def);
+                }
+            }
             if let Some(def) = parse_static_line_inner(&split.canonical, InvertedAsLongAs::Skip) {
                 return Some(def.description(text.to_string()));
+            }
+            // CR 601.3b + CR 702.8a: Inverted flash-grant conditional:
+            // "As long as X, you may cast [type] spells as though they had flash."
+            // The recursed call above fails because `parse_cast_as_though_flash_static`
+            // uses `eof` and the canonical form carries a trailing condition clause.
+            // Try the flash parser against the isolated effect slice; if it succeeds,
+            // attach the condition from the split.
+            {
+                let effect_lower = split.effect_text.to_lowercase();
+                let tp_effect = TextPair::new(&split.effect_text, &effect_lower);
+                if let Some(mut def) =
+                    parse_cast_as_though_flash_static(&tp_effect, &split.effect_text)
+                {
+                    let condition = parse_static_condition(&split.condition_text).unwrap_or(
+                        StaticCondition::Unrecognized {
+                            text: split.condition_text.clone(),
+                        },
+                    );
+                    def.condition = Some(condition);
+                    def.description = Some(text.to_string());
+                    return Some(def);
+                }
             }
             // Rewrite succeeded (we cleanly separated condition from effect), but the
             // recursed parser could not model the effect clause. Produce a generic
@@ -121,9 +349,7 @@ pub(crate) fn parse_static_line_inner(
         return Some(def);
     }
 
-    if tp.lower == "your speed can increase beyond 4."
-        || tp.lower == "your speed can increase beyond 4"
-    {
+    if is_speed_unlock_sentence(tp.lower) {
         return Some(
             StaticDefinition::new(StaticMode::SpeedCanIncreaseBeyondFour)
                 .affected(TargetFilter::Player)
@@ -179,6 +405,18 @@ pub(crate) fn parse_static_line_inner(
     // wider class (any frequency, any mana-value comparator) so future
     // printings slot in without parser changes.
     if let Some(result) = try_parse_exile_cast_permission(&text, &lower) {
+        return Some(result);
+    }
+
+    // CR 113.6b + CR 305.1 + CR 406.6 + CR 117.1c: Persistent, name-anchored
+    // exile-play permission — "[During your turn, ]you may play lands and cast
+    // spells from among cards exiled with ~." (The Matrix of Time) and the
+    // "you may look at cards exiled with ~, and you may play lands and cast
+    // spells from among those cards." variant (Prosper/Tibalt impulse-commander
+    // class). Lowers to `ExileCastPermission { pool: Persistent, play_mode:
+    // Play, frequency: Unlimited }` reading the lifetime `exile_links` set,
+    // distinct from the Maralen "this turn" rolling-pool handler above.
+    if let Some(result) = try_parse_persistent_exile_play_permission(&text, &lower) {
         return Some(result);
     }
 
@@ -240,18 +478,11 @@ pub(crate) fn parse_static_line_inner(
         // which handles the full range of type + controller phrases.
         let (filter, remainder) = parse_type_phrase(rest.original);
         let remainder_lower = remainder.to_lowercase();
-        // Accept "during each other player's untap step" with straight and curly apostrophes.
-        let tail = remainder_lower.trim().trim_end_matches('.');
-        let during_ok = nom_on_lower(tail, tail, |i| {
-            value(
-                (),
-                alt((
-                    tag("during each other player's untap step"),
-                    tag("during each other player\u{2019}s untap step"),
-                )),
-            )
-            .parse(i)
-        })
+        let during_ok = nom_on_lower(
+            remainder,
+            &remainder_lower,
+            parse_each_other_players_untap_step_suffix,
+        )
         .is_some();
         // Require the subject filter to be controlled by "you" — rules text
         // variations outside this ("each player's permanents") would not be
@@ -266,6 +497,36 @@ pub(crate) fn parse_static_line_inner(
                     .affected(filter)
                     .description(text.to_string()),
             );
+        }
+    }
+
+    // --- "Untap this <permanent> during each other player's untap step." ---
+    // CR 502.3 + CR 113.6: the self-referential Seedborn-class variant (Bender's
+    // Waterskin: "Untap this artifact during each other player's untap step").
+    // Shares the runtime of the "untap all" form
+    // (`StaticMode::UntapsDuringEachOtherPlayersUntapStep`), but the affected
+    // filter is the source itself (`SelfRef`) so its controller untaps only it
+    // during every other player's untap step. Ordered after the "untap all" arm
+    // — the typed "you control" subject and these self-reference subjects are
+    // disjoint, so neither shadows the other.
+    if let Some(rest) = nom_tag_tp(&tp, "untap ") {
+        let self_subject =
+            nom_on_lower(rest.original, rest.lower, nom_target::parse_self_reference);
+        if let Some((TargetFilter::SelfRef, remainder)) = self_subject {
+            let remainder_lower = remainder.to_lowercase();
+            let during_ok = nom_on_lower(
+                remainder,
+                &remainder_lower,
+                parse_each_other_players_untap_step_suffix,
+            )
+            .is_some();
+            if during_ok {
+                return Some(
+                    StaticDefinition::new(StaticMode::UntapsDuringEachOtherPlayersUntapStep)
+                        .affected(TargetFilter::SelfRef)
+                        .description(text.to_string()),
+                );
+            }
         }
     }
 
@@ -288,16 +549,15 @@ pub(crate) fn parse_static_line_inner(
         }
     }
 
-    // --- "Skip your [step] step" ---
-    // CR 614.1b + CR 614.10: Replacement effect that replaces the named step with nothing.
-    if let Some(rest_tp) = nom_tag_tp(&tp, "skip your ") {
-        if let Some(step) = parse_step_name(rest_tp.lower.trim_end_matches('.')) {
-            return Some(
-                StaticDefinition::new(StaticMode::SkipStep { step })
-                    .affected(TargetFilter::SelfRef)
-                    .description(text.to_string()),
-            );
-        }
+    // --- "Your opponents/Players play with their hands revealed" ---
+    // CR 400.2 + CR 701.20a: continuous effect making hand cards public.
+    if let Some(def) = parse_reveal_hand_static(&tp, &text) {
+        return Some(def);
+    }
+
+    // --- "Skip your [step] step" / "Players skip their [step] steps" ---
+    if let Some(def) = parse_skip_step_static(&tp, &text) {
+        return Some(def);
     }
 
     // CR 402.2 + CR 514.1: Maximum hand size modification.
@@ -355,6 +615,12 @@ pub(crate) fn parse_static_line_inner(
         {
             return Some(def);
         }
+    }
+
+    // CR 305.7 + CR 305.6: "Enchanted land is the chosen type" — Aura sets the
+    // enchanted land's subtype to the basic land type chosen as the Aura entered.
+    if let Some(def) = parse_enchanted_land_chosen_type_static(&tp, &text) {
+        return Some(def);
     }
 
     // CR 305.7: "Enchanted land is a [type]" — must be before general "enchanted land" handler.
@@ -421,9 +687,47 @@ pub(crate) fn parse_static_line_inner(
     // and leave "attacking you <predicate>" as input to `parse_continuous_gets_has`,
     // which expects a verb ("gets"/"has"/"is"), not a subject continuation.
     if let Some(rest) = nom_tag_tp(&tp, "all creatures attacking you ") {
-        let filter = TargetFilter::Typed(
-            TypedFilter::creature().properties(vec![FilterProp::AttackingController]),
-        );
+        let filter =
+            TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::Attacking {
+                    defender: Some(ControllerRef::You),
+                }]),
+            );
+        if let Some(def) = parse_continuous_gets_has(rest.original, filter, &text) {
+            return Some(def);
+        }
+    }
+
+    // CR 508.1b: "Creatures attacking you <predicate>" — same defender scope as
+    // the "all creatures" form above (Boarded Window, Watchdog-class statics
+    // without the quantifier).
+    if let Some(rest) = nom_tag_tp(&tp, "creatures attacking you ") {
+        let filter =
+            TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::Attacking {
+                    defender: Some(ControllerRef::You),
+                }]),
+            );
+        if let Some(def) = parse_continuous_gets_has(rest.original, filter, &text) {
+            return Some(def);
+        }
+    }
+
+    // CR 508.1b: "Creatures attacking your opponents [and/or planeswalkers they
+    // control] have/get ..." — attackers whose defending player is an opponent
+    // of the source's controller (Blast-Furnace Hellkite, Neyali).
+    if let Some(rest) = nom_tag_tp(
+        &tp,
+        "creatures attacking your opponents and/or planeswalkers they control ",
+    )
+    .or_else(|| nom_tag_tp(&tp, "creatures attacking your opponents "))
+    {
+        let filter =
+            TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::Attacking {
+                    defender: Some(ControllerRef::Opponent),
+                }]),
+            );
         if let Some(def) = parse_continuous_gets_has(rest.original, filter, &text) {
             return Some(def);
         }
@@ -508,6 +812,14 @@ pub(crate) fn parse_static_line_inner(
 
     // --- "Each creature you control [with condition] assigns combat damage equal to its toughness" ---
     // CR 510.1c: Doran-class effects that cause creatures to use toughness for combat damage.
+    if let Some(rest_tp) = nom_tag_tp(&tp, "during your turn, ") {
+        if let Some(def) = parse_assigns_damage_from_toughness(rest_tp.lower, rest_tp.original) {
+            return Some(
+                def.condition(StaticCondition::DuringYourTurn)
+                    .description(text.to_string()),
+            );
+        }
+    }
     if let Some(def) = parse_assigns_damage_from_toughness(&lower, &text) {
         return Some(def);
     }
@@ -524,6 +836,16 @@ pub(crate) fn parse_static_line_inner(
     }
 
     if let Some(def) = parse_contextual_continuous_subject_static(&tp, &text) {
+        return Some(def);
+    }
+
+    // CR 614.1c + CR 122.1: "[scope] creatures you control enter with an
+    // additional +1/+1 counter on them." Continuous "enters with" replacement
+    // static (Kalain, Bard Class, Gorma the Gullet, Master Chef). The verb here
+    // is "enter", not "get"/"has", so it must dispatch BEFORE the anthem
+    // "creatures you control ..." branches below (which route to
+    // parse_continuous_gets_has and only recognize get/has verbs).
+    if let Some(def) = parse_enters_with_additional_counters(&tp, &text) {
         return Some(def);
     }
 
@@ -691,6 +1013,15 @@ pub(crate) fn parse_static_line_inner(
         if let Some(result) = parse_typed_you_control(tp.original, tp.lower, false) {
             return Some(result);
         }
+    }
+
+    // CR 613.1d + CR 613.4b: "[Subject] lands are [P/T] creatures that are still
+    // lands" — continuous land animation (Living Plane, Nature's Revolt). Must
+    // come before parse_land_type_change: both split on "are", but the land
+    // animation form carries a creature descriptor the type-change parser can't
+    // claim. The "creature" guard lets land *type* lines fall through.
+    if let Some(def) = parse_land_animation(&tp, &text) {
+        return Some(def);
     }
 
     // CR 305.7: "[Subject] lands are [type]" — land type-changing statics.
@@ -1095,8 +1426,61 @@ pub(crate) fn parse_static_line_inner(
         return Some(def);
     }
 
+    // CR 702.122c / 702.171a / 702.184a: crew/saddle/station power-contribution
+    // modifier (Reckoner Bankbuster, Giant Ox, Stoic Star-Captain).
+    if let Some(def) = parse_crew_contribution_static(&text) {
+        return Some(def);
+    }
+
     if let Some(def) = parse_source_power_block_restriction(&text) {
         return Some(def);
+    }
+
+    // CR 506.5 + CR 508.1c: "~ can only attack alone" — CombatAlone(Attack, MustBeSole).
+    // The creature may attack only if it is the sole attacker (Master of Cruelties).
+    // Must precede the generic "can't attack" arm to avoid mis-dispatch.
+    if let Some((_, _, rest)) = nom_primitives::scan_preceded(tp.lower, |i: &str| {
+        let (i, _) = tag::<_, _, OracleError<'_>>("can only attack alone").parse(i)?;
+        let (i, _) = opt(tag::<_, _, OracleError<'_>>(".")).parse(i)?;
+        Ok((i, ()))
+    }) {
+        if rest.trim().is_empty() {
+            return Some(
+                StaticDefinition::new(StaticMode::CombatAlone {
+                    action: CombatAloneAction::Attack,
+                    requirement: CombatAloneRequirement::MustBeSole,
+                })
+                .affected(TargetFilter::SelfRef)
+                .description(text.to_string()),
+            );
+        }
+    }
+
+    // CR 506.5 + CR 508.1a + CR 509.1b: "~ can't attack alone" / "~ can't
+    // block alone" / "~ can't attack or block alone".
+    // Must precede the generic "can't block" / "can't attack" arms below, which
+    // would otherwise swallow these as a blanket CantBlock / CantAttack. The
+    // compound "attack or block alone" emits the attack half here so the
+    // single-return path is non-None; `parse_static_line_multi` emits both halves.
+    if let Some((_, restriction, rest)) =
+        nom_primitives::scan_preceded(tp.lower, parse_alone_combat_restriction)
+    {
+        if rest.trim().is_empty() {
+            let action = match restriction {
+                AloneCombatRestriction::Attack | AloneCombatRestriction::AttackOrBlock => {
+                    CombatAloneAction::Attack
+                }
+                AloneCombatRestriction::Block => CombatAloneAction::Block,
+            };
+            return Some(
+                StaticDefinition::new(StaticMode::CombatAlone {
+                    action,
+                    requirement: CombatAloneRequirement::NeedsCompanion,
+                })
+                .affected(TargetFilter::SelfRef)
+                .description(text.to_string()),
+            );
+        }
     }
 
     // --- "~ can't block" ---
@@ -1118,6 +1502,30 @@ pub(crate) fn parse_static_line_inner(
 
     // --- "~ can't attack" ---
     if nom_primitives::scan_contains(tp.lower, "can't attack") {
+        // CR 508.1d: Subject-led lines ("Each creature ... can't attack you") must not
+        // collapse to SelfRef — `parse_subject_combat_rule_static` handles them above.
+        if let Some((subject_lower, _, rest)) =
+            nom_primitives::scan_preceded(tp.lower, parse_cant_attack_rule_static_predicate_nom)
+        {
+            let rest = match opt(tag::<_, _, OracleError<'_>>(".")).parse(rest) {
+                Ok((r, _)) => r,
+                Err(_) => rest,
+            };
+            // Only defer when the line is a fully consumed scoped cant-attack
+            // (Eriette). Trailing "unless"/"if" clauses must still use SelfRef.
+            if rest.trim().is_empty() {
+                let subject = tp.original[..subject_lower.len()].trim();
+                let subject_lower = subject.to_lowercase();
+                if !subject.is_empty()
+                    && subject_lower != "~"
+                    && subject_lower != "it"
+                    && subject_lower != "this"
+                    && !SELF_REF_PARSE_ONLY_PHRASES.contains(&subject_lower.as_str())
+                {
+                    return None;
+                }
+            }
+        }
         let mode = if nom_primitives::scan_contains(tp.lower, "can't attack or block") {
             StaticMode::CantAttackOrBlock
         } else {
@@ -1145,10 +1553,27 @@ pub(crate) fn parse_static_line_inner(
         return Some(def);
     }
 
+    // --- "~ can be attached only to {filter}" ---
+    // CR 301.5 + CR 303.4 + CR 701.3a: Positive attachment restriction on an
+    // Aura/Equipment — the source can only attach to a host matching the parsed
+    // `TargetFilter` (Strata Scythe, Brass Knuckles, Konda's Banner). Enforced in
+    // game/effects/attach.rs::attachment_illegality.
+    if let Some(def) = parse_attach_only_restriction(&tp, &text) {
+        return Some(def);
+    }
+
     // --- "Spells and abilities <scope> can't cause their controller to search their library" ---
     // CR 701.23 + CR 609.3: Ashiok, Dream Render's first static. Subject-scoped
     // prohibition where `cause` identifies whose spells/abilities are muzzled.
     if let Some(def) = parse_cant_search_library(&tp, &text) {
+        return Some(def);
+    }
+
+    // --- "Triggered abilities <scope> can't cause you to sacrifice or exile <affected>" ---
+    // CR 603.2 + CR 609.3: The Master, Multiplied class. Subject-scoped prohibition
+    // where `cause` identifies whose triggered abilities are muzzled and `affected`
+    // identifies the protected objects.
+    if let Some(def) = parse_cant_cause_sacrifice_or_exile(&tp, &text) {
         return Some(def);
     }
 
@@ -1210,14 +1635,27 @@ pub(crate) fn parse_static_line_inner(
     }
 
     // --- "~ can't be the target" or "~ can't be targeted" ---
-    if nom_primitives::scan_contains(tp.lower, "can't be the target")
-        || nom_primitives::scan_contains(tp.lower, "can't be targeted")
-    {
-        return Some(
-            StaticDefinition::new(StaticMode::CantBeTargeted)
-                .affected(TargetFilter::SelfRef)
-                .description(text.to_string()),
-        );
+    // CR 702.18a / 702.11a: these descriptive phrasings ARE Shroud / Hexproof.
+    if let Some(scope) = crate::parser::oracle_keyword::classify_cant_be_targeted(tp.lower) {
+        return Some(match scope {
+            // CR 702.11a: "... your opponents control" — grant Hexproof so the
+            // permanent's own controller can still target it.
+            crate::parser::oracle_keyword::CantBeTargetedScope::OpponentsOnly => {
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::SelfRef)
+                    .modifications(vec![ContinuousModification::AddKeyword {
+                        keyword: Keyword::Hexproof,
+                    }])
+                    .description(text.to_string())
+            }
+            // CR 702.18a: blanket — can't be targeted by any player. Enforced in
+            // `targeting.rs::can_target` via the object's active static definitions.
+            crate::parser::oracle_keyword::CantBeTargetedScope::AnyPlayer => {
+                StaticDefinition::new(StaticMode::CantBeTargeted)
+                    .affected(TargetFilter::SelfRef)
+                    .description(text.to_string())
+            }
+        });
     }
 
     // --- "~ can't be sacrificed" (CR 701.21) ---
@@ -1377,23 +1815,34 @@ pub(crate) fn parse_static_line_inner(
         );
     }
 
-    // --- CR 604.3: "Players can't cast spells from [zones]" ---
-    // e.g., Grafdigger's Cage: "Players can't cast spells from graveyards or libraries."
+    // --- CR 601.3 + CR 101.2 + CR 109.5: "[subject] can't cast spells from [zones]" ---
+    // Two phrasings collapse here, discriminated by the zone clause:
+    // - Explicit list (Grafdigger's Cage): "Players can't cast spells from
+    //   graveyards or libraries." → prohibited = the listed zones.
+    // - Inverse "anywhere other than" (Drannith Magistrate): "Your opponents
+    //   can't cast spells from anywhere other than their hands." → prohibited =
+    //   every cast-capable zone except the named allowed zone.
+    // The subject prefix rides the `who` scope axis via the shared building block.
     if nom_primitives::scan_contains(tp.lower, "can't cast spells from") {
-        let zones = parse_zone_names_from_tp(&tp);
-        let affected = if zones.is_empty() {
-            TargetFilter::Any
-        } else {
-            TargetFilter::Typed(TypedFilter {
+        let who = strip_casting_prohibition_subject(tp.lower)
+            .map(|(scope, _)| scope)
+            .unwrap_or(ProhibitionScope::AllPlayers);
+        // CR 601.2a: Prefer the "anywhere other than" complement; fall back to the
+        // explicit zone list. An empty list (no recognized zone) yields no static —
+        // returning `TargetFilter::Any` here would over-block every zone.
+        let zones = parse_cast_from_anywhere_other_than_tp(&tp)
+            .unwrap_or_else(|| parse_zone_names_from_tp(&tp));
+        if !zones.is_empty() {
+            let affected = TargetFilter::Typed(TypedFilter {
                 properties: vec![FilterProp::InAnyZone { zones }],
                 ..TypedFilter::default()
-            })
-        };
-        return Some(
-            StaticDefinition::new(StaticMode::CantCastFrom)
-                .affected(affected)
-                .description(text.to_string()),
-        );
+            });
+            return Some(
+                StaticDefinition::new(StaticMode::CantCastFrom { who })
+                    .affected(affected)
+                    .description(text.to_string()),
+            );
+        }
     }
 
     // --- CR 101.2: Blanket casting prohibition ("can't cast [type] spells") ---
@@ -1670,15 +2119,12 @@ pub(crate) fn parse_static_line_inner(
         return Some(def);
     }
 
-    // --- "as though it/they had flash" (CR 702.8a) ---
-    if nom_primitives::scan_contains(tp.lower, "as though it had flash")
-        || nom_primitives::scan_contains(tp.lower, "as though they had flash")
-    {
-        return Some(
-            StaticDefinition::new(StaticMode::CastWithFlash)
-                .description(text.to_string())
-                .active_zones(vec![Zone::Battlefield]),
-        );
+    // --- "You may cast [type] spells as though they had flash" (CR 601.3b / CR 702.8a) ---
+    // Emits `CastWithKeyword { Flash }` with the spell-type filter — the only
+    // static mode the flash-timing path (granted_spell_keywords) reads, and the
+    // one that preserves the "creature spells" restriction (issue #1957).
+    if let Some(def) = parse_cast_as_though_flash_static(&tp, &text) {
+        return Some(def);
     }
 
     // --- "[Type] spells you cast [from zone] have [keyword]" (CR 702.51a) ---
@@ -1735,6 +2181,8 @@ pub(crate) fn parse_static_line_inner(
     // CR 603.2d: Trigger doubling — "triggers an additional time".
     //
     // Cause classification by phrasing:
+    // - "being dealt damage causes" / "dealt damage causes" — Wayta, Trainer
+    //   Prodigy (ControlledCreatureDealtDamage).
     // - "attacking causes" — Isshin, Two Heavens as One (CreatureAttacking).
     // - "entering" / "enters the battlefield" / "enters" — Panharmonicon-class
     //   (EntersBattlefield). Panharmonicon itself names "artifact or creature
@@ -1745,7 +2193,11 @@ pub(crate) fn parse_static_line_inner(
     //   unrestricted `Any` cause; the doubler's `affected` filter narrows
     //   which source's triggers qualify.
     if nom_primitives::scan_contains(tp.lower, "triggers an additional time") {
-        let cause = if nom_primitives::scan_contains(tp.lower, "attacking causes") {
+        let cause = if nom_primitives::scan_contains(tp.lower, "being dealt damage causes")
+            || nom_primitives::scan_contains(tp.lower, "dealt damage causes")
+        {
+            TriggerCause::ControlledCreatureDealtDamage
+        } else if nom_primitives::scan_contains(tp.lower, "attacking causes") {
             TriggerCause::CreatureAttacking
         } else if nom_primitives::scan_contains(tp.lower, "dying causes") {
             TriggerCause::CreatureDying
@@ -1791,4 +2243,93 @@ pub(crate) fn parse_static_line_inner(
     }
 
     None
+}
+
+/// CR 614.1c + CR 122.1: Parse a continuous "enters with an additional counter"
+/// replacement static.
+///
+/// Grammar (combinator-composed, one `alt()` per axis of variation):
+/// ```text
+/// <subject> " enter[s] with an additional " <counter> " counter on " <pronoun>
+/// ```
+/// where `<subject>` is a controller-scoped creature phrase
+/// ("[Other|Legendary|Nontoken|Token ]creatures you control"), `<counter>` is a
+/// recognized counter type (currently +1/+1 in shipping printings, but the
+/// strict counter-type combinator admits any recognized type so the class is not
+/// special-cased to one counter), and `<pronoun>` is "them"/"it".
+///
+/// The affected-permanent scope rides on `StaticDefinition::affected` exactly
+/// like the anthem statics — reuse `parse_continuous_subject_filter` so every
+/// Other/Legendary/Nontoken/Token qualifier is handled by the shared subject
+/// parser rather than re-enumerated here. The filter MUST anchor to
+/// `ControllerRef::You` (CR 109.5: "you control"); subjects without that anchor
+/// fall through to leave the line Unimplemented.
+///
+/// FIXED-count form only: a dynamic count (Gev, "for each opponent who lost
+/// life") produces no fixed `<counter>` token and so fails the combinator,
+/// leaving the line Unimplemented until a dynamic-count axis exists.
+fn parse_enters_with_additional_counters(
+    tp: &TextPair<'_>,
+    text: &str,
+) -> Option<StaticDefinition> {
+    // Split the subject from the predicate at the " enter[s] with an additional "
+    // verb phrase, scanned at word boundaries so any controlled-creature subject
+    // length is handled.
+    let (subject_lower, predicate_lower) = nom_primitives::scan_split_at_phrase(tp.lower, |i| {
+        alt((
+            tag::<_, _, OracleError<'_>>("enter with an additional "),
+            tag("enters with an additional "),
+        ))
+        .parse(i)
+    })?;
+
+    // Parse the predicate: verb phrase, counter type, " counter on ", pronoun.
+    fn parse_predicate(i: &str) -> OracleResult<'_, crate::types::counter::CounterType> {
+        let (i, _) = alt((
+            tag::<_, _, OracleError<'_>>("enter with an additional "),
+            tag("enters with an additional "),
+        ))
+        .parse(i)?;
+        let (i, counter_type) = nom_primitives::parse_strict_counter_type(i)?;
+        let (i, _) = tag(" counter on ").parse(i)?;
+        let (i, _) = alt((tag("them"), tag("it"))).parse(i)?;
+        let (i, _) = opt(tag(".")).parse(i)?;
+        Ok((i, counter_type))
+    }
+    let (_rest, counter_type) = all_consuming(parse_predicate)
+        .parse(predicate_lower.trim_end())
+        .ok()?;
+
+    // CR 109.5: the subject must be a controller-scoped ("you control") creature
+    // phrase. Recover the original-case slice so the shared subject parser sees
+    // the printed capitalization (subtypes/supertypes are capitalized in Oracle).
+    let subject_original = tp.original[..subject_lower.len()].trim();
+    let affected = parse_continuous_subject_filter(subject_original)?;
+    if !filter_is_controller_you(&affected) {
+        return None;
+    }
+
+    Some(
+        StaticDefinition::new(StaticMode::EntersWithAdditionalCounters {
+            counter_type,
+            count: 1,
+        })
+        .affected(affected)
+        .description(text.to_string()),
+    )
+}
+
+/// CR 109.5: True when `filter` is anchored to the source's controller via a
+/// `ControllerRef::You` constraint (directly or within an Or/And composition).
+/// Stricter than `filter_has_source_or_controller_anchor`, which also accepts
+/// `Opponent` — "enters with an additional counter" statics are always
+/// "you control" scoped, so an opponent anchor must NOT match.
+fn filter_is_controller_you(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(typed) => typed.controller == Some(ControllerRef::You),
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+            filters.iter().all(filter_is_controller_you)
+        }
+        _ => false,
+    }
 }

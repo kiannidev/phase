@@ -84,6 +84,22 @@ fn strip_spell_not_owned_qualifier(payload: &str) -> (&str, bool) {
         .unwrap_or((payload, false))
 }
 
+/// CR 603.7c: "Whenever a player casts a spell they don't own" — the casting
+/// player is the trigger event's player; the spell must not be owned by them.
+fn strip_spell_they_dont_own_qualifier(payload: &str) -> (&str, bool) {
+    let mut parser = alt((
+        terminated(
+            take_until(" they don't own"),
+            tag::<_, _, OracleError<'_>>(" they don't own"),
+        ),
+        terminated(take_until(" they do not own"), tag(" they do not own")),
+    ));
+    parser
+        .parse(payload)
+        .map(|(body, _)| (body.trim(), true))
+        .unwrap_or((payload, false))
+}
+
 fn with_owner_scope(filter: TargetFilter, controller: ControllerRef) -> TargetFilter {
     match filter {
         TargetFilter::Typed(mut typed) => {
@@ -8132,6 +8148,33 @@ fn try_parse_special_trigger_pattern(lower: &str) -> Option<(TriggerMode, Trigge
         }
     }
 
+    // CR 700.4 + CR 120.1 + CR 608.2i: "another creature dealt damage this turn
+    // by [source filter] dies" (Shelob, Child of Ungoliant).
+    let mut damaged_this_turn_prefix = alt((
+        tag::<_, _, OracleError<'_>>("whenever another creature dealt damage this turn by "),
+        tag("when another creature dealt damage this turn by "),
+    ));
+    if let Ok((rest, _)) = damaged_this_turn_prefix.parse(lower) {
+        if let Some((after_source, source)) =
+            super::oracle_replacement::parse_damage_history_source(rest)
+        {
+            if tag::<_, _, OracleError<'_>>(" dies")
+                .parse(after_source)
+                .is_ok()
+            {
+                let mut def = make_base();
+                def.mode = TriggerMode::ChangesZone;
+                def.origin = Some(Zone::Battlefield);
+                def.destination = Some(Zone::Graveyard);
+                def.valid_card = Some(TargetFilter::Typed(
+                    TypedFilter::creature().properties(vec![FilterProp::Another]),
+                ));
+                def.condition = Some(TriggerCondition::DealtDamageThisTurnBySource { source });
+                return Some((TriggerMode::ChangesZone, def));
+            }
+        }
+    }
+
     // CR 603.8: "when ~ has no [type] counters on it" — state trigger that fires
     // when the source permanent has zero counters of the specified type.
     // Handles: Dark Depths ("has no ice counters"), Afiya Grove ("has no +1/+1
@@ -9663,7 +9706,11 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
                 .map(|(rest, _)| rest)
                 .unwrap_or(after_casts)
                 .trim_start();
-            let spell_clause = after_article;
+            let (spell_clause, spell_not_owned_by_caster) =
+                strip_spell_they_dont_own_qualifier(after_article);
+            if spell_not_owned_by_caster {
+                def.valid_target = Some(TargetFilter::TriggeringPlayer);
+            }
             // CR 601.2a: pre-extract the "from <zone>" cast-origin tail (see
             // the rationale in the "you cast a/an" branch above). Without
             // this, the zone constraint is silently dropped (Ghostly Pilferer
@@ -9688,17 +9735,35 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
             // (Talion, the Kindly Lord). CR 202.3 + CR 208.1: disjunctive match on
             // mana value, power, or toughness against the source's chosen number.
             if let Some(base_tf) = parse_spell_chosen_number_quality(spell_clause) {
-                def.valid_card = Some(TargetFilter::Typed(base_tf));
+                let filter = if spell_not_owned_by_caster {
+                    with_owner_scope(TargetFilter::Typed(base_tf), ControllerRef::Opponent)
+                } else {
+                    TargetFilter::Typed(base_tf)
+                };
+                def.valid_card = Some(filter);
                 return Some((TriggerMode::SpellCast, def));
             }
             // Handle "multicolored" as a spell property (not a type phrase)
             if scan_contains(spell_clause, "multicolored") {
-                def.valid_card = Some(TargetFilter::Typed(TypedFilter::default().properties(
-                    vec![FilterProp::ColorCount {
-                        comparator: Comparator::GE,
-                        count: 2,
-                    }],
-                )));
+                let filter = if spell_not_owned_by_caster {
+                    with_owner_scope(
+                        TargetFilter::Typed(TypedFilter::default().properties(vec![
+                            FilterProp::ColorCount {
+                                comparator: Comparator::GE,
+                                count: 2,
+                            },
+                        ])),
+                        ControllerRef::Opponent,
+                    )
+                } else {
+                    TargetFilter::Typed(TypedFilter::default().properties(vec![
+                        FilterProp::ColorCount {
+                            comparator: Comparator::GE,
+                            count: 2,
+                        },
+                    ]))
+                };
+                def.valid_card = Some(filter);
             } else {
                 let (filter, _rest) = parse_type_phrase(spell_clause);
                 let is_meaningful = match &filter {
@@ -9706,7 +9771,12 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
                     TargetFilter::Or { .. } => true,
                     _ => false,
                 };
-                if is_meaningful {
+                let filter = if spell_not_owned_by_caster {
+                    with_owner_scope(filter, ControllerRef::Opponent)
+                } else {
+                    filter
+                };
+                if is_meaningful || spell_not_owned_by_caster {
                     def.valid_card = Some(filter);
                 }
             }
@@ -10372,6 +10442,39 @@ pub(crate) fn parse_post_spell_modifier(modifier: &str) -> Option<TargetFilter> 
         if modifier[consumed..].trim().is_empty() {
             return Some(TargetFilter::Typed(
                 TypedFilter::default().properties(vec![prop]),
+            ));
+        }
+    }
+
+    // CR 601.2a: cast-origin qualifier. A spell is cast from a zone; "from
+    // anywhere other than [hand]" matches the cast-capable zones except the hand
+    // (The Twelfth Doctor), and "from exile" / "from your graveyard" match that
+    // single origin zone (Wild-Magic Sorcerer class). Emits an InAnyZone /
+    // InZone origin predicate consumed by `spell_object_matches_filter_from_state`
+    // against the cast-from zone.
+    if let Ok((rest, ())) = value(
+        (),
+        tag::<_, _, OracleError<'_>>("from anywhere other than your hand"),
+    )
+    .parse(modifier)
+    {
+        if rest.trim().is_empty() {
+            return Some(TargetFilter::Typed(TypedFilter::default().properties(
+                vec![FilterProp::InAnyZone {
+                    zones: super::oracle_target::cast_capable_zones_except(Zone::Hand),
+                }],
+            )));
+        }
+    }
+    if let Ok((rest, zone)) = alt((
+        value(Zone::Exile, tag::<_, _, OracleError<'_>>("from exile")),
+        value(Zone::Graveyard, tag("from your graveyard")),
+    ))
+    .parse(modifier)
+    {
+        if rest.trim().is_empty() {
+            return Some(TargetFilter::Typed(
+                TypedFilter::default().properties(vec![FilterProp::InZone { zone }]),
             ));
         }
     }
@@ -11927,7 +12030,7 @@ mod tests {
         DamageModification, DamageSource, DelayedTriggerCondition, DiscardSelfScope, Duration,
         Effect, EffectScope, FilterProp, ManaProduction, ManaSpendPermission, ObjectScope,
         PlayerFilter, PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
-        SharedQuality, TapStateChange, TargetFilter, TypeFilter, TypedFilter,
+        SharedQuality, TapStateChange, TargetFilter, TypeFilter, TypedFilter, ZoneRef,
     };
     use crate::types::counter::{CounterMatch, CounterType};
     use crate::types::game_state::WaitingFor;
@@ -11989,6 +12092,56 @@ mod tests {
             }
             other => panic!("expected Typed or Or filter, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_post_spell_modifier_cast_origin_from_nonhand() {
+        // CR 601.2a: "from anywhere other than your hand" → InAnyZone over the
+        // cast-capable zones except the hand.
+        let expected = crate::parser::oracle_target::cast_capable_zones_except(Zone::Hand);
+        let filter = parse_post_spell_modifier("from anywhere other than your hand")
+            .expect("expected a cast-origin filter");
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected Typed filter");
+        };
+        assert!(
+            tf.properties.contains(&FilterProp::InAnyZone {
+                zones: expected.clone()
+            }),
+            "expected InAnyZone({expected:?}), got {:?}",
+            tf.properties
+        );
+    }
+
+    #[test]
+    fn parse_post_spell_modifier_cast_origin_single_zone() {
+        // CR 601.2a: "from exile" / "from your graveyard" → InZone(single).
+        for (text, zone) in [
+            ("from exile", Zone::Exile),
+            ("from your graveyard", Zone::Graveyard),
+        ] {
+            let filter = parse_post_spell_modifier(text)
+                .unwrap_or_else(|| panic!("expected a filter for {text:?}"));
+            let TargetFilter::Typed(tf) = filter else {
+                panic!("expected Typed filter for {text:?}");
+            };
+            assert!(
+                tf.properties.contains(&FilterProp::InZone { zone }),
+                "expected InZone({zone:?}) for {text:?}, got {:?}",
+                tf.properties
+            );
+        }
+    }
+
+    #[test]
+    fn parse_post_spell_modifier_rejects_unsupported_origin() {
+        // CR 601.2a: only the printed cast-origin forms are recognized; an
+        // unmodeled exclusion ("from anywhere other than your graveyard") must
+        // return None so the first-spell parser reports UnsupportedQualifier.
+        assert_eq!(
+            parse_post_spell_modifier("from anywhere other than your graveyard"),
+            None
+        );
     }
 
     #[test]
@@ -12648,6 +12801,71 @@ mod tests {
         assert_eq!(
             def.condition,
             Some(TriggerCondition::ZoneChangeObjectIsTapped)
+        );
+    }
+
+    /// CR 608.2k: the "untap it"/"tap it" bare-object-pronoun anaphor binds by
+    /// the trigger SUBJECT, not to `ParentTarget` (which resolves against the
+    /// effect's empty target list on a primary, non-targeted trigger effect and
+    /// silently no-ops the untap). This is a parse-shape building-block test for
+    /// the whole class, exercised end-to-end by
+    /// `tests/integration/issue_2915_alexios.rs`:
+    ///   - typed/attached subject ("a permanent you control", "equipped
+    ///     creature") → `TriggeringSource` (the entering/attacking object),
+    ///     matching the sibling sacrifice/destroy/exile anaphor verbs;
+    ///   - self subject (the source named in the same instruction, Alexios's
+    ///     "gains control of ~, untaps it") → `SelfRef`.
+    #[test]
+    fn untap_it_anaphor_binds_to_trigger_subject_not_parent_target() {
+        fn find_untap_target(ability: &AbilityDefinition) -> &TargetFilter {
+            let mut node = Some(ability);
+            while let Some(current) = node {
+                if let Effect::SetTapState {
+                    target,
+                    state: TapStateChange::Untap,
+                    ..
+                } = current.effect.as_ref()
+                {
+                    return target;
+                }
+                node = current.sub_ability.as_deref();
+            }
+            panic!("expected an Untap SetTapState in the trigger chain");
+        }
+
+        // Typed subject: "it" is the entering permanent (the triggering object).
+        let amulet = parse_trigger_line(
+            "Whenever a permanent you control enters tapped, untap it.",
+            "Amulet of Vigor",
+        );
+        assert_eq!(
+            find_untap_target(amulet.execute.as_ref().expect("execute present")),
+            &TargetFilter::TriggeringSource,
+            "typed-subject 'untap it' must bind to the triggering object"
+        );
+
+        // Attached subject: "it" is the equipped (attacking) creature.
+        let genji = parse_trigger_line(
+            "Whenever equipped creature attacks, untap it.",
+            "Genji Glove",
+        );
+        assert_eq!(
+            find_untap_target(genji.execute.as_ref().expect("execute present")),
+            &TargetFilter::TriggeringSource,
+            "attached-subject 'untap it' must bind to the triggering object"
+        );
+
+        // Self subject: "it" is the source named earlier in the instruction.
+        let alexios = parse_trigger_line(
+            "At the beginning of each player's upkeep, that player gains control of \
+             Alexios, untaps it, and puts a +1/+1 counter on it. It gains haste until \
+             end of turn.",
+            "Alexios, Deimos of Kosmos",
+        );
+        assert_eq!(
+            find_untap_target(alexios.execute.as_ref().expect("execute present")),
+            &TargetFilter::SelfRef,
+            "self-subject 'untaps it' must bind to the named source"
         );
     }
 
@@ -16767,6 +16985,21 @@ mod tests {
         );
         // Must restrict to controller's spells
         assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+    }
+
+    #[test]
+    fn trigger_a_player_casts_spell_they_dont_own() {
+        let def = parse_trigger_line(
+            "Whenever a player casts a spell they don't own, that player creates a Treasure token.",
+            "Gonti, Night Minister",
+        );
+        assert_eq!(def.mode, TriggerMode::SpellCast);
+        assert_eq!(def.valid_target, Some(TargetFilter::TriggeringPlayer));
+        assert_owned_by_opponent(
+            def.valid_card
+                .as_ref()
+                .expect("spell they don't own must carry valid_card"),
+        );
     }
 
     #[test]
@@ -23240,6 +23473,32 @@ mod tests {
     }
 
     #[test]
+    fn trigger_oversold_cemetery_upkeep_creature_graveyard_gate() {
+        let def = parse_trigger_line(
+            "At the beginning of your upkeep, if you have four or more creature cards in your graveyard, you may return target creature card from your graveyard to your hand.",
+            "Oversold Cemetery",
+        );
+        assert_eq!(def.mode, TriggerMode::Phase);
+        assert_eq!(def.phase, Some(Phase::Upkeep));
+        assert_eq!(
+            def.condition,
+            Some(TriggerCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Creature],
+                        filter: None,
+                        scope: CountScope::Controller,
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 4 },
+            })
+        );
+        assert!(def.optional);
+    }
+
+    #[test]
     fn trigger_put_into_your_graveyard_from_library() {
         let def = parse_trigger_line(
             "Whenever a creature card is put into your graveyard from your library, draw a card.",
@@ -24194,6 +24453,34 @@ mod tests {
         assert_eq!(
             def.condition,
             Some(TriggerCondition::DealtDamageBySourceThisTurn)
+        );
+    }
+
+    #[test]
+    fn trigger_another_creature_damaged_by_spider_you_controlled_dies() {
+        // Issue #1206 — Shelob, Child of Ungoliant
+        let def = parse_trigger_line(
+            "Whenever another creature dealt damage this turn by a Spider you controlled dies, create a token that's a copy of that creature, except it's a Food artifact with \"{2}, {T}, Sacrifice ~: You gain 3 life,\" and it loses all other card types.",
+            "Shelob, Child of Ungoliant",
+        );
+        assert_eq!(def.mode, TriggerMode::ChangesZone);
+        assert_eq!(def.origin, Some(Zone::Battlefield));
+        assert_eq!(def.destination, Some(Zone::Graveyard));
+        assert_eq!(
+            def.valid_card,
+            Some(TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::Another])
+            ))
+        );
+        assert_eq!(
+            def.condition,
+            Some(TriggerCondition::DealtDamageThisTurnBySource {
+                source: TargetFilter::Typed(
+                    TypedFilter::default()
+                        .subtype("Spider".to_string())
+                        .controller(ControllerRef::You)
+                )
+            })
         );
     }
 

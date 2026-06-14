@@ -724,6 +724,32 @@ pub(crate) fn parse_attached_subject_target_filter(input: &str) -> OracleResult<
     ))
 }
 
+/// CR 508.1a + CR 509.1a + CR 611.3a: Parse "enchanted/equipped creature is
+/// attacking|blocking" into the attached-subject's `TargetFilter` plus the
+/// combat-state `FilterProp`. Unlike `parse_attached_subject_is_filter` (which
+/// folds a STATIC characteristic — color/type/supertype — into the subject
+/// filter), combat state is re-evaluated each layer cycle (CR 611.3a), so the
+/// caller must bind it as a `RecipientMatchesFilter` GATE on the recipient (the
+/// attached creature), NOT fold it into the affected filter.
+///
+/// "blocked" is intentionally NOT a branch: `FilterProp` has no recipient-side
+/// "blocked" prop (only `Attacking`, `Blocking`, `BlockingSource`,
+/// `CombatRelation`, `Unblocked`), and there are no in-class cards. Inventing a
+/// `Blocked` prop is a new-variant decision routed through /add-engine-variant.
+pub(crate) fn parse_attached_subject_combat_state(
+    input: &str,
+) -> OracleResult<'_, (TargetFilter, FilterProp)> {
+    let (rest, subject) = parse_attached_condition_subject(input)?;
+    let (rest, _) = tag("is ").parse(rest)?;
+    let (rest, prop) = alt((
+        value(FilterProp::Attacking { defender: None }, tag("attacking")),
+        value(FilterProp::Blocking, tag("blocking")),
+    ))
+    .parse(rest)?;
+    let filter = TargetFilter::Typed(attached_subject_typed_filter(&subject));
+    Ok((rest, (filter, prop)))
+}
+
 /// Parse a positive attached-subject characteristic predicate
 /// ("enchanted creature is white", "equipped creature is an artifact",
 /// "enchanted creature is legendary") into the merged attached-subject
@@ -966,6 +992,15 @@ fn parse_attached_object_is_filter_condition(input: &str) -> OracleResult<'_, St
 ///
 /// Subjects: "~", "this creature", "this permanent", "this land", "this artifact",
 /// "this enchantment", "equipped creature", "enchanted creature", "it".
+///
+/// DEFER: the "equipped creature " / "enchanted creature " prefixes collapse to
+/// `Source*` checks for the HOST creature across the tapped/monstrous/saddled/
+/// equipped/attached-to-creature predicates that share this dispatcher too. For
+/// those the host creature (not the Equipment/Aura) is the real subject, so
+/// emitting a `Source*` condition is a suspected latent bug needing a dedicated
+/// audit + recipient-gating pass (CR 611.3a). Only the combat-state predicate is
+/// narrowed here — it uses `parse_self_source_subject` (below), which excludes
+/// the attached prefixes, because an Equipment/Aura is never an attacker.
 fn parse_source_subject(input: &str) -> OracleResult<'_, &str> {
     alt((
         tag("~ "),
@@ -979,6 +1014,27 @@ fn parse_source_subject(input: &str) -> OracleResult<'_, &str> {
         // CR 201.5: Pronouns in self-referential granted abilities refer to
         // the object that has the ability.
         tag("it "),
+    ))
+    .parse(input)
+}
+
+/// CR 611.3a: Like `parse_source_subject` but WITHOUT the attached-subject
+/// prefixes ("equipped creature " / "enchanted creature "). The combat-state
+/// predicate references the static's SOURCE; for an Equipment/Aura the source is
+/// the attachment, which is never itself an attacker/blocker. Folding
+/// "equipped creature is attacking" into `SourceIsAttacking` would gate on the
+/// Equipment's (impossible) combat state instead of the host creature's. The
+/// attached-subject combat form is owned by the inverted-grant path, which binds
+/// it as a `RecipientMatchesFilter` gate on the host (see
+/// `parse_attached_subject_combat_state`).
+fn parse_self_source_subject(input: &str) -> OracleResult<'_, &str> {
+    alt((
+        tag("~ "),
+        tag("this creature "),
+        tag("this permanent "),
+        tag("this land "),
+        tag("this artifact "),
+        tag("this enchantment "),
     ))
     .parse(input)
 }
@@ -1015,7 +1071,12 @@ fn parse_tapped_untapped(input: &str) -> OracleResult<'_, StaticCondition> {
 /// `"attacking or blocking"` emits `Or([SourceIsAttacking, SourceIsBlocking])`
 /// via the existing `StaticCondition::Or` combinator — no dedicated variant.
 fn parse_combat_state_predicate(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = parse_source_subject(input)?;
+    // CR 611.3a: combat state references the SOURCE permanent. Exclude the
+    // attached-subject prefixes ("equipped/enchanted creature") so they are NOT
+    // collapsed into a `Source*` combat condition (an Equipment/Aura is never an
+    // attacker); the attached-subject combat form is owned by the inverted-grant
+    // path via `parse_attached_subject_combat_state`.
+    let (rest, _) = parse_self_source_subject(input)?;
     let (rest, negated) =
         alt((value(false, tag("is ")), value(true, tag("isn't ")))).parse(rest)?;
     let (rest, predicate) = alt((
@@ -1935,18 +1996,41 @@ fn parse_you_have_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
     // "you have N or more [you-only quantity-suffix]"
     let (rest, n) = parse_number(rest)?;
 
-    if let Ok((rest, _)) =
-        tag::<_, _, OracleError<'_>>(" or more cards in your graveyard").parse(rest)
-    {
-        return Ok((
-            rest,
-            make_quantity_ge(
-                QuantityRef::GraveyardSize {
-                    player: PlayerScope::Controller,
-                },
-                n,
-            ),
-        ));
+    if let Ok((after_or_more, _)) = tag::<_, _, OracleError<'_>>(" or more ").parse(rest) {
+        // CR 603.4 + CR 404.2: Oversold Cemetery's intervening-if predicate
+        // counts face-up creature cards in its controller's graveyard.
+        if let Ok((rest, type_filters)) =
+            parse_you_have_typed_cards_in_your_graveyard(after_or_more)
+        {
+            return Ok((
+                rest,
+                make_quantity_ge(
+                    QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: type_filters,
+                        filter: None,
+                        scope: CountScope::Controller,
+                    },
+                    n,
+                ),
+            ));
+        }
+        // CR 603.4 + CR 404.2: Generic "you have N or more cards in your
+        // graveyard" intervening-if predicates use the controller's graveyard
+        // size.
+        if let Ok((rest, _)) =
+            tag::<_, _, OracleError<'_>>("cards in your graveyard").parse(after_or_more)
+        {
+            return Ok((
+                rest,
+                make_quantity_ge(
+                    QuantityRef::GraveyardSize {
+                        player: PlayerScope::Controller,
+                    },
+                    n,
+                ),
+            ));
+        }
     }
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(" or more life").parse(rest) {
         return Ok((
@@ -1977,6 +2061,21 @@ fn parse_you_have_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
         input,
         nom::error::ErrorKind::Fail,
     )))
+}
+
+/// CR 404.2: Parse the typed card-count tail of a controller graveyard predicate.
+fn parse_you_have_typed_cards_in_your_graveyard(input: &str) -> OracleResult<'_, Vec<TypeFilter>> {
+    let (rest, type_text) =
+        take_until::<_, _, OracleError<'_>>(" cards in your graveyard").parse(input)?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" cards in your graveyard").parse(rest)?;
+    let type_filters = parse_zone_card_type_text(type_text.trim());
+    if type_filters.is_empty() {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    }
+    Ok((rest, type_filters))
 }
 
 /// Parse "that player has" / "that opponent has" quantity conditions.
@@ -6876,6 +6975,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_typed_graveyard_creature_count_ge() {
+        let (rest, c) =
+            parse_inner_condition("you have four or more creature cards in your graveyard")
+                .unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::ZoneCardCount {
+                                zone: ZoneRef::Graveyard,
+                                card_types,
+                                scope: CountScope::Controller,
+                                ..
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 4 },
+            } => {
+                assert_eq!(card_types, vec![TypeFilter::Creature]);
+            }
+            other => panic!("expected ZoneCardCount Creature GE 4, got {other:?}"),
+        }
+    }
+
     // -- Zone condition tests (Phase 1) --
 
     #[test]
@@ -7194,18 +7320,40 @@ mod tests {
         assert_eq!(c, StaticCondition::SourceIsAttacking);
     }
 
+    /// CR 611.3a: An ATTACHED-subject combat phrase must NOT collapse to a
+    /// `Source*` combat condition (an Equipment/Aura is never an attacker). The
+    /// combat-state predicate now excludes the attached prefixes, so
+    /// `parse_inner_condition` fails on these; the dedicated
+    /// `parse_attached_subject_combat_state` combinator binds the state to the
+    /// host recipient instead (see the inverted-grant path).
     #[test]
-    fn test_equipped_creature_is_attacking() {
-        let (rest, c) = parse_inner_condition("equipped creature is attacking").unwrap();
+    fn test_equipped_creature_is_attacking_not_source_condition() {
+        assert!(parse_inner_condition("equipped creature is attacking").is_err());
+        let (rest, (filter, prop)) =
+            parse_attached_subject_combat_state("equipped creature is attacking").unwrap();
         assert_eq!(rest, "");
-        assert_eq!(c, StaticCondition::SourceIsAttacking);
+        assert_eq!(
+            filter,
+            TargetFilter::Typed(
+                TypedFilter::new(TypeFilter::Creature).properties(vec![FilterProp::EquippedBy])
+            )
+        );
+        assert_eq!(prop, FilterProp::Attacking { defender: None });
     }
 
     #[test]
-    fn test_enchanted_creature_is_attacking() {
-        let (rest, c) = parse_inner_condition("enchanted creature is attacking").unwrap();
+    fn test_enchanted_creature_is_attacking_not_source_condition() {
+        assert!(parse_inner_condition("enchanted creature is attacking").is_err());
+        let (rest, (filter, prop)) =
+            parse_attached_subject_combat_state("enchanted creature is attacking").unwrap();
         assert_eq!(rest, "");
-        assert_eq!(c, StaticCondition::SourceIsAttacking);
+        assert_eq!(
+            filter,
+            TargetFilter::Typed(
+                TypedFilter::new(TypeFilter::Creature).properties(vec![FilterProp::EnchantedBy])
+            )
+        );
+        assert_eq!(prop, FilterProp::Attacking { defender: None });
     }
 
     #[test]

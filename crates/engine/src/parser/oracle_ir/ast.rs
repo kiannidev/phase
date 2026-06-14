@@ -90,6 +90,7 @@ pub(crate) struct AnimationSpec {
     pub(crate) colors: Option<Vec<ManaColor>>,
     pub(crate) keywords: Vec<Keyword>,
     pub(crate) types: Vec<String>,
+    pub(crate) supertypes: Vec<crate::types::card_type::Supertype>,
     pub(crate) remove_all_abilities: bool,
 }
 
@@ -890,6 +891,12 @@ pub(crate) enum SearchCreationImperativeAst {
         reveal: bool,
         player: TargetFilter,
     },
+    /// CR 701.20e + CR 701.13a + CR 406.3: Fused "look at the top N ... and exiles it face down".
+    ExileTopLookedAt {
+        player: TargetFilter,
+        count: QuantityExpr,
+        face_down: bool,
+    },
     CopyTokenOf {
         target: TargetFilter,
         /// CR 107.1 + CR 707.2: Number of copy tokens to create.
@@ -1079,6 +1086,15 @@ pub(crate) enum PutImperativeAst {
         target: TargetFilter,
         enters_under: Option<ControllerRef>,
         enter_tapped: bool,
+        /// CR 401.4: Specific library placement for mass library moves.
+        /// `Some` suppresses the default library shuffle and places each moved
+        /// object at that position.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        library_position: Option<LibraryPosition>,
+        /// CR 401.4: The owner may randomize/arrange simultaneous library
+        /// placement for mass moves.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        random_order: bool,
         /// CR 608.2c: "and the rest into <zone>" complement for a tracked-set
         /// partition ("Put all <filter> revealed this way into your hand and
         /// the rest into your graveyard" — Winding Way). The primary move sends

@@ -314,7 +314,9 @@ impl AbilityCost {
                     return false;
                 };
                 if self_scope.is_source_card() {
-                    return p.hand.contains(&source);
+                    return state.objects.get(&source).is_some_and(|obj| {
+                        matches!(obj.zone, Zone::Hand | Zone::Battlefield)
+                    });
                 }
                 let resolved =
                     super::quantity::resolve_quantity(state, count, player, source).max(0) as usize;

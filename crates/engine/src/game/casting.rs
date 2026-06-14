@@ -11273,8 +11273,7 @@ pub fn can_activate_ability_now(
     }
 
     // CR 602.1: Check activation zone — default to battlefield.
-    let required_zone = ability_def.activation_zone.unwrap_or(Zone::Battlefield);
-    if obj.zone != required_zone {
+    if !ability_def.can_activate_from_zone(obj.zone) {
         return false;
     }
     // CR 701.35a: Detained permanents' activated abilities can't be activated.
@@ -11502,11 +11501,10 @@ pub fn handle_activate_ability(
         ));
     };
     // CR 602.1: Check activation zone — default to battlefield.
-    let required_zone = ability_def.activation_zone.unwrap_or(Zone::Battlefield);
-    if obj.zone != required_zone {
+    if !ability_def.can_activate_from_zone(obj.zone) {
         return Err(EngineError::InvalidAction(format!(
             "Object is not in the correct zone (expected {:?})",
-            required_zone
+            ability_def.activation_zone.unwrap_or(Zone::Battlefield)
         )));
     }
 

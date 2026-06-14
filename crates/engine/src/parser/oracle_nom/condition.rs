@@ -965,7 +965,7 @@ fn parse_attached_object_is_filter_condition(input: &str) -> OracleResult<'_, St
 /// caller so negation (`"~ isn't attacking"`) composes cleanly.
 ///
 /// Subjects: "~", "this creature", "this permanent", "this land", "this artifact",
-/// "this enchantment", "equipped creature", "enchanted creature".
+/// "this enchantment", "equipped creature", "enchanted creature", "it".
 fn parse_source_subject(input: &str) -> OracleResult<'_, &str> {
     alt((
         tag("~ "),
@@ -976,6 +976,7 @@ fn parse_source_subject(input: &str) -> OracleResult<'_, &str> {
         tag("this enchantment "),
         tag("equipped creature "),
         tag("enchanted creature "),
+        tag("it "),
     ))
     .parse(input)
 }
@@ -9102,6 +9103,27 @@ mod tests {
                 rhs: QuantityExpr::Fixed { value: 7 },
             } => {}
             other => panic!("expected SelfPower GE 7, got {other:?}"),
+        }
+    }
+
+    /// Level Up: granted attack trigger uses the pronoun "it" in the draw gate.
+    #[test]
+    fn test_it_has_power_ge() {
+        let (rest, c) = parse_inner_condition("it has power 10 or greater").unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::Power {
+                                scope: crate::types::ability::ObjectScope::Source,
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 10 },
+            } => {}
+            other => panic!("expected SelfPower GE 10, got {other:?}"),
         }
     }
 

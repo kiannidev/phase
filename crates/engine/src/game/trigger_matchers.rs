@@ -1139,6 +1139,13 @@ pub(super) fn match_damage_done(
         ..
     } = event
     {
+        // Self-referential "this creature deals combat damage" triggers already
+        // fire on per-source `DamageDealt` events emitted during the combat
+        // damage step. Only equipment-style observer triggers (`AttachedTo`)
+        // listen on the aggregate `CombatDamageDealtToPlayer` event.
+        if !matches!(trigger.valid_source, Some(TargetFilter::AttachedTo)) {
+            return false;
+        }
         !matching_combat_damage_to_player_sources(
             trigger,
             source_id,
@@ -6817,7 +6824,10 @@ mod tests {
             total_damage: 5,
         };
 
-        assert!(match_damage_done(&event, &trigger, watcher, &state));
+        assert!(
+            !match_damage_done(&event, &trigger, watcher, &state),
+            "aggregate combat damage matching is reserved for AttachedTo observers"
+        );
         assert!(matching_damage_done_events(&event, &trigger, watcher, &state).is_empty());
     }
 

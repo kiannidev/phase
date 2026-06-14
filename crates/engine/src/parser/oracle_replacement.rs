@@ -3121,13 +3121,9 @@ fn parse_typed_permanent_you_controlled_damage_source(
     input: &str,
 ) -> OracleResult<'_, TargetFilter> {
     let (rest, _) = tag("a ").parse(input)?;
-    let lower_rest = rest.to_lowercase();
-    let suffix = " you controlled";
-    let idx = lower_rest
-        .find(suffix)
-        .ok_or_else(|| nom::Err::Error(OracleError::new(rest, nom::error::ErrorKind::Tag)))?;
-    let type_text = rest[..idx].trim();
-    let after = &rest[idx + suffix.len()..];
+    let (after_type, type_text) =
+        take_until::<_, _, OracleError<'_>>(" you controlled").parse(rest)?;
+    let (after, _) = tag::<_, _, OracleError<'_>>(" you controlled").parse(after_type)?;
     let (filter, leftover) = parse_type_phrase(type_text);
     if !leftover.trim().is_empty() {
         return Err(nom::Err::Error(OracleError::new(

@@ -159,9 +159,9 @@ pub(crate) fn apply_zone_exit_cleanup(
             }
         }
 
-        // CR 709.1: A face-down card is turned face up when it leaves the stack
-        // or the battlefield. Restore its stored identity so public zones (graveyard,
-        // exile, etc.) show the real card instead of a face-down 2/2 shell.
+        // CR 708.8: As a face-down permanent or face-down spell leaves the battlefield
+        // or stack, it is turned face up. Restore its stored identity so public zones
+        // (graveyard, exile, etc.) show the real card instead of a face-down 2/2 shell.
         if obj_mut.face_down && (from == Zone::Stack || from == Zone::Battlefield) {
             obj_mut.face_down = false;
             if let Some(back_face) = obj_mut.back_face.take() {
@@ -2028,7 +2028,7 @@ mod tests {
         assert_eq!(obj.card_types.core_types, vec![CoreType::Creature]);
     }
 
-    /// CR 709.1: A face-down permanent turned face up when it leaves the battlefield.
+    /// CR 708.8: A face-down permanent turned face up when it leaves the battlefield.
     #[test]
     fn face_down_permanent_turns_face_up_when_leaving_battlefield() {
         use crate::game::morph::manifest_card;
@@ -2049,6 +2049,7 @@ mod tests {
             &mut state,
             PlayerId(0),
             id,
+            id,
             FaceDownProfile::vanilla_2_2(),
             &mut events,
         )
@@ -2060,7 +2061,7 @@ mod tests {
         let obj = &state.objects[&id];
         assert!(
             !obj.face_down,
-            "CR 709.1 must clear face_down on battlefield exit"
+            "CR 708.8 must clear face_down on battlefield exit"
         );
         assert_eq!(obj.name, "Hidden Bear");
         assert!(obj.back_face.is_none());

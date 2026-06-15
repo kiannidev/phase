@@ -210,6 +210,7 @@ mod issue_2940_krark_thumbless;
 mod issue_2941_vivien_reid;
 mod issue_2943_kayas_wrath;
 mod issue_3127_reveal_otherwise_graveyard;
+mod issue_3285_face_down_public_zone;
 mod issue_3320_peregrine_drake_untap_prompt;
 mod issue_3321_volcanic_spite_optional;
 mod issue_3322_airbend_owner_cast;

@@ -1257,6 +1257,8 @@ fn rewrite_populated_anaphor_in_def(def: &mut AbilityDefinition) {
     }
 
     rewrite_populated_anaphor_in_effect(&mut def.effect);
+    // CR 608.2c + CR 701.36a: recurse into sub_ability chains so anaphoric
+    // rewrites apply to sibling followups (Fractal Harness PutCounter/Attach).
     if let Some(sub) = def.sub_ability.as_mut() {
         rewrite_populated_anaphor_in_def(sub);
     }
@@ -1334,9 +1336,9 @@ fn rewrite_populated_anaphor_in_effect(effect: &mut Effect) {
     // just-created token.
     rebind_self_ref_grant_to_last_created(effect);
 
-    // Case 4: imperative followups like Fractal Harness's "attach this
-    // Equipment to it" parse "it" as ParentTarget (Self-ETB trigger subject).
-    // After a token creator in the same chain, rewrite to LastCreated.
+    // Case 4 (CR 301.5b + CR 122.6a): imperative followups like Fractal Harness's
+    // "attach this Equipment to it" parse "it" as ParentTarget (Self-ETB trigger
+    // subject). After a token creator in the same chain, rewrite to LastCreated.
     rewrite_parent_target_to_last_created(effect);
 }
 

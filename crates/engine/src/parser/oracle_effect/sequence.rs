@@ -4749,9 +4749,10 @@ fn try_parse_token_enters_with_counters(lower: &str) -> Option<ContinuationAst> 
 ///
 /// Returns `TokenEntersWithCounters` so it shares the continuation absorption
 /// path with `try_parse_token_enters_with_counters` (declarative form).
-/// Returns true when the counter followup consumed the entire clause. A trailing
-/// `"and attach …"` conjunct (Fractal Harness) must not be absorbed here — the
-/// bare-and splitter needs to peel it into its own attach clause.
+/// CR 122.6a + CR 301.5b: Returns true when the counter followup consumed the
+/// entire clause. A trailing `"and attach …"` conjunct (Fractal Harness) must
+/// not be absorbed here — the bare-and splitter needs to peel it into its own
+/// attach clause.
 fn token_counter_followup_tail_is_clean(rest: &str) -> bool {
     rest.trim().trim_start_matches(['.', ' ']).is_empty()
 }

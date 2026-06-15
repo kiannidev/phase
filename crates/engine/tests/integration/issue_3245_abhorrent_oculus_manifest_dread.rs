@@ -66,12 +66,13 @@ fn abhorrent_oculus_manifest_dread_manifests_choice_and_graves_other() {
     for &pid in &[P0, P1] {
         scenario.with_library_top(pid, &["Lib A", "Lib B", "Lib C", "Lib D", "Lib E"]);
     }
-    scenario
+    let oculus = scenario
         .add_creature_from_oracle(P0, "Abhorrent Oculus", 5, 5, ABHORRENT_OCULUS_ORACLE)
         .with_mana_cost(ManaCost::Cost {
             generic: 2,
             shards: vec![ManaCostShard::Blue],
-        });
+        })
+        .id();
     scenario.add_card_to_library_top(P0, "Library Top");
     scenario.add_card_to_library_top(P0, "Second Top");
 
@@ -112,6 +113,11 @@ fn abhorrent_oculus_manifest_dread_manifests_choice_and_graves_other() {
     assert!(
         !runner.state().objects[&second].face_down,
         "graveyard card must be face up in the public zone"
+    );
+    assert_eq!(
+        runner.state().objects[&top].entered_via_ability_source,
+        Some(oculus),
+        "manifest dread entry must be attributed to the resolving ability source"
     );
 }
 

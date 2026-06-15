@@ -585,12 +585,6 @@ fn extract_when_next_spell_filter(payload: &str) -> Option<TargetFilter> {
 
     let post_filter = if post.is_empty() {
         None
-    } else if post.eq_ignore_ascii_case(
-        "with {x} in its mana cost or activate an ability with {x} in its activation cost",
-    ) {
-        // Magus Lucea Kane disjunction — handled compositionally in
-        // `try_parse_when_next_event`, not as a single spell filter.
-        return None;
     } else {
         // Unknown post-spell modifier → reject the whole pattern rather than
         // silently dropping it. The caller falls through to other parsers.
@@ -608,8 +602,28 @@ fn extract_when_next_spell_filter(payload: &str) -> Option<TargetFilter> {
     })
 }
 
-const WHEN_NEXT_X_SPELL_OR_ACTIVATE: &str =
-    "spell with {x} in its mana cost or activate an ability with {x} in its activation cost";
+const WHEN_NEXT_OR_ACTIVATE_ABILITY: &str = " or activate an ability ";
+
+/// CR 603.7: Parse a disjunctive delayed-trigger condition of the form
+/// "cast a <spell-qualifier> or activate an ability <activation-qualifier>".
+/// Each branch lowers into a normal `TriggerDefinition` filter via the shared
+/// spell/activation post-modifier combinators.
+fn try_parse_when_next_spell_or_activate_disjunction(
+    condition_fragment: &str,
+) -> Option<(TargetFilter, TargetFilter)> {
+    use nom::bytes::complete::{tag, take_until};
+    use nom::Parser;
+
+    let (rest, spell_part) = take_until::<_, _, OracleError<'_>>(WHEN_NEXT_OR_ACTIVATE_ABILITY)
+        .parse(condition_fragment.trim())
+        .ok()?;
+    let (activation_part, _) =
+        tag::<_, _, OracleError<'_>>(WHEN_NEXT_OR_ACTIVATE_ABILITY).parse(rest).ok()?;
+    let spell_filter = extract_when_next_spell_filter(spell_part.trim())?;
+    let ability_filter =
+        crate::parser::oracle_trigger::parse_post_activation_modifier(activation_part.trim())?;
+    Some((spell_filter, ability_filter))
+}
 
 fn build_when_next_delayed_trigger(
     mode: crate::types::triggers::TriggerMode,
@@ -680,19 +694,11 @@ fn try_parse_when_next_event(tp: TextPair) -> Option<ParsedEffectClause> {
         parse_effect_chain(effect_text, AbilityKind::Spell)
     };
 
-    if condition_fragment
-        .trim()
-        .eq_ignore_ascii_case(WHEN_NEXT_X_SPELL_OR_ACTIVATE)
+    if let Some((spell_filter, ability_filter)) =
+        try_parse_when_next_spell_or_activate_disjunction(condition_fragment)
     {
-        use crate::types::ability::{FilterProp, TypedFilter};
         use crate::types::triggers::TriggerMode;
 
-        let spell_filter = TargetFilter::Typed(
-            TypedFilter::default().properties(vec![FilterProp::HasXInManaCost]),
-        );
-        let ability_filter = TargetFilter::Typed(
-            TypedFilter::default().properties(vec![FilterProp::HasXInActivationCost]),
-        );
         return Some(build_when_next_delayed_trigger(
             TriggerMode::SpellCast,
             spell_filter,
@@ -43975,6 +43981,48 @@ mod tests {
             ),
             "expected CopySpell on triggering source, got {:?}",
             effect.effect
+        );
+    }
+
+    /// CR 603.7: disjunctive when-next conditions compose spell and activation
+    /// qualifiers through the shared post-modifier combinators rather than an
+    /// exact full-clause string match.
+    #[test]
+    fn when_next_spell_or_activate_disjunction_composes_spell_type_filter() {
+        use crate::types::ability::{DelayedTriggerCondition, FilterProp, TypedFilter};
+        let def = parse_effect_chain(
+            "When you next cast a creature spell with {X} in its mana cost or activate an ability with {X} in its activation cost this turn, copy that spell or ability.",
+            AbilityKind::Activated,
+        );
+        let Effect::CreateDelayedTrigger { condition, .. } = &*def.effect else {
+            panic!("expected CreateDelayedTrigger, got {:?}", def.effect);
+        };
+        let DelayedTriggerCondition::WhenNextEvent {
+            trigger,
+            or_trigger,
+        } = condition
+        else {
+            panic!("expected WhenNextEvent, got {:?}", condition);
+        };
+        assert_eq!(
+            trigger.valid_card.as_ref(),
+            Some(&TargetFilter::And {
+                filters: vec![
+                    TargetFilter::Typed(TypedFilter::creature()),
+                    TargetFilter::Typed(
+                        TypedFilter::default().properties(vec![FilterProp::HasXInManaCost]),
+                    ),
+                ],
+            }),
+        );
+        let alt = or_trigger
+            .as_ref()
+            .expect("disjunctive when-next must carry or_trigger");
+        assert_eq!(
+            alt.valid_card.as_ref(),
+            Some(&TargetFilter::Typed(
+                TypedFilter::default().properties(vec![FilterProp::HasXInActivationCost]),
+            )),
         );
     }
 

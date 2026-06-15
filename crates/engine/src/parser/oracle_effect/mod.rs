@@ -587,12 +587,9 @@ fn extract_when_next_spell_filter(payload: &str) -> Option<TargetFilter> {
     } else if post.eq_ignore_ascii_case(
         "with {x} in its mana cost or activate an ability with {x} in its activation cost",
     ) {
-        use crate::types::ability::{FilterProp, TypedFilter};
-        // Magus Lucea Kane — spell branch of the disjunction; ability branch is
-        // the same one-shot delayed trigger in practice for X spells like Nature's Rhythm.
-        Some(TargetFilter::Typed(
-            TypedFilter::default().properties(vec![FilterProp::HasXInManaCost]),
-        ))
+        // Magus Lucea Kane disjunction — handled compositionally in
+        // `try_parse_when_next_event`, not as a single spell filter.
+        return None;
     } else {
         // Unknown post-spell modifier → reject the whole pattern rather than
         // silently dropping it. The caller falls through to other parsers.
@@ -608,6 +605,43 @@ fn extract_when_next_spell_filter(payload: &str) -> Option<TargetFilter> {
             filters: vec![a, b],
         },
     })
+}
+
+const WHEN_NEXT_X_SPELL_OR_ACTIVATE: &str =
+    "spell with {x} in its mana cost or activate an ability with {x} in its activation cost";
+
+fn build_when_next_delayed_trigger(
+    mode: crate::types::triggers::TriggerMode,
+    valid_card: TargetFilter,
+    inner: AbilityDefinition,
+    or_branch: Option<(crate::types::triggers::TriggerMode, TargetFilter)>,
+) -> ParsedEffectClause {
+    let mut trigger_def = crate::types::ability::TriggerDefinition::new(mode);
+    trigger_def.valid_card = Some(valid_card);
+    trigger_def.valid_target = Some(TargetFilter::Controller);
+    let or_trigger = or_branch.map(|(or_mode, or_filter)| {
+        let mut alt = crate::types::ability::TriggerDefinition::new(or_mode);
+        alt.valid_card = Some(or_filter);
+        alt.valid_target = Some(TargetFilter::Controller);
+        Box::new(alt)
+    });
+    ParsedEffectClause {
+        effect: Effect::CreateDelayedTrigger {
+            condition: DelayedTriggerCondition::WhenNextEvent {
+                trigger: Box::new(trigger_def),
+                or_trigger,
+            },
+            effect: Box::new(inner),
+            uses_tracked_set: false,
+        },
+        duration: None,
+        sub_ability: None,
+        distribute: None,
+        multi_target: None,
+        condition: None,
+        optional: false,
+        unless_pay: None,
+    }
 }
 
 /// CR 603.7: Parse "when you next cast a [type] spell [post-spell modifier] this turn, [effect]"
@@ -635,14 +669,6 @@ fn try_parse_when_next_event(tp: TextPair) -> Option<ParsedEffectClause> {
     // — e.g. "creature spell" (type only), "instant or sorcery spell" (disjunction),
     // "spell with {x} in its mana cost" (post only).
     let condition_fragment = &before_this_turn.lower[matched_prefix.len()..];
-    let combined_filter = extract_when_next_spell_filter(condition_fragment)?;
-
-    // Build a SpellCast trigger definition with the combined filter
-    let mut trigger_def = crate::types::ability::TriggerDefinition::new(TriggerMode::SpellCast);
-    trigger_def.valid_card = Some(combined_filter);
-    // "when YOU next cast" — scope to the source's controller.
-    trigger_def.valid_target = Some(TargetFilter::Controller);
-
     let effect_text = after.original;
     let effect_lower = after.lower;
 
@@ -653,10 +679,37 @@ fn try_parse_when_next_event(tp: TextPair) -> Option<ParsedEffectClause> {
         parse_effect_chain(effect_text, AbilityKind::Spell)
     };
 
+    if condition_fragment.trim().eq_ignore_ascii_case(WHEN_NEXT_X_SPELL_OR_ACTIVATE) {
+        use crate::types::ability::{FilterProp, TypedFilter};
+        use crate::types::triggers::TriggerMode;
+
+        let spell_filter = TargetFilter::Typed(
+            TypedFilter::default().properties(vec![FilterProp::HasXInManaCost]),
+        );
+        let ability_filter = TargetFilter::Typed(
+            TypedFilter::default().properties(vec![FilterProp::HasXInActivationCost]),
+        );
+        return Some(build_when_next_delayed_trigger(
+            TriggerMode::SpellCast,
+            spell_filter,
+            inner,
+            Some((TriggerMode::AbilityActivated, ability_filter)),
+        ));
+    }
+
+    let combined_filter = extract_when_next_spell_filter(condition_fragment)?;
+
+    // Build a SpellCast trigger definition with the combined filter
+    let mut trigger_def = crate::types::ability::TriggerDefinition::new(TriggerMode::SpellCast);
+    trigger_def.valid_card = Some(combined_filter);
+    // "when YOU next cast" — scope to the source's controller.
+    trigger_def.valid_target = Some(TargetFilter::Controller);
+
     Some(ParsedEffectClause {
         effect: Effect::CreateDelayedTrigger {
             condition: DelayedTriggerCondition::WhenNextEvent {
                 trigger: Box::new(trigger_def),
+                or_trigger: None,
             },
             effect: Box::new(inner),
             uses_tracked_set: false,
@@ -1280,6 +1333,7 @@ fn try_parse_inline_delayed_trigger(
     {
         DelayedTriggerCondition::WhenNextEvent {
             trigger: Box::new(trigger),
+            or_trigger: None,
         }
     } else {
         match scan_delayed_condition_kind(condition_text) {
@@ -30693,7 +30747,7 @@ mod tests {
         );
         match e {
             Effect::CreateDelayedTrigger {
-                condition: DelayedTriggerCondition::WhenNextEvent { trigger },
+                condition: DelayedTriggerCondition::WhenNextEvent { trigger, .. },
                 uses_tracked_set: false,
                 ..
             } => {
@@ -41718,7 +41772,10 @@ mod tests {
         else {
             panic!("expected CreateDelayedTrigger, got {:?}", def.effect);
         };
-        let DelayedTriggerCondition::WhenNextEvent { trigger } = condition else {
+        let DelayedTriggerCondition::WhenNextEvent {
+            trigger,
+            or_trigger,
+        } = condition else {
             panic!("expected WhenNextEvent, got {:?}", condition);
         };
         assert_eq!(
@@ -41733,6 +41790,10 @@ mod tests {
             trigger.valid_card.as_ref(),
             Some(&expected),
             "valid_card must carry HasXInManaCost filter"
+        );
+        assert!(
+            or_trigger.is_none(),
+            "single-branch when-next-cast must not carry or_trigger"
         );
         // Scoped to the source's controller — "when YOU next cast".
         assert_eq!(trigger.valid_target, Some(TargetFilter::Controller));
@@ -41756,13 +41817,26 @@ mod tests {
         else {
             panic!("expected CreateDelayedTrigger, got {:?}", def.effect);
         };
-        let DelayedTriggerCondition::WhenNextEvent { trigger } = condition else {
+        let DelayedTriggerCondition::WhenNextEvent {
+            trigger,
+            or_trigger,
+        } = condition else {
             panic!("expected WhenNextEvent, got {:?}", condition);
         };
         assert_eq!(
             trigger.valid_card.as_ref(),
             Some(&TargetFilter::Typed(
                 TypedFilter::default().properties(vec![FilterProp::HasXInManaCost]),
+            )),
+        );
+        let alt = or_trigger
+            .as_ref()
+            .expect("Magus disjunction must use or_trigger, not chained sub_abilities");
+        assert_eq!(alt.mode, crate::types::triggers::TriggerMode::AbilityActivated);
+        assert_eq!(
+            alt.valid_card.as_ref(),
+            Some(&TargetFilter::Typed(
+                TypedFilter::default().properties(vec![FilterProp::HasXInActivationCost]),
             )),
         );
         assert!(
@@ -41779,10 +41853,10 @@ mod tests {
         );
     }
 
-    /// CR 605.1a: Magus tap ability is not a mana ability once the delayed copy
-    /// clause is parsed onto the sub_ability chain.
+    /// CR 605.1a: Magus tap ability remains a mana ability; the delayed copy
+    /// clause resolves inline on the mana-ability path.
     #[test]
-    fn magus_lucea_kane_tap_ability_is_not_mana_ability() {
+    fn magus_lucea_kane_tap_ability_is_mana_ability() {
         let parsed = crate::parser::parse_oracle_text(
             "Psychic Stimulus — {T}: Add {C}{C}. When you next cast a spell with {X} in its mana cost or activate an ability with {X} in its activation cost this turn, copy that spell or ability. You may choose new targets for the copy.",
             "Magus Lucea Kane",
@@ -41792,8 +41866,8 @@ mod tests {
         );
         let ability = parsed.abilities.last().expect("tap ability");
         assert!(
-            !crate::game::mana_abilities::is_mana_ability(ability),
-            "mana plus delayed copy must use the stack"
+            crate::game::mana_abilities::is_mana_ability(ability),
+            "Psychic Stimulus must remain a mana ability per CR 605.1"
         );
     }
 

@@ -3765,8 +3765,20 @@ pub(super) fn match_ability_activated(
     else {
         return false;
     };
-    valid_player_matches(trigger, state, *player_id, source_id)
-        && valid_card_matches(trigger, state, *activated_id, source_id)
+    if !valid_player_matches(trigger, state, *player_id, source_id) {
+        return false;
+    }
+    if let Some(filter) = &trigger.valid_card {
+        use crate::types::ability::{FilterProp, TargetFilter, TypedFilter};
+        if matches!(
+            filter,
+            TargetFilter::Typed(TypedFilter { properties, .. })
+                if properties == &[FilterProp::HasXInActivationCost]
+        ) {
+            return crate::game::casting_costs::pending_activation_cost_has_x(state, *activated_id);
+        }
+    }
+    valid_card_matches(trigger, state, *activated_id, source_id)
 }
 
 /// CR 702.26c: Matches when a permanent phases in.

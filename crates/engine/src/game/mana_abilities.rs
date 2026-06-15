@@ -46,14 +46,13 @@ pub fn is_mana_ability(ability_def: &AbilityDefinition) -> bool {
     if ability_def.multi_target.is_some() || target_attached.is_some() {
         return false;
     }
-    // CR 605.1a: An activated mana ability cannot have any other effects.
-    // Magus Lucea Kane ({T}: Add {C}{C}. When you next cast a spell with {X}…)
-    // must use the stack so the delayed copy trigger is registered.
-    ability_def_chain_is_all_mana(ability_def)
+    ability_def.multi_target.is_none() && target_attached.is_none()
 }
 
 /// True iff every reachable link in an activated ability's resolution graph
 /// (`sub_ability` and `else_ability` per CR 608.2c) is `Effect::Mana`.
+/// Used only by triggered-mana-ability classification — activated mana abilities
+/// remain mana abilities regardless of chained non-mana effects (CR 605.1).
 fn ability_def_chain_is_all_mana(def: &AbilityDefinition) -> bool {
     if !matches!(&*def.effect, Effect::Mana { .. }) {
         return false;
@@ -2895,7 +2894,7 @@ mod tests {
     }
 
     #[test]
-    fn mana_with_delayed_trigger_sub_is_not_mana_ability() {
+    fn mana_with_delayed_trigger_sub_remains_mana_ability() {
         let mut head = make_mana_ability(ManaProduction::Colorless {
             count: QuantityExpr::Fixed { value: 2 },
         });
@@ -2904,6 +2903,7 @@ mod tests {
             Effect::CreateDelayedTrigger {
                 condition: DelayedTriggerCondition::WhenNextEvent {
                     trigger: Box::new(TriggerDefinition::new(TriggerMode::SpellCast)),
+                    or_trigger: None,
                 },
                 effect: Box::new(AbilityDefinition::new(
                     AbilityKind::Spell,
@@ -2917,9 +2917,64 @@ mod tests {
             },
         )));
         assert!(
-            !is_mana_ability(&head),
-            "mana plus delayed trigger must use the stack"
+            is_mana_ability(&head),
+            "CR 605.1: chained delayed triggers do not disqualify activated mana abilities"
         );
+    }
+
+    #[test]
+    fn resolve_mana_ability_sub_chain_registers_delayed_trigger() {
+        use crate::types::ability::{
+            CopyRetargetPermission, DelayedTriggerCondition, FilterProp, TriggerDefinition,
+            TypedFilter,
+        };
+        use crate::types::triggers::TriggerMode;
+
+        let mut state = GameState::new_two_player(42);
+        let obj_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Magus Lucea Kane".to_string(),
+            Zone::Battlefield,
+        );
+
+        let copy_effect = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::CopySpell {
+                target: TargetFilter::TriggeringSource,
+                retarget: CopyRetargetPermission::MayChooseNewTargets,
+                copier: None,
+            },
+        );
+        let delayed = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::CreateDelayedTrigger {
+                condition: DelayedTriggerCondition::WhenNextEvent {
+                    trigger: Box::new({
+                        let mut trigger = TriggerDefinition::new(TriggerMode::SpellCast);
+                        trigger.valid_card = Some(TargetFilter::Typed(
+                            TypedFilter::default().properties(vec![FilterProp::HasXInManaCost]),
+                        ));
+                        trigger.valid_target = Some(TargetFilter::Controller);
+                        trigger
+                    }),
+                    or_trigger: None,
+                },
+                effect: Box::new(copy_effect),
+                uses_tracked_set: false,
+            },
+        );
+        let mut def = make_mana_ability(ManaProduction::Colorless {
+            count: QuantityExpr::Fixed { value: 2 },
+        });
+        def.sub_ability = Some(Box::new(delayed));
+
+        let mut events = Vec::new();
+        resolve_mana_ability(&mut state, obj_id, PlayerId(0), &def, &mut events, None).unwrap();
+
+        assert_eq!(state.delayed_triggers.len(), 1);
+        assert!(state.objects.get(&obj_id).unwrap().tapped);
     }
 
     #[test]

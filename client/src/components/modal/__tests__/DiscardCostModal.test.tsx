@@ -230,7 +230,7 @@ describe("Discard cost modal", () => {
     render(<CardChoiceModal />);
 
     expect(screen.getByText("Untap")).toBeInTheDocument();
-    expect(screen.getByText("Choose up to 5 lands to untap")).toBeInTheDocument();
+    expect(screen.getByText("Choose up to 5 permanents to untap")).toBeInTheDocument();
     expect(screen.queryByText(/sacrifice/i)).not.toBeInTheDocument();
   });
 

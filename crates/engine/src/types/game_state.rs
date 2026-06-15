@@ -970,6 +970,11 @@ pub struct PendingChangeZoneIteration {
     /// carry-through pattern on this same struct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub face_down_profile: Option<crate::types::ability::FaceDownProfile>,
+    /// CR 401.4 + CR 701.24a: Library placement override carried across a
+    /// replacement-ordering pause so Endurance-style "on the bottom of their
+    /// library" still suppresses auto-shuffle on resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_placement: Option<crate::types::ability::LibraryPosition>,
     pub effect_kind: crate::types::ability::EffectKind,
 }
 
@@ -1024,6 +1029,22 @@ pub struct PendingChooseOneOf {
     #[serde(default)]
     pub context: super::ability::SpellContext,
     pub remaining_players: Vec<PlayerId>,
+}
+
+/// CR 701.38d + CR 608.2c: Stores the remaining voters whose per-ballot
+/// interactive body has not yet been resolved. Created when the first
+/// ballot's ChooseFromZone parks WaitingFor::ChooseFromZoneChoice; drained
+/// after each choice resolves until all voters are processed.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingVoteBallotIteration {
+    /// The ability template to instantiate for each remaining voter.
+    pub ability_template: Box<AbilityDefinition>,
+    /// Voters whose ballots have not yet been processed (in APNAP order).
+    pub remaining_voters: Vec<PlayerId>,
+    /// The source object that initiated the vote.
+    pub source_id: ObjectId,
+    /// The controller of the vote spell/ability.
+    pub controller: PlayerId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5464,6 +5485,16 @@ pub struct GameState {
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub commander_declined_zone_return: HashSet<ObjectId>,
 
+    /// CR 120.3 + CR 120.6 + CR 702.11b: Battlefield objects that have actually
+    /// dealt damage (combat or noncombat) since entering the battlefield. Sticky
+    /// per-object flag backing the `StaticCondition::SourceHasDealtDamage`
+    /// predicate (e.g. "has hexproof if it hasn't dealt damage yet"). Set only
+    /// when a nonzero amount of damage is actually dealt (CR 120.3/120.6, not the
+    /// would-deal amount of CR 120.1a); cleared when the object leaves the
+    /// battlefield so a flickered object starts with a clean slate.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub objects_that_dealt_damage: HashSet<ObjectId>,
+
     /// CR 500.7: Extra turns granted by effects, stored as a LIFO stack.
     /// Most recently created extra turn is taken first (pop from end).
     #[serde(default)]
@@ -6001,6 +6032,11 @@ pub struct GameState {
     /// selected branch has finished resolving, including any nested choices.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_choose_one_of: Option<PendingChooseOneOf>,
+    /// CR 701.38d + CR 608.2c: Per-ballot vote iteration paused by an
+    /// interactive choice. Drained after `pending_change_zone_iteration` and
+    /// before `pending_repeat_iteration`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_vote_ballot_iteration: Option<PendingVoteBallotIteration>,
 
     /// CR 122.5: Pending atomic counter moves selected during a resolution-time
     /// distribution prompt. Drained before normal pending continuations so
@@ -6364,6 +6400,15 @@ pub struct GameState {
     /// Planechase game.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planar_controller: Option<PlayerId>,
+    /// CR 904.3 / CR 904.4: The archenemy's scheme deck (single-deck Archenemy
+    /// option). Front = top; face-down in the command zone (CR 314.2). Schemes
+    /// that are set in motion turn face up and stay in the command zone, NOT here.
+    #[serde(default, skip_serializing_if = "im::Vector::is_empty")]
+    pub scheme_deck: im::Vector<ObjectId>,
+    /// CR 904.2a: The archenemy — owner/controller of all scheme cards
+    /// (CR 314.5 / CR 904.7). `None` outside an Archenemy game.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archenemy: Option<PlayerId>,
     /// CR 725: The initiative designation (like monarch — one player at a time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiative: Option<PlayerId>,
@@ -6857,6 +6902,7 @@ impl GameState {
             pending_coin_flip: None,
             pending_repeat_until: None,
             pending_choose_one_of: None,
+            pending_vote_ballot_iteration: None,
             pending_counter_moves: None,
             pending_batch_deliveries: None,
             pending_counter_additions: None,
@@ -6908,11 +6954,14 @@ impl GameState {
             dungeon_progress: HashMap::new(),
             planar_deck: im::Vector::new(),
             planar_controller: None,
+            scheme_deck: im::Vector::new(),
+            archenemy: None,
             initiative: None,
             combat_prevention_tally: None,
             cancelled_casts: Vec::new(),
             pending_activations: Vec::new(),
             commander_declined_zone_return: HashSet::new(),
+            objects_that_dealt_damage: HashSet::new(),
             debug_mode: false,
             debug_permitted: BTreeSet::new(),
             debug_infinite_mana: BTreeSet::new(),
@@ -7190,6 +7239,7 @@ impl PartialEq for GameState {
             && self.commander_cast_count == other.commander_cast_count
             && self.commander_cast_owners == other.commander_cast_owners
             && self.commander_declined_zone_return == other.commander_declined_zone_return
+            && self.objects_that_dealt_damage == other.objects_that_dealt_damage
             && self.extra_turns == other.extra_turns
             && self.turns_to_skip == other.turns_to_skip
             && self.steps_to_skip == other.steps_to_skip
@@ -7297,6 +7347,7 @@ impl PartialEq for GameState {
             && self.pending_coin_flip == other.pending_coin_flip
             && self.pending_repeat_until == other.pending_repeat_until
             && self.pending_choose_one_of == other.pending_choose_one_of
+            && self.pending_vote_ballot_iteration == other.pending_vote_ballot_iteration
             && self.pending_counter_moves == other.pending_counter_moves
             && self.pending_batch_deliveries == other.pending_batch_deliveries
             && self.pending_counter_additions == other.pending_counter_additions
@@ -7321,6 +7372,8 @@ impl PartialEq for GameState {
             && self.city_blessing == other.city_blessing
             && self.planar_deck == other.planar_deck
             && self.planar_controller == other.planar_controller
+            && self.scheme_deck == other.scheme_deck
+            && self.archenemy == other.archenemy
     }
 }
 
@@ -8197,6 +8250,7 @@ mod tests {
                 subtypes: vec!["Forest".to_string()],
                 ward: None,
             }),
+            library_placement: None,
             effect_kind: crate::types::ability::EffectKind::ChangeZone,
         };
         let json = serde_json::to_string(&original).expect("serialize");

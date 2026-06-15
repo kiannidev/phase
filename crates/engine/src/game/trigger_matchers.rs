@@ -123,6 +123,11 @@ pub fn trigger_matcher(mode: TriggerMode) -> Option<TriggerMatcher> {
         // CR 701.31d: planeswalked-away-from / planeswalked-to (encounter) endpoints.
         TriggerMode::PlaneswalkedFrom => match_planeswalked_from,
         TriggerMode::PlaneswalkedTo => match_planeswalked_to,
+        // CR 904.9 / CR 701.32b: "When you set this scheme in motion" fires for
+        // the scheme set in motion.
+        TriggerMode::SetInMotion => match_set_in_motion,
+        // CR 701.33b: "When you abandon this scheme" fires for the abandoned scheme.
+        TriggerMode::Abandoned => match_abandoned,
         TriggerMode::RoomEntered => match_room_entered,
         TriggerMode::UnlockDoor => match_unlock_door,
         TriggerMode::FullyUnlock => match_fully_unlock,
@@ -169,7 +174,6 @@ pub fn trigger_matcher(mode: TriggerMode) -> Option<TriggerMatcher> {
         | TriggerMode::PlanarDice
         | TriggerMode::Copied
         | TriggerMode::ConjureAll
-        | TriggerMode::Abandoned
         | TriggerMode::ClaimPrize
         | TriggerMode::CrankContraption
         | TriggerMode::Devoured
@@ -178,7 +182,6 @@ pub fn trigger_matcher(mode: TriggerMode) -> Option<TriggerMatcher> {
         | TriggerMode::Mentored
         | TriggerMode::Proliferate
         | TriggerMode::SeekAll
-        | TriggerMode::SetInMotion
         | TriggerMode::Trains
         | TriggerMode::VisitAttraction => match_visit_attraction,
         TriggerMode::Specializes => match_specializes,
@@ -381,6 +384,9 @@ pub fn build_trigger_registry() -> HashMap<TriggerMode, TriggerMatcher> {
     r.insert(TriggerMode::ChaosEnsues, match_chaos_ensues);
     r.insert(TriggerMode::PlaneswalkedFrom, match_planeswalked_from);
     r.insert(TriggerMode::PlaneswalkedTo, match_planeswalked_to);
+    // CR 904.9 / CR 701.32b / CR 701.33b: Archenemy scheme triggers
+    r.insert(TriggerMode::SetInMotion, match_set_in_motion);
+    r.insert(TriggerMode::Abandoned, match_abandoned);
     r.insert(TriggerMode::RoomEntered, match_room_entered);
     r.insert(TriggerMode::UnlockDoor, match_unlock_door);
     r.insert(TriggerMode::FullyUnlock, match_fully_unlock);
@@ -454,7 +460,7 @@ pub fn build_trigger_registry() -> HashMap<TriggerMode, TriggerMatcher> {
         // TriggerMode::ChaosEnsues — moved to real matcher above
         TriggerMode::Copied,
         TriggerMode::ConjureAll,
-        TriggerMode::Abandoned,
+        // TriggerMode::Abandoned — moved to real matcher above
         TriggerMode::ClaimPrize,
         TriggerMode::CrankContraption,
         TriggerMode::Devoured,
@@ -463,7 +469,7 @@ pub fn build_trigger_registry() -> HashMap<TriggerMode, TriggerMatcher> {
         TriggerMode::Mentored,
         // TriggerMode::Mutates — moved to real matcher below
         TriggerMode::SeekAll,
-        TriggerMode::SetInMotion,
+        // TriggerMode::SetInMotion — moved to real matcher above
         // TriggerMode::Specializes — moved to real matcher above
         // TriggerMode::Stationed — moved to real matcher below
         TriggerMode::Trains,
@@ -871,6 +877,8 @@ fn count_matching_trigger_event_subjects(
         | GameEvent::Planeswalked { .. }
         | GameEvent::ChaosEnsued { .. }
         | GameEvent::PlanarDieRolled { .. }
+        | GameEvent::SchemeSetInMotion { .. }
+        | GameEvent::SchemeAbandoned { .. }
         | GameEvent::InitiativeTaken { .. }
         | GameEvent::AttractionOpened { .. }
         | GameEvent::AttractionsRolledToVisit { .. }
@@ -1040,6 +1048,49 @@ pub(super) fn match_changes_zone_all(
 }
 
 // CR 603.6d: DamageDone trigger fires on damage dealt events.
+
+/// CR 510.2 + CR 603.2: Source-filtered observers whose source is not the
+/// trigger source itself listen on the aggregate `CombatDamageDealtToPlayer`
+/// event. Self/no-source creature triggers already fire on per-source
+/// `DamageDealt` events emitted during the combat damage step; matching them
+/// again on the aggregate event double-fires.
+pub(super) fn listens_on_aggregate_combat_damage_done(trigger: &TriggerDefinition) -> bool {
+    trigger.mode == TriggerMode::DamageDone
+        && matches!(
+            trigger.valid_source,
+            Some(ref filter) if !matches!(filter, TargetFilter::SelfRef)
+        )
+}
+
+fn matching_combat_damage_to_player_sources(
+    trigger: &TriggerDefinition,
+    source_id: ObjectId,
+    state: &GameState,
+    player_id: PlayerId,
+    source_amounts: &[(ObjectId, u32)],
+) -> Vec<(ObjectId, u32)> {
+    if trigger.damage_kind == DamageKindFilter::NoncombatOnly {
+        return Vec::new();
+    }
+    if let Some(ref vt) = trigger.valid_target {
+        if !player_matches_filter(vt, state, player_id, source_id) {
+            return Vec::new();
+        }
+    }
+    source_amounts
+        .iter()
+        .filter(|(src, amt)| {
+            if let Some((cmp, threshold)) = trigger.damage_amount {
+                if !cmp.evaluate(*amt as i32, threshold as i32) {
+                    return false;
+                }
+            }
+            valid_source_matches(trigger, state, *src, source_id)
+        })
+        .copied()
+        .collect()
+}
+
 pub(super) fn match_damage_done(
     event: &GameEvent,
     trigger: &TriggerDefinition,
@@ -1054,6 +1105,12 @@ pub(super) fn match_damage_done(
         ..
     } = event
     {
+        if *is_combat
+            && matches!(target, TargetRef::Player(_))
+            && listens_on_aggregate_combat_damage_done(trigger)
+        {
+            return false;
+        }
         // Check if trigger requires damage from a specific source
         if !valid_source_matches(trigger, state, *dmg_source, source_id) {
             return false;
@@ -1104,9 +1161,62 @@ pub(super) fn match_damage_done(
             }
         }
         true
+    } else if let GameEvent::CombatDamageDealtToPlayer {
+        player_id,
+        source_amounts,
+        ..
+    } = event
+    {
+        if !listens_on_aggregate_combat_damage_done(trigger) {
+            return false;
+        }
+        !matching_combat_damage_to_player_sources(
+            trigger,
+            source_id,
+            state,
+            *player_id,
+            source_amounts,
+        )
+        .is_empty()
     } else {
         false
     }
+}
+
+/// CR 510.2 + CR 603.2: `DamageDone` triggers on equipment (and other
+/// observers) listen for per-source combat damage via the aggregate
+/// `CombatDamageDealtToPlayer` event. Expand matching sources into synthetic
+/// `DamageDealt` events so downstream `EventContextAmount` and intervening-if
+/// checks see the per-source amount.
+pub(super) fn matching_damage_done_events(
+    event: &GameEvent,
+    trigger: &TriggerDefinition,
+    source_id: ObjectId,
+    state: &GameState,
+) -> Vec<GameEvent> {
+    if !listens_on_aggregate_combat_damage_done(trigger) {
+        return Vec::new();
+    }
+
+    let GameEvent::CombatDamageDealtToPlayer {
+        player_id,
+        source_amounts,
+        ..
+    } = event
+    else {
+        return Vec::new();
+    };
+
+    matching_combat_damage_to_player_sources(trigger, source_id, state, *player_id, source_amounts)
+        .into_iter()
+        .map(|(src, amt)| GameEvent::DamageDealt {
+            source_id: src,
+            target: TargetRef::Player(*player_id),
+            amount: amt,
+            is_combat: true,
+            excess: 0,
+        })
+        .collect()
 }
 
 pub(super) fn match_damage_done_once_by_controller(
@@ -1958,6 +2068,7 @@ pub(super) fn match_discarded(
     if let GameEvent::Discarded {
         player_id,
         object_id,
+        ..
     } = event
     {
         // CR 603.2: The trigger event includes which player discarded; scope
@@ -2497,6 +2608,7 @@ pub(super) fn match_cycled_or_discarded(
     if let GameEvent::Discarded {
         player_id,
         object_id,
+        ..
     } = event
     {
         if !valid_player_matches(trigger, state, *player_id, source_id) {
@@ -3585,6 +3697,32 @@ pub(super) fn match_planeswalked_to(
     }
 }
 
+/// CR 904.9 / CR 701.32b: "When you set this scheme in motion" — fires for the
+/// scheme set in motion; "you" resolves to the archenemy via the scheme's
+/// controller (stamped in `archenemy::set_in_motion`).
+pub(super) fn match_set_in_motion(
+    event: &GameEvent,
+    trigger: &TriggerDefinition,
+    source_id: ObjectId,
+    state: &GameState,
+) -> bool {
+    matches!(event, GameEvent::SchemeSetInMotion { scheme_id, player_id }
+        if *scheme_id == source_id
+        && valid_player_matches(trigger, state, *player_id, source_id))
+}
+
+/// CR 701.33b: "When you abandon this scheme" — fires for the abandoned scheme.
+pub(super) fn match_abandoned(
+    event: &GameEvent,
+    trigger: &TriggerDefinition,
+    source_id: ObjectId,
+    state: &GameState,
+) -> bool {
+    matches!(event, GameEvent::SchemeAbandoned { scheme_id, player_id }
+        if *scheme_id == source_id
+        && valid_player_matches(trigger, state, *player_id, source_id))
+}
+
 /// CR 104.3a: "Whenever a player loses the game" — fires when any player's
 /// loss event is recorded. The `valid_target` filter (if set) restricts
 /// which player's loss triggers the ability. Cards: Withengar Unbound,
@@ -4269,6 +4407,7 @@ mod tests {
             &GameEvent::Discarded {
                 player_id: PlayerId(1),
                 object_id: discarded,
+                source_id: None,
             },
             &trigger,
             source,
@@ -4278,6 +4417,7 @@ mod tests {
             &GameEvent::Discarded {
                 player_id: PlayerId(0),
                 object_id: discarded,
+                source_id: None,
             },
             &trigger,
             source,
@@ -4341,6 +4481,7 @@ mod tests {
             &GameEvent::Discarded {
                 player_id: PlayerId(1),
                 object_id: card,
+                source_id: None,
             },
             &trigger,
             source,
@@ -4350,6 +4491,7 @@ mod tests {
             &GameEvent::Discarded {
                 player_id: PlayerId(0),
                 object_id: card,
+                source_id: None,
             },
             &trigger,
             source,
@@ -6640,6 +6782,208 @@ mod tests {
         assert_eq!(rebuilt_amounts, vec![(creature_a, 3)]);
         // Only creature_a's 3 damage counts, not the aggregate 5.
         assert_eq!(total_damage, 3);
+    }
+
+    #[test]
+    fn matching_damage_done_events_expands_equipped_creature_combat_damage() {
+        let mut state = setup();
+        let equipment = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "The Key to the Vault".to_string(),
+            Zone::Battlefield,
+        );
+        let bearer = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Equipped Attacker".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&bearer).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+        }
+        state.objects.get_mut(&equipment).unwrap().attached_to = Some(AttachTarget::Object(bearer));
+
+        let mut trigger = make_trigger(TriggerMode::DamageDone);
+        trigger.valid_source = Some(TargetFilter::AttachedTo);
+        trigger.valid_target = Some(TargetFilter::Player);
+        trigger.damage_kind = DamageKindFilter::CombatOnly;
+
+        let event = GameEvent::CombatDamageDealtToPlayer {
+            player_id: PlayerId(1),
+            source_amounts: vec![(bearer, 3)],
+            total_damage: 3,
+        };
+
+        assert!(match_damage_done(&event, &trigger, equipment, &state));
+        let expanded = matching_damage_done_events(&event, &trigger, equipment, &state);
+        assert_eq!(expanded.len(), 1);
+        assert!(matches!(
+            expanded[0],
+            GameEvent::DamageDealt {
+                source_id,
+                target: TargetRef::Player(PlayerId(1)),
+                amount: 3,
+                is_combat: true,
+                ..
+            } if source_id == bearer
+        ));
+    }
+
+    #[test]
+    fn matching_damage_done_events_expands_source_filtered_combat_damage() {
+        let mut state = setup();
+        let watcher = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Damage Watcher".to_string(),
+            Zone::Battlefield,
+        );
+        let attacker_a = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Attacker A".to_string(),
+            Zone::Battlefield,
+        );
+        let attacker_b = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Attacker B".to_string(),
+            Zone::Battlefield,
+        );
+        for attacker in [attacker_a, attacker_b] {
+            state
+                .objects
+                .get_mut(&attacker)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+        }
+
+        let mut trigger = make_trigger(TriggerMode::DamageDone);
+        trigger.valid_source = Some(TargetFilter::Typed(
+            TypedFilter::creature().controller(ControllerRef::You),
+        ));
+        trigger.valid_target = Some(TargetFilter::Player);
+        trigger.damage_kind = DamageKindFilter::CombatOnly;
+
+        let event = GameEvent::CombatDamageDealtToPlayer {
+            player_id: PlayerId(1),
+            source_amounts: vec![(attacker_a, 2), (attacker_b, 3)],
+            total_damage: 5,
+        };
+
+        let per_source_event = GameEvent::DamageDealt {
+            source_id: attacker_a,
+            target: TargetRef::Player(PlayerId(1)),
+            amount: 2,
+            is_combat: true,
+            excess: 0,
+        };
+        assert!(
+            !match_damage_done(&per_source_event, &trigger, watcher, &state),
+            "source-filtered observers use the aggregate event for combat damage to players"
+        );
+        assert!(match_damage_done(&event, &trigger, watcher, &state));
+        assert_eq!(
+            matching_damage_done_events(&event, &trigger, watcher, &state).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn matching_damage_done_events_does_not_expand_once_modes() {
+        let mut state = setup();
+        let watcher = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Damage Watcher".to_string(),
+            Zone::Battlefield,
+        );
+        let attacker_a = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Attacker A".to_string(),
+            Zone::Battlefield,
+        );
+        let attacker_b = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Attacker B".to_string(),
+            Zone::Battlefield,
+        );
+        for attacker in [attacker_a, attacker_b] {
+            state
+                .objects
+                .get_mut(&attacker)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+        }
+
+        let mut trigger = make_trigger(TriggerMode::DamageDoneOnce);
+        trigger.valid_source = Some(TargetFilter::Typed(
+            TypedFilter::creature().controller(ControllerRef::You),
+        ));
+        trigger.valid_target = Some(TargetFilter::Player);
+        trigger.damage_kind = DamageKindFilter::CombatOnly;
+
+        let event = GameEvent::CombatDamageDealtToPlayer {
+            player_id: PlayerId(1),
+            source_amounts: vec![(attacker_a, 2), (attacker_b, 3)],
+            total_damage: 5,
+        };
+
+        assert!(!match_damage_done(&event, &trigger, watcher, &state));
+        assert!(matching_damage_done_events(&event, &trigger, watcher, &state).is_empty());
+    }
+
+    #[test]
+    fn matching_damage_done_events_does_not_expand_self_source_triggers() {
+        let mut state = setup();
+        let attacker = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Tempest Hawk".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&attacker)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+
+        let mut trigger = make_trigger(TriggerMode::DamageDone);
+        trigger.valid_source = Some(TargetFilter::SelfRef);
+        trigger.valid_target = Some(TargetFilter::Player);
+        trigger.damage_kind = DamageKindFilter::CombatOnly;
+
+        let event = GameEvent::CombatDamageDealtToPlayer {
+            player_id: PlayerId(1),
+            source_amounts: vec![(attacker, 2)],
+            total_damage: 2,
+        };
+
+        assert!(
+            !match_damage_done(&event, &trigger, attacker, &state),
+            "SelfRef triggers must not match aggregate combat damage"
+        );
+        assert!(!listens_on_aggregate_combat_damage_done(&trigger));
+        assert!(matching_damage_done_events(&event, &trigger, attacker, &state).is_empty());
     }
 
     #[test]

@@ -408,14 +408,41 @@ pub(super) fn handle_resolution_choice(
                 .copied()
                 .collect();
 
-            crate::game::morph::manifest_card(
+            let face_down = crate::types::ability::FaceDownProfile::vanilla_2_2();
+            match crate::game::zone_pipeline::move_object(
                 state,
-                player,
-                manifest_id,
-                crate::types::ability::FaceDownProfile::vanilla_2_2(),
+                crate::game::zone_pipeline::ZoneMoveRequest::effect(
+                    manifest_id,
+                    Zone::Battlefield,
+                    manifest_id,
+                )
+                .face_down(face_down),
                 events,
-            )
-            .map_err(|error| EngineError::InvalidAction(format!("{error}")))?;
+            ) {
+                crate::game::zone_pipeline::ZoneMoveResult::Done => {}
+                // CR 616.1: the chosen card's manifest entry paused (aura host pick
+                // or a replacement-ordering prompt). Defer the non-manifested card's
+                // graveyard move + reveal-marker cleanup until the manifest finishes
+                // entering — otherwise the other card is graved while the chosen card
+                // is still in the library (issue #3245).
+                crate::game::zone_pipeline::ZoneMoveResult::NeedsChoice(_)
+                | crate::game::zone_pipeline::ZoneMoveResult::NeedsAuraAttachmentChoice => {
+                    crate::game::zone_pipeline::defer_completion_on_pause(
+                        state,
+                        crate::types::game_state::BatchCompletion::RevealRestPile {
+                            player,
+                            rest_cards: graveyard_cards,
+                            rest_destination: Zone::Graveyard,
+                            clear_markers: cards.clone(),
+                            publish_tracked_set: None,
+                            emit_reveal_until_resolved: None,
+                        },
+                    );
+                    return Ok(ResolutionChoiceOutcome::WaitingFor(
+                        state.waiting_for.clone(),
+                    ));
+                }
+            }
 
             // CR 614.6 + CR 701.17a class: route the non-manifested cards to the
             // graveyard through the simultaneous-move batch so each card's own

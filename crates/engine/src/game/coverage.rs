@@ -714,6 +714,11 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
                 let inner_tf = TypedFilter::default().properties(props.clone());
                 parts.push(format!("any of ({})", fmt_typed_filter(&inner_tf)));
             }
+            // CR 608.2c: Negation label wraps the inner prop's rendering.
+            FilterProp::Not { prop } => {
+                let inner_tf = TypedFilter::default().properties(vec![(**prop).clone()]);
+                parts.push(format!("not {}", fmt_typed_filter(&inner_tf)));
+            }
             FilterProp::HasXInManaCost => parts.push("with {X} in cost".into()),
             FilterProp::HasXInActivationCost => parts.push("with {X} in activation cost".into()),
             FilterProp::HasManaAbility => parts.push("with a mana ability".into()),

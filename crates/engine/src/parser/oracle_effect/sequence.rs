@@ -943,6 +943,19 @@ fn split_comma_clause_boundary(current: &str, remainder: &str) -> Option<(Clause
         if nom_primitives::scan_contains(&current_lower, "from among") && put_kept_card_tail {
             return None;
         }
+        // CR 701.55a + CR 608.2c: "[subject] does X, then faces a villainous
+        // choice — …" continues a previously-named subject (the target's owner)
+        // into a villainous-choice clause. The bare "faces a villainous choice"
+        // verb is not in the imperative-verb table that
+        // `starts_clause_text_or_conjugated` checks, so without this guard the
+        // whole tail is silently dropped (This Is How It Ends). Recognize it as
+        // a `Then` boundary so the continuation reaches the ChooseOneOf parser.
+        if tag::<_, _, OracleError<'_>>("faces a villainous choice")
+            .parse(after_then_lower)
+            .is_ok()
+        {
+            return Some((ClauseBoundary::Then, whitespace_len + "then ".len()));
+        }
         if starts_clause_text_or_conjugated(after_then)
             || starts_you_control_subject_predicate(after_then_lower)
             || starts_with_damage_clause(after_then_lower)
@@ -2345,6 +2358,8 @@ pub(super) fn apply_clause_continuation(
                                 enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                                 enter_with_counters: vec![],
                                 face_down_profile,
+                                library_position: None,
+                                random_order: false,
                             },
                         ));
                     }
@@ -2402,6 +2417,8 @@ pub(super) fn apply_clause_continuation(
                 match &mut *def.effect {
                     Effect::ChangeZoneAll {
                         face_down_profile: fdp @ Some(_),
+                        library_position: None,
+                        random_order: false,
                         ..
                     }
                     | Effect::ChangeZone {
@@ -3753,6 +3770,7 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
         | Effect::CopySpell { .. }
         | Effect::CastCopyOfCard { .. }
         | Effect::CopyTokenOf { .. }
+        | Effect::CreateTokenCopyFromPool { .. }
         | Effect::Myriad
         | Effect::Encore
         | Effect::Meld { .. }

@@ -10,7 +10,7 @@ use engine::types::phase::Phase;
 const VEXING_PUZZLEBOX_ORACLE: &str = "Whenever you roll one or more dice, put a number of charge counters on this artifact equal to the result.\n{T}: Add one mana of any color. Roll a d20.\n{T}, Remove 100 charge counters from this artifact: Search your library for an artifact card, put that card onto the battlefield, then shuffle.";
 
 #[test]
-fn vexing_puzzlebox_mana_ability_is_not_classified_as_mana_ability() {
+fn vexing_puzzlebox_tap_ability_is_mana_ability() {
     let parsed = engine::parser::parse_oracle_text(
         VEXING_PUZZLEBOX_ORACLE,
         "Vexing Puzzlebox",
@@ -20,8 +20,8 @@ fn vexing_puzzlebox_mana_ability_is_not_classified_as_mana_ability() {
     );
     let ability = &parsed.abilities[0];
     assert!(
-        !engine::game::mana_abilities::is_mana_ability(ability),
-        "mana plus d20 roll must use the stack, not resolve as a mana ability"
+        engine::game::mana_abilities::is_mana_ability(ability),
+        "CR 605.1: mana plus d20 roll remains a mana ability resolved inline"
     );
 }
 

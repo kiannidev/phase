@@ -1627,41 +1627,49 @@ fn parse_life_lost_ref(input: &str) -> OracleResult<'_, QuantityRef> {
             },
             tag("life you lost"),
         ),
-        // CR 119.3 + CR 608.2k: Third-person variants resolve against the
-        // per-target player during effect iteration. The runtime's
-        // `LifeLostThisTurn` reads `player.life_lost_this_turn` where
-        // `player` is the resolution context's bound player — for
-        // `LoseLife { target: EachOpponent }` this rebinds per-opponent,
-        // so "they lost" / "that player lost" resolve correctly without
-        // a new typed variant. Archfiend of Despair, Wound Reflection,
-        // Astarion (Feed mode), Blitzwing, Warlock Class.
+        // CR 115.1 + CR 115.10 + CR 119.3 + CR 608.2c: Third-person "they" / "that
+        // player" anaphor in a life-change clause refers to the player the
+        // surrounding LoseLife/GainLife AFFECTS, never the source's controller. In
+        // a TARGETED clause ("target opponent loses life equal to the life that
+        // player lost this turn" — Blitzwing, Cruel Tormentor; Astarion Feed) that
+        // is the player TARGET (CR 115.1), read from `ability.targets`. In a
+        // per-opponent ITERATION ("each opponent loses life equal to the life they
+        // lost this turn" — Wound Reflection, Archfiend of Despair, Warlock Class
+        // L3) the affected player is not a target (CR 115.10a);
+        // `rewrite_player_scope_refs` rebinds this `Target` form to `ScopedPlayer`
+        // under the lifted `player_scope` loop, mirroring the "each opponent loses
+        // half their life" (Betor / Blood Tribute) `LifeTotal` rewrite. Emitting
+        // `Target` here (not `Controller`) is what lets both the targeted and the
+        // iterated context resolve to each affected player's OWN life lost this
+        // turn. (`LifeGainedThisTurn` has no third-person printing today; this is
+        // its symmetric extension point should one appear.)
         value(
             QuantityRef::LifeLostThisTurn {
-                player: PlayerScope::Controller,
+                player: PlayerScope::Target,
             },
             tag("the life that player lost this turn"),
         ),
         value(
             QuantityRef::LifeLostThisTurn {
-                player: PlayerScope::Controller,
+                player: PlayerScope::Target,
             },
             tag("the life they lost this turn"),
         ),
         value(
             QuantityRef::LifeLostThisTurn {
-                player: PlayerScope::Controller,
+                player: PlayerScope::Target,
             },
             tag("the amount of life they lost this turn"),
         ),
         value(
             QuantityRef::LifeLostThisTurn {
-                player: PlayerScope::Controller,
+                player: PlayerScope::Target,
             },
             tag("the life that player lost"),
         ),
         value(
             QuantityRef::LifeLostThisTurn {
-                player: PlayerScope::Controller,
+                player: PlayerScope::Target,
             },
             tag("the life they lost"),
         ),
@@ -2738,6 +2746,30 @@ fn parse_for_each_commander_cast_count(input: &str) -> OracleResult<'_, Quantity
     Ok((rest, QuantityRef::CommanderCastFromCommandZoneCount))
 }
 
+/// CR 400.7 + CR 700.4: Parse a trailing "that died [under your control] this
+/// turn" qualifier, returning the controller scope. "died" = battlefield→
+/// graveyard (CR 700.4), applied as a constant zone pair at the construction site
+/// exactly as `creatures_died_this_turn_ref` does. CR 109.5: "under your control"
+/// scopes to the source's controller (`ControllerRef::You`); unqualified forms
+/// return `None` (every player's deaths). Longer tags precede shorter so the
+/// qualified suffix isn't shadowed by `alt`. Building block shared by the
+/// aggregate this-turn-death quantity form.
+pub(crate) fn parse_died_this_turn_suffix(input: &str) -> OracleResult<'_, Option<ControllerRef>> {
+    alt((
+        value(
+            Some(ControllerRef::You),
+            tag("that died under your control this turn"),
+        ),
+        value(
+            Some(ControllerRef::You),
+            tag("that died under your control"),
+        ),
+        value(None, tag("that died this turn")),
+        value(None, tag("that died")),
+    ))
+    .parse(input)
+}
+
 /// CR 700.4: Shared tail for "creature(s) that died" / graveyard-from-battlefield
 /// phrasing. Engine tracking is per-turn-only, so the trailing "this turn"
 /// qualifier is semantically redundant when present.
@@ -3178,6 +3210,30 @@ mod tests {
         TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::mana::ManaColor;
+
+    /// CR 400.7 + CR 700.4 + CR 109.5: the shared death-suffix combinator returns
+    /// the controller scope for all four "that died" tag forms and rejects
+    /// unrelated text.
+    #[test]
+    fn test_parse_died_this_turn_suffix_controller_scopes() {
+        assert_eq!(
+            parse_died_this_turn_suffix("that died under your control this turn").unwrap(),
+            ("", Some(ControllerRef::You))
+        );
+        assert_eq!(
+            parse_died_this_turn_suffix("that died under your control").unwrap(),
+            ("", Some(ControllerRef::You))
+        );
+        assert_eq!(
+            parse_died_this_turn_suffix("that died this turn").unwrap(),
+            ("", None)
+        );
+        assert_eq!(
+            parse_died_this_turn_suffix("that died").unwrap(),
+            ("", None)
+        );
+        assert!(parse_died_this_turn_suffix("you control").is_err());
+    }
 
     /// CR 400.7d: each subject anaphora maps to the correct
     /// `CastManaObjectScope` — "this …"/"it"/"them"/"~" → `SelfObject`;
@@ -4729,6 +4785,57 @@ mod tests {
             }
         );
         assert_eq!(rest, "");
+    }
+
+    /// CR 115.1 + CR 119.3 + CR 608.2c: the third-person "they" / "that player"
+    /// life-lost anaphor must emit `PlayerScope::Target` at the leaf — the player
+    /// the surrounding LoseLife affects — so a targeted clause (Blitzwing) reads
+    /// the target's own loss and a per-opponent loop (Wound Reflection) can be
+    /// rebound to `ScopedPlayer` by `rewrite_player_scope_refs`. Guards against
+    /// the prior `Controller` mapping that drained the source's controller.
+    #[test]
+    fn parse_quantity_ref_third_person_life_lost_is_target_scoped() {
+        // The article-only forms are the exact Wound Reflection / Archfiend /
+        // Warlock / Blitzwing phrasings. The "amount of life they lost" gloss
+        // (Astarion Feed) is consumed by `parse_life_lost_ref`'s leading
+        // `opt("the amount of ")` strip and routed through the imperative-level
+        // `parse_target_relative_life_change_this_turn` recognizer instead, which
+        // also yields `Target` — so it is asserted at that layer, not here.
+        for phrase in [
+            "the life they lost this turn",
+            "the life that player lost this turn",
+        ] {
+            let (rest, q) = parse_quantity_ref(phrase).unwrap();
+            assert_eq!(
+                q,
+                QuantityRef::LifeLostThisTurn {
+                    player: PlayerScope::Target
+                },
+                "{phrase:?} must be Target-scoped, got {q:?}"
+            );
+            assert_eq!(rest, "", "{phrase:?} left remainder {rest:?}");
+        }
+    }
+
+    /// Over-broadening guard: the first-person "you"/"you've" arms must stay
+    /// `Controller`-scoped (CR 109.5 — "you" is the controller, never a target).
+    #[test]
+    fn parse_quantity_ref_first_person_life_lost_stays_controller() {
+        for phrase in [
+            "the life you lost this turn",
+            "the life you've lost this turn",
+            "total life you lost this turn",
+        ] {
+            let (rest, q) = parse_quantity_ref(phrase).unwrap();
+            assert_eq!(
+                q,
+                QuantityRef::LifeLostThisTurn {
+                    player: PlayerScope::Controller
+                },
+                "{phrase:?} must stay Controller-scoped, got {q:?}"
+            );
+            assert_eq!(rest, "", "{phrase:?} left remainder {rest:?}");
+        }
     }
 
     #[test]

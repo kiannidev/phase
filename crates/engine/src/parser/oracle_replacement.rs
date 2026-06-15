@@ -1214,7 +1214,7 @@ fn parse_as_enters_choose(norm_lower: &str, original_text: &str) -> Option<Repla
     )
 }
 
-/// CR 110.2a + CR 614.1c: "`<this permanent>` enters under the control of an
+/// CR 110.2a + CR 614.1d: "`<this permanent>` enters under the control of an
 /// opponent of your choice." — a self-ETB controller-override replacement.
 ///
 /// The permanent enters the battlefield directly under an opponent's control;
@@ -1264,7 +1264,7 @@ fn parse_self_enters_under_opponent(
     Some(
         ReplacementDefinition::new(ReplacementEvent::Moved)
             .valid_card(TargetFilter::SelfRef)
-            // CR 614.1c: battlefield-entry-scoped (see destination-gate note above).
+            // CR 614.1d: battlefield-entry-scoped (see destination-gate note above).
             .destination_zone(Zone::Battlefield)
             // CR 110.2a: enters under an opponent's control (resolved at apply time).
             .enters_under(ControllerRef::Opponent)
@@ -3091,7 +3091,10 @@ fn parse_dealt_damage_this_turn_source_condition(input: &str) -> Option<Replacem
         .then_some(ReplacementCondition::DealtDamageThisTurnBySource { source })
 }
 
-fn parse_damage_history_source(input: &str) -> Option<(&str, TargetFilter)> {
+pub(crate) fn parse_damage_history_source(input: &str) -> Option<(&str, TargetFilter)> {
+    if let Ok(result) = parse_typed_permanent_you_controlled_damage_source(input) {
+        return Some(result);
+    }
     alt((
         value(
             TargetFilter::SelfRef,
@@ -3111,6 +3114,43 @@ fn parse_damage_history_source(input: &str) -> Option<(&str, TargetFilter)> {
     ))
     .parse(input)
     .ok()
+}
+
+/// CR 608.2i: "a [type] you controlled" damage-source look-back (Shelob's Spider gate).
+fn parse_typed_permanent_you_controlled_damage_source(
+    input: &str,
+) -> OracleResult<'_, TargetFilter> {
+    let (rest, _) = tag("a ").parse(input)?;
+    let (after_type, type_text) =
+        take_until::<_, _, OracleError<'_>>(" you controlled").parse(rest)?;
+    let (after, _) = tag::<_, _, OracleError<'_>>(" you controlled").parse(after_type)?;
+    let (filter, leftover) = parse_type_phrase(type_text);
+    if !leftover.trim().is_empty() {
+        return Err(nom::Err::Error(OracleError::new(
+            leftover,
+            nom::error::ErrorKind::Eof,
+        )));
+    }
+    let filter = match filter {
+        TargetFilter::Typed(mut tf) => {
+            if tf.controller.is_none() {
+                tf.controller = Some(ControllerRef::You);
+            }
+            TargetFilter::Typed(tf)
+        }
+        TargetFilter::Or { mut filters } => {
+            for branch in &mut filters {
+                if let TargetFilter::Typed(tf) = branch {
+                    if tf.controller.is_none() {
+                        tf.controller = Some(ControllerRef::You);
+                    }
+                }
+            }
+            TargetFilter::Or { filters }
+        }
+        other => other,
+    };
+    Ok((after, filter))
 }
 
 /// CR 614.1a: Match the exile-anaphor clause in either word order, returning
@@ -4062,16 +4102,33 @@ fn scan_damage_modification(text: &str) -> Option<DamageModification> {
     {
         return Some(modification);
     }
-    // Fallback: "that much damage plus/minus N" uses strip_after for the number
-    if let Some(rest) = strip_after(text, "that much damage plus ") {
-        let (_rem, val) = nom_primitives::parse_number.parse(rest).ok()?;
-        return Some(DamageModification::Plus { value: val });
-    }
-    if let Some(rest) = strip_after(text, "that much damage minus ") {
-        let (_rem, val) = nom_primitives::parse_number.parse(rest).ok()?;
-        return Some(DamageModification::Minus { value: val });
-    }
-    None
+    // Fallback: "that much damage plus/minus N" (fixed) or "that much damage
+    // plus X" (variable). The X case yields a `Plus { value: 0 }` placeholder —
+    // `DamageModification::Plus` carries a `u32`, so X is frozen at activation in
+    // `add_target_replacement::resolve` (CR 107.3a). Composed from nom
+    // combinators rather than `strip_after` so dispatch stays structural.
+    nom_primitives::scan_at_word_boundaries(text, parse_that_much_damage_offset)
+}
+
+/// CR 614.1a + CR 107.3a: "that much damage plus N" / "plus X" / "minus N".
+/// The "plus X" arm emits `Plus { value: 0 }` as a placeholder frozen at
+/// activation (X cannot live in the `u32`-typed `DamageModification`).
+fn parse_that_much_damage_offset(
+    input: &str,
+) -> nom::IResult<&str, DamageModification, OracleError<'_>> {
+    let (rest, _) = tag("that much damage ").parse(input)?;
+    alt((
+        // "plus X" — variable offset, frozen at install. Tried before the
+        // numeric arm so the literal "x" token is not consumed by parse_number.
+        value(DamageModification::Plus { value: 0 }, tag("plus x")),
+        nom::combinator::map(preceded(tag("plus "), nom_primitives::parse_number), |n| {
+            DamageModification::Plus { value: n }
+        }),
+        nom::combinator::map(preceded(tag("minus "), nom_primitives::parse_number), |n| {
+            DamageModification::Minus { value: n }
+        }),
+    ))
+    .parse(rest)
 }
 
 /// Nom combinator for damage modification phrases.
@@ -4626,11 +4683,40 @@ fn parse_token_replacement_shape(lower: &str) -> Option<TokenReplacementShape> {
     let descriptor = lower
         .get(descriptor_start..descriptor_start + descriptor_len)?
         .trim();
-    let token = super::oracle_effect::parse_token_description(descriptor)?;
+    let descriptor = normalize_additional_token_descriptor(descriptor)?;
+    let token = super::oracle_effect::parse_token_description(&descriptor)?;
     let spec = token_description_to_spec(&token)?;
     Some(TokenReplacementShape::PlusSpec {
         spec: Box::new(spec),
     })
+}
+
+/// CR 614.1a + CR 111.1: Normalize the optional "additional" modifier on
+/// token descriptors before delegating to `parse_token_description`, whose token
+/// grammar expects an article or numeric count prefix.
+fn normalize_additional_token_descriptor(descriptor: &str) -> Option<String> {
+    let (rest, stripped_additional) = opt(value(
+        (),
+        preceded(
+            opt(alt((tag::<_, _, OracleError<'_>>("a "), tag("an ")))),
+            tag("additional "),
+        ),
+    ))
+    .parse(descriptor)
+    .ok()?;
+    let descriptor = rest.trim();
+    if descriptor.is_empty() {
+        return None;
+    }
+    if stripped_additional.is_some() {
+        let (_, article) = peek(opt(alt((tag::<_, _, OracleError<'_>>("a "), tag("an ")))))
+            .parse(descriptor)
+            .ok()?;
+        if article.is_none() {
+            return Some(format!("a {descriptor}"));
+        }
+    }
+    Some(descriptor.to_string())
 }
 
 /// CR 614.1a + CR 111.1: Parse Xorn-class subtype-gated additional-token
@@ -9041,6 +9127,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn creature_damaged_by_spider_you_controlled_replacement_source_filter() {
+        let (rest, source) =
+            parse_damage_history_source("a spider you controlled would die").unwrap();
+        assert_eq!(rest, " would die");
+        assert_eq!(
+            source,
+            TargetFilter::Typed(
+                TypedFilter::default()
+                    .subtype("Spider".to_string())
+                    .controller(ControllerRef::You)
+            )
+        );
+    }
+
     /// CR 614.1a — prefix-form `instead exile it` mirrors the suffix-form
     /// `exile it instead`. The Darkness Crystal is the canonical print and
     /// chains `you gain 2 life` after `and` as a sub-ability.
@@ -11209,6 +11310,21 @@ mod tests {
         assert_eq!(spec.characteristics.colors, vec![ManaColor::Green]);
     }
 
+    /// CR 614.1a + CR 111.1: Peregrin Took's "those tokens plus an additional
+    /// Food token are created instead" replacement.
+    #[test]
+    fn parses_peregrin_took_additional_food_token() {
+        let text = "If one or more tokens would be created under your control, those tokens plus an additional Food token are created instead.";
+        let def = parse_replacement_line(text, "Peregrin Took").expect("should parse Peregrin");
+        assert_eq!(def.event, ReplacementEvent::CreateToken);
+        assert_eq!(def.token_owner_scope, Some(ControllerRef::You));
+        let spec = def
+            .additional_token_spec
+            .as_ref()
+            .expect("additional Food token spec");
+        assert_eq!(spec.characteristics.subtypes, vec!["Food".to_string()]);
+    }
+
     /// CR 614.1a: The "twice that many" shape and the "those tokens plus"
     /// shape are mutually exclusive in `parse_token_replacement_shape`. The
     /// Double branch must not leak an `additional_token_spec`.
@@ -11615,6 +11731,41 @@ mod tests {
             ),
             "Worship must keep its IfControlsMatching condition, got {:?}",
             def.condition
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Taii Wakeen, Perfect Shot — "it deals that much damage plus X/N instead"
+    // damage-modification scanning. The "plus X" form emits a `Plus { value: 0 }`
+    // placeholder frozen at activation (CR 107.3a); a literal "plus N" carries N.
+    // -----------------------------------------------------------------------
+
+    /// CR 614.1a + CR 107.3a: "plus X" yields the `Plus { value: 0 }` placeholder
+    /// (the announced X is frozen into it at activation time, not parse time).
+    #[test]
+    fn that_much_damage_plus_x_is_zero_placeholder() {
+        assert_eq!(
+            scan_damage_modification("it deals that much damage plus x instead"),
+            Some(DamageModification::Plus { value: 0 }),
+            "'plus X' must parse to the Plus(0) placeholder frozen at activation"
+        );
+    }
+
+    /// A literal "plus 2" carries the constant directly.
+    #[test]
+    fn that_much_damage_plus_literal_carries_value() {
+        assert_eq!(
+            scan_damage_modification("it deals that much damage plus 2 instead"),
+            Some(DamageModification::Plus { value: 2 })
+        );
+    }
+
+    /// The "minus N" sibling stays intact through the nom conversion.
+    #[test]
+    fn that_much_damage_minus_literal_carries_value() {
+        assert_eq!(
+            scan_damage_modification("it deals that much damage minus 1 instead"),
+            Some(DamageModification::Minus { value: 1 })
         );
     }
 }
@@ -12094,7 +12245,7 @@ mod snapshot_tests {
             assert_eq!(
                 def.destination_zone,
                 Some(Zone::Battlefield),
-                "{card_name}: battlefield-entry-scoped (CR 614.1c)"
+                "{card_name}: battlefield-entry-scoped (CR 614.1d)"
             );
             assert_eq!(
                 def.enters_under,
@@ -12102,6 +12253,34 @@ mod snapshot_tests {
                 "{card_name}: enters under an opponent's control (CR 110.2a)"
             );
         }
+    }
+
+    /// Regression for #3213: the controller-override line must route THROUGH the
+    /// classifier (`REPLACEMENT_CONTAINS_PATTERNS`) to `parse_replacement_line`.
+    /// The test above calls `parse_replacement_line` directly (bypassing the
+    /// classifier), which is exactly why it passed while the real cards still
+    /// gapped. This drives the full `parse_oracle_text` path: reverting the
+    /// classifier entry makes the line fall through to the effect parser as
+    /// `Unimplemented`, producing zero replacements — caught here.
+    #[test]
+    fn full_card_enters_under_opponent_routes_to_replacement() {
+        let result = crate::parser::oracle::parse_oracle_text(
+            "Xantcha enters under the control of an opponent of your choice.",
+            "Xantcha, Sleeper Agent",
+            &[],
+            &["Creature".to_string()],
+            &["Phyrexian".to_string(), "Minion".to_string()],
+        );
+        assert!(
+            result.replacements.iter().any(|r| {
+                r.event == ReplacementEvent::Moved
+                    && r.enters_under == Some(ControllerRef::Opponent)
+                    && r.valid_card == Some(TargetFilter::SelfRef)
+            }),
+            "the controller-override line must route to a replacement (not Unimplemented); \
+             replacements = {:?}",
+            result.replacements
+        );
     }
 
     /// The control clause is NOT claimed when the subject is an external filter

@@ -84,8 +84,5 @@ fn vexing_puzzlebox_tap_ability_rolls_d20() {
             }
         )
     });
-    assert!(
-        rolled,
-        "activating tap ability must emit DieRolled"
-    );
+    assert!(rolled, "activating tap ability must emit DieRolled");
 }

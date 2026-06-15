@@ -63,10 +63,7 @@ fn opponent_airbend_lets_owner_cast_exiled_card_for_two() {
     let mut runner = scenario.build();
     grant_priority(&mut runner, P1);
 
-    runner
-        .cast(aang)
-        .target_object(bear)
-        .resolve();
+    runner.cast(aang).target_object(bear).resolve();
 
     assert_eq!(
         runner.state().objects[&bear].zone,

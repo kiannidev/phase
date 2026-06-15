@@ -408,6 +408,9 @@ pub(super) fn handle_resolution_choice(
                 .copied()
                 .collect();
 
+            // CR 701.40a + CR 701.62a: manifest dread manifests the chosen
+            // looked-at card, putting it onto the battlefield face down as a
+            // 2/2 creature.
             let face_down = crate::types::ability::FaceDownProfile::vanilla_2_2();
             match crate::game::zone_pipeline::move_object(
                 state,
@@ -420,11 +423,12 @@ pub(super) fn handle_resolution_choice(
                 events,
             ) {
                 crate::game::zone_pipeline::ZoneMoveResult::Done => {}
-                // CR 616.1: the chosen card's manifest entry paused (aura host pick
-                // or a replacement-ordering prompt). Defer the non-manifested card's
-                // graveyard move + reveal-marker cleanup until the manifest finishes
-                // entering — otherwise the other card is graved while the chosen card
-                // is still in the library (issue #3245).
+                // CR 303.4f / CR 616.1: the chosen card's manifest entry paused
+                // (aura host pick or a replacement-ordering prompt). CR 701.62a:
+                // defer the non-manifested card's graveyard move + reveal-marker
+                // cleanup until the manifest finishes entering — otherwise the
+                // other card is graved while the chosen card is still in the library
+                // (issue #3245).
                 crate::game::zone_pipeline::ZoneMoveResult::NeedsChoice(_)
                 | crate::game::zone_pipeline::ZoneMoveResult::NeedsAuraAttachmentChoice => {
                     crate::game::zone_pipeline::defer_completion_on_pause(
@@ -444,7 +448,7 @@ pub(super) fn handle_resolution_choice(
                 }
             }
 
-            // CR 614.6 + CR 701.17a class: route the non-manifested cards to the
+            // CR 614.6 + CR 701.62a: route the non-manifested cards to the
             // graveyard through the simultaneous-move batch so each card's own
             // `Moved` redirects (Rest in Peace / Leyline of the Void: "would be
             // put into a graveyard from anywhere → exile instead") fire — a raw

@@ -45,6 +45,7 @@ pub fn resolve(
             state,
             player,
             card_id,
+            ability.source_id,
             crate::types::ability::FaceDownProfile::vanilla_2_2(),
             events,
         )

@@ -3415,6 +3415,15 @@ pub enum CardTypeSetSource {
     ExiledBySource,
     /// CR 109.2: Objects matching a battlefield-style filter.
     Objects { filter: TargetFilter },
+    /// CR 608.2c + CR 205.2a: distinct card types among the current chain
+    /// tracked set, optionally restricted to members produced by `caused_by`.
+    /// Mirrors `QuantityRef::FilteredTrackedSetSize { caused_by }`: a merged
+    /// Draw->Discard set is disambiguated by CAUSE (drawn members are unstamped),
+    /// so Some(Discarded) counts only discarded members. None counts all.
+    TrackedSet {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caused_by: Option<ThisWayCause>,
+    },
 }
 
 /// CR 601.2h: Which cast object a mana-spent quantity reads.
@@ -5074,6 +5083,22 @@ pub enum StaticCondition {
     /// `TargetFilter::Typed` — no attachment prop, no recipient prop.
     RecipientMatchesFilter {
         filter: TargetFilter,
+    },
+    /// CR 509.1b + CR 506.2 + CR 108.3: True when the recipient creature (the
+    /// per-object subject of the continuous effect — i.e. the attacking creature
+    /// this static is gating) is currently attacking a target permitted by
+    /// `target`, evaluated relative to the recipient's OWNER (CR 108.3), not its
+    /// controller. Used to express "can't be blocked unless it's attacking its
+    /// owner or a permanent its owner controls" by wrapping this in
+    /// `StaticCondition::Not` (the "unless"): the creature is unblockable except
+    /// when attacking its owner or a permanent its owner controls. Recipient-scoped
+    /// (mirrors `RecipientMatchesFilter`/`RecipientHasCounters`); the affected
+    /// (attacking) creature is supplied as the recipient by the block-restriction
+    /// gate in `combat.rs`. `target` reuses `AttackTargetFilter` — the same
+    /// owner-relative axis as the attack-side "can't attack its owner …"
+    /// restriction (CR 506.2 / CR 508.1).
+    RecipientAttackingOwnerTarget {
+        target: crate::types::triggers::AttackTargetFilter,
     },
     /// CR 702.95b: True while the source object is paired with another creature.
     SourceIsPaired,

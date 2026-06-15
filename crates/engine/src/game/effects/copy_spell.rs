@@ -399,17 +399,22 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> Option<Sta
         TargetRef::Player(_) => None,
     });
     if let Some(target_id) = target_id {
-        return state.stack.iter().rev().find(|entry| {
-            entry.id == target_id
-                || entry.source_id == target_id
-                || matches!(
-                    &entry.kind,
-                    StackEntryKind::ActivatedAbility {
-                        source_id: activated_id,
-                        ..
-                    } if *activated_id == target_id
-                )
-        }).cloned();
+        return state
+            .stack
+            .iter()
+            .rev()
+            .find(|entry| {
+                entry.id == target_id
+                    || entry.source_id == target_id
+                    || matches!(
+                        &entry.kind,
+                        StackEntryKind::ActivatedAbility {
+                            source_id: activated_id,
+                            ..
+                        } if *activated_id == target_id
+                    )
+            })
+            .cloned();
     }
     if matches!(
         &ability.effect,
@@ -1666,7 +1671,11 @@ mod tests {
         let mut events = Vec::new();
         resolve(&mut state, &copy_effect, &mut events).unwrap();
 
-        assert_eq!(state.stack.len(), 2, "copy must remain on stack below the copy");
+        assert_eq!(
+            state.stack.len(),
+            2,
+            "copy must remain on stack below the copy"
+        );
         let copied = state.stack.back().unwrap().ability().expect("copy entry");
         assert_eq!(
             copied.chosen_x,

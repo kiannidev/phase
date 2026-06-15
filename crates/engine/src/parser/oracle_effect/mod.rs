@@ -680,7 +680,10 @@ fn try_parse_when_next_event(tp: TextPair) -> Option<ParsedEffectClause> {
         parse_effect_chain(effect_text, AbilityKind::Spell)
     };
 
-    if condition_fragment.trim().eq_ignore_ascii_case(WHEN_NEXT_X_SPELL_OR_ACTIVATE) {
+    if condition_fragment
+        .trim()
+        .eq_ignore_ascii_case(WHEN_NEXT_X_SPELL_OR_ACTIVATE)
+    {
         use crate::types::ability::{FilterProp, TypedFilter};
         use crate::types::triggers::TriggerMode;
 
@@ -43892,7 +43895,8 @@ mod tests {
         let DelayedTriggerCondition::WhenNextEvent {
             trigger,
             or_trigger,
-        } = condition else {
+        } = condition
+        else {
             panic!("expected WhenNextEvent, got {:?}", condition);
         };
         assert_eq!(
@@ -43937,7 +43941,8 @@ mod tests {
         let DelayedTriggerCondition::WhenNextEvent {
             trigger,
             or_trigger,
-        } = condition else {
+        } = condition
+        else {
             panic!("expected WhenNextEvent, got {:?}", condition);
         };
         assert_eq!(
@@ -43949,7 +43954,10 @@ mod tests {
         let alt = or_trigger
             .as_ref()
             .expect("Magus disjunction must use or_trigger, not chained sub_abilities");
-        assert_eq!(alt.mode, crate::types::triggers::TriggerMode::AbilityActivated);
+        assert_eq!(
+            alt.mode,
+            crate::types::triggers::TriggerMode::AbilityActivated
+        );
         assert_eq!(
             alt.valid_card.as_ref(),
             Some(&TargetFilter::Typed(

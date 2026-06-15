@@ -7593,10 +7593,7 @@ pub fn pending_activation_cost_has_x(state: &GameState, source_id: ObjectId) -> 
     let Some(ability) = obj.abilities.get(*ability_index) else {
         return false;
     };
-    ability
-        .cost
-        .as_ref()
-        .is_some_and(ability_cost_has_x)
+    ability.cost.as_ref().is_some_and(ability_cost_has_x)
 }
 
 /// Extract a mana sub-cost containing X from an activated ability cost.

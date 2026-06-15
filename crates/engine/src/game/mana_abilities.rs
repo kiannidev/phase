@@ -49,27 +49,6 @@ pub fn is_mana_ability(ability_def: &AbilityDefinition) -> bool {
     ability_def.multi_target.is_none() && target_attached.is_none()
 }
 
-/// True iff every reachable link in an activated ability's resolution graph
-/// (`sub_ability` and `else_ability` per CR 608.2c) is `Effect::Mana`.
-/// Used only by triggered-mana-ability classification — activated mana abilities
-/// remain mana abilities regardless of chained non-mana effects (CR 605.1).
-fn ability_def_chain_is_all_mana(def: &AbilityDefinition) -> bool {
-    if !matches!(&*def.effect, Effect::Mana { .. }) {
-        return false;
-    }
-    if let Some(sub) = def.sub_ability.as_deref() {
-        if !ability_def_chain_is_all_mana(sub) {
-            return false;
-        }
-    }
-    if let Some(else_branch) = def.else_ability.as_deref() {
-        if !ability_def_chain_is_all_mana(else_branch) {
-            return false;
-        }
-    }
-    true
-}
-
 /// CR 605.1b: A triggered ability is a mana ability iff all three hold:
 ///   (a) it doesn't require a target (CR 115.6),
 ///   (b) it triggers from the activation/resolution of an activated mana ability

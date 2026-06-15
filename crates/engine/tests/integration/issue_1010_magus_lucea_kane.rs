@@ -30,7 +30,10 @@ fn magus_lucea_kane_tap_ability_parses_delayed_copy_not_unimplemented() {
         &[],
     );
     let ability = parsed.abilities.last().expect("tap ability");
-    let sub = ability.sub_ability.as_ref().expect("delayed copy sub_ability");
+    let sub = ability
+        .sub_ability
+        .as_ref()
+        .expect("delayed copy sub_ability");
     assert!(
         matches!(sub.effect.as_ref(), Effect::CreateDelayedTrigger { .. }),
         "expected CreateDelayedTrigger, got {:?}",
@@ -45,7 +48,12 @@ fn magus_lucea_kane_tap_registers_delayed_copy_for_next_x_spell() {
     scenario.with_library_top(
         P0,
         &[
-            "Card One", "Card Two", "Card Three", "Card Four", "Card Five", "Card Six",
+            "Card One",
+            "Card Two",
+            "Card Three",
+            "Card Four",
+            "Card Five",
+            "Card Six",
         ],
     );
 
@@ -100,7 +108,12 @@ fn magus_delayed_copy_trigger_sits_above_activated_ability_on_stack() {
     scenario.with_library_top(
         P0,
         &[
-            "Card One", "Card Two", "Card Three", "Card Four", "Card Five", "Card Six",
+            "Card One",
+            "Card Two",
+            "Card Three",
+            "Card Four",
+            "Card Five",
+            "Card Six",
         ],
     );
 
@@ -193,7 +206,12 @@ fn magus_lucea_kane_tap_registers_delayed_copy_for_next_x_activated_ability() {
     scenario.with_library_top(
         P0,
         &[
-            "Card One", "Card Two", "Card Three", "Card Four", "Card Five", "Card Six",
+            "Card One",
+            "Card Two",
+            "Card Three",
+            "Card Four",
+            "Card Five",
+            "Card Six",
         ],
     );
 
@@ -228,12 +246,12 @@ fn magus_lucea_kane_tap_registers_delayed_copy_for_next_x_activated_ability() {
     runner.activate(magus, 0).resolve();
     assert_eq!(runner.state().delayed_triggers.len(), 1);
     match &runner.state().delayed_triggers[0].condition {
-        engine::types::ability::DelayedTriggerCondition::WhenNextEvent {
-            or_trigger, ..
-        } => assert!(
-            or_trigger.is_some(),
-            "Magus delayed trigger must carry or_trigger for activated abilities"
-        ),
+        engine::types::ability::DelayedTriggerCondition::WhenNextEvent { or_trigger, .. } => {
+            assert!(
+                or_trigger.is_some(),
+                "Magus delayed trigger must carry or_trigger for activated abilities"
+            )
+        }
         other => panic!("expected WhenNextEvent delayed trigger, got {other:?}"),
     }
 

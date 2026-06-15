@@ -3246,6 +3246,23 @@ pub(crate) fn parse_oracle_ir(
 
         // Priority 9: Imperative verb for instants/sorceries
         if is_spell {
+            // CR 702.29a/e + CR 702.27a: Keyword-cost lines (cycling, flashback,
+            // suspend, …) are not spell resolution instructions. Without this
+            // guard, a sorcery whose Oracle text prints a spell effect followed
+            // by a cycling line (Fractured Sanity, Decree of Justice) routes
+            // "Cycling {cost}" through the spell catch-all and produces an
+            // `Unimplemented` spell ability instead of extracting the keyword
+            // for `synthesize_cycling`. Continuation-line protection already
+            // lives in `is_spell_resolution_instruction_line`; this covers the
+            // case where the keyword-cost line is its own main-loop iteration.
+            if is_keyword_cost_line(&lower) {
+                if let Some(kw) = parse_keyword_from_oracle(&lower) {
+                    result.extracted_keywords.push(kw);
+                    i += 1;
+                    continue;
+                }
+            }
+
             // B7: Strip ability-word prefix and attach condition for spell effects.
             let mut spell_body_lines = Vec::new();
             let mut spell_description_lines = Vec::new();
@@ -5109,6 +5126,67 @@ mod tests {
         let types: Vec<String> = types.iter().map(|s| s.to_string()).collect();
         let subtypes: Vec<String> = subtypes.iter().map(|s| s.to_string()).collect();
         parse_oracle_text(text, name, &keyword_names, &types, &subtypes)
+    }
+
+    /// CR 608.2d + CR 113.3 + CR 611.2: Linvala, Shield of Sea Gate's
+    /// activated ability — "{W/U}, Sacrifice ~: Choose hexproof or
+    /// indestructible. Creatures you control gain that ability until end of
+    /// turn." The activated ability's effect chain must prompt a typed
+    /// `Effect::Choose { ChoiceType::Keyword }` and then grant
+    /// `AddChosenKeyword` — never `Effect::Unimplemented`. Confirms the
+    /// chosen-keyword anaphor works in the activated-ability frame as well as
+    /// the trigger frame (Angelic Skirmisher).
+    #[test]
+    fn parse_linvala_shield_activated_choose_then_grant_chosen_keyword() {
+        use crate::types::ability::ChoiceType;
+        let text = "Flying\n{W/U}, Sacrifice Linvala, Shield of Sea Gate: Choose \
+                    hexproof or indestructible. Creatures you control gain that \
+                    ability until end of turn.";
+        let result = parse(
+            text,
+            "Linvala, Shield of Sea Gate",
+            &[Keyword::Flying],
+            &["Creature"],
+            &["Angel", "Wizard"],
+        );
+
+        // Collect every effect across all parsed abilities and their sub_ability chains.
+        let mut effects: Vec<&Effect> = Vec::new();
+        for ability in &result.abilities {
+            let mut node = Some(ability);
+            while let Some(d) = node {
+                effects.push(&d.effect);
+                node = d.sub_ability.as_deref();
+            }
+        }
+
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::Choose {
+                    choice_type: ChoiceType::Keyword { options },
+                    persist: true,
+                } if options.as_slice()
+                    == [Keyword::Hexproof, Keyword::Indestructible]
+            )),
+            "expected a persisting keyword Choose(hexproof|indestructible), got {effects:?}"
+        );
+        assert!(
+            effects.iter().any(|e| matches!(
+                e,
+                Effect::GenericEffect { static_abilities, .. }
+                    if static_abilities.iter().any(|s| s
+                        .modifications
+                        .contains(&ContinuousModification::AddChosenKeyword))
+            )),
+            "expected an AddChosenKeyword grant, got {effects:?}"
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::Unimplemented { .. })),
+            "no clause may be Unimplemented, got {effects:?}"
+        );
     }
 
     /// Issue #2385 — the free-cast window class must parse its resolution text to a real
@@ -9978,6 +10056,44 @@ mod tests {
         );
     }
 
+    /// Issue #629: Sorcery whose Oracle text prints a spell effect then a cycling
+    /// line must extract `Keyword::Cycling` and a `TriggerMode::Cycled` trigger,
+    /// not mis-route the cycling line through the spell catch-all.
+    #[test]
+    fn fractured_sanity_sorcery_cycling_line_not_spell_effect() {
+        use crate::types::triggers::TriggerMode;
+
+        let oracle = "Each opponent mills fourteen cards.\n\
+                      Cycling {1}{U} ({1}{U}, Discard this card: Draw a card.)\n\
+                      When you cycle this card, each opponent mills four cards.";
+        let r = parse_with_keyword_names(oracle, "Fractured Sanity", &[], &["Sorcery"], &[]);
+        assert!(
+            r.extracted_keywords
+                .iter()
+                .any(|kw| matches!(kw, Keyword::Cycling(_))),
+            "cycling line must extract Keyword::Cycling"
+        );
+        assert!(
+            !r.abilities.iter().any(|a| {
+                matches!(
+                    *a.effect,
+                    crate::types::ability::Effect::Unimplemented { .. }
+                )
+            }),
+            "cycling line must not become an Unimplemented spell ability"
+        );
+        let cycle_trigger = r
+            .triggers
+            .iter()
+            .find(|t| t.mode == TriggerMode::Cycled)
+            .expect("must parse when-you-cycle-this-card trigger");
+        assert!(cycle_trigger.execute.is_some());
+        assert!(matches!(
+            &*r.abilities[0].effect,
+            crate::types::ability::Effect::Mill { .. }
+        ));
+    }
+
     #[test]
     fn no_extraction_without_mtgjson_keywords() {
         // Without MTGJSON keywords, keyword-only lines are not detected
@@ -11011,6 +11127,84 @@ mod tests {
         let etb = &result.replacements[0];
         assert_eq!(etb.event, ReplacementEvent::Moved);
         assert_eq!(etb.valid_card, Some(TargetFilter::SelfRef));
+    }
+
+    /// CR 714.2b (Saga chapter) → CR 701.15 (goad) → CR 201.2a/201.4
+    /// (chosen-name). Day of the Moon's three chapters each "Choose a creature
+    /// card name, then goad all creatures with a name chosen for this
+    /// enchantment." Regression: the chosen-name suffix used to be dropped, so
+    /// GoadAll targeted a bare Typed[Creature] (every creature). It must lower
+    /// to a chained Choose{CardName, persist} → GoadAll whose target is
+    /// And[Typed[Creature], HasChosenName].
+    #[test]
+    fn parse_saga_day_of_the_moon_goads_only_chosen_name() {
+        use crate::types::ability::TypeFilter;
+        let oracle = "(As this Saga enters and after your draw step, add a lore counter. Sacrifice after III.)\nI, II, III — Choose a creature card name, then goad all creatures with a name chosen for this enchantment. (Until your next turn, they attack each combat if able and attack a player other than you if able.)";
+        let result = parse_oracle_text(
+            oracle,
+            "Day of the Moon",
+            &[],
+            &["Enchantment".to_string()],
+            &["Saga".to_string()],
+        );
+
+        assert_eq!(
+            result.triggers.len(),
+            3,
+            "Expected 3 chapter triggers, got: {:?}",
+            result.triggers.len()
+        );
+
+        for (i, trigger) in result.triggers.iter().enumerate() {
+            assert_eq!(trigger.mode, TriggerMode::CounterAdded);
+            let execute = trigger
+                .execute
+                .as_ref()
+                .unwrap_or_else(|| panic!("chapter {i} should have an execute ability"));
+
+            // Chapter: Choose a creature card name (persisted) ...
+            assert!(
+                matches!(
+                    *execute.effect,
+                    Effect::Choose {
+                        choice_type: ChoiceType::CardName,
+                        persist: true,
+                        ..
+                    }
+                ),
+                "chapter {i} effect should be Choose{{CardName, persist}}, got {:?}",
+                execute.effect
+            );
+
+            // ... then goad all creatures WITH THE CHOSEN NAME.
+            let sub = execute
+                .sub_ability
+                .as_ref()
+                .unwrap_or_else(|| panic!("chapter {i} should chain a goad-all sub-ability"));
+            let target = match &*sub.effect {
+                Effect::GoadAll { target } => target,
+                other => panic!("chapter {i} sub-effect should be GoadAll, got {other:?}"),
+            };
+            match target {
+                TargetFilter::And { filters } => {
+                    assert!(
+                        filters.contains(&TargetFilter::HasChosenName),
+                        "chapter {i} GoadAll target must include HasChosenName, got {filters:?}"
+                    );
+                    assert!(
+                        filters.iter().any(|inner| matches!(
+                            inner,
+                            TargetFilter::Typed(tf)
+                                if tf.type_filters.contains(&TypeFilter::Creature)
+                        )),
+                        "chapter {i} GoadAll target must include Typed(Creature), got {filters:?}"
+                    );
+                }
+                other => panic!(
+                    "chapter {i} GoadAll target must be And[Typed(Creature), HasChosenName], got {other:?}"
+                ),
+            }
+        }
     }
 
     #[test]
@@ -16609,6 +16803,35 @@ mod tests {
     }
 
     /// CR 702.94a + CR 400.3: End-to-end reproduction of Sliver Weftwinder's
+    /// CR 509.1b + CR 702.28b: both shadow-block cards reach a `CanBlockShadow`
+    /// static through the full pipeline (card-name → `~` normalization included),
+    /// instead of falling to `Effect::Unimplemented`.
+    #[test]
+    fn block_shadow_cards_reach_can_block_shadow_static() {
+        for (oracle, name) in [
+            (
+                "Heartwood Dryad can block creatures with shadow as though they didn't have shadow.",
+                "Heartwood Dryad",
+            ),
+            (
+                "Wall of Diffusion can block creatures with shadow as though it had shadow.",
+                "Wall of Diffusion",
+            ),
+        ] {
+            let parsed = parse(oracle, name, &[], &["Creature"], &[]);
+            assert!(
+                parsed
+                    .statics
+                    .iter()
+                    .any(|s| s.mode == StaticMode::CanBlockShadow
+                        && s.affected == Some(TargetFilter::SelfRef)),
+                "{name}: expected a SelfRef CanBlockShadow static, got statics={:?}, abilities={:?}",
+                parsed.statics,
+                parsed.abilities,
+            );
+        }
+    }
+
     /// hand-grant line through the full `parse_oracle_text` pipeline.
     #[test]
     fn hand_grant_reaches_statics_through_full_pipeline() {

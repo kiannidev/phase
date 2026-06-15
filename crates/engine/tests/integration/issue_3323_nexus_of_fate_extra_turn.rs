@@ -2,11 +2,14 @@
 //! cast on an opponent's turn.
 
 use engine::game::scenario::{GameScenario, P0, P1};
+use engine::types::actions::GameAction;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
+
+const P2: PlayerId = PlayerId(2);
 
 const NEXUS_OF_FATE: &str = "Take an extra turn after this one.\n\
     If Nexus of Fate would be put into a graveyard from anywhere, reveal Nexus of Fate and \
@@ -72,7 +75,7 @@ fn nexus_of_fate_grants_caster_extra_turn_on_own_turn() {
 
 #[test]
 fn nexus_of_fate_extra_turn_is_taken_after_opponents_turn_ends() {
-    let mut scenario = GameScenario::new();
+    let mut scenario = GameScenario::new_n_player(3, 42);
     scenario.at_phase(Phase::PreCombatMain);
     let nexus = scenario
         .add_spell_to_hand_from_oracle(P0, "Nexus of Fate", true, NEXUS_OF_FATE)
@@ -81,19 +84,24 @@ fn nexus_of_fate_extra_turn_is_taken_after_opponents_turn_ends() {
 
     let mut runner = scenario.build();
     runner.state_mut().active_player = P1;
+    assert_eq!(
+        engine::game::players::next_player(runner.state(), P1),
+        P2,
+        "three-player setup must make P2 the natural next turn after P1"
+    );
     grant_priority(&mut runner, P0);
     runner.cast(nexus).resolve();
 
-    runner.advance_to_end_step();
-    for _ in 0..16 {
-        if runner.state().active_player == P0 {
+    for _ in 0..128 {
+        if runner.state().active_player != P1 {
             break;
         }
         if !matches!(runner.state().waiting_for, WaitingFor::Priority { .. }) {
             break;
         }
-        runner.pass_both_players();
-        runner.advance_to_phase(Phase::Upkeep);
+        runner
+            .act(GameAction::PassPriority)
+            .expect("priority pass while ending opponent's turn");
     }
 
     assert_eq!(

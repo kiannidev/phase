@@ -52,7 +52,8 @@ fn manifest_dread_prompts_for_top_two_library_cards() {
         runner.state().waiting_for
     );
 
-    let WaitingFor::ManifestDreadChoice { player, cards } = runner.state().waiting_for.clone()
+    let WaitingFor::ManifestDreadChoice { player, cards, .. } =
+        runner.state().waiting_for.clone()
     else {
         unreachable!();
     };

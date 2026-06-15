@@ -3055,6 +3055,9 @@ pub enum WaitingFor {
     ManifestDreadChoice {
         player: PlayerId,
         cards: Vec<ObjectId>,
+        /// CR 701.62a: resolving ability source for zone-pipeline attribution on
+        /// the chosen manifest entry (Abhorrent Oculus class).
+        source_id: ObjectId,
     },
     TriggerTargetSelection {
         player: PlayerId,
@@ -7613,6 +7616,7 @@ mod tests {
         assert!(!WaitingFor::ManifestDreadChoice {
             player: PlayerId(0),
             cards: vec![],
+            source_id: ObjectId(0),
         }
         .accepts_freeform_card_selection());
     }

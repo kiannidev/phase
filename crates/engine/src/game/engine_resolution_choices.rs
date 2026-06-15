@@ -390,7 +390,11 @@ pub(super) fn handle_resolution_choice(
             ResolutionChoiceOutcome::WaitingFor(wf)
         }
         (
-            WaitingFor::ManifestDreadChoice { player, cards },
+            WaitingFor::ManifestDreadChoice {
+                player,
+                cards,
+                source_id,
+            },
             GameAction::SelectCards {
                 cards: selected_cards,
             },
@@ -417,7 +421,7 @@ pub(super) fn handle_resolution_choice(
                 crate::game::zone_pipeline::ZoneMoveRequest::effect(
                     manifest_id,
                     Zone::Battlefield,
-                    manifest_id,
+                    source_id,
                 )
                 .face_down(face_down),
                 events,

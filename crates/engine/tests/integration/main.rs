@@ -93,6 +93,7 @@ mod integration_bending;
 mod integration_landfall;
 mod invoke_calamity_free_cast;
 mod issue_1005_suffer_the_past;
+mod issue_1008_korvold_sacrifice_triggers;
 mod issue_1016_peregrin_took_food_token;
 mod issue_1017_ring_tempts_you;
 mod issue_1018_manifest_dread_choice;

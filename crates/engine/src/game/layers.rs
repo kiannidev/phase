@@ -6,7 +6,8 @@ use crate::game::arithmetic::saturating_pt_add;
 use crate::game::conditions::{
     counter_condition_matches, eval_chosen_label_is, eval_class_level_ge, eval_has_city_blessing,
     eval_is_initiative, eval_is_monarch, eval_no_monarch, eval_source_entered_this_turn,
-    eval_source_in_zone, eval_source_is_attacking, eval_source_is_tapped_on_battlefield,
+    eval_source_has_dealt_damage, eval_source_in_zone, eval_source_is_attacking,
+    eval_source_is_tapped_on_battlefield,
 };
 use crate::game::devotion::count_devotion;
 use crate::game::filter::{matches_target_filter, FilterContext};
@@ -630,6 +631,7 @@ fn static_condition_uses_object_population(condition: &StaticCondition) -> bool 
         | StaticCondition::UnlessPay { .. }
         | StaticCondition::DuringYourTurn
         | StaticCondition::SourceEnteredThisTurn
+        | StaticCondition::SourceHasDealtDamage
         | StaticCondition::WasCast { .. }
         | StaticCondition::IsRingBearer
         | StaticCondition::RingLevelAtLeast { .. }
@@ -747,6 +749,7 @@ fn entered_object_perturbs_static_condition(
         | StaticCondition::UnlessPay { .. }
         | StaticCondition::DuringYourTurn
         | StaticCondition::SourceEnteredThisTurn
+        | StaticCondition::SourceHasDealtDamage
         | StaticCondition::WasCast { .. }
         | StaticCondition::IsRingBearer
         | StaticCondition::RingLevelAtLeast { .. }
@@ -927,6 +930,10 @@ fn evaluate_condition_with_context(
         }
         // CR 400.7: True when the source permanent entered the battlefield this turn.
         StaticCondition::SourceEnteredThisTurn => eval_source_entered_this_turn(state, source_id),
+        // CR 120.3 + CR 120.6 + CR 702.11b: True once the source has actually dealt
+        // damage since entering the battlefield (sticky). The "hasn't dealt damage
+        // yet" hexproof grant wraps this in `StaticCondition::Not`.
+        StaticCondition::SourceHasDealtDamage => eval_source_has_dealt_damage(state, source_id),
         // CR 601.2 + CR 611.3a: True when the source permanent was cast.
         StaticCondition::WasCast { zone } => state
             .objects
@@ -2212,12 +2219,14 @@ fn for_each_static_effect_source(
                 visit(state, obj);
             }
         }
-        // CR 114.3: command-zone emblems have static abilities that affect the game.
+        // CR 114.3: command-zone emblems have static abilities that affect the
+        // game. CR 905.4 + CR 113.6b: a face-up conspiracy's static abilities
+        // function from the command zone too.
         for &id in &state.command_zone {
             let Some(obj) = state.objects.get(&id) else {
                 continue;
             };
-            if obj.is_emblem {
+            if obj.is_emblem || crate::game::conspiracy::functions_from_command_zone(obj) {
                 visit(state, obj);
             }
         }
@@ -2236,13 +2245,15 @@ fn for_each_static_effect_source(
             visit(state, obj);
         }
         // CR 114.3: Emblems in the command zone have static abilities that affect
-        // the game. The index already filtered to `is_emblem` generators; the
-        // gate is re-asserted here for parity with the fallback path.
+        // the game. CR 905.4 + CR 113.6b: a face-up conspiracy's static abilities
+        // function from the command zone too. The index already filtered to these
+        // command-zone generators; the gate is re-asserted here for parity with
+        // the fallback path.
         for &id in &index.command_sources {
             let Some(obj) = state.objects.get(&id) else {
                 continue;
             };
-            if obj.is_emblem {
+            if obj.is_emblem || crate::game::conspiracy::functions_from_command_zone(obj) {
                 visit(state, obj);
             }
         }
@@ -8776,6 +8787,88 @@ mod tests {
         assert!(
             !land.card_types.subtypes.contains(&"Desert".to_string()),
             "CR 305.7: Old land subtypes should be removed"
+        );
+    }
+
+    #[test]
+    fn song_style_set_card_types_and_basic_land_type_makes_nonland_a_forest() {
+        // CR 205.1a + CR 305.7: Song of the Dryads both makes the enchanted
+        // permanent a land and sets its basic land subtype, which removes its
+        // rules-text abilities and grants the Forest intrinsic mana ability.
+        let mut state = setup();
+        let p0 = PlayerId(0);
+
+        let creature_id = create_object(
+            &mut state,
+            CardId(0),
+            p0,
+            "Test Creature".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let ts = state.next_timestamp();
+            let obj = state.objects.get_mut(&creature_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.timestamp = ts;
+            Arc::make_mut(&mut obj.base_abilities).push(AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    player: TargetFilter::Controller,
+                },
+            ));
+            obj.abilities = Arc::new((*obj.base_abilities).clone());
+        }
+
+        let aura_id = create_object(
+            &mut state,
+            CardId(1),
+            p0,
+            "Song of the Dryads".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let ts = state.next_timestamp();
+            let obj = state.objects.get_mut(&aura_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.base_card_types = obj.card_types.clone();
+            obj.timestamp = ts;
+            obj.static_definitions.push(
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::Typed(
+                        TypedFilter::new(TypeFilter::Card)
+                            .properties(vec![FilterProp::EnchantedBy]),
+                    ))
+                    .modifications(vec![
+                        ContinuousModification::SetCardTypes {
+                            core_types: vec![CoreType::Land],
+                        },
+                        ContinuousModification::SetBasicLandType {
+                            land_type: BasicLandType::Forest,
+                        },
+                    ]),
+            );
+        }
+
+        state.objects.get_mut(&aura_id).unwrap().attached_to = Some(creature_id.into());
+
+        evaluate_layers(&mut state);
+
+        let creature = state.objects.get(&creature_id).unwrap();
+        assert_eq!(creature.card_types.core_types, vec![CoreType::Land]);
+        assert!(creature.card_types.subtypes.contains(&"Forest".to_string()));
+        assert!(
+            !creature
+                .abilities
+                .iter()
+                .any(|ability| matches!(&*ability.effect, Effect::GainLife { .. })),
+            "CR 305.7: rules-text abilities should be removed"
+        );
+        assert_eq!(
+            count_mana_abilities(creature, ManaColor::Green),
+            1,
+            "CR 305.7: Forest subtype should grant the intrinsic green mana ability"
         );
     }
 

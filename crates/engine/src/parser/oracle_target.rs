@@ -3,7 +3,7 @@ use std::str::FromStr;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till, take_till1};
 use nom::character::complete::space1;
-use nom::combinator::{opt, peek, value};
+use nom::combinator::{opt, peek, success, value};
 use nom::multi::many0;
 use nom::Parser;
 
@@ -2754,7 +2754,17 @@ fn distribute_shared_properties(filter: TargetFilter, shared_props: &[FilterProp
 /// only to the creature disjunct. Spreading `WithKeyword(Flying)` onto the
 /// artifact/enchantment legs would require those permanents to have flying and
 /// would block activation when only a legal enchantment is present (#2941).
-fn is_adjective_prefix_prop(prop: &FilterProp) -> bool {
+///
+/// SHARED LEG-LOCALITY AUTHORITY: this predicate is the single registry of
+/// inherently-leg-local `FilterProp`s for BOTH disjunctive grammars — the
+/// target-phrase grammar (`parse_type_phrase`) and the search-filter
+/// disjunction grammar (`oracle_effect::search::parse_search_filter_disjunction`,
+/// CR 701.23a). Every `FilterProp` that an adjective prefix or a type-scoped
+/// suffix binds to exactly one disjunct MUST be registered here, or it will be
+/// wrongly distributed across earlier `Or` legs and silently break the affected
+/// cards (e.g. #2892). When adding a new leg-local search/target prop, add it to
+/// this match.
+pub(crate) fn is_adjective_prefix_prop(prop: &FilterProp) -> bool {
     matches!(
         prop,
         // CR 700.4 + CR 700.9: "modified [type]" adjective prefix.
@@ -2793,6 +2803,21 @@ fn is_adjective_prefix_prop(prop: &FilterProp) -> bool {
             | FilterProp::WithKeyword { .. }
             | FilterProp::WithoutKeyword { .. }
             | FilterProp::WithoutKeywordKind { .. }
+            // CR 702.1: "<type> with [keyword kind]" (e.g. "a card with
+            // augment", Clever Combo) is a keyword-membership predicate that
+            // binds only to its own disjunct — distributing it onto a sibling
+            // leg ("host card with augment") would empty that leg's match set.
+            | FilterProp::HasKeywordKind { .. }
+            // CR 201.2 / CR 201.2a: a card-name predicate binds only to its own
+            // disjunct — distributing `Named` onto a sibling leg ("basic land
+            // named jiang yanggu") would empty that leg's match set. Named is
+            // inherently leg-local, the same class as HasKeywordKind/WithKeyword.
+            // This is defense-in-depth: no current card routes a `Named` leg
+            // through the Or distributor (name-disjunction cards either use bare
+            // "and", which takes the dual-filter MatchEachFilter path and never
+            // reaches this distributor, or carry `Named` on every leg and are
+            // deduped by `same_kind`), but excluding it future-proofs the guard.
+            | FilterProp::Named { .. }
     )
 }
 
@@ -2806,8 +2831,18 @@ fn is_adjective_prefix_prop(prop: &FilterProp) -> bool {
 /// produced by adjective prefixes (e.g. FilterProp::Modified from "modified
 /// creatures", FilterProp::EnchantedBy from "enchanted creature") are
 /// leg-local and retained only on their originating leg. See
-/// `is_trailing_suffix_prop`.
-fn distribute_properties_to_or(filter: TargetFilter) -> TargetFilter {
+/// `is_adjective_prefix_prop`.
+///
+/// Exposed `pub(crate)` so disjunctive grammars that compose their own `Or` from
+/// independently-parsed disjuncts can reuse this shared trailing-suffix
+/// distribution instead of duplicating it. In particular the search-filter
+/// disjunction grammar (CR 701.23a, "creature, instant, or sorcery card with
+/// mana value N", #2892) parses each comma/or segment independently, so only the
+/// final segment carries the "with mana value N" suffix — this distributes the
+/// `Cmc` prop back onto the earlier `Typed` legs. `is_adjective_prefix_prop` is
+/// the shared registry that keeps leg-local props (keyword/name/adjective) from
+/// being distributed; every leg-local search prop MUST be registered there.
+pub(crate) fn distribute_properties_to_or(filter: TargetFilter) -> TargetFilter {
     let TargetFilter::Or { mut filters } = filter else {
         return filter;
     };
@@ -4126,6 +4161,32 @@ fn parse_ownership_or_controller_suffix(
         }
         return own_ctrl_offset + (own_ctrl.len() - rest.len());
     }
+    // CR 108.3 + CR 701.38d: Passive ownership form "owned by <player-ref>".
+    // Expropriate: "choose a permanent owned by the voter" — the voter is the
+    // scoped player during per-ballot iteration.  Compositional: every
+    // player-ref recognized by the active-voice combinator above is also
+    // accepted in the passive voice here.
+    let passive_parsed: nom::IResult<&str, (ControllerRef, bool), OracleError<'_>> = (
+        tag("owned by "),
+        alt((
+            tag("the voter").map(|_| ControllerRef::ScopedPlayer),
+            tag("that player").map(|_| ControllerRef::TargetPlayer),
+            tag("an opponent").map(|_| ControllerRef::Opponent),
+            tag("you").map(|_| ControllerRef::You),
+        )),
+        alt((tag(" and controlled by").map(|_| true), success(false))),
+    )
+        .map(|(_, owner, also_control)| (owner, also_control))
+        .parse(own_ctrl);
+    if let Ok((rest, (owner, also_control))) = passive_parsed {
+        properties.push(FilterProp::Owned {
+            controller: owner.clone(),
+        });
+        if also_control {
+            *controller = Some(owner);
+        }
+        return own_ctrl_offset + (own_ctrl.len() - rest.len());
+    }
 
     let (ctrl, ctrl_len) =
         parse_controller_suffix(text, ctx).map_or((None, 0), |(ctrl, len)| (Some(ctrl), len));
@@ -5253,6 +5314,8 @@ enum ZoneQual {
     Opponent,
     /// "your " — sets `ControllerRef::You` on the parent filter.
     You,
+    /// "target player's " — produces `Owned{TargetPlayer}`.
+    TargetPlayer,
     /// "their " — produces `Owned{ScopedPlayer}`; in an each-player iteration
     /// the third-person possessive binds to the iterated player.
     Their,
@@ -5307,6 +5370,8 @@ pub(crate) fn scan_zone_phrase(
 /// - Opponent possessive: "from an opponent's graveyard", "from each opponent's graveyard"
 ///   → `[Owned{Opponent}, InZone]` so stolen creatures that died are still matched by owner.
 /// - Your: "from your graveyard" → `InZone` + `ControllerRef::You`.
+/// - Target player's: "from target player's graveyard" → `[Owned{TargetPlayer}, InZone]`
+///   so the card selection is constrained by the companion player target.
 /// - "Their": "from their graveyard" → `[Owned{ScopedPlayer}, InZone]` so in an
 ///   each-player iteration the candidate set is scoped to the iterated player's
 ///   own graveyard (CR 110.1/108.3: membership is owner-keyed).
@@ -5373,6 +5438,18 @@ fn parse_zone_suffix_nom(
             None,
         ),
         ZoneQual::You => (vec![FilterProp::InZone { zone }], Some(ControllerRef::You)),
+        // CR 108.3 + CR 109.4 + CR 115.1: Non-battlefield zone membership is
+        // owner-keyed. "target player's graveyard" constrains selected cards
+        // by ownership relative to the chosen target player, not by controller.
+        ZoneQual::TargetPlayer => (
+            vec![
+                FilterProp::Owned {
+                    controller: ControllerRef::TargetPlayer,
+                },
+                FilterProp::InZone { zone },
+            ],
+            None,
+        ),
         // CR 110.1 + CR 108.3: a graveyard/hand/library card is not a permanent
         // and has no controller — membership is keyed by owner. CR 109.5:
         // "their" in an each-player iteration binds to the iterated player
@@ -5399,6 +5476,7 @@ fn parse_zone_qual(i: &str) -> super::oracle_nom::error::OracleResult<'_, ZoneQu
             alt((tag("an opponent's "), tag("each opponent's "))),
         ),
         value(ZoneQual::You, tag("your ")),
+        value(ZoneQual::TargetPlayer, tag("target player's ")),
         value(ZoneQual::Their, tag("their ")),
         value(
             ZoneQual::OtherPoss,
@@ -5732,6 +5810,23 @@ mod tests {
             f,
             TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You))
         );
+    }
+
+    #[test]
+    fn time_lord_target_keeps_subtype_and_controller() {
+        // CR 205.3m + CR 115.1: "target Time Lord you control" must keep both the
+        // two-word subtype (CR 205.3m: the only two-word creature type) and the
+        // controller restriction (CR 115.1: declared target). Regression: when
+        // "Time Lord" was absent from the SUBTYPES registry this collapsed to
+        // Typed{type_filters:[], controller:None} (Time Lord Regeneration).
+        let (filter, rest) = parse_target("target Time Lord you control");
+        assert_eq!(rest, "");
+        let tf = typed_leg(&filter).expect("expected Typed filter");
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+        assert!(tf
+            .type_filters
+            .iter()
+            .any(|t| matches!(t, TypeFilter::Subtype(s) if s == "Time Lord")));
     }
 
     #[test]

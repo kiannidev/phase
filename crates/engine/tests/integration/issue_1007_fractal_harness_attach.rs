@@ -52,7 +52,7 @@ fn pool_for_x(x: u32) -> Vec<ManaUnit> {
 }
 
 #[test]
-fn fractal_harness_etb_token_enters_with_counters_and_attach_sub() {
+fn fractal_harness_etb_put_counter_then_attach_chain() {
     let parsed = engine::parser::parse_oracle_text(
         FRACTAL_HARNESS_ORACLE,
         "Fractal Harness",
@@ -73,36 +73,52 @@ fn fractal_harness_etb_token_enters_with_counters_and_attach_sub() {
     else {
         panic!("ETB root must be Token, got {:?}", execute.effect);
     };
-    assert_eq!(enter_with_counters.len(), 1);
-    assert_eq!(enter_with_counters[0].0, CounterType::Plus1Plus1);
+    assert!(
+        enter_with_counters.is_empty(),
+        "counters must resolve via PutCounter, not enter_with_counters"
+    );
+    let put_counter = execute
+        .sub_ability
+        .as_ref()
+        .expect("PutCounter must follow token creation");
+    let Effect::PutCounter {
+        counter_type,
+        count,
+        target,
+    } = put_counter.effect.as_ref()
+    else {
+        panic!("expected PutCounter sub, got {:?}", put_counter.effect);
+    };
+    assert_eq!(*counter_type, CounterType::Plus1Plus1);
     assert!(
         matches!(
-            enter_with_counters[0].1,
+            count,
             QuantityExpr::Ref {
                 qty: QuantityRef::CostXPaid
             }
         ) || matches!(
-            enter_with_counters[0].1,
+            count,
             QuantityExpr::Ref {
                 qty: QuantityRef::Variable { .. }
             }
         ),
-        "X paid at cast must bind enter_with_counters, got {:?}",
-        enter_with_counters[0].1
+        "X paid at cast must bind PutCounter count, got {:?}",
+        count
     );
-    let attach = execute
+    assert_eq!(
+        *target,
+        TargetFilter::LastCreated,
+        "post-token 'put counters on it' must target the created token"
+    );
+    let attach = put_counter
         .sub_ability
         .as_ref()
-        .expect("attach must follow token creation directly");
+        .expect("Attach must follow PutCounter");
     let Effect::Attach { attachment, target } = attach.effect.as_ref() else {
         panic!("expected Attach sub, got {:?}", attach.effect);
     };
     assert_eq!(*attachment, TargetFilter::SelfRef);
     assert_eq!(*target, TargetFilter::LastCreated);
-    assert!(
-        attach.sub_ability.is_none(),
-        "PutCounter sibling must be folded into enter_with_counters"
-    );
 }
 
 #[test]
@@ -180,5 +196,72 @@ fn fractal_harness_attaches_to_created_token_on_etb() {
         token.counters.get(&CounterType::Plus1Plus1).copied(),
         Some(3),
         "token should receive X +1/+1 counters before attachment"
+    );
+}
+
+#[test]
+fn fractal_harness_etb_chain_resolves_directly() {
+    use engine::game::ability_utils::build_resolved_from_def;
+    use engine::game::effects::resolve_ability_chain;
+    use engine::game::zones::create_object;
+    use engine::types::events::GameEvent;
+    use engine::types::game_state::GameState;
+    use engine::types::identifiers::CardId;
+    use engine::types::player::PlayerId;
+    use engine::types::zones::Zone;
+
+    let parsed = engine::parser::parse_oracle_text(
+        FRACTAL_HARNESS_ORACLE,
+        "Fractal Harness",
+        &[],
+        &["Artifact".to_string()],
+        &["Equipment".to_string()],
+    );
+    let execute = parsed
+        .triggers
+        .iter()
+        .find(|t| t.mode == engine::types::triggers::TriggerMode::ChangesZone)
+        .and_then(|t| t.execute.as_ref())
+        .expect("ETB trigger");
+
+    let mut state = GameState::new_two_player(42);
+    let harness = create_object(
+        &mut state,
+        CardId(1),
+        PlayerId(0),
+        "Fractal Harness".to_string(),
+        Zone::Battlefield,
+    );
+    state.objects.get_mut(&harness).unwrap().cost_x_paid = Some(3);
+
+    let mut ability = build_resolved_from_def(execute, harness, PlayerId(0));
+    ability.chosen_x = Some(3);
+    let mut events = Vec::new();
+    resolve_ability_chain(&mut state, &ability, &mut events, 0).expect("ETB chain");
+
+    let harness_obj = state.objects.get(&harness).expect("harness");
+    let attached_host = harness_obj
+        .attached_to
+        .as_ref()
+        .and_then(|t| match t {
+            AttachTarget::Object(id) => Some(*id),
+            AttachTarget::Player(_) => None,
+        })
+        .expect("harness should attach to created token");
+    let token = state.objects.get(&attached_host).expect("token");
+    assert!(token.is_token);
+    assert_eq!(
+        token.counters.get(&CounterType::Plus1Plus1).copied(),
+        Some(3)
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            GameEvent::EffectResolved {
+                kind: engine::types::ability::EffectKind::PutCounter,
+                ..
+            }
+        )),
+        "PutCounter should resolve in chain: {events:?}"
     );
 }

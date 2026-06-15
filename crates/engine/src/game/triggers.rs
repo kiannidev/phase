@@ -17255,6 +17255,7 @@ pub mod tests {
                         },
                     }],
                     condition: None,
+                    duration_subject: None,
                     source_name: "Jhoira of the Ghitu".to_string(),
                 },
             );

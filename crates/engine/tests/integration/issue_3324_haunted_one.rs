@@ -1,8 +1,8 @@
 //! Issue #3324 — Haunted One must buff only the tapped commander and other
 //! creatures you control that share a creature type with it.
 
-use engine::parser::oracle_static::parse_static_line;
 use engine::parser::oracle_effect::parse_effect_chain;
+use engine::parser::oracle_static::parse_static_line;
 use engine::types::ability::{
     AbilityKind, ContinuousModification, Effect, FilterProp, SharedQuality, TargetFilter,
 };
@@ -56,8 +56,7 @@ fn haunted_one_static_grants_compound_subject_trigger() {
     let tail = execute.sub_ability.as_ref().expect("compound-subject tail");
     let tail_target = match &*tail.effect {
         Effect::GenericEffect {
-            target: Some(t),
-            ..
+            target: Some(t), ..
         }
         | Effect::Pump { target: t, .. } => t,
         other => panic!("expected tail with recipient filter, got {other:?}"),
@@ -78,8 +77,7 @@ fn haunted_one_static_grants_compound_subject_trigger() {
         tf.controller,
         Some(engine::types::ability::ControllerRef::You)
     );
-    assert!(
-        tf.type_filters
-            .contains(&engine::types::ability::TypeFilter::Creature)
-    );
+    assert!(tf
+        .type_filters
+        .contains(&engine::types::ability::TypeFilter::Creature));
 }

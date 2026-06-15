@@ -97,9 +97,10 @@ use crate::types::ability::{
     ManaSpendPermission, MultiTargetSpec, ObjectProperty, ObjectScope, PlayerFilter,
     PlayerRelation, PlayerScope, PreventionAmount, PreventionScope, ProhibitedActivity, PtValue,
     QuantityExpr, QuantityRef, ReplacementDefinition, RestrictionExpiry, RestrictionPlayerScope,
-    RoundingMode, StaticCondition, StaticDefinition, StepSkipTarget, SubAbilityLink,
-    TapStateChange, TargetFilter, TargetSelectionMode, ThisWayCause, TriggerCondition,
-    TriggerDefinition, TypeFilter, TypedFilter, UnlessPayModifier, UntilCondition, ZoneOwner,
+    RoundingMode, SharedQuality, SharedQualityRelation, StaticCondition, StaticDefinition,
+    StepSkipTarget, SubAbilityLink, TapStateChange, TargetFilter, TargetSelectionMode,
+    ThisWayCause, TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter, UnlessPayModifier,
+    UntilCondition, ZoneOwner,
 };
 #[cfg(test)]
 use crate::types::ability::{AttackScope, AttackSubject};
@@ -10071,15 +10072,13 @@ fn parse_controlled_creature_each_second_subject(rest: &str) -> Option<(usize, T
 fn parse_other_creatures_share_type_each_second_subject(
     rest: &str,
 ) -> Option<(usize, TargetFilter)> {
-    use crate::types::ability::{
-        ControllerRef, FilterProp, SharedQuality, SharedQualityRelation, TypedFilter,
-    };
-    const PREFIX: &str = "other creatures you control that share a creature type with it each ";
-    if !rest.starts_with(PREFIX) {
-        return None;
-    }
+    let (remaining, _) = tag::<_, _, OracleError<'_>>(
+        "other creatures you control that share a creature type with it each ",
+    )
+    .parse(rest)
+    .ok()?;
     Some((
-        PREFIX.len(),
+        rest.len() - remaining.len(),
         TargetFilter::Typed(
             TypedFilter::creature()
                 .controller(ControllerRef::You)
@@ -47928,7 +47927,7 @@ mod tests {
     /// SharesQuality relative to the tapped commander.
     #[test]
     fn compound_subject_each_other_creatures_share_commander_type() {
-        use crate::types::ability::{FilterProp, SharedQuality, TypedFilter};
+        use crate::types::ability::{FilterProp, SharedQuality};
 
         let mut ctx = ParseContext::default();
         let text = "it and other creatures you control that share a creature type with it each get +2/+0 and gain undying until end of turn";
@@ -47946,8 +47945,7 @@ mod tests {
         let tail = clause.sub_ability.as_ref().expect("tail link");
         let tail_target = match &*tail.effect {
             Effect::GenericEffect {
-                target: Some(t),
-                ..
+                target: Some(t), ..
             }
             | Effect::Pump { target: t, .. } => t.clone(),
             other => panic!("expected tail GenericEffect/Pump, got {other:?}"),

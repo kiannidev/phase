@@ -617,8 +617,9 @@ fn try_parse_when_next_spell_or_activate_disjunction(
     let (rest, spell_part) = take_until::<_, _, OracleError<'_>>(WHEN_NEXT_OR_ACTIVATE_ABILITY)
         .parse(condition_fragment.trim())
         .ok()?;
-    let (activation_part, _) =
-        tag::<_, _, OracleError<'_>>(WHEN_NEXT_OR_ACTIVATE_ABILITY).parse(rest).ok()?;
+    let (activation_part, _) = tag::<_, _, OracleError<'_>>(WHEN_NEXT_OR_ACTIVATE_ABILITY)
+        .parse(rest)
+        .ok()?;
     let spell_filter = extract_when_next_spell_filter(spell_part.trim())?;
     let ability_filter =
         crate::parser::oracle_trigger::parse_post_activation_modifier(activation_part.trim())?;

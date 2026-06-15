@@ -173,6 +173,14 @@ pub fn check_state_based_actions(state: &mut GameState, events: &mut Vec<GameEve
             );
         }
 
+        // CR 904.10 / CR 314.6: A face-up non-ongoing scheme with no scheme
+        // triggered ability on the stack or waiting to be put on the stack is
+        // abandoned (turned face down, put on the bottom of the scheme deck).
+        // Gated on an Archenemy game.
+        if state.archenemy.is_some() {
+            crate::game::archenemy::check_scheme_abandon_sba(state, events, &mut any_performed);
+        }
+
         if !any_performed {
             break;
         }
@@ -226,6 +234,20 @@ fn check_city_blessing(
         crate::game::layers::mark_layers_full(state);
         events.push(GameEvent::CityBlessingGained { player_id });
         *any_performed = true;
+    }
+}
+
+/// CR 702.131b + CR 702.131d: Eagerly re-evaluate the city's blessing for all
+/// players outside the normal SBA loop. Called from `resolve_chain_body` after
+/// a parent effect resolves and before a `HasCityBlessing`-gated sub-ability
+/// condition is evaluated, so that a token or permanent created by the parent
+/// effect (which may have pushed a player to 10+ permanents) is reflected in
+/// `state.city_blessing` before the sub-ability gate fires.
+pub(crate) fn apply_city_blessing_if_triggered(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    let mut any_performed = false;
+    check_city_blessing(state, events, &mut any_performed);
+    if any_performed {
+        crate::game::layers::flush_layers(state);
     }
 }
 

@@ -81,6 +81,7 @@
   "board": {
     "regroupCreatures": "Regroup duplicate creature groups",
     "changeBackground": "Change background…",
+    "customizeLayout": "Customize layout…",
     "gameLog": "Game log",
     "debugLog": "Debug log",
     "waitingForGame": "Waiting for game...",
@@ -98,8 +99,19 @@
       "open_other": "Open lands drawer ({{count}} lands)",
       "pipTooltip_one": "{{count}} hidden land can currently produce",
       "pipTooltip_other": "{{count}} hidden lands can currently produce",
+      "pipAvailability": "{{untapped}} of {{total}} untapped",
       "title_one": "Lands ({{count}})",
       "title_other": "Lands ({{count}})"
+    },
+    "creatures": {
+      "label": "Creatures",
+      "open_one": "Open creatures drawer ({{count}} creature)",
+      "open_other": "Open creatures drawer ({{count}} creatures)",
+      "title_one": "Creatures ({{count}})",
+      "title_other": "Creatures ({{count}})",
+      "totalPower": "{{power}}/{{toughness}} total power and toughness",
+      "viewAll": "Click to view all",
+      "scrollHint": "Scroll"
     },
     "support": {
       "label": "Support",
@@ -163,6 +175,7 @@
     "creaturesAbbr": "Crt",
     "landsAbbr": "Lnd",
     "otherAbbr": "Oth",
+    "manaAvailable": "{{untapped}} of {{total}} lands untapped",
     "out": "OUT",
     "eliminated": "Eliminated",
     "phasedOut": "Phased Out",
@@ -293,6 +306,20 @@
     "experienceTooltip": "Experience counters: {{count}}",
     "speedAriaLabel": "Speed {{value}}",
     "speedTooltip": "Speed: {{value}}",
+    "condCantWin": "Can't win the game",
+    "condCantGainLife": "Can't gain life",
+    "condCantLoseLife": "Can't lose life",
+    "condCantPayLife": "Can't pay life",
+    "condCantCast": "Can't cast spells",
+    "condCantActivate": "Can't activate abilities",
+    "condCastOnlyFromZones": "Can cast only from limited zones",
+    "condFromSource": "{{condition}} — from {{name}}",
+    "pendingSpell": "Next spell",
+    "pendingCantBeCountered": "Next spell can't be countered",
+    "pendingHasKeyword": "Next spell has {{keyword}}",
+    "pendingFlash": "Next spell can be cast as though it had flash",
+    "pendingFree": "Next spell without paying its mana cost",
+    "pendingCheaper": "Next spell costs {{amount}} less",
     "companion": "Companion"
   },
   "avatar": {
@@ -917,6 +944,12 @@
       "title": "Choose Ring-bearer",
       "subtitle": "Choose a creature you control"
     },
+    "learn": {
+      "title": "Learn",
+      "subtitle": "Discard a card to draw a card, or skip",
+      "labelRummage": "Discard & draw",
+      "labelSkip": "Skip"
+    },
     "reorderHint": "Drag to reorder · the top card is drawn first",
     "scry": {
       "title": "Scry",
@@ -1125,6 +1158,12 @@
       "subtitle_other": "Exile {{count}} materials to craft",
       "subtitleRange": "Exile {{min}} to {{count}} materials to craft"
     },
+    "exilePermanent": {
+      "title": "Exile a permanent",
+      "subtitle_one": "Exile {{count}} permanent you control",
+      "subtitle_other": "Exile {{count}} permanents you control",
+      "subtitleRange": "Exile {{min}} to {{count}} permanents you control"
+    },
     "behold": {
       "title": "Behold",
       "subtitleExile": "Exile a matching permanent or card",
@@ -1332,6 +1371,18 @@
   "clashOpponent": {
     "title": "Choose Clash Opponent",
     "subtitle": "Choose which opponent will clash with you."
+  },
+  "assist": {
+    "choose": {
+      "title": "Choose a Player to Assist",
+      "subtitle": "Choose another player who may pay up to {{max}} generic mana for this spell.",
+      "decline": "Decline"
+    },
+    "payment": {
+      "title": "Assist: Pay Generic Mana",
+      "commit": "Pay {{value}}",
+      "decline": "Pay nothing"
+    }
   },
   "cardDataMissing": {
     "title": "Card Data Missing",

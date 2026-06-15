@@ -52,6 +52,11 @@ pub enum ZoneOwner {
     TargetedPlayer,
     /// An opponent of the controller owns the referenced zone.
     Opponent,
+    /// CR 701.38d: The scoped player (voter) owns the referenced zone.
+    /// Used by per-ballot vote iteration (Expropriate) where the candidate
+    /// pool is "permanents owned by the voter". For Battlefield, filters
+    /// by `obj.owner` (ownership) rather than `obj.controller` (control).
+    ScopedPlayer,
 }
 
 /// CR 101.4: Who selects permanents in a multi-player category choice effect
@@ -109,6 +114,16 @@ pub enum SearchSelectionConstraint {
     MatchEachFilter { filters: Vec<TargetFilter> },
 }
 
+impl SearchSelectionConstraint {
+    /// CR 701.23b vs CR 701.23d: a *stated-quality* search (any constrained
+    /// variant) may find fewer cards than requested — including none. A pure
+    /// *quantity* search (`None`) must find as many as possible. Drives the
+    /// SearchChoice lower bound in the submission guard and AI candidate gen.
+    pub fn permits_partial_find(&self) -> bool {
+        !matches!(self, SearchSelectionConstraint::None)
+    }
+}
+
 /// CR 400.11 + CR 406.3: Candidate pool for outside-game searches. The
 /// baseline pool is the player's sideboard; Karn/Coax-class text widens that
 /// pool to include owned face-up exile cards that match the same filter.
@@ -161,6 +176,8 @@ pub struct SearchDestinationSplit {
 pub enum OpponentMayScope {
     /// "any opponent may" — each opponent in APNAP order gets the chance; first accept wins.
     AnyOpponent,
+    /// CR 608.2d + CR 101.4: "any player may" — every player INCLUDING the controller is offered in APNAP order; first accept wins (distinct from AnyOpponent which excludes the controller).
+    AnyPlayer,
 }
 
 /// What kind of named choice the player must make at resolution time.
@@ -189,8 +206,19 @@ pub enum ChoiceType {
     },
     /// "Choose a land type" — includes basic + common nonbasic land types.
     LandType,
-    /// "Choose an opponent" — selects one opponent player (CR 800.4a).
-    Opponent,
+    /// "Choose an opponent" — selects one opponent player (CR 102.3 defines an
+    /// opponent as any player not on the choosing player's team).
+    ///
+    /// `restriction`, when present, narrows the eligible opponents to those
+    /// matching the embedded `PlayerFilter` (CR 102.3 + CR 608.2d). This keeps
+    /// "choose an opponent with the most life among your opponents" (The Master,
+    /// Gallifrey's End) a genuine single-pick step — the controller picks ONE of
+    /// the qualifying opponents (CR 608.2d handles ties) — rather than fanning
+    /// the effect out to every tied opponent. Boxed to avoid inflating the
+    /// `ChoiceType` enum with the recursive `PlayerFilter` payload.
+    Opponent {
+        restriction: Option<Box<PlayerFilter>>,
+    },
     /// "Choose a player" — selects any player in the game.
     Player,
     /// "Choose two colors" — selects two distinct mana colors.
@@ -284,7 +312,18 @@ impl Serialize for ChoiceType {
                 variant.end()
             }
             Self::LandType => serializer.serialize_unit_variant("ChoiceType", 8, "LandType"),
-            Self::Opponent => serializer.serialize_unit_variant("ChoiceType", 9, "Opponent"),
+            // Serialize the unrestricted form as the legacy unit variant
+            // "Opponent" so existing card-data JSON stays byte-stable; only emit
+            // the struct form when a restriction is present.
+            Self::Opponent { restriction } => match restriction {
+                None => serializer.serialize_unit_variant("ChoiceType", 9, "Opponent"),
+                Some(restriction) => {
+                    let mut variant =
+                        serializer.serialize_struct_variant("ChoiceType", 9, "Opponent", 1)?;
+                    variant.serialize_field("restriction", restriction)?;
+                    variant.end()
+                }
+            },
             Self::Player => serializer.serialize_unit_variant("ChoiceType", 10, "Player"),
             Self::TwoColors => serializer.serialize_unit_variant("ChoiceType", 11, "TwoColors"),
             Self::Word => serializer.serialize_unit_variant("ChoiceType", 12, "Word"),
@@ -324,6 +363,10 @@ impl<'de> Deserialize<'de> for ChoiceType {
             Labeled {
                 options: Vec<String>,
             },
+            Opponent {
+                #[serde(default)]
+                restriction: Option<Box<PlayerFilter>>,
+            },
             Keyword {
                 options: Vec<Keyword>,
             },
@@ -338,7 +381,7 @@ impl<'de> Deserialize<'de> for ChoiceType {
                 "CardType" => Ok(Self::CardType),
                 "CardName" => Ok(Self::CardName),
                 "LandType" => Ok(Self::LandType),
-                "Opponent" => Ok(Self::Opponent),
+                "Opponent" => Ok(Self::Opponent { restriction: None }),
                 "Player" => Ok(Self::Player),
                 "TwoColors" => Ok(Self::TwoColors),
                 "Word" => Ok(Self::Word),
@@ -365,6 +408,7 @@ impl<'de> Deserialize<'de> for ChoiceType {
                 ChoiceTypeData::Color { excluded } => Ok(Self::Color { excluded }),
                 ChoiceTypeData::NumberRange { min, max } => Ok(Self::NumberRange { min, max }),
                 ChoiceTypeData::Labeled { options } => Ok(Self::Labeled { options }),
+                ChoiceTypeData::Opponent { restriction } => Ok(Self::Opponent { restriction }),
                 ChoiceTypeData::Keyword { options } => Ok(Self::Keyword { options }),
             },
         }
@@ -765,7 +809,7 @@ impl ChoiceValue {
             ChoiceType::Labeled { .. } => Some(Self::Label(value.to_string())),
             ChoiceType::LandType => Some(Self::LandType(value.to_string())),
             // CR 800.4a: Parse player ID from string.
-            ChoiceType::Opponent | ChoiceType::Player => value
+            ChoiceType::Opponent { .. } | ChoiceType::Player => value
                 .parse::<u8>()
                 .ok()
                 .map(|id| Self::Player(PlayerId(id))),
@@ -3330,6 +3374,15 @@ pub enum ObjectScope {
     /// Drain class (issue #511): a reveal/counter/reanimate earlier in the same
     /// ability binds "that <type>'s" to the referenced object.
     Demonstrative,
+    /// CR 603.2 + CR 120.1: The object that **received** the damage referenced
+    /// by the current trigger event — the recipient counterpart to
+    /// [`ObjectScope::EventSource`]. This is "that creature" in "deals
+    /// noncombat damage to a creature equal to that creature's toughness":
+    /// the antecedent is the damaged object carried by the `DamageDealt` event,
+    /// not the ability source or a target. Resolved at both trigger detection
+    /// and resolution (CR 603.4 intervening-if) via
+    /// `extract_target_object_from_event`.
+    EventTarget,
 }
 
 /// Source set for counting distinct card types.
@@ -3734,6 +3787,26 @@ pub enum QuantityRef {
         to: Option<Zone>,
         filter: TargetFilter,
     },
+    /// CR 400.7 + CR 603.10a + CR 700.4: Aggregate (sum/max/min via `function`) of
+    /// an object `property` over this turn's zone-change records matching
+    /// `from`/`to` and `filter`, using each moved object's last-known
+    /// characteristics. The COUNT of the same population is
+    /// `ZoneChangeCountThisTurn`; this is the value-aggregate sibling. CR 208.1
+    /// supplies each record's power/toughness; CR 202.3 its mana value. (The
+    /// Comprehensive Rules define no general "sum/max/min of a property" rule —
+    /// the reduction is a derived computation over the per-record CR 208.1/202.3
+    /// values, consumed by the surrounding effect's own rule, e.g. CR 119 for
+    /// life loss.) Used by "[loses life / draws / deals damage] equal to the
+    /// total power of [type] that died this turn" (Genesis of the Daleks).
+    ZoneChangeAggregateThisTurn {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<Zone>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to: Option<Zone>,
+        filter: TargetFilter,
+        function: AggregateFunction,
+        property: ObjectProperty,
+    },
     /// CR 120.1 + CR 120.9 + CR 603.4: Damage dealt this turn matching a source
     /// object filter and a recipient filter, optionally grouped by a key
     /// (CR 120.9 "specific source") and aggregated.
@@ -3928,7 +4001,10 @@ pub enum RoundingMode {
     Down,
 }
 
-/// CR 107.3e: Aggregate function applied over a set of objects.
+/// Reduction applied when collapsing a set of per-object values (CR 208.1 power/
+/// toughness, CR 202.3 mana value) into a single number. The Comprehensive Rules
+/// define no standalone "aggregate function" rule; this enum names the reduction
+/// kind used by the various property-aggregate `QuantityRef` variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AggregateFunction {
     Max,
@@ -4206,6 +4282,27 @@ pub enum PlayerFilter {
         comparator: Comparator,
         value: Box<QuantityExpr>,
     },
+    /// CR 608.2c + CR 109.4: The player chosen by the Nth `Effect::Choose`
+    /// (`ChoiceType::Player` / `ChoiceType::Opponent`) earlier in this
+    /// resolving ability chain (`index` is 0-based). The `PlayerFilter`-axis
+    /// analogue of `ControllerRef::ChosenPlayer { index }`: read at resolution
+    /// time from `ResolvedAbility.chosen_players[index]`, the resolution-scoped
+    /// list the `WaitingFor::NamedChoice` answer handler appends to. Powers the
+    /// "choose an opponent. That player faces a villainous choice — …" class
+    /// (The Master, Gallifrey's End) where the player who faces the choice — and
+    /// therefore the chooser of the `ChooseOneOf` branch — is the opponent
+    /// selected mid-resolution rather than the controller.
+    ChosenPlayer { index: u8 },
+    /// CR 108.3 + CR 109.4: The owner of the first object target of the
+    /// resolving ability. The owner-axis sibling of
+    /// `ParentObjectTargetController`, completing the owner/controller pair that
+    /// `PlayerScope` (`ParentObjectTargetController`) and `TargetFilter`
+    /// (`ParentTargetOwner` / `ParentTargetController`) already carry. Resolved
+    /// via `ability_utils::parent_target_owner`. Powers the "[target's owner] …,
+    /// then faces a villainous choice — …" class (This Is How It Ends) where the
+    /// player facing the choice is the owner of the targeted permanent named in
+    /// the prior clause, not the ability controller.
+    ParentObjectTargetOwner,
 }
 
 /// An expression that produces an integer for quantity comparisons.
@@ -4762,6 +4859,15 @@ pub enum StaticCondition {
     /// CR 400.7: True when the source permanent entered the battlefield this turn.
     /// Used for "as long as this [permanent] entered this turn" conditional statics.
     SourceEnteredThisTurn,
+    /// CR 120.1 + CR 120.3/120.6 + CR 702.11b + CR 613.1f: True once the source
+    /// permanent has actually dealt damage (combat or noncombat) since it entered
+    /// the battlefield. Sticky per-object flag (set on the first nonzero amount of
+    /// damage actually dealt per CR 120.3/120.6, not the would-be amount of CR
+    /// 120.1a; reset when the object leaves the battlefield). Used as a Layer 6
+    /// (CR 613.1f) ability-adding gate for "has hexproof if it hasn't dealt damage
+    /// yet" (Palladia-Mors, the Ruiner; Karakyk Guardian). The "hasn't" negation
+    /// wraps this in `StaticCondition::Not`.
+    SourceHasDealtDamage,
     /// CR 601.2 + CR 611.3a: True when the source permanent was cast (its
     /// `cast_from_zone` is `Some`). `zone: None` = cast from any zone; `Some(z)`
     /// = cast specifically from zone `z`. Used for "as long as it was cast"
@@ -6909,6 +7015,18 @@ pub enum Effect {
         /// 708.3) with these characteristics. `None` = normal face-up entry.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         face_down_profile: Option<FaceDownProfile>,
+        /// CR 401.4 + CR 701.24a: When `Some`, each object is placed at the
+        /// specified library position WITHOUT triggering the auto-shuffle
+        /// convention. `None` = default behavior (auto-shuffle on library
+        /// entry). Covers Endurance-style "puts all the cards from their
+        /// graveyard on the bottom of their library in a random order."
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        library_position: Option<LibraryPosition>,
+        /// CR 401.4: When `true`, the objects are placed in a random order
+        /// (e.g. Endurance). When `false`, the owner chooses the order per
+        /// CR 401.4's default rule. Independent of `library_position`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        random_order: bool,
     },
     /// CR 701.20e + CR 608.2c: Look at top N cards (shown only to the looking player),
     /// select some to keep per the effect's instructions, rest go elsewhere.
@@ -7247,6 +7365,45 @@ pub enum Effect {
         /// baked in at creation rather than evaluated through the layer system.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         additional_modifications: Vec<ContinuousModification>,
+    },
+    /// CR 707.2 + CR 111.1 + CR 701.9a (analogous): Create a token that's a copy
+    /// of a creature card chosen from a format-defined pool whose mana value
+    /// satisfies `mv <comparator> mv_bound`. The canonical card is the Momir
+    /// Basic emblem ("Create a token that's a copy of a creature card with mana
+    /// value X chosen at random"). The pool is the engine's creature corpus
+    /// (`GameState::momir_pool` / `momir_pool_faces`). `selection` chooses how a
+    /// candidate is picked from the matching set: `Random` (CR 701.9a is the
+    /// discard keyword action; the random *selection* here is analogous to the
+    /// random-choice idiom) or `Chosen`. Built as a reusable primitive so the
+    /// `mv` comparator also expresses "copy a creature card with mana value N or
+    /// less" (Oko-style) via `Comparator::LE`.
+    CreateTokenCopyFromPool {
+        /// CR 109.4: player who creates (and controls) the token. Defaults to
+        /// the resolving ability's controller. Mirrors `CopyTokenOf.owner`.
+        #[serde(default = "default_target_filter_controller")]
+        owner: TargetFilter,
+        /// Additional filter applied to the hydrated face beyond "is a creature
+        /// card" (the pool is already creature-only). Defaults to `Any`.
+        #[serde(default = "default_target_filter_any")]
+        type_filter: TargetFilter,
+        /// CR 202.3: comparator relating a candidate's mana value to `mv_bound`.
+        /// Momir uses `EQ` (exact match); `LE`/`GE` express threshold variants.
+        mv: Comparator,
+        /// CR 202.3: the mana-value bound. For Momir this is `Variable { "X" }`
+        /// (the chosen X paid for the ability).
+        mv_bound: QuantityExpr,
+        /// CR 701.9a (analogous) / CR 608.2d: how a candidate is selected from
+        /// the matching set — `Random` (Momir) or `Chosen`.
+        selection: CardSelectionMode,
+        /// CR 707.10: number of tokens to create. Defaults to one.
+        #[serde(default = "default_quantity_one")]
+        count: QuantityExpr,
+        /// Token enters the battlefield tapped.
+        #[serde(default)]
+        tapped: bool,
+        /// CR 508.4: token enters the battlefield attacking.
+        #[serde(default)]
+        enters_attacking: bool,
     },
     /// CR 702.116a: Myriad creates one tapped attacking copy token for each
     /// opponent other than the defending player for the source creature, then
@@ -9557,6 +9714,10 @@ impl Effect {
             // --- Effects with no player-selectable target field ---
             // These use filters, zone-level operations, or have no targeting at all.
             Effect::StartYourEngines { .. }
+            // CR 109.4: owner/type_filter are non-targeting resolution-time
+            // filters; the copy source is chosen from the format pool, not
+            // declared as a target.
+            | Effect::CreateTokenCopyFromPool { .. }
             | Effect::Myriad
             // CR 702.141a: opponents and per-opponent attack binding are chosen
             // by the effect, not declared as targets.
@@ -9722,6 +9883,7 @@ impl Effect {
             | Effect::Dig { count, .. }
             | Effect::Surveil { count, .. }
             | Effect::CopyTokenOf { count, .. }
+            | Effect::CreateTokenCopyFromPool { count, .. }
             | Effect::PutCounter { count, .. }
             | Effect::PutCounterAll { count, .. }
             | Effect::Discard { count, .. }
@@ -9922,6 +10084,7 @@ impl Effect {
             | Effect::Dig { count, .. }
             | Effect::Surveil { count, .. }
             | Effect::CopyTokenOf { count, .. }
+            | Effect::CreateTokenCopyFromPool { count, .. }
             | Effect::PutCounter { count, .. }
             | Effect::PutCounterAll { count, .. }
             | Effect::Discard { count, .. }
@@ -10172,6 +10335,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::EpicCopy { .. } => "EpicCopy",
         Effect::CastCopyOfCard { .. } => "CastCopyOfCard",
         Effect::CopyTokenOf { .. } => "CopyTokenOf",
+        Effect::CreateTokenCopyFromPool { .. } => "CreateTokenCopyFromPool",
         Effect::Myriad => "Myriad",
         Effect::Encore => "Encore",
         Effect::Meld { .. } => "Meld",
@@ -10375,6 +10539,7 @@ pub enum EffectKind {
     EpicCopy,
     CastCopyOfCard,
     CopyTokenOf,
+    CreateTokenCopyFromPool,
     Myriad,
     Encore,
     Meld,
@@ -10579,6 +10744,7 @@ impl From<&Effect> for EffectKind {
             Effect::EpicCopy { .. } => EffectKind::EpicCopy,
             Effect::CastCopyOfCard { .. } => EffectKind::CastCopyOfCard,
             Effect::CopyTokenOf { .. } => EffectKind::CopyTokenOf,
+            Effect::CreateTokenCopyFromPool { .. } => EffectKind::CreateTokenCopyFromPool,
             Effect::Myriad => EffectKind::Myriad,
             Effect::Encore => EffectKind::Encore,
             Effect::Meld { .. } => EffectKind::Meld,
@@ -12079,6 +12245,18 @@ impl AbilityCondition {
         )
     }
 
+    /// CR 608.2d + CR 101.4: `Not(OptionalEffectPerformed)` — the "if no one
+    /// does" decline branch carried directly on an "any opponent/player may"
+    /// head's sub_ability (Browbeat, Book Burning). True only for the negated
+    /// optional-effect-performed signal.
+    pub fn is_not_optional_effect_performed(&self) -> bool {
+        matches!(
+            self,
+            AbilityCondition::Not { condition }
+                if condition.is_optional_effect_performed()
+        )
+    }
+
     /// Default `min_count` for `AdditionalCostPaid` is 1 (any single payment).
     /// Used by serde `#[serde(default = ...)]`.
     pub(crate) fn default_min_count() -> u32 {
@@ -12485,6 +12663,11 @@ pub enum TriggerCondition {
     /// CR 700.4 + CR 120.1: "a creature dealt damage by ~ this turn dies" — death trigger
     /// gated on the dying creature having been dealt damage by the trigger source this turn.
     DealtDamageBySourceThisTurn,
+
+    /// CR 700.4 + CR 120.1 + CR 608.2i: "another creature dealt damage this turn by
+    /// [source filter] dies" — death trigger gated on the dying creature having been
+    /// dealt damage this turn by a source matching the filter (e.g. Shelob's Spider gate).
+    DealtDamageThisTurnBySource { source: TargetFilter },
 
     /// CR 400.7 + CR 603.10: "if it was a [type]" — true when the trigger source's
     /// last known information includes the specified core type. Used by the Glimmer cycle
@@ -12939,6 +13122,13 @@ pub enum TriggerConstraint {
     /// per opponent per turn. Used by Valgavoth, Harrower of Souls: "Whenever
     /// an opponent loses life for the first time during each of their turns, ..."
     OncePerOpponentPerTurn,
+    /// CR 109.5 + CR 603.2: Fires only when the triggering event was caused by a
+    /// spell or ability controlled by `controller` relative to the trigger's
+    /// controller. Mirrors [`ReplacementCondition::EventSourceControlledBy`] for
+    /// the trigger side — used by "when a spell or ability an opponent controls
+    /// causes you to discard this card, …" (Guerrilla Tactics, Sand Golem). The
+    /// event must carry the cause's source id (e.g. `GameEvent::Discarded.source_id`).
+    EventSourceControlledBy { controller: ControllerRef },
 }
 
 /// CR 603.6c: source-zone constraint for one clause of a zone-change trigger.
@@ -13766,6 +13956,16 @@ pub struct ReplacementDefinition {
     /// control (the default for every existing replacement).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enters_under: Option<ControllerRef>,
+    /// CR 109.4 + CR 614.1a: Installing player anchor for global pending damage
+    /// replacements whose source filter is controller-relative ("a source you
+    /// control"). Global replacements live in `pending_damage_replacements` under
+    /// the sentinel `ObjectId(0)`, which has no controller in `state.objects`, so
+    /// `ControllerRef::You` cannot otherwise resolve. Set at install time to the
+    /// activating ability's controller (I Call for Slaughter, Rankle and Torbran,
+    /// Taii Wakeen's +X boost). `None` = resolve controller from the source object
+    /// as before (every object-attached replacement; unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_controller: Option<crate::types::player::PlayerId>,
 }
 
 impl ReplacementDefinition {
@@ -13799,6 +13999,7 @@ impl ReplacementDefinition {
             ensure_token_specs: None,
             counter_match: None,
             enters_under: None,
+            source_controller: None,
         }
     }
 
@@ -15218,6 +15419,58 @@ mod tests {
                 excluded: vec![ManaColor::White],
             }
         );
+    }
+
+    #[test]
+    fn choice_type_opponent_legacy_unit_deserializes_to_unrestricted() {
+        // Legacy card-data.json emits the bare "Opponent" string for the
+        // unrestricted form; it must round-trip to `restriction: None`.
+        let choice_type: ChoiceType = serde_json::from_str("\"Opponent\"").unwrap();
+
+        assert_eq!(choice_type, ChoiceType::Opponent { restriction: None });
+    }
+
+    #[test]
+    fn choice_type_opponent_unrestricted_serializes_as_legacy_unit() {
+        // The hand-rolled Serialize must keep emitting the bare string for the
+        // unrestricted form so existing card-data.json stays byte-stable.
+        let json = serde_json::to_string(&ChoiceType::Opponent { restriction: None }).unwrap();
+
+        assert_eq!(json, "\"Opponent\"");
+    }
+
+    #[test]
+    fn choice_type_opponent_restricted_serde_round_trips() {
+        // The Master, Gallifrey's End: "choose an opponent with the most life".
+        // The hand-rolled Serialize/Deserialize for the restricted struct form
+        // must be symmetric or card-data.json load corrupts silently.
+        let original = ChoiceType::Opponent {
+            restriction: Some(Box::new(PlayerFilter::PlayerAttribute {
+                relation: PlayerRelation::Opponent,
+                attr: Box::new(QuantityRef::LifeTotal {
+                    player: PlayerScope::ScopedPlayer,
+                }),
+                comparator: Comparator::GE,
+                value: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::LifeTotal {
+                        player: PlayerScope::Opponent {
+                            aggregate: AggregateFunction::Max,
+                        },
+                    },
+                }),
+            })),
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        // Restricted form must use the externally-tagged struct variant so it is
+        // distinguishable from the legacy unit variant.
+        assert!(
+            json.starts_with(r#"{"Opponent":"#),
+            "restricted form should serialize as a struct variant, got: {json}"
+        );
+
+        let round_tripped: ChoiceType = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped, original);
     }
 
     #[test]

@@ -365,6 +365,7 @@ fn spell_record_for_restrictions(spell_obj: &super::game_object::GameObject) -> 
         has_x_in_cost: super::casting_costs::cost_has_x(&spell_obj.mana_cost),
         from_zone: spell_obj.zone,
         cast_variant: crate::types::game_state::CastingVariant::Normal,
+        was_kicked: !spell_obj.kickers_paid.is_empty(),
     }
 }
 
@@ -12722,6 +12723,7 @@ fn cant_cast_filter_matches(
                 has_x_in_cost: super::casting_costs::cost_has_x(&spell_obj.mana_cost),
                 from_zone: spell_obj.zone,
                 cast_variant: crate::types::game_state::CastingVariant::Normal,
+                was_kicked: !spell_obj.kickers_paid.is_empty(),
             };
             super::filter::spell_record_matches_filter(
                 &record,
@@ -12774,6 +12776,7 @@ fn is_blocked_by_per_turn_cast_limit(
                     has_x_in_cost: super::casting_costs::cost_has_x(&spell_obj.mana_cost),
                     from_zone: spell_obj.zone,
                     cast_variant: crate::types::game_state::CastingVariant::Normal,
+                    was_kicked: !spell_obj.kickers_paid.is_empty(),
                 };
                 if !super::filter::spell_record_matches_filter(
                     &current_record,
@@ -13709,6 +13712,7 @@ mod tests {
                 has_x_in_cost: false,
                 from_zone: Zone::Hand,
                 cast_variant: CastingVariant::Normal,
+                was_kicked: false,
             }]),
         );
     }
@@ -19233,6 +19237,7 @@ mod tests {
                     has_x_in_cost: false,
                     from_zone: Zone::Hand,
                     cast_variant: CastingVariant::Normal,
+                    was_kicked: false,
                 },
                 crate::types::SpellCastRecord {
                     name: "Opt".to_string(),
@@ -19245,6 +19250,7 @@ mod tests {
                     has_x_in_cost: false,
                     from_zone: Zone::Hand,
                     cast_variant: CastingVariant::Normal,
+                    was_kicked: false,
                 },
             ]),
         );
@@ -31383,6 +31389,7 @@ mod tests {
                 has_x_in_cost: false,
                 from_zone: Zone::Hand,
                 cast_variant: crate::types::game_state::CastingVariant::Normal,
+                was_kicked: false,
             }]),
         );
 
@@ -31499,6 +31506,7 @@ mod tests {
                 has_x_in_cost: true,
                 from_zone: Zone::Hand,
                 cast_variant: crate::types::game_state::CastingVariant::Normal,
+                was_kicked: false,
             }]),
         );
 
@@ -31570,6 +31578,7 @@ mod tests {
                 has_x_in_cost: false,
                 from_zone: Zone::Hand,
                 cast_variant: crate::types::game_state::CastingVariant::Normal,
+                was_kicked: false,
             }]),
         );
 
@@ -43520,6 +43529,7 @@ mod tests {
                 has_x_in_cost: false,
                 from_zone: Zone::Hand,
                 cast_variant: crate::types::game_state::CastingVariant::Normal,
+                was_kicked: false,
             }]
             .into(),
         );

@@ -3466,50 +3466,21 @@ fn static_first_unqualified_spell_costs_less_keeps_first_spell_gate() {
 }
 
 /// CR 601.2f + CR 702.33d: "The first kicked spell you cast each turn costs {1}
-/// less to cast." (Vine Gecko).
+/// less to cast." (Vine Gecko). The "kicked" qualifier — whether the spell's
+/// kicker additional cost was paid — is not a representable spell-cost filter,
+/// so the parser must DECLINE the cost static rather than emit a filterless,
+/// conditionless reducer. A broad reducer would silently drop both the printed
+/// "first … each turn" once-per-turn gate and the "kicked" qualifier, reducing
+/// every spell the controller casts (the bug this guards against).
 #[test]
-fn static_first_kicked_spell_costs_less() {
-    let def =
-        parse_static_line("The first kicked spell you cast each turn costs {1} less to cast.")
-            .expect("Vine Gecko static should parse");
+fn static_first_kicked_spell_does_not_emit_broad_reducer() {
+    let parsed =
+        parse_static_line("The first kicked spell you cast each turn costs {1} less to cast.");
 
-    let StaticMode::ModifyCost {
-        mode: CostModifyMode::Reduce,
-        amount,
-        ref spell_filter,
-        ..
-    } = def.mode
-    else {
-        panic!("expected ReduceCost, got {:?}", def.mode);
-    };
-
-    assert_eq!(amount, ManaCost::generic(1));
-    let filter = spell_filter
-        .as_ref()
-        .expect("expected WasKicked spell filter");
-    assert!(matches!(
-        filter,
-        TargetFilter::Typed(TypedFilter { properties, .. })
-            if properties.contains(&FilterProp::WasKicked)
-    ));
-
-    let condition = def.condition.expect("expected first-kicked-spell gate");
-    assert!(matches!(
-        &condition,
-        StaticCondition::QuantityComparison {
-            lhs: QuantityExpr::Ref {
-                qty: QuantityRef::SpellsCastThisTurn {
-                    scope: CountScope::Controller,
-                    filter: Some(inner),
-                },
-            },
-            comparator: Comparator::EQ,
-            rhs: QuantityExpr::Fixed { value: 0 },
-        } if matches!(
-            inner,
-            TargetFilter::Typed(tf) if tf.properties.contains(&FilterProp::WasKicked)
-        )
-    ));
+    assert!(
+        parsed.is_none(),
+        "kicked-spell cost reducer must be declined until paid-kicker state is representable; got {parsed:?}"
+    );
 }
 
 #[test]
@@ -6112,21 +6083,6 @@ fn static_cant_cause_sacrifice_or_exile_creature_tokens() {
 }
 
 #[test]
-fn static_legend_rule_tokens_scope() {
-    let def = parse_static_line("The \"legend rule\" doesn't apply to tokens you control.")
-        .expect("Cadric-class token exemption should parse");
-    assert_eq!(def.mode, StaticMode::LegendRuleDoesntApply);
-    assert!(matches!(
-        def.affected,
-        Some(TargetFilter::Typed(TypedFilter {
-            controller: Some(ControllerRef::You),
-            properties,
-            ..
-        })) if properties.contains(&FilterProp::Token)
-    ));
-}
-
-#[test]
 fn static_legend_rule_commanders_scope() {
     let def = parse_static_line("The \"legend rule\" doesn't apply to commanders you control.")
         .expect("commander-scoped exemption should parse");
@@ -6147,6 +6103,7 @@ fn static_legend_rule_defers_unparseable_scopes() {
     // forms, must NOT be emitted as a LegendRuleDoesntApply static — they are
     // deferred (left Unimplemented), never misparsed into a no-op exemption.
     for text in [
+            "The \"legend rule\" doesn't apply to tokens you control.", // Cadric
             "If there are exactly two permanents named Brothers Yamazaki on the battlefield, the \"legend rule\" doesn't apply to them.",
         ] {
             assert!(
@@ -14714,25 +14671,10 @@ fn cant_search_library_each_player_may_not_variant() {
 }
 
 #[test]
-fn cant_search_library_opponents_form() {
-    // CR 701.23 + CR 609.3: opponent-scoped direct search prohibition.
-    let def = parse_static_line("Your opponents can't search libraries.")
-        .expect("opponent-scoped direct search prohibition should parse");
-    assert_eq!(
-        def.mode,
-        StaticMode::CantSearchLibrary {
-            cause: ProhibitionScope::Opponents,
-        }
-    );
-
-    let each = parse_static_line("Each opponent can't search libraries.")
-        .expect("each-opponent variant should parse");
-    assert_eq!(
-        each.mode,
-        StaticMode::CantSearchLibrary {
-            cause: ProhibitionScope::Opponents,
-        }
-    );
+fn cant_search_library_opponents_form_deferred() {
+    // Opponent-scoped direct-search phrasing remains deferred until the runtime
+    // cause-vs-searcher axis is split.
+    assert!(parse_static_line("Your opponents can't search libraries.").is_none());
 }
 
 // --- CR 603.2g + CR 603.6a + CR 700.4: SuppressTriggers (Torpor Orb / Hushbringer) ---

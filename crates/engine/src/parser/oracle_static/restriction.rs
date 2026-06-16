@@ -132,16 +132,6 @@ pub(crate) fn parse_legend_rule_scope(scope: &TextPair<'_>) -> Option<TargetFilt
         ));
     }
 
-    // "tokens you control" — all tokens (Cadric, Soul's Messenger). Distinct from
-    // the creature-token intersection above.
-    if base.lower == "tokens" {
-        return Some(TargetFilter::Typed(
-            TypedFilter::permanent()
-                .properties(vec![FilterProp::Token])
-                .controller(ControllerRef::You),
-        ));
-    }
-
     // "commanders you control" — Try-My-Deck Elemental class.
     if base.lower == "commanders" {
         return Some(TargetFilter::Typed(
@@ -414,13 +404,9 @@ pub(crate) fn parse_cant_search_library(tp: &TextPair<'_>, text: &str) -> Option
     }
 
     // Mindlock Orb class: "Players can't search libraries." / "Each player can't
-    // search libraries." (all players), and opponent-scoped direct search
-    // prohibitions ("Your opponents can't search libraries.").
+    // search libraries." Keep this branch all-players only.
     let (cause, predicate) = strip_casting_prohibition_subject(tp.lower)?;
-    if !matches!(
-        cause,
-        ProhibitionScope::AllPlayers | ProhibitionScope::Opponents
-    ) {
+    if cause != ProhibitionScope::AllPlayers {
         return None;
     }
     let predicate_lower = predicate.to_lowercase();

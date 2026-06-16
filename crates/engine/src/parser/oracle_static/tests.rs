@@ -6112,41 +6112,13 @@ fn static_cant_cause_sacrifice_or_exile_creature_tokens() {
 }
 
 #[test]
-fn static_legend_rule_tokens_scope() {
-    let def = parse_static_line("The \"legend rule\" doesn't apply to tokens you control.")
-        .expect("Cadric-class token exemption should parse");
-    assert_eq!(def.mode, StaticMode::LegendRuleDoesntApply);
-    assert!(matches!(
-        def.affected,
-        Some(TargetFilter::Typed(TypedFilter {
-            controller: Some(ControllerRef::You),
-            properties,
-            ..
-        })) if properties.contains(&FilterProp::Token)
-    ));
-}
-
-#[test]
-fn static_legend_rule_commanders_scope() {
-    let def = parse_static_line("The \"legend rule\" doesn't apply to commanders you control.")
-        .expect("commander-scoped exemption should parse");
-    assert_eq!(def.mode, StaticMode::LegendRuleDoesntApply);
-    assert!(matches!(
-        def.affected,
-        Some(TargetFilter::Typed(TypedFilter {
-            controller: Some(ControllerRef::You),
-            properties,
-            ..
-        })) if properties.contains(&FilterProp::IsCommander)
-    ));
-}
-
-#[test]
 fn static_legend_rule_defers_unparseable_scopes() {
     // CR 704.5j: scopes this parser cannot resolve precisely, and conditional
     // forms, must NOT be emitted as a LegendRuleDoesntApply static — they are
     // deferred (left Unimplemented), never misparsed into a no-op exemption.
     for text in [
+            "The \"legend rule\" doesn't apply to tokens you control.", // Cadric
+            "The \"legend rule\" doesn't apply to commanders you control.", // Try-My-Deck Elemental
             "If there are exactly two permanents named Brothers Yamazaki on the battlefield, the \"legend rule\" doesn't apply to them.",
         ] {
             assert!(
@@ -14714,25 +14686,10 @@ fn cant_search_library_each_player_may_not_variant() {
 }
 
 #[test]
-fn cant_search_library_opponents_form() {
-    // CR 701.23 + CR 609.3: opponent-scoped direct search prohibition.
-    let def = parse_static_line("Your opponents can't search libraries.")
-        .expect("opponent-scoped direct search prohibition should parse");
-    assert_eq!(
-        def.mode,
-        StaticMode::CantSearchLibrary {
-            cause: ProhibitionScope::Opponents,
-        }
-    );
-
-    let each = parse_static_line("Each opponent can't search libraries.")
-        .expect("each-opponent variant should parse");
-    assert_eq!(
-        each.mode,
-        StaticMode::CantSearchLibrary {
-            cause: ProhibitionScope::Opponents,
-        }
-    );
+fn cant_search_library_opponents_form_deferred() {
+    // Opponent-scoped direct-search phrasing remains deferred until the runtime
+    // cause-vs-searcher axis is split.
+    assert!(parse_static_line("Your opponents can't search libraries.").is_none());
 }
 
 // --- CR 603.2g + CR 603.6a + CR 700.4: SuppressTriggers (Torpor Orb / Hushbringer) ---

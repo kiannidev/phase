@@ -519,6 +519,11 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
     if let Some(def) = parse_global_object_counter_prohibition(&lower, &text) {
         return Some(def);
     }
+    if let Some(def) =
+        parse_inverted_typed_counter_prohibition(&lower, &text, TypeFilter::Creature, "creatures")
+    {
+        return Some(def);
+    }
 
     // --- Counter-prohibition replacement: "~ can't have counters put on it." ---
     // CR 614.6 + CR 614.7 + CR 122.1: A self-targeted counter-placement
@@ -5266,6 +5271,35 @@ fn parse_global_object_counter_prohibition(
         [single] => single.clone(),
         _ => TypeFilter::AnyOf(type_filters),
     };
+
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::AddCounter)
+            .valid_card(attach_zone_to_filter(
+                TargetFilter::Typed(TypedFilter::new(type_filter)),
+                Zone::Battlefield,
+            ))
+            .quantity_modification(QuantityModification::Prevent)
+            .description(original_text.to_string()),
+    )
+}
+
+/// CR 614.17 + CR 614.6 + CR 122.1: Parse inverted type-scoped counter
+/// prohibitions such as "Creatures can't have counters put on them." Lowers to
+/// the same `AddCounter` + `Prevent` replacement as Solemnity's object-counter
+/// line, scoped to a single permanent type on the battlefield.
+fn parse_inverted_typed_counter_prohibition(
+    lower: &str,
+    original_text: &str,
+    type_filter: TypeFilter,
+    type_plural: &str,
+) -> Option<ReplacementDefinition> {
+    use crate::types::ability::QuantityModification;
+
+    let expected = format!("{type_plural} can't have counters put on them");
+    let trimmed = lower.trim().trim_end_matches('.');
+    if trimmed != expected {
+        return None;
+    }
 
     Some(
         ReplacementDefinition::new(ReplacementEvent::AddCounter)
@@ -10994,18 +11028,24 @@ mod tests {
     }
 
     #[test]
-    fn no_counters_replacement_rejects_non_self_subject() {
-        // CR 614.1a: the parser must NOT match the global "creatures can't
-        // have counters put on them" wording — that is a different (wider)
-        // replacement class (Solemnity-style) which is intentionally out of
-        // scope for this PR. The current scope is strictly self-targeted.
-        // A non-self subject must fall through to the unimplemented path
-        // rather than silently lower into a SelfRef replacement.
-        let def = parse_replacement_line("Creatures can't have counters put on them.", "Test Card");
-        assert!(
-            def.is_none(),
-            "non-self subject must not match the SelfRef-scoped parser"
+    fn creatures_cant_have_counters_put_on_them_replacement() {
+        let def = parse_replacement_line("Creatures can't have counters put on them.", "Test Card")
+            .expect("creatures counter prohibition must parse");
+        assert_eq!(def.event, ReplacementEvent::AddCounter);
+        assert_eq!(
+            def.quantity_modification,
+            Some(QuantityModification::Prevent)
         );
+        assert!(matches!(
+            def.valid_card,
+            Some(TargetFilter::Typed(tf))
+                if tf.type_filters == vec![TypeFilter::Creature]
+                    && tf.controller.is_none()
+                    && tf.properties.iter().any(|p| matches!(
+                        p,
+                        FilterProp::InZone { zone: Zone::Battlefield }
+                    ))
+        ));
     }
 
     #[test]

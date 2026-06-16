@@ -7369,6 +7369,27 @@ mod tests {
             .destination_zone(Zone::Battlefield)
     }
 
+    fn uphill_battle_replacement() -> ReplacementDefinition {
+        use crate::types::ability::{
+            AbilityKind, ControllerRef, FilterProp, TargetFilter, TypedFilter,
+        };
+        ReplacementDefinition::new(ReplacementEvent::ChangeZone)
+            .execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::SetTapState {
+                    target: TargetFilter::SelfRef,
+                    scope: EffectScope::Single,
+                    state: TapStateChange::Tap,
+                },
+            ))
+            .valid_card(TargetFilter::Typed(
+                TypedFilter::creature()
+                    .controller(ControllerRef::Opponent)
+                    .properties(vec![FilterProp::WasPlayed]),
+            ))
+            .destination_zone(Zone::Battlefield)
+    }
+
     fn spelunking_replacement() -> ReplacementDefinition {
         use crate::types::ability::{AbilityKind, ControllerRef, TargetFilter, TypedFilter};
         ReplacementDefinition::new(ReplacementEvent::ChangeZone)
@@ -10452,6 +10473,68 @@ mod tests {
             panic!("expected CreateToken");
         };
         assert_eq!(count, 2, "five tokens halved (rounded down) → two");
+    }
+
+    /// CR 305.1 + CR 614.1c: Uphill Battle taps cast creatures but not tokens
+    /// put directly onto the battlefield.
+    #[test]
+    fn uphill_battle_was_played_filter_matches_cast_creature_not_token() {
+        use crate::types::card_type::CoreType;
+
+        let uphill_id = ObjectId(10);
+        let mut state = test_state_with_object(uphill_id, Zone::Battlefield, vec![
+            uphill_battle_replacement(),
+        ]);
+        let registry = build_replacement_registry();
+
+        let cast_creature = ObjectId(20);
+        let mut creature = GameObject::new(
+            cast_creature,
+            CardId(2),
+            PlayerId(1),
+            "Grizzly Bears".to_string(),
+            Zone::Hand,
+        );
+        creature.card_types.core_types.push(CoreType::Creature);
+        creature.cast_from_zone = Some(Zone::Hand);
+        state.objects.insert(cast_creature, creature);
+
+        let cast_event = ProposedEvent::ZoneChange {
+            object_id: cast_creature,
+            from: Zone::Hand,
+            to: Zone::Battlefield,
+            cause: None,
+            attach_to: None,
+            enter_tapped: EtbTapState::Unspecified,
+            enter_with_counters: Vec::new(),
+            controller_override: None,
+            enter_transformed: false,
+            face_down_profile: None,
+            applied: HashSet::new(),
+        };
+        let cast_matches = find_applicable_replacements(&state, &cast_event, &registry);
+        assert!(
+            cast_matches
+                .iter()
+                .any(|rid| rid.source == uphill_id),
+            "cast creature must match Uphill Battle WasPlayed filter"
+        );
+
+        let token_event = ProposedEvent::CreateToken {
+            owner: PlayerId(1),
+            count: 1,
+            spec: Box::new(test_token_spec(PlayerId(1), CoreType::Creature)),
+            copy: None,
+            enter_tapped: EtbTapState::Unspecified,
+            applied: HashSet::new(),
+        };
+        let token_matches = find_applicable_replacements(&state, &token_event, &registry);
+        assert!(
+            !token_matches
+                .iter()
+                .any(|rid| rid.source == uphill_id),
+            "tokens put directly onto the battlefield must not match WasPlayed filter"
+        );
     }
 
     /// CR 616.1: Mixed `Double` and `Plus` quantity modifications do NOT commute

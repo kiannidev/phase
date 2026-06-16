@@ -407,6 +407,8 @@ pub(crate) fn parse_filter_scoped_cant_be_activated(
 ///   library." (Ashiok class)
 /// - "Players can't search libraries." / "Each player can't search libraries."
 ///   (Mindlock Orb class)
+/// - "Your opponents can't search libraries." / "Each opponent can't search
+///   libraries." (Stranglehold class — direct opponent search prohibition)
 pub(crate) fn parse_cant_search_library(tp: &TextPair<'_>, text: &str) -> Option<StaticDefinition> {
     fn parse_search_negation_prefix(input: &str) -> OracleResult<'_, ()> {
         let (input, _) = alt((
@@ -452,10 +454,14 @@ pub(crate) fn parse_cant_search_library(tp: &TextPair<'_>, text: &str) -> Option
         );
     }
 
-    // Mindlock Orb class: "Players can't search libraries." / "Each player can't
-    // search libraries." Keep this branch all-players only.
+    // Mindlock Orb / Stranglehold class: "Players can't search libraries.",
+    // "Each player can't search libraries.", "Your opponents can't search
+    // libraries.", "Each opponent can't search libraries."
     let (cause, predicate) = strip_casting_prohibition_subject(tp.lower)?;
-    if cause != ProhibitionScope::AllPlayers {
+    if !matches!(
+        cause,
+        ProhibitionScope::AllPlayers | ProhibitionScope::Opponents
+    ) {
         return None;
     }
     let predicate_lower = predicate.to_lowercase();

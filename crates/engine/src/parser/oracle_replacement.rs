@@ -4877,6 +4877,9 @@ fn parse_token_replacement(lower: &str, original_text: &str) -> Option<Replaceme
         TokenReplacementShape::Double => {
             def = def.quantity_modification(QuantityModification::Double);
         }
+        TokenReplacementShape::Half => {
+            def = def.quantity_modification(QuantityModification::Half);
+        }
         TokenReplacementShape::PlusSpec { spec } => {
             def = def.additional_token_spec(*spec);
         }
@@ -4886,6 +4889,12 @@ fn parse_token_replacement(lower: &str, original_text: &str) -> Option<Replaceme
     if nom_primitives::scan_contains(lower, "under your control") {
         def = def.token_owner_scope(ControllerRef::You);
     }
+    // Halving Season class: "If an opponent would create …"
+    if nom_primitives::scan_contains(lower, "an opponent would create")
+        || nom_primitives::scan_contains(lower, "opponent would create")
+    {
+        def = def.token_owner_scope(ControllerRef::Opponent);
+    }
 
     Some(def)
 }
@@ -4893,6 +4902,8 @@ fn parse_token_replacement(lower: &str, original_text: &str) -> Option<Replaceme
 enum TokenReplacementShape {
     /// "twice that many tokens … are created instead" (Doubling Season).
     Double,
+    /// "half that many … tokens … instead, rounded down" (Halving Season).
+    Half,
     /// "those tokens plus [spec] are created instead" (Chatterfang, Donatello).
     PlusSpec {
         spec: Box<crate::types::proposed_event::TokenSpec>,
@@ -4903,6 +4914,11 @@ enum TokenReplacementShape {
 /// `nom_on_lower` for case-preserving parsing and delegates token-spec
 /// extraction to the existing `parse_token_description` building block.
 fn parse_token_replacement_shape(lower: &str) -> Option<TokenReplacementShape> {
+    // "half that many" → Halving Season token-halving pattern.
+    if nom_primitives::scan_contains(lower, "half that many") {
+        return Some(TokenReplacementShape::Half);
+    }
+
     // "twice that many" → Doubling Season pattern.
     if nom_on_lower(lower, lower, |i| {
         let (i, _) = take_until::<_, _, OracleError<'_>>("twice that many").parse(i)?;
@@ -11190,7 +11206,8 @@ mod tests {
         // CR 614.6 + CR 122.1: "<type> can't have counters put on them" lowers to
         // the AddCounter+Prevent replacement scoped to that permanent type. The
         // single combinator covers every permanent type, so creatures (#3450),
-        // planeswalkers (#3453), and artifacts (#3455) are all handled by one arm.
+        // planeswalkers (#3453), artifacts (#3455, #3502), and lands are all
+        // handled by one arm — no per-type parallel tests needed.
         for (oracle_type, expected) in [
             ("Creatures", TypeFilter::Creature),
             ("Planeswalkers", TypeFilter::Planeswalker),
@@ -12347,22 +12364,6 @@ mod tests {
     }
 
     #[test]
-    fn inverted_counter_prohibition_artifacts() {
-        let def = parse_replacement_line("Artifacts can't have counters put on them.", "Test Card")
-            .expect("artifact counter prohibition must parse");
-        assert_eq!(def.event, ReplacementEvent::AddCounter);
-        assert_eq!(
-            def.quantity_modification,
-            Some(QuantityModification::Prevent)
-        );
-        assert!(matches!(
-            def.valid_card,
-            Some(TargetFilter::Typed(tf))
-                if tf.type_filters == vec![TypeFilter::Artifact]
-        ));
-    }
-
-    #[test]
     fn parses_halving_season_opponent_counter_replacement() {
         let def = parse_replacement_line(
             "If an opponent would put one or more counters on a permanent or player, they put half that many of those counters on that permanent or player instead, rounded down.",
@@ -12371,6 +12372,18 @@ mod tests {
         .expect("halving season");
         assert_eq!(def.quantity_modification, Some(QuantityModification::Half));
         assert_eq!(def.valid_player, Some(ReplacementPlayerScope::Opponent));
+    }
+
+    #[test]
+    fn parses_halving_season_opponent_token_replacement() {
+        let def = parse_replacement_line(
+            "If an opponent would create one or more tokens, they create half that many of each of those kinds of tokens instead, rounded down.",
+            "Halving Season",
+        )
+        .expect("Halving Season token halving must parse");
+        assert_eq!(def.event, ReplacementEvent::CreateToken);
+        assert_eq!(def.quantity_modification, Some(QuantityModification::Half));
+        assert_eq!(def.token_owner_scope, Some(ControllerRef::Opponent));
     }
 }
 

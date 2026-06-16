@@ -619,14 +619,28 @@ pub fn spell_modal_unavailable_modes(
     mode_abilities: &[AbilityDefinition],
 ) -> Vec<usize> {
     let mut unavailable_modes = compute_unavailable_modes(state, source_id, modal);
-    filter_modes_by_target_legality(
-        state,
-        source_id,
-        controller,
-        mode_abilities,
-        modal,
-        &mut unavailable_modes,
-    );
+    let x_dependent_modal_targets = state
+        .objects
+        .get(&source_id)
+        .map(|obj| super::casting_costs::cost_has_x(&obj.mana_cost))
+        .unwrap_or(false)
+        && mode_abilities.iter().any(|mode| {
+            let resolved = build_resolved_from_def(mode, source_id, controller);
+            ability_target_legality_needs_chosen_x(&resolved, mode.distribute.as_ref())
+        });
+    // CR 601.2b/c: When modal spell target legality depends on announced X,
+    // modes cannot be pre-disabled before ChooseXValue — same deferral as
+    // activated modal abilities (casting.rs AbilityModeChoice path).
+    if !x_dependent_modal_targets {
+        filter_modes_by_target_legality(
+            state,
+            source_id,
+            controller,
+            mode_abilities,
+            modal,
+            &mut unavailable_modes,
+        );
+    }
     unavailable_modes
 }
 

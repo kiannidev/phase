@@ -407,6 +407,20 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
         return Some(def);
     }
 
+    // --- "Double all damage that [subject] would deal" (without "instead") ---
+    // CR 614.1: Static damage modification abilities like Collective Inferno
+    // are continuous replacement effects even though they do not use "instead".
+    // Must be checked BEFORE the "instead" guard to avoid falling through to stub.
+    if nom_primitives::scan_contains(&lower, "would deal")
+        && nom_primitives::scan_contains(&lower, "damage")
+        && !nom_primitives::scan_contains(&lower, "instead")
+        && nom_primitives::scan_contains(&lower, "double")
+    {
+        if let Some(def) = parse_damage_modification_static(&norm_lower, &text) {
+            return Some(def);
+        }
+    }
+
     // --- "If [source] would deal [noncombat] damage ... it deals that much damage plus N instead" ---
     // CR 614.1a: Damage boost/reduction replacement effects.
     if nom_primitives::scan_contains(&lower, "would deal")
@@ -3709,6 +3723,47 @@ fn parse_damage_modification_replacement(
     Some(def)
 }
 
+/// CR 614.1: Parse static damage modification abilities without "instead" keyword.
+/// Handles patterns like "Double all damage that [subject] would deal" (Collective Inferno).
+/// Uses quantifier parser ("double all damage") instead of anaphor parser ("double that damage").
+/// The subject is between "that" and "would deal", not before "would deal" like in anaphor patterns.
+fn parse_damage_modification_static(
+    norm_lower: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    // --- 1. Extract modification formula using quantifier parser ---
+    let modification =
+        nom_primitives::scan_at_word_boundaries(norm_lower, parse_damage_modification_quantifier)?;
+
+    // --- 2. Extract source filter from the subject clause (between "that" and "would deal") ---
+    // Pattern: "Double all damage that [subject] would deal"
+    // Split on "that" to get the modification prefix, then extract subject between "that" and "would deal"
+    let (_, (_, after_that)) = nom_primitives::split_once_on(norm_lower, "that ").ok()?;
+    let (_, (subject, _)) = nom_primitives::split_once_on(after_that, " would deal").ok()?;
+
+    let source_filter = parse_damage_source_subject(subject.trim());
+
+    // --- 3. Extract combat scope ---
+    let combat_scope = scan_combat_scope(norm_lower);
+
+    // --- 4. Extract target filter ---
+    let target_filter = parse_damage_target_filter(norm_lower);
+
+    let mut def = ReplacementDefinition::new(ReplacementEvent::DamageDone)
+        .damage_modification(modification)
+        .description(original_text.to_string());
+    if let Some(sf) = source_filter {
+        def = def.damage_source_filter(sf);
+    }
+    if let Some(tf) = target_filter {
+        def = def.damage_target_filter(tf);
+    }
+    if let Some(cs) = combat_scope {
+        def = def.combat_scope(cs);
+    }
+    Some(def)
+}
+
 /// CR 614.9 + CR 614.1a + CR 615: Parse a one-shot "the next time [source]
 /// would deal [combat] damage [to X] this turn, [modify/redirect] instead"
 /// damage-replacement effect into `Effect::CreateDamageReplacement`.
@@ -4041,104 +4096,146 @@ fn parse_damage_source_filter(norm_lower: &str) -> Option<TargetFilter> {
         .map_or(subject, |(rest, _)| rest)
         .trim();
 
-    // "source you control" with optional qualifiers
-    if let Some(prefix) = subject.strip_suffix("source you control") {
-        let prefix = prefix.trim();
-        let mut filter = TypedFilter::default().controller(ControllerRef::You);
-        let mut props = Vec::new();
-
-        if !prefix.is_empty() {
-            // Check for "another" prefix — may appear alone or before a qualifier
-            let qualifier = if prefix == "another" {
-                props.push(FilterProp::Another);
-                ""
-            } else if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("another ").parse(prefix) {
-                props.push(FilterProp::Another);
-                rest.trim()
-            } else {
-                prefix
-            };
-
-            // Check for color qualifier (e.g. "red")
-            if let Some(color) = parse_color_word(qualifier) {
-                props.push(FilterProp::HasColor { color });
-            }
-            // CR 205.4b: "noncreature" qualifier — negation via TypeFilter::Non
-            else if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("non").parse(qualifier) {
-                if tag::<_, _, OracleError<'_>>("token")
-                    .parse(rest)
-                    .is_ok_and(|(after, _)| after.is_empty())
-                {
-                    props.push(FilterProp::NonToken);
-                } else {
-                    let inner = alt((
-                        value(
-                            TypeFilter::Creature,
-                            tag::<_, _, OracleError<'_>>("creature"),
-                        ),
-                        value(TypeFilter::Land, tag::<_, _, OracleError<'_>>("land")),
-                        value(
-                            TypeFilter::Artifact,
-                            tag::<_, _, OracleError<'_>>("artifact"),
-                        ),
-                        value(
-                            TypeFilter::Enchantment,
-                            tag::<_, _, OracleError<'_>>("enchantment"),
-                        ),
-                        value(
-                            TypeFilter::Planeswalker,
-                            tag::<_, _, OracleError<'_>>("planeswalker"),
-                        ),
-                    ))
-                    .parse(rest)
-                    .ok()
-                    .filter(|(after, _)| after.is_empty())
-                    .map_or_else(
-                        || TypeFilter::Subtype(capitalize_first(rest)),
-                        |(_, filter)| filter,
-                    );
-                    filter = filter.with_type(TypeFilter::Non(Box::new(inner)));
-                }
-            }
-            // Check for creature type qualifier (e.g. "giant")
-            else if !qualifier.is_empty() {
-                filter = filter.subtype(capitalize_first(qualifier));
-            }
-        }
-
-        if !props.is_empty() {
-            filter.properties = props;
-        }
-        return Some(TargetFilter::Typed(filter));
-    }
-
-    // "source you control" without explicit "source" word
-    if subject.ends_with("you control") {
-        return Some(TargetFilter::Typed(
-            TypedFilter::default().controller(ControllerRef::You),
-        ));
-    }
-
     // "a spell" — any spell is the source; no typed filter (Benevolent Unicorn).
     // Must precede `parse_type_phrase`, which maps bare "spell" to Card.
     if subject == "spell" {
         return None;
     }
 
-    // "a source" with no qualifier — no filter needed (matches any source)
-    if subject == "source" {
+    // "a source" / "sources" with no qualifier — no filter needed (matches any source).
+    if matches!(subject, "source" | "sources") {
         return None;
     }
 
+    if let Some(filter) = parse_damage_source_subject(subject) {
+        return Some(filter);
+    }
+
     // CR 614.1a: Typed damage sources ("creature you control with a +1/+1
-    // counter on it", "Giant source you control", …) — delegate to the shared
-    // type-phrase parser (Uncivil Unrest, Torbran-adjacent prints).
+    // counter on it", …) — delegate to the shared type-phrase parser
+    // (Uncivil Unrest, Torbran-adjacent prints).
     let (filter, rest) = parse_type_phrase(subject);
     if rest.trim().is_empty() && !matches!(filter, TargetFilter::Any) {
         return Some(filter);
     }
 
     None
+}
+
+/// Parse source-noun subjects shared by "instead" and no-"instead" damage
+/// replacement text:
+/// - "Giant source you control"
+/// - "Goblin sources you control"
+/// - "sources you control of the chosen type"
+fn parse_damage_source_subject(subject: &str) -> Option<TargetFilter> {
+    let (qualifier, tail) = split_damage_source_noun(subject)?;
+    if qualifier.trim().is_empty() && tail.trim().is_empty() {
+        return None;
+    }
+
+    let mut filter = TypedFilter::default();
+    let mut props = Vec::new();
+
+    let mut tail = tail.trim();
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("you control").parse(tail) {
+        filter = filter.controller(ControllerRef::You);
+        tail = rest.trim();
+    }
+
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("of the chosen type").parse(tail) {
+        if !rest.trim().is_empty() {
+            return None;
+        }
+        props.push(FilterProp::IsChosenCreatureType);
+    } else if !tail.is_empty() {
+        return None;
+    }
+
+    apply_damage_source_qualifier(&mut filter, &mut props, qualifier.trim());
+
+    if !props.is_empty() {
+        filter.properties = props;
+    }
+
+    Some(TargetFilter::Typed(filter))
+}
+
+fn split_damage_source_noun(subject: &str) -> Option<(&str, &str)> {
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("sources").parse(subject) {
+        return Some(("", rest));
+    }
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("source").parse(subject) {
+        return Some(("", rest));
+    }
+    if let Ok((_, (qualifier, rest))) = nom_primitives::split_once_on(subject, " sources") {
+        return Some((qualifier, rest));
+    }
+    if let Ok((_, (qualifier, rest))) = nom_primitives::split_once_on(subject, " source") {
+        return Some((qualifier, rest));
+    }
+    None
+}
+
+fn apply_damage_source_qualifier(
+    filter: &mut TypedFilter,
+    props: &mut Vec<FilterProp>,
+    qualifier: &str,
+) {
+    if qualifier.is_empty() {
+        return;
+    }
+
+    let qualifier = if qualifier == "another" {
+        props.push(FilterProp::Another);
+        ""
+    } else if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("another ").parse(qualifier) {
+        props.push(FilterProp::Another);
+        rest.trim()
+    } else {
+        qualifier
+    };
+
+    if let Some(color) = parse_color_word(qualifier) {
+        props.push(FilterProp::HasColor { color });
+    } else if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("non").parse(qualifier) {
+        // CR 205.4b: "noncreature" qualifier — negation via TypeFilter::Non.
+        if tag::<_, _, OracleError<'_>>("token")
+            .parse(rest)
+            .is_ok_and(|(after, _)| after.is_empty())
+        {
+            props.push(FilterProp::NonToken);
+        } else {
+            let inner = alt((
+                value(
+                    TypeFilter::Creature,
+                    tag::<_, _, OracleError<'_>>("creature"),
+                ),
+                value(TypeFilter::Land, tag::<_, _, OracleError<'_>>("land")),
+                value(
+                    TypeFilter::Artifact,
+                    tag::<_, _, OracleError<'_>>("artifact"),
+                ),
+                value(
+                    TypeFilter::Enchantment,
+                    tag::<_, _, OracleError<'_>>("enchantment"),
+                ),
+                value(
+                    TypeFilter::Planeswalker,
+                    tag::<_, _, OracleError<'_>>("planeswalker"),
+                ),
+            ))
+            .parse(rest)
+            .ok()
+            .filter(|(after, _)| after.is_empty())
+            .map_or_else(
+                || TypeFilter::Subtype(capitalize_first(rest)),
+                |(_, filter)| filter,
+            );
+            *filter = filter.clone().with_type(TypeFilter::Non(Box::new(inner)));
+        }
+    } else if !qualifier.is_empty() {
+        *filter = filter.clone().subtype(capitalize_first(qualifier));
+    }
 }
 
 /// Parse the damage target filter from the clause after "damage".
@@ -4294,6 +4391,14 @@ fn parse_damage_modification_phrase(
         ),
     ))
     .parse(input)
+}
+
+/// Nom combinator for quantifier damage modification phrases ("double all damage").
+/// Used for static abilities like Collective Inferno that lack the "instead" keyword.
+fn parse_damage_modification_quantifier(
+    input: &str,
+) -> nom::IResult<&str, DamageModification, OracleError<'_>> {
+    value(DamageModification::Double, tag("double all damage")).parse(input)
 }
 
 /// Scan for combat damage scope at word boundaries.
@@ -10175,6 +10280,42 @@ mod tests {
                 assert_eq!(tf.get_subtype(), Some("Giant"));
             }
             other => panic!("Expected Typed filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn damage_collective_inferno_double_all_chosen_type() {
+        // Collective Inferno: "Double all damage that sources you control of the chosen type would deal"
+        let def = parse_replacement_line(
+            "Double all damage that sources you control of the chosen type would deal.",
+            "Collective Inferno",
+        )
+        .expect("Collective Inferno static should parse");
+        assert_eq!(def.damage_modification, Some(DamageModification::Double));
+        match def.damage_source_filter.unwrap() {
+            TargetFilter::Typed(tf) => {
+                assert_eq!(tf.controller, Some(ControllerRef::You));
+                assert!(tf.properties.contains(&FilterProp::IsChosenCreatureType));
+            }
+            other => panic!("Expected Typed filter with IsChosenCreatureType, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn damage_double_all_goblin_sources() {
+        // Type-filtered variant
+        let def = parse_replacement_line(
+            "Double all damage that Goblin sources you control would deal.",
+            "Goblin Doubler",
+        )
+        .expect("Goblin doubler should parse");
+        assert_eq!(def.damage_modification, Some(DamageModification::Double));
+        match def.damage_source_filter.unwrap() {
+            TargetFilter::Typed(tf) => {
+                assert_eq!(tf.controller, Some(ControllerRef::You));
+                assert_eq!(tf.get_subtype(), Some("Goblin"));
+            }
+            other => panic!("Expected Typed filter with Goblin subtype, got {other:?}"),
         }
     }
 

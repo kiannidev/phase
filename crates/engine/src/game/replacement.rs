@@ -1569,6 +1569,70 @@ fn scry_applier(
     }
 }
 
+// --- 4d. Explore (Twists and Turns / Topography Tracker) ---
+
+// CR 701.37a + CR 614.1a: A creature is about to explore. Replacement
+// effects can modify the explore action (e.g., add a scry prelude or double explore).
+fn explore_matcher(event: &ProposedEvent, _source: ObjectId, _state: &GameState) -> bool {
+    matches!(event, ProposedEvent::Explore { .. })
+}
+
+fn explore_applier(
+    event: ProposedEvent,
+    rid: ReplacementId,
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> ApplyResult {
+    let ProposedEvent::Explore { object_id, applied } = event else {
+        return ApplyResult::Modified(event);
+    };
+
+    let Some(source) = state.objects.get(&rid.source) else {
+        return ApplyResult::Modified(ProposedEvent::Explore { object_id, applied });
+    };
+    let Some(execute) = source
+        .replacement_definitions
+        .get(rid.index)
+        .and_then(|def| def.execute.clone())
+    else {
+        return ApplyResult::Modified(ProposedEvent::Explore { object_id, applied });
+    };
+
+    use crate::game::ability_utils::build_resolved_from_def;
+    use crate::types::ability::TargetRef;
+
+    let controller = source.controller;
+    let mut current = Some(execute.as_ref());
+    while let Some(def) = current {
+        match &*def.effect {
+            Effect::Scry { .. } => {
+                let ability = build_resolved_from_def(def, rid.source, controller);
+                let _ = crate::game::effects::scry::resolve(state, &ability, events);
+            }
+            Effect::Explore => {
+                let ability = ResolvedAbility::new(
+                    Effect::Explore,
+                    vec![TargetRef::Object(object_id)],
+                    rid.source,
+                    controller,
+                );
+                let _ = crate::game::effects::explore::resolve_explore_effect(
+                    state, &ability, object_id, events,
+                );
+            }
+            _ => {
+                let mut ability = build_resolved_from_def(def, rid.source, controller);
+                ability.targets = vec![TargetRef::Object(object_id)];
+                let _ =
+                    crate::game::effects::resolve_ability_chain(state, &ability, events, 1);
+            }
+        }
+        current = def.sub_ability.as_deref();
+    }
+
+    ApplyResult::Prevented
+}
+
 // --- 4c. CoinFlip (Krark's Thumb) ---
 
 // CR 705.1 + CR 614.1a: A coin flip is about to happen. Krark's Thumb replaces
@@ -2663,6 +2727,13 @@ pub fn build_replacement_registry() -> IndexMap<ReplacementEvent, ReplacementHan
         ReplacementHandlerEntry {
             matcher: scry_matcher,
             applier: scry_applier,
+        },
+    );
+    registry.insert(
+        ReplacementEvent::Explore,
+        ReplacementHandlerEntry {
+            matcher: explore_matcher,
+            applier: explore_applier,
         },
     );
     registry.insert(
@@ -10387,6 +10458,71 @@ mod tests {
             count, 8,
             "Three doublers should multiply: 1 * 2 * 2 * 2 = 8"
         );
+    }
+
+    /// CR 614.1a + CR 111.1: Halving Season halves opponent token batches.
+    #[test]
+    fn halving_season_halves_opponent_token_creation() {
+        use crate::types::ability::QuantityModification;
+        use crate::types::proposed_event::{TokenCharacteristics, TokenSpec};
+
+        let halving_season = ObjectId(10);
+        let halver_repl = ReplacementDefinition::new(ReplacementEvent::CreateToken)
+            .quantity_modification(QuantityModification::Half)
+            .token_owner_scope(ControllerRef::Opponent);
+
+        let mut state = GameState::new_two_player(42);
+        let mut hs = GameObject::new(
+            halving_season,
+            CardId(1),
+            PlayerId(0),
+            "Halving Season".to_string(),
+            Zone::Battlefield,
+        );
+        hs.replacement_definitions = vec![halver_repl].into();
+        state.objects.insert(halving_season, hs);
+        state.battlefield.push_back(halving_season);
+
+        let soldier_spec = TokenSpec {
+            characteristics: TokenCharacteristics {
+                display_name: "Soldier".to_string(),
+                power: Some(1),
+                toughness: Some(1),
+                core_types: vec![crate::types::card_type::CoreType::Creature],
+                subtypes: vec!["Soldier".to_string()],
+                supertypes: Vec::new(),
+                colors: Vec::new(),
+                keywords: Vec::new(),
+            },
+            script_name: "Soldier".to_string(),
+            static_abilities: Vec::new(),
+            enter_with_counters: Vec::new(),
+            tapped: false,
+            enters_attacking: false,
+            sacrifice_at: None,
+            source_id: ObjectId(0),
+            controller: PlayerId(1),
+            attach_to: None,
+        };
+
+        let proposed = ProposedEvent::CreateToken {
+            owner: PlayerId(1),
+            spec: Box::new(soldier_spec),
+            copy: None,
+            enter_tapped: EtbTapState::Unspecified,
+            count: 5,
+            applied: HashSet::new(),
+        };
+
+        let mut events = Vec::new();
+        let result = replace_event(&mut state, proposed, &mut events);
+        let ReplacementResult::Execute(primary) = result else {
+            panic!("expected Execute, got {:?}", result);
+        };
+        let ProposedEvent::CreateToken { count, .. } = primary else {
+            panic!("expected CreateToken");
+        };
+        assert_eq!(count, 2, "five tokens halved (rounded down) → two");
     }
 
     /// CR 616.1: Mixed `Double` and `Plus` quantity modifications do NOT commute

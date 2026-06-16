@@ -27795,6 +27795,62 @@ mod tests {
     }
 
     #[test]
+    fn second_kicked_spell_not_reduced_after_first_kicked_this_turn() {
+        // CR 702.33d: a "first kicked spell you cast each turn costs {1} less"
+        // reducer is gated on `SpellsCastThisTurn{WasKicked} == 0`. With one kicked
+        // spell already recorded this turn, the gate count is 1, so a second kicked
+        // spell must NOT be reduced even after its kicker is declared. This pins the
+        // once-per-turn semantics that the recompute-after-kicker path rides on.
+        let mut state = setup_game_at_main_phase();
+        let obj_id = create_kicker_modal_charm(&mut state, PlayerId(0));
+        state.objects.get_mut(&obj_id).unwrap().mana_cost = ManaCost::generic(1);
+        install_first_kicked_spell_reducer(&mut state, PlayerId(0));
+
+        // Seed one kicked spell already cast this turn so the per-turn gate is closed.
+        state
+            .spells_cast_this_turn_by_player
+            .entry(PlayerId(0))
+            .or_default()
+            .push_back(crate::types::game_state::SpellCastRecord {
+                was_kicked: true,
+                ..Default::default()
+            });
+
+        add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
+        add_mana(&mut state, PlayerId(0), ManaType::Green, 1);
+
+        let mut events = Vec::new();
+        state.waiting_for =
+            handle_cast_spell(&mut state, PlayerId(0), obj_id, CardId(50), &mut events).unwrap();
+        let (pending, cost) = match &state.waiting_for {
+            WaitingFor::OptionalCostChoice {
+                pending_cast, cost, ..
+            } => (*pending_cast.clone(), cost.clone()),
+            other => panic!("expected OptionalCostChoice, got {other:?}"),
+        };
+        assert_eq!(pending.cost, ManaCost::generic(1));
+
+        state.waiting_for = crate::game::engine_casting::handle_optional_cost_choice(
+            &mut state,
+            PlayerId(0),
+            pending,
+            &cost,
+            true,
+            &mut events,
+        )
+        .unwrap();
+
+        let WaitingFor::ModeChoice { pending_cast, .. } = &state.waiting_for else {
+            panic!("expected ModeChoice, got {:?}", state.waiting_for);
+        };
+        assert_eq!(
+            pending_cast.cost,
+            ManaCost::generic(1),
+            "CR 702.33d: a kicked spell cast after the first kicked spell this turn keeps full cost"
+        );
+    }
+
+    #[test]
     fn modal_escalate_pays_tap_creature_cost_for_extra_mode() {
         let mut state = setup_game_at_main_phase();
         let obj_id = create_modal_charm(&mut state, PlayerId(0));

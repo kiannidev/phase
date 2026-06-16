@@ -1569,6 +1569,69 @@ fn scry_applier(
     }
 }
 
+// --- 4d. Explore (Twists and Turns / Topography Tracker) ---
+
+// CR 701.37a + CR 614.1a: A creature is about to explore. Replacement
+// effects can modify the explore action (e.g., add a scry prelude or double explore).
+fn explore_matcher(event: &ProposedEvent, _source: ObjectId, _state: &GameState) -> bool {
+    matches!(event, ProposedEvent::Explore { .. })
+}
+
+fn explore_applier(
+    event: ProposedEvent,
+    rid: ReplacementId,
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> ApplyResult {
+    let ProposedEvent::Explore { object_id, applied } = event else {
+        return ApplyResult::Modified(event);
+    };
+
+    let Some(source) = state.objects.get(&rid.source) else {
+        return ApplyResult::Modified(ProposedEvent::Explore { object_id, applied });
+    };
+    let Some(execute) = source
+        .replacement_definitions
+        .get(rid.index)
+        .and_then(|def| def.execute.clone())
+    else {
+        return ApplyResult::Modified(ProposedEvent::Explore { object_id, applied });
+    };
+
+    use crate::game::ability_utils::build_resolved_from_def;
+    use crate::types::ability::TargetRef;
+
+    let controller = source.controller;
+    let mut current = Some(execute.as_ref());
+    while let Some(def) = current {
+        match &*def.effect {
+            Effect::Scry { .. } => {
+                let ability = build_resolved_from_def(def, rid.source, controller);
+                let _ = crate::game::effects::scry::resolve(state, &ability, events);
+            }
+            Effect::Explore => {
+                let ability = ResolvedAbility::new(
+                    Effect::Explore,
+                    vec![TargetRef::Object(object_id)],
+                    rid.source,
+                    controller,
+                );
+                let _ = crate::game::effects::explore::resolve_explore_effect(
+                    state, &ability, object_id, events,
+                );
+            }
+            _ => {
+                let mut ability = build_resolved_from_def(def, rid.source, controller);
+                ability.targets = vec![TargetRef::Object(object_id)];
+                let _ = crate::game::effects::resolve_ability_chain(state, &ability, events, 1);
+            }
+        }
+        current = def.sub_ability.as_deref();
+    }
+
+    ApplyResult::Prevented
+}
+
 // --- 4c. CoinFlip (Krark's Thumb) ---
 
 // CR 705.1 + CR 614.1a: A coin flip is about to happen. Krark's Thumb replaces
@@ -2663,6 +2726,13 @@ pub fn build_replacement_registry() -> IndexMap<ReplacementEvent, ReplacementHan
         ReplacementHandlerEntry {
             matcher: scry_matcher,
             applier: scry_applier,
+        },
+    );
+    registry.insert(
+        ReplacementEvent::Explore,
+        ReplacementHandlerEntry {
+            matcher: explore_matcher,
+            applier: explore_applier,
         },
     );
     registry.insert(
@@ -10601,6 +10671,43 @@ mod tests {
             panic!("expected doubled LifeLoss, got {:?}", result);
         };
         assert_eq!(amount, 6);
+    }
+
+    /// CR 614.1a: Bloodletter only doubles during the source controller's turn.
+    #[test]
+    fn bloodletter_does_not_double_on_opponents_turn() {
+        let bloodletter = ObjectId(10);
+        let repl = {
+            let mut repl = ReplacementDefinition::new(ReplacementEvent::LoseLife)
+                .quantity_modification(QuantityModification::Double);
+            repl.valid_player = Some(ReplacementPlayerScope::Opponent);
+            repl
+        };
+
+        let mut state = GameState::new_two_player(42);
+        state.active_player = PlayerId(1);
+        let mut card = GameObject::new(
+            bloodletter,
+            CardId(1),
+            PlayerId(0),
+            "Bloodletter of Aclazotz".to_string(),
+            Zone::Battlefield,
+        );
+        card.replacement_definitions = vec![repl].into();
+        state.objects.insert(bloodletter, card);
+        state.battlefield.push_back(bloodletter);
+
+        let proposed = ProposedEvent::LifeLoss {
+            player_id: PlayerId(1),
+            amount: 3,
+            applied: HashSet::new(),
+        };
+        let mut events = Vec::new();
+        let result = replace_event(&mut state, proposed, &mut events);
+        let ReplacementResult::Execute(ProposedEvent::LifeLoss { amount, .. }) = result else {
+            panic!("expected LifeLoss passthrough, got {:?}", result);
+        };
+        assert_eq!(amount, 3);
     }
 
     /// CR 616.1: Mixed `Double` and `Plus` quantity modifications do NOT commute

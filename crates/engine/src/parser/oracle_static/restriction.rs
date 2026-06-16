@@ -132,25 +132,6 @@ pub(crate) fn parse_legend_rule_scope(scope: &TextPair<'_>) -> Option<TargetFilt
         ));
     }
 
-    // "tokens you control" — all tokens (Cadric, Soul's Messenger). Distinct from
-    // the creature-token intersection above.
-    if base.lower == "tokens" {
-        return Some(TargetFilter::Typed(
-            TypedFilter::permanent()
-                .properties(vec![FilterProp::Token])
-                .controller(ControllerRef::You),
-        ));
-    }
-
-    // "commanders you control" — Try-My-Deck Elemental class.
-    if base.lower == "commanders" {
-        return Some(TargetFilter::Typed(
-            TypedFilter::permanent()
-                .properties(vec![FilterProp::IsCommander])
-                .controller(ControllerRef::You),
-        ));
-    }
-
     if let Some((canonical, consumed)) = parse_subtype(base.original) {
         if consumed == base.original.len() {
             return Some(TargetFilter::Typed(

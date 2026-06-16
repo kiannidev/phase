@@ -3739,6 +3739,20 @@ pub fn find_applicable_replacements(
                                 continue;
                             }
                         } else if let Some(valid_player) = &repl_def.valid_player {
+                            // Quantity-modifying counter replacements (Halving Season
+                            // class) may scope by permanent controller; player-counter
+                            // prohibitions with valid_player stay player-only.
+                            if !matches!(
+                                repl_def.quantity_modification,
+                                Some(
+                                    QuantityModification::Double
+                                        | QuantityModification::Half
+                                        | QuantityModification::Plus { .. }
+                                        | QuantityModification::Minus { .. }
+                                )
+                            ) {
+                                continue;
+                            }
                             // CR 614.1a: Opponent-scoped counter replacements
                             // (Halving Season) apply to counters on permanents
                             // controlled by an opponent, not only player counters.
@@ -10588,7 +10602,10 @@ mod tests {
         let ReplacementResult::Execute(ProposedEvent::AddCounter { count, .. }) = result else {
             panic!("expected Execute, got {:?}", result);
         };
-        assert_eq!(count, 5, "controller-owned counters must pass through unchanged");
+        assert_eq!(
+            count, 5,
+            "controller-owned counters must pass through unchanged"
+        );
     }
 
     /// CR 616.1: Mixed `Double` and `Plus` quantity modifications do NOT commute

@@ -27594,6 +27594,48 @@ mod tests {
         obj_id
     }
 
+    fn first_kicked_spell_filter() -> TargetFilter {
+        TargetFilter::Typed(TypedFilter::card().properties(vec![FilterProp::WasKicked]))
+    }
+
+    fn install_first_kicked_spell_reducer(state: &mut GameState, player: PlayerId) -> ObjectId {
+        let source = create_object(
+            state,
+            CardId(4_231),
+            player,
+            "Vine Gecko".to_string(),
+            Zone::Battlefield,
+        );
+        let kicked_filter = first_kicked_spell_filter();
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .static_definitions
+            .push(
+                StaticDefinition::new(StaticMode::ModifyCost {
+                    mode: CostModifyMode::Reduce,
+                    amount: ManaCost::generic(1),
+                    spell_filter: Some(kicked_filter.clone()),
+                    dynamic_count: None,
+                })
+                .affected(TargetFilter::Typed(
+                    TypedFilter::card().controller(ControllerRef::You),
+                ))
+                .condition(StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::SpellsCastThisTurn {
+                            scope: CountScope::Controller,
+                            filter: Some(kicked_filter),
+                        },
+                    },
+                    comparator: Comparator::EQ,
+                    rhs: QuantityExpr::Fixed { value: 0 },
+                }),
+            );
+        source
+    }
+
     #[test]
     fn modal_kicker_declined_caps_modes_before_mode_choice() {
         let mut state = setup_game_at_main_phase();
@@ -27706,6 +27748,50 @@ mod tests {
         assert!(ability.context.additional_cost_paid);
         assert_eq!(ability.context.kickers_paid, vec![KickerVariant::First]);
         assert_eq!(state.players[0].mana_pool.count_color(ManaType::Green), 0);
+    }
+
+    #[test]
+    fn first_kicked_spell_reducer_recomputes_after_kicker_declared() {
+        let mut state = setup_game_at_main_phase();
+        let obj_id = create_kicker_modal_charm(&mut state, PlayerId(0));
+        state.objects.get_mut(&obj_id).unwrap().mana_cost = ManaCost::generic(1);
+        install_first_kicked_spell_reducer(&mut state, PlayerId(0));
+        add_mana(&mut state, PlayerId(0), ManaType::Colorless, 1);
+        add_mana(&mut state, PlayerId(0), ManaType::Green, 1);
+
+        let mut events = Vec::new();
+        state.waiting_for =
+            handle_cast_spell(&mut state, PlayerId(0), obj_id, CardId(50), &mut events).unwrap();
+        let (pending, cost) = match &state.waiting_for {
+            WaitingFor::OptionalCostChoice {
+                pending_cast, cost, ..
+            } => (*pending_cast.clone(), cost.clone()),
+            other => panic!("expected OptionalCostChoice, got {other:?}"),
+        };
+        assert_eq!(
+            pending.cost,
+            ManaCost::generic(1),
+            "the spell is not kicked yet, so the reducer must not apply"
+        );
+
+        state.waiting_for = crate::game::engine_casting::handle_optional_cost_choice(
+            &mut state,
+            PlayerId(0),
+            pending,
+            &cost,
+            true,
+            &mut events,
+        )
+        .unwrap();
+
+        let WaitingFor::ModeChoice { pending_cast, .. } = &state.waiting_for else {
+            panic!("expected ModeChoice, got {:?}", state.waiting_for);
+        };
+        assert_eq!(
+            pending_cast.cost,
+            ManaCost::generic(0),
+            "CR 601.2f + CR 702.33d: once kicker is declared, the first kicked spell reducer applies before mana payment"
+        );
     }
 
     #[test]

@@ -14762,10 +14762,16 @@ fn cant_search_library_each_player_may_not_variant() {
 }
 
 #[test]
-fn cant_search_library_opponents_form_deferred() {
-    // Opponent-scoped direct-search phrasing remains deferred until the runtime
-    // cause-vs-searcher axis is split.
-    assert!(parse_static_line("Your opponents can't search libraries.").is_none());
+fn cant_search_library_each_opponent_direct() {
+    // CR 701.23: building-block — "Each opponent" subject maps to Opponents scope.
+    let def = parse_static_line("Each opponent can't search libraries.")
+        .expect("each-opponent direct search prohibition should parse");
+    assert_eq!(
+        def.mode,
+        StaticMode::CantSearchLibrary {
+            cause: ProhibitionScope::Opponents,
+        }
+    );
 }
 
 // --- CR 603.2g + CR 603.6a + CR 700.4: SuppressTriggers (Torpor Orb / Hushbringer) ---

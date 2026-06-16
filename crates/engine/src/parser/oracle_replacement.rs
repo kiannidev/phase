@@ -4637,10 +4637,8 @@ fn parse_explore_replacement(lower: &str, original_text: &str) -> Option<Replace
     if !nom_primitives::scan_contains(lower, "if a creature you control would explore") {
         return None;
     }
-    let instead_idx = lower.find("instead ")?;
-    let execute_text = original_text[instead_idx + "instead ".len()..]
-        .trim()
-        .trim_end_matches('.');
+    let (_, execute_text) = split_once_on_lower(original_text, lower, "instead ")?;
+    let execute_text = execute_text.trim().trim_end_matches('.');
 
     Some(
         ReplacementDefinition::new(ReplacementEvent::Explore)

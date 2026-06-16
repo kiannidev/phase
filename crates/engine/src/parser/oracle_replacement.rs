@@ -532,6 +532,11 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
     ) {
         return Some(def);
     }
+    if let Some(def) =
+        parse_inverted_typed_counter_prohibition(&lower, &text, TypeFilter::Artifact, "artifacts")
+    {
+        return Some(def);
+    }
 
     // --- Counter-prohibition replacement: "~ can't have counters put on it." ---
     // CR 614.6 + CR 614.7 + CR 122.1: A self-targeted counter-placement
@@ -11053,6 +11058,22 @@ mod tests {
                         p,
                         FilterProp::InZone { zone: Zone::Battlefield }
                     ))
+        ));
+    }
+
+    #[test]
+    fn artifacts_cant_have_counters_put_on_them_replacement() {
+        let def = parse_replacement_line("Artifacts can't have counters put on them.", "Test Card")
+            .expect("artifact counter prohibition must parse");
+        assert_eq!(def.event, ReplacementEvent::AddCounter);
+        assert_eq!(
+            def.quantity_modification,
+            Some(QuantityModification::Prevent)
+        );
+        assert!(matches!(
+            def.valid_card,
+            Some(TargetFilter::Typed(tf))
+                if tf.type_filters == vec![TypeFilter::Artifact]
         ));
     }
 

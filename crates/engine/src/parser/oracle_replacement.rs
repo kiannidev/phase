@@ -155,6 +155,11 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
         return Some(def);
     }
 
+    // --- "[Type] played by your opponents enter tapped" (Uphill Battle class) ---
+    if let Some(def) = parse_played_by_opponents_entry(&norm_lower, &text) {
+        return Some(def);
+    }
+
     // --- "~ enters under the control of an opponent of your choice." ---
     // CR 110.2a: A self-ETB controller-override replacement — the permanent
     // enters the battlefield directly under an opponent's control (Xantcha,
@@ -3084,6 +3089,52 @@ fn parse_external_enters_tapped(
         return None;
     }
     build_external_entry_replacement(subject, original_text, true)
+}
+
+/// Parse "[Type] played by your opponents enter [the battlefield] tapped."
+/// Uphill Battle class — distinct from "your opponents control enter tapped"
+/// (Authority of the Consuls): only applies to cast/played entries, not tokens
+/// put directly onto the battlefield.
+fn parse_played_by_opponents_entry(
+    norm_lower: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    if !nom_primitives::scan_contains(norm_lower, "played by your opponents enter") {
+        return None;
+    }
+    let stripped = norm_lower.trim_end_matches('.');
+    // allow-noncombinator: peel fixed played-by entry suffix after scan_contains gate
+    let subject = stripped
+        .strip_suffix(" played by your opponents enter the battlefield tapped") // allow-noncombinator: fixed suffix after scan_contains gate
+        .or_else(|| {
+            stripped.strip_suffix(" played by your opponents enter tapped") // allow-noncombinator: fixed suffix after scan_contains gate
+        })?;
+    let (filter, subject_rest) = parse_type_phrase(subject.trim());
+    if !subject_rest.trim().is_empty() {
+        return None;
+    }
+    let mut typed = match filter {
+        TargetFilter::Typed(tf) => tf,
+        TargetFilter::Or { filters } if filters.len() == 1 => match &filters[0] {
+            TargetFilter::Typed(tf) => tf.clone(),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    typed.controller = Some(ControllerRef::Opponent);
+    typed.properties.push(FilterProp::WasPlayed);
+    let effect = Effect::SetTapState {
+        target: TargetFilter::SelfRef,
+        scope: EffectScope::Single,
+        state: TapStateChange::Tap,
+    };
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::ChangeZone)
+            .execute(AbilityDefinition::new(AbilityKind::Spell, effect))
+            .valid_card(TargetFilter::Typed(typed))
+            .destination_zone(Zone::Battlefield)
+            .description(original_text.to_string()),
+    )
 }
 
 /// CR 614.1a: Parse "If [filter] would die, …instead…" replacement effects.
@@ -9776,6 +9827,54 @@ mod tests {
                 assert_eq!(tf.controller, Some(ControllerRef::Opponent));
             }
             other => panic!("Expected Typed filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uphill_battle_played_by_opponents_enter_tapped() {
+        let text = "Creatures played by your opponents enter the battlefield tapped.";
+        assert!(
+            parse_played_by_opponents_entry(&text.to_lowercase(), text).is_some(),
+            "direct played-by parser must match Uphill Battle"
+        );
+        let def = parse_replacement_line(text, "Uphill Battle")
+            .expect("Uphill Battle played-by entry");
+        assert_eq!(def.event, ReplacementEvent::ChangeZone);
+        assert_eq!(def.destination_zone, Some(Zone::Battlefield));
+        match &def.valid_card {
+            Some(TargetFilter::Typed(tf)) => {
+                assert!(tf.type_filters.contains(&TypeFilter::Creature));
+                assert_eq!(tf.controller, Some(ControllerRef::Opponent));
+                assert!(tf.properties.contains(&FilterProp::WasPlayed));
+            }
+            other => panic!("Expected Typed filter with WasPlayed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn played_by_opponents_entry_covers_creature_and_land() {
+        for (text, card, type_filter) in [
+            (
+                "Creatures played by your opponents enter the battlefield tapped.",
+                "Uphill Battle",
+                TypeFilter::Creature,
+            ),
+            (
+                "Lands played by your opponents enter tapped.",
+                "Contamination",
+                TypeFilter::Land,
+            ),
+        ] {
+            let def = parse_replacement_line(text, card)
+                .unwrap_or_else(|| panic!("failed to parse {text}"));
+            assert_eq!(def.event, ReplacementEvent::ChangeZone);
+            match &def.valid_card {
+                Some(TargetFilter::Typed(tf)) => {
+                    assert!(tf.type_filters.contains(&type_filter));
+                    assert!(tf.properties.contains(&FilterProp::WasPlayed));
+                }
+                other => panic!("expected Typed filter, got {other:?}"),
+            }
         }
     }
 

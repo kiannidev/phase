@@ -5287,6 +5287,8 @@ fn parse_counter_replacement(lower: &str, original_text: &str) -> Option<Replace
 
     let modification = if nom_primitives::scan_contains(lower, "twice that many") {
         QuantityModification::Double
+    } else if nom_primitives::scan_contains(lower, "half that many") {
+        QuantityModification::HalfRoundedUp
     } else if let Some(rest) = strip_after(lower, "that many plus ") {
         // "that many plus one ... counters are put on it instead"
         // Delegate to nom_primitives::parse_number (input already lowercase)
@@ -5316,6 +5318,11 @@ fn parse_counter_replacement(lower: &str, original_text: &str) -> Option<Replace
         def = def.valid_card(TargetFilter::Typed(
             TypedFilter::creature().controller(ControllerRef::You),
         ));
+    }
+    if nom_primitives::scan_contains(lower, "if an opponent would")
+        || nom_primitives::scan_contains(lower, "an opponent would put")
+    {
+        def.valid_player = Some(ReplacementPlayerScope::Opponent);
     }
 
     // CR 122.1a + CR 614.1a: When the Oracle text names a specific counter type
@@ -10972,6 +10979,21 @@ mod tests {
             Some(QuantityModification::Double)
         );
         assert_eq!(def.token_owner_scope, Some(ControllerRef::You));
+    }
+
+    #[test]
+    fn counter_halving_replacement_opponent_scope() {
+        let def = parse_replacement_line(
+            "If an opponent would put one or more counters on a permanent or player, they put half that many of each of those kinds of counters on that permanent or player instead, rounded up.",
+            "Halving Season",
+        )
+        .unwrap();
+        assert_eq!(def.event, ReplacementEvent::AddCounter);
+        assert_eq!(
+            def.quantity_modification,
+            Some(QuantityModification::HalfRoundedUp)
+        );
+        assert_eq!(def.valid_player, Some(ReplacementPlayerScope::Opponent));
     }
 
     #[test]

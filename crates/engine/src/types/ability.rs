@@ -13863,6 +13863,9 @@ pub enum QuantityModification {
     /// SelfRef` for permanent-scoped protection and with player-scope filters
     /// for the future Solemnity-class global variant.
     Prevent,
+    /// CR 107.1a + CR 614.1a: Halving Season class — half the counter count,
+    /// rounded up.
+    HalfRoundedUp,
 }
 
 /// CR 106.3 + CR 614.1a: Mana-production replacement payload.

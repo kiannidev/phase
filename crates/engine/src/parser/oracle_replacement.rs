@@ -150,13 +150,8 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
         return Some(def);
     }
 
-    // --- "[Type] your opponents control enter tapped" (external replacement) ---
+    // --- "[Type] enter tapped" / "[Type] played by your opponents enter tapped" ---
     if let Some(def) = parse_external_enters_tapped(&norm_lower, &text) {
-        return Some(def);
-    }
-
-    // --- "[Type] played by your opponents enter tapped" (Uphill Battle class) ---
-    if let Some(def) = parse_played_by_opponents_entry(&norm_lower, &text) {
         return Some(def);
     }
 
@@ -2986,40 +2981,126 @@ fn parse_replacement_ability_word_condition(text: &str) -> Option<ReplacementCon
     .map(|(condition, _)| condition)
 }
 
-fn parse_external_entry_suffix(stripped: &str) -> Option<(&str, bool)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalEntryKind {
+    Plain {
+        enters_tapped: bool,
+    },
+    /// CR 614.1d: Uphill Battle class — cast/played entry only, not tokens.
+    PlayedByOpponents {
+        enters_tapped: bool,
+    },
+}
+
+/// CR 614.1d: Peel external entry-tapped suffixes from a normalized clause.
+/// Played-by-opponents variants are checked before plain enter-tapped suffixes
+/// so "creatures played by your opponents enter tapped" does not fall through
+/// to the Authority-of-the-Consuls control-based shape.
+fn parse_external_entry_suffix(stripped: &str) -> Option<(&str, ExternalEntryKind)> {
     stripped
-        .strip_suffix(" enter tapped")
-        .map(|subject| (subject, true))
-        .or_else(|| {
-            stripped
-                .strip_suffix(" enters tapped")
-                .map(|subject| (subject, true))
+        .strip_suffix(" played by your opponents enter the battlefield tapped")
+        .map(|subject| {
+            (
+                subject,
+                ExternalEntryKind::PlayedByOpponents {
+                    enters_tapped: true,
+                },
+            )
         })
         .or_else(|| {
             stripped
-                .strip_suffix(" enter untapped")
-                .map(|subject| (subject, false))
+                .strip_suffix(" played by your opponents enter tapped")
+                .map(|subject| {
+                    (
+                        subject,
+                        ExternalEntryKind::PlayedByOpponents {
+                            enters_tapped: true,
+                        },
+                    )
+                })
         })
         .or_else(|| {
-            stripped
-                .strip_suffix(" enters untapped")
-                .map(|subject| (subject, false))
+            stripped.strip_suffix(" enter tapped").map(|subject| {
+                (
+                    subject,
+                    ExternalEntryKind::Plain {
+                        enters_tapped: true,
+                    },
+                )
+            })
+        })
+        .or_else(|| {
+            stripped.strip_suffix(" enters tapped").map(|subject| {
+                (
+                    subject,
+                    ExternalEntryKind::Plain {
+                        enters_tapped: true,
+                    },
+                )
+            })
+        })
+        .or_else(|| {
+            stripped.strip_suffix(" enter untapped").map(|subject| {
+                (
+                    subject,
+                    ExternalEntryKind::Plain {
+                        enters_tapped: false,
+                    },
+                )
+            })
+        })
+        .or_else(|| {
+            stripped.strip_suffix(" enters untapped").map(|subject| {
+                (
+                    subject,
+                    ExternalEntryKind::Plain {
+                        enters_tapped: false,
+                    },
+                )
+            })
         })
 }
 
 fn build_external_entry_replacement(
     subject: &str,
     original_text: &str,
-    enters_tapped: bool,
+    kind: ExternalEntryKind,
 ) -> Option<ReplacementDefinition> {
     if subject.contains('~') {
         return None;
     }
 
+    let enters_tapped = match kind {
+        ExternalEntryKind::Plain { enters_tapped }
+        | ExternalEntryKind::PlayedByOpponents { enters_tapped } => enters_tapped,
+    };
+
     let (filter, rest) = parse_type_phrase(subject);
     if !rest.trim().is_empty() {
         return None;
     }
+
+    let valid_card = match kind {
+        ExternalEntryKind::PlayedByOpponents { .. } => match filter {
+            TargetFilter::Typed(mut tf) => {
+                tf.controller = Some(ControllerRef::Opponent);
+                tf.properties.push(FilterProp::WasPlayed);
+                TargetFilter::Typed(tf)
+            }
+            TargetFilter::Or { filters } if filters.len() == 1 => {
+                match filters.into_iter().next()? {
+                    TargetFilter::Typed(mut tf) => {
+                        tf.controller = Some(ControllerRef::Opponent);
+                        tf.properties.push(FilterProp::WasPlayed);
+                        TargetFilter::Typed(tf)
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        },
+        ExternalEntryKind::Plain { .. } => filter,
+    };
 
     let effect = if enters_tapped {
         Effect::SetTapState {
@@ -3038,7 +3119,7 @@ fn build_external_entry_replacement(
     Some(
         ReplacementDefinition::new(ReplacementEvent::ChangeZone)
             .execute(AbilityDefinition::new(AbilityKind::Spell, effect))
-            .valid_card(filter)
+            .valid_card(valid_card)
             .destination_zone(Zone::Battlefield)
             .description(original_text.to_string()),
     )
@@ -3057,8 +3138,8 @@ fn parse_source_state_external_entry(
     let condition = replacement_condition_from_static(condition)?;
     let rest_lower = rest.to_lowercase();
     let stripped = rest_lower.trim_end_matches('.');
-    let (entry_subject, enters_tapped) = parse_external_entry_suffix(stripped)?;
-    let mut def = build_external_entry_replacement(entry_subject, original_text, enters_tapped)?;
+    let (entry_subject, kind) = parse_external_entry_suffix(stripped)?;
+    let mut def = build_external_entry_replacement(entry_subject, original_text, kind)?;
     def.condition = Some(condition);
     Some(def)
 }
@@ -3069,72 +3150,35 @@ fn parse_external_enters_untapped(
     original_text: &str,
 ) -> Option<ReplacementDefinition> {
     let stripped = norm_lower.trim_end_matches('.');
-    let (subject, enters_tapped) = parse_external_entry_suffix(stripped)?;
-    if enters_tapped {
+    let (subject, kind) = parse_external_entry_suffix(stripped)?;
+    let ExternalEntryKind::Plain {
+        enters_tapped: false,
+    } = kind
+    else {
         return None;
-    }
-    build_external_entry_replacement(subject, original_text, false)
+    };
+    build_external_entry_replacement(subject, original_text, kind)
 }
 
 /// Parse "[Type] enter tapped" / "[Type] enters tapped" — external replacement effects.
 /// E.g., "Creatures your opponents control enter tapped." (Authority of the Consuls)
 /// E.g., "Artifacts and creatures your opponents control enter tapped." (Blind Obedience)
+/// E.g., "Creatures played by your opponents enter tapped." (Uphill Battle)
 fn parse_external_enters_tapped(
     norm_lower: &str,
     original_text: &str,
 ) -> Option<ReplacementDefinition> {
     let stripped = norm_lower.trim_end_matches('.');
-    let (subject, enters_tapped) = parse_external_entry_suffix(stripped)?;
-    if !enters_tapped {
-        return None;
+    let (subject, kind) = parse_external_entry_suffix(stripped)?;
+    match kind {
+        ExternalEntryKind::Plain {
+            enters_tapped: true,
+        }
+        | ExternalEntryKind::PlayedByOpponents {
+            enters_tapped: true,
+        } => build_external_entry_replacement(subject, original_text, kind),
+        _ => None,
     }
-    build_external_entry_replacement(subject, original_text, true)
-}
-
-/// Parse "[Type] played by your opponents enter [the battlefield] tapped."
-/// Uphill Battle class — distinct from "your opponents control enter tapped"
-/// (Authority of the Consuls): only applies to cast/played entries, not tokens
-/// put directly onto the battlefield.
-fn parse_played_by_opponents_entry(
-    norm_lower: &str,
-    original_text: &str,
-) -> Option<ReplacementDefinition> {
-    if !nom_primitives::scan_contains(norm_lower, "played by your opponents enter") {
-        return None;
-    }
-    let stripped = norm_lower.trim_end_matches('.');
-    // allow-noncombinator: peel fixed played-by entry suffix after scan_contains gate
-    let subject = stripped
-        .strip_suffix(" played by your opponents enter the battlefield tapped") // allow-noncombinator: fixed suffix after scan_contains gate
-        .or_else(|| {
-            stripped.strip_suffix(" played by your opponents enter tapped") // allow-noncombinator: fixed suffix after scan_contains gate
-        })?;
-    let (filter, subject_rest) = parse_type_phrase(subject.trim());
-    if !subject_rest.trim().is_empty() {
-        return None;
-    }
-    let mut typed = match filter {
-        TargetFilter::Typed(tf) => tf,
-        TargetFilter::Or { filters } if filters.len() == 1 => match &filters[0] {
-            TargetFilter::Typed(tf) => tf.clone(),
-            _ => return None,
-        },
-        _ => return None,
-    };
-    typed.controller = Some(ControllerRef::Opponent);
-    typed.properties.push(FilterProp::WasPlayed);
-    let effect = Effect::SetTapState {
-        target: TargetFilter::SelfRef,
-        scope: EffectScope::Single,
-        state: TapStateChange::Tap,
-    };
-    Some(
-        ReplacementDefinition::new(ReplacementEvent::ChangeZone)
-            .execute(AbilityDefinition::new(AbilityKind::Spell, effect))
-            .valid_card(TargetFilter::Typed(typed))
-            .destination_zone(Zone::Battlefield)
-            .description(original_text.to_string()),
-    )
 }
 
 /// CR 614.1a: Parse "If [filter] would die, …instead…" replacement effects.
@@ -9834,8 +9878,8 @@ mod tests {
     fn uphill_battle_played_by_opponents_enter_tapped() {
         let text = "Creatures played by your opponents enter the battlefield tapped.";
         assert!(
-            parse_played_by_opponents_entry(&text.to_lowercase(), text).is_some(),
-            "direct played-by parser must match Uphill Battle"
+            parse_external_enters_tapped(&text.to_lowercase(), text).is_some(),
+            "external entry parser must match Uphill Battle"
         );
         let def =
             parse_replacement_line(text, "Uphill Battle").expect("Uphill Battle played-by entry");

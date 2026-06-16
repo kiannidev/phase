@@ -1222,6 +1222,8 @@ pub fn matches_target_filter_on_lki_snapshot(
         controller: lki.controller,
         owner: lki.owner,
         from_zone: None,
+        cast_from_zone: None,
+        played_from_zone: None,
         to_zone: Zone::Battlefield,
         attachments: vec![],
         linked_exile_snapshot: vec![],
@@ -3635,9 +3637,11 @@ fn zone_change_record_matches_property(
         FilterProp::Token => record.is_token,
         // CR 111.1 + CR 603.6a: Nontoken identity as of the zone change.
         FilterProp::NonToken => !record.is_token,
-        // CR 305.1 + CR 601.2a: zone-change snapshots carry `from_zone` when
-        // the object existed in a prior zone (cast/played entry).
-        FilterProp::WasPlayed => record.from_zone.is_some(),
+        // CR 305.1 + CR 601.2a: zone-change snapshots carry cast/play provenance
+        // when the object was cast or played — not mere zone moves (reanimate).
+        FilterProp::WasPlayed => {
+            record.played_from_zone.is_some() || record.cast_from_zone.is_some()
+        }
 
         // -------- Group 2: source/event relational --------
         // CR 109.1 "another": same-object check against the triggering source.
@@ -9049,6 +9053,8 @@ mod tests {
             controller: PlayerId(0),
             owner: PlayerId(0),
             from_zone: Some(Zone::Battlefield),
+            cast_from_zone: None,
+            played_from_zone: None,
             to_zone: Zone::Graveyard,
             attachments: vec![],
             linked_exile_snapshot: vec![],

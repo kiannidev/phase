@@ -244,8 +244,7 @@ pub fn resolve(
             return Ok(());
         }
         ReplacementResult::NeedsChoice(player) => {
-            state.waiting_for =
-                replacement::replacement_choice_waiting_for(player, state);
+            state.waiting_for = replacement::replacement_choice_waiting_for(player, state);
             return Ok(());
         }
     }

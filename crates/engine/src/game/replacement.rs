@@ -1623,8 +1623,7 @@ fn explore_applier(
             _ => {
                 let mut ability = build_resolved_from_def(def, rid.source, controller);
                 ability.targets = vec![TargetRef::Object(object_id)];
-                let _ =
-                    crate::game::effects::resolve_ability_chain(state, &ability, events, 1);
+                let _ = crate::game::effects::resolve_ability_chain(state, &ability, events, 1);
             }
         }
         current = def.sub_ability.as_deref();

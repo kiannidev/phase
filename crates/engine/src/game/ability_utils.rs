@@ -1,7 +1,7 @@
 #[cfg(test)]
 use crate::types::ability::TapStateChange;
 use crate::types::ability::{
-    AbilityCondition, AbilityDefinition, CardTypeSetSource, CastManaSpentMetric,
+    AbilityCondition, AbilityDefinition, AbilityKind, CardTypeSetSource, CastManaSpentMetric,
     CombatRelationSubject, ControllerRef, CounterMoveSelection, Effect, EffectScope, FilterProp,
     GameRestriction, ModalChoice, ModalSelectionCondition, ModalSelectionConstraint,
     MultiTargetSpec, ObjectScope, PlayerFilter, QuantityExpr, QuantityRef, ResolvedAbility,
@@ -607,6 +607,38 @@ pub fn compute_unavailable_modes(
     unavailable.sort_unstable();
     unavailable.dedup();
     unavailable
+}
+
+/// CR 700.2a-b: Mode indices a modal spell cannot choose — repeat constraints
+/// plus modes whose targeting requirements have no legal assignment.
+pub fn spell_modal_unavailable_modes(
+    state: &GameState,
+    source_id: ObjectId,
+    controller: PlayerId,
+    modal: &ModalChoice,
+    mode_abilities: &[AbilityDefinition],
+) -> Vec<usize> {
+    let mut unavailable_modes = compute_unavailable_modes(state, source_id, modal);
+    filter_modes_by_target_legality(
+        state,
+        source_id,
+        controller,
+        mode_abilities,
+        modal,
+        &mut unavailable_modes,
+    );
+    unavailable_modes
+}
+
+/// Spell-kind abilities on a modal spell object — one entry per printed mode.
+pub fn modal_spell_mode_abilities(
+    obj: &crate::game::game_object::GameObject,
+) -> Vec<AbilityDefinition> {
+    obj.abilities
+        .iter()
+        .filter(|a| a.kind == AbilityKind::Spell)
+        .cloned()
+        .collect()
 }
 
 /// CR 700.2a-b + CR 700.2f: Extends `unavailable_modes` with mode indices

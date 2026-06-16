@@ -2614,12 +2614,7 @@ mod tests {
                 },
             });
         }
-        let targets = find_legal_targets(
-            &state,
-            &TargetFilter::StackSpell,
-            PlayerId(0),
-            counter,
-        );
+        let targets = find_legal_targets(&state, &TargetFilter::StackSpell, PlayerId(0), counter);
         assert!(targets.contains(&TargetRef::Object(opponent_spell)));
         assert!(!targets.contains(&TargetRef::Object(counter)));
     }

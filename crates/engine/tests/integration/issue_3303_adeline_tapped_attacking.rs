@@ -50,7 +50,7 @@ fn resolve_attack_trigger(runner: &mut GameRunner) {
                 }
                 runner.act(GameAction::PassPriority).expect("pass priority");
             }
-            other if matches!(other, WaitingFor::OrderTriggers { .. }) => {
+            WaitingFor::OrderTriggers { .. } => {
                 runner
                     .act(GameAction::OrderTriggers { order: vec![] })
                     .expect("order triggers");

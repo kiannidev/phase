@@ -287,8 +287,22 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
         return Some(def);
     }
 
-    // --- "If you would draw a card, {effect}" ---
-    if nom_primitives::scan_contains(&lower, "you would draw") {
+    // --- "If [player] would draw [a card | one or more cards], {effect}" ---
+    // CR 614.1a: Widened from "you would draw" to handle opponent/player
+    // scope (Notion Thief, Hullbreacher, Chains of Mephistopheles) mirroring
+    // the gain-life widening below.
+    let mentions_draw = nom_primitives::scan_at_word_boundaries(&lower, |i| {
+        value(
+            (),
+            alt((
+                tag::<_, _, OracleError<'_>>("would draw a card"),
+                tag("would draw one or more cards"),
+            )),
+        )
+        .parse(i)
+    })
+    .is_some();
+    if mentions_draw {
         let effect_text = extract_replacement_effect(&normalized);
         let mut def =
             ReplacementDefinition::new(ReplacementEvent::Draw).description(text.to_string());
@@ -307,6 +321,8 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
             }
             def = def.execute(parse_effect_chain(effect_after_modal, AbilityKind::Spell));
         }
+        // CR 614.1a: Player scope for draw replacements.
+        apply_draw_player_scope(&lower, &mut def);
         // CR 121.1 + CR 504.1 + CR 614.6: Detect Alhammarret's Archive's
         // "except the first one [you|they] draw in each of [your|their] draw
         // steps" exception clause and gate the replacement so it does NOT
@@ -4465,6 +4481,19 @@ fn apply_gain_life_player_scope(lower: &str, def: &mut ReplacementDefinition) {
         def.valid_player = Some(ReplacementPlayerScope::AnyPlayer);
     }
     // else: "you would gain life" → valid_player stays None (controller-only).
+}
+
+/// CR 614.1a: Apply `valid_player` scope to draw replacements from the
+/// antecedent subject ("an opponent", "a player", or default controller-only).
+fn apply_draw_player_scope(lower: &str, def: &mut ReplacementDefinition) {
+    if nom_primitives::scan_contains(lower, "an opponent would draw")
+        || nom_primitives::scan_contains(lower, "opponent would draw")
+    {
+        def.valid_player = Some(ReplacementPlayerScope::Opponent);
+    } else if nom_primitives::scan_contains(lower, "a player would draw") {
+        def.valid_player = Some(ReplacementPlayerScope::AnyPlayer);
+    }
+    // else: "you would draw" → valid_player stays None (controller-only).
 }
 
 fn parse_color_word(word: &str) -> Option<ManaColor> {
@@ -11986,6 +12015,61 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// CR 614.1a + CR 121.1: Opponent draw replacements with the shared
+    /// except-first-draw-in-draw-step clause (Notion Thief / Hullbreacher class).
+    #[test]
+    fn parses_opponent_draw_replacement_except_first_draw_in_step() {
+        let notion_thief = parse_replacement_line(
+            "If an opponent would draw a card except the first one they draw in each of their draw steps, instead that player skips that draw and you draw a card.",
+            "Notion Thief",
+        )
+        .expect("Notion Thief draw replacement");
+        assert_eq!(notion_thief.event, ReplacementEvent::Draw);
+        assert_eq!(
+            notion_thief.valid_player,
+            Some(ReplacementPlayerScope::Opponent)
+        );
+        assert_eq!(
+            notion_thief.condition,
+            Some(ReplacementCondition::ExceptFirstDrawInDrawStep)
+        );
+        assert!(
+            notion_thief.execute.is_some(),
+            "replacement execute chain must be present"
+        );
+
+        let hullbreacher = parse_replacement_line(
+            "If an opponent would draw a card except the first one they draw in each of their draw steps, instead you create a Treasure token.",
+            "Hullbreacher",
+        )
+        .expect("Hullbreacher draw replacement");
+        assert_eq!(hullbreacher.event, ReplacementEvent::Draw);
+        assert_eq!(
+            hullbreacher.valid_player,
+            Some(ReplacementPlayerScope::Opponent)
+        );
+        assert_eq!(
+            hullbreacher.condition,
+            Some(ReplacementCondition::ExceptFirstDrawInDrawStep)
+        );
+    }
+
+    /// CR 614.1a: Global-player draw replacement (Chains of Mephistopheles class).
+    #[test]
+    fn parses_any_player_draw_replacement_except_first_draw_in_step() {
+        let def = parse_replacement_line(
+            "If a player would draw a card except the first one they draw in each of their draw steps, that player discards a card instead.",
+            "Chains of Mephistopheles",
+        )
+        .expect("Chains draw replacement antecedent");
+        assert_eq!(def.event, ReplacementEvent::Draw);
+        assert_eq!(def.valid_player, Some(ReplacementPlayerScope::AnyPlayer));
+        assert_eq!(
+            def.condition,
+            Some(ReplacementCondition::ExceptFirstDrawInDrawStep)
+        );
     }
 
     #[test]

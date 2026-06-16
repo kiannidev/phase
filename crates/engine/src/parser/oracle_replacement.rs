@@ -3006,7 +3006,7 @@ enum ExternalEntryKind {
 /// to the Authority-of-the-Consuls control-based shape.
 fn parse_external_entry_suffix(stripped: &str) -> Option<(&str, ExternalEntryKind)> {
     stripped
-        .strip_suffix(" played by your opponents enter the battlefield tapped")
+        .strip_suffix(" played by your opponents enter the battlefield tapped") // allow-noncombinator: fixed external-entry suffix peel after type-phrase subject
         .map(|subject| {
             (
                 subject,
@@ -3017,7 +3017,7 @@ fn parse_external_entry_suffix(stripped: &str) -> Option<(&str, ExternalEntryKin
         })
         .or_else(|| {
             stripped
-                .strip_suffix(" played by your opponents enter tapped")
+                .strip_suffix(" played by your opponents enter tapped") // allow-noncombinator: fixed external-entry suffix peel after type-phrase subject
                 .map(|subject| {
                     (
                         subject,
@@ -3028,6 +3028,7 @@ fn parse_external_entry_suffix(stripped: &str) -> Option<(&str, ExternalEntryKin
                 })
         })
         .or_else(|| {
+            // allow-noncombinator: fixed external-entry suffix peel after type-phrase subject
             stripped.strip_suffix(" enter tapped").map(|subject| {
                 (
                     subject,
@@ -3038,6 +3039,7 @@ fn parse_external_entry_suffix(stripped: &str) -> Option<(&str, ExternalEntryKin
             })
         })
         .or_else(|| {
+            // allow-noncombinator: fixed external-entry suffix peel after type-phrase subject
             stripped.strip_suffix(" enters tapped").map(|subject| {
                 (
                     subject,
@@ -3048,6 +3050,7 @@ fn parse_external_entry_suffix(stripped: &str) -> Option<(&str, ExternalEntryKin
             })
         })
         .or_else(|| {
+            // allow-noncombinator: fixed external-entry suffix peel after type-phrase subject
             stripped.strip_suffix(" enter untapped").map(|subject| {
                 (
                     subject,
@@ -3058,6 +3061,7 @@ fn parse_external_entry_suffix(stripped: &str) -> Option<(&str, ExternalEntryKin
             })
         })
         .or_else(|| {
+            // allow-noncombinator: fixed external-entry suffix peel after type-phrase subject
             stripped.strip_suffix(" enters untapped").map(|subject| {
                 (
                     subject,

@@ -214,6 +214,7 @@ mod issue_2941_vivien_reid;
 mod issue_2943_kayas_wrath;
 mod issue_3127_reveal_otherwise_graveyard;
 mod issue_3245_abhorrent_oculus_manifest_dread;
+mod issue_3260_phantasmal_image_persist;
 mod issue_3285_face_down_public_zone;
 mod issue_3295_scrapwork_mutt_unearth_zone;
 mod issue_3311_manifest_dread_land;

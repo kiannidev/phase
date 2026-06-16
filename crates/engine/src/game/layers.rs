@@ -12,7 +12,9 @@ use crate::game::conditions::{
 use crate::game::devotion::count_devotion;
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::game::game_object::DisplaySource;
-use crate::game::printed_cards::{apply_copiable_values, intrinsic_copiable_values};
+use crate::game::printed_cards::{
+    apply_copiable_values, ensure_keyword_triggers_for_copiable_values, intrinsic_copiable_values,
+};
 use crate::game::quantity::{filter_uses_recipient, quantity_expr_uses_recipient, QuantityContext};
 use crate::game::speed::{effective_speed, has_max_speed};
 use crate::types::ability::{
@@ -4340,6 +4342,7 @@ pub(crate) fn compute_current_copiable_values(
             _ => {}
         }
     }
+    ensure_keyword_triggers_for_copiable_values(&mut values);
     Some(values)
 }
 

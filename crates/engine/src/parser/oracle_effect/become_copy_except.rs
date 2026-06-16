@@ -480,26 +480,9 @@ fn parse_theyre_pt_and_types(input: &str) -> Option<(&str, Vec<ContinuousModific
         .ok()?;
 
     let (rest, (power, toughness)) = parse_pt_pair(rest)?;
-    let (mut rest, _) = tag::<_, _, OracleError<'_>>(" ").parse(rest).ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" ").parse(rest).ok()?;
 
-    let mut type_words = Vec::new();
-    loop {
-        rest = rest.trim_start();
-        if let Ok((after, _)) =
-            alt((tag::<_, _, OracleError<'_>>("creatures"), tag("creature"))).parse(rest)
-        {
-            rest = after.trim_start();
-            break;
-        }
-        let word = rest.split_whitespace().next()?;
-        if word.is_empty() {
-            return None;
-        }
-        type_words.push(word);
-        rest = &rest[word.len()..];
-    }
-
-    let type_text = type_words.join(" ");
+    let (type_text, rest) = split_on_first_of(rest, &["creatures ", "creature "])?;
     let (rest, suffix) = if let Some((_, rest)) =
         split_on_first_of(rest, &[" in addition to their other colors and types"])
     {

@@ -9837,8 +9837,8 @@ mod tests {
             parse_played_by_opponents_entry(&text.to_lowercase(), text).is_some(),
             "direct played-by parser must match Uphill Battle"
         );
-        let def = parse_replacement_line(text, "Uphill Battle")
-            .expect("Uphill Battle played-by entry");
+        let def =
+            parse_replacement_line(text, "Uphill Battle").expect("Uphill Battle played-by entry");
         assert_eq!(def.event, ReplacementEvent::ChangeZone);
         assert_eq!(def.destination_zone, Some(Zone::Battlefield));
         match &def.valid_card {

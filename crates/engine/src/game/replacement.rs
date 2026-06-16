@@ -10482,9 +10482,11 @@ mod tests {
         use crate::types::card_type::CoreType;
 
         let uphill_id = ObjectId(10);
-        let mut state = test_state_with_object(uphill_id, Zone::Battlefield, vec![
-            uphill_battle_replacement(),
-        ]);
+        let mut state = test_state_with_object(
+            uphill_id,
+            Zone::Battlefield,
+            vec![uphill_battle_replacement()],
+        );
         let registry = build_replacement_registry();
 
         let cast_creature = ObjectId(20);
@@ -10514,9 +10516,7 @@ mod tests {
         };
         let cast_matches = find_applicable_replacements(&state, &cast_event, &registry);
         assert!(
-            cast_matches
-                .iter()
-                .any(|rid| rid.source == uphill_id),
+            cast_matches.iter().any(|rid| rid.source == uphill_id),
             "cast creature must match Uphill Battle WasPlayed filter"
         );
 
@@ -10530,9 +10530,7 @@ mod tests {
         };
         let token_matches = find_applicable_replacements(&state, &token_event, &registry);
         assert!(
-            !token_matches
-                .iter()
-                .any(|rid| rid.source == uphill_id),
+            !token_matches.iter().any(|rid| rid.source == uphill_id),
             "tokens put directly onto the battlefield must not match WasPlayed filter"
         );
     }

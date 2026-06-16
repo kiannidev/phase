@@ -12347,6 +12347,41 @@ mod tests {
     }
 
     #[test]
+    fn inverted_counter_prohibition_planeswalkers() {
+        let def = parse_replacement_line(
+            "Planeswalkers can't have counters put on them.",
+            "Test Card",
+        )
+        .expect("planeswalker counter prohibition must parse");
+        assert_eq!(def.event, ReplacementEvent::AddCounter);
+        assert_eq!(
+            def.quantity_modification,
+            Some(QuantityModification::Prevent)
+        );
+        assert!(matches!(
+            def.valid_card,
+            Some(TargetFilter::Typed(tf))
+                if tf.type_filters == vec![TypeFilter::Planeswalker]
+        ));
+    }
+
+    #[test]
+    fn inverted_counter_prohibition_artifacts() {
+        let def = parse_replacement_line("Artifacts can't have counters put on them.", "Test Card")
+            .expect("artifact counter prohibition must parse");
+        assert_eq!(def.event, ReplacementEvent::AddCounter);
+        assert_eq!(
+            def.quantity_modification,
+            Some(QuantityModification::Prevent)
+        );
+        assert!(matches!(
+            def.valid_card,
+            Some(TargetFilter::Typed(tf))
+                if tf.type_filters == vec![TypeFilter::Artifact]
+        ));
+    }
+
+    #[test]
     fn parses_halving_season_opponent_counter_replacement() {
         let def = parse_replacement_line(
             "If an opponent would put one or more counters on a permanent or player, they put half that many of those counters on that permanent or player instead, rounded down.",

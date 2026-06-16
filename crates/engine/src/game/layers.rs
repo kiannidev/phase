@@ -4342,6 +4342,8 @@ pub(crate) fn compute_current_copiable_values(
             _ => {}
         }
     }
+    // CR 707.2: Copies must receive synthesized keyword companion triggers when
+    // the copiable snapshot carries the keyword but omits its dies trigger.
     ensure_keyword_triggers_for_copiable_values(&mut values);
     Some(values)
 }

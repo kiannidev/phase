@@ -118,8 +118,10 @@ fn issue_3260_phantasmal_image_copy_of_kitchen_finks_persists() {
         .iter()
         .copied()
         .find(|id| {
-            let obj = &runner.state().objects[id];
-            obj.name == "Kitchen Finks" && obj.controller == P0
+            *id != finks && {
+                let obj = &runner.state().objects[id];
+                obj.name == "Kitchen Finks" && obj.controller == P0
+            }
         })
         .expect("Phantasmal Image should enter as a copy of Kitchen Finks");
 
@@ -133,6 +135,23 @@ fn issue_3260_phantasmal_image_copy_of_kitchen_finks_persists() {
             .iter()
             .any(|k| matches!(k, engine::types::keywords::Keyword::Persist)),
         "copy must have persist keyword"
+    );
+    assert!(
+        runner
+            .state()
+            .objects
+            .get(&copy_id)
+            .unwrap()
+            .trigger_definitions
+            .as_slice()
+            .iter()
+            .any(|trigger| {
+                engine::database::synthesis::KeywordTriggerInstaller::trigger_matches_keyword_kind(
+                    trigger,
+                    &engine::types::keywords::Keyword::Persist,
+                )
+            }),
+        "copy must carry Persist's synthesized dies trigger"
     );
 
     destroy_with_lethal_damage(&mut runner, copy_id);

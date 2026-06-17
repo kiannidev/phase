@@ -1208,7 +1208,10 @@ fn run_auto_pass_loop(state: &mut GameState, result: &mut ActionResult) {
                 player,
                 valid_blocker_ids,
                 ..
-            } if !phase_stop_hit(state, *player) && valid_blocker_ids.is_empty() => {
+            } if !phase_stop_hit(state, *player)
+                && (valid_blocker_ids.is_empty()
+                    || !super::combat::has_attackers_in_play(state)) =>
+            {
                 let mut events = Vec::new();
                 match engine_combat::handle_empty_blockers(state, *player, &mut events) {
                     Ok(wf) => {

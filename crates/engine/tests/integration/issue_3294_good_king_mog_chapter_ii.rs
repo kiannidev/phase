@@ -217,7 +217,7 @@ fn check_delayed_triggers_matches_noncreature_spell_cast_directly() {
     };
     let stacked = check_delayed_triggers(state, &[spell_cast]);
     assert!(
-        !stacked.is_empty() || state.stack.len() > 0,
+        !stacked.is_empty() || !state.stack.is_empty(),
         "check_delayed_triggers must queue chapter II trigger on SpellCast \
          (stacked_events={}, stack={})",
         stacked.len(),

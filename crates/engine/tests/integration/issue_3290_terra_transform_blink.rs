@@ -123,7 +123,11 @@ fn terra_transformed_flickerwisp_returns_front_face_at_end_step() {
     let mut guard = 0;
     while runner.state().delayed_triggers.is_empty() {
         guard += 1;
-        assert!(guard < 64, "ETB trigger stalled: {:?}", runner.state().waiting_for);
+        assert!(
+            guard < 64,
+            "ETB trigger stalled: {:?}",
+            runner.state().waiting_for
+        );
         match &runner.state().waiting_for {
             WaitingFor::TriggerTargetSelection { .. } => {
                 runner
@@ -148,7 +152,9 @@ fn terra_transformed_flickerwisp_returns_front_face_at_end_step() {
     while !runner.state().delayed_triggers.is_empty() || !runner.state().stack.is_empty() {
         guard += 1;
         assert!(guard < 256, "delayed return stalled");
-        runner.act(GameAction::PassPriority).expect("pass to end step");
+        runner
+            .act(GameAction::PassPriority)
+            .expect("pass to end step");
     }
 
     let terra_obj = &runner.state().objects[&terra];

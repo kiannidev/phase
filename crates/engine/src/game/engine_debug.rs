@@ -281,11 +281,7 @@ pub fn apply_debug_action(
             if let Some(want_transformed) = transformed {
                 let (zone, has_back_face, currently_transformed) = {
                     let obj = state.objects.get(&object_id).unwrap();
-                    (
-                        obj.zone,
-                        obj.back_face.is_some(),
-                        obj.transformed,
-                    )
+                    (obj.zone, obj.back_face.is_some(), obj.transformed)
                 };
                 if want_transformed != currently_transformed {
                     // CR 701.27a: toggling `transformed` on a DFC must swap

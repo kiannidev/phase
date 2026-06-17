@@ -3067,12 +3067,13 @@ fn parse_source_in_zone_condition(input: &str) -> OracleResult<'_, StaticConditi
         value(false, tag(" is")),
     ))
     .parse(rest)?;
-    let rest = rest.trim_start();
     // CR 701.13a + CR 113.6b: passive "is exiled" is equivalent to "is in
     // exile" for source-referential intervening-if gates (Cosima, God of the
-    // Voyage's granted landfall trigger: "if ~ is exiled").
+    // Voyage's granted landfall trigger: "if ~ is exiled"). Match the leading
+    // space left by `tag(" is")` — do not trim_start or `parse_zone_phrase`
+    // loses its " in your graveyard" boundary.
     let (rest, first) =
-        alt((map(tag("exiled"), |_| Zone::Exile), parse_zone_phrase)).parse(rest)?;
+        alt((map(tag(" exiled"), |_| Zone::Exile), parse_zone_phrase)).parse(rest)?;
     // CR 113.6b: a single ability that names multiple zones functions in each
     // of them — the "or"-separated zone list composes disjunctively across the
     // listed zones. ("or" is English grammar, not a CR construct; the rules

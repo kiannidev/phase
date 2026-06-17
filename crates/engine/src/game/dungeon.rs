@@ -580,18 +580,9 @@ pub fn room_effects(
             ),
             vec![],
         ),
-        // 8: Throne of the Dead Three — complex multi-step effect, deferred
+        // 8: Throne of the Dead Three — reveal 10, put creature with counters, hexproof, shuffle
         (DungeonId::Undercity, 8) => (
-            simple(
-                Effect::Unimplemented {
-                    name: "Room: Throne of the Dead Three".to_string(),
-                    description: Some(
-                        "Reveal the top ten cards of your library. Put a creature card from among them onto the battlefield with three +1/+1 counters on it. It gains hexproof until your next turn. Then shuffle.".to_string(),
-                    ),
-                },
-                source_id,
-                controller,
-            ),
+            throne_of_dead_three(source_id, controller),
             vec![],
         ),
 
@@ -952,6 +943,19 @@ fn creature_token(
         static_abilities: vec![],
         enter_with_counters: vec![],
     }
+}
+
+/// Undercity room 8 (Throne of the Dead Three): reveal 10, put a creature from
+/// among them onto the battlefield with three +1/+1 counters, grant hexproof
+/// until your next turn, then shuffle.
+fn throne_of_dead_three(source_id: ObjectId, controller: PlayerId) -> ResolvedAbility {
+    use crate::game::ability_utils::build_resolved_from_def;
+    use crate::parser::oracle_effect::parse_effect_chain;
+    use crate::types::ability::AbilityKind;
+
+    const ORACLE: &str = "Reveal the top ten cards of your library. Put a creature card from among them onto the battlefield with three +1/+1 counters on it. It gains hexproof until your next turn. Then shuffle.";
+    let def = parse_effect_chain(ORACLE, AbilityKind::Spell);
+    build_resolved_from_def(&def, source_id, controller)
 }
 
 /// Build a "search for a basic land, reveal, put into hand, shuffle" ability chain.
@@ -1444,6 +1448,29 @@ mod tests {
         assert_eq!(
             room_name(DungeonId::DungeonOfTheMadMage, 8),
             "Mad Wizard's Lair"
+        );
+    }
+
+    // ── Undercity room effect tests ─────────────────────────────────────
+
+    fn undercity_effect(room: u8) -> ResolvedAbility {
+        room_effects(DungeonId::Undercity, room, ObjectId(1), PlayerId(0)).0
+    }
+
+    #[test]
+    fn room_effects_undercity_throne_of_dead_three() {
+        let ability = undercity_effect(8);
+        assert!(
+            matches!(
+                ability.effect,
+                Effect::Dig { reveal: true, .. } | Effect::RevealTop { .. }
+            ),
+            "Throne must reveal library top, got {:?}",
+            ability.effect
+        );
+        assert!(
+            !matches!(ability.effect, Effect::Unimplemented { .. }),
+            "Throne of the Dead Three must be implemented"
         );
     }
 

@@ -987,7 +987,10 @@ fn patch_throne_parsed_chain(mut root: ResolvedAbility) -> ResolvedAbility {
     root
 }
 
-fn resolved_chain_contains(ability: &ResolvedAbility, mut pred: impl FnMut(&Effect) -> bool) -> bool {
+fn resolved_chain_contains(
+    ability: &ResolvedAbility,
+    mut pred: impl FnMut(&Effect) -> bool,
+) -> bool {
     if pred(&ability.effect) {
         return true;
     }
@@ -998,7 +1001,10 @@ fn resolved_chain_contains(ability: &ResolvedAbility, mut pred: impl FnMut(&Effe
 }
 
 fn retarget_hexproof_to_parent(ability: &mut ResolvedAbility) {
-    if let Effect::GenericEffect { static_abilities, .. } = &mut ability.effect {
+    if let Effect::GenericEffect {
+        static_abilities, ..
+    } = &mut ability.effect
+    {
         for st in static_abilities.iter_mut() {
             if matches!(st.affected, Some(TargetFilter::SelfRef)) {
                 st.affected = Some(TargetFilter::ParentTarget);
@@ -1549,15 +1555,15 @@ mod tests {
         assert!(
             super::resolved_chain_contains(ability, |effect| {
                 matches!(effect, Effect::GenericEffect { static_abilities, .. }
-                    if static_abilities.iter().any(|st| {
-                        matches!(st.affected, Some(TargetFilter::ParentTarget))
-                            && st.modifications.iter().any(|m| matches!(
-                                m,
-                                ContinuousModification::AddKeyword {
-                                    keyword: Keyword::Hexproof
-                                }
-                            ))
-                    }))
+                if static_abilities.iter().any(|st| {
+                    matches!(st.affected, Some(TargetFilter::ParentTarget))
+                        && st.modifications.iter().any(|m| matches!(
+                            m,
+                            ContinuousModification::AddKeyword {
+                                keyword: Keyword::Hexproof
+                            }
+                        ))
+                }))
             }),
             "Throne must grant hexproof to the dug creature, got {:?}",
             ability

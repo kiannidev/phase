@@ -24,7 +24,10 @@ use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
 use engine::types::zones::Zone;
 
-fn resolved_chain_contains(ability: &ResolvedAbility, mut pred: impl FnMut(&Effect) -> bool) -> bool {
+fn resolved_chain_contains(
+    ability: &ResolvedAbility,
+    mut pred: impl FnMut(&Effect) -> bool,
+) -> bool {
     if pred(&ability.effect) {
         return true;
     }
@@ -73,15 +76,15 @@ fn assert_throne_room_chain(ability: &ResolvedAbility) {
     assert!(
         resolved_chain_contains(ability, |effect| {
             matches!(effect, Effect::GenericEffect { static_abilities, .. }
-                if static_abilities.iter().any(|st| {
-                    matches!(st.affected, Some(TargetFilter::ParentTarget))
-                        && st.modifications.iter().any(|m| matches!(
-                            m,
-                            ContinuousModification::AddKeyword {
-                                keyword: Keyword::Hexproof
-                            }
-                        ))
-                }))
+            if static_abilities.iter().any(|st| {
+                matches!(st.affected, Some(TargetFilter::ParentTarget))
+                    && st.modifications.iter().any(|m| matches!(
+                        m,
+                        ContinuousModification::AddKeyword {
+                            keyword: Keyword::Hexproof
+                        }
+                    ))
+            }))
         }),
         "Throne must grant hexproof to the dug creature"
     );
@@ -150,9 +153,7 @@ fn undercity_throne_room_resolves_creature_counters_hexproof_and_shuffle() {
         "chosen creature must enter the battlefield"
     );
     assert_eq!(
-        runner
-            .state()
-            .objects[&creature]
+        runner.state().objects[&creature]
             .counters
             .get(&CounterType::Plus1Plus1)
             .copied(),

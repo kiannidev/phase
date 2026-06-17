@@ -9,6 +9,7 @@ import { CARD_BACK_URL } from "../../services/scryfall.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
 import { usePerspectivePlayerId } from "../../hooks/usePlayerId.ts";
+import type { ObjectId } from "../../adapter/types.ts";
 import { resolveFocusedOpponent } from "../../viewmodel/gameStateView.ts";
 
 interface OpponentHandProps {

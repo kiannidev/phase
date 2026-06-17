@@ -1556,7 +1556,6 @@ pub fn evaluate_layers(state: &mut GameState) {
     // CR 613.11: Rule-changing continuous effects are applied after object
     // characteristics are determined. These flags feed CR 510.1 combat damage
     // assignment and must observe final post-layer characteristics.
-    apply_phased_out_self_cda_characteristics(state);
     apply_combat_assignment_rule_effects(state);
 
     // CR 302.6: Re-apply summoning sickness for any permanent whose effective
@@ -2134,89 +2133,6 @@ fn apply_prototype_characteristics(state: &mut GameState, ids: impl IntoIterator
         obj.power = Some(form.power);
         obj.toughness = Some(form.toughness);
         obj.color = form.colors;
-    }
-}
-
-/// True when a continuous modification adjusts power and/or toughness.
-fn is_pt_continuous_modification(modification: &ContinuousModification) -> bool {
-    matches!(
-        modification,
-        ContinuousModification::AddPower { .. }
-            | ContinuousModification::AddToughness { .. }
-            | ContinuousModification::AddDynamicPower { .. }
-            | ContinuousModification::AddDynamicToughness { .. }
-            | ContinuousModification::SetPower { .. }
-            | ContinuousModification::SetToughness { .. }
-            | ContinuousModification::SetPowerDynamic { .. }
-            | ContinuousModification::SetToughnessDynamic { .. }
-            | ContinuousModification::SetDynamicPower { .. }
-            | ContinuousModification::SetDynamicToughness { .. }
-            | ContinuousModification::SwitchPowerToughness
-    )
-}
-
-/// CR 604.3 + CR 702.26: Phased-out permanents are excluded from the main
-/// layer pass (CR 702.26e), but their own characteristic-defining P/T
-/// abilities still define their power and toughness (e.g. Lumra, Bellow of
-/// the Woods). Without this pass, a */* CDA creature can remain at base 0/0
-/// and die to CR 704.5f when it phases in or after a layer reset.
-fn apply_phased_out_self_cda_characteristics(state: &mut GameState) {
-    use crate::types::statics::StaticMode;
-    use std::collections::HashSet;
-
-    let phased_out: Vec<ObjectId> = state
-        .battlefield
-        .iter()
-        .copied()
-        .filter(|id| state.objects.get(id).is_some_and(|o| o.is_phased_out()))
-        .collect();
-
-    for id in phased_out {
-        let has_self_cda_pt = state.objects.get(&id).is_some_and(|obj| {
-            obj.static_definitions.iter_all().any(|def| {
-                def.characteristic_defining
-                    && def.mode == StaticMode::Continuous
-                    && def.modifications.iter().any(is_pt_continuous_modification)
-            })
-        });
-        if !has_self_cda_pt {
-            continue;
-        }
-
-        if let Some(obj) = state.objects.get_mut(&id) {
-            obj.power = obj.base_power;
-            obj.toughness = obj.base_toughness;
-        }
-
-        let effects: Vec<ActiveContinuousEffect> = state
-            .objects
-            .get(&id)
-            .map(|obj| active_continuous_effects_from_static_source(state, obj))
-            .unwrap_or_default();
-
-        let mut cda_pt_effects: Vec<&ActiveContinuousEffect> = effects
-            .iter()
-            .filter(|e| {
-                e.source_id == id
-                    && is_pt_continuous_modification(&e.modification)
-                    && e.def_index.is_some_and(|idx| {
-                        state.objects.get(&id).is_some_and(|obj| {
-                            obj.static_definitions
-                                .get(idx)
-                                .is_some_and(|def| def.characteristic_defining)
-                        })
-                    })
-            })
-            .collect();
-
-        cda_pt_effects.sort_by_key(|e| (e.layer, e.timestamp));
-
-        let restrict = HashSet::from([id]);
-        for effect in cda_pt_effects {
-            apply_continuous_effect_to(state, effect, &restrict);
-        }
-
-        apply_pt_counter_modifications(state, std::iter::once(id));
     }
 }
 
@@ -3533,19 +3449,7 @@ fn apply_continuous_effect_filtered(
         .affected_filter
         .extract_in_zone()
         .unwrap_or(crate::types::zones::Zone::Battlefield);
-    let scan_ids: Vec<ObjectId> = if let Some(restrict) = restrict_to {
-        // Incremental fast path (and the phased-out self-CDA pass): the caller
-        // names the exact recipients. `zone_object_ids` excludes phased-out
-        // permanents (CR 702.26b), so scanning it would drop them even when
-        // `restrict_to` explicitly includes a phased-out self-CDA object.
-        restrict
-            .iter()
-            .filter(|&&id| state.objects.get(&id).is_some_and(|o| o.zone == scan_zone))
-            .copied()
-            .collect()
-    } else {
-        super::targeting::zone_object_ids(state, scan_zone)
-    };
+    let scan_ids = super::targeting::zone_object_ids(state, scan_zone);
     let ctx = FilterContext::from_source(state, effect.source_id);
     let affected_ids: Vec<ObjectId> = scan_ids
         .iter()
@@ -3553,18 +3457,7 @@ fn apply_continuous_effect_filtered(
         // The rest of the battlefield was not reset and keeps its prior derived
         // values, so re-applying to it would double-apply.
         .filter(|&&id| restrict_to.is_none_or(|ids| ids.contains(&id)))
-        .filter(|&&id| {
-            if state.objects.get(&id).is_some_and(|o| o.is_phased_out()) {
-                super::filter::matches_target_filter_including_phased_out(
-                    state,
-                    id,
-                    &effect.affected_filter,
-                    &ctx,
-                )
-            } else {
-                matches_target_filter(state, id, &effect.affected_filter, &ctx)
-            }
-        })
+        .filter(|&&id| matches_target_filter(state, id, &effect.affected_filter, &ctx))
         .filter(|&&id| {
             effect.condition.as_ref().is_none_or(|condition| {
                 evaluate_condition_with_recipient(

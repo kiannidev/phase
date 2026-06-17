@@ -13575,6 +13575,32 @@ mod tests {
     }
 
     #[test]
+    fn impostor_syndrome_copy_it_binds_to_damage_source() {
+        let def = parse_trigger_line(
+            "Whenever a nontoken creature you control deals combat damage to a player, \
+             create a token that's a copy of it, except it isn't legendary.",
+            "Impostor Syndrome",
+        );
+        assert_eq!(def.mode, TriggerMode::DamageDone);
+        match def.execute.as_ref().unwrap().effect.as_ref() {
+            Effect::CopyTokenOf {
+                target,
+                additional_modifications,
+                ..
+            } => {
+                assert_eq!(*target, TargetFilter::TriggeringSource);
+                assert!(additional_modifications.iter().any(|m| matches!(
+                    m,
+                    ContinuousModification::RemoveSupertype {
+                        supertype: crate::types::card_type::Supertype::Legendary
+                    }
+                )));
+            }
+            other => panic!("expected CopyTokenOf, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn renowned_creature_damage_subject_keeps_designation_filter() {
         let def = parse_trigger_line(
             "Whenever a renowned creature you control deals combat damage to a player, double the number of +1/+1 counters on it.",

@@ -18,9 +18,7 @@ fn issue_1319_ninjutsu_rejects_attacker_that_left_battlefield() {
     scenario.at_phase(Phase::DeclareBlockers);
 
     let attacker = scenario.add_creature(P0, "Attacker", 2, 2).id();
-    let ninja = scenario
-        .add_creature_to_hand(P0, "Ninja", 1, 1)
-        .id();
+    let ninja = scenario.add_creature_to_hand(P0, "Ninja", 1, 1).id();
     scenario.with_mana_pool(
         P0,
         vec![ManaUnit::new(ManaType::Black, ObjectId(0), false, vec![])],

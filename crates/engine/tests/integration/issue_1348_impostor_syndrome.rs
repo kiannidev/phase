@@ -7,7 +7,8 @@ use engine::types::triggers::TriggerMode;
 
 use super::rules::run_combat;
 
-const IMPOSTOR_SYNDROME_ORACLE: &str = "Whenever a nontoken creature you control deals combat damage to a player, \
+const IMPOSTOR_SYNDROME_ORACLE: &str =
+    "Whenever a nontoken creature you control deals combat damage to a player, \
 create a token that's a copy of it, except it isn't legendary.";
 
 fn token_copies_named(runner: &GameRunner, name: &str) -> usize {
@@ -16,9 +17,7 @@ fn token_copies_named(runner: &GameRunner, name: &str) -> usize {
         .objects
         .values()
         .filter(|obj| {
-            obj.zone == engine::types::zones::Zone::Battlefield
-                && obj.name == name
-                && obj.is_token
+            obj.zone == engine::types::zones::Zone::Battlefield && obj.name == name && obj.is_token
         })
         .count()
 }
@@ -37,7 +36,13 @@ fn impostor_syndrome_copies_combat_damage_creature_not_self() {
     let mut runner = scenario.build();
     let bears_before = token_copies_named(&runner, "Grizzly Bears");
 
-    let trigger = &runner.state().objects.values().find(|o| o.name == "Impostor Syndrome").unwrap().trigger_definitions[0];
+    let trigger = &runner
+        .state()
+        .objects
+        .values()
+        .find(|o| o.name == "Impostor Syndrome")
+        .unwrap()
+        .trigger_definitions[0];
     assert_eq!(trigger.mode, TriggerMode::DamageDone);
     match trigger.execute.as_ref().unwrap().effect.as_ref() {
         engine::types::ability::Effect::CopyTokenOf { target, .. } => {

@@ -13583,7 +13583,11 @@ mod tests {
         );
         assert_eq!(def.mode, TriggerMode::DamageDone);
         match def.execute.as_ref().unwrap().effect.as_ref() {
-            Effect::CopyTokenOf { target, additional_modifications, .. } => {
+            Effect::CopyTokenOf {
+                target,
+                additional_modifications,
+                ..
+            } => {
                 assert_eq!(*target, TargetFilter::TriggeringSource);
                 assert!(additional_modifications.iter().any(|m| matches!(
                     m,

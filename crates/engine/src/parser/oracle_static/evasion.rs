@@ -1223,7 +1223,7 @@ pub(crate) fn try_split_and_cant_be_targeted(text: &str) -> Option<Vec<StaticDef
 /// starting with "can't be blocked") into the corresponding `StaticMode` and
 /// optional evasion condition, composing the same building blocks the standalone
 /// branches use. Returns `None` when the tail is not a recognized evasion shape.
-fn cant_be_blocked_mode(clause: &str) -> Option<(StaticMode, Option<StaticCondition>)> {
+pub(crate) fn cant_be_blocked_mode(clause: &str) -> Option<(StaticMode, Option<StaticCondition>)> {
     type VE<'a> = OracleError<'a>;
     let rest = nom_tag_lower(clause, clause, "can't be blocked")?;
     let rest = rest.trim_end_matches('.').trim_end();
@@ -1758,6 +1758,23 @@ pub(crate) fn parse_subject_rule_static(text: &str) -> Option<StaticDefinition> 
         // trailing granted-keyword companion (the " has "/" gains " needles
         // can't appear in it), so the evasion static is complete on its own.
         return Some(def);
+    }
+
+    // CR 509.1b: "<subject> can't be blocked [by filter / unless / as long as …]"
+    // (Tetsuko Umezawa, Fugitive). Reuses cant_be_blocked_mode for tail classification.
+    if nom_primitives::scan_contains(&pred_lower, "can't be blocked")
+        && !nom_primitives::scan_contains(&pred_lower, "except by")
+    {
+        let clause = predicate_text.trim().trim_end_matches('.');
+        if let Some((mode, condition)) = cant_be_blocked_mode(clause) {
+            let mut def = StaticDefinition::new(mode)
+                .affected(affected.clone())
+                .description(text.to_string());
+            if let Some(c) = condition {
+                def.condition = Some(c);
+            }
+            return Some(def);
+        }
     }
 
     // CR 604.1 + CR 508.1d: a trailing "unless you control <X>" clause makes a

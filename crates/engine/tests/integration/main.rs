@@ -274,6 +274,7 @@ mod issue_868_szarekh_attack_trigger;
 mod issue_874_nadiers_nightblade_token_leaves;
 mod issue_879_obsessive_pursuit;
 mod issue_924_offspring;
+mod issue_1544_zinnia_offspring;
 mod issue_927_tireless_provisioner;
 mod jace_wielder_empty_library_win;
 mod json_smoke_test;

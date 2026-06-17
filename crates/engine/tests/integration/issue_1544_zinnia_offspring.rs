@@ -93,7 +93,9 @@ fn zinnia_grants_offspring_on_creature_spells_you_cast() {
         .battlefield
         .iter()
         .filter_map(|id| runner.state().objects.get(id))
-        .filter(|o| o.name == "Grizzly Bears" && o.card_types.core_types.contains(&CoreType::Creature))
+        .filter(|o| {
+            o.name == "Grizzly Bears" && o.card_types.core_types.contains(&CoreType::Creature)
+        })
         .collect();
 
     assert_eq!(

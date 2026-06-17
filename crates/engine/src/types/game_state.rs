@@ -1527,6 +1527,17 @@ pub struct PendingCounterAdditionQueue {
     pub completion: Option<PendingEffectResolved>,
 }
 
+/// CR 701.34a + CR 614.1a: Remaining proliferate actions after a replacement
+/// effect (Tekuthal class) doubles the count. Each completed `ProliferateChoice`
+/// drains one action; when `remaining` reaches zero the originating effect
+/// resolves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingProliferateActions {
+    pub actor: PlayerId,
+    pub source_id: ObjectId,
+    pub remaining: u32,
+}
+
 /// CR 603.7: A delayed triggered ability created during resolution of a spell or ability.
 /// Fires once at the specified condition, then is removed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -3102,6 +3113,11 @@ pub enum WaitingFor {
         /// Zero for all non-blight EffectZoneChoice uses.
         #[serde(default)]
         count_param: u32,
+        /// CR 118.3: When true, this choice is for a cost payment (e.g., exile cost)
+        /// rather than effect resolution. Cost-payment choices require special
+        /// handling for exile-link tracking (push_exiled_with_source_this_turn).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_cost_payment: bool,
     },
     /// Player chooses which drawn-this-turn hand cards to put on top of their
     /// library. Each unchosen required card is kept by paying life.
@@ -6183,6 +6199,12 @@ pub struct GameState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_counter_additions: Option<PendingCounterAdditionQueue>,
 
+    /// CR 701.34a + CR 614.1a: Remaining proliferate actions after a count-
+    /// modifying replacement (Tekuthal class). Resumed after each
+    /// `ProliferateChoice` completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_proliferate_actions: Option<PendingProliferateActions>,
+
     /// Pending optional effect ability chain, awaiting player accept/decline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_optional_effect: Option<Box<crate::types::ability::ResolvedAbility>>,
@@ -7063,6 +7085,7 @@ impl GameState {
             pending_counter_moves: None,
             pending_batch_deliveries: None,
             pending_counter_additions: None,
+            pending_proliferate_actions: None,
             pending_optional_effect: None,
             pending_optional_trigger_event: None,
             pending_optional_trigger_match_count: None,
@@ -7533,6 +7556,7 @@ impl PartialEq for GameState {
             && self.pending_counter_moves == other.pending_counter_moves
             && self.pending_batch_deliveries == other.pending_batch_deliveries
             && self.pending_counter_additions == other.pending_counter_additions
+            && self.pending_proliferate_actions == other.pending_proliferate_actions
             && self.may_trigger_auto_choices == other.may_trigger_auto_choices
             && self.pending_begin_game_abilities == other.pending_begin_game_abilities
             && self.resolving_begin_game_abilities == other.resolving_begin_game_abilities
@@ -8150,6 +8174,7 @@ mod tests {
             track_exiled_by_source: false,
             face_down_profile: None,
             count_param: 0,
+            is_cost_payment: false,
         }));
         variants.push(Box::new(WaitingFor::DefilerPayment {
             player: PlayerId(0),
@@ -8397,6 +8422,7 @@ mod tests {
             track_exiled_by_source: false,
             face_down_profile: None,
             count_param: 0,
+            is_cost_payment: false,
         };
         let json = serde_json::to_string(&wf).unwrap();
         let deserialized: WaitingFor = serde_json::from_str(&json).unwrap();
@@ -8498,6 +8524,7 @@ mod tests {
                 ward: None,
             }),
             count_param: 0,
+            is_cost_payment: false,
         };
         let json = serde_json::to_string(&wf).expect("serialize");
         // Modern shape must be emitted, NOT the legacy bool field.

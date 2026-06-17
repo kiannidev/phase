@@ -11,6 +11,7 @@ use super::chalice_avoidance::ChaliceAvoidancePolicy;
 use super::context::PolicyContext;
 use super::copy_value::CopyValuePolicy;
 use super::effect_timing::EffectTimingPolicy;
+use super::enchantments_payoff::EnchantmentsPayoffPolicy;
 use super::etb_value::EtbValuePolicy;
 use super::evasion_removal_priority::EvasionRemovalPriorityPolicy;
 use super::fetch_land_patience::FetchLandPatiencePolicy;
@@ -26,6 +27,7 @@ use super::payment_selection::PaymentSelectionPolicy;
 use super::plus_one_counters::PlusOneCountersPolicy;
 use super::ramp_timing::RampTimingPolicy;
 use super::reactive_self_protection::ReactiveSelfProtectionPolicy;
+use super::reanimator_payoff::ReanimatorPayoffPolicy;
 use super::recursion_awareness::RecursionAwarenessPolicy;
 use super::redundancy_avoidance::RedundancyAvoidancePolicy;
 use super::sacrifice_value::SacrificeValuePolicy;
@@ -53,6 +55,7 @@ pub enum PolicyId {
     ArtifactSynergyTactical,
     BoardDevelopment,
     EtbValue,
+    EnchantmentsPayoff,
     CopyValue,
     Tutor,
     HandDisruption,
@@ -68,6 +71,7 @@ pub enum PolicyId {
     BlightValue,
     EvasionRemovalPriority,
     RecursionAwareness,
+    ReanimatorPayoff,
     BoardWipeTelegraph,
     LifeTotalResource,
     LifegainPayoff,
@@ -273,6 +277,7 @@ impl Default for PolicyRegistry {
             Box::new(super::artifact_synergy::ArtifactSynergyPolicy),
             Box::new(BoardDevelopmentPolicy),
             Box::new(EtbValuePolicy),
+            Box::new(EnchantmentsPayoffPolicy),
             Box::new(CopyValuePolicy),
             Box::new(TutorPolicy),
             Box::new(HandDisruptionPolicy),
@@ -320,6 +325,7 @@ impl Default for PolicyRegistry {
             Box::new(ChaliceAvoidancePolicy),
             Box::new(PaymentSelectionPolicy),
             Box::new(SeparatePilesTimingPolicy),
+            Box::new(ReanimatorPayoffPolicy),
         ];
         let mut by_kind: HashMap<DecisionKind, Vec<usize>> = HashMap::new();
         for (idx, policy) in policies.iter().enumerate() {

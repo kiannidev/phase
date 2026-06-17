@@ -234,7 +234,14 @@ pub static MATCHUPS: &[MatchupSpec] = &[
         p1_label: "Orzhov Greasefang (P1)",
         p0: snap("pioneer", "orzhov-greasefang.json"),
         p1: snap("pioneer", "orzhov-greasefang.json"),
-        exercises: &[FeatureKind::Aristocrats],
+        // Orzhov Greasefang is the canonical reanimator list: discard outlets
+        // (Fleeting Spirit, Iron-Shield Elf, Guardian of New Benalia) pitch
+        // Parhelion II, then Greasefang / Lively Dirge return it from the
+        // graveyard to the battlefield. It clears `reanimator::COMMITMENT_FLOOR`,
+        // so this matchup is the gate's exercise of `ReanimatorPayoffPolicy`
+        // (verified by `greasefang_mirror_deck_activates_reanimator_payoff`
+        // below). It also exercises the aristocrats axis via its sacrifice value.
+        exercises: &[FeatureKind::Aristocrats, FeatureKind::Reanimator],
         expected: Expected::Mirror {
             tolerance: MIRROR_TOLERANCE,
         },
@@ -256,6 +263,23 @@ pub static MATCHUPS: &[MatchupSpec] = &[
             FeatureKind::PlusOneCounters,
             FeatureKind::AggroPressure,
         ],
+        expected: Expected::Mirror {
+            tolerance: MIRROR_TOLERANCE,
+        },
+    },
+    MatchupSpec {
+        id: "enchantress-mirror",
+        p0_label: "Selesnya Enchantress (P0)",
+        p1_label: "Selesnya Enchantress (P1)",
+        p0: snap("pioneer", "selesnya-enchantress.json"),
+        p1: snap("pioneer", "selesnya-enchantress.json"),
+        // Selesnya Enchantress is the canonical enchantments-matter list:
+        // enchantress / constellation payoffs (Eidolon of Blossoms, Setessan
+        // Champion, Sythis, Enchantress's Presence) over an enchantment-dense
+        // board. It clears `enchantments::COMMITMENT_FLOOR`, so this matchup is
+        // the gate's exercise of `EnchantmentsPayoffPolicy` (verified by
+        // `enchantress_mirror_deck_activates_enchantments_payoff` below).
+        exercises: &[FeatureKind::Enchantments],
         expected: Expected::Mirror {
             tolerance: MIRROR_TOLERANCE,
         },

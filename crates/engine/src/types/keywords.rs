@@ -1358,6 +1358,24 @@ impl Keyword {
                 | Keyword::DoubleTeam
         )
     }
+
+    /// CR 702.164b: Keywords whose multiple instances SUM their parameter values
+    /// into a single aggregate (e.g. a creature's total toxic value), rather than
+    /// collapsing identical instances. When such a keyword is granted on top of an
+    /// identical printed instance, BOTH must remain on the keyword list so the
+    /// aggregate reader counts every copy. Distinct from `instances_function_separately`
+    /// (which gates per-instance trigger installation — a different semantic axis).
+    /// Conservative/CR-driven: only Toxic sums today (CR 702.164b). Protection
+    /// (CR 702.16g), Ward, Annihilator, Afflict, Frenzy do NOT sum — they keep
+    /// deduping identical instances. Add any future "sum of all N" keyword here.
+    ///
+    /// Out of scope (intentionally not gated by this predicate): cast-time spell
+    /// keyword merge (`casting.rs` `upsert_keyword_by_kind`/`merge_spell_keyword` —
+    /// Toxic is inert at cast time) and the layers `AddDynamicKeyword` arm
+    /// (`DynamicKeywordKind` is only Annihilator/Modular, never Toxic).
+    pub fn sums_across_instances(&self) -> bool {
+        matches!(self, Keyword::Toxic(_))
+    }
 }
 
 /// Capitalize the first character of a string (for type name normalization).
@@ -2164,7 +2182,12 @@ impl FromStr for Keyword {
             "riot" => Ok(Keyword::Riot),
             "livingweapon" => Ok(Keyword::LivingWeapon),
             "jobselect" => Ok(Keyword::JobSelect),
-            "formirrodin!" => Ok(Keyword::ForMirrodin),
+            // Accept both the Oracle spelling ("For Mirrodin!") and the
+            // serialized variant name ("ForMirrodin"). `Serialize` emits the
+            // bare variant name (no "!"), so card-data.json round-trips through
+            // this path as "formirrodin"; without the second spelling it would
+            // fall to `Keyword::Unknown` and drop the keyword on reload.
+            "formirrodin!" | "formirrodin" => Ok(Keyword::ForMirrodin),
             // CR 702.89a/b: "umbra armor" is the current name; "totem armor" is the
             // obsolete printing both Oracle text and MTGJSON may still carry.
             "totemarmor" | "totem armor" | "umbra armor" | "umbraarmor" => Ok(Keyword::TotemArmor),
@@ -3075,6 +3098,26 @@ mod tests {
         );
         assert_eq!(Keyword::from_str("Battle Cry").unwrap(), Keyword::Battlecry);
         assert_eq!(Keyword::from_str("Aftermath").unwrap(), Keyword::Aftermath);
+    }
+
+    #[test]
+    fn unit_keywords_survive_serde_round_trip() {
+        // `Serialize` emits the bare variant name; the custom `Deserialize`
+        // routes plain strings through `FromStr`. Every unit keyword must
+        // round-trip back to itself rather than degrading to `Unknown`.
+        // ForMirrodin regressed here: its variant name "ForMirrodin" lacks the
+        // "!" that the Oracle-spelling `FromStr` arm required.
+        for kw in [
+            Keyword::Flying,
+            Keyword::LivingWeapon,
+            Keyword::JobSelect,
+            Keyword::TotemArmor,
+            Keyword::ForMirrodin,
+        ] {
+            let value = serde_json::to_value(&kw).unwrap();
+            let back: Keyword = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(back, kw, "round-trip failed for {value:?}");
+        }
     }
 
     #[test]

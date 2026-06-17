@@ -15,6 +15,7 @@ use crate::types::game_state::{
 };
 use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
+use crate::types::zones::Zone;
 
 use super::engine::EngineError;
 use super::players;
@@ -1465,6 +1466,31 @@ fn collect_target_slots(
         return Ok(());
     }
 
+    // CR 701.12a: ExchangeLifeTotals carries two distinct per-slot player filters.
+    // Context-ref filters (Controller / "you") are filled by the resolver from
+    // ability.controller and don't require a player choice. Surface one slot per
+    // non-context-ref filter, in declaration order. (Keep in sync with
+    // `build_target_slot_specs` or the slot-count invariant at ~408 fires.)
+    if let Effect::ExchangeLifeTotals { player_a, player_b } = &ability.effect {
+        for filter in [player_a, player_b] {
+            if filter.is_context_ref() {
+                continue;
+            }
+            let legal_targets =
+                legal_targets_for_ability_filter(state, ability, filter, &acc.slots);
+            if legal_targets.is_empty() && !ability.optional_targeting {
+                return Err(EngineError::ActionNotAllowed(
+                    "No legal targets available".to_string(),
+                ));
+            }
+            acc.push(TargetSelectionSlot {
+                legal_targets,
+                optional: ability.optional_targeting,
+            });
+        }
+        return Ok(());
+    }
+
     if let Effect::MoveCounters {
         source,
         target,
@@ -2549,6 +2575,25 @@ fn collect_target_slot_specs(
         return;
     }
 
+    // CR 701.12a: Mirror the ExchangeLifeTotals branch in `collect_target_slots`
+    // so per-slot specs match the surfaced TargetSelectionSlots one-for-one
+    // (context-ref slots like Controller are auto-resolved and not surfaced).
+    if let Effect::ExchangeLifeTotals { player_a, player_b } = &ability.effect {
+        for filter in [player_a, player_b] {
+            if filter.is_context_ref() {
+                continue;
+            }
+            let id = TargetInstanceId(*next_instance);
+            *next_instance += 1;
+            specs.push(TargetSlotSpec {
+                filter: filter.clone(),
+                optional: ability.optional_targeting,
+                instance: id,
+            });
+        }
+        return;
+    }
+
     if let Effect::MoveCounters {
         source,
         target,
@@ -2702,7 +2747,51 @@ fn collect_target_slot_specs(
     }
 }
 
+/// CR 601.2c / CR 602.2b: Targets are chosen before costs are paid. This
+/// engine pays a non-self Sacrifice/Discard/Exile activation cost BEFORE
+/// target selection as a documented architectural shortcut (see the ordering
+/// note in `push_activated_ability_to_stack`), so the object that cost just
+/// moved off the battlefield must not become newly eligible for an unrelated
+/// target slot just because it now sits in the destination zone. Cauldron of
+/// Essence's official ruling states this explicitly: "the target ... can't be
+/// the creature sacrificed to pay its cost." Costs that leave the object on
+/// the battlefield (Tap, Blight, RemoveCounter) never made it newly eligible
+/// for a different zone, so they are correctly left untouched by this gate.
+fn exclude_cost_paid_object_that_left_battlefield(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    targets: Vec<TargetRef>,
+) -> Vec<TargetRef> {
+    let Some(snapshot) = ability.cost_paid_object.as_ref() else {
+        return targets;
+    };
+    let left_battlefield = match state.objects.get(&snapshot.object_id) {
+        Some(obj) => obj.zone != Zone::Battlefield,
+        None => true,
+    };
+    if !left_battlefield {
+        return targets;
+    }
+    targets
+        .into_iter()
+        .filter(|target| !matches!(target, TargetRef::Object(id) if *id == snapshot.object_id))
+        .collect()
+}
+
 fn legal_targets_for_ability_filter(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    filter: &TargetFilter,
+    existing_slots: &[TargetSelectionSlot],
+) -> Vec<TargetRef> {
+    exclude_cost_paid_object_that_left_battlefield(
+        state,
+        ability,
+        legal_targets_for_ability_filter_uncapped(state, ability, filter, existing_slots),
+    )
+}
+
+fn legal_targets_for_ability_filter_uncapped(
     state: &GameState,
     ability: &ResolvedAbility,
     filter: &TargetFilter,
@@ -3261,7 +3350,7 @@ fn legal_targets_for_selected_slot(
             legal.retain(|t| t != prior);
         }
     }
-    legal
+    exclude_cost_paid_object_that_left_battlefield(state, ability, legal)
 }
 
 fn damage_any_target_legal_targets(

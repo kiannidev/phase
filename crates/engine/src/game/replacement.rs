@@ -5086,8 +5086,6 @@ enum CommuteClass {
     Multiplicative,
     Additive,
     Subtractive,
-    /// Two `SetTapState::Tap` replacements commute (same outcome).
-    EnterTap,
     /// Two `SetTapState::Untap` replacements commute (same outcome).
     EnterUntap,
 }
@@ -5284,9 +5282,9 @@ fn candidate_materiality(
                 ..
             } => {
                 field = Some(EventField::EnterTapped);
-                // CR 616.1f: Duplicate tap/untap state replacements commute.
+                // CR 616.1f: Duplicate untap state replacements commute (#1340).
                 enter_tapped_commute = Some(match state {
-                    TapStateChange::Tap => CommuteClass::EnterTap,
+                    TapStateChange::Tap => CommuteClass::NonCommuting,
                     TapStateChange::Untap => CommuteClass::EnterUntap,
                 });
             }

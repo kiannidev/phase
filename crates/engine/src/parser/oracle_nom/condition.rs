@@ -3067,7 +3067,12 @@ fn parse_source_in_zone_condition(input: &str) -> OracleResult<'_, StaticConditi
         value(false, tag(" is")),
     ))
     .parse(rest)?;
-    let (rest, first) = parse_zone_phrase(rest)?;
+    let rest = rest.trim_start();
+    // CR 701.13a + CR 113.6b: passive "is exiled" is equivalent to "is in
+    // exile" for source-referential intervening-if gates (Cosima, God of the
+    // Voyage's granted landfall trigger: "if ~ is exiled").
+    let (rest, first) =
+        alt((map(tag("exiled"), |_| Zone::Exile), parse_zone_phrase)).parse(rest)?;
     // CR 113.6b: a single ability that names multiple zones functions in each
     // of them — the "or"-separated zone list composes disjunctively across the
     // listed zones. ("or" is English grammar, not a CR construct; the rules
@@ -7202,6 +7207,26 @@ mod tests {
     }
 
     // -- Zone condition tests (Phase 1) --
+
+    #[test]
+    fn test_source_is_exiled_passive() {
+        let (rest, c) = parse_zone_conditions("~ is exiled").unwrap();
+        assert_eq!(rest, "");
+        assert!(matches!(
+            c,
+            StaticCondition::SourceInZone {
+                zone: crate::types::zones::Zone::Exile
+            }
+        ));
+        let (rest, c) = parse_inner_condition("~ is exiled").unwrap();
+        assert_eq!(rest, "");
+        assert!(matches!(
+            c,
+            StaticCondition::SourceInZone {
+                zone: crate::types::zones::Zone::Exile
+            }
+        ));
+    }
 
     #[test]
     fn test_source_in_hand() {

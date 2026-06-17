@@ -5284,6 +5284,7 @@ fn candidate_materiality(
                 ..
             } => {
                 field = Some(EventField::EnterTapped);
+                // CR 616.1f: Duplicate tap/untap state replacements commute.
                 enter_tapped_commute = Some(match state {
                     TapStateChange::Tap => CommuteClass::EnterTap,
                     TapStateChange::Untap => CommuteClass::EnterUntap,
@@ -6287,7 +6288,9 @@ mod tests {
                     state: TapStateChange::Untap,
                 },
             ))
-            .valid_card(TargetFilter::Typed(TypedFilter::land().controller(ControllerRef::You)))
+            .valid_card(TargetFilter::Typed(
+                TypedFilter::land().controller(ControllerRef::You),
+            ))
             .destination_zone(Zone::Battlefield);
         let mut state = test_state_with_object(
             ObjectId(1),
@@ -6297,12 +6300,17 @@ mod tests {
         let land_id = ObjectId(10);
         state.objects.insert(
             land_id,
-            GameObject::new(land_id, CardId(2), PlayerId(0), "Forest".to_string(), Zone::Hand),
+            GameObject::new(
+                land_id,
+                CardId(2),
+                PlayerId(0),
+                "Forest".to_string(),
+                Zone::Hand,
+            ),
         );
 
         let mut events = Vec::new();
-        let proposed =
-            ProposedEvent::zone_change(land_id, Zone::Hand, Zone::Battlefield, None);
+        let proposed = ProposedEvent::zone_change(land_id, Zone::Hand, Zone::Battlefield, None);
         let result = replace_event(&mut state, proposed, &mut events);
         assert!(
             matches!(result, ReplacementResult::Execute(_)),

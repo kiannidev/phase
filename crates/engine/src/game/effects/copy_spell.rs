@@ -1,7 +1,8 @@
 use crate::types::ability::{
-    ControllerRef, CopyRetargetPermission, Effect, EffectError, EffectKind, ResolvedAbility,
-    TargetFilter, TargetRef,
+    ContinuousModification, ControllerRef, CopyRetargetPermission, Effect, EffectError, EffectKind,
+    ResolvedAbility, TargetFilter, TargetRef,
 };
+use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{CopyTargetSlot, GameState, StackEntry, StackEntryKind, WaitingFor};
 use crate::types::identifiers::ObjectId;
@@ -40,6 +41,19 @@ pub fn resolve(
     // `copier` override routes the copy to a player relative to the controller.
     let copy_controller = resolve_copy_controller(state, ability);
 
+    let (additional_modifications, starting_loyalty_from_casualty_sacrifice) = match &ability.effect
+    {
+        Effect::CopySpell {
+            additional_modifications,
+            starting_loyalty_from_casualty_sacrifice,
+            ..
+        } => (
+            additional_modifications.clone(),
+            *starting_loyalty_from_casualty_sacrifice,
+        ),
+        _ => (Vec::new(), false),
+    };
+
     // Allocate a new stack ID for the copy.
     let copy_id = ObjectId(state.next_object_id);
     state.next_object_id += 1;
@@ -61,6 +75,12 @@ pub fn resolve(
         // cast from a graveyard" riders (Sevinne's Reclamation, issue #3283)
         // re-fire when a flashback copy resolves.
         copy_obj.cast_from_zone = None;
+        apply_spell_copy_modifications(
+            &mut copy_obj,
+            &additional_modifications,
+            starting_loyalty_from_casualty_sacrifice,
+            top_entry.ability(),
+        );
         state.objects.insert(copy_id, copy_obj);
     }
 
@@ -191,6 +211,35 @@ pub fn resolve(
 
     drain_spell_copied_observer_triggers(state, events, copied_spell_card_id.is_some())?;
     Ok(())
+}
+
+/// CR 707.9 + CR 707.2: Stamp copy exceptions onto a spell copy's GameObject at
+/// creation (Ob Nixilis: "the copy isn't legendary and has starting loyalty X").
+fn apply_spell_copy_modifications(
+    copy_obj: &mut crate::game::game_object::GameObject,
+    modifications: &[ContinuousModification],
+    starting_loyalty_from_casualty_sacrifice: bool,
+    source_ability: Option<&ResolvedAbility>,
+) {
+    for modification in modifications {
+        if let ContinuousModification::RemoveSupertype { supertype } = modification {
+            copy_obj.card_types.supertypes.retain(|s| s != supertype);
+            copy_obj
+                .base_card_types
+                .supertypes
+                .retain(|s| s != supertype);
+        }
+    }
+    if starting_loyalty_from_casualty_sacrifice {
+        if let Some(power) = source_ability
+            .and_then(|a| a.cost_paid_object.as_ref())
+            .and_then(|snap| snap.lki.power)
+        {
+            copy_obj
+                .counters
+                .insert(CounterType::Loyalty, power.max(0) as u32);
+        }
+    }
 }
 
 /// CR 603.2 + CR 707.10: Drain `SpellCopied` observers collected when the copy
@@ -631,6 +680,8 @@ mod tests {
                 target: TargetFilter::Any,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(20),
@@ -711,6 +762,8 @@ mod tests {
                 target: TargetFilter::Any,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: Some(ControllerRef::Opponent),
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(20),
@@ -770,6 +823,8 @@ mod tests {
                 target: TargetFilter::SelfRef,
                 retarget: CopyRetargetPermission::MayChooseNewTargets,
                 copier: Some(ControllerRef::Opponent),
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(10),
@@ -780,6 +835,8 @@ mod tests {
                 target: TargetFilter::SelfRef,
                 retarget: CopyRetargetPermission::MayChooseNewTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(10),
@@ -851,6 +908,8 @@ mod tests {
                 target: TargetFilter::Any,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(20),
@@ -895,6 +954,8 @@ mod tests {
                 target: TargetFilter::Any,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: Some(ControllerRef::You),
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![TargetRef::Player(PlayerId(1))],
             ObjectId(20),
@@ -938,6 +999,8 @@ mod tests {
                 target: TargetFilter::Any,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: Some(ControllerRef::You),
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(20),
@@ -958,6 +1021,8 @@ mod tests {
             target: TargetFilter::Any,
             retarget: CopyRetargetPermission::KeepOriginalTargets,
             copier: None,
+            additional_modifications: Vec::new(),
+            starting_loyalty_from_casualty_sacrifice: false,
         };
         let json_none = serde_json::to_string(&none).unwrap();
         assert!(
@@ -971,6 +1036,8 @@ mod tests {
             target: TargetFilter::Any,
             retarget: CopyRetargetPermission::MayChooseNewTargets,
             copier: Some(ControllerRef::Opponent),
+            additional_modifications: Vec::new(),
+            starting_loyalty_from_casualty_sacrifice: false,
         };
         let json = serde_json::to_string(&with).unwrap();
         assert!(json.contains("copier"));
@@ -1019,6 +1086,8 @@ mod tests {
                 target: TargetFilter::Any,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(20),
@@ -1048,6 +1117,8 @@ mod tests {
                 target: TargetFilter::Any,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(20),
@@ -1089,6 +1160,8 @@ mod tests {
                 target: TargetFilter::Any,
                 retarget: CopyRetargetPermission::MayChooseNewTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(20),
@@ -1137,6 +1210,8 @@ mod tests {
                 target: TargetFilter::Any,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(20),
@@ -1192,6 +1267,8 @@ mod tests {
                 target: TargetFilter::Any,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(20),
@@ -1329,6 +1406,8 @@ mod tests {
                 target: TargetFilter::SelfRef,
                 retarget: CopyRetargetPermission::MayChooseNewTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(10), // source_id = original spell
@@ -1414,6 +1493,8 @@ mod tests {
                 target: TargetFilter::ParentTarget,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(20),
@@ -1489,6 +1570,8 @@ mod tests {
                 target: TargetFilter::TriggeringSource,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(20),
@@ -1564,6 +1647,8 @@ mod tests {
                 target: TargetFilter::SelfRef,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![TargetRef::Player(PlayerId(1))],
             ObjectId(10),
@@ -1626,6 +1711,8 @@ mod tests {
                 target: TargetFilter::Any,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![TargetRef::Object(ObjectId(10))],
             ObjectId(20),
@@ -1682,6 +1769,8 @@ mod tests {
                 target: TargetFilter::TriggeringSource,
                 retarget: CopyRetargetPermission::MayChooseNewTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             magus,
@@ -1749,6 +1838,8 @@ mod tests {
                 target: TargetFilter::TriggeringSource,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![TargetRef::Object(source_creature)],
             magus,
@@ -1781,6 +1872,8 @@ mod tests {
                 },
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             gogo_id,
@@ -1806,6 +1899,8 @@ mod tests {
                 },
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![TargetRef::Object(ObjectId(40))],
             other_id,
@@ -1898,6 +1993,8 @@ mod tests {
                 target: TargetFilter::SelfRef,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(10),
@@ -1992,6 +2089,8 @@ mod tests {
                 target: TargetFilter::SelfRef,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(10),
@@ -2115,6 +2214,8 @@ mod tests {
                 target: gogo_target_filter,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![TargetRef::Object(hope_trigger_entry)],
             gogo_id,
@@ -2190,6 +2291,8 @@ mod tests {
                 target: TargetFilter::Any,
                 retarget: CopyRetargetPermission::MayChooseNewTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(800),
@@ -2393,6 +2496,8 @@ mod tests {
                 target: TargetFilter::Any,
                 retarget: CopyRetargetPermission::MayChooseNewTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(70),
@@ -2470,6 +2575,8 @@ mod tests {
                 target: TargetFilter::Any,
                 retarget: CopyRetargetPermission::KeepOriginalTargets,
                 copier: None,
+                additional_modifications: Vec::new(),
+                starting_loyalty_from_casualty_sacrifice: false,
             },
             vec![],
             ObjectId(70),

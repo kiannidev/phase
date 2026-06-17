@@ -27,10 +27,13 @@ fn resolve_object_targets(state: &GameState, ability: &ResolvedAbility) -> Vec<O
     if matches!(filter, TargetFilter::LastCreated) {
         return state.last_created_token_ids.clone();
     }
-    // CR 608.2c: Triggered BecomePrepared on the source (e.g. Tam landfall) uses
-    // ParentTarget/SelfRef with empty `ability.targets`; resolve to source_id.
-    if ability.targets.is_empty()
-        && matches!(filter, TargetFilter::SelfRef | TargetFilter::ParentTarget)
+    // CR 722.3a: a self-referential "this creature becomes prepared" (e.g.
+    // Stensian Sanguinist's combat-damage delayed trigger) carries no explicit
+    // object target — the subject is the ability's own source.
+    // CR 608.2c: a triggered BecomePrepared bound to the source via ParentTarget
+    // with no explicit target (e.g. Tam landfall) likewise resolves to source_id.
+    if matches!(filter, TargetFilter::SelfRef)
+        || (ability.targets.is_empty() && matches!(filter, TargetFilter::ParentTarget))
     {
         return vec![ability.source_id];
     }

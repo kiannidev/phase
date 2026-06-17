@@ -12,9 +12,9 @@ use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
     ActivationRestriction, AdditionalCost, CastTimingPermission, CastingRestriction, ChoiceType,
     ChosenSubtypeKind, ContinuousModification, DelayedTriggerCondition, Effect, FilterProp,
-    ManaProduction, ModalChoice, ParsedCondition, QuantityExpr, QuantityRef, ReplacementDefinition,
-    SolveCondition, SpellCastingOption, StaticCondition, StaticDefinition, TargetFilter,
-    TriggerCondition, TriggerDefinition, TypedFilter,
+    ManaProduction, ModalChoice, ParsedCondition, PlayerFilter, QuantityExpr, QuantityRef,
+    ReplacementDefinition, SolveCondition, SpellCastingOption, StaticCondition, StaticDefinition,
+    TargetFilter, TriggerCondition, TriggerDefinition, TypedFilter,
 };
 use crate::types::format::DeckCopyLimit;
 use crate::types::keywords::{EscapeCost, FlashbackCost, Keyword, KeywordKind};
@@ -3751,6 +3751,12 @@ fn parse_activated_ability_definition(
     if !constraints.restrictions.is_empty() {
         def.activation_restrictions = constraints.restrictions;
     }
+    if constraints.any_player_may_activate {
+        def.activator_filter = Some(PlayerFilter::All);
+    }
+    if let Some(filter) = constraints.activator_filter {
+        def.activator_filter = Some(filter);
+    }
     extract_cost_reduction_from_chain(&mut def);
     extract_mana_spend_trigger_from_chain(&mut def);
     (def, effect_text)
@@ -4392,6 +4398,38 @@ pub(super) fn strip_activated_constraints(text: &str) -> (String, ActivatedConst
                 }
                 continue;
             }
+        }
+
+        // CR 602.2a + CR 602.5d: Oft-Nabbed Goat class — opponent-only activation
+        // with sorcery-speed timing on the same trailing sentence.
+        const OPPONENTS_SORCERY_SUFFIX: &str =
+            "only your opponents may activate this ability and only as a sorcery";
+        if lower.ends_with(OPPONENTS_SORCERY_SUFFIX) {
+            let end = remaining.len() - OPPONENTS_SORCERY_SUFFIX.len();
+            remaining = remaining[..end]
+                .trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace())
+                .to_string();
+            constraints.activator_filter = Some(PlayerFilter::Opponent);
+            constraints
+                .restrictions
+                .push(ActivationRestriction::AsSorcery);
+            if remaining.is_empty() {
+                break 'parse_constraints;
+            }
+            continue 'parse_constraints;
+        }
+
+        const OPPONENTS_ACTIVATE_SUFFIX: &str = "only your opponents may activate this ability";
+        if lower.ends_with(OPPONENTS_ACTIVATE_SUFFIX) {
+            let end = remaining.len() - OPPONENTS_ACTIVATE_SUFFIX.len();
+            remaining = remaining[..end]
+                .trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace())
+                .to_string();
+            constraints.activator_filter = Some(PlayerFilter::Opponent);
+            if remaining.is_empty() {
+                break 'parse_constraints;
+            }
+            continue 'parse_constraints;
         }
 
         // CR 602.2: "Any player may activate this ability." — strip as a recognized

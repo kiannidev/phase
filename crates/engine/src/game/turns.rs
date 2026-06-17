@@ -1885,10 +1885,8 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
             }
             Phase::DeclareBlockers => {
                 // CR 509.1: Defending player declares blockers as a turn-based action.
-                let has_attackers = state
-                    .combat
-                    .as_ref()
-                    .is_some_and(|c| !c.attackers.is_empty());
+                super::combat::prune_attackers_not_in_play(state);
+                let has_attackers = super::combat::has_attackers_in_play(state);
                 if has_attackers {
                     // CR 509.1 + CR 117.1c: The declare blockers turn-based action always
                     // runs — even when no legal blocks are available — and the active

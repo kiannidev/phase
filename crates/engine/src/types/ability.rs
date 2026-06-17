@@ -2801,6 +2801,13 @@ impl TargetSelectionMode {
     pub fn is_chosen(&self) -> bool {
         matches!(self, TargetSelectionMode::Chosen)
     }
+
+    /// CR 700.2b (override) + CR 701.9b (analogous): The game selects uniformly
+    /// at random instead of the controller choosing (Cult of Skaro "choose one
+    /// at random").
+    pub fn is_random(&self) -> bool {
+        matches!(self, TargetSelectionMode::Random)
+    }
 }
 
 /// CR 701.9a: How cards are selected from a zone during an effect or cost.
@@ -8063,6 +8070,13 @@ pub enum Effect {
         /// Used for ETB choices that other abilities reference ("the chosen type/color").
         #[serde(default)]
         persist: bool,
+        /// CR 608.2d (override) + CR 701.9b (analogous): When `Random`, the game
+        /// selects the value uniformly at random (Strax "choose a player at
+        /// random") instead of `chooser`/controller announcing the choice per
+        /// CR 608.2d. Default `Chosen` preserves controller-choice. Serialized
+        /// as a type-tagged enum (omitted when `Chosen`).
+        #[serde(default, skip_serializing_if = "TargetSelectionMode::is_chosen")]
+        selection: TargetSelectionMode,
     },
     /// CR 609.7a + CR 120.7: Choose a specific source of damage matching a
     /// source-object filter. This is object/source selection, not a named
@@ -8588,6 +8602,20 @@ pub enum Effect {
         /// CR 609.3: When true, the chooser may select any number from 0..=count.
         #[serde(default)]
         up_to: bool,
+        /// CR 608.2d (override): When `Random`, the game selects the card(s)
+        /// uniformly at random (River Song's Diary "choose one of them at
+        /// random") rather than `chooser` announcing the choice per CR 608.2d.
+        /// CR 701.9b (analogous): same random-selection idiom the engine already
+        /// uses for random discard. Orthogonal to `chooser` (who would otherwise
+        /// pick). Serialized as a bare `random` bool to match the
+        /// Discard/RevealHand card-data shape.
+        #[serde(
+            default,
+            with = "card_selection_bool_compat",
+            rename = "random",
+            skip_serializing_if = "CardSelectionMode::is_chosen"
+        )]
+        selection: CardSelectionMode,
         /// Additional validation rules for the chosen subset.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         constraint: Option<ChooseFromZoneConstraint>,
@@ -11228,6 +11256,12 @@ pub struct ModalChoice {
     /// controller (CR 700.2a) for all standard modal spells/abilities.
     #[serde(default = "default_player_filter_controller")]
     pub chooser: PlayerFilter,
+    /// CR 700.2b (override) + CR 701.9b (analogous): When `Random`, the game
+    /// selects the mode(s) uniformly at random (Cult of Skaro "choose one at
+    /// random") instead of `chooser` choosing per CR 700.2a/700.2b. Default
+    /// `Chosen` preserves controller-choice; omitted from card-data when default.
+    #[serde(default, skip_serializing_if = "TargetSelectionMode::is_chosen")]
+    pub selection: TargetSelectionMode,
 }
 
 /// Selection constraints attached to a modal choice header.
@@ -11506,6 +11540,10 @@ pub struct AbilityDefinition {
     /// single authority for sorcery-speed timing. The legacy `sorcery_speed`
     /// JSON field is migrated into this `Vec` by the hand-written `Deserialize`.
     pub activation_restrictions: Vec<ActivationRestriction>,
+    /// CR 602.2a: Who may begin to activate this ability. `None` = only the
+    /// permanent's controller. `Some(All)` = any player. `Some(Opponent)` =
+    /// only opponents of the permanent's controller.
+    pub activator_filter: Option<PlayerFilter>,
     /// CR 602.1: Zone from which this ability can be activated.
     /// `None` = battlefield (default). `Some(Zone::Hand)` for Channel, Cycling, etc.
     pub activation_zone: Option<Zone>,
@@ -11626,6 +11664,8 @@ struct AbilityDefinitionRepr<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     activation_restrictions: &'a Vec<ActivationRestriction>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    activator_filter: &'a Option<PlayerFilter>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     activation_zone: &'a Option<Zone>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ability_tag: &'a Option<AbilityTag>,
@@ -11688,6 +11728,7 @@ impl Serialize for AbilityDefinition {
             description,
             target_prompt,
             activation_restrictions,
+            activator_filter,
             activation_zone,
             ability_tag,
             condition,
@@ -11725,6 +11766,7 @@ impl Serialize for AbilityDefinition {
             description,
             target_prompt,
             activation_restrictions,
+            activator_filter,
             activation_zone,
             ability_tag,
             condition,
@@ -11805,6 +11847,8 @@ struct AbilityDefinitionDe {
     #[serde(default)]
     activation_restrictions: Vec<ActivationRestriction>,
     #[serde(default)]
+    activator_filter: Option<PlayerFilter>,
+    #[serde(default)]
     activation_zone: Option<Zone>,
     #[serde(default)]
     ability_tag: Option<AbilityTag>,
@@ -11876,6 +11920,7 @@ impl<'de> Deserialize<'de> for AbilityDefinition {
             description: de.description,
             target_prompt: de.target_prompt,
             activation_restrictions,
+            activator_filter: de.activator_filter,
             activation_zone: de.activation_zone,
             ability_tag: de.ability_tag,
             condition: de.condition,
@@ -12010,6 +12055,7 @@ impl AbilityDefinition {
             description: None,
             target_prompt: None,
             activation_restrictions: Vec::new(),
+            activator_filter: None,
             activation_zone: None,
             ability_tag: None,
             condition: None,

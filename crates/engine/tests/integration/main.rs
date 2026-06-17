@@ -129,6 +129,7 @@ mod issue_1332_bronzehide_lion;
 mod issue_1333_brain_in_a_jar;
 mod issue_1334_marchesa;
 mod issue_1335_kain_traitorous_dragoon;
+mod issue_1348_impostor_syndrome;
 mod issue_1337_tekuthal_proliferate_twice;
 mod issue_1353_body_of_knowledge;
 mod issue_1353_death_pits_observer;

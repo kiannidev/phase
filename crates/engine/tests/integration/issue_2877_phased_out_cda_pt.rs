@@ -38,9 +38,7 @@ fn setup_land(state: &mut GameState, controller: PlayerId) -> ObjectId {
 fn land_count_pt_expr() -> QuantityExpr {
     QuantityExpr::Ref {
         qty: QuantityRef::ObjectCount {
-            filter: TargetFilter::Typed(
-                TypedFilter::land().controller(ControllerRef::You),
-            ),
+            filter: TargetFilter::Typed(TypedFilter::land().controller(ControllerRef::You)),
         },
     }
 }

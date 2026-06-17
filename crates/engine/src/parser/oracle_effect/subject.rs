@@ -16,7 +16,7 @@ use crate::parser::oracle_ir::ast::*;
 use crate::types::ability::{
     AbilityDefinition, AbilityKind, ChosenSubtypeKind, ContinuousModification, ControllerRef,
     Duration, Effect, FilterProp, MultiTargetSpec, PlayerFilter, PlayerScope, PtValue,
-    QuantityExpr, QuantityRef, StaticDefinition, TargetFilter, TypedFilter,
+    QuantityExpr, QuantityRef, StaticCondition, StaticDefinition, TargetFilter, TypedFilter,
 };
 use crate::types::game_state::DayNight;
 use crate::types::keywords::Keyword;
@@ -347,6 +347,12 @@ fn try_parse_subject_become_clause(
 /// `oracle_static/grammar.rs`).
 fn try_parse_combat_tax_effect_clause(text: &str) -> Option<ParsedEffectClause> {
     let static_def = parse_static_line(text)?;
+    if !matches!(
+        static_def.condition,
+        Some(StaticCondition::UnlessPay { .. })
+    ) {
+        return None;
+    }
     Some(ParsedEffectClause {
         effect: Effect::GenericEffect {
             static_abilities: vec![StaticDefinition::continuous().modifications(vec![

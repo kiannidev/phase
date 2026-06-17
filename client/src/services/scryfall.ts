@@ -457,7 +457,7 @@ export async function fetchCardImageAsset(
   faceIndex: number,
   size: ImageSize = "normal",
 ): Promise<CardImageAsset> {
-  const data = await loadScryfallData();
+  await loadScryfallData();
   const entry = lookupEntryByName(cardName);
   if (!entry) {
     throw new Error(`Card image not in local data: "${normalizeCardName(cardName)}"`);

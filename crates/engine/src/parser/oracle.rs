@@ -3751,9 +3751,11 @@ fn parse_activated_ability_definition(
     if !constraints.restrictions.is_empty() {
         def.activation_restrictions = constraints.restrictions;
     }
-    def.activator_filter = constraints
-        .activator_filter
-        .or_else(|| constraints.any_player_may_activate.then_some(PlayerFilter::All));
+    def.activator_filter = constraints.activator_filter.or_else(|| {
+        constraints
+            .any_player_may_activate
+            .then_some(PlayerFilter::All)
+    });
     extract_cost_reduction_from_chain(&mut def);
     extract_mana_spend_trigger_from_chain(&mut def);
     (def, effect_text)

@@ -2044,9 +2044,23 @@ mod tests {
         let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 4, 42);
         state.active_player = PlayerId(0);
         state.phase = Phase::DeclareBlockers;
+        let attacker = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Attacker".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&attacker)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(crate::types::card_type::CoreType::Creature);
         state.combat = Some(combat::CombatState {
             attackers: vec![combat::AttackerInfo::new(
-                ObjectId(1),
+                attacker,
                 combat::AttackTarget::Player(PlayerId(2)),
                 PlayerId(2),
             )],

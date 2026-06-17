@@ -11329,10 +11329,10 @@ fn player_may_begin_activating(
         None | Some(PlayerFilter::Controller) => player == source_controller,
         Some(PlayerFilter::All) => true,
         Some(PlayerFilter::Opponent) => {
-            player != source_controller
-                && super::players::is_opponent(state, source_controller, player)
+            super::players::is_opponent(state, source_controller, player)
         }
-        _ => player == source_controller,
+        // Activator permission is only modeled for controller / all / opponent today.
+        Some(_) => player == source_controller,
     }
 }
 

@@ -74,6 +74,8 @@ fn oft_nabbed_goat_controller_cannot_activate() {
         .id();
 
     let mut runner = scenario.build();
+    runner.state_mut().priority_player = P0;
+    runner.state_mut().waiting_for = WaitingFor::Priority { player: P0 };
     fund_generic(&mut runner, P0, 1);
 
     let err = runner.act(GameAction::ActivateAbility {
@@ -159,5 +161,32 @@ fn oft_nabbed_goat_opponent_rejected_at_instant_speed() {
     assert!(
         err.is_err(),
         "opponent-only activation must be rejected while stack is non-empty (CR 602.5d)"
+    );
+}
+
+#[test]
+fn opponents_only_activation_parses_turn_timing_composition() {
+    const ORACLE: &str = "{T}: Draw a card. Only your opponents may activate this ability and only during your turn.";
+    let mut scenario = GameScenario::new();
+    let source = scenario
+        .add_creature_from_oracle(P0, "Test Permanent", 1, 1, ORACLE)
+        .id();
+    let runner = scenario.build();
+    let ability = runner
+        .state()
+        .objects
+        .get(&source)
+        .and_then(|obj| {
+            obj.abilities
+                .iter()
+                .find(|a| a.kind == AbilityKind::Activated)
+        })
+        .expect("activated ability");
+    assert_eq!(ability.activator_filter, Some(PlayerFilter::Opponent));
+    assert!(
+        ability
+            .activation_restrictions
+            .contains(&ActivationRestriction::DuringYourTurn),
+        "opponent permission must compose with DuringYourTurn"
     );
 }

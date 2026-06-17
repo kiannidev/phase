@@ -3751,12 +3751,9 @@ fn parse_activated_ability_definition(
     if !constraints.restrictions.is_empty() {
         def.activation_restrictions = constraints.restrictions;
     }
-    if constraints.any_player_may_activate {
-        def.activator_filter = Some(PlayerFilter::All);
-    }
-    if let Some(filter) = constraints.activator_filter {
-        def.activator_filter = Some(filter);
-    }
+    def.activator_filter = constraints
+        .activator_filter
+        .or_else(|| constraints.any_player_may_activate.then_some(PlayerFilter::All));
     extract_cost_reduction_from_chain(&mut def);
     extract_mana_spend_trigger_from_chain(&mut def);
     (def, effect_text)
@@ -4400,23 +4397,24 @@ pub(super) fn strip_activated_constraints(text: &str) -> (String, ActivatedConst
             }
         }
 
-        // CR 602.2a + CR 602.5d: Oft-Nabbed Goat class — opponent-only activation
-        // with sorcery-speed timing on the same trailing sentence.
-        const OPPONENTS_SORCERY_SUFFIX: &str =
-            "only your opponents may activate this ability and only as a sorcery";
-        if lower.ends_with(OPPONENTS_SORCERY_SUFFIX) {
-            let end = remaining.len() - OPPONENTS_SORCERY_SUFFIX.len();
-            remaining = remaining[..end]
-                .trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace())
-                .to_string();
-            constraints.activator_filter = Some(PlayerFilter::Opponent);
-            constraints
-                .restrictions
-                .push(ActivationRestriction::AsSorcery);
-            if remaining.is_empty() {
-                break 'parse_constraints;
+        // CR 602.2a + CR 602.5: "Only your opponents may activate this ability and only
+        // <restriction>" — mirror the any-player composition: record the opponent
+        // permission and delegate the timing axis to `parse_activation_timing_restriction`.
+        if let Some((before, restriction)) =
+            tp.rsplit_around("only your opponents may activate this ability and only ")
+        {
+            if let Some(parsed) = parse_activation_timing_restriction(restriction.original) {
+                constraints.activator_filter = Some(PlayerFilter::Opponent);
+                constraints.restrictions.extend(parsed);
+                remaining = before
+                    .original
+                    .trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace())
+                    .to_string();
+                if remaining.trim().is_empty() {
+                    break;
+                }
+                continue;
             }
-            continue 'parse_constraints;
         }
 
         const OPPONENTS_ACTIVATE_SUFFIX: &str = "only your opponents may activate this ability";
@@ -9530,6 +9528,46 @@ mod tests {
             )),
             "expected source-on-stack condition, got {:?}",
             restrictions
+        );
+    }
+
+    /// CR 602.2a + CR 602.5: opponent permission must compose with the same timing
+    /// combinator as the any-player path — not a single hardcoded suffix.
+    #[test]
+    fn opponents_may_activate_but_only_records_timing_restriction() {
+        let activation_for = |text: &str, name: &str| {
+            let parsed = parse(text, name, &[], &["Creature"], &[]);
+            parsed
+                .abilities
+                .into_iter()
+                .find(|ability| ability.activator_filter.is_some())
+                .expect("expected an activated ability with activator_filter")
+        };
+
+        let sorcery = activation_for(
+            "{1}: Draw a card. Only your opponents may activate this ability and only as a sorcery.",
+            "Test Opponent Sorcery",
+        );
+        assert_eq!(sorcery.activator_filter, Some(PlayerFilter::Opponent));
+        assert!(
+            sorcery
+                .activation_restrictions
+                .contains(&ActivationRestriction::AsSorcery),
+            "expected AsSorcery, got {:?}",
+            sorcery.activation_restrictions
+        );
+
+        let during_turn = activation_for(
+            "{1}: Draw a card. Only your opponents may activate this ability and only during your turn.",
+            "Test Opponent Turn",
+        );
+        assert_eq!(during_turn.activator_filter, Some(PlayerFilter::Opponent));
+        assert!(
+            during_turn
+                .activation_restrictions
+                .contains(&ActivationRestriction::DuringYourTurn),
+            "expected DuringYourTurn, got {:?}",
+            during_turn.activation_restrictions
         );
     }
 

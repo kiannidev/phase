@@ -10,9 +10,7 @@ use engine::types::PlayerId;
 const QUEEN_MARCHESA_UPKEEP: &str =
     "At the beginning of your upkeep, if an opponent is the monarch, create a 1/1 black Assassin creature token with haste.";
 
-fn build_runner(
-    monarch: Option<PlayerId>,
-) -> engine::game::scenario::GameRunner {
+fn build_runner(monarch: Option<PlayerId>) -> engine::game::scenario::GameRunner {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::Untap);
     scenario

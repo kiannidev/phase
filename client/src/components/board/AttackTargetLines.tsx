@@ -6,7 +6,7 @@ import { useUiStore } from "../../stores/uiStore.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { usePlayerId } from "../../hooks/usePlayerId.ts";
 import { objectAnchorSelector } from "../../utils/objectAnchorSelector.ts";
-import { isOneOnOne } from "../../viewmodel/gameStateView.ts";
+import { isOneOnOne, resolveFocusedOpponent } from "../../viewmodel/gameStateView.ts";
 import {
   arcPath,
   useAttackerArrowPositions,
@@ -73,11 +73,11 @@ export function AttackTargetLines() {
   const isMinimal = vfxQuality === "minimal";
 
   const isMultiplayer = gameState != null && !isOneOnOne(gameState);
-  const effectiveFocusedOpponent = useMemo(() => {
-    if (focusedOpponent != null) return focusedOpponent;
+  const liveOpponents = useMemo(() => {
     const eliminated = new Set(eliminatedPlayers ?? []);
-    return seatOrder?.find((id) => id !== localPlayerId && !eliminated.has(id)) ?? null;
-  }, [focusedOpponent, seatOrder, eliminatedPlayers, localPlayerId]);
+    return (seatOrder ?? []).filter((id) => id !== localPlayerId && !eliminated.has(id));
+  }, [eliminatedPlayers, localPlayerId, seatOrder]);
+  const effectiveFocusedOpponent = resolveFocusedOpponent(focusedOpponent, liveOpponents);
 
   const isControllerOnScreen = useMemo(() => {
     return (controllerId: PlayerId) =>

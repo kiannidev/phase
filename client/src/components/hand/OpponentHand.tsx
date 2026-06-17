@@ -9,7 +9,7 @@ import { CARD_BACK_URL } from "../../services/scryfall.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
 import { usePerspectivePlayerId } from "../../hooks/usePlayerId.ts";
-import type { ObjectId } from "../../adapter/types.ts";
+import { resolveFocusedOpponent } from "../../viewmodel/gameStateView.ts";
 
 interface OpponentHandProps {
   showCards?: boolean;
@@ -27,7 +27,9 @@ export function OpponentHand({ showCards = false }: OpponentHandProps) {
     const eliminated = new Set(eliminatedPlayers ?? []);
     return orderedPlayers.filter((id) => id !== myId && !eliminated.has(id));
   }, [eliminatedPlayers, myId, players, seatOrder]);
-  const opponentId = focusedOpponent ?? opponents[0] ?? (myId === 0 ? 1 : 0);
+  const opponentId =
+    resolveFocusedOpponent(focusedOpponent, opponents)
+    ?? (myId === 0 ? 1 : 0);
   const opponent = players?.[opponentId];
   const objects = useGameStore((s) => s.gameState?.objects);
   const revealedCards = useGameStore((s) => s.gameState?.revealed_cards);

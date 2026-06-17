@@ -5440,7 +5440,31 @@ fn alternative_spell_layout(obj: &crate::game::game_object::GameObject) -> Optio
     }
 }
 
-/// CR 712.11b: Returns true if `obj` is a Modal double-faced card whose two
+/// CR 708.2a: Split cards whose two faces are both spells (Life // Death,
+/// Breaking // Entering without Fuse, etc.) require a cast-time face choice —
+/// the same player decision as spell//spell MDFCs.
+fn split_spell_face_choice_available(obj: &crate::game::game_object::GameObject) -> bool {
+    use crate::types::card_type::CoreType;
+    let Some(back) = obj.back_face.as_ref() else {
+        return false;
+    };
+    if back.layout_kind != Some(LayoutKind::Split) {
+        return false;
+    }
+    let face_is_castable_spell = |types: &crate::types::card_type::CardType| {
+        types
+            .core_types
+            .iter()
+            .any(|ct| matches!(ct, CoreType::Instant | CoreType::Sorcery))
+    };
+    face_is_castable_spell(&obj.card_types) && face_is_castable_spell(&back.card_types)
+}
+
+/// CR 712.11b + CR 708.2a: Cast-time face choice for spell//spell MDFCs and
+/// spell//spell split cards.
+fn cast_spell_face_choice_available(obj: &crate::game::game_object::GameObject) -> bool {
+    modal_spell_face_choice_available(obj) || split_spell_face_choice_available(obj)
+}
 /// faces present a real *cast*-time face choice — i.e. both faces are spells
 /// (neither is a land). This is the spell//spell MDFC class (Esika, God of the
 /// Tree // The Prismatic Bridge and the other Kaldheim gods, Valki // Tibalt,
@@ -7436,7 +7460,7 @@ pub fn handle_cast_spell_with_payment_mode(
     // re-enters this function; the swap clears the back face's Modal
     // `layout_kind`, so the re-entry casts the chosen face without re-prompting.
     if let Some(obj) = state.objects.get(&object_id) {
-        if cast_face_choice_offered_from_zone(state, obj) && modal_spell_face_choice_available(obj)
+        if cast_face_choice_offered_from_zone(state, obj) && cast_spell_face_choice_available(obj)
         {
             return Ok(WaitingFor::ModalFaceChoice {
                 player,

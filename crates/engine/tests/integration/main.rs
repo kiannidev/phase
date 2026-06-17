@@ -240,6 +240,7 @@ mod issue_3245_abhorrent_oculus_manifest_dread;
 mod issue_3260_phantasmal_image_persist;
 mod issue_3283_sevinne_reclamation_copy_no_self_copy;
 mod issue_3285_face_down_public_zone;
+mod issue_3287_life_death_split_cast;
 mod issue_3288_electrolyze_second_target;
 mod issue_3289_oft_nabbed_goat;
 mod issue_3290_terra_transform_blink;

@@ -6,6 +6,7 @@ use crate::types::ability::{EffectKind, KeywordAction, TargetRef};
 #[cfg(test)]
 use crate::types::ability::{EffectScope, TapStateChange};
 use crate::types::actions::GameAction;
+use crate::types::card::LayoutKind;
 use crate::types::events::{BendingType, ContestRound, GameEvent, ManaTapState, PlayerActionKind};
 use crate::types::game_state::{
     ActionResult, AssistState, AutoPassMode, AutoPassRequest, CastOfferKind, ConvokeMode,
@@ -1750,17 +1751,27 @@ fn apply_action(
             if let Some(obj) = state.objects.get_mut(object_id) {
                 if back_face {
                     // Swap to back face using existing primitives
-                    let back = obj.back_face.take().expect("MDFC has back face");
+                    let back = obj.back_face.take().expect("dual-faced card has back face");
+                    let is_split_half = back.layout_kind == Some(LayoutKind::Split);
                     let front_snapshot = super::printed_cards::snapshot_object_face(obj);
                     super::printed_cards::apply_back_face_to_object(obj, back);
                     obj.back_face = Some(front_snapshot);
-                    // CR 712.8a: Mark MDFC back-face so apply_zone_exit_cleanup
-                    // reverts to front face on any zone exit to a non-battlefield zone.
-                    // Do NOT set obj.transformed — MDFC face choice ≠ transform
-                    obj.modal_back_face = true;
+                    // CR 712.8a: MDFC back-face marker only — split half swaps
+                    // revert via the normal transform/split zone-exit paths, not
+                    // `modal_back_face`.
+                    if !is_split_half {
+                        obj.modal_back_face = true;
+                    }
                 } else {
-                    // Front face chosen — clear layout_kind so the MDFC intercept
+                    // Front face chosen — clear layout_kind so the intercept
                     // won't re-fire on re-entry into handle_play_land / handle_cast_spell.
+                    if let Some(ref mut bf) = obj.back_face {
+                        bf.layout_kind = None;
+                    }
+                }
+                // After choosing either face, clear layout on the stashed other
+                // half so cast/play re-entry does not re-prompt.
+                if back_face {
                     if let Some(ref mut bf) = obj.back_face {
                         bf.layout_kind = None;
                     }

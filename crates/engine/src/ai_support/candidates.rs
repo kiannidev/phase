@@ -3904,9 +3904,23 @@ fn mana_payment_actions(
                 crate::types::mana::ManaCost::Cost { shards, .. } => Some(shards.as_slice()),
                 _ => None,
             });
-        for (obj_id, obj) in &state.objects {
-            match mode {
-                ConvokeMode::Waterbend if obj.is_waterbend_eligible(player) => {
+        if mode == ConvokeMode::Delve {
+            if let Some(p) = state.players.iter().find(|p| p.id == player) {
+                for obj_id in &p.graveyard {
+                    actions.push(candidate(
+                        GameAction::TapForConvoke {
+                            object_id: *obj_id,
+                            mana_type: crate::types::mana::ManaType::Colorless,
+                        },
+                        TacticalClass::Mana,
+                        Some(player),
+                    ));
+                }
+            }
+        } else {
+            for (obj_id, obj) in &state.objects {
+                match mode {
+                    ConvokeMode::Waterbend if obj.is_waterbend_eligible(player) => {
                     // Waterbend: always colorless
                     actions.push(candidate(
                         GameAction::TapForConvoke {
@@ -3919,19 +3933,6 @@ fn mana_payment_actions(
                 }
                 ConvokeMode::Improvise if obj.is_improvise_eligible(player) => {
                     // CR 702.126a: Improvise pays generic mana — always colorless.
-                    actions.push(candidate(
-                        GameAction::TapForConvoke {
-                            object_id: *obj_id,
-                            mana_type: crate::types::mana::ManaType::Colorless,
-                        },
-                        TacticalClass::Mana,
-                        Some(player),
-                    ));
-                }
-                ConvokeMode::Delve
-                    if obj.zone == crate::types::zones::Zone::Graveyard && obj.owner == player =>
-                {
-                    // CR 702.66a: exile a graveyard card to pay one generic mana.
                     actions.push(candidate(
                         GameAction::TapForConvoke {
                             object_id: *obj_id,
@@ -3974,6 +3975,7 @@ fn mana_payment_actions(
                 }
                 _ => {}
             }
+        }
         }
     }
     actions

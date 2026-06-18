@@ -640,6 +640,9 @@ fn sacrifice_cost_defers_target_selection_until_cost_paid_object_exists() {
         .id();
     let victim_id = scenario.add_creature(P0, "Victim", 3, 3).id();
     let target_id = scenario.add_creature(P0, "Counter Target", 1, 1).id();
+    // A second legal creature target so auto-select does not skip the post-sacrifice
+    // target prompt when only one creature remains after the victim leaves play.
+    scenario.add_creature(P0, "Alternate Target", 2, 2);
 
     let mut runner = scenario.build();
     runner

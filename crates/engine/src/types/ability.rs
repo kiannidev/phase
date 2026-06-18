@@ -11984,6 +11984,9 @@ impl AbilityDefinition {
         if let Some(else_ab) = self.else_ability.as_mut() {
             else_ab.normalize_parsed_replacement_flags();
         }
+        for mode in &mut self.mode_abilities {
+            mode.normalize_parsed_replacement_flags();
+        }
     }
 
     pub fn player_scope(mut self, scope: PlayerFilter) -> Self {

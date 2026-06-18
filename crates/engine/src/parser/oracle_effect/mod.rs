@@ -41651,7 +41651,8 @@ mod tests {
             replacement.combat_scope,
             Some(CombatDamageScope::CombatOnly)
         );
-        assert!(replacement.is_consumed);
+        assert!(replacement.consume_on_apply);
+        assert!(!replacement.is_consumed);
         assert_eq!(
             replacement.expiry,
             Some(crate::types::ability::RestrictionExpiry::EndOfTurn)
@@ -41703,7 +41704,8 @@ mod tests {
             replacement.combat_scope,
             Some(CombatDamageScope::CombatOnly)
         );
-        assert!(replacement.is_consumed);
+        assert!(replacement.consume_on_apply);
+        assert!(!replacement.is_consumed);
         assert_eq!(
             replacement.expiry,
             Some(crate::types::ability::RestrictionExpiry::EndOfTurn)

@@ -175,8 +175,8 @@ mod tests {
     use crate::game::replacement::{replace_event, ReplacementResult};
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        DamageModification, DamageTargetPlayerScope, Duration, ReplacementDefinition,
-        RestrictionExpiry, TargetFilter, AbilityDefinition,
+        AbilityDefinition, DamageModification, DamageTargetPlayerScope, Duration,
+        ReplacementDefinition, RestrictionExpiry, TargetFilter,
     };
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::player::PlayerId;

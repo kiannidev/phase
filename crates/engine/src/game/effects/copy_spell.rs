@@ -1,9 +1,8 @@
 use crate::game::ability_utils::build_resolved_from_def;
 use crate::game::filter::{matches_target_filter, FilterContext};
 use crate::types::ability::{
-    AbilityDefinition, AbilityKind, ContinuousModification, ControllerRef,
-    CopyRetargetPermission, Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter,
-    TargetRef,
+    AbilityDefinition, AbilityKind, ContinuousModification, ControllerRef, CopyRetargetPermission,
+    Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter, TargetRef,
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::{

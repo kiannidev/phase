@@ -46,6 +46,9 @@
 //!   pronoun accepts `he`/`she`/`it` so cards from any gender print route
 //!   through the same arm. When neither index is set, the arm declines (no
 //!   modification produced) so the rest of the except clause still parses.
+//! - `<possessive> starting loyalty is N`
+//!   → [`ContinuousModification::SetStartingLoyalty`] so planeswalker-copy
+//!   exceptions seed loyalty counters from the overridden value.
 //!
 //! # Fail-soft semantics
 //!
@@ -67,9 +70,10 @@ use std::str::FromStr;
 
 use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
-use nom::bytes::complete::tag;
+use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::char;
 use nom::combinator::{opt, value};
+use nom::sequence::preceded;
 use nom::Parser;
 
 use super::super::oracle_keyword::parse_keyword_from_oracle;
@@ -161,6 +165,7 @@ pub(crate) fn parse_except_clause<'a>(
 ///   - `it's a(n) {subtype} in addition to its other types`    → AddSubtype
 ///   - `is a(n) {core_type|subtype} in addition to its other types`
 ///     (elided-subject form for non-leading bodies)            → AddType/AddSubtype
+///   - `<possessive> starting loyalty is N`                    → SetStartingLoyalty
 ///   - `it has "<triggered/activated/static ability>"`         → GrantTrigger/GrantAbility/etc.
 ///   - `it has {keyword[, keyword, ...]}`                      → AddKeyword per kw
 pub(crate) fn parse_except_body<'a>(
@@ -172,6 +177,9 @@ pub(crate) fn parse_except_body<'a>(
         return Some((rest, vec![name_mod]));
     }
     if let Some((rest, mods)) = parse_half_pt_override(input) {
+        return Some((rest, mods));
+    }
+    if let Some((rest, mods)) = parse_theyre_pt_and_types(input) {
         return Some((rest, mods));
     }
     if let Some((rest, mods)) = parse_subject_pt_and_types(input) {
@@ -187,6 +195,9 @@ pub(crate) fn parse_except_body<'a>(
         return Some((rest, vec![modification]));
     }
     if let Some((rest, modification)) = parse_enters_with_additional_counter(input) {
+        return Some((rest, vec![modification]));
+    }
+    if let Some((rest, modification)) = parse_starting_loyalty_override(input) {
         return Some((rest, vec![modification]));
     }
     // CR 707.9d: the replacement form ("… and loses all other card types")
@@ -471,6 +482,50 @@ fn parse_subject_pt_and_types(input: &str) -> Option<(&str, Vec<ContinuousModifi
     Some((rest, mods))
 }
 
+/// CR 707.9b + CR 707.9d: Plural token-copy exception — "they're N/M {types}
+/// creature[s] in addition to their other types" (Astral Dragon / Project Image).
+/// Mirrors [`parse_subject_pt_and_types`] but uses the plural anaphor and
+/// terminates on "creature(s)" rather than a bare type list.
+fn parse_theyre_pt_and_types(input: &str) -> Option<(&str, Vec<ContinuousModification>)> {
+    let (rest, _) = alt((tag::<_, _, OracleError<'_>>("they're "), tag("they are ")))
+        .parse(input)
+        .ok()?;
+
+    let (rest, (power, toughness)) = parse_pt_pair(rest)?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" ").parse(rest).ok()?;
+
+    let (type_text, rest) = split_on_first_of(rest, &["creatures ", "creature "])?;
+    let (rest, suffix) = if let Some((_, rest)) =
+        split_on_first_of(rest, &[" in addition to their other colors and types"])
+    {
+        (rest, AdditiveSuffix::ColorsAndTypes)
+    } else if let Some((_, rest)) = split_on_first_of(rest, &[" in addition to their other colors"])
+    {
+        (rest, AdditiveSuffix::Colors)
+    } else if let Some((_, rest)) = split_on_first_of(rest, &[" in addition to their other types"])
+    {
+        (rest, AdditiveSuffix::Types)
+    } else {
+        let (rest, _) = split_at_body_boundary(rest);
+        (rest, AdditiveSuffix::None)
+    };
+
+    let (replace_color, replace_types) = match suffix {
+        AdditiveSuffix::None => (true, true),
+        AdditiveSuffix::Types => (true, false),
+        AdditiveSuffix::Colors => (false, true),
+        AdditiveSuffix::ColorsAndTypes => (false, false),
+    };
+
+    let mut mods = vec![
+        ContinuousModification::SetPower { value: power },
+        ContinuousModification::SetToughness { value: toughness },
+    ];
+    append_color_and_type_modifications(type_text.trim(), replace_color, replace_types, &mut mods);
+
+    Some((rest, mods))
+}
+
 /// CR 707.9b + CR 707.9d: append the color and type modifications declared by a
 /// copy exception's type list. `replace_color` selects `SetColor` (no carve-out
 /// for color) vs per-color `AddColor`; `replace_types` selects whether an exact
@@ -586,6 +641,23 @@ fn parse_has_this_ability<'a>(
     ))
 }
 
+/// CR 707.9b + CR 205.1b: suffix after the named type in additive copy-except
+/// bodies — covers both the generic "other types" and the creature-specific
+/// "other creature types" phrasing (Sakashima's Student class).
+fn split_in_addition_type_suffix(input: &str) -> Option<(&str, &str)> {
+    let in_addition_suffix = (
+        tag::<_, _, OracleError<'_>>(" in addition to "),
+        alt((tag("its"), tag("their"), tag("his"), tag("her"))),
+        tag(" other "),
+        opt(tag("creature ")),
+        tag("types"),
+    );
+    let (rest, (type_word, _)) = (take_until(" in addition to "), in_addition_suffix)
+        .parse(input)
+        .ok()?;
+    Some((type_word.trim(), rest))
+}
+
 /// CR 707.9b + CR 205.1b: "it's a(n) {type_word} in addition to its other
 /// types", plus the elided-subject form "is a(n) {type_word} in addition to
 /// its other types" used for non-leading bodies in a comma-anded copy-except
@@ -615,9 +687,7 @@ fn parse_its_a_type_in_addition(input: &str) -> Option<(&str, ContinuousModifica
     ))
     .parse(input)
     .ok()?;
-    let (type_word, rest) = nom_primitives::split_once_on(rest, " in addition to its other types")
-        .ok()
-        .map(|(_, pair)| pair)?;
+    let (type_word, rest) = split_in_addition_type_suffix(rest)?;
     let type_word = type_word.trim();
     if type_word.is_empty() {
         return None;
@@ -907,6 +977,28 @@ fn parse_additional_count(input: &str) -> Option<(&str, i32)> {
         return Some((rest, count));
     }
     Some((rest, 1))
+}
+
+/// CR 707.9b + CR 306.5b/c: Match "`its/their starting loyalty is N`" copy
+/// exceptions. Jace, Mirror Mage is the canonical token-copy form; the grammar
+/// is shared with BecomeCopy exceptions so future planeswalker-copy effects use
+/// the same resolution-time override.
+fn parse_starting_loyalty_override(input: &str) -> Option<(&str, ContinuousModification)> {
+    let (rest, _) = preceded(
+        alt((
+            tag::<_, _, OracleError<'_>>("its"),
+            tag("his"),
+            tag("her"),
+            tag("their"),
+            tag("it's"),
+            tag("it\u{2019}s"),
+        )),
+        tag(" starting loyalty is "),
+    )
+    .parse(input)
+    .ok()?;
+    let (rest, value) = nom_primitives::parse_number(rest).ok()?;
+    Some((rest, ContinuousModification::SetStartingLoyalty { value }))
 }
 
 /// Parse the optional `" if it's a <core_type>"` tail trailing a counter
@@ -1383,6 +1475,24 @@ mod tests {
             m,
             ContinuousModification::AddSubtype { subtype } if subtype == "Spider"
         )));
+    }
+
+    /// CR 707.9b: Sakashima's Student — "it's a Ninja in addition to its other
+    /// creature types" uses the creature-type-specific suffix.
+    #[test]
+    fn its_a_ninja_in_addition_to_other_creature_types_emits_add_subtype() {
+        let (_, mods) = parse_except_clause(
+            ", except it's a Ninja in addition to its other creature types",
+            "Sakashima's Student",
+            &ParseContext::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            mods,
+            vec![ContinuousModification::AddSubtype {
+                subtype: "Ninja".to_string(),
+            }]
+        );
     }
 
     /// CR 205.1a + CR 613.1d + CR 707.9d: Myrkul, Lord of Bones — "it's an
@@ -1931,6 +2041,27 @@ mod tests {
         }
     }
 
+    /// CR 707.9b + CR 306.5b/c: Jace, Mirror Mage's token-copy exception
+    /// changes the copy's starting loyalty instead of merely adding counters.
+    #[test]
+    fn starting_loyalty_exception_emits_override() {
+        let (_, mods) = parse_except_clause(
+            ", except it's not legendary and its starting loyalty is 1",
+            "Jace, Mirror Mage",
+            &ParseContext::default(),
+        )
+        .unwrap();
+        assert!(mods.iter().any(|m| matches!(
+            m,
+            ContinuousModification::RemoveSupertype {
+                supertype: Supertype::Legendary
+            }
+        )));
+        assert!(mods
+            .iter()
+            .any(|m| matches!(m, ContinuousModification::SetStartingLoyalty { value: 1 })));
+    }
+
     /// CR 122.1 + CR 614.1c: Spark Double's three-clause body — bare comma
     /// separator between bodies plus ", and " before the last.
     #[test]
@@ -1964,5 +2095,42 @@ mod tests {
                 supertype: Supertype::Legendary
             }
         )));
+    }
+
+    /// CR 707.9b: Astral Dragon plural token-copy exception.
+    #[test]
+    fn theyre_pt_and_dragon_creature_types_in_addition() {
+        let (_, mods) = parse_except_clause(
+            ", except they're 3/3 Dragon creatures in addition to their other types, and they have flying",
+            "Card",
+            &ParseContext::default(),
+        )
+        .unwrap();
+        assert!(
+            mods.iter()
+                .any(|m| matches!(m, ContinuousModification::SetPower { value: 3 })),
+            "missing SetPower(3); got {mods:?}"
+        );
+        assert!(
+            mods.iter()
+                .any(|m| matches!(m, ContinuousModification::SetToughness { value: 3 })),
+            "missing SetToughness(3); got {mods:?}"
+        );
+        assert!(
+            mods.iter().any(|m| matches!(
+                m,
+                ContinuousModification::AddSubtype { subtype } if subtype == "Dragon"
+            )),
+            "missing AddSubtype(Dragon); got {mods:?}"
+        );
+        assert!(
+            mods.iter().any(|m| matches!(
+                m,
+                ContinuousModification::AddType {
+                    core_type: CoreType::Creature
+                }
+            )),
+            "missing AddType(Creature); got {mods:?}"
+        );
     }
 }

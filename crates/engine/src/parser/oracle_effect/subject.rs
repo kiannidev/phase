@@ -9,13 +9,14 @@ use nom::Parser;
 use super::animation::{
     animation_modifications_with_replacement, has_in_addition_to_other_types, parse_animation_spec,
 };
+use super::imperative;
 use super::lower::BOUNDED_TARGET_PHRASES;
 use super::{resolve_it_pronoun, ParseContext};
 use crate::parser::oracle_ir::ast::*;
 use crate::types::ability::{
     AbilityDefinition, AbilityKind, ChosenSubtypeKind, ContinuousModification, ControllerRef,
     Duration, Effect, FilterProp, MultiTargetSpec, PlayerFilter, PlayerScope, PtValue,
-    QuantityExpr, QuantityRef, StaticDefinition, TargetFilter, TypedFilter,
+    QuantityExpr, QuantityRef, StaticCondition, StaticDefinition, TargetFilter, TypedFilter,
 };
 use crate::types::game_state::DayNight;
 use crate::types::keywords::Keyword;
@@ -32,7 +33,7 @@ use super::super::oracle_quantity;
 use super::super::oracle_static::{
     classify_block_exception, parse_additive_type_clause_modifications,
     parse_cant_be_activated_exemption_in_text, parse_chosen_qualifier_subject,
-    parse_continuous_modifications, parse_static_line_multi,
+    parse_continuous_modifications, parse_static_line, parse_static_line_multi,
 };
 use super::super::oracle_target::{parse_target, parse_target_with_ctx, parse_type_phrase};
 use super::super::oracle_util::{
@@ -337,10 +338,49 @@ fn try_parse_subject_become_clause(
     build_become_clause(application, &predicate, ctx)
 }
 
+/// CR 508.1d + CR 508.1h: "[creatures] can't attack [you] unless [player] pays
+/// {N} [for each of those creatures]" as a one-shot effect (Summon: Yojimbo
+/// chapters II/III). The static-side `parse_combat_tax_static` authority
+/// already lowers the UnlessPay payload; wrap it in `GrantStaticAbility` on
+/// `SelfRef` so `register_transient_effect` installs the tax on the resolving
+/// source for the effect's duration (mirrors quoted-static grant routing in
+/// `oracle_static/grammar.rs`).
+fn try_parse_combat_tax_effect_clause(text: &str) -> Option<ParsedEffectClause> {
+    let static_def = parse_static_line(text)?;
+    if !matches!(
+        static_def.condition,
+        Some(StaticCondition::UnlessPay { .. })
+    ) {
+        return None;
+    }
+    Some(ParsedEffectClause {
+        effect: Effect::GenericEffect {
+            static_abilities: vec![StaticDefinition::continuous().modifications(vec![
+                ContinuousModification::GrantStaticAbility {
+                    definition: Box::new(static_def),
+                },
+            ])],
+            duration: None,
+            target: Some(TargetFilter::SelfRef),
+        },
+        distribute: None,
+        multi_target: None,
+        duration: None,
+        sub_ability: None,
+        condition: None,
+        optional: false,
+        unless_pay: None,
+    })
+}
+
 fn try_parse_subject_restriction_clause(
     text: &str,
     ctx: &mut ParseContext,
 ) -> Option<ParsedEffectClause> {
+    if let Some(clause) = try_parse_combat_tax_effect_clause(text) {
+        return Some(clause);
+    }
+
     let lower = text.to_lowercase();
 
     // CR 509.1c: "Target creature must be blocked [this turn] [if able]"
@@ -397,6 +437,52 @@ fn try_parse_subject_restriction_clause(
             optional: false,
             unless_pay: None,
         });
+    }
+
+    // CR 508.1d (must-attack declaration) + CR 608.2c (one-shot anaphora binding)
+    // + CR 611.2c (continuous effect affected-set) — mirrors the " must be blocked"
+    // subject form (CR 509.1c). "[subject] attacks/attack this turn/combat if able"
+    // for a targeted or set subject (Boiling Blood, Heckling Fiends, Incite, …):
+    // the bare imperative recognizer drops the subject (target: None, affected:
+    // None), silently un-binding the MustAttack requirement. Split off the subject
+    // here and re-bind: target = the typed/targeted subject, static affected =
+    // ParentTarget so `register_transient_effect` produces a per-target
+    // SpecificObject TCE. Use `find_predicate_start`/`deconjugate_verb` (NOT
+    // `split_around`, which consumes the "attack" needle and leaves a tail the
+    // recognizer rejects) to yield subject + deconjugated "attack … if able"
+    // predicate, exactly as `try_parse_subject_become_clause` does.
+    if let Some(verb_start) = find_predicate_start(text) {
+        let subject = text[..verb_start].trim();
+        let predicate = deconjugate_verb(text[verb_start..].trim());
+        // Classify via the existing recognizer. Only the bare GenericEffect form
+        // (MustAttack) is re-bound here; the player-bound `ForceAttack` form
+        // ("attacks you/that player …") has its own targeted handling and must
+        // NOT be captured.
+        if let Some(ImperativeFamilyAst::GainKeyword(Effect::GenericEffect { duration, .. })) =
+            imperative::try_parse_attack_if_able(&predicate)
+        {
+            // `?` here makes a bare/source-granted "attacks this turn if able"
+            // (empty subject, granted ability) fall through to None, preserving
+            // the existing target:None behavior for that class.
+            let application = parse_subject_application(subject, ctx)?;
+            let affected = static_affected_for_application(&application);
+            return Some(ParsedEffectClause {
+                effect: Effect::GenericEffect {
+                    static_abilities: vec![
+                        imperative::must_attack_static_definition().affected(affected)
+                    ],
+                    duration: duration.clone(),
+                    target: application.target,
+                },
+                distribute: None,
+                multi_target: application.multi_target,
+                duration,
+                sub_ability: None,
+                condition: None,
+                optional: application.is_optional,
+                unless_pay: None,
+            });
+        }
     }
 
     // CR 602.5 + CR 603.2a: "[subject] activated abilities can't be activated" —
@@ -1080,10 +1166,18 @@ pub(super) fn parse_subject_application(
     // TriggeringPlayer branch here to the two player-referencing forms.
     let player_subject = all_consuming(alt((
         value(
+            ("that attacking player", true),
+            tag::<_, _, OracleError<'_>>("that attacking player may"),
+        ),
+        value(
             ("that player", true),
             tag::<_, _, OracleError<'_>>("that player may"),
         ),
         value(("the player", true), tag("the player may")),
+        value(
+            ("that attacking player", false),
+            tag("that attacking player"),
+        ),
         value(("that player", false), tag("that player")),
         value(("the player", false), tag("the player")),
     )))
@@ -1093,7 +1187,10 @@ pub(super) fn parse_subject_application(
         else {
             return None;
         };
-        if matches!(ctx_filter, TargetFilter::TriggeringPlayer) {
+        if matches!(
+            ctx_filter,
+            TargetFilter::TriggeringPlayer | TargetFilter::DefendingPlayer
+        ) {
             // CR 608.2c + CR 109.4 (issue #534): "That player" after a
             // `Choose(Player)`/`Choose(Opponent)` clause binds to the
             // just-chosen player — mirrors the `resolve_they_pronoun`
@@ -1634,6 +1731,21 @@ fn resolve_they_pronoun(ctx: &mut ParseContext) -> TargetFilter {
     if matches!(ctx.relative_player_scope, Some(ControllerRef::ScopedPlayer)) {
         return TargetFilter::ScopedPlayer;
     }
+    // CR 608.2c + CR 109.4 (issue #1670, #3659): "they" after body "its
+    // controller may … if they do, they draw" refers to that creature's
+    // controller, not the damaged opponent from the trigger condition.
+    if matches!(
+        ctx.relative_player_scope,
+        Some(ControllerRef::ParentTargetController)
+    ) {
+        return TargetFilter::ParentTargetController;
+    }
+    if matches!(
+        ctx.relative_player_scope,
+        Some(ControllerRef::ParentTargetOwner)
+    ) {
+        return TargetFilter::ParentTargetOwner;
+    }
     // CR 603.7c + CR 120.3 + CR 506.2: A "deals [combat] damage to a player" or
     // "attacks a player" trigger introduces the damaged/attacked player as the
     // event referent (the parser stamps `relative_player_scope = TargetPlayer`).
@@ -1689,8 +1801,18 @@ fn subject_filter_application(filter: TargetFilter, targeted: bool) -> Option<Su
 /// self-documenting and matches the convention used by sibling counter
 /// sub_abilities (`PutCounter { target: ParentTarget }`) and the
 /// `LastCreated` rewrite for token anaphors.
+///
+/// CR 608.2c + CR 502.3: also bind to the inherited target when the subject is
+/// an anaphor to a previously-mentioned single object (`inherits_parent`,
+/// e.g. spell-form "Tap target land. That land doesn't untap" — Chandra's
+/// Revolution, Glacial Grasp). Without this, the static's `affected` would
+/// broadcast the CantUntap lock over every matching permanent. The
+/// transient-effect resolver already binds `ParentTarget` to the inherited
+/// (immediately-preceding) object target, so this resolves to exactly the one
+/// tapped object. Mirrors `build_pump_effect`, which honors `inherits_parent`
+/// the same way for the Pump family.
 pub(super) fn static_affected_for_application(application: &SubjectApplication) -> TargetFilter {
-    if application.target.is_some() {
+    if application.target.is_some() || application.inherits_parent {
         TargetFilter::ParentTarget
     } else {
         application.affected.clone()
@@ -2230,10 +2352,19 @@ fn build_become_clause(
     )))
     .parse(become_lower.as_str())
     {
-        let target = application
-            .target
-            .clone()
-            .unwrap_or(crate::types::ability::TargetFilter::ParentTarget);
+        // CR 722.3a: Resolve the prepare/unprepare target from the subject.
+        // A targeted subject ("target creature becomes prepared", Biblioplex)
+        // binds to the chosen object via `ParentTarget` at resolution; a
+        // self-referential or anaphoric subject ("this creature becomes
+        // prepared" — Stensian Sanguinist, normalized to `~` → `SelfRef`) uses
+        // the subject's own `affected` filter. Mirrors
+        // `static_affected_for_application`'s targeted-vs-subject split so the
+        // self-reference is preserved instead of collapsing to `ParentTarget`.
+        let target = if application.target.is_some() || application.inherits_parent {
+            crate::types::ability::TargetFilter::ParentTarget
+        } else {
+            application.affected.clone()
+        };
         let effect = match kind {
             PreparedKind::Prepared => Effect::BecomePrepared { target },
             PreparedKind::Unprepared => Effect::BecomeUnprepared { target },
@@ -2566,6 +2697,7 @@ fn try_parse_become_choice(
         effect: Effect::Choose {
             choice_type,
             persist: false,
+            selection: crate::types::ability::TargetSelectionMode::Chosen,
         },
         duration,
         sub_ability,
@@ -3415,6 +3547,13 @@ pub(crate) const PREDICATE_VERBS: &[&str] = &[
     "exile",
     "explore",
     "fight",
+    // CR 705.1: Coin flips — "you flip a coin" / "that player flips a coin" /
+    // "each player flips a coin". The self/player subject is stripped here so the
+    // deconjugated predicate ("flip a coin") re-dispatches through the imperative
+    // path to `Effect::FlipCoin`. The flip arm in `imperative.rs` requires the
+    // literal "a coin", so the Kamigawa "flip <permanent>" flip-card mechanic
+    // ("flip ~" / "flip it", CR 710.4) is never mis-routed to a coin flip.
+    "flip",
     "gain",
     "get",
     "have",
@@ -3511,7 +3650,9 @@ fn add_another_property(filter: TargetFilter) -> TargetFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ability::{AbilityKind, ContinuousModification, Effect, TypeFilter};
+    use crate::types::ability::{
+        AbilityKind, ContinuousModification, ControllerRef, Effect, TypeFilter,
+    };
     use crate::types::card_type::Supertype;
     use crate::types::statics::BlockExceptionKind;
 
@@ -3922,6 +4063,39 @@ mod tests {
                 "chosen object is an anaphoric parent target, not a new target"
             );
         }
+    }
+
+    #[test]
+    fn combat_tax_effect_clause_yojimbo_chapter() {
+        use crate::types::ability::{ContinuousModification, StaticCondition};
+        use crate::types::statics::StaticMode;
+
+        let mut ctx = ParseContext::default();
+        let clause = try_parse_subject_restriction_clause(
+            "Creatures can't attack you unless their controller pays {2} for each of those creatures.",
+            &mut ctx,
+        )
+        .expect("Yojimbo chapter combat tax should parse");
+
+        let Effect::GenericEffect {
+            static_abilities,
+            target,
+            ..
+        } = clause.effect
+        else {
+            panic!("expected GenericEffect combat tax grant");
+        };
+        assert_eq!(target, Some(TargetFilter::SelfRef));
+        assert_eq!(static_abilities.len(), 1);
+        let mods = &static_abilities[0].modifications;
+        let ContinuousModification::GrantStaticAbility { definition } = &mods[0] else {
+            panic!("combat tax effect must grant static onto source");
+        };
+        assert!(matches!(definition.mode, StaticMode::CantAttack));
+        assert!(matches!(
+            definition.condition,
+            Some(StaticCondition::UnlessPay { .. })
+        ));
     }
 
     #[test]
@@ -4463,6 +4637,56 @@ mod tests {
         let result = parse_subject_application("that player", &mut ctx);
         assert!(result.is_some());
         assert_eq!(result.unwrap().affected, TargetFilter::TriggeringPlayer);
+    }
+
+    #[test]
+    fn parse_subject_that_attacking_player_trigger_context_is_triggering_player() {
+        // Issue #1325: "that attacking player" is synonymous with the attack
+        // event's declaring player (CR 506.2 + CR 603.7c).
+        let mut ctx = ParseContext {
+            subject: Some(TargetFilter::Player),
+            relative_player_scope: Some(ControllerRef::DefendingPlayer),
+            card_name: Some("Ellie, Brick Master".to_string()),
+            ..ParseContext::default()
+        };
+        let result = parse_subject_application("that attacking player", &mut ctx);
+        assert!(result.is_some());
+        assert_eq!(
+            result.unwrap().affected,
+            TargetFilter::TriggeringPlayer,
+            "that attacking player must bind to TriggeringPlayer in trigger context"
+        );
+    }
+
+    #[test]
+    fn parse_subject_predicate_that_attacking_player_creates_token() {
+        use crate::parser::oracle_effect::parse_effect_clause;
+        use crate::types::ability::Effect;
+
+        let mut ctx = ParseContext {
+            subject: Some(TargetFilter::Player),
+            relative_player_scope: Some(ControllerRef::DefendingPlayer),
+            card_name: Some("Ellie, Brick Master".to_string()),
+            ..ParseContext::default()
+        };
+        let clause = parse_effect_clause(
+            "that attacking player creates a tapped 1/1 black Fungus Zombie creature token named Cordyceps Infected that's attacking that opponent",
+            &mut ctx,
+        );
+        let Effect::Token {
+            owner,
+            name,
+            tapped,
+            enters_attacking,
+            ..
+        } = &clause.effect
+        else {
+            panic!("expected Token effect, got {:?}", clause.effect);
+        };
+        assert_eq!(*owner, TargetFilter::TriggeringPlayer);
+        assert_eq!(name, "Cordyceps Infected");
+        assert!(*tapped);
+        assert!(*enters_attacking);
     }
 
     #[test]

@@ -96,6 +96,7 @@ pub mod exchange_control;
 // `intensify.rs`, so `intensify.rs` stays implementation-only).
 pub mod cloak;
 pub mod exchange_life;
+pub mod exchange_life_totals;
 pub mod exile_from_top_until;
 pub mod exile_top;
 pub mod exploit;
@@ -390,7 +391,7 @@ pub(crate) fn matches_player_scope(
                             state, value, controller, source_id,
                         );
                         crate::game::players::matches_relation(state, p.id, controller, *relation)
-                            && candidate_player_scalar(p, attr)
+                            && candidate_player_scalar_with_state(state, p, controller, attr)
                                 .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
                     }
                 }
@@ -458,6 +459,41 @@ pub(crate) fn candidate_player_scalar(p: &Player, attr: &QuantityRef) -> Option<
         // CR 122.1f (poison) + CR 122.1: the candidate's named player-counter total.
         QuantityRef::PlayerCounter { kind, .. } => {
             Some(u32_to_i32_saturating(p.player_counter(kind)))
+        }
+        // CR 121.1: cards drawn this turn is tracked per candidate player.
+        QuantityRef::CardsDrawnThisTurn { .. } => {
+            Some(u32_to_i32_saturating(p.cards_drawn_this_turn))
+        }
+        _ => None,
+    }
+}
+
+/// CR 402.1 / 119.1 / 403.3 / 608.2h: Per-candidate scalar lookup that needs game-state
+/// backing (battlefield entry ledger). Used by `PlayerFilter::PlayerAttribute`
+/// in `resolve_player_count` when `candidate_player_scalar` returns `None`.
+pub(crate) fn candidate_player_scalar_with_state(
+    state: &crate::types::game_state::GameState,
+    candidate: &Player,
+    controller: crate::types::player::PlayerId,
+    attr: &QuantityRef,
+) -> Option<i32> {
+    if let Some(value) = candidate_player_scalar(candidate, attr) {
+        return Some(value);
+    }
+    match attr {
+        QuantityRef::BattlefieldEntriesThisTurn { filter, .. } => {
+            Some(crate::game::arithmetic::usize_to_i32_saturating(
+                state
+                    .battlefield_entries_this_turn
+                    .iter()
+                    .filter(|record| {
+                        record.controller == candidate.id
+                            && crate::game::restrictions::battlefield_entry_matches_filter(
+                                record, filter, controller,
+                            )
+                    })
+                    .count(),
+            ))
         }
         _ => None,
     }
@@ -987,10 +1023,57 @@ pub(crate) fn parent_referent_context_from_events(
 
     // CR 608.2c: a later instruction's "that creature" may refer to a single
     // creature an earlier instruction in the same resolution tapped — e.g.
-    // Enlist's "+X/+0 … where X is the tapped creature's power". Tried last so
-    // sacrifice/move/reveal referents continue to take precedence. The tapped
-    // permanent stays on the battlefield, so it is snapshot live.
-    tapped_object_context_from_events(state, events)
+    // Enlist's "+X/+0 … where X is the tapped creature's power". Tried before
+    // the damage referent so sacrifice/move/reveal/tap referents continue to
+    // take precedence. The tapped permanent stays on the battlefield, so it is
+    // snapshot live.
+    if let Some(snapshot) = tapped_object_context_from_events(state, events) {
+        return Some(snapshot);
+    }
+
+    // CR 608.2c: the weakest referent — a later instruction's "that creature"
+    // may refer to the single creature an earlier instruction in the same
+    // resolution dealt damage to (e.g. fight-back templates: "~ deals damage
+    // equal to its power to target creature. That creature deals damage equal
+    // to its power to ~"). A damaged permanent stays on the battlefield, so its
+    // claim is the weakest; sacrifice/move/reveal/tap referents from the same
+    // resolution still win.
+    damaged_object_context_from_events(state, events)
+}
+
+/// CR 608.2c: capture a single creature an earlier instruction dealt damage to
+/// as the resolution's anaphoric referent (the "fight-back clause"). A
+/// multi-target damage parent (e.g. Living Inferno, which deals damage to each
+/// creature) has no singular "that creature", so it yields no snapshot —
+/// Living Inferno is intentionally NOT fixed here; it needs distributive
+/// per-creature resolution this referent does not attempt. Player-targeted
+/// damage (`TargetRef::Player`) is filtered out. The damaged permanent stays on
+/// the battlefield, so it is snapshot live.
+fn damaged_object_context_from_events(
+    state: &GameState,
+    events: &[GameEvent],
+) -> Option<CostPaidObjectSnapshot> {
+    let mut seen = HashSet::new();
+    let mut damaged = events.iter().filter_map(|event| match event {
+        // CR 608.2c: only object-targeted damage introduces a "that creature".
+        GameEvent::DamageDealt {
+            target: TargetRef::Object(object_id),
+            ..
+        } if seen.insert(*object_id) => {
+            state
+                .objects
+                .get(object_id)
+                .map(|obj| CostPaidObjectSnapshot {
+                    object_id: *object_id,
+                    lki: obj.snapshot_for_mana_spent(),
+                })
+        }
+        _ => None,
+    });
+    // CR 608.2c: single-object guard — a multi-target damage parent has no
+    // singular referent.
+    let first = damaged.next()?;
+    damaged.next().is_none().then_some(first)
 }
 
 /// CR 608.2c: capture a single creature tapped by the parent instruction as the
@@ -1162,6 +1245,28 @@ fn try_begin_reflexive_target_selection(
         return Ok(false);
     }
 
+    // CR 608.2c + CR 109.4: Propagate the parent's resolution-scoped
+    // `chosen_players` onto the reflexive ability BEFORE its target slots are
+    // built, so a `ControllerRef::ChosenPlayer`-scoped target filter (Strax's
+    // "fights another target creature THAT PLAYER controls" after a random
+    // "choose a player") enumerates against the game-selected player. The
+    // interactive path achieves this via the answer handler appending to the
+    // stashed continuation chain; the inline (e.g. random-`Choose`) path has no
+    // such stash, so the slot builder would otherwise see an empty
+    // `chosen_players`. Only clones when the parent actually carries choices the
+    // reflexive lacks, preserving the borrow for every ordinary reflexive.
+    let reflexive_owned;
+    let reflexive = if parent.is_some_and(|p| {
+        !p.chosen_players.is_empty() && p.chosen_players.len() > reflexive.chosen_players.len()
+    }) {
+        let mut owned = reflexive.clone();
+        owned.set_chosen_players_recursive(&parent.unwrap().chosen_players);
+        reflexive_owned = owned;
+        &reflexive_owned
+    } else {
+        reflexive
+    };
+
     // CR 700.2b + CR 603.3c: A reflexive MODAL trigger (Caesar, Legion's
     // Emperor) chooses its mode(s) when it is put on the stack — after the
     // optional cost was paid. Its own effect is a target-less modal marker, so
@@ -1322,6 +1427,41 @@ fn try_begin_reflexive_target_selection(
         description: trigger_description,
     };
     Ok(true)
+}
+
+/// CR 120.1 + CR 608.2c + CR 115.10a: the "one-sided fight" chain shape — a
+/// boost head ("Target creature you control gets +N/+M …") followed by a
+/// `DealDamage`/`DamageAll` sub whose `damage_source = Target` ("It deals damage
+/// equal to its power to target creature an opponent controls"). The anaphoric
+/// "It"/"its power" names the creature the boost head chose, NOT the sub's own
+/// fresh recipient (CR 608.2c — read the whole text). The sub carries only its
+/// recipient in `targets` (it was assigned its own target slot in declaration
+/// order), so the damage source (and the `Power{Anaphoric}` amount the runtime
+/// resolves to `targets[0]`) would otherwise read the recipient. This predicate
+/// recognizes that sub so the chain descent can prepend the parent's chosen
+/// object target, restoring the `targets = [source, recipient]` contract the
+/// `deal_damage` resolver (CR 120.1: the object that deals damage is the source)
+/// and the `quantity::resolve_object_pt` one-sided-fight fallback both expect.
+fn is_one_sided_fight_damage_sub(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::DealDamage {
+            damage_source: Some(crate::types::ability::DamageSource::Target),
+            ..
+        } | Effect::DamageAll {
+            damage_source: Some(crate::types::ability::DamageSource::Target),
+            ..
+        }
+    )
+}
+
+/// The first `TargetRef::Object` in a target list (the chain head's chosen
+/// creature for the one-sided-fight prepend).
+fn first_object_target(targets: &[TargetRef]) -> Option<ObjectId> {
+    targets.iter().find_map(|t| match t {
+        TargetRef::Object(id) => Some(*id),
+        TargetRef::Player(_) => None,
+    })
 }
 
 fn apply_parent_chain_context(
@@ -2510,6 +2650,7 @@ pub fn resolve_effect(
         Effect::CollectEvidence { .. } => collect_evidence::resolve(state, ability, events),
         Effect::SetLifeTotal { .. } => life::resolve_set_life_total(state, ability, events),
         Effect::ExchangeLifeWithStat { .. } => exchange_life::resolve(state, ability, events),
+        Effect::ExchangeLifeTotals { .. } => exchange_life_totals::resolve(state, ability, events),
         Effect::SetDayNight { to } => {
             crate::game::day_night::resolve_set_day_night(state, *to, events);
             Ok(())
@@ -2708,6 +2849,7 @@ fn quantity_expr_references_tracked_set(qty: &QuantityExpr) -> bool {
                 qty,
                 QuantityRef::TrackedSetSize
                     | QuantityRef::FilteredTrackedSetSize { .. }
+                    | QuantityRef::TrackedSetAggregate { .. }
                     | QuantityRef::DistinctCardTypes {
                         source: CardTypeSetSource::TrackedSet { .. }
                     }
@@ -3128,6 +3270,20 @@ fn mandatory_parent_effect_performed(effect: &Effect, events: &[GameEvent]) -> b
                     action: PlayerActionKind::SearchedLibrary,
                     ..
                 }
+            )
+        }),
+        // CR 110.2 + CR 608.2c: "that player gains control of ~. If they do, …"
+        // gates the rider on whether control actually changed (Kain, Traitorous
+        // Dragoon). `resolve_give` emits `EffectResolved` and, when the
+        // recipient differs from the object's current controller,
+        // `ControllerChanged`.
+        Effect::GiveControl { .. } => events.iter().any(|event| {
+            matches!(
+                event,
+                GameEvent::EffectResolved {
+                    kind: crate::types::ability::EffectKind::GiveControl,
+                    ..
+                } | GameEvent::ControllerChanged { .. }
             )
         }),
         _ => true,
@@ -3755,6 +3911,25 @@ fn optional_prompt_player(state: &GameState, ability: &ResolvedAbility) -> Playe
             }
         }
     }
+
+    // CR 503.1a + CR 608.2d (issue #1535): per-player upkeep optional effects
+    // ("that player may put a card from their hand ...") route the prompt to
+    // the scoped player, not the ability's controller (Braids, Conjurer Adept).
+    if let Some(scoped) = ability.scoped_player {
+        if let Effect::ChangeZone { target, .. } = &ability.effect {
+            if filter_uses_relative_controller_scoped(target) {
+                return scoped;
+            }
+        }
+        if ability
+            .effect
+            .target_filter()
+            .is_some_and(filter_uses_relative_controller_scoped)
+        {
+            return scoped;
+        }
+    }
+
     ability.controller
 }
 
@@ -3812,10 +3987,41 @@ fn hydrate_event_context_targets<'a>(
     Cow::Owned(resolved)
 }
 
+/// CR 603.2: Filters that auto-resolve from `state.current_trigger_event` during
+/// hydration / unless-pay payer resolution (issue #2361, Kain #1335).
+fn hydratable_event_context_filter(filter: &TargetFilter) -> bool {
+    matches!(
+        filter,
+        TargetFilter::TriggeringSpellController
+            | TargetFilter::TriggeringSpellOwner
+            | TargetFilter::TriggeringPlayer
+            | TargetFilter::TriggeringSource
+            | TargetFilter::DefendingPlayer
+            | TargetFilter::ParentTargetController
+            | TargetFilter::ParentTarget
+            | TargetFilter::StackSpell
+    )
+}
+
 /// CR 603.2: Extract an event-context target filter from an effect, if present.
 /// Returns the filter only for event-context variants (TriggeringSpellController, etc.)
 /// that auto-resolve from `state.current_trigger_event` at resolution time.
 fn extract_event_context_filter(effect: &Effect) -> Option<&TargetFilter> {
+    // CR 110.2 + CR 603.7c: `GiveControl` carries both an object `target` and a
+    // `recipient`. Kain ("that player gains control of Kain") binds the recipient
+    // to `TriggeringPlayer` while the object is `SelfRef` — only the recipient
+    // is an event-context player ref and must be hydrated into `ability.targets`
+    // when empty (issue #1335).
+    if let Effect::GiveControl { target, recipient } = effect {
+        if hydratable_event_context_filter(recipient) {
+            return Some(recipient);
+        }
+        if hydratable_event_context_filter(target) {
+            return Some(target);
+        }
+        return None;
+    }
+
     let filter = match effect {
         Effect::DealDamage { target, .. }
         | Effect::Pump { target, .. }
@@ -3874,7 +4080,6 @@ fn extract_event_context_filter(effect: &Effect) -> Option<&TargetFilter> {
         | Effect::SkipNextStep { target, .. }
         | Effect::ControlNextTurn { target, .. }
         | Effect::AdditionalPhase { target, .. }
-        | Effect::GiveControl { target, .. }
         | Effect::Detain { target, .. }
         | Effect::TargetOnly { target } => target,
         // CR 701.26a/b + CR 603.7c: only the single-permanent tap/untap exposes
@@ -3908,17 +4113,7 @@ fn extract_event_context_filter(effect: &Effect) -> Option<&TargetFilter> {
         _ => return None,
     };
 
-    if matches!(
-        filter,
-        TargetFilter::TriggeringSpellController
-            | TargetFilter::TriggeringSpellOwner
-            | TargetFilter::TriggeringPlayer
-            | TargetFilter::TriggeringSource
-            | TargetFilter::DefendingPlayer
-            | TargetFilter::ParentTargetController
-            | TargetFilter::ParentTarget
-            | TargetFilter::StackSpell
-    ) {
+    if hydratable_event_context_filter(filter) {
         Some(filter)
     } else {
         None
@@ -4243,6 +4438,38 @@ fn resolve_chain_body(
         Cow::Borrowed(ability)
     };
     let ability = ability.as_ref();
+
+    // CR 608.2d (override) + CR 701.9b (analogous) + CR 109.4: A random
+    // `Effect::Choose` ("choose a player at random") or `Effect::ChooseFromZone`
+    // ("choose one of them at random") is resolved here, at the chain resolution
+    // point where a mutable ability is available, so the game-selected value
+    // lands on `chosen_players` / `targets` BEFORE the chain descends to a
+    // dependent sub (Strax's reflexive Fight scoped to the chosen player; River
+    // Song's Diary's `CastFromZone { target: ParentTarget }`). No interactive
+    // `WaitingFor::NamedChoice` / `ChooseFromZoneChoice` is raised. This mirrors
+    // the resolution-point handling of `TargetSelectionMode::Random` for targets.
+    let random_choice_owned;
+    let random_is_choose = matches!(
+        &ability.effect,
+        Effect::Choose { selection, .. }
+            if matches!(selection, crate::types::ability::TargetSelectionMode::Random)
+    );
+    let random_is_choose_from_zone = matches!(
+        &ability.effect,
+        Effect::ChooseFromZone { selection, .. } if selection.is_random()
+    );
+    let (ability, random_choice_resolved) = if random_is_choose || random_is_choose_from_zone {
+        let mut owned = ability.clone();
+        if random_is_choose {
+            choose::resolve_random_in_chain(state, &mut owned, events);
+        } else {
+            choose_from_zone::resolve_random_in_chain(state, &mut owned, events);
+        }
+        random_choice_owned = owned;
+        (&random_choice_owned, true)
+    } else {
+        (ability, false)
+    };
 
     if effect_depends_on_missing_chosen_player(ability) {
         state.cost_payment_failed_flag = true;
@@ -4923,11 +5150,14 @@ fn resolve_chain_body(
     // CR 603.7: Snapshot event count so we can detect objects moved by this effect.
     let events_before = events.len();
 
-    // Skip no-op unimplemented/runtime-handled effects
-    if !matches!(
-        ability.effect,
-        Effect::Unimplemented { .. } | Effect::RuntimeHandled { .. }
-    ) {
+    // Skip no-op unimplemented/runtime-handled effects, and a random
+    // `Effect::Choose` already resolved above by `resolve_random_in_chain`.
+    if !random_choice_resolved
+        && !matches!(
+            ability.effect,
+            Effect::Unimplemented { .. } | Effect::RuntimeHandled { .. }
+        )
+    {
         let hydrated = hydrate_event_context_targets(state, ability);
         let effective = hydrated.as_ref();
 
@@ -5261,6 +5491,21 @@ fn resolve_chain_body(
     // links via `TargetFilter::ExiledBySource`. Either way, skip the outer
     // chain to avoid double-execution.
     if matches!(ability.effect, Effect::ExileFromTopUntil { .. }) {
+        return Ok(());
+    }
+
+    // CR 701.44d: `ExploreAll` is the single authority for its own sub_ability
+    // chain. `explore::resolve_single_explorer` carries `ability.sub_ability`
+    // onto the terminal explorer (and synthesizes the per-explorer `TrackedSet`
+    // continuation between explorers). If the generic chain walker ALSO
+    // processed the sub here, a paused explore (the nonland `DigChoice`) would
+    // re-prepend the sub onto `pending_continuation` a SECOND time. For a
+    // synthesized `ExploreAll { TrackedSet }` continuation that second prepend
+    // chains it to itself, producing a self-renewing loop that re-explores the
+    // same permanent every time the choice resolves — Hakbal of the Surging
+    // Soul accrued unbounded +1/+1 counters this way. Mirror the
+    // `ExileFromTopUntil` guard above and skip the outer chain.
+    if matches!(ability.effect, Effect::ExploreAll { .. }) {
         return Ok(());
     }
 
@@ -5665,6 +5910,36 @@ fn resolve_chain_body(
             return Ok(());
         }
 
+        // CR 120.1 + CR 608.2c + CR 115.10a: one-sided-fight chain — the boost
+        // head ("Target creature you control gets +N/+M …") chose the creature
+        // that the trailing `DealDamage { damage_source = Target }` sub's "It"
+        // anaphor names. The sub was assigned its OWN recipient slot in
+        // declaration order, so its `targets` hold only the fresh opponent
+        // recipient. Per CR 120.1 the object that deals the damage is the boosted
+        // creature (the parent's chosen object target), and per CR 608.2c "It"/
+        // "its power" refer to that same creature — not the recipient. Prepend
+        // the parent's chosen object so the sub resolves with the contract the
+        // `deal_damage` resolver and `quantity::resolve_object_pt`'s
+        // one-sided-fight fallback expect: `targets = [source, recipient]`
+        // (source = `targets[0]`, recipients = `targets[1..]`). Guarded on the
+        // parent already carrying an object target and the source not already
+        // being `targets[0]`, so it is a no-op for every other chain shape.
+        if is_one_sided_fight_damage_sub(&sub.effect) && !sub.targets.is_empty() {
+            if let Some(source) = first_object_target(&ability.targets) {
+                if first_object_target(&sub.targets) != Some(source) {
+                    let mut sub_with_source = sub.as_ref().clone();
+                    sub_with_source.targets.insert(0, TargetRef::Object(source));
+                    apply_parent_chain_context(
+                        &mut sub_with_source,
+                        ability,
+                        effect_context_object.as_ref(),
+                    );
+                    resolve_ability_chain(state, &sub_with_source, events, depth + 1)?;
+                    return Ok(());
+                }
+            }
+        }
+
         // Apply forward_result: moved object becomes sub's source.
         //
         // CR 303.4f: Aura entering by non-spell means — controller chooses the enchanted object.
@@ -5907,32 +6182,93 @@ pub(crate) fn evaluate_condition(
         // GameObject at cast resolution, and propagated back into the trigger's
         // resolved-ability context for ETB triggers).
         AbilityCondition::AdditionalCostPaid {
+            subject,
             source,
             origin,
             origin_ordinal,
             variant,
             kicker_cost,
             min_count,
-        } => {
-            if let Some(origin) = origin {
-                let count = origin_ordinal.map_or_else(
-                    || ability.context.instance_payment_count(*origin),
-                    |ordinal| {
-                        ability
-                            .context
-                            .instance_payment_count_for_ordinal(*origin, ordinal)
-                    },
-                );
-                count >= (*min_count).max(1)
-            } else {
-                ability.context.additional_cost_paid_matches(
-                    *source,
-                    *variant,
-                    kicker_cost.as_ref(),
-                    *min_count,
-                )
+        } => match subject {
+            // CR 113.7: Source-relative payments live in the resolving ability's
+            // own SpellContext. `Anaphoric`/`Demonstrative` "it"/"that spell"
+            // back-references resolve to the source's context here, mirroring the
+            // trigger path (the legacy kicker/Gift/Buyback/Casualty/Replicate class).
+            crate::types::ability::ObjectScope::Source
+            | crate::types::ability::ObjectScope::Anaphoric
+            | crate::types::ability::ObjectScope::Demonstrative => {
+                if let Some(origin) = origin {
+                    let count = origin_ordinal.map_or_else(
+                        || ability.context.instance_payment_count(*origin),
+                        |ordinal| {
+                            ability
+                                .context
+                                .instance_payment_count_for_ordinal(*origin, ordinal)
+                        },
+                    );
+                    count >= (*min_count).max(1)
+                } else {
+                    ability.context.additional_cost_paid_matches(
+                        *source,
+                        *variant,
+                        kicker_cost.as_ref(),
+                        *min_count,
+                    )
+                }
             }
-        }
+            // CR 115.1 + CR 608.2c + CR 702.33d: Target-relative payments — "counter
+            // target spell if it was kicked" (Ertai's Trickery): "it" anaphors to the
+            // first object target (the countered spell), so we read that object's
+            // cast-time payments stamped on its GameObject, not the source context.
+            // Mirrors the trigger evaluation in `triggers.rs` precisely.
+            crate::types::ability::ObjectScope::Target => {
+                if kicker_cost.is_some() && variant.is_none() {
+                    return false;
+                }
+                let Some(id) = ability.targets.iter().find_map(|t| match t {
+                    crate::types::ability::TargetRef::Object(id) => Some(*id),
+                    crate::types::ability::TargetRef::Player(_) => None,
+                }) else {
+                    return false;
+                };
+                let Some(obj) = state.objects.get(&id) else {
+                    return false;
+                };
+                match variant {
+                    Some(kicker) => obj.kickers_paid.contains(kicker),
+                    None => {
+                        let non_kicker_count = if let Some(origin) = origin {
+                            origin_ordinal.map_or_else(
+                                || obj.instance_payment_count(*origin),
+                                |ordinal| obj.instance_payment_count_for_ordinal(*origin, ordinal),
+                            )
+                        } else if obj.additional_cost_payments.is_empty() {
+                            obj.additional_cost_payment_count
+                        } else {
+                            obj.additional_cost_payments
+                                .iter()
+                                .map(|payment| payment.count)
+                                .sum()
+                        };
+                        crate::types::ability::additional_cost_payment_count_matches(
+                            *source,
+                            non_kicker_count > 0 || !obj.kickers_paid.is_empty(),
+                            obj.kickers_paid.len(),
+                            non_kicker_count,
+                            *min_count,
+                        )
+                    }
+                }
+            }
+            // No additional-cost-read semantics exist for these scopes: a
+            // recipient/event/cost-paid referent never carries the "if it was
+            // kicked" casting-payment question, which is only ever asked of the
+            // resolving spell/ability (Source) or the targeted spell (Target).
+            crate::types::ability::ObjectScope::Recipient
+            | crate::types::ability::ObjectScope::EventSource
+            | crate::types::ability::ObjectScope::CostPaidObject
+            | crate::types::ability::ObjectScope::EventTarget => false,
+        },
         AbilityCondition::AlternativeManaCostPaid => ability.context.alternative_mana_cost_paid,
         AbilityCondition::EffectOutcome {
             signal: EffectOutcomeSignal::OptionalEffectPerformed,
@@ -7580,6 +7916,7 @@ mod tests {
             track_exiled_by_source: false,
             face_down_profile: None,
             count_param: 0,
+            is_cost_payment: false,
         };
 
         crate::game::engine::apply(
@@ -8350,6 +8687,7 @@ mod tests {
             Effect::Choose {
                 choice_type: ChoiceType::Keyword { options: vec![] },
                 persist: false,
+                selection: crate::types::ability::TargetSelectionMode::Chosen,
             },
             vec![],
             ObjectId(100),
@@ -8419,6 +8757,7 @@ mod tests {
                 chooser: Chooser::Controller,
                 up_to: false,
                 constraint: None,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
             },
             vec![],
             ObjectId(100),
@@ -8557,6 +8896,8 @@ mod tests {
             Effect::Manifest {
                 target: TargetFilter::ParentTargetController,
                 count: QuantityExpr::Fixed { value: 1 },
+                profile: None,
+                enters_under: None,
             },
             vec![],
             ObjectId(100),
@@ -8854,6 +9195,85 @@ mod tests {
             card_names: vec!["A".into(), "B".into()],
         }];
         assert!(revealed_object_context_from_events(&state, &events).is_none());
+    }
+
+    /// CR 608.2c: a single object-targeted `DamageDealt` introduces a
+    /// fight-back referent ("that creature deals damage equal to its power").
+    #[test]
+    fn damaged_object_context_reads_single_object_damage() {
+        let mut state = GameState::new_two_player(42);
+        let creature = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Five Power Creature".to_string(),
+            Zone::Battlefield,
+        );
+        let events = vec![GameEvent::DamageDealt {
+            source_id: ObjectId(99),
+            target: TargetRef::Object(creature),
+            amount: 3,
+            is_combat: false,
+            excess: 0,
+        }];
+
+        let snapshot = damaged_object_context_from_events(&state, &events)
+            .expect("a single object-targeted damage event should provide a referent");
+        assert_eq!(snapshot.object_id, creature);
+        assert_eq!(snapshot.lki.name, "Five Power Creature");
+    }
+
+    /// CR 608.2c: a multi-target damage parent (e.g. Living Inferno) has no
+    /// singular "that creature" — the single-object guard declines it.
+    #[test]
+    fn damaged_object_context_ignores_multi_target_damage() {
+        let mut state = GameState::new_two_player(42);
+        let a = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "A".into(),
+            Zone::Battlefield,
+        );
+        let b = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "B".into(),
+            Zone::Battlefield,
+        );
+        let events = vec![
+            GameEvent::DamageDealt {
+                source_id: ObjectId(99),
+                target: TargetRef::Object(a),
+                amount: 1,
+                is_combat: false,
+                excess: 0,
+            },
+            GameEvent::DamageDealt {
+                source_id: ObjectId(99),
+                target: TargetRef::Object(b),
+                amount: 1,
+                is_combat: false,
+                excess: 0,
+            },
+        ];
+        assert!(damaged_object_context_from_events(&state, &events).is_none());
+        assert!(parent_referent_context_from_events(&state, &events).is_none());
+    }
+
+    /// CR 608.2c: player-targeted damage carries no "that creature" referent.
+    #[test]
+    fn damaged_object_context_ignores_player_damage() {
+        let state = GameState::new_two_player(42);
+        let events = vec![GameEvent::DamageDealt {
+            source_id: ObjectId(99),
+            target: TargetRef::Player(PlayerId(1)),
+            amount: 3,
+            is_combat: false,
+            excess: 0,
+        }];
+        assert!(damaged_object_context_from_events(&state, &events).is_none());
     }
 
     /// Two separate `CardsRevealed` events → ambiguous "it" → no referent.
@@ -11721,6 +12141,7 @@ mod tests {
             track_exiled_by_source: false,
             face_down_profile: None,
             count_param: 0,
+            is_cost_payment: false,
         };
         state.pending_continuation =
             Some(PendingContinuation::new(Box::new(ResolvedAbility::new(
@@ -11757,6 +12178,7 @@ mod tests {
                 track_exiled_by_source: false,
                 face_down_profile: None,
                 count_param: 0,
+                is_cost_payment: false,
             },
             GameAction::SelectCards {
                 cards: vec![second],
@@ -14772,6 +15194,87 @@ mod tests {
         ));
     }
 
+    /// CR 115.1 + CR 608.2c + CR 702.33d: `AdditionalCostPaid { subject }` reads
+    /// the *target spell's* `kickers_paid` under `ObjectScope::Target`, and the
+    /// resolving ability's own (empty) context under `ObjectScope::Source`. This
+    /// is the building-block guard behind Ertai's Trickery: the Target path must
+    /// see the target's kicker state while the Source path stays blind to it,
+    /// proving the two scopes evaluate independently.
+    #[test]
+    fn evaluate_condition_additional_cost_paid_target_reads_target_object() {
+        let mut state = GameState::new_two_player(42);
+
+        // Target spell object whose kicker WAS paid at cast time.
+        let mut kicked = crate::game::game_object::GameObject::new(
+            ObjectId(7),
+            CardId(700),
+            PlayerId(0),
+            "Kickable Brute".to_string(),
+            Zone::Stack,
+        );
+        kicked
+            .kickers_paid
+            .push(crate::types::ability::KickerVariant::First);
+        state.objects.insert(ObjectId(7), kicked);
+
+        // Target spell object whose kicker was NOT paid.
+        let unkicked = crate::game::game_object::GameObject::new(
+            ObjectId(8),
+            CardId(700),
+            PlayerId(0),
+            "Kickable Brute".to_string(),
+            Zone::Stack,
+        );
+        state.objects.insert(ObjectId(8), unkicked);
+
+        let target_condition = AbilityCondition::additional_cost_paid_target();
+
+        // ObjectScope::Target reads the FIRST object target's kicker state.
+        let counter_kicked = ResolvedAbility::new(
+            Effect::Counter {
+                target: TargetFilter::Any,
+                source_rider: None,
+            },
+            vec![TargetRef::Object(ObjectId(7))],
+            ObjectId(99),
+            PlayerId(1),
+        );
+        assert!(
+            evaluate_condition(&target_condition, &state, &counter_kicked),
+            "Target subject must see the kicked target's kickers_paid"
+        );
+
+        let counter_unkicked = ResolvedAbility::new(
+            Effect::Counter {
+                target: TargetFilter::Any,
+                source_rider: None,
+            },
+            vec![TargetRef::Object(ObjectId(8))],
+            ObjectId(99),
+            PlayerId(1),
+        );
+        assert!(
+            !evaluate_condition(&target_condition, &state, &counter_unkicked),
+            "Target subject must report false when the target was not kicked"
+        );
+
+        // The same ability under ObjectScope::Source reads its OWN empty context,
+        // not the target object — proving the two paths are independent.
+        let source_condition = AbilityCondition::AdditionalCostPaid {
+            subject: crate::types::ability::ObjectScope::Source,
+            source: crate::types::ability::AdditionalCostPaymentSource::Any,
+            origin: None,
+            origin_ordinal: None,
+            variant: None,
+            kicker_cost: None,
+            min_count: 1,
+        };
+        assert!(
+            !evaluate_condition(&source_condition, &state, &counter_kicked),
+            "Source subject must ignore the target's kicker and read the (empty) own context"
+        );
+    }
+
     /// CR 608.2c + CR 700.1: Currency Converter — "Put a card exiled with this
     /// artifact into its owner's graveyard. If it's a land card, create a
     /// Treasure token. If it's a nonland card, create a 2/2 black Rogue
@@ -17589,6 +18092,8 @@ mod tests {
             target: TargetFilter::Any,
             retarget: crate::types::ability::CopyRetargetPermission::MayChooseNewTargets,
             copier: None,
+            additional_modifications: Vec::new(),
+            starting_loyalty_from_casualty_sacrifice: false,
         };
 
         // A copy was put on the stack → the effect was performed → the negated
@@ -17610,6 +18115,34 @@ mod tests {
         assert!(
             !mandatory_parent_effect_performed(&copy, &not_made),
             "a CopySpell that made no copy is NOT 'performed' — the draw rider must run"
+        );
+    }
+
+    /// CR 110.2 + CR 608.2c (issue #1335): Kain's "that player gains control of
+    /// Kain. If they do, …" gates the rider on whether control actually
+    /// transferred. `GiveControl` counts as performed only when
+    /// `ControllerChanged` or a `GiveControl` `EffectResolved` is emitted.
+    #[test]
+    fn give_control_performed_tracks_controller_changed_event() {
+        let give = Effect::GiveControl {
+            target: TargetFilter::SelfRef,
+            recipient: TargetFilter::TriggeringPlayer,
+        };
+
+        let transferred = [GameEvent::ControllerChanged {
+            object_id: ObjectId(1),
+            old_controller: PlayerId(0),
+            new_controller: PlayerId(1),
+        }];
+        assert!(
+            mandatory_parent_effect_performed(&give, &transferred),
+            "GiveControl that changed controllers is 'performed'"
+        );
+
+        let not_transferred: [GameEvent; 0] = [];
+        assert!(
+            !mandatory_parent_effect_performed(&give, &not_transferred),
+            "GiveControl that failed must not seed the if-they-do rider"
         );
     }
 

@@ -2186,6 +2186,26 @@ pub fn casualty_copy_ability_definition() -> AbilityDefinition {
 }
 
 fn casualty_copy_ability_definition_for_ordinal(origin_ordinal: Option<u32>) -> AbilityDefinition {
+    casualty_copy_ability_definition_for_ordinal_with_rider(origin_ordinal, &[], false)
+}
+
+fn casualty_copy_rider_from_oracle(oracle: &str) -> (Vec<ContinuousModification>, bool) {
+    let lower = oracle.to_lowercase();
+    let mut modifications = Vec::new();
+    if lower.contains("the copy isn't legendary") || lower.contains("the copy is not legendary") {
+        modifications.push(ContinuousModification::RemoveSupertype {
+            supertype: Supertype::Legendary,
+        });
+    }
+    let starting_loyalty = lower.contains("has starting loyalty");
+    (modifications, starting_loyalty)
+}
+
+fn casualty_copy_ability_definition_for_ordinal_with_rider(
+    origin_ordinal: Option<u32>,
+    additional_modifications: &[ContinuousModification],
+    starting_loyalty_from_casualty_sacrifice: bool,
+) -> AbilityDefinition {
     AbilityDefinition::new(
         AbilityKind::Spell,
         // CR 702.153a: Casualty — "If the spell has any targets, you may choose
@@ -2194,9 +2214,12 @@ fn casualty_copy_ability_definition_for_ordinal(origin_ordinal: Option<u32>) -> 
             target: TargetFilter::SelfRef,
             retarget: CopyRetargetPermission::MayChooseNewTargets,
             copier: None,
+            additional_modifications: additional_modifications.to_vec(),
+            starting_loyalty_from_casualty_sacrifice,
         },
     )
     .condition(AbilityCondition::AdditionalCostPaid {
+        subject: ObjectScope::Source,
         source: AdditionalCostPaymentSource::NonKicker,
         origin: Some(AdditionalCostOrigin::Casualty),
         origin_ordinal,
@@ -2245,9 +2268,18 @@ pub fn synthesize_casualty(face: &mut CardFace) {
 
     // CR 702.153a: "When you cast this spell, if a casualty cost was paid, copy it.
     // If the spell has any targets, you may choose new targets for the copy."
+    let (casualty_copy_mods, starting_loyalty) = face
+        .oracle_text
+        .as_deref()
+        .map(casualty_copy_rider_from_oracle)
+        .unwrap_or_default();
     for (casualty_ordinal, _) in casualty_thresholds.iter().enumerate() {
         let casualty_ordinal = u32::try_from(casualty_ordinal).unwrap_or(u32::MAX);
-        let execute = casualty_copy_ability_definition_for_ordinal(Some(casualty_ordinal));
+        let execute = casualty_copy_ability_definition_for_ordinal_with_rider(
+            Some(casualty_ordinal),
+            &casualty_copy_mods,
+            starting_loyalty,
+        );
         let already_has_trigger = face.triggers.iter().any(|t| {
             matches!(t.mode, TriggerMode::SpellCast)
                 && matches!(t.valid_card, Some(TargetFilter::SelfRef))
@@ -2298,6 +2330,8 @@ pub(crate) fn replicate_copy_ability_definition_for_ordinal(
             target: TargetFilter::SelfRef,
             retarget: CopyRetargetPermission::MayChooseNewTargets,
             copier: None,
+            additional_modifications: Vec::new(),
+            starting_loyalty_from_casualty_sacrifice: false,
         },
     )
     // CR 702.56a: "if a replicate cost was paid for it". With zero payments the
@@ -2305,6 +2339,7 @@ pub(crate) fn replicate_copy_ability_definition_for_ordinal(
     // no-op (no SpellCopied events) when replicate was declined, matching the
     // intervening-if phrasing exactly.
     .condition(AbilityCondition::AdditionalCostPaid {
+        subject: ObjectScope::Source,
         source: AdditionalCostPaymentSource::NonKicker,
         origin: Some(AdditionalCostOrigin::Replicate),
         origin_ordinal,
@@ -2416,6 +2451,8 @@ pub fn demonstrate_copy_ability_definition() -> AbilityDefinition {
             target: TargetFilter::SelfRef,
             retarget: CopyRetargetPermission::MayChooseNewTargets,
             copier: Some(ControllerRef::Opponent),
+            additional_modifications: Vec::new(),
+            starting_loyalty_from_casualty_sacrifice: false,
         },
     )
     .description(
@@ -2430,6 +2467,8 @@ pub fn demonstrate_copy_ability_definition() -> AbilityDefinition {
             target: TargetFilter::SelfRef,
             retarget: CopyRetargetPermission::MayChooseNewTargets,
             copier: None,
+            additional_modifications: Vec::new(),
+            starting_loyalty_from_casualty_sacrifice: false,
         },
     )
     .optional()
@@ -2587,6 +2626,8 @@ pub fn conspire_copy_ability_definition() -> AbilityDefinition {
             target: TargetFilter::SelfRef,
             retarget: CopyRetargetPermission::MayChooseNewTargets,
             copier: None,
+            additional_modifications: Vec::new(),
+            starting_loyalty_from_casualty_sacrifice: false,
         },
     )
     .condition(AbilityCondition::additional_cost_paid_any())
@@ -2629,6 +2670,8 @@ pub fn gravestorm_copy_ability_definition() -> AbilityDefinition {
             target: TargetFilter::SelfRef,
             retarget: CopyRetargetPermission::MayChooseNewTargets,
             copier: None,
+            additional_modifications: Vec::new(),
+            starting_loyalty_from_casualty_sacrifice: false,
         },
     );
     // CR 702.69a: "copy it for each permanent that was put into a graveyard from
@@ -8656,6 +8699,7 @@ pub fn synthesize_read_ahead(face: &mut CardFace) {
                 max: final_chapter.min(u8::MAX as u32) as u8,
             },
             persist: true,
+            selection: crate::types::ability::TargetSelectionMode::Chosen,
         },
     )
     .sub_ability(AbilityDefinition::new(
@@ -9325,6 +9369,7 @@ pub fn synthesize_siege_intrinsics(face: &mut CardFace) {
                 Some(Effect::Choose {
                     choice_type: ChoiceType::Opponent { .. },
                     persist: true,
+                    ..
                 })
             )
     });
@@ -9341,6 +9386,7 @@ pub fn synthesize_siege_intrinsics(face: &mut CardFace) {
             Effect::Choose {
                 choice_type: ChoiceType::Opponent { restriction: None },
                 persist: true,
+                selection: crate::types::ability::TargetSelectionMode::Chosen,
             },
         )));
         face.replacements.push(protector_replacement);
@@ -9444,6 +9490,7 @@ pub fn synthesize_tribute_intrinsics(face: &mut CardFace) {
                 Some(Effect::Choose {
                     choice_type: ChoiceType::Opponent { .. },
                     persist: true,
+                    ..
                 }),
             )
             && r.execute
@@ -9465,6 +9512,7 @@ pub fn synthesize_tribute_intrinsics(face: &mut CardFace) {
         Effect::Choose {
             choice_type: ChoiceType::Opponent { restriction: None },
             persist: true,
+            selection: crate::types::ability::TargetSelectionMode::Chosen,
         },
     )
     .sub_ability(tribute_stage);
@@ -16414,6 +16462,7 @@ mod siege_synthesis_tests {
             Some(Effect::Choose {
                 choice_type: ChoiceType::Opponent { .. },
                 persist: true,
+                ..
             })
         ));
     }
@@ -17570,6 +17619,48 @@ mod idempotency_tests {
             "intrinsic casualty trigger's execute must equal the canonical \
              casualty_copy_ability_definition() — single source of truth for \
              both intrinsic and dynamically-granted casualty"
+        );
+    }
+
+    #[test]
+    fn synthesize_casualty_ob_nixilis_rider_strips_legendary_and_sets_starting_loyalty() {
+        let mut face = CardFace::default();
+        face.card_type.core_types.push(CoreType::Planeswalker);
+        face.card_type.supertypes.push(Supertype::Legendary);
+        face.keywords.push(Keyword::Casualty(1));
+        face.oracle_text = Some(
+            "Casualty X. The copy isn't legendary and has starting loyalty X. \
+             (As you cast this spell, you may sacrifice a creature with power X. \
+             When you do, copy this spell. The copy becomes a token.)"
+                .to_string(),
+        );
+        synthesize_casualty(&mut face);
+
+        let execute = face
+            .triggers
+            .first()
+            .and_then(|t| t.execute.as_ref())
+            .expect("casualty trigger");
+        let Effect::CopySpell {
+            additional_modifications,
+            starting_loyalty_from_casualty_sacrifice,
+            ..
+        } = &*execute.effect
+        else {
+            panic!(
+                "expected CopySpell casualty execute, got {:?}",
+                execute.effect
+            );
+        };
+        assert!(
+            additional_modifications.contains(&ContinuousModification::RemoveSupertype {
+                supertype: Supertype::Legendary,
+            }),
+            "Ob Nixilis rider must strip legendary from the copy"
+        );
+        assert!(
+            *starting_loyalty_from_casualty_sacrifice,
+            "Ob Nixilis rider must set starting loyalty from the casualty sacrifice"
         );
     }
 }
@@ -22221,6 +22312,7 @@ mod devour_synthesis_tests {
         let Effect::Choose {
             choice_type: ChoiceType::NumberRange { min, max },
             persist,
+            ..
         } = &*execute.effect
         else {
             panic!("read-ahead ETB should choose a number");
@@ -24700,6 +24792,7 @@ mod demonstrate_synthesis_tests {
                 target: TargetFilter::SelfRef,
                 retarget: CopyRetargetPermission::MayChooseNewTargets,
                 copier: None,
+                ..
             }
         ));
         // Opponent's copy — sub-ability with the opponent copier, may retarget.
@@ -24710,6 +24803,7 @@ mod demonstrate_synthesis_tests {
                 target: TargetFilter::SelfRef,
                 retarget: CopyRetargetPermission::MayChooseNewTargets,
                 copier: Some(ControllerRef::Opponent),
+                ..
             }
         ));
     }

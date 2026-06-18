@@ -1539,7 +1539,14 @@ pub(super) fn handle_resolution_choice(
                 events,
             );
             if let Some(cont) = state.pending_continuation.as_mut() {
-                cont.chain.targets = unkept
+                // CR 608.2c: Hideaway / "exile one face down" sub-abilities bind
+                // ParentTarget to the kept (exiled) card; hand-routing tails like
+                // Expressive Iteration bind ParentTarget to the unkept pile.
+                let continuation_targets = match kept_destination {
+                    Some(Zone::Exile) => kept.clone(),
+                    _ => unkept.clone(),
+                };
+                cont.chain.targets = continuation_targets
                     .iter()
                     .map(|&id| TargetRef::Object(id))
                     .collect();

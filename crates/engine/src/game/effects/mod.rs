@@ -18274,9 +18274,9 @@ mod tests {
     #[test]
     fn expressive_iteration_dig_chain_reaches_library_bottom_and_exile() {
         use crate::game::engine;
-        use crate::types::actions::GameAction;
         use crate::types::ability::CastingPermission;
         use crate::types::ability::Duration;
+        use crate::types::actions::GameAction;
 
         let mut state = GameState::new_two_player(42);
         let source = create_object(
@@ -18339,14 +18339,14 @@ mod tests {
             .copied()
             .collect();
         assert!(
-            tracked.contains(&card_a)
-                && tracked.contains(&card_b)
-                && tracked.contains(&card_c),
+            tracked.contains(&card_a) && tracked.contains(&card_b) && tracked.contains(&card_c),
             "dig must publish all looked-at cards to the tracked set, got {tracked:?}"
         );
 
         if matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }) {
-            let WaitingFor::EffectZoneChoice { cards: eligible, .. } = state.waiting_for.clone()
+            let WaitingFor::EffectZoneChoice {
+                cards: eligible, ..
+            } = state.waiting_for.clone()
             else {
                 unreachable!();
             };

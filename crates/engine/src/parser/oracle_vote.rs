@@ -1039,8 +1039,13 @@ mod tests {
         );
         let state = GameState::new_two_player(42);
         let resolved = build_resolved_from_def(&parsed, ObjectId(1), PlayerId(0));
-        let slots = build_target_slots(&state, &resolved).expect("target opponent draw needs a slot");
-        assert_eq!(slots.len(), 1, "opponent half must declare one player target");
+        let slots =
+            build_target_slots(&state, &resolved).expect("target opponent draw needs a slot");
+        assert_eq!(
+            slots.len(),
+            1,
+            "opponent half must declare one player target"
+        );
         assert!(
             slots[0]
                 .legal_targets

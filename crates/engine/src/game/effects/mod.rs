@@ -1150,16 +1150,18 @@ fn stack_pushed_object_context_from_events(
     events: &[GameEvent],
 ) -> Option<CostPaidObjectSnapshot> {
     let mut pushed = events.iter().filter_map(|event| match event {
-        GameEvent::StackPushed { object_id } => state.objects.get(object_id).map(|obj| {
-            CostPaidObjectSnapshot {
-                object_id: *object_id,
-                lki: obj.snapshot_for_mana_spent(),
-            }
-        }),
+        GameEvent::StackPushed { object_id } => {
+            state
+                .objects
+                .get(object_id)
+                .map(|obj| CostPaidObjectSnapshot {
+                    object_id: *object_id,
+                    lki: obj.snapshot_for_mana_spent(),
+                })
+        }
         _ => None,
     });
-    let first = pushed.next()?;
-    pushed.next().is_none().then_some(first)
+    pushed.next()
 }
 
 /// CR 608.2c + CR 608.2h + CR 701.20b: A `reveal` instruction introduces an

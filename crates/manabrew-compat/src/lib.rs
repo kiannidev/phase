@@ -669,10 +669,15 @@ pub fn build_prompt(
             insert_json(&mut fields, "numToDiscard", count);
             "chooseDiscard"
         }
-        WaitingFor::ModeChoice { modal, .. } => {
+        WaitingFor::ModeChoice {
+            modal,
+            unavailable_modes,
+            ..
+        } => {
             insert_json(&mut fields, "options", modal_options(modal));
             insert_json(&mut fields, "minChoices", modal.min_choices);
             insert_json(&mut fields, "maxChoices", modal.max_choices);
+            insert_json(&mut fields, "unavailableModes", unavailable_modes);
             "chooseMode"
         }
         WaitingFor::AbilityModeChoice { modal, .. } => {
@@ -1923,6 +1928,7 @@ mod tests {
                     effect_kind: EffectKind::CopySpell,
                     effect_source_id: Some(ObjectId(1)),
                     current_slot: 0,
+                    paradigm_remaining_offers: None,
                 },
                 PlayerId(0),
             ),
@@ -2243,6 +2249,7 @@ mod tests {
                         ..Default::default()
                     },
                     pending_cast: dummy_pending_cast(),
+                    unavailable_modes: vec![],
                 },
             ),
             (
@@ -2317,6 +2324,7 @@ mod tests {
                     max: 3,
                     pending_cast: dummy_pending_cast(),
                     convoke_mode: None,
+                    x_cost_previews: vec![],
                 },
             ),
             (

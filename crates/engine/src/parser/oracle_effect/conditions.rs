@@ -1036,6 +1036,56 @@ fn parse_target_color_condition_text(text: &str) -> Option<AbilityCondition> {
     parsed
 }
 
+/// CR 508.1a + CR 603.4 + CR 603.7: target-anaphoric combat-history gate used
+/// as a trailing "if" condition — "it attacked this turn" / "it didn't attack
+/// this turn" (Aggression, Berserk, Norritt, Nettling Imp). Composes the shared
+/// target-anaphoric subject parser with a verb-tense polarity axis; emits
+/// `TargetMatchesFilter { creature + AttackedThisTurn }`, wrapped in `Not` for
+/// the negated form, resolved against the ability's first object target (or the
+/// triggering source) at runtime. `use_lki: false` — the creature is still on
+/// the battlefield when the destroy condition evaluates (CR 400.7), so current
+/// object state is authoritative, not an LKI snapshot.
+fn parse_target_attacked_this_turn_condition(
+    input: &str,
+) -> super::super::oracle_nom::error::OracleResult<'_, AbilityCondition> {
+    let (rest, _) = parse_target_anaphoric_subject(input)?;
+    let (rest, negated) = parse_anaphoric_attacked_tense_polarity(rest)?;
+    let (rest, _) = tag(" this turn").parse(rest)?;
+    Ok((
+        rest,
+        maybe_negate(
+            AbilityCondition::TargetMatchesFilter {
+                filter: TargetFilter::Typed(
+                    TypedFilter::creature().properties(vec![FilterProp::AttackedThisTurn]),
+                ),
+                use_lki: false,
+            },
+            negated,
+        ),
+    ))
+}
+
+/// Verb tense+polarity after a target-anaphoric subject for the
+/// attacked-this-turn gate. Returns `negated`. Negated/longest forms listed
+/// first so "didn't attack" wins over the positive "attacked". The positive
+/// form is bare " attacked" — "did attack" is not real Oracle wording.
+fn parse_anaphoric_attacked_tense_polarity(input: &str) -> OracleResult<'_, bool> {
+    alt((
+        value(true, alt((tag(" didn't attack"), tag(" did not attack")))),
+        value(false, tag(" attacked")),
+    ))
+    .parse(input)
+}
+
+fn parse_target_attacked_this_turn_condition_text(text: &str) -> Option<AbilityCondition> {
+    let lower = text.trim().trim_end_matches('.').to_ascii_lowercase();
+    let parsed = all_consuming(parse_target_attacked_this_turn_condition)
+        .parse(lower.as_str())
+        .ok()
+        .map(|(_, c)| c);
+    parsed
+}
+
 pub(super) fn try_parse_type_setting(text: &str) -> Option<AbilityDefinition> {
     let lower = text.to_lowercase();
     let lower = lower.trim_end_matches('.');
@@ -1737,6 +1787,14 @@ pub(super) fn strip_suffix_conditional(
         return (Some(cond), effect_text);
     }
 
+    if let Some(cond) = parse_was_kicked_condition_text(condition_core) {
+        return (Some(cond), effect_text);
+    }
+
+    if let Some(cond) = parse_mana_spent_vs_mana_value_target_condition_text(condition_core) {
+        return (Some(cond), effect_text);
+    }
+
     if let Some(condition) = parse_triggering_spell_targets_filter_ability_condition(condition_core)
         .or_else(|| try_nom_condition_as_ability_condition(condition_core, ctx))
         .or_else(|| parse_condition_text(condition_core))
@@ -1800,10 +1858,79 @@ fn parse_no_mana_spent_to_cast_target_condition(input: &str) -> OracleResult<'_,
     ))
 }
 
+/// CR 702.33d + CR 608.2c: "if it/that spell was kicked" suffix on a targeted
+/// spell effect (Ertai's Trickery).
+fn parse_was_kicked_condition_text(text: &str) -> Option<AbilityCondition> {
+    let lower = text.to_ascii_lowercase();
+    nom_parse_lower(&lower, |input| {
+        all_consuming(parse_was_kicked_condition).parse(input)
+    })
+}
+
+fn parse_was_kicked_condition(input: &str) -> OracleResult<'_, AbilityCondition> {
+    let (rest, _) = (
+        alt((tag("it"), tag("that spell"), tag("this spell"))),
+        tag(" was kicked"),
+    )
+        .parse(input)?;
+    Ok((rest, AbilityCondition::additional_cost_paid_any()))
+}
+
+/// CR 601.2h + CR 608.2c: "if the amount of mana spent to cast it/that spell
+/// was less than its mana value" on a targeted spell effect — the spell
+/// anaphors to the ability's object target (Unravel-class riders).
+fn parse_mana_spent_vs_mana_value_target_condition_text(text: &str) -> Option<AbilityCondition> {
+    let lower = text.to_ascii_lowercase();
+    nom_parse_lower(&lower, |input| {
+        all_consuming(parse_mana_spent_vs_mana_value_target_condition).parse(input)
+    })
+}
+
+fn parse_mana_spent_vs_mana_value_target_condition(
+    input: &str,
+) -> OracleResult<'_, AbilityCondition> {
+    let (rest, (_, _, _, comparator, _)) = (
+        tag("the amount of mana spent to cast "),
+        alt((tag("it"), tag("that spell"), tag("this spell"))),
+        alt((tag(" was "), tag(" is "))),
+        alt((
+            value(Comparator::LT, tag("less than")),
+            value(Comparator::GT, tag("greater than")),
+        )),
+        tag(" its mana value"),
+    )
+        .parse(input)?;
+    Ok((
+        rest,
+        AbilityCondition::QuantityCheck {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ManaSpentToCast {
+                    scope: CastManaObjectScope::AbilityTarget,
+                    metric: CastManaSpentMetric::Total,
+                },
+            },
+            comparator,
+            rhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectManaValue {
+                    scope: ObjectScope::Target,
+                },
+            },
+        },
+    ))
+}
+
 pub(super) fn parse_condition_text(text: &str) -> Option<AbilityCondition> {
     let text = text.trim().trim_end_matches('.');
 
     if let Some(condition) = parse_no_mana_spent_to_cast_target_condition_text(text) {
+        return Some(condition);
+    }
+
+    if let Some(condition) = parse_was_kicked_condition_text(text) {
+        return Some(condition);
+    }
+
+    if let Some(condition) = parse_mana_spent_vs_mana_value_target_condition_text(text) {
         return Some(condition);
     }
 
@@ -2140,6 +2267,16 @@ fn build_instead_def(
     kind: AbilityKind,
     ctx: &mut ParseContext,
 ) -> Option<AbilityDefinition> {
+    // CR 608.2e: An additional-cost-paid "instead" fold ("if it/this spell was
+    // kicked, ... instead") is owned by `strip_additional_cost_conditional`,
+    // which folds it to the dedicated `AdditionalCostPaidInstead`. Defer here so
+    // the generic `parse_condition_text` recognizer (which now classifies "was
+    // kicked" as the bare `AdditionalCostPaid`) does not pre-empt that fold by
+    // producing a `ConditionInstead { inner: AdditionalCostPaid }` wrapper.
+    if parse_additional_cost_instead_condition_fragment(&cond_text).is_some() {
+        return None;
+    }
+
     let condition = try_nom_condition_as_ability_condition(&cond_text, ctx)
         .or_else(|| parse_condition_text(&cond_text))
         .or_else(|| parse_control_count_as_ability_condition(&cond_text))?;
@@ -2896,6 +3033,14 @@ pub(super) fn try_nom_condition_as_ability_condition(
 
     // CR 508.1a: "you attacked with <filter> [this turn]" filtered attack-history gate.
     if let Some(condition) = parse_attacked_with_filter_condition(lower.as_str()) {
+        return Some(condition);
+    }
+
+    // CR 508.1a + CR 603.4: target-anaphoric "it [didn't] attack this turn"
+    // combat-history gate (Aggression end-step trigger, Berserk delayed trigger).
+    // Tried after the controller-scoped "you attacked with" form above, whose
+    // subject parser cannot match the anaphoric "it"/"that creature".
+    if let Some(condition) = parse_target_attacked_this_turn_condition_text(lower.as_str()) {
         return Some(condition);
     }
 
@@ -4232,6 +4377,48 @@ mod tests {
         assert!(matches!(cond, Some(AbilityCondition::QuantityCheck { .. })));
     }
 
+    #[test]
+    fn parse_was_kicked_suffix_condition_on_counter() {
+        let (cond, text) = strip_suffix_conditional(
+            "Counter target spell if it was kicked",
+            &mut ParseContext::default(),
+        );
+        assert_eq!(text, "Counter target spell");
+        assert_eq!(cond, Some(AbilityCondition::additional_cost_paid_any()));
+    }
+
+    #[test]
+    fn parse_mana_spent_vs_mana_value_target_condition_reads_ability_target_mana() {
+        let cond = parse_mana_spent_vs_mana_value_target_condition_text(
+            "the amount of mana spent to cast that spell was less than its mana value",
+        )
+        .expect("should parse target mana-spent comparison");
+        assert!(matches!(
+            cond,
+            AbilityCondition::QuantityCheck {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ManaSpentToCast {
+                        scope: CastManaObjectScope::AbilityTarget,
+                        metric: CastManaSpentMetric::Total,
+                    },
+                },
+                comparator: Comparator::LT,
+                rhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectManaValue {
+                        scope: ObjectScope::Target,
+                    },
+                },
+            }
+        ));
+
+        let (cond, text) = strip_leading_general_conditional(
+            "If the amount of mana spent to cast that spell was less than its mana value, you draw a card.",
+            &mut ParseContext::default(),
+        );
+        assert_eq!(text, "you draw a card.");
+        assert!(matches!(cond, Some(AbilityCondition::QuantityCheck { .. })));
+    }
+
     /// CR 508.1a: filtered attack-history condition — "you attacked with <X>"
     /// resolves to a QuantityCheck over the (optionally filtered) AttackedThisTurn
     /// count. Covers the count, commander, and self-reference forms.
@@ -4278,6 +4465,88 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Assert a condition is a (possibly `Not`-wrapped) `TargetMatchesFilter`
+    /// over a creature `TypedFilter` carrying `FilterProp::AttackedThisTurn`
+    /// with `use_lki: false`. Returns whether the condition was negated, so the
+    /// caller distinguishes the Aggression (negated) and Berserk (positive)
+    /// shapes. Mirrors the structural assertions in
+    /// `attacked_with_filter_condition_forms`.
+    fn assert_attacked_this_turn_target_match(cond: &AbilityCondition) -> bool {
+        let (inner, negated) = match cond {
+            AbilityCondition::Not { condition } => (condition.as_ref(), true),
+            other => (other, false),
+        };
+        match inner {
+            AbilityCondition::TargetMatchesFilter {
+                filter: TargetFilter::Typed(tf),
+                use_lki,
+            } => {
+                assert!(
+                    !use_lki,
+                    "attacked-this-turn gate must use current state, not LKI (CR 400.7)"
+                );
+                assert!(
+                    tf.type_filters.contains(&TypeFilter::Creature),
+                    "filter must be a creature TypedFilter, got {tf:?}"
+                );
+                assert!(
+                    tf.properties.contains(&FilterProp::AttackedThisTurn),
+                    "filter must carry AttackedThisTurn, got {tf:?}"
+                );
+            }
+            other => panic!("expected TargetMatchesFilter, got {other:?}"),
+        }
+        negated
+    }
+
+    /// CR 508.1a + CR 603.4: Aggression's end-step trigger — "destroy that
+    /// creature if it didn't attack this turn" — peels the trailing-if into a
+    /// `Not(TargetMatchesFilter{ creature + AttackedThisTurn })` gate, leaving
+    /// the bare "destroy that creature" effect. Reverting the dispatch arm makes
+    /// this `cond` `None`, failing the `expect`.
+    #[test]
+    fn target_attacked_this_turn_condition_aggression_negated() {
+        let (cond, text) = strip_suffix_conditional(
+            "destroy that creature if it didn't attack this turn",
+            &mut ParseContext::default(),
+        );
+        assert_eq!(text, "destroy that creature");
+        let cond = cond.expect("Aggression trailing-if must extract a combat-history gate");
+        assert!(
+            assert_attacked_this_turn_target_match(&cond),
+            "Aggression's 'didn't attack' form must be Not-wrapped"
+        );
+    }
+
+    /// CR 508.1a + CR 603.7: Berserk's delayed end-step trigger — "destroy that
+    /// creature if it attacked this turn" — must produce the positive (NOT
+    /// `Not`-wrapped) `TargetMatchesFilter{ creature + AttackedThisTurn }` so the
+    /// drawback only fires when the creature actually attacked.
+    #[test]
+    fn target_attacked_this_turn_condition_berserk_positive() {
+        let (cond, text) = strip_suffix_conditional(
+            "destroy that creature if it attacked this turn",
+            &mut ParseContext::default(),
+        );
+        assert_eq!(text, "destroy that creature");
+        let cond = cond.expect("Berserk trailing-if must extract a combat-history gate");
+        assert!(
+            !assert_attacked_this_turn_target_match(&cond),
+            "Berserk's 'attacked' form must NOT be Not-wrapped"
+        );
+    }
+
+    /// No-regression: the controller-scoped "you attacked this turn" form must
+    /// stay on the controller path and never reach the anaphoric arm — the
+    /// anaphoric subject parser cannot match "you".
+    #[test]
+    fn target_attacked_this_turn_does_not_swallow_controller_form() {
+        assert!(
+            parse_target_attacked_this_turn_condition_text("you attacked this turn").is_none(),
+            "controller-scoped 'you attacked this turn' must not match the anaphoric gate"
+        );
     }
 
     /// CR 608.2c + CR 201.2: Amareth pattern is now a typed

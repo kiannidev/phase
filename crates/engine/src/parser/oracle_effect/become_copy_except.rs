@@ -639,12 +639,7 @@ fn parse_has_this_ability<'a>(
 fn split_in_addition_type_suffix(input: &str) -> Option<(&str, &str)> {
     let in_addition_suffix = (
         tag::<_, _, OracleError<'_>>(" in addition to "),
-        alt((
-            tag("its"),
-            tag("their"),
-            tag("his"),
-            tag("her"),
-        )),
+        alt((tag("its"), tag("their"), tag("his"), tag("her"))),
         tag(" other "),
         opt(tag("creature ")),
         tag("types"),

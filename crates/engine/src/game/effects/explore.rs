@@ -394,11 +394,13 @@ pub fn handle_choice(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::engine;
     use crate::game::zones::create_object;
     use crate::types::ability::{
         AbilityDefinition, AbilityKind, ControllerRef, Effect, QuantityExpr, ReplacementDefinition,
         TargetFilter, TargetRef, TypedFilter,
     };
+    use crate::types::actions::GameAction;
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::keywords::Keyword;
     use crate::types::player::PlayerId;
@@ -951,10 +953,6 @@ mod tests {
     /// explore must resume after the first explore's nonland DigChoice completes.
     #[test]
     fn chained_explore_resumes_after_nonland_dig_choice() {
-        use crate::game::engine;
-        use crate::types::actions::GameAction;
-        use crate::types::zones::Zone;
-
         let mut state = GameState::new_two_player(42);
         let ranger = create_object(
             &mut state,

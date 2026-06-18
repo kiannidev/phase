@@ -5441,14 +5441,22 @@ fn alternative_spell_layout(obj: &crate::game::game_object::GameObject) -> Optio
 }
 
 /// CR 709.3 / CR 709.3a-b: Split cards whose two faces are both spells
-/// (Life // Death, Breaking // Entering without Fuse, etc.) require a cast-time
-/// face choice — the same player decision as spell//spell MDFCs.
+/// (Life // Death, etc.) require a cast-time face choice — the same player
+/// decision as spell//spell MDFCs. Fuse split cards (Breaking // Entering) keep
+/// the existing `CastingVariant::Fuse` prompt instead.
 fn split_spell_face_choice_available(obj: &crate::game::game_object::GameObject) -> bool {
     use crate::types::card_type::CoreType;
     let Some(back) = obj.back_face.as_ref() else {
         return false;
     };
     if back.layout_kind != Some(LayoutKind::Split) {
+        return false;
+    }
+    if obj
+        .keywords
+        .iter()
+        .any(|k| matches!(k, crate::types::keywords::Keyword::Fuse))
+    {
         return false;
     }
     let face_is_castable_spell = |types: &crate::types::card_type::CardType| {

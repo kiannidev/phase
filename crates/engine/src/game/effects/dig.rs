@@ -594,15 +594,17 @@ mod tests {
             );
         }
 
-        // A fresh tracked set must have been inserted with exactly the kept cards.
+        // A fresh tracked set must publish every looked-at card so downstream
+        // TrackedSetFiltered routing (Zimone land/creature split, Expressive
+        // Iteration bottom/exile tail) can see the full dig pile.
         let tracked_id = TrackedSetId(next_id_before);
         let set = state
             .tracked_object_sets
             .get(&tracked_id)
-            .expect("tracked set must be inserted for the kept cards");
+            .expect("tracked set must be inserted for the looked-at cards");
         assert_eq!(
-            *set, kept,
-            "tracked set must contain exactly the kept cards"
+            *set, cards_on_top,
+            "tracked set must contain every looked-at card, not only the kept subset"
         );
         assert_eq!(
             state.next_tracked_set_id,

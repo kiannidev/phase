@@ -1750,17 +1750,23 @@ fn apply_action(
             if let Some(obj) = state.objects.get_mut(object_id) {
                 if back_face {
                     // Swap to back face using existing primitives
-                    let back = obj.back_face.take().expect("MDFC has back face");
+                    let back = obj.back_face.take().expect("dual-faced card has back face");
                     let front_snapshot = super::printed_cards::snapshot_object_face(obj);
                     super::printed_cards::apply_back_face_to_object(obj, back);
                     obj.back_face = Some(front_snapshot);
-                    // CR 712.8a: Mark MDFC back-face so apply_zone_exit_cleanup
-                    // reverts to front face on any zone exit to a non-battlefield zone.
-                    // Do NOT set obj.transformed — MDFC face choice ≠ transform
+                    // CR 712.8a (MDFC) / CR 709.3 (split): non-front face showing;
+                    // `apply_zone_exit_cleanup` reverts when leaving the stack.
                     obj.modal_back_face = true;
                 } else {
-                    // Front face chosen — clear layout_kind so the MDFC intercept
+                    // Front face chosen — clear layout_kind so the intercept
                     // won't re-fire on re-entry into handle_play_land / handle_cast_spell.
+                    if let Some(ref mut bf) = obj.back_face {
+                        bf.layout_kind = None;
+                    }
+                }
+                // After choosing either face, clear layout on the stashed other
+                // half so cast/play re-entry does not re-prompt.
+                if back_face {
                     if let Some(ref mut bf) = obj.back_face {
                         bf.layout_kind = None;
                     }

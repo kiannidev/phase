@@ -38,7 +38,8 @@ use lower::{
     absorb_trailing_rounding_suffix, apply_where_x_ability_expression,
     apply_where_x_quantity_expression, compute_sentence_where_x, consolidate_die_and_coin_defs,
     extract_deal_damage_multi_target, extract_double_counter_multi_target,
-    extract_put_counter_multi_target, extract_switch_pt_multi_target, is_token_creating_effect,
+    extract_put_counter_multi_target, extract_remove_counter_multi_target,
+    extract_switch_pt_multi_target, is_token_creating_effect,
     parse_damage_player_scope, parse_for_each_opponent_target_fanout_clause,
     rebind_clause_recipients_with, rebind_decline_body_recipient,
     rebind_subject_only_body_recipient, split_difference_repeat_suffix,
@@ -8703,6 +8704,9 @@ fn lower_imperative_clause(text: &str, ctx: &mut ParseContext) -> ParsedEffectCl
     // imperative parser strips "any number of" / "each of" to keep `parse_target`
     // bare, so the MultiTargetSpec is rebuilt from the original text here
     // (parallel to the DealDamage / Double counter fixups above).
+    if matches!(clause.effect, Effect::RemoveCounter { .. }) && clause.multi_target.is_none() {
+        clause.multi_target = extract_remove_counter_multi_target(text);
+    }
     if matches!(clause.effect, Effect::SwitchPT { .. }) && clause.multi_target.is_none() {
         clause.multi_target = extract_switch_pt_multi_target(text);
     }

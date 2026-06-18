@@ -1003,7 +1003,10 @@ mod tests {
             "second explore must be stashed while first explore waits for DigChoice"
         );
         assert_eq!(
-            state.objects[&ranger].counters.get(&CounterType::Plus1Plus1).copied(),
+            state.objects[&ranger]
+                .counters
+                .get(&CounterType::Plus1Plus1)
+                .copied(),
             Some(1),
             "first explore should add one +1/+1 counter"
         );
@@ -1013,12 +1016,17 @@ mod tests {
         };
         engine::apply_as_current(
             &mut state,
-            GameAction::SelectCards { cards: vec![cards[0]] },
+            GameAction::SelectCards {
+                cards: vec![cards[0]],
+            },
         )
         .unwrap();
 
         assert_eq!(
-            state.objects[&ranger].counters.get(&CounterType::Plus1Plus1).copied(),
+            state.objects[&ranger]
+                .counters
+                .get(&CounterType::Plus1Plus1)
+                .copied(),
             Some(2),
             "second explore should add another +1/+1 counter after DigChoice resolves"
         );

@@ -1523,15 +1523,13 @@ pub(super) fn handle_resolution_choice(
                     }
                 }
             }
-            // CR 701.20b + CR 608.2c: Publish the kept (revealed) cards as a
-            // tracked set so downstream sub_abilities can route them by type
-            // via `TargetFilter::TrackedSetFiltered`. Used by Zimone's
-            // Experiment — "Put all land cards revealed this way onto the
-            // battlefield tapped and put all creature cards revealed this way
-            // into your hand" consume this set. Use a fresh tracked set so a
-            // parent effect's empty pre-choice publish cannot keep the chain
+            // CR 701.20b + CR 608.2c: Publish every looked-at card as a tracked
+            // set so downstream sub_abilities can route them (Zimone's
+            // Experiment land/creature split; Expressive Iteration's bottom/
+            // exile tail after keeping one to hand). Use a fresh tracked set so
+            // a parent effect's empty pre-choice publish cannot keep the chain
             // sentinel bound to the wrong set.
-            effects::publish_fresh_tracked_set(state, kept.clone());
+            effects::publish_fresh_tracked_set(state, cards.clone());
             // None => Graveyard; map to a concrete zone so the rest mover
             // (shared with the search-split partition) has a single Zone.
             route_rest_partition(
@@ -1541,7 +1539,10 @@ pub(super) fn handle_resolution_choice(
                 events,
             );
             if let Some(cont) = state.pending_continuation.as_mut() {
-                cont.chain.targets = kept.iter().map(|&id| TargetRef::Object(id)).collect();
+                cont.chain.targets = unkept
+                    .iter()
+                    .map(|&id| TargetRef::Object(id))
+                    .collect();
                 cont.chain.context.optional_effect_performed = !kept.is_empty();
             }
             ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))

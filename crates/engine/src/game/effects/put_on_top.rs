@@ -58,6 +58,15 @@ pub fn resolve(
             .collect();
     }
 
+    if matches!(target_filter, TargetFilter::TrackedSet { .. }) {
+        collected_targets.retain(|id| {
+            state
+                .objects
+                .get(id)
+                .is_some_and(|obj| obj.zone == Zone::Library)
+        });
+    }
+
     // CR 115.1 + CR 400.2: When the filter specifies a private zone (hand/library)
     // and no targets were pre-selected during casting (because the Oracle text does
     // not say "target"), present an EffectZoneChoice for resolution-time selection.

@@ -21421,7 +21421,6 @@ mod dedup_regression_tests {
         let (mut state, observer) = setup_with_observer(TriggerMode::Attacks);
         {
             let obj = state.objects.get_mut(&observer).unwrap();
-            obj.card_types.core_types.push(CoreType::Creature);
             obj.power = Some(2);
             obj.toughness = Some(2);
         }
@@ -21457,7 +21456,6 @@ mod dedup_regression_tests {
         let (mut state, observer) = setup_with_observer(TriggerMode::Attacks);
         {
             let obj = state.objects.get_mut(&observer).unwrap();
-            obj.card_types.core_types.push(CoreType::Creature);
             obj.power = Some(4);
             obj.toughness = Some(4);
         }

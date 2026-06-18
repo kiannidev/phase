@@ -749,7 +749,11 @@ pub(crate) fn matches_stack_target_filter(
     match filter {
         TargetFilter::Any => true,
         TargetFilter::StackSpell => matches!(&entry.kind, StackEntryKind::Spell { .. }),
-        TargetFilter::StackAbility { controller, tag, kind } => {
+        TargetFilter::StackAbility {
+            controller,
+            tag,
+            kind,
+        } => {
             let ability_kind_ok = kind.as_ref().is_none_or(|kind| {
                 matches!(
                     (kind, &entry.kind),
@@ -4772,7 +4776,7 @@ mod tests {
         let ability_leg = TargetFilter::StackAbility {
             controller: None,
             tag: None,
-        kind: None,
+            kind: None,
         };
         assert!(
             matches_stack_target_filter(&state, ability_entry_id, &ability_leg, &ctx),

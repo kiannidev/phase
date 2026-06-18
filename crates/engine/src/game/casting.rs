@@ -17466,7 +17466,7 @@ mod tests {
                     target: TargetFilter::StackAbility {
                         controller: Some(ControllerRef::You),
                         tag: None,
-                    kind: None,
+                        kind: None,
                     },
                     retarget: CopyRetargetPermission::MayChooseNewTargets,
                     copier: None,
@@ -20121,7 +20121,7 @@ mod tests {
                             TargetFilter::StackAbility {
                                 controller: None,
                                 tag: None,
-                            kind: None,
+                                kind: None,
                             },
                         ],
                     },
@@ -20267,7 +20267,7 @@ mod tests {
                 target: TargetFilter::StackAbility {
                     controller: None,
                     tag: None,
-                kind: None,
+                    kind: None,
                 },
                 source_rider: None,
             },

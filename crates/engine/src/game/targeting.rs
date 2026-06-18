@@ -1188,7 +1188,11 @@ fn stack_ability_matches_filter(
     source_controller: PlayerId,
 ) -> bool {
     match filter {
-        TargetFilter::StackAbility { controller, tag, kind } => {
+        TargetFilter::StackAbility {
+            controller,
+            tag,
+            kind,
+        } => {
             if !matches!(
                 &entry.kind,
                 // CR 113.3b / CR 113.3c: Activated and triggered abilities are

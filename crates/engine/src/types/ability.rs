@@ -16248,7 +16248,7 @@ mod tests {
             TargetFilter::StackAbility {
                 controller: None,
                 tag: None,
-            kind: None,
+                kind: None,
             }
         );
         assert_eq!(
@@ -16266,7 +16266,7 @@ mod tests {
             TargetFilter::StackAbility {
                 controller: Some(ControllerRef::You),
                 tag: None,
-            kind: None,
+                kind: None,
             }
         );
         assert_eq!(

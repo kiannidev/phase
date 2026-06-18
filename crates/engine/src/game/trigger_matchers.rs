@@ -9285,7 +9285,7 @@ mod tests {
                 TargetFilter::StackAbility {
                     controller: Some(controller),
                     tag: None,
-                kind: None,
+                    kind: None,
                 },
             ],
         }
@@ -9427,7 +9427,7 @@ mod tests {
         trigger.valid_source = Some(TargetFilter::StackAbility {
             controller: None,
             tag: Some(AbilityTag::Backup),
-        kind: None,
+            kind: None,
         });
         let event = GameEvent::BecomesTarget {
             target: TargetRef::Object(trigger_owner),
@@ -9451,7 +9451,7 @@ mod tests {
         trigger.valid_source = Some(TargetFilter::StackAbility {
             controller: None,
             tag: Some(AbilityTag::Backup),
-        kind: None,
+            kind: None,
         });
         let event = GameEvent::BecomesTarget {
             target: TargetRef::Object(trigger_owner),

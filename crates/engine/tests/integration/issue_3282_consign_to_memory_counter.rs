@@ -8,9 +8,7 @@
 use engine::game::targeting::find_legal_targets;
 use engine::game::zones::create_object;
 use engine::parser::oracle_effect::parse_effect;
-use engine::types::ability::{
-    Effect, ResolvedAbility, StackAbilityKind, TargetFilter, TargetRef,
-};
+use engine::types::ability::{Effect, ResolvedAbility, StackAbilityKind, TargetFilter, TargetRef};
 use engine::types::card_type::{CardType, CoreType};
 use engine::types::game_state::{CastingVariant, GameState, StackEntry, StackEntryKind};
 use engine::types::identifiers::{CardId, ObjectId};
@@ -156,13 +154,7 @@ fn stack_with_counter_targets() -> (GameState, ObjectId, ObjectId, ObjectId, Obj
         });
     }
 
-    (
-        state,
-        activated,
-        triggered,
-        colorless_spell,
-        colored_spell,
-    )
+    (state, activated, triggered, colorless_spell, colored_spell)
 }
 
 #[test]

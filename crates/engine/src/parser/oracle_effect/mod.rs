@@ -8974,26 +8974,25 @@ fn try_parse_verb_and_target<'a>(
     // CR 701.6: Counter a spell or ability on the stack.
     if let Some((_, rest)) = nom_on_lower(text, lower, |i| value((), tag("counter ")).parse(i)) {
         let rest_lower = &lower[lower.len() - rest.len()..];
-        let stack_phrase = rest
-            .strip_prefix("target ")
-            .or_else(|| rest.strip_prefix("Target "))
-            .unwrap_or(rest);
+        let stack_phrase = tag::<_, _, OracleError<'_>>("target ")
+            .parse(rest_lower)
+            .map(|(phrase, _)| phrase)
+            .unwrap_or(rest_lower);
         let (parsed_target, rem) = parse_target_with_ctx(rest, ctx);
-        let target =
-            if let Ok((_, stack_target)) =
-                crate::parser::oracle_nom::target::parse_stack_object_target(stack_phrase)
-            {
-                stack_target
-            } else if scan_contains_phrase(rest_lower, "activated or triggered ability") {
-                // CR 701.6: "activated or triggered ability" is a special-case target
-                // that maps to StackAbility. We still use parse_target's remainder to
-                // preserve the compound-detection contract.
-                imperative::stack_ability_filter_from_text(rest_lower)
-            } else if scan_contains_phrase(rest_lower, "spell") {
-                constrain_filter_to_stack(parsed_target)
-            } else {
-                parsed_target
-            };
+        let target = if let Ok((_, stack_target)) =
+            crate::parser::oracle_nom::target::parse_stack_object_target(stack_phrase)
+        {
+            stack_target
+        } else if scan_contains_phrase(rest_lower, "activated or triggered ability") {
+            // CR 701.6: "activated or triggered ability" is a special-case target
+            // that maps to StackAbility. We still use parse_target's remainder to
+            // preserve the compound-detection contract.
+            imperative::stack_ability_filter_from_text(rest_lower)
+        } else if scan_contains_phrase(rest_lower, "spell") {
+            constrain_filter_to_stack(parsed_target)
+        } else {
+            parsed_target
+        };
         // CR 118.12: Parse "unless its controller pays {X}" for conditional counters
         let unless_pay = parse_unless_payment(rest_lower).map(counter_unless_pay_modifier);
         return Some((
@@ -20419,7 +20418,7 @@ fn try_parse_change_targets(lower: &str) -> Option<Effect> {
                 TargetFilter::StackAbility {
                     controller: None,
                     tag: None,
-                kind: None,
+                    kind: None,
                 },
             ],
         }
@@ -20429,7 +20428,7 @@ fn try_parse_change_targets(lower: &str) -> Option<Effect> {
         TargetFilter::StackAbility {
             controller: None,
             tag: None,
-        kind: None,
+            kind: None,
         }
     } else if scan_contains_phrase(spell_phrase_clean, "spell") {
         // Parse with parse_target for type-specific spells (e.g. "instant or sorcery spell")
@@ -26241,7 +26240,7 @@ mod tests {
                     target: TargetFilter::StackAbility {
                         controller: Some(ControllerRef::Opponent),
                         tag: None,
-                    kind: None,
+                        kind: None,
                     },
                 }
             ),
@@ -26283,7 +26282,7 @@ mod tests {
                     target: TargetFilter::StackAbility {
                         controller: None,
                         tag: None,
-                    kind: None,
+                        kind: None,
                     },
                     ..
                 }
@@ -27143,7 +27142,7 @@ mod tests {
             TargetFilter::StackAbility {
                 controller: Some(ControllerRef::You),
                 tag: None,
-            kind: None,
+                kind: None,
             }
         ));
     }
@@ -37198,7 +37197,7 @@ mod tests {
             TargetFilter::StackAbility {
                 controller: None,
                 tag: None,
-            kind: None,
+                kind: None,
             }
         ));
     }

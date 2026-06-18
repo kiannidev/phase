@@ -13,7 +13,9 @@ use nom::Parser;
 use super::error::{oracle_err, OracleError, OracleResult};
 use super::primitives::parse_color;
 use crate::parser::oracle_util::{parse_subtype, OUTLAW_SUBTYPES};
-use crate::types::ability::{Comparator, ControllerRef, FilterProp, TargetFilter, TypeFilter, TypedFilter};
+use crate::types::ability::{
+    Comparator, ControllerRef, FilterProp, TargetFilter, TypeFilter, TypedFilter,
+};
 use crate::types::card_type::Supertype;
 use crate::types::mana::ManaColor;
 use crate::types::zones::Zone;
@@ -438,22 +440,16 @@ pub fn parse_stack_object_target(input: &str) -> OracleResult<'_, TargetFilter> 
 /// `kind`, while combined phrases accept both.
 fn parse_ability_kind_leg(input: &str) -> OracleResult<'_, TargetFilter> {
     alt((
-        map(
-            tag("triggered ability"),
-            |_| TargetFilter::StackAbility {
-                controller: None,
-                tag: None,
-                kind: Some(crate::types::ability::StackAbilityKind::Triggered),
-            },
-        ),
-        map(
-            tag("activated ability"),
-            |_| TargetFilter::StackAbility {
-                controller: None,
-                tag: None,
-                kind: Some(crate::types::ability::StackAbilityKind::Activated),
-            },
-        ),
+        map(tag("triggered ability"), |_| TargetFilter::StackAbility {
+            controller: None,
+            tag: None,
+            kind: Some(crate::types::ability::StackAbilityKind::Triggered),
+        }),
+        map(tag("activated ability"), |_| TargetFilter::StackAbility {
+            controller: None,
+            tag: None,
+            kind: Some(crate::types::ability::StackAbilityKind::Activated),
+        }),
         map(
             alt((
                 tag("activated ability, triggered ability"),
@@ -557,8 +553,7 @@ fn parse_ability_spell_disjunction(input: &str) -> OracleResult<'_, TargetFilter
                 if let Some(slot) = ability_slot {
                     *ability_kind = merge_ability_kind(*ability_kind, kind);
                     if let TargetFilter::StackAbility {
-                        kind: slot_kind,
-                        ..
+                        kind: slot_kind, ..
                     } = &mut filters[*slot]
                     {
                         *slot_kind = *ability_kind;
@@ -1072,7 +1067,7 @@ mod tests {
             TargetFilter::StackAbility {
                 controller: None,
                 tag: None,
-            kind: None,
+                kind: None,
             }
         );
     }

@@ -710,7 +710,7 @@ mod tests {
                 target: TargetFilter::StackAbility {
                     controller: None,
                     tag: None,
-                kind: None,
+                    kind: None,
                 },
                 source_rider: Some(CounterSourceRider::LosesAbilities {
                     static_def: Box::new(source_static),
@@ -866,7 +866,7 @@ mod tests {
                 target: TargetFilter::StackAbility {
                     controller: None,
                     tag: None,
-                kind: None,
+                    kind: None,
                 },
                 source_rider: Some(CounterSourceRider::Destroy),
             },
@@ -1431,7 +1431,7 @@ mod tests {
                 target: TargetFilter::StackAbility {
                     controller: None,
                     tag: None,
-                kind: None,
+                    kind: None,
                 },
             },
             vec![],
@@ -1510,7 +1510,7 @@ mod tests {
                 target: TargetFilter::StackAbility {
                     controller: Some(ControllerRef::Opponent),
                     tag: None,
-                kind: None,
+                    kind: None,
                 },
             },
             vec![],

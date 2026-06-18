@@ -29832,6 +29832,34 @@ mod tests {
         );
     }
 
+    /// Issue #3659 (leak guard) — Gix's "its controller may pay … if they do,
+    /// they draw" antecedent must not leak into a later independent "that
+    /// player" clause, which must bind to the damaged opponent (TriggeringPlayer).
+    #[test]
+    fn gix_its_controller_antecedent_does_not_leak_to_later_that_player() {
+        let def = parse_trigger_line(
+            "Whenever a creature deals combat damage to one of your opponents, \
+             its controller may pay 1 life. If they do, they draw a card. That player discards a card.",
+            "Gix, Yawgmoth Praetor",
+        );
+        let execute = def.execute.as_ref().expect("trigger should have execute");
+        let chain = ability_chain(execute);
+        let discard_node = chain
+            .iter()
+            .find(|d| matches!(d.effect.as_ref(), Effect::Discard { .. }))
+            .expect("chain must contain a Discard node");
+        match discard_node.effect.as_ref() {
+            Effect::Discard { target, .. } => {
+                assert_eq!(
+                    *target,
+                    TargetFilter::TriggeringPlayer,
+                    "later 'that player' must be the damaged opponent, not the creature's controller"
+                );
+            }
+            other => panic!("expected Discard, got {other:?}"),
+        }
+    }
+
     /// Issue #1670 — Star Athlete: "Whenever this creature attacks, choose up to
     /// one target nonland permanent. Its controller may sacrifice it. If they
     /// don't, this creature deals 5 damage to that player." The "that player"

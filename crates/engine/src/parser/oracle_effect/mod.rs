@@ -18131,7 +18131,14 @@ pub(crate) fn parse_effect_chain_ir(
         // chunk (both higher-precedence rungs are None). Independent of the
         // lazy `.or_else` chain — pure Option inspection.
         let seeded_parent_target_controller_this_chunk = chain_chosen_player_scope.is_none()
-            && ctx.relative_player_scope.is_none()
+            && matches!(
+                chain_chosen_player_scope
+                    .clone()
+                    .or_else(|| chain_parent_target_controller_scope.clone())
+                    .or_else(|| ctx.relative_player_scope.clone())
+                    .as_ref(),
+                Some(ControllerRef::ParentTargetController)
+            )
             && chain_parent_target_controller_scope.is_some();
         let mut chunk_ctx = ParseContext {
             subject: chunk_subject,

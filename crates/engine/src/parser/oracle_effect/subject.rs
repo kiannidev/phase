@@ -1740,6 +1740,12 @@ fn resolve_they_pronoun(ctx: &mut ParseContext) -> TargetFilter {
     ) {
         return TargetFilter::ParentTargetController;
     }
+    if matches!(
+        ctx.relative_player_scope,
+        Some(ControllerRef::ParentTargetOwner)
+    ) {
+        return TargetFilter::ParentTargetOwner;
+    }
     // CR 603.7c + CR 120.3 + CR 506.2: A "deals [combat] damage to a player" or
     // "attacks a player" trigger introduces the damaged/attacked player as the
     // event referent (the parser stamps `relative_player_scope = TargetPlayer`).

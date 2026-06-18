@@ -248,6 +248,7 @@ fn synthesize_prepared_copy_object(
     // Do not re-enter alternative-face casting logic for this synthetic copy.
     copy_obj.back_face = None;
     apply_back_face_to_object(&mut copy_obj, back.clone());
+    copy_obj.casting_permissions.clear();
     copy_obj
         .casting_permissions
         .push(CastingPermission::ExileWithAltCost {

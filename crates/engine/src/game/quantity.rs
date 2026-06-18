@@ -2152,7 +2152,7 @@ fn resolve_ref(
                 u32_to_i32_saturating(p.cards_drawn_this_turn)
             })
         }
-        // CR 403.3 + CR 603.4: Battlefield entries this turn for the scoped player.
+        // CR 403.3 + CR 608.2h: Battlefield entries this turn for the scoped player.
         QuantityRef::BattlefieldEntriesThisTurn { player, ref filter } => {
             resolve_per_player_scalar(
                 state,

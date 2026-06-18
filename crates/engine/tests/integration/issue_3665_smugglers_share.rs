@@ -6,7 +6,9 @@
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{Effect, PlayerFilter, QuantityExpr, QuantityRef};
 use engine::types::actions::GameAction;
-use engine::types::game_state::{StackEntryKind, WaitingFor};
+use engine::types::card_type::CoreType;
+use engine::types::game_state::{BattlefieldEntryRecord, StackEntryKind, WaitingFor};
+use engine::types::identifiers::ObjectId;
 use engine::types::phase::Phase;
 
 const SMUGGLERS_SHARE: &str = "Smuggler's Share";
@@ -39,6 +41,32 @@ fn reach_end_step(runner: &mut GameRunner) {
 
 fn hand_len(runner: &GameRunner, player: engine::types::player::PlayerId) -> usize {
     runner.state().players[player.0 as usize].hand.len()
+}
+
+fn treasure_count(runner: &GameRunner) -> usize {
+    runner
+        .state()
+        .battlefield
+        .iter()
+        .filter_map(|id| runner.state().objects.get(id))
+        .filter(|obj| obj.controller == P0)
+        .filter(|obj| obj.name.eq_ignore_ascii_case("Treasure"))
+        .count()
+}
+
+fn record_opponent_land_entry(runner: &mut GameRunner, object_id: u64) {
+    runner
+        .state_mut()
+        .battlefield_entries_this_turn
+        .push(BattlefieldEntryRecord {
+            object_id: ObjectId(object_id),
+            name: format!("Land {object_id}"),
+            core_types: vec![CoreType::Land],
+            subtypes: vec![],
+            supertypes: vec![],
+            colors: vec![],
+            controller: P1,
+        });
 }
 
 #[test]
@@ -128,5 +156,25 @@ fn smugglers_share_draws_when_opponent_drew_two_cards() {
         hand_len(&runner, P0),
         hand_before + 1,
         "Smuggler's Share must draw once per qualifying opponent"
+    );
+}
+
+#[test]
+fn smugglers_share_creates_treasure_when_opponent_had_two_lands_enter() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let _share = add_smugglers_share(&mut scenario);
+    let mut runner = scenario.build();
+    record_opponent_land_entry(&mut runner, 9001);
+    record_opponent_land_entry(&mut runner, 9002);
+
+    let treasures_before = treasure_count(&runner);
+    reach_end_step(&mut runner);
+    runner.advance_until_stack_empty();
+
+    assert_eq!(
+        treasure_count(&runner),
+        treasures_before + 1,
+        "Smuggler's Share must create one Treasure per opponent with two or more lands entered"
     );
 }

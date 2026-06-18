@@ -1282,17 +1282,7 @@ pub(crate) fn apply_zone_delivery_tail(
             events,
         );
         if let Some(wf) = waiting_for {
-            // Pause only on mid-entry interactive replacements — not on ETB
-            // triggers (e.g. Cloud Key's NamedChoice) that `add_real_card` and
-            // other scenario helpers expect to drain without stalling delivery.
-            if matches!(
-                wf,
-                WaitingFor::EffectZoneChoice { .. }
-                    | WaitingFor::ReplacementChoice { .. }
-                    | WaitingFor::CopyTargetChoice { .. }
-                    | WaitingFor::ChooseOneOfBranch { .. }
-                    | WaitingFor::ReturnAsAuraTarget { .. }
-            ) {
+            if !matches!(wf, WaitingFor::Priority { .. }) {
                 state.waiting_for = wf;
                 return replacement_pause_delivery_result(state);
             }
@@ -1831,6 +1821,7 @@ fn replacement_pause_delivery_result(state: &GameState) -> ZoneDeliveryResult {
         // surface their own `WaitingFor` variant with the correct chooser.
         | WaitingFor::CopyTargetChoice { player, .. }
         | WaitingFor::ChooseOneOfBranch { player, .. }
+        | WaitingFor::NamedChoice { player, .. }
         | WaitingFor::ReturnAsAuraTarget { player, .. } => ZoneDeliveryResult::NeedsChoice(*player),
         _ => ZoneDeliveryResult::NeedsChoice(state.active_player),
     }

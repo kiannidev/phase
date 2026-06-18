@@ -1762,10 +1762,11 @@ pub(crate) fn parse_subject_rule_static(text: &str) -> Option<StaticDefinition> 
 
     // CR 509.1b: "<subject> can't be blocked [by filter / unless / as long as …]"
     // (Tetsuko Umezawa, Fugitive). Reuses cant_be_blocked_mode for tail classification.
-    if nom_primitives::scan_contains(&pred_lower, "can't be blocked")
+    if (pred_lower.starts_with("can't be blocked")
+        || pred_lower.starts_with("can\u{2019}t be blocked"))
         && !nom_primitives::scan_contains(&pred_lower, "except by")
     {
-        let clause = predicate_text.trim().trim_end_matches('.');
+        let clause = pred_lower.trim().trim_end_matches('.');
         if let Some((mode, condition)) = cant_be_blocked_mode(clause) {
             let mut def = StaticDefinition::new(mode)
                 .affected(affected.clone())

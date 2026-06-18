@@ -29797,6 +29797,41 @@ mod tests {
         out
     }
 
+    /// Issue #3659 — Gix, Yawgmoth Praetor: damage trigger with "its controller may
+    /// pay … if they do, they draw" must route the draw to the creature's
+    /// controller (ParentTargetController), not the damaged opponent
+    /// (TriggeringPlayer from the damage condition scope).
+    #[test]
+    fn gix_optional_draw_binds_creature_controller_not_damaged_player() {
+        let def = parse_trigger_line(
+            "Whenever a creature deals combat damage to one of your opponents, its controller may pay 1 life. If they do, they draw a card.",
+            "Gix, Yawgmoth Praetor",
+        );
+        assert_eq!(def.mode, TriggerMode::DamageDone);
+        let execute = def.execute.as_ref().expect("trigger should have execute");
+        let chain = ability_chain(execute);
+        let draw_node = chain
+            .iter()
+            .find(|d| matches!(d.effect.as_ref(), Effect::Draw { .. }))
+            .expect("chain must contain a Draw node");
+        match draw_node.effect.as_ref() {
+            Effect::Draw { target, count, .. } => {
+                assert_eq!(
+                    *target,
+                    TargetFilter::ParentTargetController,
+                    "Gix draw must go to the creature's controller who paid, not the damaged opponent"
+                );
+                assert_eq!(*count, QuantityExpr::Fixed { value: 1 });
+            }
+            other => panic!("expected Draw, got {other:?}"),
+        }
+        assert_eq!(
+            draw_node.condition,
+            Some(AbilityCondition::effect_performed()),
+            "draw must be gated on optional cost payment"
+        );
+    }
+
     /// Issue #1670 — Star Athlete: "Whenever this creature attacks, choose up to
     /// one target nonland permanent. Its controller may sacrifice it. If they
     /// don't, this creature deals 5 damage to that player." The "that player"

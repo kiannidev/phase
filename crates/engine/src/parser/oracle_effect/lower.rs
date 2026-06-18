@@ -4587,6 +4587,9 @@ fn resolve_player_anaphor_damage_recipient(
     }
     match ctx.relative_player_scope {
         Some(ControllerRef::ScopedPlayer) => Some(TargetFilter::ScopedPlayer),
+        Some(ControllerRef::ParentTargetController) => {
+            Some(TargetFilter::ParentTargetController)
+        }
         Some(ControllerRef::TriggeringPlayer) | Some(ControllerRef::TargetPlayer) => {
             Some(TargetFilter::TriggeringPlayer)
         }

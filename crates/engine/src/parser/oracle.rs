@@ -741,13 +741,10 @@ fn try_parse_graveyard_keyword_static_with_continuation(line: &str) -> Option<St
     let lower = line.to_lowercase();
     let (prefix, continuation) = split_once_on_lower(line, &lower, ". ")?;
     let prefix_lower = prefix.to_lowercase();
-    let (grant_prefix, during_your_turn) =
-        if let Some(suffix) = prefix_lower.strip_prefix("during your turn, ") {
-            let start = prefix.len() - suffix.len();
-            (&prefix[start..], true)
-        } else {
-            (prefix, false)
-        };
+    let (turn_condition, grant_prefix) = nom_on_lower(prefix, &prefix_lower, |input| {
+        value(StaticCondition::DuringYourTurn, tag("during your turn, ")).parse(input)
+    })
+    .map_or((None, prefix), |(condition, rest)| (Some(condition), rest));
     let (affected, kind) = try_parse_graveyard_keyword_grant_clause(grant_prefix)?;
     let keyword = parse_graveyard_keyword_continuation(continuation, kind)?;
     if !kind.matches_keyword(&keyword) {
@@ -757,8 +754,8 @@ fn try_parse_graveyard_keyword_static_with_continuation(line: &str) -> Option<St
         .affected(affected)
         .modifications(vec![ContinuousModification::AddKeyword { keyword }])
         .description(line.to_string());
-    if during_your_turn {
-        def = def.condition(StaticCondition::DuringYourTurn);
+    if let Some(condition) = turn_condition {
+        def = def.condition(condition);
     }
     Some(def)
 }

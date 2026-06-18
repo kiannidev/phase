@@ -12890,4 +12890,40 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn parse_artifact_or_noncreature_permanent_keeps_negation_on_second_branch() {
+        let (filter, rest) = parse_type_phrase("artifact or noncreature permanent");
+        assert!(rest.trim().is_empty(), "unexpected remainder: {rest:?}");
+        let TargetFilter::Or { filters } = filter else {
+            panic!("expected Or filter, got {filter:?}");
+        };
+
+        let has_artifact = |filter: &TargetFilter| {
+            let TargetFilter::Typed(tf) = filter else {
+                return false;
+            };
+            tf.type_filters.contains(&TypeFilter::Artifact)
+        };
+        let has_noncreature = |filter: &TargetFilter| {
+            let TargetFilter::Typed(tf) = filter else {
+                return false;
+            };
+            tf.type_filters
+                .contains(&TypeFilter::Non(Box::new(TypeFilter::Creature)))
+        };
+
+        let artifact_branch = filters
+            .iter()
+            .find(|branch| has_artifact(branch))
+            .expect("artifact branch");
+        assert!(
+            !has_noncreature(artifact_branch),
+            "noncreature must not distribute back onto artifact branch: {artifact_branch:?}"
+        );
+        assert!(
+            filters.iter().any(has_noncreature),
+            "expected a noncreature branch in {filters:?}"
+        );
+    }
 }

@@ -346,6 +346,22 @@ pub struct PolicyPenalties {
     /// equipment-committed deck. Consumed by `EquipmentPayoffPolicy`.
     #[serde(default = "default_equipment_payoff_cast_bonus")]
     pub equipment_payoff_cast_bonus: f64,
+    /// CR 603.7: Bonus for deploying a flicker enabler in a blink-committed deck
+    /// (one with both flicker density and ETB payoffs) — the engine that
+    /// re-triggers ETBs. Consumed by `BlinkPayoffPolicy`, which is payoff-gated so
+    /// this never applies to decks running incidental flicker.
+    #[serde(default = "default_deploy_flicker_engine_bonus")]
+    pub deploy_flicker_engine_bonus: f64,
+    /// CR 603.6a: Bonus for casting a value-ETB creature in a blink-committed
+    /// deck — a re-triggerable payoff, worth a premium on top of its one-shot ETB
+    /// value because the deck can flicker it. Consumed by `BlinkPayoffPolicy`.
+    #[serde(default = "default_etb_payoff_cast_bonus")]
+    pub etb_payoff_cast_bonus: f64,
+    /// Bonus for casting an opponent-mill spell in a mill-committed deck.
+    /// Scales with library-size urgency (×2 below 15 cards, ×3 below 5 cards).
+    /// Consumed by `MillPayoffPolicy`.
+    #[serde(default = "default_mill_cast_bonus")]
+    pub mill_cast_bonus: f64,
 }
 
 impl Default for PolicyPenalties {
@@ -395,6 +411,9 @@ impl Default for PolicyPenalties {
             graveyard_enabler_bonus: default_graveyard_enabler_bonus(),
             deploy_equipment_bonus: default_deploy_equipment_bonus(),
             equipment_payoff_cast_bonus: default_equipment_payoff_cast_bonus(),
+            deploy_flicker_engine_bonus: default_deploy_flicker_engine_bonus(),
+            etb_payoff_cast_bonus: default_etb_payoff_cast_bonus(),
+            mill_cast_bonus: default_mill_cast_bonus(),
         }
     }
 }
@@ -483,6 +502,15 @@ fn default_deploy_equipment_bonus() -> f64 {
 fn default_equipment_payoff_cast_bonus() -> f64 {
     0.4
 }
+fn default_deploy_flicker_engine_bonus() -> f64 {
+    0.4
+}
+fn default_etb_payoff_cast_bonus() -> f64 {
+    0.3
+}
+fn default_mill_cast_bonus() -> f64 {
+    0.5
+}
 
 /// Policy penalty fields present in the active CMA-ES `--group penalties`
 /// vector. Adding a `PolicyPenalties` field requires listing it here or in
@@ -560,6 +588,18 @@ pub const UNTUNED_POLICY_PENALTY_FIELDS: &[(&str, &str)] = &[
     (
         "equipment_payoff_cast_bonus",
         "new EquipmentPayoffPolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "deploy_flicker_engine_bonus",
+        "new BlinkPayoffPolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "etb_payoff_cast_bonus",
+        "new BlinkPayoffPolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
+    ),
+    (
+        "mill_cast_bonus",
+        "new MillPayoffPolicy knob; awaiting a paired-seed ai-gate calibration before joining the CMA-ES vector",
     ),
 ];
 

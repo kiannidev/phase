@@ -102,6 +102,7 @@ import {
 import { DebugPanel } from "../components/chrome/DebugPanel.tsx";
 import { GameMenu } from "../components/chrome/GameMenu.tsx";
 import { ConcedeDialog } from "../components/multiplayer/ConcedeDialog.tsx";
+import { TakebackRequestDialog } from "../components/multiplayer/TakebackRequestDialog.tsx";
 import { ConnectionToast } from "../components/multiplayer/ConnectionToast.tsx";
 import { EmoteOverlay } from "../components/multiplayer/EmoteOverlay.tsx";
 import { ResolutionProgressOverlay } from "../components/board/ResolutionProgressOverlay.tsx";
@@ -271,6 +272,10 @@ export function GamePage() {
   );
   const [gameStartedAt, setGameStartedAt] = useState<number | null>(null);
   const hasConcededRef = useRef(false);
+  // GH #1507: "request takeback" — the table-wide pending request, if any.
+  const [pendingTakeback, setPendingTakeback] = useState<
+    { requester: number; requesterName: string } | null
+  >(null);
 
   const handleWsEvent = useCallback((event: WsAdapterEvent) => {
     switch (event.type) {
@@ -355,6 +360,18 @@ export function GamePage() {
           ...prev,
           [event.player]: event.remainingSeconds,
         }));
+        break;
+      case "takebackRequested":
+        setPendingTakeback({
+          requester: event.requester,
+          requesterName: event.requesterName,
+        });
+        break;
+      case "takebackResolved":
+        setPendingTakeback(null);
+        if (!event.approved) {
+          useMultiplayerStore.getState().showToast(t("multiplayer:takebackDialog.declinedToast"));
+        }
         break;
       case "playerDisconnected":
         // Multiplayer (3+ players): a specific player disconnected
@@ -642,6 +659,8 @@ export function GamePage() {
         receivedEmote={receivedEmote}
         timerRemaining={timerRemaining}
         gameStartedAt={gameStartedAt}
+        pendingTakeback={pendingTakeback}
+        onCloseTakebackDialog={() => setPendingTakeback(null)}
         disconnectChoice={disconnectChoice}
         onDismissDisconnectChoice={() => setDisconnectChoice(null)}
         pauseReason={pauseReason}
@@ -677,6 +696,8 @@ interface GamePageContentProps {
   receivedEmote: string | null;
   timerRemaining: Record<number, number>;
   gameStartedAt: number | null;
+  pendingTakeback: { requester: number; requesterName: string } | null;
+  onCloseTakebackDialog: () => void;
   // 3-4p P2P additions
   disconnectChoice: { playerId: number; gracePeriodMs: number } | null;
   onDismissDisconnectChoice: () => void;
@@ -706,6 +727,8 @@ function GamePageContent({
   receivedEmote,
   timerRemaining,
   gameStartedAt,
+  pendingTakeback,
+  onCloseTakebackDialog,
   disconnectChoice,
   onDismissDisconnectChoice,
   pauseReason,
@@ -847,6 +870,31 @@ function GamePageContent({
     },
     [adapter],
   );
+
+  // GH #1507: "request takeback" — ask every other human player to approve
+  // rolling the game back to before this player's last action.
+  const handleRequestTakeback = useCallback(() => {
+    if (adapter && adapter instanceof WebSocketAdapter) {
+      adapter.sendRequestTakeback();
+    }
+  }, [adapter]);
+
+  const handleRespondTakeback = useCallback(
+    (approve: boolean) => {
+      if (adapter && adapter instanceof WebSocketAdapter) {
+        adapter.sendRespondTakeback(approve);
+      }
+      onCloseTakebackDialog();
+    },
+    [adapter, onCloseTakebackDialog],
+  );
+
+  const handleCancelTakeback = useCallback(() => {
+    if (adapter && adapter instanceof WebSocketAdapter) {
+      adapter.sendCancelTakeback();
+    }
+    onCloseTakebackDialog();
+  }, [adapter, onCloseTakebackDialog]);
 
   // Issue #311 safety net: when the engine emits a WaitingFor variant the
   // frontend has no UI for, this handler is the user's escape hatch.
@@ -1277,6 +1325,7 @@ function GamePageContent({
         onSettingsClick={() => setPreferencesOpen({})}
         onHelpClick={() => setHelpSheetOpen(true)}
         onConcede={onShowConcedeDialog}
+        onRequestTakeback={isOnlineMode ? handleRequestTakeback : undefined}
         showSandboxTools={mode === "ai" || mode === "local" || isSandboxGame}
         onSandboxToolsClick={() => useUiStore.getState().openSandboxTools()}
       />
@@ -1692,6 +1741,14 @@ function GamePageContent({
             isOpen={showConcedeDialog}
             onConfirm={handleConcede}
             onCancel={onHideConcedeDialog}
+          />
+          <TakebackRequestDialog
+            isOpen={pendingTakeback !== null}
+            requesterName={pendingTakeback?.requesterName ?? ""}
+            isOwnRequest={pendingTakeback?.requester === playerId}
+            onApprove={() => handleRespondTakeback(true)}
+            onDecline={() => handleRespondTakeback(false)}
+            onCancel={handleCancelTakeback}
           />
           {!isSpectatorMode && (
             <EmoteOverlay

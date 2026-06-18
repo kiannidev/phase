@@ -25,12 +25,13 @@ use crate::parser::oracle_static::{
     parse_continuous_modifications, parse_quoted_ability_modifications,
 };
 use crate::types::ability::{
-    AbilityCost, AbilityDefinition, AbilityKind, BounceSelection, CategoryChooserScope, ChoiceType,
-    Chooser, ContinuousModification, ControllerRef, CopyRetargetPermission, Duration, Effect,
-    EffectScope, FaceDownProfile, FilterProp, LibraryPosition, MultiTargetSpec,
-    OutsideGameSourcePool, PlayerScope, PreventionAmount, PreventionScope, PtStat, PtValue,
-    QuantityExpr, QuantityRef, SearchSelectionConstraint, StaticDefinition, TapStateChange,
-    TargetFilter, TypeFilter, TypedFilter, ZoneOwner,
+    AbilityCost, AbilityDefinition, AbilityKind, BounceSelection, CardSelectionMode,
+    CategoryChooserScope, ChoiceType, Chooser, ContinuousModification, ControllerRef,
+    CopyRetargetPermission, Duration, Effect, EffectScope, FaceDownProfile, FilterProp,
+    LibraryPosition, MultiTargetSpec, OutsideGameSourcePool, PlayerScope, PreventionAmount,
+    PreventionScope, PtStat, PtValue, QuantityExpr, QuantityRef, SearchSelectionConstraint,
+    StaticDefinition, TapStateChange, TargetFilter, TargetSelectionMode, TypeFilter, TypedFilter,
+    ZoneOwner,
 };
 use crate::types::card_type::CoreType;
 use crate::types::phase::Phase;
@@ -283,6 +284,18 @@ fn parse_dynamic_count_phrase(lower: &str) -> Option<QuantityExpr> {
     .parse(lower)
     {
         let qty_text = qty_tail.trim_end_matches('.').trim();
+        // CR 107.1a + CR 121.1: "cards equal to half the number of cards in
+        // their library" — fraction-led dynamic draw count, rounded per CR
+        // 107.1a. `qty_text` is already lowercase + trimmed, so call
+        // `parse_fraction_rounded` directly (no `nom_on_lower` bridge), and
+        // require full consumption before accepting the fraction expression.
+        if let Ok((rest, expr)) =
+            crate::parser::oracle_nom::quantity::parse_fraction_rounded(qty_text)
+        {
+            if rest.trim().is_empty() {
+                return Some(expr);
+            }
+        }
         if let Some(qty) = crate::parser::oracle_quantity::parse_quantity_ref(qty_text) {
             return Some(QuantityExpr::Ref { qty });
         }
@@ -2676,7 +2689,17 @@ pub(super) fn parse_choose_ast(
     }
 
     if let Some(choice_type) = super::try_parse_named_choice(lower) {
-        return Some(ChooseImperativeAst::NamedChoice { choice_type });
+        // CR 608.2d (override) + CR 701.9b (analogous): "choose a player at
+        // random" (Strax) — the game selects the referent, not the controller.
+        let selection = if nom_primitives::scan_contains(lower, "at random") {
+            TargetSelectionMode::Random
+        } else {
+            TargetSelectionMode::Chosen
+        };
+        return Some(ChooseImperativeAst::NamedChoice {
+            choice_type,
+            selection,
+        });
     }
 
     if nom_on_lower(text, lower, |input| value((), tag("choose ")).parse(input)).is_some()
@@ -2695,8 +2718,12 @@ pub(super) fn parse_choose_ast(
     // "choose N of them/those [cards]" / "you choose N of those cards" /
     // "an opponent chooses N of them" — anaphoric reference to a previously
     // revealed/exiled set, producing ChooseFromZone.
-    if let Some((count, chooser)) = parse_choose_anaphoric(lower) {
-        return Some(ChooseImperativeAst::FromTrackedSet { count, chooser });
+    if let Some((count, chooser, selection)) = parse_choose_anaphoric(lower) {
+        return Some(ChooseImperativeAst::FromTrackedSet {
+            count,
+            chooser,
+            selection,
+        });
     }
 
     None
@@ -2741,6 +2768,8 @@ fn try_parse_choose_owned_by_voter(
         filter,
         chooser: Chooser::Controller,
         up_to: false,
+        // CR 608.2d: per-ballot voter choice is controller-directed, never random.
+        selection: crate::types::ability::CardSelectionMode::Chosen,
     })
 }
 
@@ -2754,9 +2783,24 @@ fn try_parse_choose_from_zone(lower: &str, ctx: &mut ParseContext) -> Option<Cho
     .parse(lower)
     .ok()?;
 
-    if nom_primitives::scan_contains(choice_text, "at random") {
-        return None;
-    }
+    // CR 608.2d (override) + CR 701.9b (analogous): "choose ... at random" — the
+    // game selects the card(s), not the controller. Captured as a typed
+    // `CardSelectionMode` (was previously a bail-out that dropped the qualifier).
+    let selection = if nom_primitives::scan_contains(choice_text, "at random") {
+        crate::types::ability::CardSelectionMode::Random
+    } else {
+        crate::types::ability::CardSelectionMode::Chosen
+    };
+
+    // The "at random" qualifier is now captured in `selection`; strip it so it
+    // does not leak into the downstream zone/filter parse. Otherwise a pre-zone
+    // qualifier ("a creature card at random from target opponent's graveyard")
+    // lands in the search-filter prefix, which `parse_search_filter` can't
+    // classify, emitting a spurious "search-filter-suffix unmatched"
+    // TargetFallback (Tariel, Reckoner of Souls; Deadbridge Chant; Higure).
+    // allow-noncombinator: strip a captured free-floating qualifier before sub-parse
+    let choice_text_owned = choice_text.replace(" at random", "");
+    let choice_text = choice_text_owned.as_str();
 
     let (filter_prefix, (zone_owner, zones), zone_suffix) =
         nom_primitives::scan_preceded(choice_text, parse_choose_zone_connector)?;
@@ -2801,6 +2845,7 @@ fn try_parse_choose_from_zone(lower: &str, ctx: &mut ParseContext) -> Option<Cho
         filter,
         chooser: Chooser::Controller,
         up_to: false,
+        selection,
     })
 }
 
@@ -2837,6 +2882,7 @@ pub(super) fn parse_for_each_player_choose_from_zone(
             filter,
             chooser,
             up_to,
+            selection,
         } => Some(ChooseImperativeAst::FromZone {
             count,
             zones,
@@ -2844,6 +2890,7 @@ pub(super) fn parse_for_each_player_choose_from_zone(
             filter,
             chooser,
             up_to,
+            selection,
         }),
         _ => None,
     }
@@ -2987,7 +3034,7 @@ fn try_parse_two_targets(rest: &str) -> Option<ChooseImperativeAst> {
 
 /// Parse anaphoric "choose N of them/those [cards]" patterns using nom combinators.
 /// Returns (count, chooser) if the pattern matches.
-fn parse_choose_anaphoric(lower: &str) -> Option<(u32, Chooser)> {
+fn parse_choose_anaphoric(lower: &str) -> Option<(u32, Chooser, CardSelectionMode)> {
     type E<'a> = OracleError<'a>;
 
     // Determine chooser from prefix: "an opponent chooses" / "target opponent chooses" → Opponent,
@@ -3018,11 +3065,23 @@ fn parse_choose_anaphoric(lower: &str) -> Option<(u32, Chooser)> {
     let (rest, count) = nom_primitives::parse_number.parse(rest).ok()?;
 
     // Must be followed by " of them" or " of those" (optionally with trailing type noun).
-    let _ = alt((tag::<_, _, E>(" of them"), tag(" of those")))
-        .parse(rest)
-        .ok()?;
+    let (after_anaphor, ()) = alt((
+        value((), tag::<_, _, E>(" of them")),
+        value((), tag(" of those")),
+    ))
+    .parse(rest)
+    .ok()?;
 
-    Some((count, chooser))
+    // CR 608.2d (override) + CR 701.9b (analogous): "choose one of them at
+    // random" (River Song's Diary) — the game picks, not the chooser. Scan the
+    // remainder after the anaphor for the qualifier.
+    let selection = if nom_primitives::scan_contains(after_anaphor, "at random") {
+        CardSelectionMode::Random
+    } else {
+        CardSelectionMode::Chosen
+    };
+
+    Some((count, chooser, selection))
 }
 
 /// Public entry for Tragic Arrogance-style patterns where the chooser_scope is ControllerForAll.
@@ -3239,7 +3298,11 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
     match ast {
         ChooseImperativeAst::TargetOnly { target } => Effect::TargetOnly { target },
         ChooseImperativeAst::Reparse { text } => super::parse_effect(&text),
-        ChooseImperativeAst::NamedChoice { choice_type } => Effect::Choose {
+        ChooseImperativeAst::NamedChoice {
+            choice_type,
+            selection,
+        } => Effect::Choose {
+            selection,
             // CR 201.3 / CR 113.6 / CR 205.2a / CR 614.12c: A chosen attribute
             // must persist on the source whenever a later clause refers back to
             // it. CardName choices persist for "with the chosen name" filters
@@ -3277,7 +3340,11 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
         },
         // CR 700.2: Anaphoric "choose N of them/those" → select from the tracked set
         // populated by the preceding effect (RevealTop, RevealHand, ExileTop, etc.).
-        ChooseImperativeAst::FromTrackedSet { count, chooser } => Effect::ChooseFromZone {
+        ChooseImperativeAst::FromTrackedSet {
+            count,
+            chooser,
+            selection,
+        } => Effect::ChooseFromZone {
             count,
             zone: Zone::Exile,
             additional_zones: Vec::new(),
@@ -3285,6 +3352,7 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
             filter: None,
             chooser,
             up_to: false,
+            selection,
             constraint: None,
         },
         ChooseImperativeAst::FromZone {
@@ -3294,6 +3362,7 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
             filter,
             chooser,
             up_to,
+            selection,
         } => {
             let mut zones = zones.into_iter();
             let zone = zones.next().unwrap_or(Zone::Hand);
@@ -3305,6 +3374,7 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
                 filter: Some(filter),
                 chooser,
                 up_to,
+                selection,
                 constraint: None,
             }
         }
@@ -3617,6 +3687,7 @@ fn parse_copy_stack_ability_target(input: &str) -> Option<(TargetFilter, &str)> 
             TargetFilter::StackAbility {
                 controller: Some(ControllerRef::You),
                 tag: None,
+                kind: None,
             },
             rem,
         ));
@@ -3630,6 +3701,7 @@ fn parse_copy_stack_ability_target(input: &str) -> Option<(TargetFilter, &str)> 
             TargetFilter::StackAbility {
                 controller: None,
                 tag: None,
+                kind: None,
             },
             input,
         ));
@@ -3651,6 +3723,7 @@ pub(super) fn stack_ability_filter_from_text(input: &str) -> TargetFilter {
     TargetFilter::StackAbility {
         controller,
         tag: None,
+        kind: None,
     }
 }
 
@@ -3735,6 +3808,8 @@ pub(super) fn lower_utility_imperative_ast(ast: UtilityImperativeAst) -> Effect 
             target,
             retarget,
             copier: None,
+            additional_modifications: Vec::new(),
+            starting_loyalty_from_casualty_sacrifice: false,
         },
         UtilityImperativeAst::Transform { target } => Effect::Transform { target },
         UtilityImperativeAst::Attach { attachment, target } => {
@@ -8847,6 +8922,55 @@ mod tests {
         tf.properties.iter().any(|candidate| candidate == &prop)
     }
 
+    /// CR 107.1a + CR 121.1: Change B — `parse_dynamic_count_phrase` routes a
+    /// fraction-led draw count ("cards equal to half the number of cards in
+    /// their library") through `parse_fraction_rounded` FIRST, yielding a
+    /// `DivideRounded` over the target's library count (Peer into the Abyss).
+    #[test]
+    fn dynamic_count_phrase_fraction_routes_to_divide_rounded() {
+        let qty =
+            parse_dynamic_count_phrase("cards equal to half the number of cards in their library")
+                .expect("fraction-led draw count must parse");
+        match qty {
+            QuantityExpr::DivideRounded {
+                inner,
+                divisor,
+                rounding,
+            } => {
+                assert_eq!(divisor, 2);
+                // Rounding defaults to Down here; the trailing "Round up each
+                // time." post-pass flips it to Up at the card level.
+                assert_eq!(rounding, crate::types::ability::RoundingMode::Down);
+                assert!(
+                    matches!(
+                        *inner,
+                        QuantityExpr::Ref {
+                            qty: QuantityRef::TargetZoneCardCount {
+                                zone: crate::types::ability::ZoneRef::Library
+                            }
+                        }
+                    ),
+                    "expected TargetZoneCardCount{{Library}} inner, got {inner:?}"
+                );
+            }
+            other => panic!("expected DivideRounded, got {other:?}"),
+        }
+    }
+
+    /// Change B fallback guard: a NON-fraction "cards equal to <ref>" draw
+    /// count still parses to its prior `QuantityExpr::Ref` via the unchanged
+    /// semantic `parse_quantity_ref` call — `parse_fraction_rounded` misses on
+    /// the non-fraction lead and falls through (no regression).
+    #[test]
+    fn dynamic_count_phrase_nonfraction_falls_through_to_ref() {
+        let qty = parse_dynamic_count_phrase("cards equal to the number of creatures you control")
+            .expect("non-fraction draw count must still parse");
+        assert!(
+            matches!(qty, QuantityExpr::Ref { .. }),
+            "non-fraction draw count must remain a plain Ref, got {qty:?}"
+        );
+    }
+
     /// CR 122.1: `counter_placement_is_mass` recognizes "on each"/"on all"
     /// mass placements and rejects targeted ("on target") or anaphoric
     /// ("on it") single-object placements.
@@ -8884,7 +9008,8 @@ mod tests {
                 f,
                 TargetFilter::StackAbility {
                     controller: None,
-                    tag: None
+                    tag: None,
+                    kind: None,
                 }
             )),
             "missing the activated/triggered ability disjunct: {target:?}"
@@ -8930,7 +9055,8 @@ mod tests {
                 f,
                 TargetFilter::StackAbility {
                     controller: None,
-                    tag: None
+                    tag: None,
+                    kind: Some(crate::types::ability::StackAbilityKind::Triggered),
                 }
             )),
             "missing the triggered-ability disjunct: {target:?}"
@@ -8982,7 +9108,8 @@ mod tests {
                 f,
                 TargetFilter::StackAbility {
                     controller: None,
-                    tag: None
+                    tag: None,
+                    kind: None,
                 }
             )),
             "missing the activated/triggered ability disjunct: {target:?}"
@@ -10817,6 +10944,36 @@ mod tests {
         }
     }
 
+    /// Issue #720: "amass Orcs X, where X is that spell's mana value" (Saruman,
+    /// the White Hand) must bind X to the triggering spell's mana value, not
+    /// fall through to a bare `Variable` ref — which always resolves to 0
+    /// outside an actually-paid-X cost, silently amassing nothing.
+    #[test]
+    fn parse_amass_orcs_x_where_x_is_spell_mana_value() {
+        let result = try_parse_amass(
+            "amass Orcs X, where X is that spell's mana value",
+            "amass orcs x, where x is that spell's mana value",
+        );
+        assert!(
+            result.is_some(),
+            "Should parse 'amass Orcs X, where X is ...'"
+        );
+        match result.unwrap() {
+            Effect::Amass { subtype, count } => {
+                assert_eq!(subtype, "Orc");
+                assert_eq!(
+                    count,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectManaValue {
+                            scope: crate::types::ability::ObjectScope::EventSource,
+                        }
+                    }
+                );
+            }
+            other => panic!("Expected Amass, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_monstrosity_4() {
         let result = try_parse_monstrosity("monstrosity 4.");
@@ -11464,7 +11621,7 @@ mod tests {
         let lower = text.to_lowercase();
         let result = parse_choose_ast(text, &lower, &mut ParseContext::default());
         match result {
-            Some(ChooseImperativeAst::FromTrackedSet { count, chooser }) => {
+            Some(ChooseImperativeAst::FromTrackedSet { count, chooser, .. }) => {
                 assert_eq!(count, 1);
                 assert_eq!(chooser, Chooser::Controller);
             }
@@ -11478,7 +11635,7 @@ mod tests {
         let lower = text.to_lowercase();
         let result = parse_choose_ast(text, &lower, &mut ParseContext::default());
         match result {
-            Some(ChooseImperativeAst::FromTrackedSet { count, chooser }) => {
+            Some(ChooseImperativeAst::FromTrackedSet { count, chooser, .. }) => {
                 assert_eq!(count, 2);
                 assert_eq!(chooser, Chooser::Controller);
             }
@@ -11492,7 +11649,7 @@ mod tests {
         let lower = text.to_lowercase();
         let result = parse_choose_ast(text, &lower, &mut ParseContext::default());
         match result {
-            Some(ChooseImperativeAst::FromTrackedSet { count, chooser }) => {
+            Some(ChooseImperativeAst::FromTrackedSet { count, chooser, .. }) => {
                 assert_eq!(count, 1);
                 assert_eq!(chooser, Chooser::Opponent);
             }
@@ -11506,7 +11663,7 @@ mod tests {
         let lower = text.to_lowercase();
         let result = parse_choose_ast(text, &lower, &mut ParseContext::default());
         match result {
-            Some(ChooseImperativeAst::FromTrackedSet { count, chooser }) => {
+            Some(ChooseImperativeAst::FromTrackedSet { count, chooser, .. }) => {
                 assert_eq!(count, 1);
                 assert_eq!(chooser, Chooser::Controller);
             }
@@ -11520,7 +11677,7 @@ mod tests {
         let lower = text.to_lowercase();
         let result = parse_choose_ast(text, &lower, &mut ParseContext::default());
         match result {
-            Some(ChooseImperativeAst::FromTrackedSet { count, chooser }) => {
+            Some(ChooseImperativeAst::FromTrackedSet { count, chooser, .. }) => {
                 assert_eq!(count, 2);
                 assert_eq!(chooser, Chooser::Controller);
             }
@@ -11640,14 +11797,97 @@ mod tests {
     }
 
     #[test]
-    fn parse_choose_random_card_in_graveyard_is_not_direct_choice() {
+    fn parse_choose_random_card_in_graveyard_records_random_selection() {
+        // CR 608.2d (override): "choose a card at random in your graveyard" is a
+        // ChooseFromZone, but the "at random" qualifier is now captured as a
+        // typed `CardSelectionMode::Random` (previously the parser bailed out and
+        // dropped the random axis, treating it as a deliberate player choice).
         let text = "choose a card at random in your graveyard";
         let lower = text.to_lowercase();
         let result = parse_choose_ast(text, &lower, &mut ParseContext::default());
+        match result {
+            Some(ChooseImperativeAst::FromZone { selection, .. }) => {
+                assert_eq!(selection, CardSelectionMode::Random);
+            }
+            other => panic!("expected random FromZone, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_choose_one_of_them_at_random_records_random_selection() {
+        // CR 608.2d (override): "choose one of them at random" (River Song's
+        // Diary) → anaphoric FromTrackedSet with CardSelectionMode::Random.
+        let text = "choose one of them at random";
+        let lower = text.to_lowercase();
+        match parse_choose_ast(text, &lower, &mut ParseContext::default()) {
+            Some(ChooseImperativeAst::FromTrackedSet {
+                count, selection, ..
+            }) => {
+                assert_eq!(count, 1);
+                assert_eq!(selection, CardSelectionMode::Random);
+            }
+            other => panic!("expected random FromTrackedSet, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_choose_a_player_at_random_records_random_selection() {
+        // CR 608.2d (override): "choose a player at random" (Strax) → NamedChoice
+        // with TargetSelectionMode::Random.
+        let text = "choose a player at random";
+        let lower = text.to_lowercase();
+        match parse_choose_ast(text, &lower, &mut ParseContext::default()) {
+            Some(ChooseImperativeAst::NamedChoice { selection, .. }) => {
+                assert_eq!(selection, TargetSelectionMode::Random);
+            }
+            other => panic!("expected random NamedChoice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_choose_from_zone_at_random_strips_qualifier_no_target_fallback() {
+        // CR 608.2d (override): "choose a creature card at random from target
+        // opponent's graveyard" (Tariel, Reckoner of Souls) → FromZone with
+        // selection=Random and zone_owner=TargetedPlayer. The captured "at
+        // random" must be stripped before the filter parse so it does NOT leak
+        // into the search-filter prefix and emit a spurious
+        // "search-filter-suffix unmatched" TargetFallback (pre-fix regression).
+        let text = "choose a creature card at random from target opponent's graveyard";
+        let lower = text.to_lowercase();
+        let mut ctx = ParseContext::default();
+        match parse_choose_ast(text, &lower, &mut ctx) {
+            Some(ChooseImperativeAst::FromZone {
+                selection,
+                zone_owner,
+                ..
+            }) => {
+                assert_eq!(selection, CardSelectionMode::Random);
+                assert_eq!(zone_owner, ZoneOwner::TargetedPlayer);
+            }
+            other => panic!("expected random FromZone, got {other:?}"),
+        }
+        // The clean parse emits no target-fallback at all; pre-fix the leaked
+        // "at random" produced a "search-filter-suffix unmatched" TargetFallback.
         assert!(
-            !matches!(result, Some(ChooseImperativeAst::FromZone { .. })),
-            "random choices must not become player-directed ChooseFromZone prompts"
+            !ctx.diagnostics
+                .iter()
+                .any(|d| matches!(d, OracleDiagnostic::TargetFallback { .. })),
+            "the stripped 'at random' qualifier must not leak a target-fallback: {:?}",
+            ctx.diagnostics
         );
+    }
+
+    #[test]
+    fn parse_choose_anaphoric_non_random_defaults_to_chosen() {
+        // Building-block regression: the ordinary anaphoric path stays Chosen.
+        let text = "choose one of them";
+        match parse_choose_anaphoric(&text.to_lowercase()) {
+            Some((count, _chooser, selection)) => {
+                assert_eq!(count, 1);
+                assert_eq!(selection, CardSelectionMode::Chosen);
+            }
+            other => panic!("expected anaphoric tuple, got {other:?}"),
+        }
     }
 
     #[test]
@@ -11952,6 +12192,7 @@ mod tests {
         let ast = ChooseImperativeAst::FromTrackedSet {
             count: 3,
             chooser: Chooser::Opponent,
+            selection: crate::types::ability::CardSelectionMode::Chosen,
         };
         let effect = lower_choose_ast(ast);
         match effect {
@@ -11964,6 +12205,7 @@ mod tests {
                 chooser,
                 up_to,
                 constraint,
+                ..
             } => {
                 assert_eq!(count, 3);
                 assert_eq!(zone, Zone::Exile);
@@ -12473,6 +12715,7 @@ mod tests {
             TargetFilter::StackAbility {
                 controller: Some(ControllerRef::You),
                 tag: None,
+                kind: None,
             }
         ));
 
@@ -12483,7 +12726,8 @@ mod tests {
             unscoped.0,
             TargetFilter::StackAbility {
                 controller: None,
-                tag: None
+                tag: None,
+                kind: None,
             }
         ));
 

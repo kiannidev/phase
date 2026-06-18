@@ -16,7 +16,7 @@ use crate::parser::oracle_ir::ast::*;
 use crate::types::ability::{
     AbilityDefinition, AbilityKind, ChosenSubtypeKind, ContinuousModification, ControllerRef,
     Duration, Effect, FilterProp, MultiTargetSpec, PlayerFilter, PlayerScope, PtValue,
-    QuantityExpr, QuantityRef, StaticDefinition, TargetFilter, TypedFilter,
+    QuantityExpr, QuantityRef, StaticCondition, StaticDefinition, TargetFilter, TypedFilter,
 };
 use crate::types::game_state::DayNight;
 use crate::types::keywords::Keyword;
@@ -33,7 +33,7 @@ use super::super::oracle_quantity;
 use super::super::oracle_static::{
     classify_block_exception, parse_additive_type_clause_modifications,
     parse_cant_be_activated_exemption_in_text, parse_chosen_qualifier_subject,
-    parse_continuous_modifications, parse_static_line_multi,
+    parse_continuous_modifications, parse_static_line, parse_static_line_multi,
 };
 use super::super::oracle_target::{parse_target, parse_target_with_ctx, parse_type_phrase};
 use super::super::oracle_util::{
@@ -338,10 +338,49 @@ fn try_parse_subject_become_clause(
     build_become_clause(application, &predicate, ctx)
 }
 
+/// CR 508.1d + CR 508.1h: "[creatures] can't attack [you] unless [player] pays
+/// {N} [for each of those creatures]" as a one-shot effect (Summon: Yojimbo
+/// chapters II/III). The static-side `parse_combat_tax_static` authority
+/// already lowers the UnlessPay payload; wrap it in `GrantStaticAbility` on
+/// `SelfRef` so `register_transient_effect` installs the tax on the resolving
+/// source for the effect's duration (mirrors quoted-static grant routing in
+/// `oracle_static/grammar.rs`).
+fn try_parse_combat_tax_effect_clause(text: &str) -> Option<ParsedEffectClause> {
+    let static_def = parse_static_line(text)?;
+    if !matches!(
+        static_def.condition,
+        Some(StaticCondition::UnlessPay { .. })
+    ) {
+        return None;
+    }
+    Some(ParsedEffectClause {
+        effect: Effect::GenericEffect {
+            static_abilities: vec![StaticDefinition::continuous().modifications(vec![
+                ContinuousModification::GrantStaticAbility {
+                    definition: Box::new(static_def),
+                },
+            ])],
+            duration: None,
+            target: Some(TargetFilter::SelfRef),
+        },
+        distribute: None,
+        multi_target: None,
+        duration: None,
+        sub_ability: None,
+        condition: None,
+        optional: false,
+        unless_pay: None,
+    })
+}
+
 fn try_parse_subject_restriction_clause(
     text: &str,
     ctx: &mut ParseContext,
 ) -> Option<ParsedEffectClause> {
+    if let Some(clause) = try_parse_combat_tax_effect_clause(text) {
+        return Some(clause);
+    }
+
     let lower = text.to_lowercase();
 
     // CR 509.1c: "Target creature must be blocked [this turn] [if able]"
@@ -1692,6 +1731,21 @@ fn resolve_they_pronoun(ctx: &mut ParseContext) -> TargetFilter {
     if matches!(ctx.relative_player_scope, Some(ControllerRef::ScopedPlayer)) {
         return TargetFilter::ScopedPlayer;
     }
+    // CR 608.2c + CR 109.4 (issue #1670, #3659): "they" after body "its
+    // controller may … if they do, they draw" refers to that creature's
+    // controller, not the damaged opponent from the trigger condition.
+    if matches!(
+        ctx.relative_player_scope,
+        Some(ControllerRef::ParentTargetController)
+    ) {
+        return TargetFilter::ParentTargetController;
+    }
+    if matches!(
+        ctx.relative_player_scope,
+        Some(ControllerRef::ParentTargetOwner)
+    ) {
+        return TargetFilter::ParentTargetOwner;
+    }
     // CR 603.7c + CR 120.3 + CR 506.2: A "deals [combat] damage to a player" or
     // "attacks a player" trigger introduces the damaged/attacked player as the
     // event referent (the parser stamps `relative_player_scope = TargetPlayer`).
@@ -2298,10 +2352,19 @@ fn build_become_clause(
     )))
     .parse(become_lower.as_str())
     {
-        let target = application
-            .target
-            .clone()
-            .unwrap_or(crate::types::ability::TargetFilter::ParentTarget);
+        // CR 722.3a: Resolve the prepare/unprepare target from the subject.
+        // A targeted subject ("target creature becomes prepared", Biblioplex)
+        // binds to the chosen object via `ParentTarget` at resolution; a
+        // self-referential or anaphoric subject ("this creature becomes
+        // prepared" — Stensian Sanguinist, normalized to `~` → `SelfRef`) uses
+        // the subject's own `affected` filter. Mirrors
+        // `static_affected_for_application`'s targeted-vs-subject split so the
+        // self-reference is preserved instead of collapsing to `ParentTarget`.
+        let target = if application.target.is_some() || application.inherits_parent {
+            crate::types::ability::TargetFilter::ParentTarget
+        } else {
+            application.affected.clone()
+        };
         let effect = match kind {
             PreparedKind::Prepared => Effect::BecomePrepared { target },
             PreparedKind::Unprepared => Effect::BecomeUnprepared { target },
@@ -2634,6 +2697,7 @@ fn try_parse_become_choice(
         effect: Effect::Choose {
             choice_type,
             persist: false,
+            selection: crate::types::ability::TargetSelectionMode::Chosen,
         },
         duration,
         sub_ability,
@@ -3999,6 +4063,39 @@ mod tests {
                 "chosen object is an anaphoric parent target, not a new target"
             );
         }
+    }
+
+    #[test]
+    fn combat_tax_effect_clause_yojimbo_chapter() {
+        use crate::types::ability::{ContinuousModification, StaticCondition};
+        use crate::types::statics::StaticMode;
+
+        let mut ctx = ParseContext::default();
+        let clause = try_parse_subject_restriction_clause(
+            "Creatures can't attack you unless their controller pays {2} for each of those creatures.",
+            &mut ctx,
+        )
+        .expect("Yojimbo chapter combat tax should parse");
+
+        let Effect::GenericEffect {
+            static_abilities,
+            target,
+            ..
+        } = clause.effect
+        else {
+            panic!("expected GenericEffect combat tax grant");
+        };
+        assert_eq!(target, Some(TargetFilter::SelfRef));
+        assert_eq!(static_abilities.len(), 1);
+        let mods = &static_abilities[0].modifications;
+        let ContinuousModification::GrantStaticAbility { definition } = &mods[0] else {
+            panic!("combat tax effect must grant static onto source");
+        };
+        assert!(matches!(definition.mode, StaticMode::CantAttack));
+        assert!(matches!(
+            definition.condition,
+            Some(StaticCondition::UnlessPay { .. })
+        ));
     }
 
     #[test]

@@ -323,6 +323,15 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
         }
     }
 
+    // --- Untap-step replacement: "If [filter] would untap during [its
+    // controller's | your] untap step, [effect] instead" (Freyalise's Winds,
+    // Edge of Malacol). CR 502.3 + CR 502.4 + CR 614.1a.
+    if nom_primitives::scan_contains(&lower, "would untap during") {
+        if let Some(def) = parse_untap_step_replacement(&text, &lower) {
+            return Some(def);
+        }
+    }
+
     // --- "If [player] would draw [a card | one or more cards], {effect}" ---
     // CR 614.1a: Widened from "you would draw" to handle opponent/player
     // scope (Notion Thief, Hullbreacher, Chains of Mephistopheles) mirroring
@@ -1420,6 +1429,7 @@ fn parse_shock_land(norm_lower: &str, original_text: &str) -> Option<Replacement
             Effect::Choose {
                 choice_type: ChoiceType::BasicLandType,
                 persist: true,
+                selection: crate::types::ability::TargetSelectionMode::Chosen,
             },
         )
     });
@@ -1430,6 +1440,7 @@ fn parse_shock_land(norm_lower: &str, original_text: &str) -> Option<Replacement
             Effect::Choose {
                 choice_type: ChoiceType::BasicLandType,
                 persist: true,
+                selection: crate::types::ability::TargetSelectionMode::Chosen,
             },
         )
         .sub_ability(tap_self)
@@ -1489,6 +1500,7 @@ fn parse_as_enters_choose(norm_lower: &str, original_text: &str) -> Option<Repla
         Effect::Choose {
             choice_type,
             persist: true,
+            selection: crate::types::ability::TargetSelectionMode::Chosen,
         },
     );
 
@@ -4753,9 +4765,17 @@ fn extract_replacement_effect(text: &str) -> Option<String> {
         let effect = TextPair::new(effect, &lower)
             .trim_end()
             .trim_end_matches('.');
+        // Strip trailing "... instead" marker (e.g., "draw two cards instead.").
         let effect = effect
             .strip_suffix(" instead")
             .map_or(effect, |trimmed| trimmed.trim_end());
+        // CR 614.1a: Strip leading "instead ..." marker (e.g., "instead you
+        // draw two cards"). This form appears when the subject follows the
+        // replacement word, as in Blood Scrivener: "..., instead you draw two
+        // cards and you lose 1 life."
+        let effect = effect
+            .strip_prefix("instead ") // allow-noncombinator: TextPair structural cleanup on an already-extracted replacement effect fragment, mirroring the trailing "instead" strip above.
+            .map_or(effect, |stripped| stripped.trim_start());
         if !effect.original.is_empty() {
             return Some(effect.original.to_string());
         }
@@ -4998,6 +5018,61 @@ fn parse_explore_replacement(lower: &str, original_text: &str) -> Option<Replace
                 TypedFilter::creature().controller(ControllerRef::You),
             ))
             .execute(parse_effect_chain(execute_text, AbilityKind::Spell))
+            .description(original_text.to_string()),
+    )
+}
+
+/// CR 502.3 + CR 502.4 + CR 614.1a: untap-step replacement —
+/// "If [filter] would untap during [its controller's | your] untap step,
+/// [effect] instead" (Freyalise's Winds, Edge of Malacol). The `valid_card`
+/// filter scopes WHICH permanent (parsed generically via `parse_type_phrase`),
+/// and `ReplacementCondition::DuringUntapStep` scopes WHEN (so effect-untaps at
+/// other times are unaffected). The alternative effect appears BEFORE "instead"
+/// ("remove all wind counters from it instead", "put two +1/+1 counters on it
+/// instead").
+fn parse_untap_step_replacement(original_text: &str, lower: &str) -> Option<ReplacementDefinition> {
+    if !nom_primitives::scan_contains(lower, "untap step")
+        || !nom_primitives::scan_contains(lower, "instead")
+    {
+        return None;
+    }
+
+    // Subject filter: between "if " and " would untap during".
+    let (head, after_would) = split_once_on_lower(original_text, lower, " would untap during ")?;
+    // Self-reference untap clauses ("~ would untap") are handled elsewhere.
+    if head.contains('~') {
+        return None;
+    }
+    // CR 614.1a: consume the leading "if " with a `tag` combinator, then parse
+    // the subject as a typed filter (lowercase, as `parse_type_phrase` expects).
+    let head_lc = head.trim().to_ascii_lowercase();
+    let (subject_lc, _) = tag::<_, _, OracleError<'_>>("if ")
+        .parse(head_lc.as_str())
+        .ok()?;
+    let (filter, subject_rest) = parse_type_phrase(subject_lc.trim());
+    if matches!(&filter, TargetFilter::Any) || !subject_rest.trim().is_empty() {
+        return None;
+    }
+
+    // Skip past "[its controller's | your] untap step" to the alternative effect.
+    let after_would_lc = after_would.to_ascii_lowercase();
+    let (_step_owner, after_step) =
+        split_once_on_lower(after_would, &after_would_lc, "untap step")?;
+    let after_step = after_step.trim_start_matches([',', ' ']);
+
+    // Effect is the text before " instead".
+    let after_step_lc = after_step.to_ascii_lowercase();
+    let (effect_text, _) = split_once_on_lower(after_step, &after_step_lc, "instead")?;
+    let effect_text = effect_text.trim().trim_end_matches([',', ' ']);
+    if effect_text.is_empty() {
+        return None;
+    }
+
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::Untap)
+            .valid_card(filter)
+            .condition(ReplacementCondition::DuringUntapStep)
+            .execute(parse_effect_chain(effect_text, AbilityKind::Spell))
             .description(original_text.to_string()),
     )
 }
@@ -7141,6 +7216,45 @@ mod tests {
         }
     }
 
+    /// CR 502.3 + CR 502.4 + CR 614.1a: untap-step replacement. Edge of Malacol
+    /// "If a creature you control would untap during your untap step, put two
+    /// +1/+1 counters on it instead." gates to the untap step (so effect-untaps
+    /// elsewhere are unaffected) and keeps the alternative effect.
+    #[test]
+    fn untap_step_replacement_edge_of_malacol() {
+        let def = parse_replacement_line(
+            "If a creature you control would untap during your untap step, put two +1/+1 counters on it instead.",
+            "Edge of Malacol",
+        )
+        .expect("untap-step replacement should parse");
+        assert_eq!(def.event, ReplacementEvent::Untap);
+        assert_eq!(def.condition, Some(ReplacementCondition::DuringUntapStep));
+        assert!(
+            def.execute.is_some(),
+            "alternative effect (+1/+1 counters) must not be dropped"
+        );
+        assert!(
+            def.valid_card.is_some(),
+            "valid_card filter (a creature you control) should be set"
+        );
+    }
+
+    /// CR 502.3 + CR 614.1a: untap-step replacement with a counter-filtered
+    /// subject — Freyalise's Winds "If a permanent with a wind counter on it
+    /// would untap during its controller's untap step, remove all wind counters
+    /// from it instead."
+    #[test]
+    fn untap_step_replacement_freyalises_winds() {
+        let def = parse_replacement_line(
+            "If a permanent with a wind counter on it would untap during its controller's untap step, remove all wind counters from it instead.",
+            "Freyalise's Winds",
+        )
+        .expect("counter-filtered untap-step replacement should parse");
+        assert_eq!(def.event, ReplacementEvent::Untap);
+        assert_eq!(def.condition, Some(ReplacementCondition::DuringUntapStep));
+        assert!(def.execute.is_some());
+    }
+
     /// CR 614.12a: Karoo artifact — Mox Diamond's "you may discard ..." cost.
     /// The non-cost "you may " lead-in is stripped before `parse_single_cost`.
     #[test]
@@ -8646,6 +8760,7 @@ mod tests {
             Effect::Choose {
                 choice_type: ChoiceType::Color { ref excluded },
                 persist: true,
+                ..
             } if excluded.is_empty()
         ));
     }
@@ -8688,6 +8803,7 @@ mod tests {
                 Effect::Choose {
                     choice_type: ChoiceType::Color { ref excluded },
                     persist: true,
+                    ..
                 } if excluded == &vec![ManaColor::Green]
             ),
             "sub-ability must be Choose color (excluding Green), got {:?}",
@@ -8711,6 +8827,7 @@ mod tests {
             Effect::Choose {
                 choice_type: ChoiceType::Color { ref excluded },
                 persist: true,
+                ..
             } if excluded == &vec![ManaColor::White]
         ));
     }
@@ -8728,6 +8845,7 @@ mod tests {
             Effect::Choose {
                 choice_type: ChoiceType::TwoColors,
                 persist: true,
+                ..
             }
         ));
     }
@@ -8745,6 +8863,7 @@ mod tests {
             Effect::Choose {
                 choice_type: ChoiceType::CreatureType,
                 persist: true,
+                ..
             }
         ));
     }
@@ -11802,6 +11921,56 @@ mod tests {
                     qty: QuantityRef::EventContextAmount
                 }
             ) && *offset == 1
+        ));
+    }
+
+    #[test]
+    fn draw_replacement_leading_instead_prefix_blood_scrivener() {
+        // CR 614.1a: "instead you draw two cards" — leading "instead" form with
+        // subject prefix. The replacement must wire up Draw {count:2} as the
+        // execute effect and LoseLife as a sub_ability, gated on HandSize == 0.
+        // Regression test for issue #3305: "instead" was not stripped from the
+        // effect text, leaving the draw as Unimplemented and only the life loss
+        // fired.
+        let def = parse_replacement_line(
+            "If you would draw a card while you have no cards in hand, instead you draw two cards and you lose 1 life.",
+            "Blood Scrivener",
+        )
+        .unwrap();
+
+        assert_eq!(def.event, ReplacementEvent::Draw);
+        // Gate: HandSize EQ 0
+        assert!(matches!(
+            &def.condition,
+            Some(ReplacementCondition::OnlyIfQuantity {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::HandSize {
+                        player: crate::types::ability::PlayerScope::Controller
+                    }
+                },
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Fixed { value: 0 },
+                active_player_req: None,
+            })
+        ));
+        // Execute: Draw { count: 2 }
+        assert!(matches!(
+            def.execute.as_deref().map(|a| &*a.effect),
+            Some(Effect::Draw {
+                count: QuantityExpr::Fixed { value: 2 },
+                ..
+            })
+        ));
+        // Sub-ability: LoseLife { amount: 1 }
+        assert!(matches!(
+            def.execute
+                .as_deref()
+                .and_then(|a| a.sub_ability.as_deref())
+                .map(|a| &*a.effect),
+            Some(Effect::LoseLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                ..
+            })
         ));
     }
 

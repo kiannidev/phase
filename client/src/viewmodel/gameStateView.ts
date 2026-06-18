@@ -109,6 +109,39 @@ export function isLibraryCardRevealedToViewer(
   );
 }
 
+/**
+ * Whether a face-down card sitting in the shared Exile zone is visible to
+ * `viewerId`.
+ *
+ * Mirrors the engine's `hidden_facedown_exile_ids` gate
+ * (`crates/engine/src/game/visibility.rs`, CR 406.3 + CR 702.75a +
+ * CR 702.143e): a foretold card's owner may look at it, and the controller of
+ * the permanent that Hideaway-exiled a card may look at it. Every other
+ * face-down exile — including a plain `TrackedBySource` link that grants no
+ * look-permission (Bomat Courier, Necropotence, Asmodeus) — stays hidden.
+ *
+ * Like `isLibraryCardRevealedToViewer` above, this exists because single-player
+ * renders the raw, unredacted state: `obj.face_down` alone can't distinguish
+ * "hidden from this viewer" from "visible to this viewer", and the object's
+ * `name`/`printed_ref` carry the real identity regardless of viewer. Used by
+ * the exile `ZoneViewer` to keep an opponent's Hideaway-exiled card (or a
+ * non-owner's foretold exile) from leaking its name or image.
+ */
+export function isFaceDownExileCardVisibleToViewer(
+  gameState: GameState | null,
+  obj: GameObject,
+  viewerId: PlayerId,
+): boolean {
+  if (!gameState || !obj.face_down) return false;
+  if (obj.foretold && obj.owner === viewerId) return true;
+  return (gameState.exile_links ?? []).some(
+    (link) =>
+      link.exiled_id === obj.id &&
+      link.kind === "HideawayLookable" &&
+      gameState.objects[link.source_id]?.controller === viewerId,
+  );
+}
+
 export function getWaitingForObjectChoiceIds(
   waitingFor: WaitingFor | null | undefined,
 ): ObjectId[] {
@@ -207,11 +240,22 @@ export function buildPlayerBattlefieldView(
   const playerObjects = battlefieldObjects.filter(
     (object) => object.controller === playerId,
   );
-  return buildPlayerBattlefieldViewFromObjects(playerObjects);
+  // CR 701.54: the Ring-bearer must render as its own card even when a
+  // same-named, identically-statted permanent (e.g. another Army token)
+  // would otherwise collapse it into a shared group — otherwise the
+  // ring-bearer badge can land on the wrong representative or disappear
+  // entirely behind a stack badge.
+  const ringBearerIds = new Set(
+    Object.values(gameState.ring_bearer ?? {}).filter(
+      (id): id is ObjectId => id != null,
+    ),
+  );
+  return buildPlayerBattlefieldViewFromObjects(playerObjects, ringBearerIds);
 }
 
 export function buildPlayerBattlefieldViewFromObjects(
   playerObjects: GameObject[],
+  ringBearerIds: ReadonlySet<ObjectId> = new Set(),
 ): PlayerBattlefieldView {
   const partition = partitionByType(playerObjects);
   const objectMap = new Map(playerObjects.map((object) => [object.id, object]));
@@ -221,11 +265,11 @@ export function buildPlayerBattlefieldViewFromObjects(
       .filter(Boolean) as GameObject[];
 
   return {
-    creatures: groupByName(resolveObjects(partition.creatures)),
-    lands: groupByName(resolveObjects(partition.lands)),
-    support: groupByName(resolveObjects(partition.support)),
-    planeswalkers: groupByName(resolveObjects(partition.planeswalkers)),
-    other: groupByName(resolveObjects(partition.other)),
+    creatures: groupByName(resolveObjects(partition.creatures), ringBearerIds),
+    lands: groupByName(resolveObjects(partition.lands), ringBearerIds),
+    support: groupByName(resolveObjects(partition.support), ringBearerIds),
+    planeswalkers: groupByName(resolveObjects(partition.planeswalkers), ringBearerIds),
+    other: groupByName(resolveObjects(partition.other), ringBearerIds),
   };
 }
 

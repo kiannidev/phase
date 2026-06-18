@@ -4,6 +4,7 @@ use super::aggro_pressure::AggroPressurePolicy;
 use super::anthem_priority::AnthemPriorityPolicy;
 use super::anti_self_harm::AntiSelfHarmPolicy;
 use super::blight_value::BlightValuePolicy;
+use super::blink_payoff::BlinkPayoffPolicy;
 use super::board_development::BoardDevelopmentPolicy;
 use super::board_wipe_telegraph::BoardWipeTelegraphPolicy;
 use super::card_advantage::CardAdvantagePolicy;
@@ -24,6 +25,7 @@ use super::landfall_timing::LandfallTimingPolicy;
 use super::lethality_awareness::LethalityAwarenessPolicy;
 use super::life_total_resource::LifeTotalResourcePolicy;
 use super::lifegain_payoff::LifegainPayoffPolicy;
+use super::mill_payoff::MillPayoffPolicy;
 use super::payment_selection::PaymentSelectionPolicy;
 use super::plus_one_counters::PlusOneCountersPolicy;
 use super::ramp_timing::RampTimingPolicy;
@@ -31,6 +33,7 @@ use super::reactive_self_protection::ReactiveSelfProtectionPolicy;
 use super::reanimator_payoff::ReanimatorPayoffPolicy;
 use super::recursion_awareness::RecursionAwarenessPolicy;
 use super::redundancy_avoidance::RedundancyAvoidancePolicy;
+use super::sacrifice_land_protection::SacrificeLandProtectionPolicy;
 use super::sacrifice_value::SacrificeValuePolicy;
 use super::separate_piles_timing::SeparatePilesTimingPolicy;
 use super::spellslinger_casting::SpellslingerCastingPolicy;
@@ -58,6 +61,7 @@ pub enum PolicyId {
     EtbValue,
     EnchantmentsPayoff,
     EquipmentPayoff,
+    BlinkPayoff,
     CopyValue,
     Tutor,
     HandDisruption,
@@ -102,6 +106,7 @@ pub enum PolicyId {
     SpellslingerKeepablesMulligan,
     CombatTaxPayment,
     ReactiveSelfProtection,
+    SacrificeLandProtection,
     ComboLineProgress,
     CedhKeepablesMulligan,
     FixedDeckKeepMulligan,
@@ -114,6 +119,7 @@ pub enum PolicyId {
     XValue,
     LandAnimation,
     MillTargeting,
+    MillPayoff,
     ChaliceAvoidance,
     PaymentSelection,
     SeparatePilesTiming,
@@ -315,6 +321,7 @@ impl Default for PolicyRegistry {
             Box::new(SpellslingerCastingPolicy),
             Box::new(super::combat_tax::CombatTaxPaymentPolicy),
             Box::new(ReactiveSelfProtectionPolicy),
+            Box::new(SacrificeLandProtectionPolicy),
             Box::new(super::combo_line::ComboLinePolicy::new()),
             Box::new(super::planeswalker_loyalty::PlaneswalkerLoyaltyPolicy),
             Box::new(super::equipment_priority::EquipmentPriorityPolicy),
@@ -325,10 +332,12 @@ impl Default for PolicyRegistry {
             Box::new(super::control_change_awareness::ControlChangeAwarenessPolicy),
             Box::new(super::land_animation::LandAnimationPolicy),
             Box::new(super::mill_targeting::MillTargetingPolicy),
+            Box::new(MillPayoffPolicy),
             Box::new(ChaliceAvoidancePolicy),
             Box::new(PaymentSelectionPolicy),
             Box::new(SeparatePilesTimingPolicy),
             Box::new(ReanimatorPayoffPolicy),
+            Box::new(BlinkPayoffPolicy),
         ];
         let mut by_kind: HashMap<DecisionKind, Vec<usize>> = HashMap::new();
         for (idx, policy) in policies.iter().enumerate() {

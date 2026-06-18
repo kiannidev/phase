@@ -1947,6 +1947,27 @@ fn entered_object_blocks_incremental(
     false
 }
 
+/// Incremental layer re-derivation recipients: freshly-entered objects plus any
+/// host they are already attached to (Song of the Dryads class — the aura's
+/// continuous static applies to the enchanted permanent, not itself).
+fn incremental_recipient_ids(
+    state: &GameState,
+    entered_ids: &HashSet<ObjectId>,
+) -> HashSet<ObjectId> {
+    let mut recipients = entered_ids.clone();
+    for &id in entered_ids {
+        if let Some(host) = state
+            .objects
+            .get(&id)
+            .and_then(|obj| obj.attached_to.as_ref())
+            .and_then(|target| target.as_object())
+        {
+            recipients.insert(host);
+        }
+    }
+    recipients
+}
+
 /// Incremental layer re-derivation for a set of freshly-entered objects.
 ///
 /// Mirrors the PER-OBJECT subset of `evaluate_layers` for `entered_ids` only:
@@ -1963,8 +1984,9 @@ fn entered_object_blocks_incremental(
 /// effect's magnitude or affected set reads board population — so re-deriving
 /// just the entered objects yields a board identical to a full pass (CR 613.1).
 fn apply_layers_incremental(state: &mut GameState, entered_ids: &HashSet<ObjectId>) {
+    let recipient_ids = incremental_recipient_ids(state, entered_ids);
     // Step 1 (per-entered subset): reset computed characteristics to base.
-    for &id in entered_ids {
+    for &id in &recipient_ids {
         if let Some(obj) = state.objects.get_mut(&id) {
             obj.sync_missing_base_characteristics();
             obj.name = obj.base_name.clone();
@@ -2001,14 +2023,14 @@ fn apply_layers_incremental(state: &mut GameState, entered_ids: &HashSet<ObjectI
         crate::types::game_state::StaticSourceIndex::rebuild_from_state(state);
     }
 
-    // Step 2: Copy effects first (Layer 1), restricted to entered objects.
+    // Step 2: Copy effects first (Layer 1), restricted to recipient objects.
     let copy_effects = gather_active_effects_for_layer(state, Layer::Copy);
     let ordered_copy = order_active_continuous_effects(Layer::Copy, &copy_effects, state);
     for effect in &ordered_copy {
-        apply_continuous_effect_to(state, effect, entered_ids);
+        apply_continuous_effect_to(state, effect, &recipient_ids);
     }
 
-    // Step 3-4: Remaining layers in order, restricted to entered objects.
+    // Step 3-4: Remaining layers in order, restricted to recipient objects.
     let effects_by_layer = gather_active_continuous_effects(state);
     for (layer, layer_bucket) in &effects_by_layer {
         if *layer == Layer::Copy {
@@ -2022,25 +2044,25 @@ fn apply_layers_incremental(state: &mut GameState, entered_ids: &HashSet<ObjectI
                 order_by_timestamp(&layer_effects)
             };
             for effect in &ordered {
-                apply_continuous_effect_to(state, effect, entered_ids);
+                apply_continuous_effect_to(state, effect, &recipient_ids);
             }
         }
         // CR 613.1f: mirror the full-pass end-of-Layer-6 denial hook for the
         // incremental path, restricted to the freshly-entered objects that were
         // reset and re-derived in this pass.
         if *layer == Layer::Ability {
-            apply_cant_have_keyword_denials(state, Some(entered_ids));
+            apply_cant_have_keyword_denials(state, Some(&recipient_ids));
         }
         // CR 613.4c: P/T counters modify power/toughness in layer 7c, before the
         // 7d switch (CR 613.4d). The CounterPT bucket carries no continuous
         // effects, so fold the on-object counters in here.
         if *layer == Layer::CounterPT {
-            apply_pt_counter_modifications(state, entered_ids.iter().copied());
+            apply_pt_counter_modifications(state, recipient_ids.iter().copied());
         }
         if *layer == Layer::Type {
-            apply_prototype_characteristics(state, entered_ids.iter().copied());
-            let entered_vec: Vec<ObjectId> = entered_ids.iter().copied().collect();
-            apply_intrinsic_basic_land_mana_abilities(state, &entered_vec);
+            apply_prototype_characteristics(state, recipient_ids.iter().copied());
+            let recipient_vec: Vec<ObjectId> = recipient_ids.iter().copied().collect();
+            apply_intrinsic_basic_land_mana_abilities(state, &recipient_vec);
         }
     }
 
@@ -2069,7 +2091,7 @@ fn apply_layers_incremental(state: &mut GameState, entered_ids: &HashSet<ObjectI
     // CR 306.5c: loyalty re-derives from loyalty counters. Per-entered fixups
     // only. (P/T counters are applied in-loop at Layer::CounterPT above, in
     // layer 7c before the 7d switch — CR 613.4c/613.4d.)
-    for &id in entered_ids {
+    for &id in &recipient_ids {
         if let Some(obj) = state.objects.get_mut(&id) {
             let granted: Vec<Keyword> = obj
                 .counters
@@ -2095,10 +2117,10 @@ fn apply_layers_incremental(state: &mut GameState, entered_ids: &HashSet<ObjectI
     // (which runs after the in-loop Layer 6 denial) so a counter can't add a
     // forbidden keyword. Restricted to the freshly-entered objects, mirroring the
     // incremental denial hook above.
-    apply_cant_have_keyword_denials(state, Some(entered_ids));
+    apply_cant_have_keyword_denials(state, Some(&recipient_ids));
 
-    // CR 613.11: Combat-assignment rule effects, restricted to entered objects.
-    apply_combat_assignment_rule_effects_filtered(state, Some(entered_ids));
+    // CR 613.11: Combat-assignment rule effects, restricted to recipient objects.
+    apply_combat_assignment_rule_effects_filtered(state, Some(&recipient_ids));
 
     // CR 603.6a + CR 611.2e: Rebuild the TriggerIndex so the next event scan
     // sees the entered objects' (and any granted) trigger sets.
@@ -3372,7 +3394,8 @@ fn modification_dynamic_quantity(m: &ContinuousModification) -> Option<&Quantity
         | ContinuousModification::AddDynamicToughness { value }
         | ContinuousModification::AddDynamicKeyword { value, .. } => Some(value),
         // Resolution-time-consumed; never an active continuous effect.
-        ContinuousModification::AddCounterOnEnter { .. } => None,
+        ContinuousModification::AddCounterOnEnter { .. }
+        | ContinuousModification::SetStartingLoyalty { .. } => None,
         // Non-dynamic modifications carry plain i32 / enum payloads, no dynamic
         // magnitude. Enumerated explicitly (no wildcard) so a future
         // QuantityExpr-carrying variant forces a decision here.
@@ -3766,17 +3789,32 @@ fn apply_continuous_effect_filtered(
                     },
                     other => other.clone(),
                 };
+                // Three-way grant policy:
                 // CR 702.164b: summing keywords (Toxic) accumulate even when an
                 // identical instance is already present (granted Toxic 1 on
-                // printed Toxic 1 -> total 2). All other parameterized keywords
-                // keep deduping identical instances per CR 702.16g (Protection
-                // A+B are separate abilities; Ward/Annihilator each apply
-                // independently). `evaluate_layers` resets `obj.keywords =
-                // obj.base_keywords.clone()` each pass, so this never accumulates
-                // unbounded across re-evaluations.
-                if resolved_keyword.sums_across_instances()
-                    || !obj.keywords.contains(&resolved_keyword)
-                {
+                // printed Toxic 1 -> total 2).
+                // CR 613.7: single-authoritative-value keywords (Crew/Saddle/Enchant,
+                // see `overrides_same_kind_on_grant`) replace any earlier same-kind
+                // instance so a "first match" reader never sees a stale value.
+                // All other parameterized keywords keep deduping identical instances
+                // per CR 702.16g (Protection A+B are separate abilities;
+                // Ward/Annihilator each apply independently). `evaluate_layers` resets
+                // `obj.keywords = obj.base_keywords.clone()` each pass, so this never
+                // accumulates unbounded across re-evaluations.
+                if resolved_keyword.sums_across_instances() {
+                    obj.keywords.push(resolved_keyword.clone());
+                } else if resolved_keyword.overrides_same_kind_on_grant() {
+                    // CR 613.7: this grant is a single-authoritative-value keyword — the
+                    // most recently applied instance (this one, since modifications are
+                    // applied in ascending timestamp order, see `order_by_timestamp`)
+                    // replaces any earlier same-discriminant instance (printed or a prior
+                    // grant) rather than coexisting with it. Mirrors `RemoveKeyword`'s
+                    // discriminant technique below, but replaces instead of strips.
+                    obj.keywords.retain(|k| {
+                        std::mem::discriminant(k) != std::mem::discriminant(&resolved_keyword)
+                    });
+                    obj.keywords.push(resolved_keyword.clone());
+                } else if !obj.keywords.contains(&resolved_keyword) {
                     obj.keywords.push(resolved_keyword.clone());
                 }
                 for trigger in KeywordTriggerInstaller::triggers_for(&resolved_keyword) {
@@ -3929,6 +3967,17 @@ fn apply_continuous_effect_filtered(
                 debug_assert!(
                     false,
                     "AddCounterOnEnter must be consumed at resolution time, \
+                     not via apply_continuous_effect"
+                );
+            }
+            // CR 707.9b + CR 306.5b/c: Starting-loyalty exceptions are folded
+            // into copied values at copy resolution, before loyalty counters
+            // are seeded. Reaching the layer system means a resolver forgot to
+            // consume this one-shot copy exception.
+            ContinuousModification::SetStartingLoyalty { .. } => {
+                debug_assert!(
+                    false,
+                    "SetStartingLoyalty must be consumed at copy resolution time, \
                      not via apply_continuous_effect"
                 );
             }
@@ -4309,6 +4358,12 @@ pub(crate) fn compute_current_copiable_values(
             // source's name.
             ContinuousModification::SetName { name } => {
                 values.name = name.clone();
+            }
+            // CR 707.9b + CR 306.5b: Starting loyalty is a copy-effect
+            // characteristic exception. A later copy of this copy must see
+            // the overridden loyalty value.
+            ContinuousModification::SetStartingLoyalty { value } => {
+                values.loyalty = Some(*value);
             }
             // CR 707.9a: A copy effect that grants/retains an ability ("…
             // and it has this ability") makes that ability part of the
@@ -9139,6 +9194,80 @@ mod tests {
             count_mana_abilities(creature, ManaColor::Green),
             1,
             "CR 305.7: Forest subtype should grant the intrinsic green mana ability"
+        );
+    }
+
+    #[test]
+    fn song_style_aura_applies_to_host_when_attached_via_attach_to() {
+        use crate::game::effects::attach::attach_to;
+
+        let mut state = setup();
+        let p0 = PlayerId(0);
+
+        let creature_id = create_object(
+            &mut state,
+            CardId(0),
+            p0,
+            "Test Creature".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let ts = state.next_timestamp();
+            let obj = state.objects.get_mut(&creature_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.timestamp = ts;
+            Arc::make_mut(&mut obj.base_abilities).push(AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    player: TargetFilter::Controller,
+                },
+            ));
+            obj.abilities = Arc::new((*obj.base_abilities).clone());
+        }
+
+        let aura_id = create_object(
+            &mut state,
+            CardId(1),
+            p0,
+            "Song of the Dryads".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let ts = state.next_timestamp();
+            let obj = state.objects.get_mut(&aura_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.base_card_types = obj.card_types.clone();
+            obj.timestamp = ts;
+            obj.static_definitions.push(
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::Typed(
+                        TypedFilter::new(TypeFilter::Card)
+                            .properties(vec![FilterProp::EnchantedBy]),
+                    ))
+                    .modifications(vec![
+                        ContinuousModification::SetCardTypes {
+                            core_types: vec![CoreType::Land],
+                        },
+                        ContinuousModification::SetBasicLandType {
+                            land_type: BasicLandType::Forest,
+                        },
+                    ]),
+            );
+        }
+
+        attach_to(&mut state, aura_id, creature_id);
+
+        let creature = state.objects.get(&creature_id).unwrap();
+        assert_eq!(creature.card_types.core_types, vec![CoreType::Land]);
+        assert!(creature.card_types.subtypes.contains(&"Forest".to_string()));
+        assert!(
+            !creature
+                .abilities
+                .iter()
+                .any(|ability| matches!(&*ability.effect, Effect::GainLife { .. })),
+            "CR 305.7: attach_to must flush layers so rules-text abilities are removed"
         );
     }
 

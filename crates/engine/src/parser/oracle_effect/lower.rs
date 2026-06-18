@@ -24,11 +24,11 @@ use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::parser::oracle_ir::effect_chain::{ClauseIr, EffectChainIr, SpecialClause};
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AttackScope, AttackSubject,
-    Comparator, ContinuousModification, ControllerRef, DamageSource, DelayedTriggerCondition,
-    Duration, Effect, EffectScope, FilterProp, MultiTargetSpec, ObjectScope, PlayerFilter,
-    PreventionAmount, PreventionScope, PtValue, QuantityExpr, QuantityRef, RoundingMode,
-    StaticCondition, StaticDefinition, SubAbilityLink, TargetChoiceTiming, TargetFilter,
-    TypeFilter, TypedFilter,
+    CastFromZoneDriver, Comparator, ContinuousModification, ControllerRef, DamageSource,
+    DelayedTriggerCondition, Duration, Effect, EffectScope, FilterProp, MultiTargetSpec,
+    ObjectScope, PlayerFilter, PreventionAmount, PreventionScope, PtValue, QuantityExpr,
+    QuantityRef, RoundingMode, StaticCondition, StaticDefinition, SubAbilityLink,
+    TargetChoiceTiming, TargetFilter, TypeFilter, TypedFilter,
 };
 use crate::types::counter::CounterType;
 use crate::types::game_state::{DistributionUnit, TargetSelectionConstraint};
@@ -49,9 +49,10 @@ use super::{
     mark_uses_tracked_set, parse_effect_clause, parse_event_context_ref_with_ctx,
     parse_for_each_object_copy_parts, publishes_tracked_set_from_resolution,
     refine_damage_target_remainder, replace_player_anaphor_with_parent_target,
-    rewrite_parent_targets_to_tracked_set, rewrite_rounding_mode, rewrite_that_type_mana_instead,
-    scan_contains_phrase, stamp_delayed_returns, target_filter_controller_ref,
-    try_fold_token_repeat_into_count, wire_optional_cast_decline_fallback,
+    retarget_counter_additional_cost_to_target, rewrite_parent_targets_to_tracked_set,
+    rewrite_rounding_mode, rewrite_that_type_mana_instead, scan_contains_phrase,
+    stamp_delayed_returns, target_filter_controller_ref, try_fold_token_repeat_into_count,
+    wire_optional_cast_decline_fallback,
 };
 
 fn rewrite_player_anaphor_targets_in_definition(def: &mut AbilityDefinition) {
@@ -421,12 +422,45 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
             clause_ir.parsed.sub_ability.clone()
         };
 
+        // CR 118.9 + CR 608.2g: A *standing-duration* `CastFromZone` lingering
+        // grant (no DuringResolution driver, no alternative cost, no
+        // eligibility constraint, and an explicit duration — Discover/Nashi/
+        // Urza-class "until end of turn, you may play that card without
+        // paying its mana cost") is unconditional, like
+        // `GrantCastingPermission`: the "may" describes the later cast
+        // decision, not the grant itself. Gating the grant behind an
+        // immediate accept/decline drops the permission entirely when
+        // declined (issue #720 follow-up: Urza, Lord High Artificer).
+        // `constraint`/`alt_ability_cost` are EXCLUDED from this carve-out:
+        // Beseech the Mirror's "...if that spell's mana value is 4 or less"
+        // (constraint) and Infamous Cruelclaw's "...by discarding a card
+        // rather than paying its mana cost" (alt_ability_cost) both need the
+        // immediate accept/decline because declining branches into a
+        // fallback action (hand fallback) or an alternative payment the
+        // engine must resolve right now, not later. A missing `duration` is
+        // ALSO excluded: Memory Plunder's "you may cast target instant or
+        // sorcery card... without paying its mana cost" carries no standing
+        // duration at all, so its "may" is the immediate resolution-time
+        // decision the existing `OptionalEffectChoice` prompt correctly
+        // drives (issue #2884) — only an explicit duration marks the grant
+        // as deferred to a later priority window.
+        let is_lingering_cast_from_zone = matches!(
+            &clause_ir.parsed.effect,
+            Effect::CastFromZone {
+                driver: CastFromZoneDriver::LingeringPermission,
+                constraint: None,
+                alt_ability_cost: None,
+                duration: Some(_),
+                ..
+            }
+        );
         if clause_ir.is_optional
             && !matches!(&clause_ir.parsed.effect, Effect::SearchOutsideGame { .. })
             && !matches!(
                 &clause_ir.parsed.effect,
                 Effect::GrantCastingPermission { .. }
             )
+            && !is_lingering_cast_from_zone
         {
             def.optional = true;
             def.optional_for = clause_ir.opponent_may_scope;
@@ -437,6 +471,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
                 &clause_ir.parsed.effect,
                 Effect::GrantCastingPermission { .. }
             )
+            && !is_lingering_cast_from_zone
         {
             def.optional = true;
         }
@@ -849,6 +884,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
     nest_whenever_this_turn_token_cleanup_delayed_trigger(&mut result);
     rewire_result_anchored_subchain(&mut result);
     wire_optional_cast_decline_fallback(&mut result);
+    retarget_counter_additional_cost_to_target(&mut result);
     if matches!(&*result.effect, Effect::SearchOutsideGame { .. }) {
         result.optional = false;
         result.optional_for = None;
@@ -3053,6 +3089,18 @@ pub(super) fn extract_double_counter_multi_target(text: &str) -> Option<MultiTar
     multi_target
 }
 
+/// CR 115.1d + CR 122.1: Recover `MultiTargetSpec` for "remove … from each of
+/// any number of <type>". The imperative parser strips the distribution prefix
+/// so `parse_type_phrase` sees a bare filter; rebuild the spec from the
+/// original text (parallel to `extract_switch_pt_multi_target`).
+pub(super) fn extract_remove_counter_multi_target(text: &str) -> Option<MultiTargetSpec> {
+    let lower = text.to_lowercase();
+    if strip_after(&lower, "from each of any number of ").is_some() {
+        return Some(MultiTargetSpec::unlimited(0));
+    }
+    None
+}
+
 fn parse_each_of_up_to_damage_target<'a>(
     target_phrase: &'a str,
     ctx: &mut ParseContext,
@@ -4551,6 +4599,8 @@ fn resolve_player_anaphor_damage_recipient(
     }
     match ctx.relative_player_scope {
         Some(ControllerRef::ScopedPlayer) => Some(TargetFilter::ScopedPlayer),
+        Some(ControllerRef::ParentTargetController) => Some(TargetFilter::ParentTargetController),
+        Some(ControllerRef::ParentTargetOwner) => Some(TargetFilter::ParentTargetOwner),
         Some(ControllerRef::TriggeringPlayer) | Some(ControllerRef::TargetPlayer) => {
             Some(TargetFilter::TriggeringPlayer)
         }
@@ -5399,7 +5449,8 @@ fn apply_where_x_continuous_modification(
         }
         // Resolution-time-consumed; where-X counter quantities are applied by
         // the counter/enter-with parser paths before this continuous grant pass.
-        ContinuousModification::AddCounterOnEnter { .. } => {}
+        ContinuousModification::AddCounterOnEnter { .. }
+        | ContinuousModification::SetStartingLoyalty { .. } => {}
         // Non-dynamic modifications carry fixed integers, enum payloads, or
         // nested definitions that are already parsed/lowered independently.
         // Keep this wildcard-free so a future QuantityExpr-carrying variant
@@ -5496,7 +5547,8 @@ fn rebind_target_anaphor_continuous_modification(modification: &mut ContinuousMo
         | ContinuousModification::AddDynamicKeyword { value, .. } => {
             rebind_cost_paid_object_pt_to_target(value);
         }
-        ContinuousModification::AddCounterOnEnter { .. } => {}
+        ContinuousModification::AddCounterOnEnter { .. }
+        | ContinuousModification::SetStartingLoyalty { .. } => {}
         ContinuousModification::CopyValues { .. }
         | ContinuousModification::SetName { .. }
         | ContinuousModification::AddPower { .. }

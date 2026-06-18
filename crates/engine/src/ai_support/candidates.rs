@@ -3921,61 +3921,61 @@ fn mana_payment_actions(
             for (obj_id, obj) in &state.objects {
                 match mode {
                     ConvokeMode::Waterbend if obj.is_waterbend_eligible(player) => {
-                    // Waterbend: always colorless
-                    actions.push(candidate(
-                        GameAction::TapForConvoke {
-                            object_id: *obj_id,
-                            mana_type: crate::types::mana::ManaType::Colorless,
-                        },
-                        TacticalClass::Mana,
-                        Some(player),
-                    ));
-                }
-                ConvokeMode::Improvise if obj.is_improvise_eligible(player) => {
-                    // CR 702.126a: Improvise pays generic mana — always colorless.
-                    actions.push(candidate(
-                        GameAction::TapForConvoke {
-                            object_id: *obj_id,
-                            mana_type: crate::types::mana::ManaType::Colorless,
-                        },
-                        TacticalClass::Mana,
-                        Some(player),
-                    ));
-                }
-                ConvokeMode::Convoke if obj.is_convoke_eligible(player) => {
-                    // CR 702.51a: Colorless (for generic) always available
-                    actions.push(candidate(
-                        GameAction::TapForConvoke {
-                            object_id: *obj_id,
-                            mana_type: crate::types::mana::ManaType::Colorless,
-                        },
-                        TacticalClass::Mana,
-                        Some(player),
-                    ));
-                    // CR 702.51a: one colored tap per color the creature has — but only
-                    // colors the cost can actually use. A colored convoke marker pays only a
-                    // matching colored pip, so a color absent from the cost is a wasted tap.
-                    // `contributes_to` covers hybrid/Phyrexian/two-brid pips. When the cost is
-                    // unavailable, offer every color rather than risk pruning a useful option.
-                    for color in &obj.color {
-                        if let Some(shards) = convoke_cost_shards {
-                            if !shards.iter().any(|shard| shard.contributes_to(*color)) {
-                                continue;
-                            }
-                        }
+                        // Waterbend: always colorless
                         actions.push(candidate(
                             GameAction::TapForConvoke {
                                 object_id: *obj_id,
-                                mana_type: mana_sources::mana_color_to_type(color),
+                                mana_type: crate::types::mana::ManaType::Colorless,
                             },
                             TacticalClass::Mana,
                             Some(player),
                         ));
                     }
+                    ConvokeMode::Improvise if obj.is_improvise_eligible(player) => {
+                        // CR 702.126a: Improvise pays generic mana — always colorless.
+                        actions.push(candidate(
+                            GameAction::TapForConvoke {
+                                object_id: *obj_id,
+                                mana_type: crate::types::mana::ManaType::Colorless,
+                            },
+                            TacticalClass::Mana,
+                            Some(player),
+                        ));
+                    }
+                    ConvokeMode::Convoke if obj.is_convoke_eligible(player) => {
+                        // CR 702.51a: Colorless (for generic) always available
+                        actions.push(candidate(
+                            GameAction::TapForConvoke {
+                                object_id: *obj_id,
+                                mana_type: crate::types::mana::ManaType::Colorless,
+                            },
+                            TacticalClass::Mana,
+                            Some(player),
+                        ));
+                        // CR 702.51a: one colored tap per color the creature has — but only
+                        // colors the cost can actually use. A colored convoke marker pays only a
+                        // matching colored pip, so a color absent from the cost is a wasted tap.
+                        // `contributes_to` covers hybrid/Phyrexian/two-brid pips. When the cost is
+                        // unavailable, offer every color rather than risk pruning a useful option.
+                        for color in &obj.color {
+                            if let Some(shards) = convoke_cost_shards {
+                                if !shards.iter().any(|shard| shard.contributes_to(*color)) {
+                                    continue;
+                                }
+                            }
+                            actions.push(candidate(
+                                GameAction::TapForConvoke {
+                                    object_id: *obj_id,
+                                    mana_type: mana_sources::mana_color_to_type(color),
+                                },
+                                TacticalClass::Mana,
+                                Some(player),
+                            ));
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
-        }
         }
     }
     actions

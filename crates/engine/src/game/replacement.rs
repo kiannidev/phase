@@ -5791,12 +5791,13 @@ mod tests {
     use crate::game::effects::token::apply_create_token_after_replacement;
     use crate::game::game_object::{AttachTarget, GameObject};
     use crate::types::ability::{
-        AbilityCost, AbilityDefinition, AbilityKind, ChosenAttribute, Effect, FilterProp,
-        OriginConstraint, QuantityExpr, QuantityModification, QuantityRef, ReplacementDefinition,
-        ReplacementMode, ReplacementPlayerScope, TargetFilter, TargetRef, TypeFilter, TypedFilter,
+        AbilityCost, AbilityDefinition, AbilityKind, CastManaObjectScope, CastManaSpentMetric,
+        ChosenAttribute, ControllerRef, Effect, FilterProp, OriginConstraint, QuantityExpr,
+        QuantityModification, QuantityRef, ReplacementDefinition, ReplacementMode,
+        ReplacementPlayerScope, TargetFilter, TargetRef, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::CoreType;
-    use crate::types::game_state::DamageRecord;
+    use crate::types::game_state::{DamageRecord, ManaSpentSourceSnapshot};
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::keywords::Keyword;
     use crate::types::player::PlayerId;
@@ -10681,12 +10682,6 @@ mod tests {
     /// the spell object, not the static replacement source.
     #[test]
     fn artifact_mana_spent_on_self_resolves_against_entering_object() {
-        use crate::types::ability::{
-            AbilityKind, CastManaObjectScope, CastManaSpentMetric, Effect, QuantityExpr,
-            QuantityRef, TargetFilter, TypeFilter, TypedFilter,
-        };
-        use crate::types::card_type::CoreType;
-
         let coin_id = ObjectId(10);
         let creature_id = ObjectId(20);
         let treasure_id = ObjectId(30);
@@ -10709,10 +10704,8 @@ mod tests {
             },
         );
 
-        let creature_filter = TargetFilter::Typed(
-            crate::types::ability::TypedFilter::creature()
-                .controller(crate::types::ability::ControllerRef::You),
-        );
+        let creature_filter =
+            TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You));
 
         let repl = ReplacementDefinition::new(ReplacementEvent::ChangeZone)
             .execute(etb_counter_ability)
@@ -10721,7 +10714,7 @@ mod tests {
 
         let mut state = test_state_with_object(coin_id, Zone::Battlefield, vec![repl]);
 
-        let mut treasure = crate::game::game_object::GameObject::new(
+        let mut treasure = GameObject::new(
             treasure_id,
             CardId(98),
             PlayerId(0),
@@ -10732,7 +10725,7 @@ mod tests {
         treasure.card_types.subtypes.push("Treasure".to_string());
         state.objects.insert(treasure_id, treasure);
 
-        let mut spell = crate::game::game_object::GameObject::new(
+        let mut spell = GameObject::new(
             creature_id,
             CardId(99),
             PlayerId(0),
@@ -10741,11 +10734,11 @@ mod tests {
         );
         spell.card_types.core_types.push(CoreType::Creature);
         spell.mana_spent_source_snapshots = vec![
-            crate::types::game_state::ManaSpentSourceSnapshot {
+            ManaSpentSourceSnapshot {
                 source_id: treasure_id,
                 lki: state.objects[&treasure_id].snapshot_for_mana_spent(),
             },
-            crate::types::game_state::ManaSpentSourceSnapshot {
+            ManaSpentSourceSnapshot {
                 source_id: treasure_id,
                 lki: state.objects[&treasure_id].snapshot_for_mana_spent(),
             },

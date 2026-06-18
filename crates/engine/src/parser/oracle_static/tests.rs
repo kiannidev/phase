@@ -7497,9 +7497,13 @@ fn iroh_non_lesson_graveyard_flashback_self_mana_cost() {
         .statics
         .iter()
         .find(|def| {
-            def.description
-                .as_deref()
-                == Some("During your turn, each non-Lesson instant and sorcery card in your graveyard has flashback.")
+            def.condition == Some(StaticCondition::DuringYourTurn)
+                && matches!(
+                    def.modifications.first(),
+                    Some(ContinuousModification::AddKeyword {
+                        keyword: Keyword::Flashback(FlashbackCost::Mana(ManaCost::SelfManaCost)),
+                    })
+                )
         })
         .expect("non-Lesson graveyard flashback static");
     assert_eq!(non_lesson.condition, Some(StaticCondition::DuringYourTurn));

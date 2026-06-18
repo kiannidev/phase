@@ -7460,7 +7460,7 @@ fn graveyard_keyword_grant_clause_non_lesson_instant_sorcery() {
                     };
                     has_non_lesson(tf)
                         && tf.properties.contains(&FilterProp::InZone {
-                            zone: Zone::Graveyard
+                            zone: Zone::Graveyard,
                         })
                 }),
                 "each branch should be non-Lesson instant/sorcery in graveyard: {filter:?}"
@@ -7502,14 +7502,8 @@ fn iroh_non_lesson_graveyard_flashback_self_mana_cost() {
                 .is_some_and(|d| d.contains("non-Lesson"))
         })
         .expect("non-Lesson graveyard flashback static");
-    assert_eq!(
-        non_lesson.condition,
-        Some(StaticCondition::DuringYourTurn)
-    );
-    let TargetFilter::Or { filters } = non_lesson
-        .affected
-        .as_ref()
-        .expect("affected filter")
+    assert_eq!(non_lesson.condition, Some(StaticCondition::DuringYourTurn));
+    let TargetFilter::Or { filters } = non_lesson.affected.as_ref().expect("affected filter")
     else {
         panic!("expected Or filter for instant/sorcery");
     };

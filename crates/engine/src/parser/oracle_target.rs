@@ -3051,22 +3051,28 @@ pub(crate) fn distribute_neg_type_filters_to_or(filter: TargetFilter) -> TargetF
         return filter;
     };
 
-    let mut neg_filters: Vec<TypeFilter> = Vec::new();
-    for f in &filters {
-        if let TargetFilter::Typed(TypedFilter { type_filters, .. }) = f {
-            for tf in type_filters {
-                if matches!(tf, TypeFilter::Non(_)) && !neg_filters.contains(tf) {
-                    neg_filters.push(tf.clone());
-                }
+    let neg_filters: Vec<TypeFilter> = filters
+        .first()
+        .and_then(|f| {
+            if let TargetFilter::Typed(TypedFilter { type_filters, .. }) = f {
+                Some(
+                    type_filters
+                        .iter()
+                        .filter(|tf| matches!(tf, TypeFilter::Non(_)))
+                        .cloned()
+                        .collect(),
+                )
+            } else {
+                None
             }
-        }
-    }
+        })
+        .unwrap_or_default();
 
     if neg_filters.is_empty() {
         return TargetFilter::Or { filters };
     }
 
-    for f in &mut filters {
+    for f in filters.iter_mut().skip(1) {
         if let TargetFilter::Typed(ref mut typed) = f {
             for neg in &neg_filters {
                 if !typed.type_filters.iter().any(|existing| existing == neg) {

@@ -741,13 +741,13 @@ fn try_parse_graveyard_keyword_static_with_continuation(line: &str) -> Option<St
     let lower = line.to_lowercase();
     let (prefix, continuation) = split_once_on_lower(line, &lower, ". ")?;
     let prefix_lower = prefix.to_lowercase();
-    let (grant_prefix, during_your_turn) = if let Some(suffix) = prefix_lower.strip_prefix("during your turn, ")
-    {
-        let start = prefix.len() - suffix.len();
-        (&prefix[start..], true)
-    } else {
-        (prefix, false)
-    };
+    let (grant_prefix, during_your_turn) =
+        if let Some(suffix) = prefix_lower.strip_prefix("during your turn, ") {
+            let start = prefix.len() - suffix.len();
+            (&prefix[start..], true)
+        } else {
+            (prefix, false)
+        };
     let (affected, kind) = try_parse_graveyard_keyword_grant_clause(grant_prefix)?;
     let keyword = parse_graveyard_keyword_continuation(continuation, kind)?;
     if !kind.matches_keyword(&keyword) {

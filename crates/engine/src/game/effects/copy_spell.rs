@@ -2,7 +2,6 @@ use crate::types::ability::{
     ContinuousModification, ControllerRef, CopyRetargetPermission, Effect, EffectError, EffectKind,
     ResolvedAbility, TargetFilter, TargetRef,
 };
-use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{CopyTargetSlot, GameState, StackEntry, StackEntryKind, WaitingFor};
 use crate::types::identifiers::ObjectId;
@@ -235,9 +234,12 @@ fn apply_spell_copy_modifications(
             .and_then(|a| a.cost_paid_object.as_ref())
             .and_then(|snap| snap.lki.power)
         {
-            copy_obj
-                .counters
-                .insert(CounterType::Loyalty, power.max(0) as u32);
+            let loyalty = power.max(0) as u32;
+            // CR 306.5b: seed the entering face's printed loyalty, not live
+            // counters — stack objects lose counters at the zone-change boundary
+            // (CR 122.2), and ETB reads loyalty from the face values.
+            copy_obj.base_loyalty = Some(loyalty);
+            copy_obj.loyalty = Some(loyalty);
         }
     }
 }
@@ -2595,5 +2597,110 @@ mod tests {
             .filter(|o| o.is_token && o.zone == Zone::Stack)
             .count();
         assert_eq!(copies, 2);
+    }
+
+    /// CR 702.153a + CR 306.5b: Ob Nixilis Casualty copies stamp starting
+    /// loyalty on the entering face (not live counters) so ETB seeding survives
+    /// the stack → battlefield zone change.
+    #[test]
+    fn casualty_planeswalker_copy_enters_with_sacrifice_power_loyalty() {
+        use crate::game::game_object::GameObject;
+        use crate::game::stack::resolve_top;
+        use crate::types::ability::CostPaidObjectSnapshot;
+        use crate::types::card_type::{CardType, CoreType, Supertype};
+        use crate::types::counter::CounterType;
+        use crate::types::game_state::LKISnapshot;
+
+        let mut state = GameState::new_two_player(42);
+        let mut original = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![],
+                duration: None,
+                target: None,
+            },
+            vec![],
+            ObjectId(10),
+            PlayerId(0),
+        );
+        original.cost_paid_object = Some(CostPaidObjectSnapshot {
+            object_id: ObjectId(99),
+            lki: LKISnapshot {
+                name: "Sacrifice".to_string(),
+                power: Some(4),
+                toughness: Some(4),
+                base_power: Some(4),
+                base_toughness: Some(4),
+                mana_value: 4,
+                controller: PlayerId(0),
+                owner: PlayerId(0),
+                card_types: vec![CoreType::Creature],
+                subtypes: vec![],
+                supertypes: vec![],
+                keywords: vec![],
+                colors: vec![],
+                chosen_attributes: vec![],
+                counters: Default::default(),
+            },
+        });
+
+        let mut obj = GameObject::new(
+            ObjectId(10),
+            CardId(1),
+            PlayerId(0),
+            "Ob Nixilis, the Adversary".to_string(),
+            Zone::Stack,
+        );
+        obj.card_types = CardType {
+            supertypes: vec![Supertype::Legendary],
+            core_types: vec![CoreType::Planeswalker],
+            subtypes: vec!["Nixilis".to_string()],
+        };
+        obj.base_loyalty = Some(3);
+        obj.loyalty = Some(3);
+        state.objects.insert(ObjectId(10), obj);
+        state.stack.push_back(StackEntry {
+            id: ObjectId(10),
+            source_id: ObjectId(10),
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(1),
+                ability: Some(original),
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+
+        let copy_ability = ResolvedAbility::new(
+            Effect::CopySpell {
+                target: TargetFilter::SelfRef,
+                retarget: CopyRetargetPermission::KeepOriginalTargets,
+                copier: None,
+                additional_modifications: vec![ContinuousModification::RemoveSupertype {
+                    supertype: Supertype::Legendary,
+                }],
+                starting_loyalty_from_casualty_sacrifice: true,
+            },
+            vec![],
+            ObjectId(10),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &copy_ability, &mut events).unwrap();
+
+        let copy_id = state.stack.back().unwrap().id;
+        resolve_top(&mut state, &mut events);
+
+        let copy = state.objects.get(&copy_id).expect("copy permanent");
+        assert_eq!(copy.zone, Zone::Battlefield);
+        assert!(
+            !copy.card_types.supertypes.contains(&Supertype::Legendary),
+            "Casualty copy must not be legendary"
+        );
+        assert_eq!(copy.loyalty, Some(4));
+        assert_eq!(
+            copy.counters.get(&CounterType::Loyalty).copied(),
+            Some(4),
+            "ETB must seed loyalty counters from the stamped entering face"
+        );
     }
 }

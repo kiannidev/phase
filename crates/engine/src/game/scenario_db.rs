@@ -19,6 +19,7 @@ use crate::game::deck_loading::create_object_from_card_face;
 use crate::game::printed_cards::populate_back_face_if_dfc;
 use crate::game::scenario::GameScenario;
 use crate::game::zones::{add_to_zone, remove_from_zone};
+use crate::types::game_state::{GameState, WaitingFor};
 use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
@@ -27,11 +28,18 @@ use crate::types::zones::Zone;
 /// prior turn, so any deferred as-enters `NamedChoice` / counter-branch prompt
 /// surfaced during the zone pipeline is abandoned without applying a value.
 fn abandon_as_enters_choice_for_scenario_setup(
-    state: &mut crate::types::game_state::GameState,
+    state: &mut GameState,
     controller: PlayerId,
-) {
+) -> bool {
+    if !matches!(
+        state.waiting_for,
+        WaitingFor::NamedChoice { .. } | WaitingFor::ChooseOneOfBranch { .. }
+    ) {
+        return false;
+    }
     state.deferred_entry_events.clear();
-    state.waiting_for = crate::types::game_state::WaitingFor::Priority { player: controller };
+    state.waiting_for = WaitingFor::Priority { player: controller };
+    true
 }
 
 /// Extends `GameScenario` with `CardDatabase`-backed card placement.
@@ -81,7 +89,12 @@ impl GameScenarioDbExt for GameScenario {
             match crate::game::zone_pipeline::move_object(&mut self.state, req, &mut events) {
                 crate::game::zone_pipeline::ZoneMoveResult::Done => {}
                 crate::game::zone_pipeline::ZoneMoveResult::NeedsChoice(_) => {
-                    abandon_as_enters_choice_for_scenario_setup(&mut self.state, player);
+                    if !abandon_as_enters_choice_for_scenario_setup(&mut self.state, player) {
+                        panic!(
+                            "add_real_card battlefield entry for '{}' paused on an unsupported as-enters choice",
+                            name
+                        );
+                    }
                 }
                 crate::game::zone_pipeline::ZoneMoveResult::NeedsAuraAttachmentChoice => {
                     panic!(

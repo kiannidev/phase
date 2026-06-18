@@ -488,10 +488,6 @@ struct CastLinkSnapshot {
     additional_cost_payment_count: u32,
     additional_cost_payments: Vec<AdditionalCostInstancePayment>,
     convoked_creatures: Vec<ObjectId>,
-    mana_spent_to_cast: bool,
-    mana_spent_to_cast_amount: u32,
-    colors_spent_to_cast: crate::types::mana::ColoredManaCount,
-    mana_spent_source_snapshots: Vec<crate::types::game_state::ManaSpentSourceSnapshot>,
 }
 
 /// Result of a single zone-move attempt through the replacement pipeline.
@@ -1568,10 +1564,6 @@ pub(crate) fn deliver_replaced_zone_change(
                     additional_cost_payment_count: obj.additional_cost_payment_count,
                     additional_cost_payments: obj.additional_cost_payments.clone(),
                     convoked_creatures: obj.convoked_creatures.clone(),
-                    mana_spent_to_cast: obj.mana_spent_to_cast,
-                    mana_spent_to_cast_amount: obj.mana_spent_to_cast_amount,
-                    colors_spent_to_cast: obj.colors_spent_to_cast.clone(),
-                    mana_spent_source_snapshots: obj.mana_spent_source_snapshots.clone(),
                 })
             })
             .flatten();
@@ -1641,10 +1633,6 @@ pub(crate) fn deliver_replaced_zone_change(
                 obj.additional_cost_payment_count = link.additional_cost_payment_count;
                 obj.additional_cost_payments = link.additional_cost_payments;
                 obj.convoked_creatures = link.convoked_creatures;
-                obj.mana_spent_to_cast = link.mana_spent_to_cast;
-                obj.mana_spent_to_cast_amount = link.mana_spent_to_cast_amount;
-                obj.colors_spent_to_cast = link.colors_spent_to_cast;
-                obj.mana_spent_source_snapshots = link.mana_spent_source_snapshots;
             }
         }
         if to == Zone::Battlefield || from == Zone::Battlefield {

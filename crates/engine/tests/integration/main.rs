@@ -116,6 +116,7 @@ mod issue_1021_recurring_nightmare;
 mod issue_1022_savai_triome_cycling;
 mod issue_1023_oversold_cemetery;
 mod issue_1025_rishkars_expertise;
+mod issue_1156_coin_of_mastery;
 mod issue_1202_prepared_spell_cast_timing;
 mod issue_1206_shelob_spider_death_tokens;
 mod issue_1297_venture_initiative_triggers;

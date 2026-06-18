@@ -4331,14 +4331,14 @@ fn apply_action(
             let copy_id = effects::paradigm::cast_paradigm_copy(state, src, p, &mut events)
                 .map_err(EngineError::InvalidAction)?;
             // CR 707.10c: If the paradigm spell has target slots, open target
-            // selection via CopyRetarget. Otherwise return to priority so the
-            // copy resolves through normal stack flow.
+            // selection via CopyRetarget. Otherwise re-offer any remaining
+            // paradigm sources before returning to priority.
             if effects::prepare::open_copy_target_selection(state, copy_id, p)
                 .map_err(EngineError::InvalidAction)?
             {
                 state.waiting_for.clone()
             } else {
-                WaitingFor::Priority { player: p }
+                effects::paradigm::waiting_after_accepted_offer(p, &offers, src)
             }
         }
         // CR 702.xxx: Paradigm (Strixhaven) — decline the turn-based offer.

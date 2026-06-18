@@ -65,6 +65,31 @@ pub fn paradigm_offers_for(state: &GameState, player: PlayerId) -> Vec<ObjectId>
         .collect()
 }
 
+/// After the player accepts one paradigm source from a multi-offer window,
+/// determine whether to re-offer the remaining sources or return to priority.
+///
+/// CR 702.xxx: Each exiled paradigm source is offered independently at the
+/// start of the first main phase; accepting one copy does not forfeit the rest.
+pub fn waiting_after_accepted_offer(
+    player: PlayerId,
+    offers: &[ObjectId],
+    accepted: ObjectId,
+) -> WaitingFor {
+    let remaining: Vec<ObjectId> = offers
+        .iter()
+        .copied()
+        .filter(|id| *id != accepted)
+        .collect();
+    if remaining.is_empty() {
+        WaitingFor::Priority { player }
+    } else {
+        WaitingFor::CastOffer {
+            player,
+            kind: CastOfferKind::Paradigm { offers: remaining },
+        }
+    }
+}
+
 /// Enqueue a `WaitingFor::CastOffer` (Paradigm) if offers exist for the given
 /// player. Returns true if a `WaitingFor` was set; false if no offers and the
 /// caller should continue normal phase flow.
@@ -193,6 +218,103 @@ mod tests {
             paradigm_offers_for(&state, PlayerId(1)),
             vec![ObjectId(101)]
         );
+    }
+
+    /// Issue #3660 — accepting one paradigm source must re-offer the rest.
+    #[test]
+    fn waiting_after_accepted_offer_re_offers_remaining_sources() {
+        let p = PlayerId(0);
+        let offers = vec![ObjectId(100), ObjectId(101), ObjectId(102)];
+
+        let wf = waiting_after_accepted_offer(p, &offers, ObjectId(100));
+        match wf {
+            WaitingFor::CastOffer {
+                player,
+                kind: CastOfferKind::Paradigm { offers: remaining },
+            } => {
+                assert_eq!(player, p);
+                assert_eq!(remaining, vec![ObjectId(101), ObjectId(102)]);
+            }
+            other => panic!("expected remaining paradigm offer, got {other:?}"),
+        }
+
+        let last = waiting_after_accepted_offer(p, &[ObjectId(101)], ObjectId(101));
+        assert!(matches!(
+            last,
+            WaitingFor::Priority { player } if player == p
+        ));
+    }
+
+    /// Issue #3660 — casting one paradigm copy re-opens the offer for siblings.
+    #[test]
+    fn cast_paradigm_copy_re_offers_remaining_sources() {
+        use std::sync::Arc;
+
+        use crate::game::effects::prepare;
+        use crate::game::zones::create_object;
+        use crate::types::ability::{
+            AbilityDefinition, AbilityKind, Effect, QuantityExpr, TargetFilter,
+        };
+        use crate::types::card_type::CoreType;
+        use crate::types::identifiers::CardId;
+        use crate::types::mana::ManaCost;
+        use crate::types::zones::Zone;
+
+        let mut state = GameState::new_two_player(42);
+        let controller = PlayerId(0);
+
+        let source_a = create_object(
+            &mut state,
+            CardId(100),
+            controller,
+            "Paradigm Bolt A".to_string(),
+            Zone::Exile,
+        );
+        let source_b = create_object(
+            &mut state,
+            CardId(101),
+            controller,
+            "Paradigm Bolt B".to_string(),
+            Zone::Exile,
+        );
+        for id in [source_a, source_b] {
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Instant);
+            obj.base_card_types = obj.card_types.clone();
+            obj.mana_cost = ManaCost::generic(1);
+            Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+            ));
+        }
+        arm_paradigm(&mut state, source_a, controller, "Paradigm Bolt A");
+        arm_paradigm(&mut state, source_b, controller, "Paradigm Bolt B");
+        state.waiting_for = WaitingFor::CastOffer {
+            player: controller,
+            kind: CastOfferKind::Paradigm {
+                offers: vec![source_a, source_b],
+            },
+        };
+
+        let mut events = Vec::new();
+        let copy_id = cast_paradigm_copy(&mut state, source_a, controller, &mut events).unwrap();
+        assert!(
+            !prepare::open_copy_target_selection(&mut state, copy_id, controller).unwrap(),
+            "targetless draw copy should not arm CopyRetarget"
+        );
+        state.waiting_for =
+            waiting_after_accepted_offer(controller, &[source_a, source_b], source_a);
+
+        match state.waiting_for {
+            WaitingFor::CastOffer {
+                kind: CastOfferKind::Paradigm { offers },
+                ..
+            } => assert_eq!(offers, vec![source_b]),
+            other => panic!("expected remaining paradigm offer after first cast, got {other:?}"),
+        }
     }
 
     // Test gap #4: If a Paradigm spell fizzles (all targets illegal) at

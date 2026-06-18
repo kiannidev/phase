@@ -3956,6 +3956,10 @@ pub enum WaitingFor {
         /// Index of the slot currently awaiting a ChooseTarget action.
         #[serde(default)]
         current_slot: usize,
+        /// Remaining paradigm sources to re-offer after this copy's targets are
+        /// chosen (issue #3660).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        paradigm_remaining_offers: Option<Vec<ObjectId>>,
     },
     /// CR 510.1c: Attacker with multiple blockers — controller divides damage as they choose.
     /// CR 702.19b/c: Trample requires lethal to each blocker before assigning excess.

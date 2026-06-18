@@ -65,10 +65,26 @@ pub fn paradigm_offers_for(state: &GameState, player: PlayerId) -> Vec<ObjectId>
         .collect()
 }
 
+/// CR 505.4: After accepting one paradigm source, re-offer any remaining exiled
+/// sources from the same offer window (issue #3660).
+pub fn waiting_after_remaining_offers(
+    player: PlayerId,
+    remaining: Vec<ObjectId>,
+) -> WaitingFor {
+    if remaining.is_empty() {
+        WaitingFor::Priority { player }
+    } else {
+        WaitingFor::CastOffer {
+            player,
+            kind: CastOfferKind::Paradigm { offers: remaining },
+        }
+    }
+}
+
 /// After the player accepts one paradigm source from a multi-offer window,
 /// determine whether to re-offer the remaining sources or return to priority.
 ///
-/// CR 702.xxx: Each exiled paradigm source is offered independently at the
+/// CR 505.4: Each exiled paradigm source is offered independently at the
 /// start of the first main phase; accepting one copy does not forfeit the rest.
 pub fn waiting_after_accepted_offer(
     player: PlayerId,
@@ -80,14 +96,7 @@ pub fn waiting_after_accepted_offer(
         .copied()
         .filter(|id| *id != accepted)
         .collect();
-    if remaining.is_empty() {
-        WaitingFor::Priority { player }
-    } else {
-        WaitingFor::CastOffer {
-            player,
-            kind: CastOfferKind::Paradigm { offers: remaining },
-        }
-    }
+    waiting_after_remaining_offers(player, remaining)
 }
 
 /// Enqueue a `WaitingFor::CastOffer` (Paradigm) if offers exist for the given
@@ -302,7 +311,7 @@ mod tests {
         let mut events = Vec::new();
         let copy_id = cast_paradigm_copy(&mut state, source_a, controller, &mut events).unwrap();
         assert!(
-            !prepare::open_copy_target_selection(&mut state, copy_id, controller).unwrap(),
+            !prepare::open_copy_target_selection(&mut state, copy_id, controller, None).unwrap(),
             "targetless draw copy should not arm CopyRetarget"
         );
         state.waiting_for =

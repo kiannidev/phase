@@ -1263,6 +1263,7 @@ fn finalize_copy_retarget(
     slots: &[crate::types::game_state::CopyTargetSlot],
     effect_kind: crate::types::ability::EffectKind,
     effect_source_id: Option<ObjectId>,
+    paradigm_remaining_offers: Option<Vec<ObjectId>>,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EngineError> {
     let targets: Vec<_> = slots
@@ -1296,7 +1297,11 @@ fn finalize_copy_retarget(
         effects::drain_pending_continuation(state, events);
         return Ok(());
     }
-    state.waiting_for = WaitingFor::Priority { player };
+    state.waiting_for = if let Some(remaining) = paradigm_remaining_offers {
+        effects::paradigm::waiting_after_remaining_offers(player, remaining)
+    } else {
+        WaitingFor::Priority { player }
+    };
     state.priority_player = player;
     effects::drain_pending_continuation(state, events);
     Ok(())
@@ -4330,15 +4335,25 @@ fn apply_action(
             let p = *player;
             let copy_id = effects::paradigm::cast_paradigm_copy(state, src, p, &mut events)
                 .map_err(EngineError::InvalidAction)?;
+            let remaining: Vec<ObjectId> = offers
+                .iter()
+                .copied()
+                .filter(|id| *id != src)
+                .collect();
             // CR 707.10c: If the paradigm spell has target slots, open target
             // selection via CopyRetarget. Otherwise re-offer any remaining
             // paradigm sources before returning to priority.
-            if effects::prepare::open_copy_target_selection(state, copy_id, p)
-                .map_err(EngineError::InvalidAction)?
+            if effects::prepare::open_copy_target_selection(
+                state,
+                copy_id,
+                p,
+                Some(remaining.clone()),
+            )
+            .map_err(EngineError::InvalidAction)?
             {
                 state.waiting_for.clone()
             } else {
-                effects::paradigm::waiting_after_accepted_offer(p, &offers, src)
+                effects::paradigm::waiting_after_remaining_offers(p, remaining)
             }
         }
         // CR 702.xxx: Paradigm (Strixhaven) — decline the turn-based offer.
@@ -4542,6 +4557,7 @@ fn apply_action(
                 effect_kind,
                 effect_source_id,
                 current_slot,
+                paradigm_remaining_offers,
             },
             GameAction::ChooseTarget { target },
         ) => {
@@ -4578,6 +4594,7 @@ fn apply_action(
                     effect_kind: *effect_kind,
                     effect_source_id: *effect_source_id,
                     current_slot: next_slot,
+                    paradigm_remaining_offers: paradigm_remaining_offers.clone(),
                 };
             } else {
                 finalize_copy_retarget(
@@ -4587,6 +4604,7 @@ fn apply_action(
                     &updated_slots,
                     *effect_kind,
                     *effect_source_id,
+                    paradigm_remaining_offers.clone(),
                     &mut events,
                 )?;
             }
@@ -4605,6 +4623,7 @@ fn apply_action(
                 target_slots,
                 effect_kind,
                 effect_source_id,
+                paradigm_remaining_offers,
                 ..
             },
             GameAction::KeepAllCopyTargets,
@@ -4619,6 +4638,7 @@ fn apply_action(
                 &slots,
                 *effect_kind,
                 *effect_source_id,
+                paradigm_remaining_offers.clone(),
                 &mut events,
             )?;
             state.waiting_for.clone()

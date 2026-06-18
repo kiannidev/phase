@@ -887,6 +887,19 @@ pub(crate) fn push_grant_clause_modifications(
     part: &str,
     where_x_expression: Option<&str>,
 ) {
+    // CR 702.16n / 702.16p: a keyword-grant clause reaching this fn is a single
+    // BARE (unquoted) keyword token — granted activated/triggered abilities are
+    // quoted and stripped to a separate path (strip_quoted_segments at :645 +
+    // parse_quoted_ability_modifications at :798) before extract_keyword_clause
+    // runs, so any ". " here can only introduce a trailing inert prose sentence
+    // (e.g. Benevolent Blessing's SBA-exemption "This effect doesn't remove ...").
+    // Drop it so the keyword sentence reaches map_keyword clean.
+    let part =
+        match super::oracle_nom::bridge::split_once_on_lower(part, &part.to_lowercase(), ". ") {
+            Some((first, _)) => first,
+            None => part,
+        };
+
     let part_trimmed = part.trim().trim_end_matches('.');
     let (part_without_duration, _) = strip_trailing_duration(part_trimmed);
     let part_trimmed = part_without_duration.trim().trim_end_matches('.');
@@ -1031,6 +1044,23 @@ pub(crate) fn classify_quoted_inner(ability_text: &str) -> Vec<ContinuousModific
                 trigger: Box::new(trigger),
             })
             .collect();
+    }
+
+    // CR 702.6a: a standalone "Equip {N}" line is the equip activated ability —
+    // detect it BEFORE keyword extraction. An MTGJSON keyword name can match the
+    // printed equip cost, so parse_keyword_from_oracle("equip {2}") would otherwise
+    // land an inert AddKeyword{Equip}; but equip is an activated ability that needs
+    // its Effect::Attach body. Mirrors oracle.rs's "Pre-keyword activated ability"
+    // ordering. `try_parse_equip` assumes its caller has already confirmed the
+    // "equip" prefix (it strips the first 5 bytes unconditionally), so the
+    // `starts_with` guard is required — without it any quoted line would be
+    // mis-parsed as equip.
+    if nom_tag_lower(&lower, &lower, "equip").is_some() {
+        if let Some(ability) = super::oracle::try_parse_equip(ability_text) {
+            return vec![ContinuousModification::GrantAbility {
+                definition: Box::new(ability),
+            }];
+        }
     }
 
     // CR 702: Quoted text that is a keyword (e.g. "Ward—Pay 2 life") should be

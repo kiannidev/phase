@@ -387,6 +387,7 @@
     "payMana": "Manakosten bezahlen",
     "convokeHint": "Tappe Kreaturen, um die Bezahlung zu unterstützen.",
     "improviseHint": "Tappe Artefakte, um die Bezahlung zu unterstützen.",
+    "delveHint": "Exiliere Karten aus deinem Friedhof, um die Bezahlung zu unterstützen.",
     "convokeOrImproviseHint": "Tappe Kreaturen oder Artefakte, um die Bezahlung zu unterstützen.",
     "convokeStaged": "Getappt:",
     "lifeAmount": "2 Leben",
@@ -1526,6 +1527,7 @@
     "chooseExact": "Wähle {{count}}",
     "chooseRange": "Wähle {{min}} bis {{max}}",
     "confirm": "Bestätigen ({{selected}}/{{count}})",
+    "confirmBudget": "Bestätigen ({{spent}}/{{budget}} {P})",
     "clear": "Leeren",
     "alreadyChosen": "(bereits gewählt)"
   },

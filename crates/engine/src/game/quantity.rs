@@ -255,7 +255,8 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
         | QuantityRef::PartySize { .. }
         | QuantityRef::DistinctColorsAmongPermanents { .. }
         | QuantityRef::DistinctCounterKindsAmong { .. }
-        | QuantityRef::EnteredThisTurn { .. } => true,
+        | QuantityRef::EnteredThisTurn { .. }
+        | QuantityRef::CommanderManaValue { .. } => true,
         // Distinct card types reads battlefield population ONLY when its source
         // is the object-filter variant; zone / linked-exile sources do not.
         QuantityRef::DistinctCardTypes { source } => match source {
@@ -280,6 +281,7 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
         | QuantityRef::Intensity { .. }
         | QuantityRef::Toughness { .. }
         | QuantityRef::ObjectManaValue { .. }
+        | QuantityRef::TargetObjectManaValue { .. }
         | QuantityRef::ObjectColorCount { .. }
         | QuantityRef::ObjectNameWordCount { .. }
         | QuantityRef::ObjectTypelineComponentCount { .. }
@@ -287,9 +289,11 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
         | QuantityRef::SelfManaValue
         | QuantityRef::TargetZoneCardCount { .. }
         | QuantityRef::CardsExiledBySource
+        | QuantityRef::ExiledCardPower { .. }
         | QuantityRef::ZoneCardCount { .. }
         | QuantityRef::TrackedSetSize
         | QuantityRef::FilteredTrackedSetSize { .. }
+        | QuantityRef::TrackedSetAggregate { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount
         | QuantityRef::LifeLostThisTurn { .. }
@@ -302,6 +306,7 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
         | QuantityRef::CrimesCommittedThisTurn
         | QuantityRef::LifeGainedThisTurn { .. }
         | QuantityRef::CardsDrawnThisTurn { .. }
+        | QuantityRef::BattlefieldEntriesThisTurn { .. }
         | QuantityRef::LandsPlayedThisTurn { .. }
         | QuantityRef::TurnsTaken
         | QuantityRef::ZoneChangeCountThisTurn { .. }
@@ -439,6 +444,9 @@ fn entered_object_perturbs_quantity_ref(
         QuantityRef::PartySize { .. } => {
             entered.card_types.core_types.contains(&CoreType::Creature)
         }
+        // CR 903.3d: a commander entering the battlefield or command zone can change
+        // the single-commander mana value. Conservatively perturb on any commander entry.
+        QuantityRef::CommanderManaValue { .. } => entered.is_commander,
         // Player-level, single-object, history-record, payment, and choice refs:
         // an object's battlefield entry/exit cannot change their value. Identical
         // enumeration to the `false` arm of `quantity_ref_uses_object_count`.
@@ -456,6 +464,7 @@ fn entered_object_perturbs_quantity_ref(
         | QuantityRef::Intensity { .. }
         | QuantityRef::Toughness { .. }
         | QuantityRef::ObjectManaValue { .. }
+        | QuantityRef::TargetObjectManaValue { .. }
         | QuantityRef::ObjectColorCount { .. }
         | QuantityRef::ObjectNameWordCount { .. }
         | QuantityRef::ObjectTypelineComponentCount { .. }
@@ -463,9 +472,11 @@ fn entered_object_perturbs_quantity_ref(
         | QuantityRef::SelfManaValue
         | QuantityRef::TargetZoneCardCount { .. }
         | QuantityRef::CardsExiledBySource
+        | QuantityRef::ExiledCardPower { .. }
         | QuantityRef::ZoneCardCount { .. }
         | QuantityRef::TrackedSetSize
         | QuantityRef::FilteredTrackedSetSize { .. }
+        | QuantityRef::TrackedSetAggregate { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount
         | QuantityRef::LifeLostThisTurn { .. }
@@ -478,6 +489,7 @@ fn entered_object_perturbs_quantity_ref(
         | QuantityRef::CrimesCommittedThisTurn
         | QuantityRef::LifeGainedThisTurn { .. }
         | QuantityRef::CardsDrawnThisTurn { .. }
+        | QuantityRef::BattlefieldEntriesThisTurn { .. }
         | QuantityRef::LandsPlayedThisTurn { .. }
         | QuantityRef::TurnsTaken
         | QuantityRef::ZoneChangeCountThisTurn { .. }
@@ -1010,11 +1022,15 @@ pub(crate) fn object_count_matching_ids(
     filter_ctx: &FilterContext<'_>,
     source_id: ObjectId,
 ) -> Vec<ObjectId> {
-    let zone = filter
-        .extract_in_zone()
-        .unwrap_or(crate::types::zones::Zone::Battlefield);
-    let mut ids: Vec<ObjectId> = crate::game::targeting::zone_object_ids(state, zone)
+    let zones = filter.extract_zones();
+    let zones = if zones.is_empty() {
+        vec![crate::types::zones::Zone::Battlefield]
+    } else {
+        zones
+    };
+    let mut ids: Vec<ObjectId> = zones
         .into_iter()
+        .flat_map(|zone| crate::game::targeting::zone_object_ids(state, zone))
         .filter(|&id| matches_target_filter(state, id, filter, filter_ctx))
         .collect();
     // Drop the triggering object for an "other than" filter (Valakut's "five
@@ -1350,6 +1366,11 @@ fn resolve_ref(
         QuantityRef::ObjectManaValue { scope } => {
             resolve_object_mana_value(state, *scope, ctx, targets, ability)
         }
+        // CR 202.3 + CR 115.1: mana value of the object chosen for this ref's own
+        // target slot. Reuses the ObjectScope::Target read path — does NOT duplicate.
+        QuantityRef::TargetObjectManaValue { .. } => {
+            resolve_object_mana_value(state, ObjectScope::Target, ctx, targets, ability)
+        }
         // CR 105.1 + CR 105.2: Count the object's current colors. The color
         // vector is maintained by layer 5, so recipient-relative static boosts
         // see color-changing effects correctly when this resolves in layer 7c.
@@ -1662,6 +1683,18 @@ fn resolve_ref(
         QuantityRef::CardsExiledBySource => usize_to_i32_saturating(
             crate::game::players::linked_exile_cards_for_source(state, source_id).len(),
         ),
+        // CR 607.2a: The power of a specific card exiled by the source, indexed by order.
+        // ENGINE INVARIANT: The ordering is guaranteed by Vec::push in push_exiled_with_source_this_turn.
+        QuantityRef::ExiledCardPower { index } => {
+            let exiled_cards = state.cards_exiled_with_source_this_turn.get(&source_id);
+            match exiled_cards.and_then(|cards| cards.get(*index as usize)) {
+                Some(&card_id) => {
+                    let card = state.objects.get(&card_id);
+                    card.and_then(|obj| obj.power).unwrap_or(0)
+                }
+                None => 0,
+            }
+        }
         // CR 604.3: Count cards in a zone matching optional type filters.
         QuantityRef::ZoneCardCount {
             zone,
@@ -1761,6 +1794,42 @@ fn resolve_ref(
                 })
                 .count();
             usize_to_i32_saturating(count)
+        }
+        // CR 608.2c + CR 609.3 + CR 107.3e + CR 202.3: Reduce a numeric property
+        // over the most recent chain tracked set. Mirrors `FilteredTrackedSetSize`'s set
+        // selection (highest id = the set the preceding chain effect published)
+        // but aggregates a per-member value instead of counting. The members are
+        // addressed by identity, so cards the producer moved to exile are read in
+        // place (mirrors the `Aggregate` extract: live object first, LKI cache
+        // fallback). Drives "deals damage equal to the total mana value of those
+        // exiled cards" (Ensnared by the Mara).
+        QuantityRef::TrackedSetAggregate { function, property } => {
+            let Some((_, ids)) = state.tracked_object_sets.iter().max_by_key(|(id, _)| id.0) else {
+                return 0;
+            };
+            let extract = |id: ObjectId| -> Option<i32> {
+                let live = state.objects.get(&id).and_then(|obj| match property {
+                    ObjectProperty::Power => obj.power,
+                    ObjectProperty::Toughness => obj.toughness,
+                    // CR 202.3e: include X when on the stack (cost_x_paid).
+                    ObjectProperty::ManaValue => Some(u32_to_i32_saturating(
+                        obj.mana_cost.mana_value_with_x(obj.zone, obj.cost_x_paid),
+                    )),
+                });
+                live.or_else(|| {
+                    state.lki_cache.get(&id).and_then(|lki| match property {
+                        ObjectProperty::Power => lki.power,
+                        ObjectProperty::Toughness => lki.toughness,
+                        ObjectProperty::ManaValue => Some(u32_to_i32_saturating(lki.mana_value)),
+                    })
+                })
+            };
+            let values = ids.iter().filter_map(|&id| extract(id));
+            match function {
+                AggregateFunction::Max => values.max().unwrap_or(0),
+                AggregateFunction::Min => values.min().unwrap_or(0),
+                AggregateFunction::Sum => values.sum(),
+            }
         }
         // CR 400.7 + CR 608.2c: Read the per-resolution counter populated by
         // ChangeZoneAll when it exiles cards from a hand. Used by "draws a card
@@ -1907,6 +1976,36 @@ fn resolve_ref(
         QuantityRef::CommanderCastFromCommandZoneCount => u32_to_i32_saturating(
             super::commander::commander_casts_from_command_zone(state, controller),
         ),
+        // CR 903.3d: Mana value of a commander you own on the battlefield or in the command zone.
+        // Used by Stinging Study's "X is the mana value of a commander you own on the battlefield
+        // or in the command zone" pattern. Returns the mana value of the first matching commander
+        // (any one if multiple exist).
+        QuantityRef::CommanderManaValue { owner } => {
+            let filter = TargetFilter::Typed(
+                TypedFilter::default()
+                    .controller(owner.clone())
+                    .properties(vec![FilterProp::IsCommander]),
+            );
+            let zones = [
+                crate::types::zones::Zone::Battlefield,
+                crate::types::zones::Zone::Command,
+            ];
+            let ids: Vec<ObjectId> = zones
+                .into_iter()
+                .flat_map(|zone| crate::game::targeting::zone_object_ids(state, zone))
+                .filter(|&id| matches_target_filter(state, id, &filter, &filter_ctx))
+                .collect();
+
+            // Return mana value of first matching commander (any one if multiple exist)
+            ids.first()
+                .and_then(|&id| state.objects.get(&id))
+                .map(|obj| {
+                    u32_to_i32_saturating(
+                        obj.mana_cost.mana_value_with_x(obj.zone, obj.cost_x_paid),
+                    )
+                })
+                .unwrap_or(0)
+        }
         // CR 106.1 + CR 109.1: Count distinct colors (W/U/B/R/G) among permanents
         // matching the filter. "Gold"/"multicolor"/"colorless" are not colors, so
         // each ManaColor contributes at most once per colored permanent.
@@ -2052,6 +2151,31 @@ fn resolve_ref(
             resolve_per_player_scalar(state, player, controller, ctx, targets, ability, |p| {
                 u32_to_i32_saturating(p.cards_drawn_this_turn)
             })
+        }
+        // CR 403.3 + CR 608.2h: Battlefield entries this turn for the scoped player.
+        QuantityRef::BattlefieldEntriesThisTurn { player, ref filter } => {
+            resolve_per_player_scalar(
+                state,
+                player,
+                controller,
+                ctx,
+                targets,
+                ability,
+                |scoped_player| {
+                    usize_to_i32_saturating(
+                        state
+                            .battlefield_entries_this_turn
+                            .iter()
+                            .filter(|record| {
+                                record.controller == scoped_player.id
+                                    && crate::game::restrictions::battlefield_entry_matches_filter(
+                                        record, filter, controller,
+                                    )
+                            })
+                            .count(),
+                    )
+                },
+            )
         }
         // CR 305.2a + CR 603.4: Lands played this turn by the scoped player.
         QuantityRef::LandsPlayedThisTurn { player, from_zones } => {
@@ -2684,6 +2808,33 @@ fn split_controller_filter(filter: &TargetFilter) -> (Option<TargetFilter>, Opti
             let controller = stripped.controller.take();
             (Some(TargetFilter::Typed(stripped)), controller)
         }
+        // CR 120.9: lift the controller predicate out of an And so the remainder
+        // evaluates structurally and the controller is checked against the
+        // DamageRecord participant. Player-targeted damage records store the
+        // controller on a `Typed{controller=..}` child alongside a
+        // `TargetFilter::Player` structural child (e.g. "damage dealt to target
+        // opponent this turn" → And{[Player, Typed(controller=TargetPlayer)]}).
+        TargetFilter::And { filters } => {
+            let mut lifted = None;
+            let mut remainder = Vec::with_capacity(filters.len());
+            for f in filters {
+                match split_controller_filter(f) {
+                    (Some(stripped), Some(ctrl)) => {
+                        lifted = lifted.or(Some(ctrl));
+                        remainder.push(stripped);
+                    }
+                    (_, Some(ctrl)) => {
+                        lifted = lifted.or(Some(ctrl));
+                    }
+                    _ => remainder.push(f.clone()),
+                }
+            }
+            if lifted.is_some() {
+                (Some(TargetFilter::And { filters: remainder }), lifted)
+            } else {
+                (None, None)
+            }
+        }
         _ => (None, None),
     }
 }
@@ -2716,12 +2867,41 @@ fn damage_record_target_matches(
                 live_target_filter.as_ref().unwrap_or(filter);
             matches_target_filter(state, object_id, live_target_filter_ref, filter_ctx)
         }
-        TargetRef::Player(player_id) => player_matches_target_filter_in_state(
-            state,
-            filter,
-            player_id,
-            filter_ctx.source_controller,
-        ),
+        // CR 120.9 + CR 109.4 + CR 115.1: a player-targeted damage record. Lift
+        // any controller predicate and check it against the record's participant
+        // controller snapshot (so TargetPlayer resolves against `ability.targets`
+        // rather than failing closed at filter.rs); evaluate the controller-
+        // stripped remainder structurally against the player. When no controller
+        // is lifted (e.g. a bare `And{[Player]}` or `TargetFilter::Player`), fall
+        // back to the full-filter player match exactly as before.
+        TargetRef::Player(player_id) => {
+            let (stripped, lifted_controller) = split_controller_filter(filter);
+            if let Some(expected) = lifted_controller.as_ref() {
+                // CR 109.4: for a player-targeted record the controller predicate
+                // is evaluated against the DAMAGED PLAYER itself (`player_id`),
+                // not the object-control snapshot — `You`/`Opponent` are relative
+                // to the resolving controller, and `TargetPlayer` resolves against
+                // `ability.targets`. Mirrors `damage_source_controller_matches`'s
+                // `actual` argument but anchored on the player participant.
+                if !damage_source_controller_matches(
+                    state,
+                    player_id,
+                    controller,
+                    quantity_ctx,
+                    ability,
+                    expected,
+                ) {
+                    return false;
+                }
+            }
+            let remainder: &TargetFilter = stripped.as_ref().unwrap_or(filter);
+            player_matches_target_filter_in_state(
+                state,
+                remainder,
+                player_id,
+                filter_ctx.source_controller,
+            )
+        }
     }
 }
 
@@ -3201,17 +3381,15 @@ where
                     .and_then(|snapshot| lki_extract(&snapshot.lki))
             })
             .unwrap_or(0),
-        // CR 608.2c: An anaphoric pronoun ("its power") in a triggered ability
+        // CR 608.2c: A demonstrative noun phrase ("that creature's toughness")
         // binds to the object introduced by the most recent earlier *effect
         // instruction* in the same ability (slot 1: `effect_context_object`).
         // CR 608.2k: if no such instruction exists, fall back to the
         // trigger-condition referent (slot 2: trigger-event source) then the
-        // cost referent (slot 3: `cost_paid_object`). The arm differs from
+        // cost referent (slot 3: `cost_paid_object`). This arm differs from
         // `CostPaidObject` only in slot priority — instruction-order (608.2c)
-        // first, vs. cost referent (608.2k) first. `Demonstrative` ("that
-        // creature's toughness") shares this resolution — same earlier-
-        // instruction referent, named by a full noun phrase rather than "its".
-        ObjectScope::Anaphoric | ObjectScope::Demonstrative => ability
+        // first, vs. cost referent (608.2k) first.
+        ObjectScope::Demonstrative => ability
             .and_then(|a| a.effect_context_object.as_ref())
             .and_then(|snapshot| lki_extract(&snapshot.lki))
             .or_else(|| {
@@ -3227,6 +3405,60 @@ where
                 ability
                     .and_then(|a| a.cost_paid_object.as_ref())
                     .and_then(|snapshot| lki_extract(&snapshot.lki))
+            })
+            .unwrap_or(0),
+        // CR 608.2c: An anaphoric pronoun ("its power"). Shares the
+        // `Demonstrative` referent chain (earlier instruction → trigger-event
+        // source → cost referent), plus one extra final fallback for the
+        // one-sided-fight damage class (see below).
+        ObjectScope::Anaphoric => ability
+            .and_then(|a| a.effect_context_object.as_ref())
+            .and_then(|snapshot| lki_extract(&snapshot.lki))
+            .or_else(|| {
+                object_id_for_scope(state, ObjectScope::EventSource, ctx, targets).and_then(|id| {
+                    state
+                        .objects
+                        .get(&id)
+                        .and_then(&obj_extract)
+                        .or_else(|| state.lki_cache.get(&id).and_then(&lki_extract))
+                })
+            })
+            .or_else(|| {
+                ability
+                    .and_then(|a| a.cost_paid_object.as_ref())
+                    .and_then(|snapshot| lki_extract(&snapshot.lki))
+            })
+            .or_else(|| {
+                // CR 608.2c + CR 115.10a: for a one-sided-fight damage clause
+                // (damage_source = Target), the anaphoric "It"/"its" is the
+                // object dealing the damage = targets[0] (the same object
+                // deal_damage.rs selects as source). Last fallback so
+                // reveal/sacrifice/tap referents above still win.
+                let is_one_sided_fight = ability
+                    .map(|a| {
+                        matches!(
+                            a.effect,
+                            crate::types::ability::Effect::DealDamage {
+                                damage_source: Some(crate::types::ability::DamageSource::Target),
+                                ..
+                            } | crate::types::ability::Effect::DamageAll {
+                                damage_source: Some(crate::types::ability::DamageSource::Target),
+                                ..
+                            }
+                        )
+                    })
+                    .unwrap_or(false);
+                if !is_one_sided_fight {
+                    return None;
+                }
+                targets.iter().find_map(|t| match t {
+                    TargetRef::Object(id) => state
+                        .objects
+                        .get(id)
+                        .and_then(&obj_extract)
+                        .or_else(|| state.lki_cache.get(id).and_then(&lki_extract)),
+                    _ => None,
+                })
             })
             .unwrap_or(0),
     }
@@ -3923,8 +4155,10 @@ pub(crate) fn resolve_player_count(
                             let threshold = resolve_quantity(state, value, controller, source_id);
                             crate::game::players::matches_relation(
                                 state, p.id, controller, *relation,
-                            ) && crate::game::effects::candidate_player_scalar(p, attr)
-                                .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
+                            ) && crate::game::effects::candidate_player_scalar_with_state(
+                                state, p, controller, attr,
+                            )
+                            .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
                         }
                     }
             })
@@ -4745,6 +4979,138 @@ mod tests {
         assert_eq!(
             resolve_quantity(&state, &all_expr, PlayerId(0), ObjectId(0)),
             8
+        );
+    }
+
+    /// CR 903.3d: CommanderManaValue resolves to the mana value of a commander
+    /// you own on the battlefield or in the command zone. Test with commander
+    /// in command zone (Stinging Study pattern).
+    #[test]
+    fn resolve_quantity_commander_mana_value_command_zone() {
+        use crate::types::format::FormatConfig;
+        use crate::types::mana::ManaCost;
+
+        let mut state = GameState::new(FormatConfig::commander(), 4, 42);
+        let expr = QuantityExpr::Ref {
+            qty: QuantityRef::CommanderManaValue {
+                owner: ControllerRef::You,
+            },
+        };
+
+        // No commander yet → 0.
+        assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), ObjectId(0)), 0);
+
+        // Build a 5-mana commander in command zone and verify the resolver returns 5.
+        let cmd_id = create_object(
+            &mut state,
+            CardId(101),
+            PlayerId(0),
+            "Kaalia".to_string(),
+            Zone::Command,
+        );
+        {
+            let obj = state.objects.get_mut(&cmd_id).unwrap();
+            obj.is_commander = true;
+            obj.mana_cost = ManaCost::generic(5);
+        }
+
+        assert_eq!(
+            resolve_quantity(&state, &expr, PlayerId(0), ObjectId(0)),
+            5,
+            "Commander in command zone should resolve to its mana value (5)"
+        );
+    }
+
+    /// CR 903.3d: CommanderManaValue resolves to the mana value of a commander
+    /// on the battlefield when no commander is in the command zone.
+    #[test]
+    fn resolve_quantity_commander_mana_value_battlefield() {
+        use crate::types::mana::ManaCost;
+
+        let mut state = GameState::new_two_player(42);
+        let expr = QuantityExpr::Ref {
+            qty: QuantityRef::CommanderManaValue {
+                owner: ControllerRef::You,
+            },
+        };
+
+        // Build a 3-mana commander on battlefield.
+        let cmd_id = create_object(
+            &mut state,
+            CardId(101),
+            PlayerId(0),
+            "Test Commander".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&cmd_id).unwrap();
+            obj.is_commander = true;
+            obj.mana_cost = ManaCost::generic(3);
+        }
+
+        assert_eq!(
+            resolve_quantity(&state, &expr, PlayerId(0), ObjectId(0)),
+            3,
+            "Commander on battlefield should resolve to its mana value (3)"
+        );
+    }
+
+    /// CR 903.3d: Greatest commander mana value with partners in command zone.
+    /// Verifies that the Aggregate resolver correctly enumerates command-zone
+    /// commanders after zone_object_ids(Zone::Command) was fixed.
+    #[test]
+    fn resolve_quantity_greatest_commander_mana_value_command_zone() {
+        use crate::types::format::FormatConfig;
+        use crate::types::mana::ManaCost;
+
+        let mut state = GameState::new(FormatConfig::commander(), 4, 42);
+        let expr = QuantityExpr::Ref {
+            qty: QuantityRef::Aggregate {
+                function: AggregateFunction::Max,
+                property: ObjectProperty::ManaValue,
+                filter: TargetFilter::Typed(
+                    TypedFilter::default()
+                        .controller(ControllerRef::You)
+                        .properties(vec![
+                            FilterProp::IsCommander,
+                            FilterProp::InAnyZone {
+                                zones: vec![Zone::Battlefield, Zone::Command],
+                            },
+                        ]),
+                ),
+            },
+        };
+
+        // Add two partners in command zone: 3-mana and 5-mana
+        let cmd1_id = create_object(
+            &mut state,
+            CardId(101),
+            PlayerId(0),
+            "Partner1".to_string(),
+            Zone::Command,
+        );
+        {
+            let obj = state.objects.get_mut(&cmd1_id).unwrap();
+            obj.is_commander = true;
+            obj.mana_cost = ManaCost::generic(3);
+        }
+        let cmd2_id = create_object(
+            &mut state,
+            CardId(102),
+            PlayerId(0),
+            "Partner2".to_string(),
+            Zone::Command,
+        );
+        {
+            let obj = state.objects.get_mut(&cmd2_id).unwrap();
+            obj.is_commander = true;
+            obj.mana_cost = ManaCost::generic(5);
+        }
+
+        assert_eq!(
+            resolve_quantity(&state, &expr, PlayerId(0), ObjectId(0)),
+            5,
+            "Greatest of partners in command zone should be 5"
         );
     }
 

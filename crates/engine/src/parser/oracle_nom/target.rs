@@ -13,7 +13,9 @@ use nom::Parser;
 use super::error::{oracle_err, OracleError, OracleResult};
 use super::primitives::parse_color;
 use crate::parser::oracle_util::{parse_subtype, OUTLAW_SUBTYPES};
-use crate::types::ability::{ControllerRef, FilterProp, TargetFilter, TypeFilter, TypedFilter};
+use crate::types::ability::{
+    Comparator, ControllerRef, FilterProp, TargetFilter, TypeFilter, TypedFilter,
+};
 use crate::types::card_type::Supertype;
 use crate::types::mana::ManaColor;
 use crate::types::zones::Zone;
@@ -30,8 +32,15 @@ pub fn parse_type_phrase(input: &str) -> OracleResult<'_, TargetFilter> {
     // Optional supertype prefix ("legendary", "basic", "snow")
     let (rest, supertype_opt) = opt(parse_supertype_prefix).parse(rest)?;
 
-    // Optional color prefix
-    let (rest, color_opt) = opt(parse_color_prefix).parse(rest)?;
+    // Optional color-quality prefix ("colorless ", "monocolored ", "multicolored ")
+    let (rest, color_quality_opt) = opt(parse_color_quality_prefix).parse(rest)?;
+
+    // Optional WUBRG color prefix (mutually exclusive with color-quality)
+    let (rest, color_opt) = if color_quality_opt.is_some() {
+        (rest, None)
+    } else {
+        opt(parse_color_prefix).parse(rest)?
+    };
 
     // Core type(s) joined by " or "
     let (rest, types) = parse_type_list(rest)?;
@@ -40,6 +49,12 @@ pub fn parse_type_phrase(input: &str) -> OracleResult<'_, TargetFilter> {
     let (rest, controller) = opt(preceded(space1, parse_controller_suffix)).parse(rest)?;
 
     let mut filter = build_type_filter(types, color_opt, supertype_opt, controller);
+
+    if let Some(prop) = color_quality_opt {
+        if let TargetFilter::Typed(ref mut tf) = filter {
+            tf.properties.push(prop);
+        }
+    }
 
     // Wrap in Non if "non" prefix was present
     if non_prefix.is_some() {
@@ -96,6 +111,35 @@ pub fn parse_supertype_prefix(input: &str) -> OracleResult<'_, Supertype> {
     let (rest, st) = parse_supertype_word(input)?;
     let (rest, _) = space1.parse(rest)?;
     Ok((rest, st))
+}
+
+/// Parse color-quality adjective prefixes: "colorless ", "monocolored ",
+/// "multicolored ".
+fn parse_color_quality_prefix(input: &str) -> OracleResult<'_, FilterProp> {
+    alt((
+        value(
+            FilterProp::ColorCount {
+                comparator: Comparator::EQ,
+                count: 0,
+            },
+            tag("colorless "),
+        ),
+        value(
+            FilterProp::ColorCount {
+                comparator: Comparator::EQ,
+                count: 1,
+            },
+            tag("monocolored "),
+        ),
+        value(
+            FilterProp::ColorCount {
+                comparator: Comparator::GE,
+                count: 2,
+            },
+            tag("multicolored "),
+        ),
+    ))
+    .parse(input)
 }
 
 /// Parse a color word followed by a space, consuming both.
@@ -276,6 +320,20 @@ fn parse_itself_self_reference(input: &str) -> OracleResult<'_, TargetFilter> {
 
 /// Parse an event context reference from Oracle text.
 ///
+/// CR 506.2 + CR 603.7c: "that attacking player" — the player who declared
+/// attackers in the triggering `AttackersDeclared` event (Ellie, Brick Master;
+/// Breena, the Demagogue).
+pub fn parse_attacking_player_event_ref(input: &str) -> OracleResult<'_, TargetFilter> {
+    value(TargetFilter::TriggeringPlayer, tag("that attacking player")).parse(input)
+}
+
+/// CR 506.3d + CR 508.1: "that opponent" inside an attack trigger's effect —
+/// the opponent being attacked in the triggering event (token enters attacking
+/// that opponent; Adeline / Ellie class).
+pub fn parse_attacked_opponent_event_ref(input: &str) -> OracleResult<'_, TargetFilter> {
+    value(TargetFilter::DefendingPlayer, tag("that opponent")).parse(input)
+}
+
 /// Matches "that spell", "that player", "that creature", "defending player",
 /// "the defending player", "that card", "that permanent".
 /// Returns a `TargetFilter` for the referenced entity.
@@ -294,6 +352,9 @@ pub fn parse_event_context_ref(input: &str) -> OracleResult<'_, TargetFilter> {
         value(TargetFilter::TriggeringSource, tag("that creature")),
         value(TargetFilter::TriggeringSource, tag("that permanent")),
         value(TargetFilter::TriggeringSource, tag("that card")),
+        parse_attacking_player_event_ref,
+        // CR 506.3d: "that opponent" before the shorter "that player" arm.
+        parse_attacked_opponent_event_ref,
         value(TargetFilter::TriggeringPlayer, tag("that player")),
         // CR 506.3d: "defending player" / "the defending player"
         value(TargetFilter::DefendingPlayer, tag("the defending player")),
@@ -354,6 +415,7 @@ pub fn parse_stack_object_target(input: &str) -> OracleResult<'_, TargetFilter> 
                     TargetFilter::StackAbility {
                         controller: None,
                         tag: None,
+                        kind: None,
                     },
                 ],
             },
@@ -373,28 +435,36 @@ pub fn parse_stack_object_target(input: &str) -> OracleResult<'_, TargetFilter> 
 
 /// Parse a single ability-kind leg of a stack-object phrase.
 ///
-/// CR 113.3b/113.3c: the only ability kinds that exist on the stack are
-/// activated and triggered abilities; both denote the same legal set (any
-/// ability on the stack), so every spelling maps to one
-/// `StackAbility { controller: None, tag: None }`. Longest-match-first so the
-/// comma/`or`-joined two-word forms are consumed whole before the shorter
-/// single-word alternates.
+/// CR 113.3b/113.3c: activated and triggered abilities are distinct stack
+/// objects; a lone "triggered ability" or "activated ability" leg narrows
+/// `kind`, while combined phrases accept both.
 fn parse_ability_kind_leg(input: &str) -> OracleResult<'_, TargetFilter> {
-    value(
-        TargetFilter::StackAbility {
+    alt((
+        map(tag("triggered ability"), |_| TargetFilter::StackAbility {
             controller: None,
             tag: None,
-        },
-        alt((
-            tag("activated ability, triggered ability"),
-            tag("activated or triggered ability"),
-            tag("triggered or activated ability"),
-            tag("triggered ability or activated ability"),
-            tag("activated ability or triggered ability"),
-            tag("triggered ability"),
-            tag("activated ability"),
-        )),
-    )
+            kind: Some(crate::types::ability::StackAbilityKind::Triggered),
+        }),
+        map(tag("activated ability"), |_| TargetFilter::StackAbility {
+            controller: None,
+            tag: None,
+            kind: Some(crate::types::ability::StackAbilityKind::Activated),
+        }),
+        map(
+            alt((
+                tag("activated ability, triggered ability"),
+                tag("activated or triggered ability"),
+                tag("triggered or activated ability"),
+                tag("triggered ability or activated ability"),
+                tag("activated ability or triggered ability"),
+            )),
+            |_| TargetFilter::StackAbility {
+                controller: None,
+                tag: None,
+                kind: None,
+            },
+        ),
+    ))
     .parse(input)
 }
 
@@ -439,7 +509,7 @@ fn parse_ability_kind_leg(input: &str) -> OracleResult<'_, TargetFilter> {
 fn parse_ability_spell_disjunction(input: &str) -> OracleResult<'_, TargetFilter> {
     enum StackLeg {
         Spell(TargetFilter),
-        Ability,
+        Ability(TargetFilter),
     }
 
     fn parse_leg(input: &str) -> OracleResult<'_, StackLeg> {
@@ -448,25 +518,50 @@ fn parse_ability_spell_disjunction(input: &str) -> OracleResult<'_, TargetFilter
         // spell phrase, so the two leg kinds are disjoint and the order is for
         // determinism only.
         alt((
-            map(parse_ability_kind_leg, |_| StackLeg::Ability),
+            map(parse_ability_kind_leg, StackLeg::Ability),
             map(parse_restricted_spell, StackLeg::Spell),
         ))
         .parse(input)
     }
 
+    fn merge_ability_kind(
+        existing: Option<crate::types::ability::StackAbilityKind>,
+        incoming: Option<crate::types::ability::StackAbilityKind>,
+    ) -> Option<crate::types::ability::StackAbilityKind> {
+        match (existing, incoming) {
+            (None, k) | (k, None) => k,
+            (Some(a), Some(b)) if a == b => Some(a),
+            _ => None,
+        }
+    }
+
     // Source-encounter-ordered assembly. Ability legs fold into the first
     // ability slot: push a single `StackAbility` marker at the position it is
-    // first seen, and ignore later ability legs (they denote the same set).
-    fn push_leg(filters: &mut Vec<TargetFilter>, saw_ability: &mut bool, leg: StackLeg) {
+    // first seen, and merge later ability legs (widening `kind` when mixed).
+    fn push_leg(
+        filters: &mut Vec<TargetFilter>,
+        ability_slot: &mut Option<usize>,
+        ability_kind: &mut Option<crate::types::ability::StackAbilityKind>,
+        leg: StackLeg,
+    ) {
         match leg {
             StackLeg::Spell(f) => filters.push(f),
-            StackLeg::Ability => {
-                if !*saw_ability {
-                    *saw_ability = true;
-                    filters.push(TargetFilter::StackAbility {
-                        controller: None,
-                        tag: None,
-                    });
+            StackLeg::Ability(ability_filter) => {
+                let TargetFilter::StackAbility { kind, .. } = ability_filter else {
+                    return;
+                };
+                if let Some(slot) = ability_slot {
+                    *ability_kind = merge_ability_kind(*ability_kind, kind);
+                    if let TargetFilter::StackAbility {
+                        kind: slot_kind, ..
+                    } = &mut filters[*slot]
+                    {
+                        *slot_kind = *ability_kind;
+                    }
+                } else {
+                    *ability_slot = Some(filters.len());
+                    *ability_kind = kind;
+                    filters.push(ability_filter);
                 }
             }
         }
@@ -475,8 +570,9 @@ fn parse_ability_spell_disjunction(input: &str) -> OracleResult<'_, TargetFilter
     // First leg is mandatory.
     let (mut rest, first) = parse_leg(input)?;
     let mut filters: Vec<TargetFilter> = Vec::new();
-    let mut saw_ability = false;
-    push_leg(&mut filters, &mut saw_ability, first);
+    let mut ability_slot = None;
+    let mut ability_kind = None;
+    push_leg(&mut filters, &mut ability_slot, &mut ability_kind, first);
 
     // Subsequent legs joined by a list connector. Longest-match-first so
     // ", or " / ", and/or " win over the bare ", " separator.
@@ -491,7 +587,7 @@ fn parse_ability_spell_disjunction(input: &str) -> OracleResult<'_, TargetFilter
         match opt(preceded(connector, parse_leg)).parse(rest)? {
             (next, Some(leg)) => {
                 rest = next;
-                push_leg(&mut filters, &mut saw_ability, leg);
+                push_leg(&mut filters, &mut ability_slot, &mut ability_kind, leg);
             }
             (next, None) => {
                 rest = next;
@@ -502,7 +598,7 @@ fn parse_ability_spell_disjunction(input: &str) -> OracleResult<'_, TargetFilter
 
     // CONTRACT: an ability disjunct is required — pure-spell phrases go to
     // `parse_target` so the existing single-leg contracts hold.
-    if !saw_ability {
+    if ability_slot.is_none() {
         return Err(oracle_err(input));
     }
 
@@ -834,6 +930,16 @@ mod tests {
         let (rest6, f6) = parse_event_context_ref("the defending player gains").unwrap();
         assert_eq!(rest6, " gains");
         assert_eq!(f6, TargetFilter::DefendingPlayer);
+
+        // CR 506.2 + CR 603.7c: attack-trigger actor anaphor (Ellie, Breena).
+        let (rest7, f7) = parse_event_context_ref("that attacking player creates").unwrap();
+        assert_eq!(rest7, " creates");
+        assert_eq!(f7, TargetFilter::TriggeringPlayer);
+
+        // CR 506.3d: attacked opponent anaphor in token-enter-attacking clauses.
+        let (rest8, f8) = parse_event_context_ref("that opponent.").unwrap();
+        assert_eq!(rest8, ".");
+        assert_eq!(f8, TargetFilter::DefendingPlayer);
     }
 
     #[test]
@@ -916,7 +1022,8 @@ mod tests {
                 filters: vec![
                     TargetFilter::StackAbility {
                         controller: None,
-                        tag: None
+                        tag: None,
+                        kind: None,
                     },
                     noncreature_spell_leg(),
                 ],
@@ -959,7 +1066,8 @@ mod tests {
             filter,
             TargetFilter::StackAbility {
                 controller: None,
-                tag: None
+                tag: None,
+                kind: None,
             }
         );
     }
@@ -972,9 +1080,45 @@ mod tests {
             filter,
             TargetFilter::StackAbility {
                 controller: None,
-                tag: None
+                tag: None,
+                kind: Some(crate::types::ability::StackAbilityKind::Activated),
             }
         );
+    }
+
+    #[test]
+    fn test_stack_object_triggered_ability_only() {
+        let (rest, filter) = parse_stack_object_target("triggered ability").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            filter,
+            TargetFilter::StackAbility {
+                controller: None,
+                tag: None,
+                kind: Some(crate::types::ability::StackAbilityKind::Triggered),
+            }
+        );
+    }
+
+    #[test]
+    fn test_stack_object_triggered_ability_or_colorless_spell() {
+        let (rest, filter) =
+            parse_stack_object_target("triggered ability or colorless spell").unwrap();
+        assert_eq!(rest, "");
+        assert!(matches!(
+            filter,
+            TargetFilter::Or {
+                filters: legs
+            } if legs.len() == 2
+                && matches!(
+                    &legs[0],
+                    TargetFilter::StackAbility {
+                        kind: Some(crate::types::ability::StackAbilityKind::Triggered),
+                        ..
+                    }
+                )
+                && matches!(&legs[1], TargetFilter::Typed(_))
+        ));
     }
 
     #[test]
@@ -991,7 +1135,8 @@ mod tests {
                     TargetFilter::StackSpell,
                     TargetFilter::StackAbility {
                         controller: None,
-                        tag: None
+                        tag: None,
+                        kind: None,
                     },
                 ],
             }
@@ -1045,6 +1190,7 @@ mod tests {
                     TargetFilter::StackAbility {
                         controller: None,
                         tag: None,
+                        kind: Some(crate::types::ability::StackAbilityKind::Triggered),
                     },
                 ],
             }

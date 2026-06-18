@@ -3,7 +3,7 @@ use crate::types::ability::{
     AbilityKind, AdditionalCost, CardPlayMode, CastTimingPermission, CastingPermission, ChoiceType,
     ContinuousModification, CostObjectCount, CostPaidObjectSnapshot, CounterCostSelection,
     Duration, Effect, FilterProp, GameRestriction, ModalSelectionCondition, ObjectScope,
-    PlayerScope, ProhibitedActivity, QuantityExpr, QuantityRef, ResolvedAbility,
+    PlayerFilter, PlayerScope, ProhibitedActivity, QuantityExpr, QuantityRef, ResolvedAbility,
     RestrictionPlayerScope, StaticDefinition, TargetFilter, TargetRef,
 };
 use crate::types::actions::AlternativeCastDecision;
@@ -4345,6 +4345,32 @@ pub(super) fn concrete_cost_for_x(
     cost
 }
 
+/// CR 601.2f + CR 702.41a: Build per-X total cost previews for the Choose-X UI.
+/// Each entry is `(x, concrete_cost)` after Affinity/reductions/floors. Empty
+/// when `base_cost` is unavailable or the legal range exceeds 100 values.
+pub(super) fn build_choose_x_cost_previews(
+    state: &GameState,
+    player: PlayerId,
+    pending: &PendingCast,
+    min: u32,
+    max: u32,
+) -> Vec<(u32, ManaCost)> {
+    let Some(base) = pending.base_cost.as_ref() else {
+        return Vec::new();
+    };
+    if min > max || max.saturating_sub(min) > 100 {
+        return Vec::new();
+    }
+    (min..=max)
+        .map(|x| {
+            (
+                x,
+                concrete_cost_for_x(state, player, pending.object_id, &pending.ability, base, x),
+            )
+        })
+        .collect()
+}
+
 /// CR 601.2f + CR 107.3g: Re-derive a pending `{X}` spell's full concrete cost
 /// AFTER the chosen X is known. Rebuilds from the captured tax-inclusive base
 /// via `concrete_cost_for_x`, re-applying all reductions, target-dependent
@@ -5412,6 +5438,40 @@ fn alternative_spell_layout(obj: &crate::game::game_object::GameObject) -> Optio
         Some(_) => None,
         None => Some(LayoutKind::Adventure),
     }
+}
+
+/// CR 709.3 / CR 709.3a-b: Split cards whose two faces are both spells
+/// (Life // Death, etc.) require a cast-time face choice — the same player
+/// decision as spell//spell MDFCs. Fuse split cards (Breaking // Entering) keep
+/// the existing `CastingVariant::Fuse` prompt instead.
+fn split_spell_face_choice_available(obj: &crate::game::game_object::GameObject) -> bool {
+    use crate::types::card_type::CoreType;
+    let Some(back) = obj.back_face.as_ref() else {
+        return false;
+    };
+    if back.layout_kind != Some(LayoutKind::Split) {
+        return false;
+    }
+    if obj
+        .keywords
+        .iter()
+        .any(|k| matches!(k, crate::types::keywords::Keyword::Fuse))
+    {
+        return false;
+    }
+    let face_is_castable_spell = |types: &crate::types::card_type::CardType| {
+        types
+            .core_types
+            .iter()
+            .any(|ct| matches!(ct, CoreType::Instant | CoreType::Sorcery))
+    };
+    face_is_castable_spell(&obj.card_types) && face_is_castable_spell(&back.card_types)
+}
+
+/// CR 712.11b + CR 709.3: Cast-time face choice for spell//spell MDFCs and
+/// spell//spell split cards.
+fn cast_spell_face_choice_available(obj: &crate::game::game_object::GameObject) -> bool {
+    modal_spell_face_choice_available(obj) || split_spell_face_choice_available(obj)
 }
 
 /// CR 712.11b: Returns true if `obj` is a Modal double-faced card whose two
@@ -6872,6 +6932,13 @@ pub fn handle_cast_spell_as_sneak_with_payment_mode(
             "You don't control that creature".to_string(),
         ));
     }
+    // CR 506.4 + CR 702.190a: Sneak may only return an unblocked attacker still
+    // on the battlefield.
+    if !super::combat::is_attacker_in_play(state, creature_to_return) {
+        return Err(EngineError::ActionNotAllowed(
+            "Attacker is no longer on the battlefield".to_string(),
+        ));
+    }
 
     let placement = if is_permanent_spell {
         Some(SneakPlacement {
@@ -7403,8 +7470,7 @@ pub fn handle_cast_spell_with_payment_mode(
     // re-enters this function; the swap clears the back face's Modal
     // `layout_kind`, so the re-entry casts the chosen face without re-prompting.
     if let Some(obj) = state.objects.get(&object_id) {
-        if cast_face_choice_offered_from_zone(state, obj) && modal_spell_face_choice_available(obj)
-        {
+        if cast_face_choice_offered_from_zone(state, obj) && cast_spell_face_choice_available(obj) {
             return Ok(WaitingFor::ModalFaceChoice {
                 player,
                 object_id,
@@ -8452,7 +8518,7 @@ fn continue_with_prepared(
                     events,
                 );
             }
-            // Cap max_choices to actual mode count
+            // Cap max_choices to actual mode count for count-capped modals.
             let mut capped = modal_choice_for_player(
                 state,
                 player,
@@ -8460,7 +8526,14 @@ fn continue_with_prepared(
                 modal_choice,
                 &crate::types::ability::SpellContext::default(),
             );
-            capped.max_choices = capped.max_choices.min(capped.mode_count);
+            // CR 700.2i: for a pawprint points-budget modal, `max_choices` is the
+            // POINT BUDGET (Σ of chosen weights), NOT a mode count — do NOT clamp
+            // it to `mode_count`. Mirrors the same discriminant branch in
+            // `build_modal_choice` (parser) so the runtime prompt carries the full
+            // budget (e.g. 5) rather than a count cap (3).
+            if capped.mode_pawprints.is_empty() {
+                capped.max_choices = capped.max_choices.min(capped.mode_count);
+            }
             let target_constraints = target_constraints_from_modal(&capped);
 
             // Build a placeholder resolved ability -- will be replaced after mode selection
@@ -8482,10 +8555,23 @@ fn continue_with_prepared(
             // "an opponent chooses —"). Target selection still belongs to the
             // controller (CR 115.1) — `pending_cast` keeps the caster.
             let mode_chooser = resolve_modal_chooser(state, &capped, player, prepared.object_id);
+            let mode_abilities = state
+                .objects
+                .get(&prepared.object_id)
+                .map(super::ability_utils::modal_spell_mode_abilities)
+                .unwrap_or_default();
+            let unavailable_modes = super::ability_utils::spell_modal_unavailable_modes(
+                state,
+                prepared.object_id,
+                player,
+                &capped,
+                &mode_abilities,
+            );
             return Ok(WaitingFor::ModeChoice {
                 player: mode_chooser,
                 modal: capped,
                 pending_cast: Box::new(pending_modal),
+                unavailable_modes,
             });
         }
 
@@ -9139,9 +9225,25 @@ pub fn spell_has_legal_targets(
         });
     }
 
-    // Modal spells defer target checking until after mode selection
-    if obj.modal.is_some() {
-        return true;
+    // CR 700.2a-b: Modal spells are castable only when at least one mode has a
+    // legal targeting assignment (or needs no targets).
+    if let Some(ref modal) = obj.modal {
+        let mode_abilities = super::ability_utils::modal_spell_mode_abilities(obj);
+        let capped = modal_choice_for_player(
+            &simulated,
+            player,
+            obj.id,
+            modal,
+            &crate::types::ability::SpellContext::default(),
+        );
+        let unavailable = super::ability_utils::spell_modal_unavailable_modes(
+            &simulated,
+            obj.id,
+            player,
+            &capped,
+            &mode_abilities,
+        );
+        return unavailable.len() < capped.mode_count;
     }
 
     // Only Spell-kind abilities contribute targets when casting.
@@ -9584,7 +9686,7 @@ fn can_cast_prepared_now(
     // recursion: swap to the back face and re-test. `swap_to_alternative_spell_face`
     // clears the back face's `layout_kind`, so the recursive call does not
     // re-enter this branch (no infinite recursion).
-    if modal_spell_face_choice_available(obj) {
+    if cast_spell_face_choice_available(obj) {
         let mut sim = state.clone();
         if let Some(sim_obj) = sim.objects.get_mut(&prepared.object_id) {
             swap_to_alternative_spell_face(sim_obj);
@@ -11288,6 +11390,25 @@ fn can_pay_ability_cost_now(
     )
 }
 
+/// CR 602.2a: Whether `player` may begin to activate an activated ability on
+/// a permanent controlled by `source_controller`.
+fn player_may_begin_activating(
+    state: &GameState,
+    player: PlayerId,
+    source_controller: PlayerId,
+    activator_filter: Option<&PlayerFilter>,
+) -> bool {
+    match activator_filter {
+        None | Some(PlayerFilter::Controller) => player == source_controller,
+        Some(PlayerFilter::All) => true,
+        Some(PlayerFilter::Opponent) => {
+            super::players::is_opponent(state, source_controller, player)
+        }
+        // Activator permission is only modeled for controller / all / opponent today.
+        Some(_) => player == source_controller,
+    }
+}
+
 pub fn can_activate_ability_now(
     state: &GameState,
     player: PlayerId,
@@ -11297,13 +11418,18 @@ pub fn can_activate_ability_now(
     let Some(obj) = state.objects.get(&source_id) else {
         return false;
     };
-    if obj.controller != player {
-        return false;
-    }
     let Some(mut ability_def) = activation_ability_definition(state, source_id, ability_index)
     else {
         return false;
     };
+    if !player_may_begin_activating(
+        state,
+        player,
+        obj.controller,
+        ability_def.activator_filter.as_ref(),
+    ) {
+        return false;
+    }
 
     // CR 702.61a + CR 702.61b: While a spell with split second is on the stack,
     // players can't activate abilities that aren't mana abilities.
@@ -11532,16 +11658,21 @@ pub fn handle_activate_ability(
         .get(&source_id)
         .ok_or_else(|| EngineError::InvalidAction("Object not found".to_string()))?;
 
-    // CR 602.2: Only an object's controller can activate its activated ability.
-    if obj.controller != player {
-        return Err(EngineError::NotYourPriority);
-    }
+    // CR 602.2a: Only players permitted by `activator_filter` may begin activation.
     let Some(mut ability_def) = activation_ability_definition(state, source_id, ability_index)
     else {
         return Err(EngineError::InvalidAction(
             "Invalid ability index".to_string(),
         ));
     };
+    if !player_may_begin_activating(
+        state,
+        player,
+        obj.controller,
+        ability_def.activator_filter.as_ref(),
+    ) {
+        return Err(EngineError::NotYourPriority);
+    }
     // CR 602.1: Check activation zone — default to battlefield.
     let required_zone = ability_def.activation_zone.unwrap_or(Zone::Battlefield);
     if obj.zone != required_zone {
@@ -12245,15 +12376,20 @@ pub fn handle_cancel_cast(
         }
     }
 
-    if pending
+    let restore_swapped_cast_face = pending
         .casting_variant
         .restores_front_face_after_stack_exit()
-    {
-        // CR 601.2i + CR 712.11a: backing out of a cast with an alternative
-        // spell face before it completes restores the card's normal front face
-        // in its origin zone.
+        || state
+            .objects
+            .get(&pending.object_id)
+            .is_some_and(|obj| obj.modal_back_face);
+    if restore_swapped_cast_face {
+        // CR 601.2i + CR 712.11a / CR 709.3: backing out of a cast with an
+        // alternative spell face before it completes restores the card's normal
+        // front face in its origin zone.
+        super::stack::restore_alternative_spell_normal_face(state, pending.object_id);
         if let Some(obj) = state.objects.get_mut(&pending.object_id) {
-            swap_to_alternative_spell_face(obj);
+            obj.modal_back_face = false;
         }
     }
 
@@ -17375,9 +17511,12 @@ mod tests {
                     target: TargetFilter::StackAbility {
                         controller: Some(ControllerRef::You),
                         tag: None,
+                        kind: None,
                     },
                     retarget: CopyRetargetPermission::MayChooseNewTargets,
                     copier: None,
+                    additional_modifications: Vec::new(),
+                    starting_loyalty_from_casualty_sacrifice: false,
                 },
             )
             .cost(AbilityCost::Composite {
@@ -20029,6 +20168,7 @@ mod tests {
                             TargetFilter::StackAbility {
                                 controller: None,
                                 tag: None,
+                                kind: None,
                             },
                         ],
                     },
@@ -20174,6 +20314,7 @@ mod tests {
                 target: TargetFilter::StackAbility {
                     controller: None,
                     tag: None,
+                    kind: None,
                 },
                 source_rider: None,
             },
@@ -20408,6 +20549,37 @@ mod tests {
         // affordable X effectively costs 1 less mana — max X is 3 higher.
         let (mut affinity_state, affinity_spell) = build_state(3);
         let affinity_max = choose_max(&mut affinity_state, affinity_spell);
+
+        match &affinity_state.waiting_for {
+            WaitingFor::ChooseXValue {
+                x_cost_previews,
+                min,
+                max,
+                ..
+            } => {
+                assert_eq!(*min, 0);
+                assert_eq!(*max, affinity_max);
+                assert_eq!(
+                    x_cost_previews.len(),
+                    (max - min + 1) as usize,
+                    "Choose-X UI must receive per-X cost previews"
+                );
+                let cost_at_3 = x_cost_previews
+                    .iter()
+                    .find(|(x, _)| *x == 3)
+                    .map(|(_, cost)| cost.clone())
+                    .expect("preview for X=3");
+                assert_eq!(
+                    cost_at_3,
+                    ManaCost::Cost {
+                        shards: vec![ManaCostShard::Black, ManaCostShard::Black],
+                        generic: 0,
+                    },
+                    "3 creature Affinity on {{X}}{{B}}{{B}} at X=3 must preview as two black mana"
+                );
+            }
+            other => panic!("expected ChooseXValue with previews, got {other:?}"),
+        }
 
         assert_eq!(
             affinity_max,

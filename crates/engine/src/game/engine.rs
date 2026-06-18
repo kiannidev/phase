@@ -1263,9 +1263,15 @@ fn finalize_copy_retarget(
     slots: &[crate::types::game_state::CopyTargetSlot],
     effect_kind: crate::types::ability::EffectKind,
     effect_source_id: Option<ObjectId>,
-    paradigm_remaining_offers: Option<Vec<ObjectId>>,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EngineError> {
+    let paradigm_remaining_offers = match &state.waiting_for {
+        WaitingFor::CopyRetarget {
+            paradigm_remaining_offers,
+            ..
+        } => paradigm_remaining_offers.clone(),
+        _ => None,
+    };
     let targets: Vec<_> = slots
         .iter()
         .map(|slot| {
@@ -4604,7 +4610,6 @@ fn apply_action(
                     &updated_slots,
                     *effect_kind,
                     *effect_source_id,
-                    paradigm_remaining_offers.clone(),
                     &mut events,
                 )?;
             }
@@ -4623,7 +4628,6 @@ fn apply_action(
                 target_slots,
                 effect_kind,
                 effect_source_id,
-                paradigm_remaining_offers,
                 ..
             },
             GameAction::KeepAllCopyTargets,
@@ -4638,7 +4642,6 @@ fn apply_action(
                 &slots,
                 *effect_kind,
                 *effect_source_id,
-                paradigm_remaining_offers.clone(),
                 &mut events,
             )?;
             state.waiting_for.clone()

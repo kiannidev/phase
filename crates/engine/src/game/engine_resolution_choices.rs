@@ -1528,8 +1528,14 @@ pub(super) fn handle_resolution_choice(
             // Experiment land/creature split; Expressive Iteration's bottom/
             // exile tail after keeping one to hand). Use a fresh tracked set so
             // a parent effect's empty pre-choice publish cannot keep the chain
-            // sentinel bound to the wrong set.
-            effects::publish_fresh_tracked_set(state, cards.clone());
+            // sentinel bound to the wrong set. When nothing was kept, publish an
+            // empty set so ParentTarget continuations do not bind stale cards.
+            let publish_set = if kept.is_empty() {
+                Vec::new()
+            } else {
+                cards.clone()
+            };
+            effects::publish_fresh_tracked_set(state, publish_set);
             // None => Graveyard; map to a concrete zone so the rest mover
             // (shared with the search-split partition) has a single Zone.
             route_rest_partition(
@@ -1539,17 +1545,10 @@ pub(super) fn handle_resolution_choice(
                 events,
             );
             if let Some(cont) = state.pending_continuation.as_mut() {
-                // CR 608.2c: Hideaway / "exile one face down" sub-abilities bind
-                // ParentTarget to the kept (exiled) card; hand-routing tails like
-                // Expressive Iteration bind ParentTarget to the unkept pile.
-                let continuation_targets = match kept_destination {
-                    Some(Zone::Exile) => kept.clone(),
-                    _ => unkept.clone(),
-                };
-                cont.chain.targets = continuation_targets
-                    .iter()
-                    .map(|&id| TargetRef::Object(id))
-                    .collect();
+                // CR 608.2c: ParentTarget continuations (Hideaway conceal, dig
+                // conditionals on the kept card) bind to the kept selection.
+                // Hand/bottom/exile tails route via TrackedSetFiltered instead.
+                cont.chain.targets = kept.iter().map(|&id| TargetRef::Object(id)).collect();
                 cont.chain.context.optional_effect_performed = !kept.is_empty();
             }
             ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))

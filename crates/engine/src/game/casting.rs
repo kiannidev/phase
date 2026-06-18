@@ -5440,9 +5440,9 @@ fn alternative_spell_layout(obj: &crate::game::game_object::GameObject) -> Optio
     }
 }
 
-/// CR 708.2a: Split cards whose two faces are both spells (Life // Death,
-/// Breaking // Entering without Fuse, etc.) require a cast-time face choice —
-/// the same player decision as spell//spell MDFCs.
+/// CR 709.3 / CR 709.3a-b: Split cards whose two faces are both spells
+/// (Life // Death, Breaking // Entering without Fuse, etc.) require a cast-time
+/// face choice — the same player decision as spell//spell MDFCs.
 fn split_spell_face_choice_available(obj: &crate::game::game_object::GameObject) -> bool {
     use crate::types::card_type::CoreType;
     let Some(back) = obj.back_face.as_ref() else {
@@ -5460,11 +5460,13 @@ fn split_spell_face_choice_available(obj: &crate::game::game_object::GameObject)
     face_is_castable_spell(&obj.card_types) && face_is_castable_spell(&back.card_types)
 }
 
-/// CR 712.11b + CR 708.2a: Cast-time face choice for spell//spell MDFCs and
+/// CR 712.11b + CR 709.3: Cast-time face choice for spell//spell MDFCs and
 /// spell//spell split cards.
 fn cast_spell_face_choice_available(obj: &crate::game::game_object::GameObject) -> bool {
     modal_spell_face_choice_available(obj) || split_spell_face_choice_available(obj)
 }
+
+/// CR 712.11b: Returns true if `obj` is a Modal double-faced card whose two
 /// faces present a real *cast*-time face choice — i.e. both faces are spells
 /// (neither is a land). This is the spell//spell MDFC class (Esika, God of the
 /// Tree // The Prismatic Bridge and the other Kaldheim gods, Valki // Tibalt,
@@ -9676,7 +9678,7 @@ fn can_cast_prepared_now(
     // recursion: swap to the back face and re-test. `swap_to_alternative_spell_face`
     // clears the back face's `layout_kind`, so the recursive call does not
     // re-enter this branch (no infinite recursion).
-    if modal_spell_face_choice_available(obj) {
+    if cast_spell_face_choice_available(obj) {
         let mut sim = state.clone();
         if let Some(sim_obj) = sim.objects.get_mut(&prepared.object_id) {
             swap_to_alternative_spell_face(sim_obj);
@@ -12366,15 +12368,20 @@ pub fn handle_cancel_cast(
         }
     }
 
-    if pending
+    let restore_swapped_cast_face = pending
         .casting_variant
         .restores_front_face_after_stack_exit()
-    {
-        // CR 601.2i + CR 712.11a: backing out of a cast with an alternative
-        // spell face before it completes restores the card's normal front face
-        // in its origin zone.
+        || state
+            .objects
+            .get(&pending.object_id)
+            .is_some_and(|obj| obj.modal_back_face);
+    if restore_swapped_cast_face {
+        // CR 601.2i + CR 712.11a / CR 709.3: backing out of a cast with an
+        // alternative spell face before it completes restores the card's normal
+        // front face in its origin zone.
+        super::stack::restore_alternative_spell_normal_face(state, pending.object_id);
         if let Some(obj) = state.objects.get_mut(&pending.object_id) {
-            swap_to_alternative_spell_face(obj);
+            obj.modal_back_face = false;
         }
     }
 

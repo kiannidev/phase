@@ -1771,7 +1771,7 @@ impl<'a> SpellCast<'a> {
     }
 
     /// Choose which face of a spell//spell MDFC or split card to cast (CR
-    /// 712.11b / CR 708.2a). Required when the engine surfaces
+    /// 712.11b / CR 709.3). Required when the engine surfaces
     /// `WaitingFor::ModalFaceChoice`.
     pub fn modal_back_face(mut self, back: bool) -> Self {
         self.modal_back_face = Some(back);

@@ -397,6 +397,13 @@ pub struct ZoneChangeRecord {
     /// on the battlefield, emblem creation in the command zone). For normal
     /// zone moves this carries the origin zone.
     pub from_zone: Option<Zone>,
+    /// CR 601.2a: Cast origin as of the zone change — distinct from `from_zone`
+    /// for objects put onto the battlefield without being cast (reanimate, etc.).
+    #[serde(default)]
+    pub cast_from_zone: Option<Zone>,
+    /// CR 305.1: Land-play provenance as of the zone change.
+    #[serde(default)]
+    pub played_from_zone: Option<Zone>,
     pub to_zone: Zone,
     /// CR 603.10a + CR 603.6e: Snapshot of attachments on the object at the moment
     /// of the zone change. Required by look-back triggers of the form
@@ -530,6 +537,8 @@ impl ZoneChangeRecord {
             controller: PlayerId(0),
             owner: PlayerId(0),
             from_zone: from,
+            cast_from_zone: None,
+            played_from_zone: None,
             to_zone: to,
             attachments: Vec::new(),
             linked_exile_snapshot: Vec::new(),
@@ -914,6 +923,12 @@ pub enum PendingCoinFlipKind {
 pub struct PendingCoinFlip {
     pub source_id: ObjectId,
     pub controller: PlayerId,
+    /// CR 705.2: The player who flips (and therefore wins/loses) the coin — the
+    /// already-resolved `Effect::FlipCoin::flipper`. The kept Krark's-Thumb flip's
+    /// `CoinFlipped` is recorded for this player, not `controller`. Defaults to
+    /// the controller for in-flight states serialized before this field existed.
+    #[serde(default)]
+    pub flipper: PlayerId,
     pub targets: Vec<TargetRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub win_effect: Option<Box<AbilityDefinition>>,
@@ -1510,6 +1525,17 @@ pub struct PendingCounterAdditionQueue {
     pub remaining: Vec<PendingCounterAddition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion: Option<PendingEffectResolved>,
+}
+
+/// CR 701.34a + CR 614.1a: Remaining proliferate actions after a replacement
+/// effect (Tekuthal class) doubles the count. Each completed `ProliferateChoice`
+/// drains one action; when `remaining` reaches zero the originating effect
+/// resolves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingProliferateActions {
+    pub actor: PlayerId,
+    pub source_id: ObjectId,
+    pub remaining: u32,
 }
 
 /// CR 603.7: A delayed triggered ability created during resolution of a spell or ability.
@@ -2653,6 +2679,10 @@ pub enum WaitingFor {
     /// `convoke_mode` passes through to the subsequent `ManaPayment` step.
     /// `pending_cast` is embedded so filtered state snapshots (multiplayer)
     /// still carry enough context for the UI to render the spell name/cost.
+    /// `x_cost_previews` maps each legal X in `[min, max]` to the engine-
+    /// authoritative total mana cost after concretizing X and applying cost
+    /// modifiers (Affinity, reductions, floors). Display-only for the Choose-X
+    /// UI — omitted when the range is empty or unreasonably large.
     ChooseXValue {
         player: PlayerId,
         #[serde(default)]
@@ -2661,6 +2691,8 @@ pub enum WaitingFor {
         pending_cast: Box<PendingCast>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         convoke_mode: Option<ConvokeMode>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        x_cost_previews: Vec<(u32, ManaCost)>,
     },
     TargetSelection {
         player: PlayerId,
@@ -3087,6 +3119,11 @@ pub enum WaitingFor {
         /// Zero for all non-blight EffectZoneChoice uses.
         #[serde(default)]
         count_param: u32,
+        /// CR 118.3: When true, this choice is for a cost payment (e.g., exile cost)
+        /// rather than effect resolution. Cost-payment choices require special
+        /// handling for exile-link tracking (push_exiled_with_source_this_turn).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        is_cost_payment: bool,
     },
     /// Player chooses which drawn-this-turn hand cards to put on top of their
     /// library. Each unchosen required card is kept by paying life.
@@ -3175,6 +3212,10 @@ pub enum WaitingFor {
         player: PlayerId,
         modal: ModalChoice,
         pending_cast: Box<PendingCast>,
+        /// Mode indices unavailable due to NoRepeat constraints or unsatisfied
+        /// targeting requirements (CR 700.2a-b). Mirrors `AbilityModeChoice`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        unavailable_modes: Vec<usize>,
     },
     /// Player must choose which cards to discard down to maximum hand size (cleanup step).
     DiscardToHandSize {
@@ -3915,6 +3956,10 @@ pub enum WaitingFor {
         /// Index of the slot currently awaiting a ChooseTarget action.
         #[serde(default)]
         current_slot: usize,
+        /// Remaining paradigm sources to re-offer after this copy's targets are
+        /// chosen (issue #3660).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        paradigm_remaining_offers: Option<Vec<ObjectId>>,
     },
     /// CR 510.1c: Attacker with multiple blockers — controller divides damage as they choose.
     /// CR 702.19b/c: Trample requires lethal to each blocker before assigning excess.
@@ -4632,6 +4677,14 @@ pub struct MiracleOffer {
     pub player: PlayerId,
     pub object_id: ObjectId,
     pub cost: super::mana::ManaCost,
+}
+
+/// CR 702.xxx: Remaining Paradigm sources paused while copy-announcement
+/// observer triggers drain (issue #3660). Resumed when priority next settles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingParadigmRemainingOffers {
+    pub player: PlayerId,
+    pub offers: Vec<ObjectId>,
 }
 
 /// CR 702.190b: Placement data for a Sneak-cast **permanent** spell —
@@ -5884,6 +5937,10 @@ pub struct GameState {
     /// "first card drawn this turn" condition).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_miracle_offers: Vec<MiracleOffer>,
+    /// CR 702.xxx: Paradigm sources still owed after a targeted copy's
+    /// `CopyRetarget` finalization paused on deferred copy observers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_paradigm_remaining_offers: Option<PendingParadigmRemainingOffers>,
     #[serde(default)]
     pub spells_cast_this_game: HashMap<PlayerId, u32>,
     /// Per-player spell cast history this game.
@@ -6163,6 +6220,12 @@ pub struct GameState {
     /// their remaining counter placements after the current choice resolves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_counter_additions: Option<PendingCounterAdditionQueue>,
+
+    /// CR 701.34a + CR 614.1a: Remaining proliferate actions after a count-
+    /// modifying replacement (Tekuthal class). Resumed after each
+    /// `ProliferateChoice` completes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_proliferate_actions: Option<PendingProliferateActions>,
 
     /// Pending optional effect ability chain, awaiting player accept/decline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6995,6 +7058,7 @@ impl GameState {
             first_card_drawn_this_turn: HashMap::new(),
             cards_drawn_this_turn: HashMap::new(),
             pending_miracle_offers: Vec::new(),
+            pending_paradigm_remaining_offers: None,
             spells_cast_this_game: HashMap::new(),
             spells_cast_this_game_by_player: HashMap::new(),
             spells_cast_this_turn_by_player: HashMap::new(),
@@ -7044,6 +7108,7 @@ impl GameState {
             pending_counter_moves: None,
             pending_batch_deliveries: None,
             pending_counter_additions: None,
+            pending_proliferate_actions: None,
             pending_optional_effect: None,
             pending_optional_trigger_event: None,
             pending_optional_trigger_match_count: None,
@@ -7447,6 +7512,7 @@ impl PartialEq for GameState {
             && self.first_card_drawn_this_turn == other.first_card_drawn_this_turn
             && self.cards_drawn_this_turn == other.cards_drawn_this_turn
             && self.pending_miracle_offers == other.pending_miracle_offers
+            && self.pending_paradigm_remaining_offers == other.pending_paradigm_remaining_offers
             && self.spells_cast_this_game == other.spells_cast_this_game
             && self.spells_cast_this_game_by_player == other.spells_cast_this_game_by_player
             && self.spells_cast_this_turn_by_player == other.spells_cast_this_turn_by_player
@@ -7514,6 +7580,7 @@ impl PartialEq for GameState {
             && self.pending_counter_moves == other.pending_counter_moves
             && self.pending_batch_deliveries == other.pending_batch_deliveries
             && self.pending_counter_additions == other.pending_counter_additions
+            && self.pending_proliferate_actions == other.pending_proliferate_actions
             && self.may_trigger_auto_choices == other.may_trigger_auto_choices
             && self.pending_begin_game_abilities == other.pending_begin_game_abilities
             && self.resolving_begin_game_abilities == other.resolving_begin_game_abilities
@@ -7989,6 +8056,7 @@ mod tests {
                 ..Default::default()
             },
             pending_cast: dummy_pending(),
+            unavailable_modes: vec![],
         }));
         variants.push(Box::new(WaitingFor::DiscardToHandSize {
             player: PlayerId(0),
@@ -8130,6 +8198,7 @@ mod tests {
             track_exiled_by_source: false,
             face_down_profile: None,
             count_param: 0,
+            is_cost_payment: false,
         }));
         variants.push(Box::new(WaitingFor::DefilerPayment {
             player: PlayerId(0),
@@ -8192,6 +8261,7 @@ mod tests {
             max: 5,
             pending_cast: pending,
             convoke_mode: None,
+            x_cost_previews: vec![],
         };
         assert!(choose_x.pending_cast_ref().is_some());
         assert!(choose_x.has_pending_cast());
@@ -8377,6 +8447,7 @@ mod tests {
             track_exiled_by_source: false,
             face_down_profile: None,
             count_param: 0,
+            is_cost_payment: false,
         };
         let json = serde_json::to_string(&wf).unwrap();
         let deserialized: WaitingFor = serde_json::from_str(&json).unwrap();
@@ -8478,6 +8549,7 @@ mod tests {
                 ward: None,
             }),
             count_param: 0,
+            is_cost_payment: false,
         };
         let json = serde_json::to_string(&wf).expect("serialize");
         // Modern shape must be emitted, NOT the legacy bool field.

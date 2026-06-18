@@ -97,6 +97,12 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
         return Some(def);
     }
 
+    // --- The Mimeoplasm: "As ~ enters, you may exile N cards from graveyards. If you do, ..." ---
+    // Check before other "as enters" patterns to ensure it matches correctly
+    if let Some(def) = parse_as_enters_exile_from_graveyards(&norm_lower, &normalized, &text) {
+        return Some(def);
+    }
+
     // --- "~ enters prepared." ---
     // CR 722.3a: "enters prepared" gives the entering permanent the prepared
     // designation as part of the entry event, not through a triggered ability.
@@ -150,7 +156,7 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
         return Some(def);
     }
 
-    // --- "[Type] your opponents control enter tapped" (external replacement) ---
+    // --- "[Type] enter tapped" / "[Type] played by your opponents enter tapped" ---
     if let Some(def) = parse_external_enters_tapped(&norm_lower, &text) {
         return Some(def);
     }
@@ -287,8 +293,61 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
         return Some(def);
     }
 
-    // --- "If you would draw a card, {effect}" ---
-    if nom_primitives::scan_contains(&lower, "you would draw") {
+    if let Some(def) = parse_proliferate_count_replacement(&lower, &text) {
+        return Some(def);
+    }
+
+    // --- "If [player] would proliferate, {effect}" ---
+    // CR 701.34a + CR 614.1a: Generic proliferate replacement (Tekuthal class).
+    if nom_primitives::scan_contains(&lower, "would proliferate") {
+        let effect_text = extract_replacement_effect(&normalized);
+        let mut def =
+            ReplacementDefinition::new(ReplacementEvent::Proliferate).description(text.to_string());
+        {
+            let e = effect_text?;
+            let (optional_modal_present, effect_after_modal) = strip_optional_instead_lead_in(&e);
+            if optional_modal_present {
+                def = def.mode(ReplacementMode::Optional { decline: None });
+            }
+            def = def.execute(parse_effect_chain(effect_after_modal, AbilityKind::Spell));
+        }
+        apply_proliferate_player_scope(&lower, &mut def);
+        return Some(def);
+    }
+
+    // --- Explore replacement: "If a creature you control would explore, instead …"
+    // (Twists and Turns / Topography Tracker class).
+    if nom_primitives::scan_contains(&lower, "would explore") {
+        if let Some(def) = parse_explore_replacement(&lower, &text) {
+            return Some(def);
+        }
+    }
+
+    // --- Untap-step replacement: "If [filter] would untap during [its
+    // controller's | your] untap step, [effect] instead" (Freyalise's Winds,
+    // Edge of Malacol). CR 502.3 + CR 502.4 + CR 614.1a.
+    if nom_primitives::scan_contains(&lower, "would untap during") {
+        if let Some(def) = parse_untap_step_replacement(&text, &lower) {
+            return Some(def);
+        }
+    }
+
+    // --- "If [player] would draw [a card | one or more cards], {effect}" ---
+    // CR 614.1a: Widened from "you would draw" to handle opponent/player
+    // scope (Notion Thief, Hullbreacher, Chains of Mephistopheles) mirroring
+    // the gain-life widening below.
+    let mentions_draw = nom_primitives::scan_at_word_boundaries(&lower, |i| {
+        value(
+            (),
+            alt((
+                tag::<_, _, OracleError<'_>>("would draw a card"),
+                tag("would draw one or more cards"),
+            )),
+        )
+        .parse(i)
+    })
+    .is_some();
+    if mentions_draw {
         let effect_text = extract_replacement_effect(&normalized);
         let mut def =
             ReplacementDefinition::new(ReplacementEvent::Draw).description(text.to_string());
@@ -307,6 +366,8 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
             }
             def = def.execute(parse_effect_chain(effect_after_modal, AbilityKind::Spell));
         }
+        // CR 614.1a: Player scope for draw replacements.
+        apply_draw_player_scope(&lower, &mut def);
         // CR 121.1 + CR 504.1 + CR 614.6: Detect Alhammarret's Archive's
         // "except the first one [you|they] draw in each of [your|their] draw
         // steps" exception clause and gate the replacement so it does NOT
@@ -772,6 +833,110 @@ fn parse_self_enters_pay_cost_replacement(
     )
 }
 
+/// CR 614.1a + CR 614.12: The Mimeoplasm — "As ~ enters, you may exile N cards
+/// from graveyards. If you do, it enters as a copy of one of those cards with a
+/// number of additional +1/+1 counters on it equal to the power of the other card."
+///
+/// Emits a `ReplacementMode::MayCost` on the `Moved` event: the accept-cost is
+/// the parsed `AbilityCost::Exile` from graveyards; the "If you do" continuation
+/// is the copy + counter placement effect chain. No decline branch — the permanent
+/// enters normally (no exile, no copy, no counters) if declined.
+fn parse_as_enters_exile_from_graveyards(
+    norm_lower: &str,
+    normalized: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    // Prefix: "as ~ enters, you may exile "
+    let ((), after_prefix) = nom_on_lower(normalized, norm_lower, |i| {
+        value(
+            (),
+            preceded(
+                tag("as "),
+                alt((
+                    tag("~ enters, you may exile "),
+                    tag("this creature enters, you may exile "),
+                )),
+            ),
+        )
+        .parse(i)
+    })?;
+
+    // Isolate the cost body from the "If you do" continuation
+    let after_prefix_lower = after_prefix.to_lowercase();
+    let (cost_body, _tail) =
+        split_once_on_lower(after_prefix, &after_prefix_lower, ". if you do, ")?;
+
+    // Parse the exile cost manually to handle "from graveyards" (plural)
+    // Pattern: "[count] [type] card(s) from graveyards"
+    let cost_body_lower = cost_body.trim().to_lowercase();
+    let (count, filter_text) =
+        parse_number(&cost_body_lower).unwrap_or((1, cost_body_lower.trim()));
+
+    // Strip the "from graveyards" suffix to extract the type filter.
+    // filter_text is already lowercase (slice of cost_body_lower).
+    // Use take_until + alt to consume up to and including the zone suffix.
+    let parsed: nom::IResult<&str, (&str, &str)> = pair(
+        take_until(" from graveyard"),
+        alt((tag(" from graveyards"), tag(" from graveyard"))),
+    )
+    .parse(filter_text);
+    let Ok(("", (filter_text, _))) = parsed else {
+        return None;
+    };
+
+    // Parse the type filter (e.g., "creature")
+    let (filter, remainder) = parse_type_phrase(filter_text.trim());
+    if !remainder.trim().is_empty() {
+        return None;
+    }
+
+    let cost = AbilityCost::Exile {
+        count,
+        zone: Some(Zone::Graveyard),
+        filter: Some(filter),
+    };
+
+    // CR 607.2a: Manually construct the continuation for Mimeoplasm-style effects.
+    // The continuation text "it enters as a copy of one of those cards, except it has
+    // the other card's power and toughness as +1/+1 counters" must be lowered to:
+    // - BecomeCopy targeting the first exiled card (ExiledCardByIndex { index: 0 })
+    // - PutCounter with count = second exiled card's power (ExiledCardPower { index: 1 })
+    // This cannot use parse_effect_chain because the generic parser lowers this
+    // pattern to CopySpell (which copies spells on the stack, not exiled cards).
+    let continuation = crate::types::ability::AbilityDefinition::new(
+        crate::types::ability::AbilityKind::Spell,
+        crate::types::ability::Effect::BecomeCopy {
+            target: crate::types::ability::TargetFilter::ExiledCardByIndex { index: 0 },
+            duration: None,
+            mana_value_limit: None,
+            additional_modifications: vec![],
+        },
+    )
+    .sub_ability(crate::types::ability::AbilityDefinition::new(
+        crate::types::ability::AbilityKind::Spell,
+        crate::types::ability::Effect::PutCounter {
+            counter_type: crate::types::counter::CounterType::Plus1Plus1,
+            count: crate::types::ability::QuantityExpr::Ref {
+                qty: crate::types::ability::QuantityRef::ExiledCardPower { index: 1 },
+            },
+            target: crate::types::ability::TargetFilter::SelfRef,
+        },
+    ));
+
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::Moved)
+            .mode(ReplacementMode::MayCost {
+                cost,
+                decline: None, // No decline branch — enters normally if declined
+            })
+            .execute(continuation)
+            .valid_card(TargetFilter::SelfRef)
+            // CR 614.1c: battlefield-entry-scoped (see destination-gate note above).
+            .destination_zone(Zone::Battlefield)
+            .description(original_text.to_string()),
+    )
+}
+
 /// Case-insensitive replacement of card name and self-referencing phrases with "~".
 fn replace_self_refs(text: &str, card_name: &str) -> String {
     normalize_card_name_refs(text, card_name)
@@ -873,6 +1038,10 @@ fn parse_krark_coin_flip_replacement(text: &str, lower: &str) -> Option<Replacem
                 },
                 win_effect: None,
                 lose_effect: None,
+                // CR 614.1a + CR 705.2: the replacement re-flips for the same
+                // flipper the original event named (the replacement applier rebinds
+                // the acting controller), so `Controller` reads that flipper.
+                flipper: crate::types::ability::TargetFilter::Controller,
             },
         ))
         .description(text.to_string());
@@ -1260,6 +1429,7 @@ fn parse_shock_land(norm_lower: &str, original_text: &str) -> Option<Replacement
             Effect::Choose {
                 choice_type: ChoiceType::BasicLandType,
                 persist: true,
+                selection: crate::types::ability::TargetSelectionMode::Chosen,
             },
         )
     });
@@ -1270,6 +1440,7 @@ fn parse_shock_land(norm_lower: &str, original_text: &str) -> Option<Replacement
             Effect::Choose {
                 choice_type: ChoiceType::BasicLandType,
                 persist: true,
+                selection: crate::types::ability::TargetSelectionMode::Chosen,
             },
         )
         .sub_ability(tap_self)
@@ -1329,6 +1500,7 @@ fn parse_as_enters_choose(norm_lower: &str, original_text: &str) -> Option<Repla
         Effect::Choose {
             choice_type,
             persist: true,
+            selection: crate::types::ability::TargetSelectionMode::Chosen,
         },
     );
 
@@ -2977,40 +3149,130 @@ fn parse_replacement_ability_word_condition(text: &str) -> Option<ReplacementCon
     .map(|(condition, _)| condition)
 }
 
-fn parse_external_entry_suffix(stripped: &str) -> Option<(&str, bool)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExternalEntryKind {
+    Plain {
+        enters_tapped: bool,
+    },
+    /// CR 614.1d: Uphill Battle class — cast/played entry only, not tokens.
+    PlayedByOpponents {
+        enters_tapped: bool,
+    },
+}
+
+/// CR 614.1d: Peel external entry-tapped suffixes from a normalized clause.
+/// Played-by-opponents variants are checked before plain enter-tapped suffixes
+/// so "creatures played by your opponents enter tapped" does not fall through
+/// to the Authority-of-the-Consuls control-based shape.
+fn parse_external_entry_suffix(stripped: &str) -> Option<(&str, ExternalEntryKind)> {
     stripped
-        .strip_suffix(" enter tapped")
-        .map(|subject| (subject, true))
-        .or_else(|| {
-            stripped
-                .strip_suffix(" enters tapped")
-                .map(|subject| (subject, true))
+        .strip_suffix(" played by your opponents enter the battlefield tapped") // allow-noncombinator: fixed external-entry suffix peel after type-phrase subject
+        .map(|subject| {
+            (
+                subject,
+                ExternalEntryKind::PlayedByOpponents {
+                    enters_tapped: true,
+                },
+            )
         })
         .or_else(|| {
             stripped
-                .strip_suffix(" enter untapped")
-                .map(|subject| (subject, false))
+                .strip_suffix(" played by your opponents enter tapped") // allow-noncombinator: fixed external-entry suffix peel after type-phrase subject
+                .map(|subject| {
+                    (
+                        subject,
+                        ExternalEntryKind::PlayedByOpponents {
+                            enters_tapped: true,
+                        },
+                    )
+                })
         })
         .or_else(|| {
-            stripped
-                .strip_suffix(" enters untapped")
-                .map(|subject| (subject, false))
+            // allow-noncombinator: fixed external-entry suffix peel after type-phrase subject
+            stripped.strip_suffix(" enter tapped").map(|subject| {
+                (
+                    subject,
+                    ExternalEntryKind::Plain {
+                        enters_tapped: true,
+                    },
+                )
+            })
+        })
+        .or_else(|| {
+            // allow-noncombinator: fixed external-entry suffix peel after type-phrase subject
+            stripped.strip_suffix(" enters tapped").map(|subject| {
+                (
+                    subject,
+                    ExternalEntryKind::Plain {
+                        enters_tapped: true,
+                    },
+                )
+            })
+        })
+        .or_else(|| {
+            // allow-noncombinator: fixed external-entry suffix peel after type-phrase subject
+            stripped.strip_suffix(" enter untapped").map(|subject| {
+                (
+                    subject,
+                    ExternalEntryKind::Plain {
+                        enters_tapped: false,
+                    },
+                )
+            })
+        })
+        .or_else(|| {
+            // allow-noncombinator: fixed external-entry suffix peel after type-phrase subject
+            stripped.strip_suffix(" enters untapped").map(|subject| {
+                (
+                    subject,
+                    ExternalEntryKind::Plain {
+                        enters_tapped: false,
+                    },
+                )
+            })
         })
 }
 
 fn build_external_entry_replacement(
     subject: &str,
     original_text: &str,
-    enters_tapped: bool,
+    kind: ExternalEntryKind,
 ) -> Option<ReplacementDefinition> {
     if subject.contains('~') {
         return None;
     }
 
+    let enters_tapped = match kind {
+        ExternalEntryKind::Plain { enters_tapped }
+        | ExternalEntryKind::PlayedByOpponents { enters_tapped } => enters_tapped,
+    };
+
     let (filter, rest) = parse_type_phrase(subject);
     if !rest.trim().is_empty() {
         return None;
     }
+
+    let valid_card = match kind {
+        ExternalEntryKind::PlayedByOpponents { .. } => match filter {
+            TargetFilter::Typed(mut tf) => {
+                tf.controller = Some(ControllerRef::Opponent);
+                tf.properties.push(FilterProp::WasPlayed);
+                TargetFilter::Typed(tf)
+            }
+            TargetFilter::Or { filters } if filters.len() == 1 => {
+                match filters.into_iter().next()? {
+                    TargetFilter::Typed(mut tf) => {
+                        tf.controller = Some(ControllerRef::Opponent);
+                        tf.properties.push(FilterProp::WasPlayed);
+                        TargetFilter::Typed(tf)
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        },
+        ExternalEntryKind::Plain { .. } => filter,
+    };
 
     let effect = if enters_tapped {
         Effect::SetTapState {
@@ -3029,7 +3291,7 @@ fn build_external_entry_replacement(
     Some(
         ReplacementDefinition::new(ReplacementEvent::ChangeZone)
             .execute(AbilityDefinition::new(AbilityKind::Spell, effect))
-            .valid_card(filter)
+            .valid_card(valid_card)
             .destination_zone(Zone::Battlefield)
             .description(original_text.to_string()),
     )
@@ -3048,8 +3310,8 @@ fn parse_source_state_external_entry(
     let condition = replacement_condition_from_static(condition)?;
     let rest_lower = rest.to_lowercase();
     let stripped = rest_lower.trim_end_matches('.');
-    let (entry_subject, enters_tapped) = parse_external_entry_suffix(stripped)?;
-    let mut def = build_external_entry_replacement(entry_subject, original_text, enters_tapped)?;
+    let (entry_subject, kind) = parse_external_entry_suffix(stripped)?;
+    let mut def = build_external_entry_replacement(entry_subject, original_text, kind)?;
     def.condition = Some(condition);
     Some(def)
 }
@@ -3060,26 +3322,35 @@ fn parse_external_enters_untapped(
     original_text: &str,
 ) -> Option<ReplacementDefinition> {
     let stripped = norm_lower.trim_end_matches('.');
-    let (subject, enters_tapped) = parse_external_entry_suffix(stripped)?;
-    if enters_tapped {
+    let (subject, kind) = parse_external_entry_suffix(stripped)?;
+    let ExternalEntryKind::Plain {
+        enters_tapped: false,
+    } = kind
+    else {
         return None;
-    }
-    build_external_entry_replacement(subject, original_text, false)
+    };
+    build_external_entry_replacement(subject, original_text, kind)
 }
 
 /// Parse "[Type] enter tapped" / "[Type] enters tapped" — external replacement effects.
 /// E.g., "Creatures your opponents control enter tapped." (Authority of the Consuls)
 /// E.g., "Artifacts and creatures your opponents control enter tapped." (Blind Obedience)
+/// E.g., "Creatures played by your opponents enter tapped." (Uphill Battle)
 fn parse_external_enters_tapped(
     norm_lower: &str,
     original_text: &str,
 ) -> Option<ReplacementDefinition> {
     let stripped = norm_lower.trim_end_matches('.');
-    let (subject, enters_tapped) = parse_external_entry_suffix(stripped)?;
-    if !enters_tapped {
-        return None;
+    let (subject, kind) = parse_external_entry_suffix(stripped)?;
+    match kind {
+        ExternalEntryKind::Plain {
+            enters_tapped: true,
+        }
+        | ExternalEntryKind::PlayedByOpponents {
+            enters_tapped: true,
+        } => build_external_entry_replacement(subject, original_text, kind),
+        _ => None,
     }
-    build_external_entry_replacement(subject, original_text, true)
 }
 
 /// CR 614.1a: Parse "If [filter] would die, …instead…" replacement effects.
@@ -4463,6 +4734,19 @@ fn apply_gain_life_player_scope(lower: &str, def: &mut ReplacementDefinition) {
     // else: "you would gain life" → valid_player stays None (controller-only).
 }
 
+/// CR 614.1a: Apply `valid_player` scope to draw replacements from the
+/// antecedent subject ("an opponent", "a player", or default controller-only).
+fn apply_draw_player_scope(lower: &str, def: &mut ReplacementDefinition) {
+    if nom_primitives::scan_contains(lower, "an opponent would draw")
+        || nom_primitives::scan_contains(lower, "opponent would draw")
+    {
+        def.valid_player = Some(ReplacementPlayerScope::Opponent);
+    } else if nom_primitives::scan_contains(lower, "a player would draw") {
+        def.valid_player = Some(ReplacementPlayerScope::AnyPlayer);
+    }
+    // else: "you would draw" → valid_player stays None (controller-only).
+}
+
 fn parse_color_word(word: &str) -> Option<ManaColor> {
     match word {
         "white" => Some(ManaColor::White),
@@ -4481,9 +4765,17 @@ fn extract_replacement_effect(text: &str) -> Option<String> {
         let effect = TextPair::new(effect, &lower)
             .trim_end()
             .trim_end_matches('.');
+        // Strip trailing "... instead" marker (e.g., "draw two cards instead.").
         let effect = effect
             .strip_suffix(" instead")
             .map_or(effect, |trimmed| trimmed.trim_end());
+        // CR 614.1a: Strip leading "instead ..." marker (e.g., "instead you
+        // draw two cards"). This form appears when the subject follows the
+        // replacement word, as in Blood Scrivener: "..., instead you draw two
+        // cards and you lose 1 life."
+        let effect = effect
+            .strip_prefix("instead ") // allow-noncombinator: TextPair structural cleanup on an already-extracted replacement effect fragment, mirroring the trailing "instead" strip above.
+            .map_or(effect, |stripped| stripped.trim_start());
         if !effect.original.is_empty() {
             return Some(effect.original.to_string());
         }
@@ -4586,6 +4878,94 @@ fn parse_mill_replacement_count(input: &str) -> nom::IResult<&str, QuantityExpr,
     .parse(input)
 }
 
+/// CR 614.1a: Apply `valid_player` scope to proliferate replacements from the
+/// antecedent subject ("an opponent", "a player", or default controller-only).
+fn apply_proliferate_player_scope(lower: &str, def: &mut ReplacementDefinition) {
+    if nom_primitives::scan_contains(lower, "an opponent would proliferate")
+        || nom_primitives::scan_contains(lower, "opponent would proliferate")
+    {
+        def.valid_player = Some(ReplacementPlayerScope::Opponent);
+    } else if nom_primitives::scan_contains(lower, "a player would proliferate") {
+        def.valid_player = Some(ReplacementPlayerScope::AnyPlayer);
+    } else if nom_primitives::scan_contains(lower, "you would proliferate") {
+        def.valid_player = Some(ReplacementPlayerScope::You);
+    }
+}
+
+fn parse_proliferate_replacement_count(
+    input: &str,
+) -> nom::IResult<&str, QuantityExpr, OracleError<'_>> {
+    alt((
+        value(
+            QuantityExpr::Multiply {
+                factor: 2,
+                inner: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                }),
+            },
+            tag("twice that many"),
+        ),
+        nom::combinator::map(nom_primitives::parse_number, |value| QuantityExpr::Fixed {
+            value: value as i32,
+        }),
+        // CR 616.1: "proliferate twice" is a *multiplicative* replacement, not a
+        // set-to-2. Modeling it as `Multiply` (double the in-flight count) instead
+        // of `Fixed { value: 2 }` lets two doublers compound through the
+        // replacement pipeline's re-evaluation: two Tekuthal, Inquiry Dominus
+        // proliferate 1 -> 2 -> 4 times (per the MOM ruling), not a flat 2. The
+        // single-doubler case is unchanged (1 * 2 == 2).
+        value(
+            QuantityExpr::Multiply {
+                factor: 2,
+                inner: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                }),
+            },
+            tag("twice"),
+        ),
+        value(
+            QuantityExpr::Ref {
+                qty: QuantityRef::EventContextAmount,
+            },
+            tag("that many"),
+        ),
+    ))
+    .parse(input)
+}
+
+/// CR 701.34a + CR 614.1a: Parse count-modifying proliferate replacements such
+/// as Tekuthal, Inquiry Dominus ("proliferate twice instead").
+fn parse_proliferate_count_replacement(
+    lower: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    let (count, rest) = nom_on_lower(lower, lower, |input| {
+        let (input, _) = tag("if you would proliferate, proliferate ").parse(input)?;
+        let (input, count) = parse_proliferate_replacement_count.parse(input)?;
+        let (input, _) = alt((tag(" instead"), tag(" times instead"))).parse(input)?;
+        let (input, _) = opt(char('.')).parse(input)?;
+        Ok((input, count))
+    })?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+
+    let repeat_for = match count {
+        QuantityExpr::Fixed { value: 1 } => None,
+        other => Some(other),
+    };
+    let mut execute = AbilityDefinition::new(AbilityKind::Spell, Effect::Proliferate);
+    if let Some(repeat) = repeat_for {
+        execute.repeat_for = Some(repeat);
+    }
+
+    let mut def = ReplacementDefinition::new(ReplacementEvent::Proliferate)
+        .execute(execute)
+        .description(original_text.to_string());
+    def.valid_player = Some(ReplacementPlayerScope::You);
+    Some(def)
+}
+
 fn parse_scry_count_replacement(lower: &str, original_text: &str) -> Option<ReplacementDefinition> {
     let ((effect_kind, count), rest) = nom_on_lower(lower, lower, |input| {
         let (input, _) = tag("if you would scry ").parse(input)?;
@@ -4618,6 +4998,81 @@ fn parse_scry_count_replacement(lower: &str, original_text: &str) -> Option<Repl
     Some(
         ReplacementDefinition::new(ReplacementEvent::Scry)
             .execute(AbilityDefinition::new(AbilityKind::Spell, effect))
+            .description(original_text.to_string()),
+    )
+}
+
+/// CR 701.44 + CR 614.1a: Parse explore replacement effects such as Twists and
+/// Turns ("instead you scry 1, then that creature explores") and Topography
+/// Tracker ("instead it explores, then it explores again").
+fn parse_explore_replacement(lower: &str, original_text: &str) -> Option<ReplacementDefinition> {
+    if !nom_primitives::scan_contains(lower, "if a creature you control would explore") {
+        return None;
+    }
+    let (_, execute_text) = split_once_on_lower(original_text, lower, "instead ")?;
+    let execute_text = execute_text.trim().trim_end_matches('.');
+
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::Explore)
+            .valid_card(TargetFilter::Typed(
+                TypedFilter::creature().controller(ControllerRef::You),
+            ))
+            .execute(parse_effect_chain(execute_text, AbilityKind::Spell))
+            .description(original_text.to_string()),
+    )
+}
+
+/// CR 502.3 + CR 502.4 + CR 614.1a: untap-step replacement —
+/// "If [filter] would untap during [its controller's | your] untap step,
+/// [effect] instead" (Freyalise's Winds, Edge of Malacol). The `valid_card`
+/// filter scopes WHICH permanent (parsed generically via `parse_type_phrase`),
+/// and `ReplacementCondition::DuringUntapStep` scopes WHEN (so effect-untaps at
+/// other times are unaffected). The alternative effect appears BEFORE "instead"
+/// ("remove all wind counters from it instead", "put two +1/+1 counters on it
+/// instead").
+fn parse_untap_step_replacement(original_text: &str, lower: &str) -> Option<ReplacementDefinition> {
+    if !nom_primitives::scan_contains(lower, "untap step")
+        || !nom_primitives::scan_contains(lower, "instead")
+    {
+        return None;
+    }
+
+    // Subject filter: between "if " and " would untap during".
+    let (head, after_would) = split_once_on_lower(original_text, lower, " would untap during ")?;
+    // Self-reference untap clauses ("~ would untap") are handled elsewhere.
+    if head.contains('~') {
+        return None;
+    }
+    // CR 614.1a: consume the leading "if " with a `tag` combinator, then parse
+    // the subject as a typed filter (lowercase, as `parse_type_phrase` expects).
+    let head_lc = head.trim().to_ascii_lowercase();
+    let (subject_lc, _) = tag::<_, _, OracleError<'_>>("if ")
+        .parse(head_lc.as_str())
+        .ok()?;
+    let (filter, subject_rest) = parse_type_phrase(subject_lc.trim());
+    if matches!(&filter, TargetFilter::Any) || !subject_rest.trim().is_empty() {
+        return None;
+    }
+
+    // Skip past "[its controller's | your] untap step" to the alternative effect.
+    let after_would_lc = after_would.to_ascii_lowercase();
+    let (_step_owner, after_step) =
+        split_once_on_lower(after_would, &after_would_lc, "untap step")?;
+    let after_step = after_step.trim_start_matches([',', ' ']);
+
+    // Effect is the text before " instead".
+    let after_step_lc = after_step.to_ascii_lowercase();
+    let (effect_text, _) = split_once_on_lower(after_step, &after_step_lc, "instead")?;
+    let effect_text = effect_text.trim().trim_end_matches([',', ' ']);
+    if effect_text.is_empty() {
+        return None;
+    }
+
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::Untap)
+            .valid_card(filter)
+            .condition(ReplacementCondition::DuringUntapStep)
+            .execute(parse_effect_chain(effect_text, AbilityKind::Spell))
             .description(original_text.to_string()),
     )
 }
@@ -6761,6 +7216,45 @@ mod tests {
         }
     }
 
+    /// CR 502.3 + CR 502.4 + CR 614.1a: untap-step replacement. Edge of Malacol
+    /// "If a creature you control would untap during your untap step, put two
+    /// +1/+1 counters on it instead." gates to the untap step (so effect-untaps
+    /// elsewhere are unaffected) and keeps the alternative effect.
+    #[test]
+    fn untap_step_replacement_edge_of_malacol() {
+        let def = parse_replacement_line(
+            "If a creature you control would untap during your untap step, put two +1/+1 counters on it instead.",
+            "Edge of Malacol",
+        )
+        .expect("untap-step replacement should parse");
+        assert_eq!(def.event, ReplacementEvent::Untap);
+        assert_eq!(def.condition, Some(ReplacementCondition::DuringUntapStep));
+        assert!(
+            def.execute.is_some(),
+            "alternative effect (+1/+1 counters) must not be dropped"
+        );
+        assert!(
+            def.valid_card.is_some(),
+            "valid_card filter (a creature you control) should be set"
+        );
+    }
+
+    /// CR 502.3 + CR 614.1a: untap-step replacement with a counter-filtered
+    /// subject — Freyalise's Winds "If a permanent with a wind counter on it
+    /// would untap during its controller's untap step, remove all wind counters
+    /// from it instead."
+    #[test]
+    fn untap_step_replacement_freyalises_winds() {
+        let def = parse_replacement_line(
+            "If a permanent with a wind counter on it would untap during its controller's untap step, remove all wind counters from it instead.",
+            "Freyalise's Winds",
+        )
+        .expect("counter-filtered untap-step replacement should parse");
+        assert_eq!(def.event, ReplacementEvent::Untap);
+        assert_eq!(def.condition, Some(ReplacementCondition::DuringUntapStep));
+        assert!(def.execute.is_some());
+    }
+
     /// CR 614.12a: Karoo artifact — Mox Diamond's "you may discard ..." cost.
     /// The non-cost "you may " lead-in is stripped before `parse_single_cost`.
     #[test]
@@ -6782,6 +7276,37 @@ mod tests {
             }
             other => panic!("expected MayCost, got {other:?}"),
         }
+    }
+
+    /// CR 614.1a + CR 614.12: The Mimeoplasm — "As ~ enters, you may exile two
+    /// creature cards from graveyards. If you do, it enters as a copy of one of
+    /// those cards with a number of additional +1/+1 counters on it equal to the
+    /// power of the other card."
+    #[test]
+    fn mimeoplasm_exile_from_graveyards_replacement() {
+        let def = parse_replacement_line(
+            "As ~ enters, you may exile two creature cards from graveyards. If you do, \
+             it enters as a copy of one of those cards with a number of additional +1/+1 \
+             counters on it equal to the power of the other card.",
+            "The Mimeoplasm",
+        )
+        .expect("The Mimeoplasm should parse as a replacement");
+        assert_eq!(def.event, ReplacementEvent::Moved);
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+        match &def.mode {
+            ReplacementMode::MayCost { cost, decline } => {
+                assert!(
+                    matches!(cost, AbilityCost::Exile { count, zone, filter } if *count == 2 && *zone == Some(Zone::Graveyard) && filter.is_some()),
+                    "expected Exile count 2 from Graveyard, got {cost:?}"
+                );
+                assert!(decline.is_none(), "The Mimeoplasm has no decline branch");
+            }
+            other => panic!("expected MayCost, got {other:?}"),
+        }
+        // Verify the continuation effect is present in execute
+        let execute = def.execute.as_ref().expect("execute must be present");
+        // The continuation should be the copy + counter placement effect
+        assert!(!matches!(&*execute.effect, Effect::Unimplemented { .. }));
     }
 
     #[test]
@@ -8235,6 +8760,7 @@ mod tests {
             Effect::Choose {
                 choice_type: ChoiceType::Color { ref excluded },
                 persist: true,
+                ..
             } if excluded.is_empty()
         ));
     }
@@ -8277,6 +8803,7 @@ mod tests {
                 Effect::Choose {
                     choice_type: ChoiceType::Color { ref excluded },
                     persist: true,
+                    ..
                 } if excluded == &vec![ManaColor::Green]
             ),
             "sub-ability must be Choose color (excluding Green), got {:?}",
@@ -8300,6 +8827,7 @@ mod tests {
             Effect::Choose {
                 choice_type: ChoiceType::Color { ref excluded },
                 persist: true,
+                ..
             } if excluded == &vec![ManaColor::White]
         ));
     }
@@ -8317,6 +8845,7 @@ mod tests {
             Effect::Choose {
                 choice_type: ChoiceType::TwoColors,
                 persist: true,
+                ..
             }
         ));
     }
@@ -8334,6 +8863,7 @@ mod tests {
             Effect::Choose {
                 choice_type: ChoiceType::CreatureType,
                 persist: true,
+                ..
             }
         ));
     }
@@ -9776,6 +10306,54 @@ mod tests {
     }
 
     #[test]
+    fn uphill_battle_played_by_opponents_enter_tapped() {
+        let text = "Creatures played by your opponents enter the battlefield tapped.";
+        assert!(
+            parse_external_enters_tapped(&text.to_lowercase(), text).is_some(),
+            "external entry parser must match Uphill Battle"
+        );
+        let def =
+            parse_replacement_line(text, "Uphill Battle").expect("Uphill Battle played-by entry");
+        assert_eq!(def.event, ReplacementEvent::ChangeZone);
+        assert_eq!(def.destination_zone, Some(Zone::Battlefield));
+        match &def.valid_card {
+            Some(TargetFilter::Typed(tf)) => {
+                assert!(tf.type_filters.contains(&TypeFilter::Creature));
+                assert_eq!(tf.controller, Some(ControllerRef::Opponent));
+                assert!(tf.properties.contains(&FilterProp::WasPlayed));
+            }
+            other => panic!("Expected Typed filter with WasPlayed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn played_by_opponents_entry_covers_creature_and_land() {
+        for (text, card, type_filter) in [
+            (
+                "Creatures played by your opponents enter the battlefield tapped.",
+                "Uphill Battle",
+                TypeFilter::Creature,
+            ),
+            (
+                "Lands played by your opponents enter tapped.",
+                "Contamination",
+                TypeFilter::Land,
+            ),
+        ] {
+            let def = parse_replacement_line(text, card)
+                .unwrap_or_else(|| panic!("failed to parse {text}"));
+            assert_eq!(def.event, ReplacementEvent::ChangeZone);
+            match &def.valid_card {
+                Some(TargetFilter::Typed(tf)) => {
+                    assert!(tf.type_filters.contains(&type_filter));
+                    assert!(tf.properties.contains(&FilterProp::WasPlayed));
+                }
+                other => panic!("expected Typed filter, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn blind_obedience_compound_or_filter() {
         let def = parse_replacement_line(
             "Artifacts and creatures your opponents control enter tapped.",
@@ -11206,7 +11784,8 @@ mod tests {
         // CR 614.6 + CR 122.1: "<type> can't have counters put on them" lowers to
         // the AddCounter+Prevent replacement scoped to that permanent type. The
         // single combinator covers every permanent type, so creatures (#3450),
-        // planeswalkers (#3453), and artifacts (#3455) are all handled by one arm.
+        // planeswalkers (#3453), artifacts (#3455, #3502), and lands are all
+        // handled by one arm — no per-type parallel tests needed.
         for (oracle_type, expected) in [
             ("Creatures", TypeFilter::Creature),
             ("Planeswalkers", TypeFilter::Planeswalker),
@@ -11342,6 +11921,56 @@ mod tests {
                     qty: QuantityRef::EventContextAmount
                 }
             ) && *offset == 1
+        ));
+    }
+
+    #[test]
+    fn draw_replacement_leading_instead_prefix_blood_scrivener() {
+        // CR 614.1a: "instead you draw two cards" — leading "instead" form with
+        // subject prefix. The replacement must wire up Draw {count:2} as the
+        // execute effect and LoseLife as a sub_ability, gated on HandSize == 0.
+        // Regression test for issue #3305: "instead" was not stripped from the
+        // effect text, leaving the draw as Unimplemented and only the life loss
+        // fired.
+        let def = parse_replacement_line(
+            "If you would draw a card while you have no cards in hand, instead you draw two cards and you lose 1 life.",
+            "Blood Scrivener",
+        )
+        .unwrap();
+
+        assert_eq!(def.event, ReplacementEvent::Draw);
+        // Gate: HandSize EQ 0
+        assert!(matches!(
+            &def.condition,
+            Some(ReplacementCondition::OnlyIfQuantity {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::HandSize {
+                        player: crate::types::ability::PlayerScope::Controller
+                    }
+                },
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Fixed { value: 0 },
+                active_player_req: None,
+            })
+        ));
+        // Execute: Draw { count: 2 }
+        assert!(matches!(
+            def.execute.as_deref().map(|a| &*a.effect),
+            Some(Effect::Draw {
+                count: QuantityExpr::Fixed { value: 2 },
+                ..
+            })
+        ));
+        // Sub-ability: LoseLife { amount: 1 }
+        assert!(matches!(
+            def.execute
+                .as_deref()
+                .and_then(|a| a.sub_ability.as_deref())
+                .map(|a| &*a.effect),
+            Some(Effect::LoseLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                ..
+            })
         ));
     }
 
@@ -11966,6 +12595,34 @@ mod tests {
     }
 
     #[test]
+    fn tekuthal_proliferate_replacement_parses() {
+        let def = parse_replacement_line(
+            "If you would proliferate, proliferate twice instead.",
+            "Tekuthal, Inquiry Dominus",
+        )
+        .expect("Tekuthal proliferate replacement");
+
+        assert_eq!(def.event, ReplacementEvent::Proliferate);
+        assert_eq!(
+            def.valid_player,
+            Some(ReplacementPlayerScope::You),
+            "controller-scoped proliferate replacement"
+        );
+        let execute = def.execute.expect("execute ability");
+        assert!(matches!(*execute.effect, Effect::Proliferate));
+        assert_eq!(
+            execute.repeat_for,
+            Some(QuantityExpr::Multiply {
+                factor: 2,
+                inner: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                }),
+            }),
+            "proliferate twice instead → repeat_for Multiply(2 × event count) so stacked doublers compound"
+        );
+    }
+
+    #[test]
     fn max_speed_draw_replacement_gets_replacement_condition() {
         let def = parse_replacement_line(
             "Max speed \u{2014} If you would draw a card, draw two cards instead.",
@@ -11982,6 +12639,61 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// CR 614.1a + CR 121.1: Opponent draw replacements with the shared
+    /// except-first-draw-in-draw-step clause (Notion Thief / Hullbreacher class).
+    #[test]
+    fn parses_opponent_draw_replacement_except_first_draw_in_step() {
+        let notion_thief = parse_replacement_line(
+            "If an opponent would draw a card except the first one they draw in each of their draw steps, instead that player skips that draw and you draw a card.",
+            "Notion Thief",
+        )
+        .expect("Notion Thief draw replacement");
+        assert_eq!(notion_thief.event, ReplacementEvent::Draw);
+        assert_eq!(
+            notion_thief.valid_player,
+            Some(ReplacementPlayerScope::Opponent)
+        );
+        assert_eq!(
+            notion_thief.condition,
+            Some(ReplacementCondition::ExceptFirstDrawInDrawStep)
+        );
+        assert!(
+            notion_thief.execute.is_some(),
+            "replacement execute chain must be present"
+        );
+
+        let hullbreacher = parse_replacement_line(
+            "If an opponent would draw a card except the first one they draw in each of their draw steps, instead you create a Treasure token.",
+            "Hullbreacher",
+        )
+        .expect("Hullbreacher draw replacement");
+        assert_eq!(hullbreacher.event, ReplacementEvent::Draw);
+        assert_eq!(
+            hullbreacher.valid_player,
+            Some(ReplacementPlayerScope::Opponent)
+        );
+        assert_eq!(
+            hullbreacher.condition,
+            Some(ReplacementCondition::ExceptFirstDrawInDrawStep)
+        );
+    }
+
+    /// CR 614.1a: Global-player draw replacement (Chains of Mephistopheles class).
+    #[test]
+    fn parses_any_player_draw_replacement_except_first_draw_in_step() {
+        let def = parse_replacement_line(
+            "If a player would draw a card except the first one they draw in each of their draw steps, that player discards a card instead.",
+            "Chains of Mephistopheles",
+        )
+        .expect("Chains draw replacement antecedent");
+        assert_eq!(def.event, ReplacementEvent::Draw);
+        assert_eq!(def.valid_player, Some(ReplacementPlayerScope::AnyPlayer));
+        assert_eq!(
+            def.condition,
+            Some(ReplacementCondition::ExceptFirstDrawInDrawStep)
+        );
     }
 
     #[test]
@@ -12363,41 +13075,6 @@ mod tests {
     }
 
     #[test]
-    fn inverted_counter_prohibition_planeswalkers() {
-        let def = parse_replacement_line(
-            "Planeswalkers can't have counters put on them.",
-            "Test Card",
-        )
-        .expect("planeswalker counter prohibition must parse");
-        assert_eq!(def.event, ReplacementEvent::AddCounter);
-        assert_eq!(
-            def.quantity_modification,
-            Some(QuantityModification::Prevent)
-        );
-        assert!(matches!(
-            def.valid_card,
-            Some(TargetFilter::Typed(tf))
-                if tf.type_filters == vec![TypeFilter::Planeswalker]
-        ));
-    }
-
-    #[test]
-    fn inverted_counter_prohibition_artifacts() {
-        let def = parse_replacement_line("Artifacts can't have counters put on them.", "Test Card")
-            .expect("artifact counter prohibition must parse");
-        assert_eq!(def.event, ReplacementEvent::AddCounter);
-        assert_eq!(
-            def.quantity_modification,
-            Some(QuantityModification::Prevent)
-        );
-        assert!(matches!(
-            def.valid_card,
-            Some(TargetFilter::Typed(tf))
-                if tf.type_filters == vec![TypeFilter::Artifact]
-        ));
-    }
-
-    #[test]
     fn parses_halving_season_opponent_counter_replacement() {
         let def = parse_replacement_line(
             "If an opponent would put one or more counters on a permanent or player, they put half that many of those counters on that permanent or player instead, rounded down.",
@@ -12406,6 +13083,34 @@ mod tests {
         .expect("halving season");
         assert_eq!(def.quantity_modification, Some(QuantityModification::Half));
         assert_eq!(def.valid_player, Some(ReplacementPlayerScope::Opponent));
+    }
+
+    #[test]
+    fn parses_explore_replacement_scry_prelude() {
+        let def = parse_replacement_line(
+            "If a creature you control would explore, instead you scry 1, then that creature explores.",
+            "Twists and Turns",
+        )
+        .expect("Twists and Turns explore replacement must parse");
+        assert_eq!(def.event, ReplacementEvent::Explore);
+        assert!(matches!(
+            def.valid_card,
+            Some(TargetFilter::Typed(tf))
+                if tf.type_filters == vec![TypeFilter::Creature]
+                    && tf.controller == Some(ControllerRef::You)
+        ));
+        assert!(def.execute.is_some());
+    }
+
+    #[test]
+    fn parses_explore_replacement_double_explore() {
+        let def = parse_replacement_line(
+            "If a creature you control would explore, instead it explores, then it explores again.",
+            "Topography Tracker",
+        )
+        .expect("Topography Tracker explore replacement must parse");
+        assert_eq!(def.event, ReplacementEvent::Explore);
+        assert!(def.execute.is_some());
     }
 
     #[test]

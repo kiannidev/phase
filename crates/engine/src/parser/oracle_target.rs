@@ -1961,6 +1961,7 @@ pub fn parse_type_phrase_with_ctx<'a>(
                 let combined = merge_or_filters(left, other_filter);
                 let combined = distribute_shared_properties(combined, &properties);
                 let combined = distribute_controller_to_or(combined);
+                let combined = distribute_core_type_to_or(combined);
                 return (distribute_properties_to_or(combined), final_rest);
             }
         }
@@ -2625,17 +2626,20 @@ pub(crate) fn starts_with_type_word(text: &str) -> bool {
             return true;
         }
     }
-    // CR 205.4b: Negated type prefix: "noncreature spell", "nonland permanent"
+    // CR 205.4b: Negated type prefix: "noncreature spell", "nonland permanent",
+    // "non-Saga token" (Good King Mog XII chapter II — issue #3294).
     if let Ok((after_non, _)) = alt((tag::<_, _, OracleError<'_>>("non-"), tag("non"))).parse(text)
     {
-        // Consume the negated word up to whitespace, then check for a core type after.
+        // Consume the negated word up to whitespace, then check for a core type or
+        // standalone "token"/"tokens" after the negation.
         if let Ok((after_space, _)) = (
             take_till::<_, _, OracleError<'_>>(|c: char| c.is_whitespace()),
             tag::<_, _, OracleError<'_>>(" "),
         )
             .parse(after_non)
         {
-            if parse_core_type(after_space).0.is_some() {
+            if parse_core_type(after_space).0.is_some() || parse_token_suffix(after_space).is_some()
+            {
                 return true;
             }
         }
@@ -2840,6 +2844,7 @@ pub(crate) fn is_adjective_prefix_prop(prop: &FilterProp) -> bool {
             | FilterProp::Untapped
             // CR 702.171b: "saddled [type]" adjective prefix.
             | FilterProp::IsSaddled
+            | FilterProp::ProtectorMatches { .. }
             // CR 509.1h: combat-status prefixes "attacking/blocking/unblocked".
             | FilterProp::Attacking { defender: None }
             | FilterProp::Blocking
@@ -2978,6 +2983,60 @@ pub(crate) fn distribute_controller_to_or(filter: TargetFilter) -> TargetFilter 
         }
     }
 
+    TargetFilter::Or { filters }
+}
+
+/// Backfill the concrete core type onto `Or` legs assembled as `[TypeFilter::Any]`
+/// because the type noun appeared only after a later disjunct ("green or white
+/// creature" — the "green" leg is built with `Any` before "creature" is parsed,
+/// while the final "white creature" leg carries `[Creature]`). Without this, the
+/// `Any` leg imposes no type restriction (type_filters are ANDed in
+/// game/filter.rs), so a green noncreature would be a legal target.
+///
+/// CR 105.2 (color is a characteristic) + CR 109.2 (a type-word object
+/// description restricts to that card type): the trailing type word binds to
+/// EVERY disjunct of the color/adjective disjunction; an `Any`-only leg from a
+/// deferred type noun must inherit the concrete core type of the type-bearing leg.
+///
+/// Source: the UNIQUE non-`[Any]` `type_filters` shared by every type-bearing
+/// `Typed` leg. Backfill happens ONLY when the disjunction is unambiguous — i.e.
+/// all non-`[Any]` Typed legs agree on the same `type_filters`. Guards:
+/// - only an exactly-`[Any]` leg is rewritten (an `[Artifact]` leg in "artifact
+///   or creature" is untouched);
+/// - if NO leg has a concrete type (genuine "X or Y permanent" where every leg
+///   is `[Any]`/`[Permanent]`) there is no source → no-op;
+/// - if the type-bearing legs DISAGREE (a compound disjunction like "red or
+///   green instant or sorcery spell", whose legs carry `[Instant]` vs
+///   `[Sorcery]`), there is no single core type to project onto the bare color
+///   legs, so the `[Any]` legs are left unchanged — preserving the prior, looser
+///   behavior the runtime relies on (e.g. Wort, the Raidmother granting conspire
+///   to a red *instant*). Over-narrowing such a leg to one branch's type
+///   ("[Sorcery]") would wrongly exclude the other ("a red instant").
+///
+/// The common case ("green or white creature" → exactly one type leg `[Creature]`)
+/// has a single distinct value and is backfilled onto the bare color legs.
+pub(crate) fn distribute_core_type_to_or(filter: TargetFilter) -> TargetFilter {
+    let TargetFilter::Or { mut filters } = filter else {
+        return filter;
+    };
+    let mut distinct: Vec<Vec<TypeFilter>> = Vec::new();
+    for f in &filters {
+        if let TargetFilter::Typed(TypedFilter { type_filters, .. }) = f {
+            if type_filters.as_slice() != [TypeFilter::Any] && !distinct.contains(type_filters) {
+                distinct.push(type_filters.clone());
+            }
+        }
+    }
+    if distinct.len() == 1 {
+        let types = &distinct[0];
+        for f in &mut filters {
+            if let TargetFilter::Typed(ref mut typed) = f {
+                if typed.type_filters.as_slice() == [TypeFilter::Any] {
+                    typed.type_filters = types.clone();
+                }
+            }
+        }
+    }
     TargetFilter::Or { filters }
 }
 
@@ -3232,6 +3291,7 @@ pub(crate) fn parse_combat_status_prefix(text: &str) -> Option<(FilterProp, usiz
                 // CR 702.171b: "saddled" designation as a type-phrase prefix
                 // ("saddled Mount", "saddled creature").
                 | FilterProp::IsSaddled
+                | FilterProp::ProtectorMatches { .. }
                 | FilterProp::FaceDown
                 // CR 701.60b: "suspected" is a battlefield designation that appears
                 // as an adjective prefix in type phrases ("suspected creatures").
@@ -3873,8 +3933,8 @@ fn parse_bare_any_counter_suffix(input: &str) -> super::oracle_nom::error::Oracl
 /// `FilterContext::from_ability`.
 pub(crate) fn parse_counter_suffix(text: &str) -> Option<(FilterProp, usize)> {
     use nom::branch::alt;
-    use nom::bytes::complete::{tag as tag_e, take_until};
-    use nom::combinator::{opt, value};
+    use nom::bytes::complete::tag as tag_e;
+    use nom::combinator::value;
 
     let trimmed = text.trim_start();
     let leading_ws = text.len() - trimmed.len();
@@ -3891,6 +3951,31 @@ pub(crate) fn parse_counter_suffix(text: &str) -> Option<(FilterProp, usize)> {
     .ok()?;
     let lead_len = trimmed.len() - rest.len();
 
+    // The shared counter-spec body, with offsets relative to `rest`. The public
+    // entry adds back the leading whitespace and the consumed lead length to
+    // preserve the absolute (FilterProp, bytes-from-`text`) contract.
+    let (prop, consumed) = parse_counter_spec_after_lead(rest, comparator)?;
+    Some((prop, leading_ws + lead_len + consumed))
+}
+
+/// CR 122.1 / CR 122.1a: parse the counter spec AFTER the lead is consumed and
+/// the comparator decided. `rest` begins at "[a/an/<count>] <type> counter(s) on
+/// it/them" / "counter(s) on it/them" / "no counters …". Returns `(FilterProp,
+/// bytes consumed from `rest`)`.
+///
+/// The EQ-vs-GE selection is gated purely on the `comparator` parameter — no
+/// lead-specific state leaks in — so both the `with`/`without` entry
+/// (`parse_counter_suffix`) and the relative-clause entry
+/// (`parse_that_clause_suffix`'s "that has a … counter on it" arm) share this
+/// body and produce identical `FilterProp::Counters` shapes.
+fn parse_counter_spec_after_lead(
+    rest: &str,
+    comparator: Comparator,
+) -> Option<(FilterProp, usize)> {
+    use nom::branch::alt;
+    use nom::bytes::complete::{tag as tag_e, take_until};
+    use nom::combinator::{opt, value};
+
     // CR 122.1: Negated branch — untyped FIRST, before any `take_until`. The
     // untyped negated case ("with no counters on them", "without counters")
     // never touches the typed suffix loop, so the empty-`counter_text` guard
@@ -3905,7 +3990,7 @@ pub(crate) fn parse_counter_suffix(text: &str) -> Option<(FilterProp, usize)> {
         ))
         .parse(rest);
         if let Ok((after, _)) = untyped {
-            let consumed = leading_ws + lead_len + (rest.len() - after.len());
+            let consumed = rest.len() - after.len();
             return Some((
                 FilterProp::Counters {
                     counters: CounterMatch::Any,
@@ -3924,7 +4009,7 @@ pub(crate) fn parse_counter_suffix(text: &str) -> Option<(FilterProp, usize)> {
         // it". Must precede the typed-counter branch so the empty-counter-type
         // guard there doesn't fire.
         if let Ok((after, _)) = parse_bare_any_counter_suffix(rest) {
-            let consumed = leading_ws + lead_len + (rest.len() - after.len());
+            let consumed = rest.len() - after.len();
             return Some((
                 FilterProp::Counters {
                     counters: CounterMatch::Any,
@@ -3951,7 +4036,7 @@ pub(crate) fn parse_counter_suffix(text: &str) -> Option<(FilterProp, usize)> {
             Ok((input, expr))
         },
     ));
-    let (rest, count_opt) = opt(count_parser).parse(rest).ok()?;
+    let (after_count, count_opt) = opt(count_parser).parse(rest).ok()?;
     let count = count_opt.unwrap_or(QuantityExpr::Fixed { value: 1 });
 
     // Try each counter suffix; pick the first that matches via `take_until`.
@@ -3963,7 +4048,8 @@ pub(crate) fn parse_counter_suffix(text: &str) -> Option<(FilterProp, usize)> {
         " counter on them",
         " counter on it",
     ] {
-        let Ok((after, counter_text)) = take_until::<_, _, OracleError<'_>>(suffix).parse(rest)
+        let Ok((after, counter_text)) =
+            take_until::<_, _, OracleError<'_>>(suffix).parse(after_count)
         else {
             continue;
         };
@@ -3971,7 +4057,7 @@ pub(crate) fn parse_counter_suffix(text: &str) -> Option<(FilterProp, usize)> {
         if counter_type.is_empty() {
             continue;
         }
-        let consumed = text.len() - after.len() + suffix.len();
+        let consumed = rest.len() - after.len() + suffix.len();
         // CR 122.1: negated typed filter means exactly 0 counters of the type;
         // positive filter is the parsed (or implicit-1) threshold.
         let count = if comparator == Comparator::EQ {
@@ -4775,6 +4861,26 @@ pub(crate) fn parse_that_clause_suffix<'a>(
             if at_clause_boundary {
                 return Some((props, consumed_at(after_disjunction)));
             }
+        }
+    }
+
+    // CR 122.1 / CR 122.1a: "that has a/an <type> counter on it" / "that have …
+    // on them" — relative-clause counter predicate; positive (GE). Reuses the
+    // shared counter-spec combinator the with-form (parse_counter_suffix) uses,
+    // so the FilterProp::Counters is identical to "creature with a … counter on
+    // it" (Crumbling Ashes). The article a/an is consumed inside
+    // parse_counter_spec_after_lead, so the lead here is just "has "/"have ".
+    // Banewhip Punisher: "Destroy target creature that has a -1/-1 counter on
+    // it"; Triad of Fates: "Exile target creature that has a fate counter on it".
+    if let Ok((after_verb, _)) = alt((
+        tag::<_, _, OracleError<'_>>("has "),
+        tag::<_, _, OracleError<'_>>("have "),
+    ))
+    .parse(after_that)
+    {
+        if let Some((prop, consumed)) = parse_counter_spec_after_lead(after_verb, Comparator::GE) {
+            let verb_len = after_that.len() - after_verb.len();
+            return Some((vec![prop], that_len + verb_len + consumed));
         }
     }
 
@@ -5584,45 +5690,126 @@ fn parse_zone_suffix_nom(
         )));
     }
 
-    let out = match qual {
-        ZoneQual::Opponent => (
-            vec![
-                FilterProp::Owned {
-                    controller: ControllerRef::Opponent,
-                },
-                FilterProp::InZone { zone },
-            ],
-            None,
-        ),
-        ZoneQual::You => (vec![FilterProp::InZone { zone }], Some(ControllerRef::You)),
-        // CR 108.3 + CR 109.4 + CR 115.1: Non-battlefield zone membership is
-        // owner-keyed. "target player's graveyard" constrains selected cards
-        // by ownership relative to the chosen target player, not by controller.
-        ZoneQual::TargetPlayer => (
-            vec![
-                FilterProp::Owned {
-                    controller: ControllerRef::TargetPlayer,
-                },
-                FilterProp::InZone { zone },
-            ],
-            None,
-        ),
-        // CR 110.1 + CR 108.3: a graveyard/hand/library card is not a permanent
-        // and has no controller — membership is keyed by owner. CR 109.5:
-        // "their" in an each-player iteration binds to the iterated player
-        // (ControllerRef::ScopedPlayer), distinct from "your" (the controller).
-        // Emit FilterProp::Owned, not a controller match.
-        ZoneQual::Their => (
-            vec![
-                FilterProp::Owned {
-                    controller: ControllerRef::ScopedPlayer,
-                },
-                FilterProp::InZone { zone },
-            ],
-            None,
-        ),
-        ZoneQual::OtherPoss | ZoneQual::Plain => (vec![FilterProp::InZone { zone }], None),
+    // Check for zone disjunction: "or in <zone>" or "or on <zone>" or "or from <zone>"
+    let (i, zones) = if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(" or ").parse(i) {
+        // Parse additional zone phrases
+        let mut zones = vec![zone];
+        let mut rest = rest;
+
+        loop {
+            let (next_rest, next_prep) = alt((
+                value(ZonePrep::From, tag("from ")),
+                value(ZonePrep::In, tag("in ")),
+                value(ZonePrep::On, tag("on ")),
+            ))
+            .parse(rest)?;
+
+            let (next_rest, next_qual) = parse_zone_qual(next_rest)?;
+            let (next_rest, next_zone) = parse_zone_word(next_rest)?;
+            let (next_rest, _) = peek_zone_boundary(next_rest)?;
+
+            // CR 400.1: only the battlefield is referred to with "on"
+            if next_prep == ZonePrep::On && next_zone != Zone::Battlefield {
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    next_rest,
+                    nom::error::ErrorKind::Fail,
+                )));
+            }
+
+            // Qualifier consistency check: all zones in a disjunction should use the same qualifier
+            if qual != next_qual {
+                return Err(nom::Err::Error(nom::error::Error::new(
+                    next_rest,
+                    nom::error::ErrorKind::Fail,
+                )));
+            }
+
+            zones.push(next_zone);
+            rest = next_rest;
+
+            // Check for another "or" separator
+            if tag::<_, _, OracleError<'_>>(" or ").parse(rest).is_err() {
+                break;
+            }
+        }
+
+        (rest, zones)
+    } else {
+        (i, vec![zone])
     };
+
+    let out = if zones.len() > 1 {
+        // Multi-zone disjunction: use InAnyZone
+        match qual {
+            ZoneQual::Opponent => (
+                vec![
+                    FilterProp::Owned {
+                        controller: ControllerRef::Opponent,
+                    },
+                    FilterProp::InAnyZone { zones },
+                ],
+                None,
+            ),
+            ZoneQual::You => (
+                vec![FilterProp::InAnyZone { zones }],
+                Some(ControllerRef::You),
+            ),
+            ZoneQual::TargetPlayer => (
+                vec![
+                    FilterProp::Owned {
+                        controller: ControllerRef::TargetPlayer,
+                    },
+                    FilterProp::InAnyZone { zones },
+                ],
+                None,
+            ),
+            ZoneQual::Their => (
+                vec![
+                    FilterProp::Owned {
+                        controller: ControllerRef::ScopedPlayer,
+                    },
+                    FilterProp::InAnyZone { zones },
+                ],
+                None,
+            ),
+            ZoneQual::OtherPoss | ZoneQual::Plain => (vec![FilterProp::InAnyZone { zones }], None),
+        }
+    } else {
+        // Single zone: use InZone
+        let zone = zones[0];
+        match qual {
+            ZoneQual::Opponent => (
+                vec![
+                    FilterProp::Owned {
+                        controller: ControllerRef::Opponent,
+                    },
+                    FilterProp::InZone { zone },
+                ],
+                None,
+            ),
+            ZoneQual::You => (vec![FilterProp::InZone { zone }], Some(ControllerRef::You)),
+            ZoneQual::TargetPlayer => (
+                vec![
+                    FilterProp::Owned {
+                        controller: ControllerRef::TargetPlayer,
+                    },
+                    FilterProp::InZone { zone },
+                ],
+                None,
+            ),
+            ZoneQual::Their => (
+                vec![
+                    FilterProp::Owned {
+                        controller: ControllerRef::ScopedPlayer,
+                    },
+                    FilterProp::InZone { zone },
+                ],
+                None,
+            ),
+            ZoneQual::OtherPoss | ZoneQual::Plain => (vec![FilterProp::InZone { zone }], None),
+        }
+    };
+
     Ok((i, out))
 }
 
@@ -8899,6 +9086,60 @@ mod tests {
         }
     }
 
+    /// "that has a <type> counter on it" relative clause — must lower to the
+    /// same `FilterProp::Counters` shape as the `with`-form (Banewhip Punisher,
+    /// Triad of Fates). Previously this clause was dropped entirely.
+    #[test]
+    fn parse_that_clause_has_minus_counter() {
+        let phrase = " that has a -1/-1 counter on it";
+        let (props, consumed) =
+            parse_that_clause_suffix(phrase, None).expect("relative counter clause must parse");
+        assert_eq!(consumed, phrase.len());
+        assert_eq!(
+            props,
+            vec![FilterProp::Counters {
+                counters: CounterMatch::OfType(CounterType::Minus1Minus1),
+                comparator: Comparator::GE,
+                count: QuantityExpr::Fixed { value: 1 },
+            }]
+        );
+    }
+
+    /// Plural relative-clause form "that have a +1/+1 counter on them" → the
+    /// same positive (GE) typed counter filter (Plus1Plus1).
+    #[test]
+    fn parse_that_clause_have_plus_counter_plural() {
+        let phrase = " that have a +1/+1 counter on them";
+        let (props, consumed) =
+            parse_that_clause_suffix(phrase, None).expect("plural relative counter clause");
+        assert_eq!(consumed, phrase.len());
+        assert_eq!(
+            props,
+            vec![FilterProp::Counters {
+                counters: CounterMatch::OfType(CounterType::Plus1Plus1),
+                comparator: Comparator::GE,
+                count: QuantityExpr::Fixed { value: 1 },
+            }]
+        );
+    }
+
+    /// "that has a fate counter on it" → Generic("fate") (Triad of Fates).
+    #[test]
+    fn parse_that_clause_has_fate_counter() {
+        let phrase = " that has a fate counter on it";
+        let (props, consumed) =
+            parse_that_clause_suffix(phrase, None).expect("generic relative counter clause");
+        assert_eq!(consumed, phrase.len());
+        assert_eq!(
+            props,
+            vec![FilterProp::Counters {
+                counters: CounterMatch::OfType(CounterType::Generic("fate".to_string())),
+                comparator: Comparator::GE,
+                count: QuantityExpr::Fixed { value: 1 },
+            }]
+        );
+    }
+
     #[test]
     fn parse_type_phrase_creature_with_stun_counter() {
         let (filter, _rest) = parse_type_phrase("creature with a stun counter on it");
@@ -9174,6 +9415,320 @@ mod tests {
             other => panic!("Expected Or filter, got {other:?}"),
         }
         assert_eq!(rest.trim(), "");
+    }
+
+    // CR 105.2 (color characteristic) + CR 109.2 (type-word object description):
+    // when the core type noun ("creature") appears only after a later color
+    // disjunct, the earlier color-only leg is assembled with `[TypeFilter::Any]`
+    // before "creature" is parsed. `distribute_core_type_to_or` backfills the
+    // concrete core type so EVERY leg carries the type restriction (type_filters
+    // are ANDed in game/filter.rs). Without it, a green noncreature would be a
+    // legal "green or white creature" target. These drive the real parse pipeline
+    // and assert each flat Or leg independently.
+
+    /// Extract the `HasColor` color from a Typed leg's properties, if present.
+    fn leg_color(filter: &TargetFilter) -> Option<ManaColor> {
+        typed_leg(filter).and_then(|tf| {
+            tf.properties.iter().find_map(|p| match p {
+                FilterProp::HasColor { color } => Some(*color),
+                _ => None,
+            })
+        })
+    }
+
+    #[test]
+    fn or_color_disjunction_backfills_core_type_deathmark() {
+        // Deathmark: "Destroy target green or white creature".
+        let (f, rest) = parse_target("target green or white creature");
+        assert_eq!(rest.trim(), "");
+        let TargetFilter::Or { filters } = f else {
+            panic!("expected Or filter, got {f:?}");
+        };
+        assert_eq!(filters.len(), 2, "expected 2-way OR, got {filters:#?}");
+        // Both legs must carry exactly [Creature] (the green leg was [Any]).
+        for (i, leg) in filters.iter().enumerate() {
+            let tf = typed_leg(leg).unwrap_or_else(|| panic!("leg {i} not Typed: {leg:?}"));
+            assert_eq!(
+                tf.type_filters,
+                vec![TypeFilter::Creature],
+                "leg {i} must be [Creature], got {:?}",
+                tf.type_filters
+            );
+        }
+        assert_eq!(
+            leg_color(&filters[0]),
+            Some(ManaColor::Green),
+            "leg 0 = green"
+        );
+        assert_eq!(
+            leg_color(&filters[1]),
+            Some(ManaColor::White),
+            "leg 1 = white"
+        );
+    }
+
+    #[test]
+    fn or_color_disjunction_backfills_core_type_tidebinder() {
+        // Tidebinder Mage: "tap target red or green creature an opponent controls".
+        let (f, rest) = parse_target("target red or green creature an opponent controls");
+        assert_eq!(rest.trim(), "");
+        let TargetFilter::Or { filters } = f else {
+            panic!("expected Or filter, got {f:?}");
+        };
+        assert_eq!(filters.len(), 2, "expected 2-way OR, got {filters:#?}");
+        for (i, leg) in filters.iter().enumerate() {
+            let tf = typed_leg(leg).unwrap_or_else(|| panic!("leg {i} not Typed: {leg:?}"));
+            assert_eq!(
+                tf.type_filters,
+                vec![TypeFilter::Creature],
+                "leg {i} must be [Creature], got {:?}",
+                tf.type_filters
+            );
+            assert_eq!(
+                tf.controller,
+                Some(ControllerRef::Opponent),
+                "leg {i} must inherit opponent controller scope"
+            );
+        }
+        assert_eq!(leg_color(&filters[0]), Some(ManaColor::Red), "leg 0 = red");
+        assert_eq!(
+            leg_color(&filters[1]),
+            Some(ManaColor::Green),
+            "leg 1 = green"
+        );
+    }
+
+    #[test]
+    fn or_color_disjunction_backfills_core_type_self_inflicted_wound() {
+        // Self-Inflicted Wound: "a green or white creature of their choice".
+        // The filter-phrase level (parse_type_phrase) is what the parser produces;
+        // load-bearing assertion is that BOTH legs carry [Creature].
+        let (f, _rest) = parse_type_phrase("green or white creature");
+        let TargetFilter::Or { filters } = f else {
+            panic!("expected Or filter, got {f:?}");
+        };
+        assert_eq!(filters.len(), 2, "expected 2-way OR, got {filters:#?}");
+        for (i, leg) in filters.iter().enumerate() {
+            let tf = typed_leg(leg).unwrap_or_else(|| panic!("leg {i} not Typed: {leg:?}"));
+            assert_eq!(
+                tf.type_filters,
+                vec![TypeFilter::Creature],
+                "leg {i} must be [Creature], got {:?}",
+                tf.type_filters
+            );
+        }
+        assert_eq!(
+            leg_color(&filters[0]),
+            Some(ManaColor::Green),
+            "leg 0 = green"
+        );
+        assert_eq!(
+            leg_color(&filters[1]),
+            Some(ManaColor::White),
+            "leg 1 = white"
+        );
+    }
+
+    #[test]
+    fn distribute_core_type_to_or_backfills_every_flat_any_leg() {
+        // Building-block test: `merge_or_filters` flattens nested `Or`s, so a
+        // ≥3-disjunct list arrives at `distribute_core_type_to_or` as flat
+        // siblings. Drive the distributor directly with a flat 3-leg Or in which
+        // two legs are the deferred-type `[Any]` shape (color-only) and the last
+        // carries the concrete `[Creature]`. EVERY `[Any]` leg must inherit
+        // `[Creature]`; the type-bearing leg is untouched. (The surface parser
+        // does not yet assemble a ≥3 color-only disjunction — comma/no-comma color
+        // chains are a separate gap — so we pin the distributor at its own seam,
+        // which is exactly the level `merge_or_filters` feeds.)
+        let any_leg = |color: ManaColor| {
+            TargetFilter::Typed(TypedFilter {
+                type_filters: vec![TypeFilter::Any],
+                controller: None,
+                properties: vec![FilterProp::HasColor { color }],
+            })
+        };
+        let creature_leg = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Creature],
+            controller: None,
+            properties: vec![FilterProp::HasColor {
+                color: ManaColor::Black,
+            }],
+        });
+        let input = TargetFilter::Or {
+            filters: vec![
+                any_leg(ManaColor::White),
+                any_leg(ManaColor::Blue),
+                creature_leg,
+            ],
+        };
+        let TargetFilter::Or { filters } = distribute_core_type_to_or(input) else {
+            panic!("distributor must preserve the Or shape");
+        };
+        assert_eq!(filters.len(), 3);
+        for (i, leg) in filters.iter().enumerate() {
+            let tf = typed_leg(leg).unwrap_or_else(|| panic!("leg {i} not Typed: {leg:?}"));
+            assert_eq!(
+                tf.type_filters,
+                vec![TypeFilter::Creature],
+                "leg {i} must inherit [Creature], got {:?}",
+                tf.type_filters
+            );
+        }
+        assert_eq!(
+            leg_color(&filters[0]),
+            Some(ManaColor::White),
+            "leg 0 = white"
+        );
+        assert_eq!(
+            leg_color(&filters[1]),
+            Some(ManaColor::Blue),
+            "leg 1 = blue"
+        );
+        assert_eq!(
+            leg_color(&filters[2]),
+            Some(ManaColor::Black),
+            "leg 2 = black"
+        );
+    }
+
+    #[test]
+    fn distribute_core_type_to_or_skips_disagreeing_type_legs() {
+        // Regression (Wort, the Raidmother / conspire): a COMPOUND disjunction
+        // "red or green instant or sorcery spell" yields an `[Any]`+red leg
+        // alongside DISAGREEING type legs (`[Instant]` and `[Sorcery]`). There is
+        // no single core type to project, so the `[Any]` leg must be LEFT
+        // UNCHANGED — over-narrowing it to one branch ("[Sorcery]") would wrongly
+        // stop a red *instant* from matching, so Wort would no longer grant it
+        // conspire. Backfilling here is unsafe; the distributor must no-op.
+        let any_red = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Any],
+            controller: None,
+            properties: vec![FilterProp::HasColor {
+                color: ManaColor::Red,
+            }],
+        });
+        let instant_leg = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Instant],
+            controller: None,
+            properties: vec![],
+        });
+        let sorcery_leg = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Sorcery],
+            controller: None,
+            properties: vec![],
+        });
+        let input = TargetFilter::Or {
+            filters: vec![any_red, instant_leg, sorcery_leg],
+        };
+        let TargetFilter::Or { filters } = distribute_core_type_to_or(input) else {
+            panic!("distributor must preserve the Or shape");
+        };
+        // The `[Any]`+red leg is unchanged (NOT narrowed to [Instant] or [Sorcery]).
+        let red = typed_leg(&filters[0]).expect("leg 0 Typed");
+        assert_eq!(
+            red.type_filters,
+            vec![TypeFilter::Any],
+            "the bare color leg must stay [Any] when type legs disagree, got {:?}",
+            red.type_filters
+        );
+        assert_eq!(
+            typed_leg(&filters[1]).unwrap().type_filters,
+            vec![TypeFilter::Instant]
+        );
+        assert_eq!(
+            typed_leg(&filters[2]).unwrap().type_filters,
+            vec![TypeFilter::Sorcery]
+        );
+    }
+
+    #[test]
+    fn or_disjunction_distinct_explicit_types_untouched() {
+        // No-regression: "artifact or creature" — neither leg is [Any], so the
+        // backfill must NOT collapse the distinct types into one.
+        let (f, rest) = parse_type_phrase("artifact or creature");
+        assert_eq!(rest.trim(), "");
+        let TargetFilter::Or { filters } = f else {
+            panic!("expected Or filter, got {f:?}");
+        };
+        assert_eq!(filters.len(), 2, "expected 2-way OR, got {filters:#?}");
+        assert_eq!(
+            typed_leg(&filters[0]).unwrap().type_filters,
+            vec![TypeFilter::Artifact],
+            "leg 0 stays [Artifact]"
+        );
+        assert_eq!(
+            typed_leg(&filters[1]).unwrap().type_filters,
+            vec![TypeFilter::Creature],
+            "leg 1 stays [Creature]"
+        );
+    }
+
+    #[test]
+    fn or_disjunction_artifact_or_enchantment_untouched() {
+        // No-regression: both legs explicit, neither [Any] — untouched.
+        let (f, rest) = parse_type_phrase("artifact or enchantment");
+        assert_eq!(rest.trim(), "");
+        let TargetFilter::Or { filters } = f else {
+            panic!("expected Or filter, got {f:?}");
+        };
+        assert_eq!(filters.len(), 2);
+        assert_eq!(
+            typed_leg(&filters[0]).unwrap().type_filters,
+            vec![TypeFilter::Artifact]
+        );
+        assert_eq!(
+            typed_leg(&filters[1]).unwrap().type_filters,
+            vec![TypeFilter::Enchantment]
+        );
+    }
+
+    #[test]
+    fn single_green_creature_not_or_early_returns() {
+        // No-regression: a non-Or phrase early-returns from the distributor.
+        let (f, rest) = parse_type_phrase("green creature");
+        assert_eq!(rest.trim(), "");
+        match f {
+            TargetFilter::Typed(tf) => {
+                assert_eq!(tf.type_filters, vec![TypeFilter::Creature]);
+                assert!(
+                    has_prop(
+                        &tf,
+                        FilterProp::HasColor {
+                            color: ManaColor::Green
+                        }
+                    ),
+                    "expected green color prop, got {tf:?}"
+                );
+            }
+            other => panic!("expected single Typed filter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn or_spell_or_permanent_leaves_non_any_legs_alone() {
+        // Reviewer's extra guard: "target spell or permanent that's red or green"
+        // parses to an Or with a StackSpell-bearing leg + a [Permanent] leg.
+        // Neither leg is exactly [Any], so the backfill must leave the StackSpell
+        // leg and the [Permanent] leg untouched (no source → no-op anyway).
+        let (f, rest) = parse_target("target spell or permanent that's red or green");
+        assert!(rest.trim().is_empty(), "remainder: '{rest}'");
+        let TargetFilter::Or { filters } = f else {
+            panic!("expected Or filter, got {f:?}");
+        };
+        assert_eq!(filters.len(), 2);
+        // The spell leg must remain a StackSpell (not rewritten into a Typed type).
+        assert!(
+            filters.iter().any(is_stack_spell_leg),
+            "spell leg must remain StackSpell: {filters:#?}"
+        );
+        // The permanent leg keeps [Permanent] — not collapsed to [Any] or rewritten.
+        assert!(
+            filters
+                .iter()
+                .filter_map(typed_leg)
+                .any(|tf| tf.type_filters == vec![TypeFilter::Permanent]),
+            "permanent leg must keep [Permanent]: {filters:#?}"
+        );
     }
 
     // CR 508.5 / CR 508.5a: the "defending player controls" controller suffix
@@ -12237,5 +12792,33 @@ mod tests {
             "expected Named prop with 'Falkenrath Gorger', got {tf:?}"
         );
         assert_eq!(rest.trim_start_matches([',', ' ']), "it gains");
+    }
+
+    #[test]
+    fn parse_non_saga_token_you_control_issue_3294() {
+        use crate::types::ability::{ControllerRef, FilterProp, TypeFilter};
+
+        let (filter, rest) = parse_type_phrase("non-saga token you control");
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected Typed filter, got {filter:?}");
+        };
+        assert!(
+            tf.type_filters
+                .contains(&TypeFilter::Non(Box::new(TypeFilter::Subtype(
+                    "Saga".to_string()
+                )))),
+            "expected Non(Saga), got {:?}",
+            tf.type_filters
+        );
+        assert!(tf.properties.contains(&FilterProp::Token));
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+        assert!(rest.is_empty(), "expected empty remainder, got {rest:?}");
+
+        let (filter2, rest2) = parse_target("a non-Saga token you control");
+        let TargetFilter::Typed(tf2) = filter2 else {
+            panic!("parse_target must not collapse to Any, got {filter2:?}");
+        };
+        assert!(tf2.properties.contains(&FilterProp::Token));
+        assert!(rest2.is_empty(), "expected empty remainder, got {rest2:?}");
     }
 }

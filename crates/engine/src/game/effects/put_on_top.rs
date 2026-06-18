@@ -57,6 +57,30 @@ pub fn resolve(
             .map(|(id, _)| *id)
             .collect();
     }
+    if collected_targets.is_empty()
+        && matches!(
+            target_filter,
+            TargetFilter::TrackedSet { .. } | TargetFilter::TrackedSetFiltered { .. }
+        )
+    {
+        let effective_filter =
+            crate::game::targeting::resolve_tracked_set_sentinel(state, target_filter.clone());
+        let ctx = crate::game::filter::FilterContext::from_ability(ability);
+        collected_targets = state
+            .objects
+            .iter()
+            .filter(|(id, obj)| {
+                obj.zone == Zone::Library
+                    && crate::game::filter::matches_target_filter(
+                        state,
+                        **id,
+                        &effective_filter,
+                        &ctx,
+                    )
+            })
+            .map(|(id, _)| *id)
+            .collect();
+    }
 
     if matches!(target_filter, TargetFilter::TrackedSet { .. }) {
         collected_targets.retain(|id| {

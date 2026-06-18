@@ -1538,12 +1538,16 @@ pub(super) fn handle_resolution_choice(
             effects::publish_fresh_tracked_set(state, publish_set);
             // None => Graveyard; map to a concrete zone so the rest mover
             // (shared with the search-split partition) has a single Zone.
-            route_rest_partition(
-                state,
-                &unkept,
-                rest_destination.unwrap_or(Zone::Graveyard),
-                events,
-            );
+            // When a continuation owns the unkept pile (Expressive Iteration
+            // bottom/exile tail), do not pre-route here.
+            if state.pending_continuation.is_none() {
+                route_rest_partition(
+                    state,
+                    &unkept,
+                    rest_destination.unwrap_or(Zone::Graveyard),
+                    events,
+                );
+            }
             if let Some(cont) = state.pending_continuation.as_mut() {
                 // CR 608.2c: ParentTarget continuations (Hideaway conceal, dig
                 // conditionals on the kept card) bind to the kept selection.

@@ -602,6 +602,7 @@ pub fn resolve(
             // resolves the choice.
             face_down_profile: face_down_profile.clone(),
             count_param: 0,
+            library_position: None,
             is_cost_payment: false,
         };
         // EffectResolved is emitted by the EffectZoneChoice handler after the player chooses
@@ -6569,6 +6570,7 @@ mod tests {
             track_exiled_by_source: false,
             face_down_profile: None,
             count_param: 0,
+            library_position: None,
             is_cost_payment: false,
         };
 

@@ -7916,6 +7916,7 @@ mod tests {
             track_exiled_by_source: false,
             face_down_profile: None,
             count_param: 0,
+            library_position: None,
             is_cost_payment: false,
         };
 
@@ -12141,6 +12142,7 @@ mod tests {
             track_exiled_by_source: false,
             face_down_profile: None,
             count_param: 0,
+            library_position: None,
             is_cost_payment: false,
         };
         state.pending_continuation =
@@ -12178,6 +12180,7 @@ mod tests {
                 track_exiled_by_source: false,
                 face_down_profile: None,
                 count_param: 0,
+                library_position: None,
                 is_cost_payment: false,
             },
             GameAction::SelectCards {
@@ -18343,39 +18346,34 @@ mod tests {
             "dig must publish all looked-at cards to the tracked set, got {tracked:?}"
         );
 
-        if matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }) {
-            let WaitingFor::EffectZoneChoice {
-                cards: eligible, ..
-            } = state.waiting_for.clone()
-            else {
-                unreachable!();
-            };
-            assert!(
-                eligible.contains(&card_b) && eligible.contains(&card_c),
-                "bottom choice must be among unkept looked-at cards: {eligible:?}"
-            );
-            engine::apply_as_current(
-                &mut state,
-                GameAction::SelectCards {
-                    cards: vec![card_b],
-                },
-            )
-            .unwrap();
-        }
+        assert!(
+            matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }),
+            "expected bottom-of-library choice after keeping to hand, got {:?}",
+            state.waiting_for
+        );
+        let WaitingFor::EffectZoneChoice {
+            cards: eligible, ..
+        } = state.waiting_for.clone()
+        else {
+            unreachable!();
+        };
+        assert!(
+            eligible.contains(&card_b) && eligible.contains(&card_c),
+            "choice must be among unkept looked-at cards: {eligible:?}"
+        );
+        engine::apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![card_b],
+            },
+        )
+        .unwrap();
 
         assert_eq!(state.objects[&card_a].zone, Zone::Hand);
-        assert!(
-            state.objects[&card_c].zone == Zone::Exile
-                || state.objects[&card_b].zone == Zone::Exile,
-            "one unkept looked-at card must be exiled (A={:?}, B={:?}, C={:?})",
-            state.objects[&card_a].zone,
-            state.objects[&card_b].zone,
-            state.objects[&card_c].zone,
-        );
         let exiled = [card_b, card_c]
             .into_iter()
             .find(|id| state.objects[id].zone == Zone::Exile)
-            .expect("exiled card");
+            .expect("one unkept looked-at card must be exiled");
         assert!(
             state.objects[&exiled]
                 .casting_permissions

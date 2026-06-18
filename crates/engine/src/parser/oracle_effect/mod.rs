@@ -826,7 +826,7 @@ fn try_parse_die_exile_rider(lower: &str, kind: AbilityKind) -> Option<AbilityDe
         .valid_card(TargetFilter::SelfRef)
         .destination_zone(Zone::Graveyard)
         .execute(exile_effect);
-    repl.is_consumed = true;
+    repl.consume_on_apply = true;
     repl.expiry = Some(RestrictionExpiry::EndOfTurn);
 
     Some(AbilityDefinition::new(
@@ -1263,7 +1263,7 @@ fn try_parse_next_time_source_damage_replacement(lower: &str) -> Option<Effect> 
         return None;
     }
 
-    replacement.is_consumed = true;
+    replacement.consume_on_apply = true;
     replacement.expiry = Some(RestrictionExpiry::EndOfTurn);
 
     Some(Effect::AddTargetReplacement {

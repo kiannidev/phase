@@ -11972,6 +11972,20 @@ impl AbilityDefinition {
         self.cost.as_ref().is_some_and(AbilityCost::consumes_source)
     }
 
+    /// Card-data migration: older exports stored one-shot semantics in
+    /// `is_consumed` at parse time, which made replacements inert at runtime.
+    pub fn normalize_parsed_replacement_flags(&mut self) {
+        if let Effect::AddTargetReplacement { replacement, .. } = &mut *self.effect {
+            replacement.fix_legacy_parse_time_consumed_flag();
+        }
+        if let Some(sub) = self.sub_ability.as_mut() {
+            sub.normalize_parsed_replacement_flags();
+        }
+        if let Some(else_ab) = self.else_ability.as_mut() {
+            else_ab.normalize_parsed_replacement_flags();
+        }
+    }
+
     pub fn player_scope(mut self, scope: PlayerFilter) -> Self {
         self.player_scope = Some(scope);
         self
@@ -14108,6 +14122,11 @@ pub struct ReplacementDefinition {
     /// None = applies to the replacement source player only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub valid_player: Option<ReplacementPlayerScope>,
+    /// Parser/runtime flag: mark `is_consumed` after this replacement successfully
+    /// applies once. Distinct from `is_consumed`, which is the live consumed state
+    /// checked by `find_applicable_replacements`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub consume_on_apply: bool,
     /// Marks this replacement as consumed (one-shot). Skipped by find_applicable_replacements.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_consumed: bool,
@@ -14200,6 +14219,13 @@ pub struct ReplacementDefinition {
 }
 
 impl ReplacementDefinition {
+    pub fn fix_legacy_parse_time_consumed_flag(&mut self) {
+        if self.is_consumed && self.shield_kind.is_none() {
+            self.consume_on_apply = true;
+            self.is_consumed = false;
+        }
+    }
+
     /// Create a new replacement definition with only the required event field.
     /// All optional fields default to `None`/`Mandatory`.
     pub fn new(event: ReplacementEvent) -> Self {
@@ -14221,6 +14247,7 @@ impl ReplacementDefinition {
             token_owner_scope: None,
             token_owner_redirect: None,
             valid_player: None,
+            consume_on_apply: false,
             is_consumed: false,
             expiry: None,
             redirect_target: None,

@@ -1166,6 +1166,21 @@ fn damage_done_applier(
     ApplyResult::Modified(event)
 }
 
+/// Mark a one-shot replacement as consumed after it successfully applies.
+fn mark_replacement_consumed(state: &mut GameState, rid: ReplacementId) {
+    let repl = if rid.source == ObjectId(0) {
+        state.pending_damage_replacements.get_mut(rid.index)
+    } else {
+        state
+            .objects
+            .get_mut(&rid.source)
+            .and_then(|obj| obj.replacement_definitions.get_mut(rid.index))
+    };
+    if let Some(repl) = repl {
+        repl.is_consumed = true;
+    }
+}
+
 /// Consume or update a prevention shield on either an object or the game-state registry.
 /// If `new_amount` is `None`, marks the shield as consumed.
 /// If `new_amount` is `Some(amount)`, updates the remaining shield capacity.
@@ -4396,7 +4411,7 @@ fn apply_single_replacement(
     // the same resolution step, right after the ZoneChange completes. Without this,
     // the chooser would never be prompted. Optional replacements set
     // `post_replacement_continuation` in `continue_replacement` when the player accepts.
-    let (event_key, modifiers, mandatory_post_effect) = match repl_def_ref {
+    let (event_key, modifiers, mandatory_post_effect, consume_on_apply) = match repl_def_ref {
         Some(repl_def) => {
             let ability = match branch {
                 ReplacementBranch::Execute => repl_def.execute.as_deref(),
@@ -4504,7 +4519,12 @@ fn apply_single_replacement(
             // imperative `Effect::ChangeZone.enters_under` slot. Surface it as an
             // event modifier so it is written onto the `ZoneChange` below.
             modifiers.controller_override = repl_def.enters_under.clone();
-            (repl_def.event.clone(), modifiers, post_effect)
+            (
+                repl_def.event.clone(),
+                modifiers,
+                post_effect,
+                repl_def.consume_on_apply,
+            )
         }
         None => return Ok(proposed),
     };
@@ -4568,6 +4588,9 @@ fn apply_single_replacement(
                             .extend(modifiers.etb_counters.iter().cloned()),
                         _ => {}
                     }
+                }
+                if consume_on_apply {
+                    mark_replacement_consumed(state, rid);
                 }
                 // CR 614.12a: Stash the mandatory execute ability as a post-replacement
                 // effect when it has work beyond the event modifiers (e.g., a Choose

@@ -1245,7 +1245,9 @@ fn damage_done_applier(
     ApplyResult::Modified(event)
 }
 
-/// CR 614.5: Mark a one-shot replacement as consumed after it successfully applies.
+/// CR 614.1a + CR 614.5: Mark a one-shot "instead" replacement as consumed
+/// after it successfully applies — the effect won't replace subsequent
+/// occurrences of the same event.
 fn mark_replacement_consumed(state: &mut GameState, rid: ReplacementId) {
     let repl = if rid.source == ObjectId(0) {
         state.pending_damage_replacements.get_mut(rid.index)

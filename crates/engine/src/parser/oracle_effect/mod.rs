@@ -10577,7 +10577,7 @@ fn parse_static_compound_subject_prefix(
                 TargetFilter::ScopedPlayer,
                 tag::<_, _, OracleError<'_>>("that player each "),
             ),
-            value(TargetFilter::ScopedPlayer, tag("target opponent each ")),
+            value(TargetFilter::Player, tag("target opponent each ")),
             value(TargetFilter::Player, tag("target player each ")),
             value(TargetFilter::ParentTarget, tag("that creature each ")),
         )),

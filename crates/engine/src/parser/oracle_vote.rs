@@ -958,8 +958,8 @@ mod tests {
     }
 
     /// "you and target opponent each create a Treasure token" — the chosen
-    /// opponent must be surfaced as a real player target, not collapsed into a
-    /// single token effect with `owner: Any`.
+    /// opponent must bind as `ScopedPlayer` (the targeted opponent from the
+    /// preceding "target opponent" clause), not a generic `Player`.
     #[test]
     fn parser_distributes_you_and_target_opponent_each_create_token() {
         let parsed = parse_effect_chain_with_context(
@@ -978,9 +978,48 @@ mod tests {
             .expect("expected second-half sub_ability");
         match *sub.effect {
             Effect::Token { ref owner, .. } => {
-                assert_eq!(*owner, TargetFilter::Player);
+                assert_eq!(*owner, TargetFilter::ScopedPlayer);
             }
             other => panic!("expected Token for second half, got {:?}", other),
+        }
+    }
+
+    /// Fall of the First Civilization chapter I: "you and target opponent each
+    /// draw two cards" — both halves must distribute to `OriginalController`
+    /// and `ScopedPlayer` so the targeted opponent receives the second draw.
+    #[test]
+    fn parser_distributes_you_and_target_opponent_each_draw_two() {
+        let parsed = parse_effect_chain_with_context(
+            "you and target opponent each draw two cards",
+            AbilityKind::Spell,
+            &mut ParseContext::default(),
+        );
+        match *parsed.effect {
+            Effect::Draw {
+                ref target, count, ..
+            } => {
+                assert_eq!(*target, TargetFilter::OriginalController);
+                assert_eq!(count, QuantityExpr::Fixed { value: 2 });
+            }
+            other => panic!(
+                "expected Draw {{ target: OriginalController, count: 2 }} for first half, got {:?}",
+                other
+            ),
+        }
+        let sub = parsed
+            .sub_ability
+            .expect("expected second-half sub_ability");
+        match *sub.effect {
+            Effect::Draw {
+                ref target, count, ..
+            } => {
+                assert_eq!(*target, TargetFilter::ScopedPlayer);
+                assert_eq!(count, QuantityExpr::Fixed { value: 2 });
+            }
+            other => panic!(
+                "expected Draw {{ target: ScopedPlayer, count: 2 }} for second half, got {:?}",
+                other
+            ),
         }
     }
 

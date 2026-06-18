@@ -1962,6 +1962,7 @@ pub fn parse_type_phrase_with_ctx<'a>(
                 let combined = distribute_shared_properties(combined, &properties);
                 let combined = distribute_controller_to_or(combined);
                 let combined = distribute_core_type_to_or(combined);
+                let combined = distribute_neg_type_filters_to_or(combined);
                 return (distribute_properties_to_or(combined), final_rest);
             }
         }
@@ -3037,6 +3038,44 @@ pub(crate) fn distribute_core_type_to_or(filter: TargetFilter) -> TargetFilter {
             }
         }
     }
+    TargetFilter::Or { filters }
+}
+
+/// CR 205.4b: When a leading `non-` negation scopes a type disjunction
+/// ("non-Lesson instant and sorcery card"), the negated type must bind to
+/// every disjunct — not only the first leg parsed before the `and`/`or`
+/// connector. Without this, "non-Lesson instant and sorcery" would match
+/// any sorcery, including Lessons (issue #1163, Iroh, Grand Lotus).
+pub(crate) fn distribute_neg_type_filters_to_or(filter: TargetFilter) -> TargetFilter {
+    let TargetFilter::Or { mut filters } = filter else {
+        return filter;
+    };
+
+    let mut neg_filters: Vec<TypeFilter> = Vec::new();
+    for f in &filters {
+        if let TargetFilter::Typed(TypedFilter { type_filters, .. }) = f {
+            for tf in type_filters {
+                if matches!(tf, TypeFilter::Non(_)) && !neg_filters.contains(tf) {
+                    neg_filters.push(tf.clone());
+                }
+            }
+        }
+    }
+
+    if neg_filters.is_empty() {
+        return TargetFilter::Or { filters };
+    }
+
+    for f in &mut filters {
+        if let TargetFilter::Typed(ref mut typed) = f {
+            for neg in &neg_filters {
+                if !typed.type_filters.iter().any(|existing| existing == neg) {
+                    typed.type_filters.push(neg.clone());
+                }
+            }
+        }
+    }
+
     TargetFilter::Or { filters }
 }
 
@@ -12820,5 +12859,29 @@ mod tests {
         };
         assert!(tf2.properties.contains(&FilterProp::Token));
         assert!(rest2.is_empty(), "expected empty remainder, got {rest2:?}");
+    }
+
+    #[test]
+    fn parse_non_lesson_instant_and_sorcery_distributes_negation() {
+        let (filter, rest) =
+            parse_type_phrase("non-Lesson instant and sorcery card in your graveyard");
+        assert!(rest.trim().is_empty(), "unexpected remainder: {rest:?}");
+        let TargetFilter::Or { filters } = filter else {
+            panic!("expected Or filter, got {filter:?}");
+        };
+        assert_eq!(filters.len(), 2);
+        for branch in filters {
+            let TargetFilter::Typed(tf) = branch else {
+                panic!("expected typed branch");
+            };
+            assert!(
+                tf.type_filters.iter().any(|f| matches!(
+                    f,
+                    TypeFilter::Non(boxed) if matches!(**boxed, TypeFilter::Subtype(ref s) if s == "Lesson")
+                )),
+                "each branch must exclude Lesson: {:?}",
+                tf.type_filters
+            );
+        }
     }
 }

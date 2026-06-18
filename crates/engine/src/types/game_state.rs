@@ -4679,6 +4679,14 @@ pub struct MiracleOffer {
     pub cost: super::mana::ManaCost,
 }
 
+/// CR 702.xxx: Remaining Paradigm sources paused while copy-announcement
+/// observer triggers drain (issue #3660). Resumed when priority next settles.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingParadigmRemainingOffers {
+    pub player: PlayerId,
+    pub offers: Vec<ObjectId>,
+}
+
 /// CR 702.190b: Placement data for a Sneak-cast **permanent** spell —
 /// captures the `(defender, attack_target)` pair from the returned creature's
 /// `AttackerInfo` at cost-payment time, so the permanent can enter the
@@ -5929,6 +5937,10 @@ pub struct GameState {
     /// "first card drawn this turn" condition).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_miracle_offers: Vec<MiracleOffer>,
+    /// CR 702.xxx: Paradigm sources still owed after a targeted copy's
+    /// `CopyRetarget` finalization paused on deferred copy observers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_paradigm_remaining_offers: Option<PendingParadigmRemainingOffers>,
     #[serde(default)]
     pub spells_cast_this_game: HashMap<PlayerId, u32>,
     /// Per-player spell cast history this game.
@@ -7046,6 +7058,7 @@ impl GameState {
             first_card_drawn_this_turn: HashMap::new(),
             cards_drawn_this_turn: HashMap::new(),
             pending_miracle_offers: Vec::new(),
+            pending_paradigm_remaining_offers: None,
             spells_cast_this_game: HashMap::new(),
             spells_cast_this_game_by_player: HashMap::new(),
             spells_cast_this_turn_by_player: HashMap::new(),
@@ -7499,6 +7512,7 @@ impl PartialEq for GameState {
             && self.first_card_drawn_this_turn == other.first_card_drawn_this_turn
             && self.cards_drawn_this_turn == other.cards_drawn_this_turn
             && self.pending_miracle_offers == other.pending_miracle_offers
+            && self.pending_paradigm_remaining_offers == other.pending_paradigm_remaining_offers
             && self.spells_cast_this_game == other.spells_cast_this_game
             && self.spells_cast_this_game_by_player == other.spells_cast_this_game_by_player
             && self.spells_cast_this_turn_by_player == other.spells_cast_this_turn_by_player

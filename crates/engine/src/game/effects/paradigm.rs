@@ -65,7 +65,7 @@ pub fn paradigm_offers_for(state: &GameState, player: PlayerId) -> Vec<ObjectId>
         .collect()
 }
 
-/// CR 505.4: After accepting one paradigm source, re-offer any remaining exiled
+/// CR 702.xxx: After accepting one paradigm source, re-offer any remaining exiled
 /// sources from the same offer window (issue #3660).
 pub fn waiting_after_remaining_offers(player: PlayerId, remaining: Vec<ObjectId>) -> WaitingFor {
     if remaining.is_empty() {
@@ -81,7 +81,7 @@ pub fn waiting_after_remaining_offers(player: PlayerId, remaining: Vec<ObjectId>
 /// After the player accepts one paradigm source from a multi-offer window,
 /// determine whether to re-offer the remaining sources or return to priority.
 ///
-/// CR 505.4: Each exiled paradigm source is offered independently at the
+/// CR 702.xxx: Each exiled paradigm source is offered independently at the
 /// start of the first main phase; accepting one copy does not forfeit the rest.
 pub fn waiting_after_accepted_offer(
     player: PlayerId,
@@ -94,6 +94,38 @@ pub fn waiting_after_accepted_offer(
         .filter(|id| *id != accepted)
         .collect();
     waiting_after_remaining_offers(player, remaining)
+}
+
+/// CR 702.xxx: Park remaining paradigm sources when copy-announcement observer
+/// drains pause before the CastOffer window can resume (issue #3660).
+pub(crate) fn stash_pending_remaining_offers(
+    state: &mut GameState,
+    player: PlayerId,
+    remaining: Vec<ObjectId>,
+) {
+    if remaining.is_empty() {
+        return;
+    }
+    state.pending_paradigm_remaining_offers =
+        Some(crate::types::game_state::PendingParadigmRemainingOffers {
+            player,
+            offers: remaining,
+        });
+}
+
+/// CR 702.xxx: Intercept `WaitingFor::Priority` and resume the Paradigm
+/// `CastOffer` window once deferred copy observers finish.
+pub(crate) fn flush_pending_remaining_offers(
+    state: &mut GameState,
+    outgoing: WaitingFor,
+) -> WaitingFor {
+    if !matches!(outgoing, WaitingFor::Priority { .. }) {
+        return outgoing;
+    }
+    let Some(pending) = state.pending_paradigm_remaining_offers.take() else {
+        return outgoing;
+    };
+    waiting_after_remaining_offers(pending.player, pending.offers)
 }
 
 /// Enqueue a `WaitingFor::CastOffer` (Paradigm) if offers exist for the given
@@ -249,6 +281,27 @@ mod tests {
             last,
             WaitingFor::Priority { player } if player == p
         ));
+    }
+
+    #[test]
+    fn flush_pending_remaining_offers_resumes_cast_offer_at_priority() {
+        let mut state = GameState::new_two_player(42);
+        let p = PlayerId(0);
+        let remaining = vec![ObjectId(101), ObjectId(102)];
+        stash_pending_remaining_offers(&mut state, p, remaining.clone());
+
+        let wf = flush_pending_remaining_offers(&mut state, WaitingFor::Priority { player: p });
+        match wf {
+            WaitingFor::CastOffer {
+                player,
+                kind: CastOfferKind::Paradigm { offers },
+            } => {
+                assert_eq!(player, p);
+                assert_eq!(offers, remaining);
+            }
+            other => panic!("expected paradigm CastOffer resume, got {other:?}"),
+        }
+        assert!(state.pending_paradigm_remaining_offers.is_none());
     }
 
     /// Issue #3660 — casting one paradigm copy re-opens the offer for siblings.

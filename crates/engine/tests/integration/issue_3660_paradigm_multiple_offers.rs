@@ -38,7 +38,7 @@ fn seed_targetless_paradigm_source(
     id
 }
 
-/// CR 505.4 + CR 707.10c: Each paradigm source is offered independently; casting
+/// CR 702.xxx + CR 707.10c: Each paradigm source is offered independently; casting
 /// one copy must leave the CastOffer window open for the rest.
 #[test]
 fn paradigm_cast_re_offers_remaining_sources_through_engine() {

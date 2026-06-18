@@ -1298,6 +1298,9 @@ fn finalize_copy_retarget(
     if let Some(wf) =
         triggers::drain_deferred_triggers_after_stack_object_announcement(state, events)
     {
+        if let Some(remaining) = paradigm_remaining_offers.filter(|offers| !offers.is_empty()) {
+            effects::paradigm::stash_pending_remaining_offers(state, player, remaining);
+        }
         state.waiting_for = wf;
         state.priority_player = player;
         effects::drain_pending_continuation(state, events);
@@ -23001,6 +23004,131 @@ mod keyword_action_stack_tests {
                 .attached_to
                 .is_none(),
             "Equipment must not attach when Equip is countered"
+        );
+    }
+
+    /// Issue #3660: deferred copy observers must not drop remaining paradigm offers.
+    #[test]
+    fn issue_3660_finalize_copy_retarget_stashes_offers_on_deferred_pause() {
+        use crate::game::triggers::{PendingTrigger, PendingTriggerContext};
+        use crate::types::ability::{
+            Effect, EffectKind, QuantityExpr, ResolvedAbility, TargetFilter, TargetRef,
+        };
+        use crate::types::game_state::{
+            CastingVariant, CopyTargetSlot, StackEntry, StackEntryKind,
+        };
+        use crate::types::zones::Zone;
+
+        fn deferred_draw_trigger(
+            state: &mut GameState,
+            name: &str,
+            controller: PlayerId,
+        ) -> PendingTriggerContext {
+            let source_id = create_object(
+                state,
+                CardId(state.next_object_id),
+                controller,
+                name.to_string(),
+                Zone::Battlefield,
+            );
+            PendingTriggerContext {
+                pending: PendingTrigger {
+                    source_id,
+                    controller,
+                    condition: None,
+                    ability: {
+                        let mut ability = ResolvedAbility::new(
+                            Effect::Draw {
+                                count: QuantityExpr::Fixed { value: 1 },
+                                target: TargetFilter::Controller,
+                            },
+                            vec![],
+                            source_id,
+                            controller,
+                        );
+                        ability.description = Some(name.to_string());
+                        ability
+                    },
+                    timestamp: 0,
+                    target_constraints: Vec::new(),
+                    distribute: None,
+                    trigger_event: None,
+                    modal: None,
+                    mode_abilities: vec![],
+                    description: Some(name.to_string()),
+                    may_trigger_origin: None,
+                    subject_match_count: None,
+                    die_result: None,
+                },
+                trigger_events: Vec::new(),
+            }
+        }
+
+        let mut state = GameState::new_two_player(42);
+        let player = PlayerId(0);
+        let copy_id = ObjectId(50);
+        let remaining = vec![ObjectId(101)];
+
+        state.stack.push_back(StackEntry {
+            id: copy_id,
+            source_id: copy_id,
+            controller: player,
+            kind: StackEntryKind::Spell {
+                card_id: CardId(1),
+                ability: Some(ResolvedAbility::new(
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 2 },
+                        target: TargetFilter::Player,
+                    },
+                    vec![TargetRef::Player(PlayerId(1))],
+                    copy_id,
+                    player,
+                )),
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+        let slots = vec![CopyTargetSlot {
+            current: Some(TargetRef::Player(PlayerId(1))),
+            legal_alternatives: vec![TargetRef::Player(PlayerId(1))],
+        }];
+        state.waiting_for = WaitingFor::CopyRetarget {
+            player,
+            copy_id,
+            target_slots: slots.clone(),
+            effect_kind: EffectKind::Draw,
+            effect_source_id: Some(copy_id),
+            current_slot: 0,
+            paradigm_remaining_offers: Some(remaining.clone()),
+        };
+        state.deferred_triggers = vec![
+            deferred_draw_trigger(&mut state, "Copy Observer A", player),
+            deferred_draw_trigger(&mut state, "Copy Observer B", player),
+        ];
+
+        let mut events = Vec::new();
+        finalize_copy_retarget(
+            &mut state,
+            player,
+            copy_id,
+            &slots,
+            EffectKind::Draw,
+            Some(copy_id),
+            &mut events,
+        )
+        .expect("finalize copy retarget");
+
+        assert!(
+            matches!(state.waiting_for, WaitingFor::OrderTriggers { .. }),
+            "expected OrderTriggers pause, got {:?}",
+            state.waiting_for
+        );
+        assert_eq!(
+            state
+                .pending_paradigm_remaining_offers
+                .as_ref()
+                .map(|pending| pending.offers.as_slice()),
+            Some(remaining.as_slice()),
         );
     }
 }

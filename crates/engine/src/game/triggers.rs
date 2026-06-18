@@ -1781,6 +1781,8 @@ fn collect_pending_triggers(
                             target: TargetFilter::SelfRef,
                             retarget: CopyRetargetPermission::MayChooseNewTargets,
                             copier: None,
+                            additional_modifications: Vec::new(),
+                            starting_loyalty_from_casualty_sacrifice: false,
                         },
                         Vec::new(),
                         *cast_obj_id,
@@ -3994,6 +3996,7 @@ fn trigger_cause_matches(
             let Some(GameEvent::ZoneChanged {
                 to: Zone::Battlefield,
                 record,
+                object_id,
                 ..
             }) = event
             else {
@@ -4005,7 +4008,15 @@ fn trigger_cause_matches(
             // CR 603.6a: The entering permanent's core types must include at
             // least one of the predicate's listed types. Panharmonicon uses
             // `[Artifact, Creature]` — either type qualifies.
-            record.core_types.iter().any(|ct| core_types.contains(ct))
+            // Use the live object's post-layer core_types if available (e.g., after
+            // Ashaya's layer effect adds the Land type). Fall back to the record's
+            // pre-layer types if the object is not in state.objects.
+            let core_types_to_check = if let Some(obj) = state.objects.get(object_id) {
+                &obj.card_types.core_types
+            } else {
+                &record.core_types
+            };
+            core_types_to_check.iter().any(|ct| core_types.contains(ct))
         }
         TriggerCause::CreatureAttacking => {
             matches!(event, Some(GameEvent::AttackersDeclared { .. }))
@@ -23426,6 +23437,7 @@ mod push_first_contract_tests {
             allow_repeat_modes: false,
             constraints: vec![],
             mode_costs: vec![],
+            mode_pawprints: vec![],
             entwine_cost: None,
             chooser: PlayerFilter::Controller,
             selection: crate::types::ability::TargetSelectionMode::Chosen,
@@ -23537,6 +23549,7 @@ mod push_first_contract_tests {
             allow_repeat_modes: false,
             constraints: vec![],
             mode_costs: vec![],
+            mode_pawprints: vec![],
             entwine_cost: None,
             chooser: PlayerFilter::Controller,
             // The axis under test: the game selects the mode at random.

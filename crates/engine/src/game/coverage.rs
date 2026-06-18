@@ -404,19 +404,41 @@ fn fmt_target(filter: &TargetFilter) -> String {
         TargetFilter::StackAbility {
             controller: None,
             tag: None,
+            kind: None,
         } => "ability on stack".into(),
+        TargetFilter::StackAbility {
+            controller: None,
+            tag: None,
+            kind: Some(crate::types::ability::StackAbilityKind::Triggered),
+        } => "triggered ability on stack".into(),
+        TargetFilter::StackAbility {
+            controller: None,
+            tag: None,
+            kind: Some(crate::types::ability::StackAbilityKind::Activated),
+        } => "activated ability on stack".into(),
         TargetFilter::StackAbility {
             controller: Some(ControllerRef::You),
             tag: None,
+            kind: None,
         } => "ability you control on stack".into(),
         TargetFilter::StackAbility {
             controller: Some(ControllerRef::Opponent),
             tag: None,
+            kind: None,
         } => "ability opponent controls on stack".into(),
         TargetFilter::StackAbility {
             controller: Some(controller),
             tag: None,
+            kind: None,
         } => format!("ability scoped to {controller:?} on stack"),
+        TargetFilter::StackAbility {
+            kind: Some(crate::types::ability::StackAbilityKind::Triggered),
+            ..
+        } => "triggered ability on stack".into(),
+        TargetFilter::StackAbility {
+            kind: Some(crate::types::ability::StackAbilityKind::Activated),
+            ..
+        } => "activated ability on stack".into(),
         TargetFilter::StackSpell => "spell on stack".into(),
         TargetFilter::AttachedTo => "attached permanent".into(),
         TargetFilter::LastCreated => "last created".into(),
@@ -1073,6 +1095,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::EventTarget => "event target's mana value".into(),
             ObjectScope::CostPaidObject => "referenced object's mana value".into(),
         },
+        QuantityRef::TargetObjectManaValue { .. } => "target object's mana value".into(),
         QuantityRef::ObjectColorCount { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
                 "self colors".into()
@@ -1257,6 +1280,11 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
         QuantityRef::CardsDrawnThisTurn { player } => {
             format!("cards drawn this turn ({})", fmt_player_scope(player))
         }
+        QuantityRef::BattlefieldEntriesThisTurn { player, filter } => format!(
+            "battlefield entries this turn ({}, {})",
+            fmt_target(filter),
+            fmt_player_scope(player)
+        ),
         QuantityRef::LandsPlayedThisTurn { player, from_zones } => from_zones.as_ref().map_or_else(
             || format!("lands played this turn ({})", fmt_player_scope(player)),
             |zones| {
@@ -1370,6 +1398,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
         QuantityRef::CommanderCastFromCommandZoneCount => {
             "# of commander casts from command zone".into()
         }
+        QuantityRef::CommanderManaValue { .. } => "mana value of a commander".into(),
         QuantityRef::AttachmentsOnLeavingObject { kind, controller } => {
             let kind_s = match kind {
                 crate::types::ability::AttachmentKind::Aura => "auras",
@@ -2981,6 +3010,9 @@ fn fmt_modification(m: &crate::types::ability::ContinuousModification) -> String
                 ),
                 None => format!("enter with {count_str} {} counter", counter_type.as_str()),
             }
+        }
+        ContinuousModification::SetStartingLoyalty { value } => {
+            format!("starting loyalty {value}")
         }
         ContinuousModification::RemoveManaCost => "no mana cost".to_string(),
     }
@@ -5667,6 +5699,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::EventTarget => ("EventTargetManaValue", Handled),
             ObjectScope::CostPaidObject => ("CostPaidObjectManaValue", Handled),
         },
+        QuantityRef::TargetObjectManaValue { .. } => ("TargetObjectManaValue", Handled),
         QuantityRef::ObjectColorCount { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
                 ("SourceObjectColorCount", Handled)
@@ -5733,6 +5766,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         QuantityRef::CrimesCommittedThisTurn => ("CrimesCommittedThisTurn", Handled),
         QuantityRef::LifeGainedThisTurn { .. } => ("LifeGainedThisTurn", Handled),
         QuantityRef::CardsDrawnThisTurn { .. } => ("CardsDrawnThisTurn", Handled),
+        QuantityRef::BattlefieldEntriesThisTurn { .. } => ("BattlefieldEntriesThisTurn", Handled),
         QuantityRef::LandsPlayedThisTurn { .. } => ("LandsPlayedThisTurn", Handled),
         QuantityRef::ZoneChangeCountThisTurn { .. } => ("ZoneChangeCountThisTurn", Handled),
         QuantityRef::ZoneChangeAggregateThisTurn { .. } => ("ZoneChangeAggregateThisTurn", Handled),
@@ -5767,6 +5801,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         QuantityRef::CommanderCastFromCommandZoneCount => {
             ("CommanderCastFromCommandZoneCount", Handled)
         }
+        QuantityRef::CommanderManaValue { .. } => ("CommanderManaValue", Handled),
         QuantityRef::AttachmentsOnLeavingObject { .. } => ("AttachmentsOnLeavingObject", Handled),
         QuantityRef::PlayerCounter { .. } => ("PlayerCounter", Handled),
         QuantityRef::PartySize { .. } => ("PartySize", Handled),

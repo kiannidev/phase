@@ -7268,6 +7268,43 @@ mod tests {
         );
     }
 
+    /// CR 707.10 + CR 608.2c: a spell copy put onto the stack can be an
+    /// anaphoric referent only when the parent resolution produced exactly one
+    /// copied stack object.
+    #[test]
+    fn stack_pushed_parent_referent_requires_singular_copy() {
+        let mut state = GameState::new_two_player(42);
+        let first = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "First Copy".to_string(),
+            Zone::Stack,
+        );
+        let second = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Second Copy".to_string(),
+            Zone::Stack,
+        );
+        let single = [GameEvent::StackPushed { object_id: first }];
+        let multiple = [
+            GameEvent::StackPushed { object_id: first },
+            GameEvent::StackPushed { object_id: second },
+        ];
+
+        assert_eq!(
+            parent_referent_context_from_events(&state, &single).map(|snapshot| snapshot.object_id),
+            Some(first),
+            "one copied spell can feed ParentTarget"
+        );
+        assert!(
+            parent_referent_context_from_events(&state, &multiple).is_none(),
+            "multiple copied spells must not bind ParentTarget arbitrarily"
+        );
+    }
+
     /// CR 608.2c: duplicate events for the same tapped creature still describe
     /// one singular referent.
     #[test]

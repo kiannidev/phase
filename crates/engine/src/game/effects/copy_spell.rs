@@ -481,8 +481,8 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> Option<Sta
             .cloned();
     }
     if let Effect::CopySpell { target, .. } = &ability.effect {
-        if let Some(entry) = copy_source_from_tracked_set(state, ability, target) {
-            return Some(entry);
+        if references_tracked_set(target) {
+            return copy_source_from_tracked_set(state, ability, target);
         }
     }
     if matches!(
@@ -2700,8 +2700,6 @@ mod tests {
     /// imprinted instant from exile via `TrackedSet`, not the top of stack.
     #[test]
     fn copy_spell_tracked_set_copies_exiled_imprint_not_top_of_stack() {
-        use crate::types::ability::AbilityDefinition;
-
         let mut state = GameState::new_two_player(42);
         let scepter_id = ObjectId(5);
         let imprint_id = ObjectId(10);
@@ -2773,6 +2771,81 @@ mod tests {
                 .is_some_and(|a| matches!(a.effect, Effect::DealDamage { .. })),
             "copy must replicate the exiled imprint, not the decoy draw spell"
         );
+    }
+
+    /// CR 707.10 + CR 702.153a: tracked-set copying is an exiled-card source
+    /// selector, so an invalid tracked object must not fall through to the top
+    /// stack entry and copy an unrelated spell.
+    #[test]
+    fn copy_spell_tracked_set_without_spell_ability_does_not_fallback_to_stack_top() {
+        let mut state = GameState::new_two_player(42);
+        let scepter_id = ObjectId(5);
+        let imprint_id = ObjectId(10);
+        let decoy_spell_id = ObjectId(20);
+
+        let non_spell_ability = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+        );
+        let mut imprint_obj = GameObject::new(
+            imprint_id,
+            CardId(1),
+            PlayerId(0),
+            "Activated Imprint".to_string(),
+            Zone::Exile,
+        );
+        imprint_obj.abilities = std::sync::Arc::new(vec![non_spell_ability]);
+        state.objects.insert(imprint_id, imprint_obj);
+        state
+            .tracked_object_sets
+            .insert(TrackedSetId(0), vec![imprint_id]);
+
+        let decoy_ability = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            decoy_spell_id,
+            PlayerId(0),
+        );
+        push_spell(
+            &mut state,
+            decoy_spell_id,
+            CardId(2),
+            PlayerId(0),
+            "Divination",
+            decoy_ability,
+            CastingVariant::Normal,
+        );
+
+        let copy_ability = ResolvedAbility::new(
+            Effect::CopySpell {
+                target: TargetFilter::TrackedSet {
+                    id: TrackedSetId(0),
+                },
+                retarget: CopyRetargetPermission::KeepOriginalTargets,
+                copier: None,
+                additional_modifications: vec![],
+                starting_loyalty_from_casualty_sacrifice: false,
+            },
+            vec![],
+            scepter_id,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+
+        assert!(
+            resolve(&mut state, &copy_ability, &mut events).is_err(),
+            "invalid tracked imprint must not copy the unrelated top stack spell"
+        );
+        assert_eq!(state.stack.len(), 1, "only the decoy spell remains");
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, GameEvent::StackPushed { .. })));
     }
 
     /// CR 702.153a + CR 306.5b: Ob Nixilis Casualty copies stamp starting

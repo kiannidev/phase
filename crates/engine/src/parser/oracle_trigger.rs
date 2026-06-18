@@ -13802,7 +13802,10 @@ mod tests {
             ))
         );
         assert_eq!(def.valid_target, Some(TargetFilter::Player));
-        assert!(def.batched, "one-or-more combat damage triggers are batched");
+        assert!(
+            def.batched,
+            "one-or-more combat damage triggers are batched"
+        );
     }
 
     #[test]

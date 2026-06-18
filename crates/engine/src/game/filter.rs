@@ -76,6 +76,7 @@ pub(crate) fn affected_filter_uses_object_population(filter: &TargetFilter) -> b
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
         | TargetFilter::ExiledBySource
+        | TargetFilter::ExiledCardByIndex { .. }
         | TargetFilter::TriggeringSpellController
         | TargetFilter::TriggeringSpellOwner
         | TargetFilter::TriggeringPlayer
@@ -146,6 +147,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         | FilterProp::ColorCount { .. }
         | FilterProp::Token
         | FilterProp::NonToken
+        | FilterProp::WasPlayed
         | FilterProp::Attacking { .. }
         | FilterProp::Blocking
         | FilterProp::BlockingSource
@@ -155,6 +157,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         | FilterProp::BlockingAlone
         | FilterProp::Tapped
         | FilterProp::IsSaddled
+        | FilterProp::ProtectorMatches { .. }
         | FilterProp::Untapped
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
@@ -265,6 +268,7 @@ pub(crate) fn entered_object_perturbs_affected_filter(
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
         | TargetFilter::ExiledBySource
+        | TargetFilter::ExiledCardByIndex { .. }
         | TargetFilter::TriggeringSpellController
         | TargetFilter::TriggeringSpellOwner
         | TargetFilter::TriggeringPlayer
@@ -347,6 +351,7 @@ fn entered_object_perturbs_filter_prop(
         | FilterProp::ColorCount { .. }
         | FilterProp::Token
         | FilterProp::NonToken
+        | FilterProp::WasPlayed
         | FilterProp::Attacking { .. }
         | FilterProp::Blocking
         | FilterProp::BlockingSource
@@ -356,6 +361,7 @@ fn entered_object_perturbs_filter_prop(
         | FilterProp::BlockingAlone
         | FilterProp::Tapped
         | FilterProp::IsSaddled
+        | FilterProp::ProtectorMatches { .. }
         | FilterProp::Untapped
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
@@ -743,11 +749,28 @@ pub(crate) fn matches_stack_target_filter(
     match filter {
         TargetFilter::Any => true,
         TargetFilter::StackSpell => matches!(&entry.kind, StackEntryKind::Spell { .. }),
-        TargetFilter::StackAbility { controller, tag } => {
+        TargetFilter::StackAbility {
+            controller,
+            tag,
+            kind,
+        } => {
+            let ability_kind_ok = kind.as_ref().is_none_or(|kind| {
+                matches!(
+                    (kind, &entry.kind),
+                    (
+                        crate::types::ability::StackAbilityKind::Activated,
+                        StackEntryKind::ActivatedAbility { .. }
+                    ) | (
+                        crate::types::ability::StackAbilityKind::Triggered,
+                        StackEntryKind::TriggeredAbility { .. }
+                    )
+                )
+            });
             matches!(
                 &entry.kind,
                 StackEntryKind::ActivatedAbility { .. } | StackEntryKind::TriggeredAbility { .. }
-            ) && stack_entry_controller_matches(state, controller.as_ref(), entry.controller, ctx)
+            ) && ability_kind_ok
+                && stack_entry_controller_matches(state, controller.as_ref(), entry.controller, ctx)
                 // CR 113.7a: keyword-origin tag (e.g. `AbilityTag::Backup`) must
                 // match the ability on the stack when the filter requires one.
                 && tag.as_ref().is_none_or(|tag| {
@@ -1220,6 +1243,8 @@ pub fn matches_target_filter_on_lki_snapshot(
         controller: lki.controller,
         owner: lki.owner,
         from_zone: None,
+        cast_from_zone: None,
+        played_from_zone: None,
         to_zone: Zone::Battlefield,
         attachments: vec![],
         linked_exile_snapshot: vec![],
@@ -1619,6 +1644,17 @@ fn filter_inner_for_object(
                 .iter()
                 .any(|entry| entry.exiled_id == object_id)
         }
+        // CR 607.2a: References a specific card exiled by the source, indexed by order.
+        // Used by The Mimeoplasm to distinguish "the first card exiled this way" from
+        // "the second card exiled this way". ENGINE INVARIANT: The ordering is
+        // guaranteed by Vec::push in push_exiled_with_source_this_turn.
+        TargetFilter::ExiledCardByIndex { index } => {
+            // Look up the source's exile list and check if object_id matches the indexed position
+            let exiled_cards = state.cards_exiled_with_source_this_turn.get(&source_id);
+            exiled_cards
+                .and_then(|cards| cards.get(*index as usize))
+                .is_some_and(|&card_id| card_id == object_id)
+        }
         // CR 603.7c: Event-context references resolve to players, not objects.
         TargetFilter::TriggeringSpellController
         | TargetFilter::TriggeringSpellOwner
@@ -1861,6 +1897,7 @@ fn zone_change_filter_inner(
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
         | TargetFilter::ExiledBySource
+        | TargetFilter::ExiledCardByIndex { .. }
         | TargetFilter::TriggeringSpellController
         | TargetFilter::TriggeringSpellOwner
         | TargetFilter::TriggeringPlayer
@@ -2092,6 +2129,7 @@ pub fn spell_record_matches_filter(
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
         | TargetFilter::ExiledBySource
+        | TargetFilter::ExiledCardByIndex { .. }
         | TargetFilter::TriggeringSpellController
         | TargetFilter::TriggeringSpellOwner
         | TargetFilter::TriggeringPlayer
@@ -2332,6 +2370,7 @@ fn spell_object_matches_filter_inner(
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
         | TargetFilter::ExiledBySource
+        | TargetFilter::ExiledCardByIndex { .. }
         | TargetFilter::TriggeringSpellController
         | TargetFilter::TriggeringSpellOwner
         | TargetFilter::TriggeringPlayer
@@ -2580,6 +2619,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         // for this snapshot shape.
         FilterProp::Token => false,
         FilterProp::NonToken => true,
+        FilterProp::WasPlayed => true,
         FilterProp::InZone { zone: required } => record.from_zone == *required,
         // CR 400.1 + CR 601.2a: cast-origin membership — the record's captured
         // from_zone (populated when the spell was put on the stack from where it
@@ -2602,6 +2642,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         | FilterProp::BlockingAlone
         | FilterProp::Tapped
         | FilterProp::IsSaddled
+        | FilterProp::ProtectorMatches { .. }
         | FilterProp::Untapped
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::Counters { .. }
@@ -2888,6 +2929,8 @@ fn matches_filter_prop(
         FilterProp::Token => obj.is_token,
         // CR 111.1: Nontoken identity of the matched object or event-time snapshot.
         FilterProp::NonToken => !obj.is_token,
+        // CR 305.1 + CR 601.2a: "played by" entry replacements (Uphill Battle).
+        FilterProp::WasPlayed => obj.played_from_zone.is_some() || obj.cast_from_zone.is_some(),
         // CR 508.1b: Attacking creatures may be scoped by defending player
         // relation ("attacking", "attacking you", "attacking your opponents").
         FilterProp::Attacking { defender } => state.combat.as_ref().is_some_and(|combat| {
@@ -2928,6 +2971,21 @@ fn matches_filter_prop(
         FilterProp::Tapped => obj.tapped,
         // CR 702.171b: Matches permanents with the saddled designation.
         FilterProp::IsSaddled => obj.is_saddled,
+        // CR 310.8a: "each battle they protect" — protector is an opponent of
+        // the source controller (Joyful Stormsculptor class).
+        FilterProp::ProtectorMatches { controller } => {
+            if !obj.card_types.core_types.contains(&CoreType::Battle) {
+                return false;
+            }
+            let Some(protector) = obj.protector() else {
+                return false;
+            };
+            match controller {
+                ControllerRef::Opponent => source.controller.is_some_and(|sc| sc != protector),
+                ControllerRef::You => source.controller == Some(protector),
+                _ => false,
+            }
+        }
         // CR 302.6 / CR 110.5: Untapped status as targeting qualifier.
         FilterProp::Untapped => !obj.tapped,
         // CR 302.6 + CR 702.10b + CR 702.154a: Enlist may tap a creature only
@@ -3630,6 +3688,11 @@ fn zone_change_record_matches_property(
         FilterProp::Token => record.is_token,
         // CR 111.1 + CR 603.6a: Nontoken identity as of the zone change.
         FilterProp::NonToken => !record.is_token,
+        // CR 305.1 + CR 601.2a: zone-change snapshots carry cast/play provenance
+        // when the object was cast or played — not mere zone moves (reanimate).
+        FilterProp::WasPlayed => {
+            record.played_from_zone.is_some() || record.cast_from_zone.is_some()
+        }
 
         // -------- Group 2: source/event relational --------
         // CR 109.1 "another": same-object check against the triggering source.
@@ -3795,6 +3858,7 @@ fn zone_change_record_matches_property(
         }),
         FilterProp::Tapped
         | FilterProp::IsSaddled
+        | FilterProp::ProtectorMatches { .. }
         | FilterProp::Untapped
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::AttackedThisTurn
@@ -4712,6 +4776,7 @@ mod tests {
         let ability_leg = TargetFilter::StackAbility {
             controller: None,
             tag: None,
+            kind: None,
         };
         assert!(
             matches_stack_target_filter(&state, ability_entry_id, &ability_leg, &ctx),
@@ -9041,6 +9106,8 @@ mod tests {
             controller: PlayerId(0),
             owner: PlayerId(0),
             from_zone: Some(Zone::Battlefield),
+            cast_from_zone: None,
+            played_from_zone: None,
             to_zone: Zone::Graveyard,
             attachments: vec![],
             linked_exile_snapshot: vec![],

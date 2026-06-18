@@ -1112,8 +1112,13 @@ fn collect_matching_players(
                             p.id,
                             source_controller,
                             *relation,
-                        ) && crate::game::effects::candidate_player_scalar(p, attr)
-                            .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
+                        ) && crate::game::effects::candidate_player_scalar_with_state(
+                            state,
+                            p,
+                            source_controller,
+                            attr,
+                        )
+                        .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
                     }
                 }
         })
@@ -1309,8 +1314,13 @@ pub fn resolve_each_player(
                             p.id,
                             ability.controller,
                             *relation,
-                        ) && crate::game::effects::candidate_player_scalar(p, attr)
-                            .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
+                        ) && crate::game::effects::candidate_player_scalar_with_state(
+                            state,
+                            p,
+                            ability.controller,
+                            attr,
+                        )
+                        .is_some_and(|lhs| comparator.evaluate(lhs, threshold))
                     }
                 }
         })
@@ -1370,8 +1380,8 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        ContinuousModification, Duration, FilterProp, ObjectScope, QuantityExpr, QuantityRef,
-        TargetFilter, TypeFilter, TypedFilter,
+        ChosenAttribute, ContinuousModification, ControllerRef, Duration, FilterProp, ObjectScope,
+        QuantityExpr, QuantityRef, TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::CoreType;
     use crate::types::events::GameEvent;
@@ -1745,6 +1755,134 @@ mod tests {
 
         assert_eq!(state.objects[&source].damage_marked, 0);
         assert_eq!(state.objects[&recipient].damage_marked, 3);
+    }
+
+    /// #699 (one-sided fight — full Ambuscade-class shape). The boosted creature
+    /// is `targets[0]` (power 5), the opponent's creature is `targets[1]`
+    /// (power 2). With `damage_source: Some(Target)` + `amount: Power{Target}`
+    /// the boosted creature deals damage equal to ITS OWN power (5, read from
+    /// targets[0], NOT the recipient's 2) to the recipient. Asserts: recipient
+    /// (targets[1]) takes 5, boosted creature (targets[0]) takes 0. Proves the
+    /// amount reads the boosted creature (Target == targets[0]) and the recipient
+    /// is targets[1] — the exact slot ordering the #699 parser fix relies on.
+    /// CR 120.1: the boosted creature is the damage source.
+    #[test]
+    fn one_sided_fight_amount_reads_boosted_creature_recipient_takes_damage() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(20),
+            PlayerId(0),
+            "Boosted Creature".to_string(),
+            Zone::Battlefield,
+        );
+        let recipient = create_object(
+            &mut state,
+            CardId(21),
+            PlayerId(1),
+            "Opponent Creature".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let s = state.objects.get_mut(&source).unwrap();
+            s.card_types.core_types.push(CoreType::Creature);
+            s.power = Some(5);
+            s.base_power = Some(5);
+        }
+        {
+            let r = state.objects.get_mut(&recipient).unwrap();
+            r.card_types.core_types.push(CoreType::Creature);
+            r.power = Some(2);
+            r.base_power = Some(2);
+        }
+        let ability = ResolvedAbility::new(
+            Effect::DealDamage {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::Power {
+                        scope: ObjectScope::Target,
+                    },
+                },
+                target: TargetFilter::Typed(TypedFilter::creature()),
+                damage_source: Some(DamageSource::Target),
+            },
+            vec![TargetRef::Object(source), TargetRef::Object(recipient)],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        // Boosted creature deals its power (5), not the recipient's (2);
+        // recipient (targets[1]) receives it, boosted (targets[0]) is unscathed.
+        assert_eq!(state.objects[&source].damage_marked, 0);
+        assert_eq!(state.objects[&recipient].damage_marked, 5);
+    }
+
+    /// #699 (one-sided fight — `Power{Anaphoric}` amount). Same shape as the
+    /// `Power{Target}` test above, but the amount is `Power{Anaphoric}` with
+    /// `effect_context_object = None` (the real Ambuscade-class AST after the
+    /// Option-b fix: the parser leaves "its power" as Anaphoric). With no
+    /// effect-context / event-source / cost referent to seed it, the anaphor
+    /// MUST resolve through the runtime one-sided-fight fallback to `targets[0]`
+    /// (the boosted creature, power 5) — NOT to 0. Asserts the boosted creature
+    /// (targets[0]) takes 0 and the opponent (targets[1]) takes 5. This is the
+    /// assertion that flips (5 → 0 on the recipient) if the new
+    /// `resolve_object_pt` Anaphoric fallback is reverted.
+    /// CR 608.2c + CR 120.1: the boosted creature is the anaphoric "It" and the
+    /// damage source.
+    #[test]
+    fn one_sided_fight_anaphoric_amount_reads_boosted_creature() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(30),
+            PlayerId(0),
+            "Boosted Creature".to_string(),
+            Zone::Battlefield,
+        );
+        let recipient = create_object(
+            &mut state,
+            CardId(31),
+            PlayerId(1),
+            "Opponent Creature".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let s = state.objects.get_mut(&source).unwrap();
+            s.card_types.core_types.push(CoreType::Creature);
+            s.power = Some(5);
+            s.base_power = Some(5);
+        }
+        {
+            let r = state.objects.get_mut(&recipient).unwrap();
+            r.card_types.core_types.push(CoreType::Creature);
+            r.power = Some(2);
+            r.base_power = Some(2);
+        }
+        // ResolvedAbility::new leaves effect_context_object = None and
+        // cost_paid_object = None, so only the new targets[0] fallback can seed
+        // the anaphoric power.
+        let ability = ResolvedAbility::new(
+            Effect::DealDamage {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::Power {
+                        scope: ObjectScope::Anaphoric,
+                    },
+                },
+                target: TargetFilter::Typed(TypedFilter::creature()),
+                damage_source: Some(DamageSource::Target),
+            },
+            vec![TargetRef::Object(source), TargetRef::Object(recipient)],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.objects[&source].damage_marked, 0);
+        assert_eq!(state.objects[&recipient].damage_marked, 5);
     }
 
     #[test]
@@ -2747,6 +2885,69 @@ mod tests {
         // CR 120.3c: Damage to planeswalker removes loyalty, not damage_marked.
         assert_eq!(state.objects[&pw_id].loyalty, Some(2));
         assert_eq!(state.objects[&pw_id].damage_marked, 0);
+    }
+
+    /// Issue #3293: Joyful Stormsculptor — opponent+battle compound damage must
+    /// not hit opponent-controlled creatures.
+    #[test]
+    fn resolve_all_opponent_and_battle_they_protect_skips_creatures() {
+        let mut state = GameState::new_two_player(42);
+        let creature_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Opponent Creature".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&creature_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.toughness = Some(3);
+            obj.base_toughness = Some(3);
+        }
+        let battle_id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Protected Siege".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&battle_id).unwrap();
+            obj.card_types.core_types.push(CoreType::Battle);
+            obj.defense = Some(3);
+            obj.base_defense = Some(3);
+            obj.counters.insert(CounterType::Defense, 3);
+            obj.chosen_attributes
+                .push(ChosenAttribute::Player(PlayerId(1)));
+        }
+
+        let ability = ResolvedAbility::new(
+            Effect::DamageAll {
+                amount: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Battle).properties(vec![
+                    FilterProp::ProtectorMatches {
+                        controller: ControllerRef::Opponent,
+                    },
+                ])),
+                player_filter: Some(PlayerFilter::Opponent),
+                damage_source: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        let p1_life_before = state.players[1].life;
+
+        resolve_all(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.objects[&creature_id].damage_marked, 0,
+            "opponent creatures must not be damaged"
+        );
+        assert_eq!(state.objects[&battle_id].defense, Some(2));
+        assert_eq!(state.players[1].life, p1_life_before - 1);
     }
 
     #[test]

@@ -1282,7 +1282,17 @@ pub(crate) fn apply_zone_delivery_tail(
             events,
         );
         if let Some(wf) = waiting_for {
-            if !matches!(wf, WaitingFor::Priority { .. }) {
+            // Pause only on mid-entry interactive replacements — not on ETB
+            // triggers (e.g. Cloud Key's NamedChoice) that `add_real_card` and
+            // other scenario helpers expect to drain without stalling delivery.
+            if matches!(
+                wf,
+                WaitingFor::EffectZoneChoice { .. }
+                    | WaitingFor::ReplacementChoice { .. }
+                    | WaitingFor::CopyTargetChoice { .. }
+                    | WaitingFor::ChooseOneOfBranch { .. }
+                    | WaitingFor::ReturnAsAuraTarget { .. }
+            ) {
                 state.waiting_for = wf;
                 return replacement_pause_delivery_result(state);
             }
@@ -1812,16 +1822,15 @@ pub(crate) fn deliver_replaced_zone_change(
 
 fn replacement_pause_delivery_result(state: &GameState) -> ZoneDeliveryResult {
     match &state.waiting_for {
-        WaitingFor::ReplacementChoice { player, .. } => ZoneDeliveryResult::NeedsChoice(*player),
+        WaitingFor::ReplacementChoice { player, .. }
         // CR 614.12a: a Devour as-enters sacrifice surfaced its own
         // `EffectZoneChoice`; carry its chooser so the caller's `park_waiting_for`
         // doesn't clobber the already-surfaced prompt.
-        WaitingFor::EffectZoneChoice { player, .. } => ZoneDeliveryResult::NeedsChoice(*player),
+        | WaitingFor::EffectZoneChoice { player, .. }
         // CR 707.9 + CR 614.12a: enter-as-copy and other mid-entry choices
         // surface their own `WaitingFor` variant with the correct chooser.
-        WaitingFor::CopyTargetChoice { player, .. }
+        | WaitingFor::CopyTargetChoice { player, .. }
         | WaitingFor::ChooseOneOfBranch { player, .. }
-        | WaitingFor::NamedChoice { player, .. }
         | WaitingFor::ReturnAsAuraTarget { player, .. } => ZoneDeliveryResult::NeedsChoice(*player),
         _ => ZoneDeliveryResult::NeedsChoice(state.active_player),
     }

@@ -67,10 +67,7 @@ pub fn paradigm_offers_for(state: &GameState, player: PlayerId) -> Vec<ObjectId>
 
 /// CR 505.4: After accepting one paradigm source, re-offer any remaining exiled
 /// sources from the same offer window (issue #3660).
-pub fn waiting_after_remaining_offers(
-    player: PlayerId,
-    remaining: Vec<ObjectId>,
-) -> WaitingFor {
+pub fn waiting_after_remaining_offers(player: PlayerId, remaining: Vec<ObjectId>) -> WaitingFor {
     if remaining.is_empty() {
         WaitingFor::Priority { player }
     } else {

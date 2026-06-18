@@ -18337,30 +18337,40 @@ mod tests {
 
         let tracked: Vec<_> = state
             .tracked_object_sets
-            .values()
-            .flatten()
-            .copied()
-            .collect();
-        assert!(
-            tracked.contains(&card_a) && tracked.contains(&card_b) && tracked.contains(&card_c),
-            "dig must publish all looked-at cards to the tracked set, got {tracked:?}"
+            .get(
+                &state
+                    .chain_tracked_set_id
+                    .expect("dig tail must publish a tracked set"),
+            )
+            .expect("tracked set must exist")
+            .clone();
+        assert_eq!(
+            tracked,
+            vec![card_b, card_c],
+            "dig must publish only the unkept looked-at cards"
         );
 
-        assert!(
-            matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }),
-            "expected bottom-of-library choice after keeping to hand, got {:?}",
-            state.waiting_for
-        );
         let WaitingFor::EffectZoneChoice {
-            cards: eligible, ..
+            cards: eligible,
+            effect_kind,
+            ..
         } = state.waiting_for.clone()
         else {
-            unreachable!();
+            panic!(
+                "expected bottom-of-library choice after keeping to hand, got {:?}",
+                state.waiting_for
+            );
         };
-        assert!(
-            eligible.contains(&card_b) && eligible.contains(&card_c),
-            "choice must be among unkept looked-at cards: {eligible:?}"
+        assert_eq!(
+            effect_kind,
+            crate::types::ability::EffectKind::PutAtLibraryPosition
         );
+        assert_eq!(
+            eligible,
+            vec![card_b, card_c],
+            "bottom choice must be among unkept library cards"
+        );
+
         engine::apply_as_current(
             &mut state,
             GameAction::SelectCards {
@@ -18370,12 +18380,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(state.objects[&card_a].zone, Zone::Hand);
-        let exiled = [card_b, card_c]
-            .into_iter()
-            .find(|id| state.objects[id].zone == Zone::Exile)
-            .expect("one unkept looked-at card must be exiled");
+        assert_eq!(state.objects[&card_b].zone, Zone::Library);
+        assert_eq!(state.objects[&card_c].zone, Zone::Exile);
         assert!(
-            state.objects[&exiled]
+            state.players[0].library.back() == Some(&card_b),
+            "card B must be on the bottom of the library"
+        );
+        assert!(
+            !state.objects[&card_b]
+                .casting_permissions
+                .iter()
+                .any(|p| matches!(p, CastingPermission::PlayFromExile { .. })),
+            "bottomed card must not receive play permission"
+        );
+        assert!(
+            state.objects[&card_c]
                 .casting_permissions
                 .iter()
                 .any(|p| matches!(

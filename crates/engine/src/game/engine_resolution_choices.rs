@@ -137,9 +137,9 @@ pub(super) fn handles(waiting_for: &WaitingFor) -> bool {
 
 /// CR 608.2c: Expressive Iteration-style dig tails chain a
 /// `PutAtLibraryPosition { TrackedSet }` step before exiling from the same
-/// looked-at pile. Those continuations need the full dig pile in the tracked
-/// set; generic reveal/keep continuations (Zimone land split) bind only the
-/// kept/revealed subset.
+/// looked-at pile. Those continuations publish and route via the **unkept**
+/// looked-at cards; generic reveal/keep continuations (Zimone land split)
+/// bind only the kept/revealed subset.
 fn dig_continuation_needs_full_looked_at_tracked_set(ability: &ResolvedAbility) -> bool {
     let mut current = Some(ability);
     while let Some(sub) = current {
@@ -1547,20 +1547,17 @@ pub(super) fn handle_resolution_choice(
             }
             // CR 701.20b + CR 608.2c: Publish a tracked set for downstream
             // sub_abilities. Reveal/keep continuations (Zimone land split) bind
-            // the kept subset; Expressive Iteration's bottom/exile tail needs the
-            // full looked-at pile when its continuation chains
+            // the kept subset; Expressive Iteration's bottom/exile tail binds the
+            // unkept looked-at pile when its continuation chains
             // `PutAtLibraryPosition { TrackedSet }`.
             let publish_set = if kept.is_empty() {
                 Vec::new()
-            } else if kept_destination == Some(Zone::Hand) && state.pending_continuation.is_some() {
-                // Expressive Iteration-style hand keep + bottom/exile tail.
-                cards.clone()
-            } else if state
-                .pending_continuation
-                .as_ref()
-                .is_some_and(|cont| dig_continuation_needs_full_looked_at_tracked_set(&cont.chain))
-            {
-                cards.clone()
+            } else if state.pending_continuation.as_ref().is_some_and(|cont| {
+                dig_continuation_needs_full_looked_at_tracked_set(&cont.chain)
+            }) {
+                // Expressive Iteration-style bottom/exile tail: downstream
+                // `TrackedSet` steps address the unkept looked-at pile only.
+                unkept.clone()
             } else {
                 kept.clone()
             };
@@ -3009,6 +3006,26 @@ pub(super) fn handle_resolution_choice(
                         .filter_map(|event| match event {
                             GameEvent::PermanentSacrificed { object_id, .. } => Some(*object_id),
                             _ => None,
+                        })
+                        .collect()
+                } else if matches!(effect_kind, EffectKind::PutAtLibraryPosition)
+                    && matches!(library_position, Some(LibraryPosition::Bottom))
+                    && state.pending_continuation.is_some()
+                {
+                    // CR 608.2c: Expressive Iteration's bottom pick narrows the
+                    // tracked set to the remaining looked-at library cards so the
+                    // chained exile step cannot re-select the bottomed card.
+                    state
+                        .chain_tracked_set_id
+                        .and_then(|id| state.tracked_object_sets.get(&id).cloned())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|id| !chosen.contains(id))
+                        .filter(|id| {
+                            state
+                                .objects
+                                .get(id)
+                                .is_some_and(|obj| obj.zone == Zone::Library)
                         })
                         .collect()
                 } else {

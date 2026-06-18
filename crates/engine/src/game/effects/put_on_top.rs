@@ -43,8 +43,13 @@ pub fn resolve(
     // This is the post-#323 SelfRef short-circuit applied uniformly.
     let effective_targets =
         crate::game::targeting::resolved_targets(ability, &target_filter, state);
-    let mut collected_targets =
-        crate::game::effects::effect_object_targets(&target_filter, &effective_targets);
+    // CR 608.2c: `effect_object_targets` forwards `ability.targets` verbatim
+    // for non-slot filters. A dig hand-keep binds `ParentTarget` on the exile
+    // tail but must not pre-fill a `TrackedSet` bottom pick with the kept card.
+    let mut collected_targets = match &target_filter {
+        TargetFilter::TrackedSet { .. } | TargetFilter::TrackedSetFiltered { .. } => Vec::new(),
+        _ => crate::game::effects::effect_object_targets(&target_filter, &effective_targets),
+    };
     if collected_targets.is_empty() && matches!(target_filter, TargetFilter::ExiledBySource) {
         let ctx = crate::game::filter::FilterContext::from_ability(ability);
         collected_targets = state

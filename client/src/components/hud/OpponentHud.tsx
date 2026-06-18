@@ -14,7 +14,7 @@ import { getOpponentDisplayName, useMultiplayerStore } from "../../stores/multip
 import { usePreferencesStore } from "../../stores/preferencesStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
 import { partitionByType } from "../../viewmodel/battlefieldProps.ts";
-import { isOneOnOne, resolveFocusedOpponent } from "../../viewmodel/gameStateView.ts";
+import { getOpponentIds, isOneOnOne, resolveFocusedOpponent } from "../../viewmodel/gameStateView.ts";
 import { LifeTotal } from "../controls/LifeTotal.tsx";
 import { ManaPoolSummary } from "./ManaPoolSummary.tsx";
 import { ScoreBadge } from "../draft/ScoreBadge.tsx";
@@ -66,7 +66,7 @@ export function OpponentHud({ opponentName, onKickPlayer }: OpponentHudProps) {
   }, [gameState, playerId]);
 
   const eliminated = gameState?.eliminated_players ?? [];
-  const liveOpponents = allOpponents.filter((id) => !eliminated.includes(id));
+  const liveOpponents = useMemo(() => getOpponentIds(gameState, playerId), [gameState, playerId]);
   // Routed through `isOneOnOne` so this can't drift from GameBoard's
   // layout decision — the bug that motivated the helper was exactly
   // those two derivations disagreeing after an elimination. The

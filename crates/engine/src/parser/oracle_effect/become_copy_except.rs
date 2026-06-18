@@ -67,7 +67,7 @@ use std::str::FromStr;
 
 use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
-use nom::bytes::complete::tag;
+use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::char;
 use nom::combinator::{opt, value};
 use nom::Parser;
@@ -637,19 +637,22 @@ fn parse_has_this_ability<'a>(
 /// bodies — covers both the generic "other types" and the creature-specific
 /// "other creature types" phrasing (Sakashima's Student class).
 fn split_in_addition_type_suffix(input: &str) -> Option<(&str, &str)> {
-    const SUFFIXES: &[&str] = &[
-        " in addition to its other creature types",
-        " in addition to its other types",
-        " in addition to his other creature types",
-        " in addition to her other creature types",
-        " in addition to his other types",
-        " in addition to her other types",
-    ];
-    SUFFIXES.iter().find_map(|suffix| {
-        input
-            .strip_suffix(suffix)
-            .map(|type_word| (type_word.trim(), ""))
-    })
+    let in_addition_suffix = (
+        tag::<_, _, OracleError<'_>>(" in addition to "),
+        alt((
+            tag("its"),
+            tag("their"),
+            tag("his"),
+            tag("her"),
+        )),
+        tag(" other "),
+        opt(tag("creature ")),
+        tag("types"),
+    );
+    let (rest, (type_word, _)) = (take_until(" in addition to "), in_addition_suffix)
+        .parse(input)
+        .ok()?;
+    Some((type_word.trim(), rest))
 }
 
 /// CR 707.9b + CR 205.1b: "it's a(n) {type_word} in addition to its other

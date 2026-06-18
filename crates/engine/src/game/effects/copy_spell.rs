@@ -601,7 +601,6 @@ fn spell_ability_definition(abilities: &[AbilityDefinition]) -> Option<AbilityDe
     abilities
         .iter()
         .find(|ability| ability.kind == AbilityKind::Spell)
-        .or_else(|| abilities.first())
         .cloned()
 }
 

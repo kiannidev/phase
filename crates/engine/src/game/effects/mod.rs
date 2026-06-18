@@ -1161,7 +1161,8 @@ fn stack_pushed_object_context_from_events(
         }
         _ => None,
     });
-    pushed.next()
+    let first = pushed.next()?;
+    pushed.next().is_none().then_some(first)
 }
 
 /// CR 608.2c + CR 608.2h + CR 701.20b: A `reveal` instruction introduces an

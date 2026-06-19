@@ -758,13 +758,66 @@ fn try_parse_when_next_event(tp: TextPair) -> Option<ParsedEffectClause> {
     })
 }
 
+/// CR 603.7: Parse "copy the next [type] spell you cast this turn when you cast it"
+/// — a one-shot delayed trigger that copies the next matching spell at cast time.
+/// Tzaangor Shaman (issue #1191) uses this wording instead of "when you next cast …".
+fn try_parse_copy_next_spell_when_cast(tp: TextPair) -> Option<ParsedEffectClause> {
+    use crate::types::ability::CopyRetargetPermission;
+    use crate::types::triggers::TriggerMode;
+
+    const PREFIX: &str = "copy the next ";
+    if !tp.lower.starts_with(PREFIX) {
+        return None;
+    }
+    const SUFFIX: &str = " you cast this turn when you cast it";
+    let rest = &tp.lower[PREFIX.len()..];
+    let spell_part_end = rest.find(SUFFIX)?;
+    let spell_part = rest[..spell_part_end].trim();
+    let combined_filter = extract_when_next_spell_filter(spell_part)?;
+
+    let after_suffix_idx = PREFIX.len() + spell_part_end + SUFFIX.len();
+    let remainder = tp.original.get(after_suffix_idx..).unwrap_or("").trim();
+    let remainder_for_retarget = remainder
+        .trim_start_matches(|c: char| c == '.' || c.is_whitespace())
+        .to_lowercase();
+    let retarget = if remainder_for_retarget.is_empty() {
+        CopyRetargetPermission::KeepOriginalTargets
+    } else if crate::parser::oracle_effect::sequence::recognize_copy_retarget_clause(
+        &remainder_for_retarget,
+    ) {
+        CopyRetargetPermission::MayChooseNewTargets
+    } else {
+        return None;
+    };
+
+    let inner = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::CopySpell {
+            target: TargetFilter::TriggeringSource,
+            retarget,
+            copier: None,
+            additional_modifications: Vec::new(),
+            starting_loyalty_from_casualty_sacrifice: false,
+        },
+    );
+
+    Some(build_when_next_delayed_trigger(
+        TriggerMode::SpellCast,
+        combined_filter,
+        inner,
+        None,
+    ))
+}
+
 pub(crate) fn try_parse_temporal_delayed_trigger_ability(
     text: &str,
     kind: AbilityKind,
 ) -> Option<AbilityDefinition> {
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
-    let clause = try_parse_whenever_this_turn(tp).or_else(|| try_parse_when_next_event(tp))?;
+    let clause = try_parse_whenever_this_turn(tp)
+        .or_else(|| try_parse_when_next_event(tp))
+        .or_else(|| try_parse_copy_next_spell_when_cast(tp))?;
     Some(ability_definition_from_clause(kind, clause))
 }
 
@@ -4694,6 +4747,11 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
 
     // CR 603.7: "When you next cast a [type] spell this turn, ..." — one-shot delayed trigger.
     if let Some(clause) = try_parse_when_next_event(tp) {
+        return clause;
+    }
+
+    // CR 603.7: "Copy the next [type] spell you cast this turn when you cast it."
+    if let Some(clause) = try_parse_copy_next_spell_when_cast(tp) {
         return clause;
     }
 
@@ -27734,6 +27792,42 @@ mod tests {
                 }
             ),
             "expected inner CopySpell with MayChooseNewTargets, got {:?}",
+            inner.effect
+        );
+    }
+
+    /// CR 603.7 (issue #1191): Tzaangor Shaman — "copy the next instant or
+    /// sorcery spell you cast this turn when you cast it" must install a
+    /// one-shot delayed trigger, not a combat-damage CopySpell.
+    #[test]
+    fn effect_tzaangor_copy_next_spell_when_cast() {
+        let def = parse_effect_chain(
+            "Copy the next instant or sorcery spell you cast this turn when you cast it. \
+             You may choose new targets for the copy.",
+            AbilityKind::Spell,
+        );
+        let Effect::CreateDelayedTrigger {
+            condition,
+            effect: inner,
+            ..
+        } = &*def.effect
+        else {
+            panic!("expected CreateDelayedTrigger, got {:?}", def.effect);
+        };
+        let DelayedTriggerCondition::WhenNextEvent { trigger, .. } = condition else {
+            panic!("expected WhenNextEvent, got {condition:?}");
+        };
+        assert_eq!(trigger.mode, crate::types::triggers::TriggerMode::SpellCast);
+        assert!(
+            matches!(
+                *inner.effect,
+                Effect::CopySpell {
+                    target: TargetFilter::TriggeringSource,
+                    retarget: CopyRetargetPermission::MayChooseNewTargets,
+                    ..
+                }
+            ),
+            "expected inner CopySpell on triggering spell, got {:?}",
             inner.effect
         );
     }

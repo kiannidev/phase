@@ -139,7 +139,7 @@ describe("ActionButton", () => {
 
     render(<ActionButton />);
 
-    expect(screen.getByRole("button", { name: "Resolve" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Resolve Pass priority/ })).toBeInTheDocument();
   });
 
   it("shows blocker controls when turn decision controller differs from blocking player (issue #1199)", () => {

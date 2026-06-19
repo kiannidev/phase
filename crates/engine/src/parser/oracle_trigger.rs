@@ -38,8 +38,8 @@ use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, AbilityTag, AttachmentKind,
     AttackersDeclaredCountSubject, CastManaObjectScope, CastManaSpentMetric, CastVariantPaid,
     CoinFlipResult, Comparator, ControllerRef, CounterTriggerFilter, DamageKindFilter,
-    DestinationConstraint, Effect, FilterProp, ObjectScope, OriginConstraint, PlayerFilter,
-    PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, RenownSubject,
+    DestinationConstraint, Effect, FilterProp, ObjectScope, OriginConstraint, ParsedCondition,
+    PlayerFilter, PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, RenownSubject,
     SacrificeAggregateStat, SacrificeCost, SacrificeRequirement, StaticCondition, TargetFilter,
     TriggerCondition, TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter,
     UnlessPayModifier, ZoneChangeClause,
@@ -3317,6 +3317,9 @@ fn extract_if_condition(text: &str) -> (String, Option<TriggerCondition>) {
     // parsed predicate in `Not`. Cost-form `unless` ("unless you pay {2}",
     // "unless you sacrifice a creature") is already stripped upstream by
     // `extract_unless_pay_modifier`.
+    if let Some(result) = try_extract_spell_targets_intervening_if(&tp, &lower, text) {
+        return result;
+    }
     if let Some(result) = try_extract_intervening(
         &tp,
         &lower,
@@ -3775,6 +3778,30 @@ enum PostEffectPolicy {
 ///   instead. Re-homeability is decided by `condition_text_is_rehomeable`.
 /// - `PostEffectPolicy::AlwaysHoist` (the `unless` path): always hoist. There
 ///   is no reachable downstream re-homer for `unless`.
+fn try_extract_spell_targets_intervening_if(
+    tp: &TextPair<'_>,
+    lower: &str,
+    text: &str,
+) -> Option<(String, Option<TriggerCondition>)> {
+    let pos = tp.find("if ")?;
+    // CR 603.4: only a leading intervening-if immediately after the trigger event.
+    if !lower[..pos].trim().is_empty() {
+        return None;
+    }
+    let cond_fragment = text[pos + 3..].trim_end_matches('.').trim();
+    let comma_end = cond_fragment.find(',').unwrap_or(cond_fragment.len());
+    let cond_core = cond_fragment[..comma_end].trim();
+    let ParsedCondition::SpellTargetsFilter { filter } =
+        crate::parser::oracle_condition::parse_spell_targets_filter(cond_core)?
+    else {
+        return None;
+    };
+    Some((
+        strip_condition_clause(text, pos, 3 + comma_end),
+        Some(TriggerCondition::TriggeringSpellTargetsFilter { filter }),
+    ))
+}
+
 fn try_extract_intervening(
     tp: &TextPair<'_>,
     lower: &str,

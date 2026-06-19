@@ -1382,6 +1382,71 @@ pub(crate) fn triggering_spell_targets_filter(
         .any(|target| target_ref_matches_spell_targets_filter(state, spell_id, target, filter))
 }
 
+/// CR 608.2c + CR 603.2 + CR 603.4: Evaluate a spell-target intervening-if on a
+/// triggered ability. Like [`triggering_spell_targets_filter`], but excludes the
+/// trigger source when the filter uses "other" (Orvar — "other permanents you
+/// control").
+pub(crate) fn triggering_spell_targets_filter_for_trigger(
+    state: &crate::types::game_state::GameState,
+    spell_id: crate::types::identifiers::ObjectId,
+    trigger_source: Option<crate::types::identifiers::ObjectId>,
+    filter: &crate::types::ability::TargetFilter,
+) -> bool {
+    use crate::types::ability::TargetRef;
+    use crate::types::events::GameEvent;
+    use crate::types::game_state::StackEntryKind;
+
+    let targets: Option<Vec<TargetRef>> = state
+        .stack
+        .iter()
+        .rev()
+        .find(|entry| entry.id == spell_id)
+        .and_then(|entry| match &entry.kind {
+            StackEntryKind::Spell {
+                ability: Some(resolved),
+                ..
+            } => Some(super::ability_utils::flatten_targets_in_chain(resolved)),
+            _ => None,
+        })
+        .or_else(|| {
+            state
+                .current_trigger_event
+                .as_ref()
+                .and_then(|event| match event {
+                    GameEvent::SpellCast { object_id, .. } if *object_id == spell_id => state
+                        .stack
+                        .iter()
+                        .rev()
+                        .find(|entry| entry.id == spell_id)
+                        .and_then(|entry| match &entry.kind {
+                            StackEntryKind::Spell {
+                                ability: Some(resolved),
+                                ..
+                            } => Some(super::ability_utils::flatten_targets_in_chain(resolved)),
+                            _ => None,
+                        }),
+                    _ => None,
+                })
+        });
+    let Some(targets) = targets else {
+        return false;
+    };
+    if targets.is_empty() {
+        return false;
+    }
+    targets.iter().any(|target| match target {
+        TargetRef::Object(object_id) => {
+            if trigger_source == Some(*object_id) {
+                return false;
+            }
+            target_ref_matches_spell_targets_filter(state, spell_id, target, filter)
+        }
+        TargetRef::Player(_) => {
+            target_ref_matches_spell_targets_filter(state, spell_id, target, filter)
+        }
+    })
+}
+
 /// CR 601.3d + CR 702.8a: Validate, post-target, that every target-dependent
 /// flash permission on the cast object is satisfied by the chosen targets in
 /// `ability`. Returns `Ok(())` when each `AsThoughHadFlash` option whose

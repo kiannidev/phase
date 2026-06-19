@@ -10,12 +10,12 @@ use engine::types::ability::{
     ContinuousModification, Effect, FilterProp, ResolvedAbility, TargetFilter, TargetRef,
     TypeFilter, TypedFilter,
 };
-use engine::types::keywords::Keyword;
-use engine::types::statics::StaticMode;
 use engine::types::actions::{DebugAction, GameAction};
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
+use engine::types::keywords::Keyword;
 use engine::types::phase::Phase;
+use engine::types::statics::StaticMode;
 use engine::types::zones::{EtbTapState, Zone};
 
 const RHYTHM_OF_THE_WILD: &str = "Creature spells you control can't be countered.\n\
@@ -115,7 +115,9 @@ fn rhythm_of_the_wild_grants_riot_on_library_to_battlefield_put() {
             .state()
             .objects
             .get(&wurm)
-            .and_then(|o| o.counters.get(&engine::types::counter::CounterType::Plus1Plus1))
+            .and_then(|o| o
+                .counters
+                .get(&engine::types::counter::CounterType::Plus1Plus1))
             .copied(),
         Some(1),
         "accepting Riot should make the creature enter with a +1/+1 counter"
@@ -150,12 +152,7 @@ fn atla_egg_trigger_puts_creature_with_rhythm_of_the_wild_riot() {
         .objects
         .iter()
         .find(|(_, obj)| {
-            obj.zone == Zone::Battlefield
-                && obj
-                    .card_types
-                    .subtypes
-                    .iter()
-                    .any(|s| s == "Egg")
+            obj.zone == Zone::Battlefield && obj.card_types.subtypes.iter().any(|s| s == "Egg")
         })
         .map(|(id, _)| *id)
         .expect("Atla activation should create an Egg token");
@@ -200,7 +197,9 @@ fn rhythm_of_the_wild_oracle_parses_cant_be_countered_and_riot_grant() {
     match cant_counter.affected.as_ref() {
         Some(TargetFilter::Typed(TypedFilter { type_filters, .. })) => {
             assert!(
-                type_filters.iter().any(|t| matches!(t, TypeFilter::Creature)),
+                type_filters
+                    .iter()
+                    .any(|t| matches!(t, TypeFilter::Creature)),
                 "cant-be-countered subject must be creature spells"
             );
         }
@@ -265,12 +264,7 @@ fn cast_rhythm_of_the_wild_then_atla_egg_trigger_still_gets_riot() {
         .objects
         .iter()
         .find(|(_, obj)| {
-            obj.zone == Zone::Battlefield
-                && obj
-                    .card_types
-                    .subtypes
-                    .iter()
-                    .any(|s| s == "Egg")
+            obj.zone == Zone::Battlefield && obj.card_types.subtypes.iter().any(|s| s == "Egg")
         })
         .map(|(id, _)| *id)
         .expect("Atla activation should create an Egg token");

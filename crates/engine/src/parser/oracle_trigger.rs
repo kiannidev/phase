@@ -3800,12 +3800,9 @@ fn try_extract_spell_targets_intervening_if(
 /// CR 603.4: Leading `if <spell-targets-filter>,` intervening-if on a trigger.
 fn parse_leading_spell_targets_if_clause(input: &str) -> Option<(&str, TargetFilter)> {
     let (after_if, _) = tag::<_, _, OracleError<'_>>("if ").parse(input).ok()?;
-    let (rest, cond_part) = terminated(
-        take_until::<_, _, OracleError<'_>>(","),
-        tag(","),
-    )
-    .parse(after_if)
-    .ok()?;
+    let (rest, cond_part) = terminated(take_until::<_, _, OracleError<'_>>(","), tag(","))
+        .parse(after_if)
+        .ok()?;
     let cond_core = cond_part.trim().trim_end_matches('.').trim();
     let ParsedCondition::SpellTargetsFilter { filter } =
         crate::parser::oracle_condition::parse_spell_targets_filter(cond_core)?

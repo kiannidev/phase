@@ -112,4 +112,26 @@ describe("ActionButton", () => {
     expect(screen.getByRole("button", { name: "Block with None" })).toBeInTheDocument();
     expect(screen.queryByText("Auto-Passing to End Step...")).not.toBeInTheDocument();
   });
+
+  it("shows resolve when turn decision controller differs from priority player (issue #1218)", () => {
+    useGameStore.setState({
+      gameMode: "online",
+      gameState: {
+        ...createGameState({
+          type: "Priority",
+          data: { player: 0 },
+        }),
+        turn_decision_controller: 1,
+        active_player: 0,
+        stack: [{ object_id: 1, card_id: 1, controller: 0, owner: 0 }],
+      },
+      waitingFor: { type: "Priority", data: { player: 0 } },
+      legalActions: [],
+    });
+    useMultiplayerStore.setState({ activePlayerId: 1, actionPending: false });
+
+    render(<ActionButton />);
+
+    expect(screen.getByRole("button", { name: "Resolve" })).toBeInTheDocument();
+  });
 });

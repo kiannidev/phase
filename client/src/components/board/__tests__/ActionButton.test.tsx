@@ -112,4 +112,27 @@ describe("ActionButton", () => {
     expect(screen.getByRole("button", { name: "Block with None" })).toBeInTheDocument();
     expect(screen.queryByText("Auto-Passing to End Step...")).not.toBeInTheDocument();
   });
+
+  it("shows blocker controls when turn decision controller differs from blocking player (issue #1199)", () => {
+    useGameStore.setState({
+      gameMode: "online",
+      gameState: createGameState(blockerPrompt()),
+      waitingFor: blockerPrompt(),
+      legalActions: [],
+    });
+    useGameStore.setState((state) => ({
+      gameState: state.gameState
+        ? {
+            ...state.gameState,
+            turn_decision_controller: 1,
+            active_player: 0,
+          }
+        : state.gameState,
+    }));
+    useMultiplayerStore.setState({ activePlayerId: 1, actionPending: false });
+
+    render(<ActionButton />);
+
+    expect(screen.getByRole("button", { name: "Block with None" })).toBeInTheDocument();
+  });
 });

@@ -3779,27 +3779,40 @@ enum PostEffectPolicy {
 /// - `PostEffectPolicy::AlwaysHoist` (the `unless` path): always hoist. There
 ///   is no reachable downstream re-homer for `unless`.
 fn try_extract_spell_targets_intervening_if(
-    tp: &TextPair<'_>,
+    _tp: &TextPair<'_>,
     lower: &str,
     text: &str,
 ) -> Option<(String, Option<TriggerCondition>)> {
-    let pos = tp.find("if ")?;
-    // CR 603.4: only a leading intervening-if immediately after the trigger event.
-    if !lower[..pos].trim().is_empty() {
-        return None;
-    }
-    let cond_fragment = text[pos + 3..].trim_end_matches('.').trim();
-    let comma_end = cond_fragment.find(',').unwrap_or(cond_fragment.len());
-    let cond_core = cond_fragment[..comma_end].trim();
+    let lower_trim = lower.trim();
+    let text_trim = text.trim();
+    let leading_skip = text.len() - text_trim.len();
+
+    let (rest_lower, filter) = parse_leading_spell_targets_if_clause(lower_trim)?;
+    let consumed = lower_trim.len() - rest_lower.len();
+    let remaining = text[leading_skip + consumed..].trim_start();
+
+    Some((
+        remaining.to_string(),
+        Some(TriggerCondition::TriggeringSpellTargetsFilter { filter }),
+    ))
+}
+
+/// CR 603.4: Leading `if <spell-targets-filter>,` intervening-if on a trigger.
+fn parse_leading_spell_targets_if_clause(input: &str) -> Option<(&str, TargetFilter)> {
+    let (after_if, _) = tag::<_, _, OracleError<'_>>("if ").parse(input).ok()?;
+    let (rest, cond_part) = terminated(
+        take_until::<_, _, OracleError<'_>>(","),
+        tag(","),
+    )
+    .parse(after_if)
+    .ok()?;
+    let cond_core = cond_part.trim().trim_end_matches('.').trim();
     let ParsedCondition::SpellTargetsFilter { filter } =
         crate::parser::oracle_condition::parse_spell_targets_filter(cond_core)?
     else {
         return None;
     };
-    Some((
-        strip_condition_clause(text, pos, 3 + comma_end),
-        Some(TriggerCondition::TriggeringSpellTargetsFilter { filter }),
-    ))
+    Some((rest, filter))
 }
 
 fn try_extract_intervening(

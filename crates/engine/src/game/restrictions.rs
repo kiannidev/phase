@@ -1307,7 +1307,7 @@ fn target_filter_accepts_player(filter: &crate::types::ability::TargetFilter) ->
 
 fn target_ref_matches_spell_targets_filter(
     state: &crate::types::game_state::GameState,
-    spell_id: crate::types::identifiers::ObjectId,
+    context_source_id: crate::types::identifiers::ObjectId,
     target: &crate::types::ability::TargetRef,
     filter: &crate::types::ability::TargetFilter,
 ) -> bool {
@@ -1315,7 +1315,7 @@ fn target_ref_matches_spell_targets_filter(
     match target {
         TargetRef::Player(_) => target_filter_accepts_player(filter),
         TargetRef::Object(object_id) => {
-            let ctx = super::filter::FilterContext::from_source(state, spell_id);
+            let ctx = super::filter::FilterContext::from_source(state, context_source_id);
             match filter {
                 TargetFilter::Player => false,
                 TargetFilter::Or { filters } => filters.iter().any(|branch| match branch {
@@ -1328,122 +1328,65 @@ fn target_ref_matches_spell_targets_filter(
     }
 }
 
+fn spell_cast_targets(
+    state: &crate::types::game_state::GameState,
+    spell_id: crate::types::identifiers::ObjectId,
+) -> Option<Vec<crate::types::ability::TargetRef>> {
+    use crate::types::events::GameEvent;
+    use crate::types::game_state::StackEntryKind;
+
+    state
+        .stack
+        .iter()
+        .rev()
+        .find(|entry| entry.id == spell_id)
+        .and_then(|entry| match &entry.kind {
+            StackEntryKind::Spell {
+                ability: Some(resolved),
+                ..
+            } => Some(super::ability_utils::flatten_targets_in_chain(resolved)),
+            _ => None,
+        })
+        .or_else(|| {
+            state
+                .current_trigger_event
+                .as_ref()
+                .and_then(|event| match event {
+                    GameEvent::SpellCast { object_id, .. } if *object_id == spell_id => state
+                        .stack
+                        .iter()
+                        .rev()
+                        .find(|entry| entry.id == spell_id)
+                        .and_then(|entry| match &entry.kind {
+                            StackEntryKind::Spell {
+                                ability: Some(resolved),
+                                ..
+                            } => Some(super::ability_utils::flatten_targets_in_chain(resolved)),
+                            _ => None,
+                        }),
+                    _ => None,
+                })
+        })
+        .filter(|targets| !targets.is_empty())
+}
+
 /// CR 608.2c + CR 603.2: Evaluate `TriggeringSpellTargetsFilter` against the
 /// triggering spell's committed targets at resolution time.
+///
+/// `context_source_id` scopes filter-relative terms like `FilterProp::Another`:
+/// use the triggering spell id for `AbilityCondition`, and the trigger source id
+/// for `TriggerCondition` (Orvar — "other permanents you control").
 pub(crate) fn triggering_spell_targets_filter(
     state: &crate::types::game_state::GameState,
     spell_id: crate::types::identifiers::ObjectId,
     filter: &crate::types::ability::TargetFilter,
+    context_source_id: crate::types::identifiers::ObjectId,
 ) -> bool {
-    use crate::types::ability::TargetRef;
-    use crate::types::events::GameEvent;
-    use crate::types::game_state::StackEntryKind;
-
-    let targets: Option<Vec<TargetRef>> = state
-        .stack
-        .iter()
-        .rev()
-        .find(|entry| entry.id == spell_id)
-        .and_then(|entry| match &entry.kind {
-            StackEntryKind::Spell {
-                ability: Some(resolved),
-                ..
-            } => Some(super::ability_utils::flatten_targets_in_chain(resolved)),
-            _ => None,
-        })
-        .or_else(|| {
-            state
-                .current_trigger_event
-                .as_ref()
-                .and_then(|event| match event {
-                    GameEvent::SpellCast { object_id, .. } if *object_id == spell_id => state
-                        .stack
-                        .iter()
-                        .rev()
-                        .find(|entry| entry.id == spell_id)
-                        .and_then(|entry| match &entry.kind {
-                            StackEntryKind::Spell {
-                                ability: Some(resolved),
-                                ..
-                            } => Some(super::ability_utils::flatten_targets_in_chain(resolved)),
-                            _ => None,
-                        }),
-                    _ => None,
-                })
-        });
-    let Some(targets) = targets else {
+    let Some(targets) = spell_cast_targets(state, spell_id) else {
         return false;
     };
-    if targets.is_empty() {
-        return false;
-    }
-    targets
-        .iter()
-        .any(|target| target_ref_matches_spell_targets_filter(state, spell_id, target, filter))
-}
-
-/// CR 608.2c + CR 603.2 + CR 603.4: Evaluate a spell-target intervening-if on a
-/// triggered ability. Like [`triggering_spell_targets_filter`], but excludes the
-/// trigger source when the filter uses "other" (Orvar — "other permanents you
-/// control").
-pub(crate) fn triggering_spell_targets_filter_for_trigger(
-    state: &crate::types::game_state::GameState,
-    spell_id: crate::types::identifiers::ObjectId,
-    trigger_source: Option<crate::types::identifiers::ObjectId>,
-    filter: &crate::types::ability::TargetFilter,
-) -> bool {
-    use crate::types::ability::TargetRef;
-    use crate::types::events::GameEvent;
-    use crate::types::game_state::StackEntryKind;
-
-    let targets: Option<Vec<TargetRef>> = state
-        .stack
-        .iter()
-        .rev()
-        .find(|entry| entry.id == spell_id)
-        .and_then(|entry| match &entry.kind {
-            StackEntryKind::Spell {
-                ability: Some(resolved),
-                ..
-            } => Some(super::ability_utils::flatten_targets_in_chain(resolved)),
-            _ => None,
-        })
-        .or_else(|| {
-            state
-                .current_trigger_event
-                .as_ref()
-                .and_then(|event| match event {
-                    GameEvent::SpellCast { object_id, .. } if *object_id == spell_id => state
-                        .stack
-                        .iter()
-                        .rev()
-                        .find(|entry| entry.id == spell_id)
-                        .and_then(|entry| match &entry.kind {
-                            StackEntryKind::Spell {
-                                ability: Some(resolved),
-                                ..
-                            } => Some(super::ability_utils::flatten_targets_in_chain(resolved)),
-                            _ => None,
-                        }),
-                    _ => None,
-                })
-        });
-    let Some(targets) = targets else {
-        return false;
-    };
-    if targets.is_empty() {
-        return false;
-    }
-    targets.iter().any(|target| match target {
-        TargetRef::Object(object_id) => {
-            if trigger_source == Some(*object_id) {
-                return false;
-            }
-            target_ref_matches_spell_targets_filter(state, spell_id, target, filter)
-        }
-        TargetRef::Player(_) => {
-            target_ref_matches_spell_targets_filter(state, spell_id, target, filter)
-        }
+    targets.iter().any(|target| {
+        target_ref_matches_spell_targets_filter(state, context_source_id, target, filter)
     })
 }
 

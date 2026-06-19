@@ -3,7 +3,7 @@ use std::str::FromStr;
 use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
-use nom::combinator::{all_consuming, value};
+use nom::combinator::{all_consuming, opt, value};
 use nom::sequence::terminated;
 use nom::Parser;
 
@@ -1203,10 +1203,12 @@ pub(crate) fn parse_spell_targets_filter(text: &str) -> Option<ParsedCondition> 
     }
     // CR 115.9b: "one or more" is redundant with .any() semantics (Orvar — "if it
     // targets one or more other permanents you control").
-    let rest = rest
-        .strip_prefix("one or more ")
-        .or_else(|| rest.strip_prefix("one or more"))
-        .unwrap_or(rest);
+    let (rest, _) = opt(alt((
+        tag::<_, _, OracleError<'_>>("one or more "),
+        tag("one or more"),
+    )))
+    .parse(rest)
+    .ok()?;
     let (filter, remainder) = parse_type_phrase(rest);
     if !remainder.trim().is_empty() {
         return None;

@@ -5359,8 +5359,12 @@ pub(crate) fn check_trigger_condition(
                 _ => None,
             })
             .is_some_and(|spell_id| {
-                super::restrictions::triggering_spell_targets_filter_for_trigger(
-                    state, spell_id, source_id, filter,
+                let context_source_id = source_id.unwrap_or(spell_id);
+                super::restrictions::triggering_spell_targets_filter(
+                    state,
+                    spell_id,
+                    filter,
+                    context_source_id,
                 )
             }),
     }

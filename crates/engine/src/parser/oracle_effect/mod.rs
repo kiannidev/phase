@@ -56,15 +56,15 @@ pub(crate) use self::token::parse_token_description;
 
 use std::str::FromStr;
 
-use crate::parser::oracle_nom::error::OracleError;
+use crate::parser::oracle_nom::error::{oracle_err, OracleError};
 #[cfg(test)]
 use crate::parser::oracle_trigger::parse_trigger_line;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
-use nom::character::complete::{anychar, multispace1, space1};
+use nom::character::complete::{anychar, multispace0, multispace1, space1};
 use nom::combinator::{all_consuming, eof, map, not, opt, peek, recognize, rest, value};
 use nom::multi::{many1, separated_list1};
-use nom::sequence::{preceded, terminated};
+use nom::sequence::{pair, preceded, terminated};
 use nom::Parser;
 
 use super::oracle_nom::bridge::nom_on_lower;
@@ -91,8 +91,8 @@ use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
     BounceSelection, CardPlayMode, CastPermissionConstraint, CastingPermission, ChoiceType,
     ChooseFromZoneConstraint, Chooser, CombatDamageScope, Comparator, ConjureCard, ConjureSource,
-    ContinuousModification, ControllerRef, DamageModification, DamageSource,
-    DelayedTriggerCondition, DoubleTarget, Duration, Effect, EffectScope, FilterProp,
+    ContinuousModification, ControllerRef, CopyRetargetPermission, DamageModification,
+    DamageSource, DelayedTriggerCondition, DoubleTarget, Duration, Effect, EffectScope, FilterProp,
     GameRestriction, IntensityScope, IterationKindBinding, LibraryPosition, ManaProduction,
     ManaSpendPermission, MultiTargetSpec, ObjectProperty, ObjectScope, OriginConstraint,
     PlayerFilter, PlayerRelation, PlayerScope, PreventionAmount, PreventionScope,
@@ -758,37 +758,46 @@ fn try_parse_when_next_event(tp: TextPair) -> Option<ParsedEffectClause> {
     })
 }
 
+/// CR 603.7: nom body for "copy the next [type] spell you cast this turn when
+/// you cast it[, optionally with copy retarget permission]".
+fn parse_copy_next_spell_when_cast_body(
+    input: &str,
+) -> OracleResult<'_, (TargetFilter, CopyRetargetPermission)> {
+    let (rest, spell_part) = preceded(
+        tag("copy the next "),
+        take_until(" you cast this turn when you cast it"),
+    )
+    .parse(input)?;
+    let (rest, _) = tag(" you cast this turn when you cast it").parse(rest)?;
+
+    let filter =
+        extract_when_next_spell_filter(spell_part.trim()).ok_or_else(|| oracle_err(spell_part))?;
+
+    let (rest, retarget) = alt((
+        map(
+            preceded(
+                pair(multispace0, opt(preceded(multispace0, tag(".")))),
+                all_consuming(sequence::parse_copy_retarget_clause),
+            ),
+            |_| CopyRetargetPermission::MayChooseNewTargets,
+        ),
+        value(
+            CopyRetargetPermission::KeepOriginalTargets,
+            all_consuming(eof),
+        ),
+    ))
+    .parse(rest)?;
+
+    Ok((rest, (filter, retarget)))
+}
+
 /// CR 603.7: Parse "copy the next [type] spell you cast this turn when you cast it"
 /// — a one-shot delayed trigger that copies the next matching spell at cast time.
 /// Tzaangor Shaman (issue #1191) uses this wording instead of "when you next cast …".
 fn try_parse_copy_next_spell_when_cast(tp: TextPair) -> Option<ParsedEffectClause> {
-    use crate::types::ability::CopyRetargetPermission;
-    use crate::types::triggers::TriggerMode;
-
-    const PREFIX: &str = "copy the next ";
-    if !tp.lower.starts_with(PREFIX) {
-        return None;
-    }
-    const SUFFIX: &str = " you cast this turn when you cast it";
-    let rest = &tp.lower[PREFIX.len()..];
-    let spell_part_end = rest.find(SUFFIX)?;
-    let spell_part = rest[..spell_part_end].trim();
-    let combined_filter = extract_when_next_spell_filter(spell_part)?;
-
-    let after_suffix_idx = PREFIX.len() + spell_part_end + SUFFIX.len();
-    let remainder = tp.original.get(after_suffix_idx..).unwrap_or("").trim();
-    let remainder_for_retarget = remainder
-        .trim_start_matches(|c: char| c == '.' || c.is_whitespace())
-        .to_lowercase();
-    let retarget = if remainder_for_retarget.is_empty() {
-        CopyRetargetPermission::KeepOriginalTargets
-    } else if crate::parser::oracle_effect::sequence::recognize_copy_retarget_clause(
-        &remainder_for_retarget,
-    ) {
-        CopyRetargetPermission::MayChooseNewTargets
-    } else {
-        return None;
-    };
+    let (_, (combined_filter, retarget)) = all_consuming(parse_copy_next_spell_when_cast_body)
+        .parse(tp.lower)
+        .ok()?;
 
     let inner = AbilityDefinition::new(
         AbilityKind::Spell,

@@ -43,7 +43,8 @@ fn assault_formation_assigns_combat_damage_from_toughness() {
     run_combat(&mut runner, vec![attacker], vec![]);
 
     assert_eq!(
-        runner.state().players[P1.0 as usize].life, 16,
+        runner.state().players[P1.0 as usize].life,
+        16,
         "1/4 attacker should deal 4 combat damage under Assault Formation"
     );
 }
@@ -58,10 +59,7 @@ fn assault_formation_green_ability_lets_defender_attack_for_toughness_damage() {
         .as_enchantment()
         .from_oracle_text(ASSAULT_FORMATION_ORACLE)
         .id();
-    let defender = scenario
-        .add_creature(P0, "Wall", 0, 4)
-        .defender()
-        .id();
+    let defender = scenario.add_creature(P0, "Wall", 0, 4).defender().id();
 
     let mut runner = scenario.build();
     runner.state_mut().players[P0.0 as usize]
@@ -88,7 +86,8 @@ fn assault_formation_green_ability_lets_defender_attack_for_toughness_damage() {
     run_combat(&mut runner, vec![defender], vec![]);
 
     assert_eq!(
-        runner.state().players[P1.0 as usize].life, 16,
+        runner.state().players[P1.0 as usize].life,
+        16,
         "0/4 defender should deal 4 combat damage after paying green"
     );
 }
@@ -101,7 +100,11 @@ fn assault_formation_static_parses_assign_damage_from_toughness() {
     let defs = parse_static_line_multi(
         "Each creature you control assigns combat damage equal to its toughness rather than its power.",
     );
-    assert_eq!(defs.len(), 1, "expected one continuous static, got {defs:?}");
+    assert_eq!(
+        defs.len(),
+        1,
+        "expected one continuous static, got {defs:?}"
+    );
     assert!(
         defs[0]
             .modifications

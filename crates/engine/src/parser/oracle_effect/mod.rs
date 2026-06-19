@@ -50981,6 +50981,10 @@ mod tests {
         );
         assert_eq!(def.player_scope, Some(PlayerFilter::All));
         assert_eq!(def.starting_with, Some(ControllerRef::You));
+        assert!(
+            !def.optional,
+            "join-forces PayCost must not be optional at ability level"
+        );
 
         // Inner: Draw { count: Variable("X"), target: Controller }, player_scope = All.
         let sub = def.sub_ability.as_ref().expect("expected Draw sub_ability");
@@ -51209,6 +51213,10 @@ mod tests {
         ));
         assert_eq!(def.player_scope, Some(PlayerFilter::All));
         assert_eq!(def.starting_with, Some(ControllerRef::You));
+        assert!(
+            !def.optional,
+            "join-forces PayCost must not be optional at ability level"
+        );
     }
 
     // --- compound-subject-each object axis (CR 109.5 / 115.1 / 611.2c) ---

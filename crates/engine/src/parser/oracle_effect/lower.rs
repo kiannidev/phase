@@ -454,6 +454,18 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
                 ..
             }
         );
+        // CR 107.1c + CR 117.1: Join Forces' "each player may pay any amount
+        // of mana" is NOT an OptionalEffectChoice — the "may" only means each
+        // player may pay zero. PayAmountChoice (min=0) handles that; flagging
+        // the PayCost as optional would let a decline skip the mill/draw body.
+        let is_pay_any_amount_mana_cost = matches!(
+            &clause_ir.parsed.effect,
+            Effect::PayCost {
+                cost: AbilityCost::Mana { cost },
+                scale: None,
+                ..
+            } if crate::game::casting_costs::cost_has_x(cost)
+        );
         if clause_ir.is_optional
             && !matches!(&clause_ir.parsed.effect, Effect::SearchOutsideGame { .. })
             && !matches!(
@@ -461,6 +473,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
                 Effect::GrantCastingPermission { .. }
             )
             && !is_lingering_cast_from_zone
+            && !is_pay_any_amount_mana_cost
         {
             def.optional = true;
             def.optional_for = clause_ir.opponent_may_scope;
@@ -472,6 +485,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
                 Effect::GrantCastingPermission { .. }
             )
             && !is_lingering_cast_from_zone
+            && !is_pay_any_amount_mana_cost
         {
             def.optional = true;
         }

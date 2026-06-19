@@ -1550,17 +1550,18 @@ pub(super) fn handle_resolution_choice(
             // the kept subset; Expressive Iteration's bottom/exile tail binds the
             // unkept looked-at pile when its continuation chains
             // `PutAtLibraryPosition { TrackedSet }`.
-            let publish_set = if kept.is_empty() {
-                Vec::new()
-            } else if state.pending_continuation.as_ref().is_some_and(|cont| {
-                dig_continuation_needs_full_looked_at_tracked_set(&cont.chain)
-            }) {
-                // Expressive Iteration-style bottom/exile tail: downstream
-                // `TrackedSet` steps address the unkept looked-at pile only.
-                unkept.clone()
-            } else {
-                kept.clone()
-            };
+            let publish_set =
+                if kept.is_empty() {
+                    Vec::new()
+                } else if state.pending_continuation.as_ref().is_some_and(|cont| {
+                    dig_continuation_needs_full_looked_at_tracked_set(&cont.chain)
+                }) {
+                    // Expressive Iteration-style bottom/exile tail: downstream
+                    // `TrackedSet` steps address the unkept looked-at pile only.
+                    unkept.clone()
+                } else {
+                    kept.clone()
+                };
             effects::publish_fresh_tracked_set(state, publish_set);
             // None => Graveyard; map to a concrete zone so the rest mover
             // (shared with the search-split partition) has a single Zone.

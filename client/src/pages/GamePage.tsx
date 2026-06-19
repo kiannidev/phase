@@ -1200,23 +1200,27 @@ function GamePageContent({
             className="flex shrink-0 items-start gap-1.5 px-1 py-1"
             style={playerZoneRailStyle}
           >
-            <ExilePile
-              playerId={activeOpponentId}
-              size={pileSize}
-              onClick={() => setViewingZone({ zone: "exile", playerId: activeOpponentId })}
-            />
-            <LibraryPile
-              playerId={activeOpponentId}
-              size={pileSize}
-              onView={() => setViewingZone({ zone: "library", playerId: activeOpponentId })}
-            />
-            <GraveyardPile
-              playerId={activeOpponentId}
-              size={pileSize}
-              onClick={() =>
-                setViewingZone({ zone: "graveyard", playerId: activeOpponentId })
-              }
-            />
+            {activeOpponentId != null ? (
+              <>
+                <ExilePile
+                  playerId={activeOpponentId}
+                  size={pileSize}
+                  onClick={() => setViewingZone({ zone: "exile", playerId: activeOpponentId })}
+                />
+                <LibraryPile
+                  playerId={activeOpponentId}
+                  size={pileSize}
+                  onView={() => setViewingZone({ zone: "library", playerId: activeOpponentId })}
+                />
+                <GraveyardPile
+                  playerId={activeOpponentId}
+                  size={pileSize}
+                  onClick={() =>
+                    setViewingZone({ zone: "graveyard", playerId: activeOpponentId })
+                  }
+                />
+              </>
+            ) : null}
           </DraggableWidget>
         </div>
 

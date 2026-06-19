@@ -7483,6 +7483,13 @@ pub enum Effect {
     TimeTravel,
     /// CR 725.1: Become the monarch. Sets GameState::monarch to the controller.
     BecomeMonarch,
+    /// CR 101.3 + CR 608.2: An instruction with no game action — "there's no
+    /// effect." Used as the resolved outcome for a choice that has no printed
+    /// clause, e.g. the losing/unlisted option of a single-conditional
+    /// Will-of-the-council threshold vote ("If guilty gets more votes, X" —
+    /// the "innocent"/tied outcome does nothing). Resolving this emits only an
+    /// `EffectResolved` so the chain continues.
+    NoOp,
     Proliferate,
     /// CR 701.34a (operation) + CR 122.1: "For each kind of counter on target
     /// permanent or player, give that permanent or player another counter of
@@ -7546,6 +7553,19 @@ pub enum Effect {
         /// emits `EffectResolved` with no tally and the chain continues.
         #[serde(default = "default_voter_scope_all")]
         voter_scope: VoterScope,
+        /// CR 701.38a: How the tally maps to effects. The CR defines only the
+        /// vote *procedure* (each player chooses one listed option in turn
+        /// order); the strict-majority / tie-break semantics below are
+        /// card-defined ("If <B> gets more votes or the vote is tied, …").
+        /// `VoteTally::PerVote` (Council's-dilemma classics — Tivit, Capital
+        /// Punishment) resolves `per_choice_effect[i]` once per vote tallied
+        /// for `choices[i]`. `VoteTally::Threshold { tie_breaker_index }`
+        /// (Will-of-the-council — Plea for Power, Split Decision, Coercive
+        /// Portal, Trial of a Time Lord IV) resolves exactly ONE
+        /// `per_choice_effect` — the choice with the most votes, with ties
+        /// broken in favor of `tie_breaker_index` ("...or the vote is tied").
+        #[serde(default)]
+        tally_mode: VoteTally,
     },
     /// CR 700.3 + CR 608: Separate objects into two piles, have another player
     /// choose one of them, and apply a sub-effect to the chosen pile. The
@@ -8836,6 +8856,36 @@ pub enum Effect {
     Discover {
         mana_value_limit: QuantityExpr,
     },
+    /// Heist — designed-for-digital (MTG Arena) keyword action. NOT in the
+    /// Comprehensive Rules; operates per the Arena programmed rules (see
+    /// `docs/MagicCompRules.txt` — absent). Reminder text:
+    /// "Look at three random nonland cards from target opponent's library. Exile
+    /// one of them face down. You may cast that card for as long as it remains
+    /// exiled, and you may spend mana as though it were mana of any type to cast
+    /// that spell."
+    ///
+    /// This is the selection/look step: the resolver surfaces
+    /// `WaitingFor::ChooseFromZoneChoice` over `look_count` random nonland cards
+    /// from the targeted opponent's library and stashes an `Effect::HeistExile`
+    /// continuation. The chosen card is finalized by `HeistExile`; the unchosen
+    /// cards never leave the library. `target` is the targeted opponent player
+    /// (resolved from `ability.targets`).
+    Heist {
+        target: TargetFilter,
+        /// Number of random nonland cards to look at. Defaults to 3 per the
+        /// Arena reminder text; `serde(default)` keeps existing data loadable.
+        #[serde(default = "default_heist_look_count")]
+        look_count: u8,
+    },
+    /// Heist finalizer — continuation stashed by `Effect::Heist`. The chosen
+    /// card (carried on `ability.targets` by the `ChooseFromZoneChoice` answer
+    /// handler) is exiled from its owner's library, turned face down (CR 406.3),
+    /// linked to the source so the controller may look at it (mirrors Hideaway's
+    /// `ExileLinkKind::HideawayLookable`), and granted a permanent
+    /// `PlayFromExile` permission with any-type-or-color mana so it can be cast
+    /// for as long as it remains exiled. Unit variant — no fields; the target is
+    /// implicit in `ability.targets`.
+    HeistExile,
     /// CR 702.85a: Cascade — when you cast a spell with cascade, exile cards from
     /// the top of your library until you exile a nonland card whose mana value is
     /// less than the cascade spell's mana value. You may cast that card without
@@ -9446,6 +9496,11 @@ pub(crate) fn default_target_filter_any() -> TargetFilter {
     TargetFilter::Any
 }
 
+/// Default number of random nonland cards a Heist looks at (Arena reminder: 3).
+fn default_heist_look_count() -> u8 {
+    3
+}
+
 pub(crate) fn default_target_filter_permanent() -> TargetFilter {
     TargetFilter::Typed(TypedFilter::permanent())
 }
@@ -9689,6 +9744,38 @@ pub enum VoterScope {
     /// Pir's Whim, Khorvath's Fury, Regna's Sanction, Virtus's Maneuver,
     /// and Zndrsplt's Judgment.
     ControllerLabels,
+}
+
+/// CR 701.38a: How a completed `Effect::Vote` tally maps onto its
+/// `per_choice_effect` slots. CR 701.38 defines only the vote procedure; the
+/// strict-majority / tie-break outcome semantics below are card-defined, not a
+/// CR subrule.
+///
+/// `PerVote` is the Council's-dilemma family (Tivit, Capital Punishment,
+/// Expropriate, Emissary Green): every per-choice sub-effect resolves, fanning
+/// out once per vote (or once per voter / once aggregate) tallied for that
+/// choice. This is the historical `Effect::Vote` behavior and the serde
+/// default, so pre-existing serialized votes deserialize unchanged.
+///
+/// `Threshold` is the Will-of-the-council family (Plea for Power, Split
+/// Decision, Coercive Portal, Magister of Worth, Tyrant's Choice, Trial of a
+/// Time Lord IV): the players vote between two named outcomes and exactly ONE
+/// `per_choice_effect` resolves — the choice with strictly more votes. Ties
+/// resolve to `tie_breaker_index`, matching the Oracle phrasing "If <B> gets
+/// more votes **or the vote is tied**, <effect-B>".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "type")]
+pub enum VoteTally {
+    /// CR 701.38a: Every per-choice effect resolves, fanning out per the
+    /// tally for that choice. The historical default.
+    #[default]
+    PerVote,
+    /// CR 701.38a: The single winning choice's effect resolves once. The
+    /// strict-majority rule and tie behavior are card-defined (not a CR
+    /// subrule): on a tie, `tie_breaker_index` (the choice whose Oracle clause
+    /// reads "...or the vote is tied") wins. `u8` indexes `choices`; vote
+    /// cardinality is bounded by Magic card design.
+    Threshold { tie_breaker_index: u8 },
 }
 
 impl TargetFilter {
@@ -10017,6 +10104,9 @@ impl Effect {
             // resolution consistent.
             Effect::HideawayConceal { target } => Some(target),
 
+            // Heist targets the opponent whose library is heisted.
+            Effect::Heist { target, .. } => Some(target),
+
             // CR 109.4 + CR 115.1 + CR 707.2: `CopyTokenOf` has two
             // potentially-targetable axes — the copy *source* (`target`) and
             // the token *creator/owner* (`owner`). `target_filter()` surfaces
@@ -10149,6 +10239,7 @@ impl Effect {
             | Effect::Investigate
             | Effect::Tribute { .. }
             | Effect::BecomeMonarch
+            | Effect::NoOp
             | Effect::Proliferate
             | Effect::Populate
             | Effect::Clash
@@ -10181,6 +10272,7 @@ impl Effect {
             | Effect::GainEnergy { .. }
             | Effect::RevealUntil { .. }
             | Effect::Discover { .. }
+            | Effect::HeistExile
             | Effect::Cascade
             | Effect::Ripple { .. }
             | Effect::MiracleCast { .. }
@@ -10359,6 +10451,7 @@ impl Effect {
             | Effect::Tribute { .. }
             | Effect::TimeTravel
             | Effect::BecomeMonarch
+            | Effect::NoOp
             | Effect::Proliferate
             | Effect::ProliferateTarget { .. }
             | Effect::EndTheTurn
@@ -10430,6 +10523,8 @@ impl Effect {
             | Effect::CreateDelayedTrigger { .. }
             | Effect::CreateEmblem { .. }
             | Effect::Discover { .. }
+            | Effect::Heist { .. }
+            | Effect::HeistExile
             | Effect::DraftFromSpellbook { .. }
             | Effect::Endure { .. }
             | Effect::ExchangeControl { .. }
@@ -10561,6 +10656,7 @@ impl Effect {
             | Effect::Tribute { .. }
             | Effect::TimeTravel
             | Effect::BecomeMonarch
+            | Effect::NoOp
             | Effect::Proliferate
             | Effect::ProliferateTarget { .. }
             | Effect::EndTheTurn
@@ -10632,6 +10728,8 @@ impl Effect {
             | Effect::CreateDelayedTrigger { .. }
             | Effect::CreateEmblem { .. }
             | Effect::Discover { .. }
+            | Effect::Heist { .. }
+            | Effect::HeistExile
             | Effect::DraftFromSpellbook { .. }
             | Effect::Endure { .. }
             | Effect::ExchangeControl { .. }
@@ -10730,6 +10828,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::Tribute { .. } => "Tribute",
         Effect::TimeTravel => "TimeTravel",
         Effect::BecomeMonarch => "BecomeMonarch",
+        Effect::NoOp => "NoOp",
         Effect::Proliferate => "Proliferate",
         Effect::ProliferateTarget { .. } => "ProliferateTarget",
         Effect::EndTheTurn => "EndTheTurn",
@@ -10825,6 +10924,8 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::ExileFromTopUntil { .. } => "ExileFromTopUntil",
         Effect::RevealUntil { .. } => "RevealUntil",
         Effect::Discover { .. } => "Discover",
+        Effect::Heist { .. } => "Heist",
+        Effect::HeistExile => "HeistExile",
         Effect::Cascade => "Cascade",
         Effect::Ripple { .. } => "Ripple",
         Effect::MiracleCast { .. } => "MiracleCast",
@@ -10932,6 +11033,7 @@ pub enum EffectKind {
     Tribute,
     TimeTravel,
     BecomeMonarch,
+    NoOp,
     Proliferate,
     ProliferateTarget,
     Populate,
@@ -11027,6 +11129,8 @@ pub enum EffectKind {
     ExileFromTopUntil,
     RevealUntil,
     Discover,
+    Heist,
+    HeistExile,
     Cascade,
     Ripple,
     MiracleCast,
@@ -11141,6 +11245,7 @@ impl From<&Effect> for EffectKind {
             Effect::Tribute { .. } => EffectKind::Tribute,
             Effect::TimeTravel => EffectKind::TimeTravel,
             Effect::BecomeMonarch => EffectKind::BecomeMonarch,
+            Effect::NoOp => EffectKind::NoOp,
             Effect::Proliferate => EffectKind::Proliferate,
             Effect::ProliferateTarget { .. } => EffectKind::ProliferateTarget,
             Effect::EndTheTurn => EffectKind::EndTheTurn,
@@ -11240,6 +11345,8 @@ impl From<&Effect> for EffectKind {
             Effect::ExileFromTopUntil { .. } => EffectKind::ExileFromTopUntil,
             Effect::RevealUntil { .. } => EffectKind::RevealUntil,
             Effect::Discover { .. } => EffectKind::Discover,
+            Effect::Heist { .. } => EffectKind::Heist,
+            Effect::HeistExile => EffectKind::HeistExile,
             Effect::Cascade => EffectKind::Cascade,
             Effect::Ripple { .. } => EffectKind::Ripple,
             Effect::MiracleCast { .. } => EffectKind::MiracleCast,

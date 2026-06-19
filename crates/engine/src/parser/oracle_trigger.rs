@@ -772,6 +772,47 @@ fn is_damage_done_trigger_pattern(cond_lower: &str) -> bool {
     )
 }
 
+/// CR 109.4 + CR 115.1 + CR 506.2 + CR 603.7c: Derive the relative-player scope
+/// that a trigger condition introduces for `"that player"`/`"they"`-style
+/// anaphors in the trigger's effect body.
+///
+/// This is the single authority for mapping a trigger condition to the
+/// `ControllerRef` that a later `"that player controls"` reference must resolve
+/// against. Both the in-line trigger body parser (`parse_trigger`) and the
+/// delayed-trigger split path (`parse_delayed_whenever_trigger` in
+/// `oracle_effect`) call this so the same condition yields the same scope —
+/// otherwise the delayed-trigger effect would lose the `TriggeringPlayer`
+/// binding for "...deals combat damage to a player ... target creature that
+/// player controls" (The Sea Devils III).
+///
+/// DamageDone (`TriggeringPlayer`) is checked BEFORE `condition_introduces_target_player`
+/// because both match "deals [combat] damage to a player", but DamageDone needs
+/// `TriggeringPlayer` while generic target-player triggers need `TargetPlayer`.
+pub(crate) fn relative_player_scope_for_condition(cond_lower: &str) -> Option<ControllerRef> {
+    if is_damage_done_trigger_pattern(cond_lower) {
+        Some(ControllerRef::TriggeringPlayer)
+    } else if condition_introduces_damage_source_controller_player(cond_lower) {
+        Some(ControllerRef::ParentTargetController)
+    } else if condition_introduces_defending_player(cond_lower) {
+        // CR 608.2c: Attack triggers use DefendingPlayer (the attacked player
+        // in combat), not TargetPlayer (which requires a player target to be
+        // bound at runtime).
+        Some(ControllerRef::DefendingPlayer)
+    } else if condition_introduces_target_player(cond_lower) {
+        Some(ControllerRef::TargetPlayer)
+    } else if condition_introduces_chosen_player_phase(cond_lower) {
+        Some(ControllerRef::SourceChosenPlayer)
+    } else if condition_introduces_scoped_phase_player(cond_lower) {
+        Some(ControllerRef::ScopedPlayer)
+    } else if condition_matches_taps_for_mana_event(cond_lower) {
+        // CR 603.2 + CR 605.1a: "that player" in tap-all-lands effects (War's
+        // Toll) refers to the player who tapped for mana.
+        Some(ControllerRef::TriggeringPlayer)
+    } else {
+        None
+    }
+}
+
 /// Parse a full trigger line into a TriggerDefinition.
 /// Input: a line starting with "When", "Whenever", or "At".
 /// The card_name is used for self-reference substitution.
@@ -897,30 +938,12 @@ pub(crate) fn parse_trigger_line_with_index_ir(
         ..Default::default()
     };
 
-    // CR 109.4 + CR 115.1 + CR 506.2: Set relative-player scope for
-    // TargetPlayer resolution inside the trigger effect body.
-    // CR 603.7c: DamageDone triggers ("...deals damage to a player") use
-    // TriggeringPlayer for "that player" in the effect body. This must be
-    // checked BEFORE `condition_introduces_target_player` because both match
-    // "deals [combat] damage to a player", but DamageDone needs TriggeringPlayer
-    // while generic target-player triggers need TargetPlayer.
-    if is_damage_done_trigger_pattern(&cond_lower) {
-        effect_ctx.relative_player_scope = Some(ControllerRef::TriggeringPlayer);
-    } else if condition_introduces_damage_source_controller_player(&cond_lower) {
-        effect_ctx.relative_player_scope = Some(ControllerRef::ParentTargetController);
-    } else if condition_introduces_defending_player(&cond_lower) {
-        // CR 608.2c: Attack triggers use DefendingPlayer (the attacked player
-        // in combat), not TargetPlayer (which requires a player target to be
-        // bound at runtime).
-        effect_ctx.relative_player_scope = Some(ControllerRef::DefendingPlayer);
-    } else if condition_introduces_target_player(&cond_lower) {
-        effect_ctx.relative_player_scope = Some(ControllerRef::TargetPlayer);
-    } else if condition_introduces_chosen_player_phase(&cond_lower) {
-        effect_ctx.relative_player_scope = Some(ControllerRef::SourceChosenPlayer);
-    } else if condition_introduces_scoped_phase_player(&cond_lower) {
-        effect_ctx.relative_player_scope = Some(ControllerRef::ScopedPlayer);
-    } else if condition_introduces_taps_for_mana_event(&cond_lower) {
-        effect_ctx.relative_player_scope = Some(ControllerRef::TriggeringPlayer);
+    // CR 109.4 + CR 115.1 + CR 506.2 + CR 603.7c: Set relative-player scope for
+    // `"that player"` resolution inside the trigger effect body. Delegated to the
+    // single-authority `relative_player_scope_for_condition` so the delayed-trigger
+    // split path derives the identical scope from the same condition.
+    if let Some(scope) = relative_player_scope_for_condition(&cond_lower) {
+        effect_ctx.relative_player_scope = Some(scope);
     }
     // Snapshot the condition-established scope before body parsing (which may
     // temporarily rebind it via `with_player_scope`) so lowering sees the scope
@@ -1719,17 +1742,6 @@ fn condition_introduces_scoped_phase_player(cond_lower: &str) -> bool {
     };
 
     scan_for_phase(phase_text).is_some()
-}
-
-/// CR 603.2 + CR 605.1a: "Whenever [an opponent / a player / you] taps … for
-/// mana" — the tapping player is the trigger event's `player_id`, so "that
-/// player" in the effect body (War's Toll's "tap each land that player
-/// controls") must bind to `TriggeringPlayer`, not the ability's controller.
-fn condition_introduces_taps_for_mana_event(cond_lower: &str) -> bool {
-    scan_contains(cond_lower, "an opponent taps ")
-        || scan_contains(cond_lower, "a player taps ")
-        || scan_contains(cond_lower, "whenever you tap ")
-        || scan_contains(cond_lower, "when you tap ")
 }
 
 /// CR 613.1 + CR 503.1a: "At the beginning of the chosen player's upkeep"
@@ -2561,6 +2573,9 @@ fn substitute_another_in_expr(expr: &QuantityExpr) -> QuantityExpr {
         QuantityExpr::Difference { left, right } => QuantityExpr::Difference {
             left: Box::new(substitute_another_in_expr(left)),
             right: Box::new(substitute_another_in_expr(right)),
+        },
+        QuantityExpr::Max { exprs } => QuantityExpr::Max {
+            exprs: exprs.iter().map(substitute_another_in_expr).collect(),
         },
         other => other.clone(),
     }
@@ -6553,6 +6568,48 @@ fn split_taps_for_mana_for_clause(text: &str) -> Option<(String, Option<Vec<Mana
     Some((subject.to_string(), produced))
 }
 
+/// CR 603.2 + CR 605.1a: Shared nom dispatch for "Whenever [an opponent / a player]
+/// taps … for mana" trigger conditions. Used by trigger-line dispatch and by
+/// `condition_matches_taps_for_mana_event` for `"that player"` scope binding.
+fn parse_taps_for_mana_actor_line(
+    i: &str,
+) -> OracleResult<'_, (Option<ControllerRef>, String, Option<Vec<ManaType>>)> {
+    let (rest, actor_controller) = preceded(
+        alt((tag("whenever "), tag("when "))),
+        alt((
+            value(Some(ControllerRef::Opponent), tag("an opponent taps ")),
+            value(None, tag("a player taps ")),
+        )),
+    )
+    .parse(i)?;
+    let (subject_text, produced_filter) =
+        split_taps_for_mana_for_clause(rest).ok_or_else(|| oracle_err(rest))?;
+    Ok(("", (actor_controller, subject_text, produced_filter)))
+}
+
+/// CR 603.2 + CR 605.1a: Returns true when `cond_lower` is a taps-for-mana trigger
+/// condition ("Whenever [you / an opponent / a player] taps … for mana").
+fn condition_matches_taps_for_mana_event(cond_lower: &str) -> bool {
+    if let Ok((rem, (_, subject_text, _))) = parse_taps_for_mana_actor_line(cond_lower) {
+        if rem.trim().is_empty() {
+            let (_, sub_rem) = parse_trigger_subject(&subject_text, &mut ParseContext::default());
+            if sub_rem.trim().is_empty() {
+                return true;
+            }
+        }
+    }
+    for prefix in ["whenever you tap ", "when you tap "] {
+        let Ok((rest, ())) = value((), tag::<_, _, OracleError<'_>>(prefix)).parse(cond_lower)
+        else {
+            continue;
+        };
+        if split_taps_for_mana_for_clause(rest).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
 /// CR 509.1h: Strip a trailing "and isn't/aren't blocked" qualifier from attack
 /// trigger event text. Covers singular self-referential phrasing ("attacks and
 /// isn't blocked", Frenzy) and plural batched phrasing ("attack you and aren't
@@ -8097,7 +8154,7 @@ fn parse_damage_source_subject(input: &str) -> OracleResult<'_, TargetFilter> {
     // CR 109.4: Head noun — "source" (any), a card type, or a negated type
     // prefix ("noncreature source"). The negated variant uses
     // `TypeFilter::Non(Box::new(…))` so the runtime filter excludes that type.
-    let (rest, head_type) = alt((
+    let core_head = alt((
         value(
             Some(TypeFilter::Non(Box::new(TypeFilter::Creature))),
             (
@@ -8116,7 +8173,25 @@ fn parse_damage_source_subject(input: &str) -> OracleResult<'_, TargetFilter> {
         value(Some(TypeFilter::Battle), tag("battle")),
         value(Some(TypeFilter::Land), tag("land")),
     ))
-    .parse(rest)?;
+    .parse(rest);
+    // CR 205.3 + CR 603.2: When the damage source is named by a creature subtype
+    // ("a Salamander deals combat damage to a player" — The Sea Devils III)
+    // rather than a core type or "source", fall back to the shared subtype
+    // recognizer so the DamageDone trigger pattern is detected and "that player"
+    // binds to TriggeringPlayer. `parse_subtype` is the single subtype authority
+    // (oracle_util.rs); it returns the canonical name and consumed byte length.
+    let (rest, head_type) = match core_head {
+        Ok((rest, head_type)) => (rest, head_type),
+        Err(_) => match crate::parser::oracle_util::parse_subtype(rest) {
+            Some((subtype, consumed)) => (&rest[consumed..], Some(TypeFilter::Subtype(subtype))),
+            None => {
+                return Err(nom::Err::Error(OracleError::new(
+                    rest,
+                    nom::error::ErrorKind::Alt,
+                )))
+            }
+        },
+    };
 
     // Optional controller scope. Absence → no controller restriction
     // (matches any source — Phyrexian Obliterator class, deferred).
@@ -10020,24 +10095,8 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
     // Shared frame for both:
     //   - "a player taps …"  → no controller constraint on the source
     //   - "an opponent taps …" → source must be opponent-controlled (Vorinclex class)
-    // Nested nom dispatch: outer trigger verb → actor → subject-up-to-"for mana".
-    fn parse_taps_for_mana_line(
-        i: &str,
-    ) -> OracleResult<'_, (Option<ControllerRef>, String, Option<Vec<ManaType>>)> {
-        let (rest, actor_controller) = preceded(
-            alt((tag("whenever "), tag("when "))),
-            alt((
-                value(Some(ControllerRef::Opponent), tag("an opponent taps ")),
-                value(None, tag("a player taps ")),
-            )),
-        )
-        .parse(i)?;
-        let (subject_text, produced_filter) =
-            split_taps_for_mana_for_clause(rest).ok_or_else(|| oracle_err(rest))?;
-        Ok(("", (actor_controller, subject_text, produced_filter)))
-    }
     if let Ok((rem, (actor_controller, subject_text, produced_filter))) =
-        parse_taps_for_mana_line(lower)
+        parse_taps_for_mana_actor_line(lower)
     {
         if rem.trim().is_empty() {
             let (mut filter, sub_rem) =
@@ -19652,13 +19711,13 @@ mod tests {
     }
 
     #[test]
-    fn trigger_opponent_taps_land_for_mana_wars_toll_tap_each_land() {
+    fn trigger_opponent_taps_land_for_mana_wars_toll_tap_all_lands() {
         let def = parse_trigger_line(
-            "Whenever an opponent taps a land for mana, tap each land that player controls.",
+            "Whenever an opponent taps a land for mana, tap all lands that player controls.",
             "War's Toll",
         );
         assert_eq!(def.mode, TriggerMode::TapsForMana);
-        let execute = def.execute.expect("War's Toll must have tap-each execute");
+        let execute = def.execute.expect("War's Toll must have tap-all execute");
         match &*execute.effect {
             Effect::SetTapState {
                 scope: EffectScope::All,
@@ -19670,6 +19729,52 @@ mod tests {
                     tf.controller,
                     Some(ControllerRef::TriggeringPlayer),
                     "that player controls must bind to the tapping opponent"
+                );
+            }
+            other => panic!("expected TapAll effect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trigger_player_taps_land_for_mana_that_player_scope() {
+        let def = parse_trigger_line(
+            "Whenever a player taps a land for mana, tap all lands that player controls.",
+            "Test",
+        );
+        assert_eq!(def.mode, TriggerMode::TapsForMana);
+        let execute = def.execute.expect("must have tap-all execute");
+        match &*execute.effect {
+            Effect::SetTapState {
+                target: TargetFilter::Typed(ref tf),
+                ..
+            } => {
+                assert_eq!(
+                    tf.controller,
+                    Some(ControllerRef::TriggeringPlayer),
+                    "a player taps: that player must bind to TriggeringPlayer"
+                );
+            }
+            other => panic!("expected TapAll effect, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trigger_you_tap_land_for_mana_that_player_scope() {
+        let def = parse_trigger_line(
+            "Whenever you tap a land for mana, tap all lands that player controls.",
+            "Test",
+        );
+        assert_eq!(def.mode, TriggerMode::TapsForMana);
+        let execute = def.execute.expect("must have tap-all execute");
+        match &*execute.effect {
+            Effect::SetTapState {
+                target: TargetFilter::Typed(ref tf),
+                ..
+            } => {
+                assert_eq!(
+                    tf.controller,
+                    Some(ControllerRef::TriggeringPlayer),
+                    "you tap: that player must bind to TriggeringPlayer"
                 );
             }
             other => panic!("expected TapAll effect, got {other:?}"),

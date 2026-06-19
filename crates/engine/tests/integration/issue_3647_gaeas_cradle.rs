@@ -46,7 +46,9 @@ fn gaeas_cradle_adds_green_for_each_creature_you_control() {
     }
 
     assert_eq!(
-        runner.state().players[0].mana_pool.count_color(ManaType::Green),
+        runner.state().players[0]
+            .mana_pool
+            .count_color(ManaType::Green),
         2,
         "two creatures should produce two green mana (cradle itself is not a creature)"
     );

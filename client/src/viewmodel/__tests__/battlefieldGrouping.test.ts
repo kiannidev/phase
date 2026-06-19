@@ -178,6 +178,27 @@ describe("partitionByType", () => {
     expect(result.support).toEqual([]);
   });
 
+  it("excludes bestowed enchantment-only Aura when attached without Aura subtype", () => {
+    const objects = [
+      makeGameObject({ id: 1, card_types: { supertypes: [], core_types: ["Creature"], subtypes: ["Bird"] } }),
+      makeGameObject({
+        id: 99,
+        name: "Springheart Nantuko",
+        attached_to: { type: "Object", data: 1 },
+        card_types: {
+          supertypes: [],
+          core_types: ["Enchantment"],
+          subtypes: ["Insect", "Monk"],
+        },
+      }),
+    ];
+
+    const result = partitionByType(objects);
+
+    expect(result.creatures).toEqual([1]);
+    expect(result.support).toEqual([]);
+  });
+
   it("keeps attached non-attachment creatures in the creature row", () => {
     const objects = [
       makeGameObject({

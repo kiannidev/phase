@@ -281,6 +281,7 @@ mod issue_3324_haunted_one;
 mod issue_3325_umbral_mantle;
 mod issue_3425_legend_rule_exemption_scopes;
 mod issue_3652_together_as_one;
+mod issue_3654_nyxbloom_mana_reflection;
 mod issue_3660_paradigm_multiple_offers;
 mod issue_3665_smugglers_share;
 mod issue_3681_inferno_titan_divided_damage;

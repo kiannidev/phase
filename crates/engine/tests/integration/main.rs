@@ -130,6 +130,7 @@ mod issue_1312_prepared_spell_cast_triggers;
 mod issue_1318_throne_god_pharaoh;
 mod issue_1319_ninjutsu_dead_attacker;
 mod issue_1322_murktide_delve;
+mod issue_1323_token_generation_conditions;
 mod issue_1325_ellie_brick_master;
 mod issue_1326_tabernacle_upkeep_destroy;
 mod issue_1327_zack_fair;

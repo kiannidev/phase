@@ -4894,10 +4894,13 @@ fn collect_battlefield_cost_modifiers(
                 }
             }
 
-            // CR 601.2f: Check static condition — "as long as" clauses gate cost modification.
-            // Uses `caster` so SpellsCastThisTurn resolves against the casting player's history.
+            // CR 601.2f: Check static condition — "as long as" / "during your turn"
+            // clauses gate cost modification. Use the source permanent's controller
+            // so "during your turn" (Paladin Class) binds to the static owner's turn,
+            // while scoped quantity refs still resolve opponents relative to that
+            // controller via `scoped_players`.
             if let Some(ref cond) = def.condition {
-                if !super::layers::evaluate_condition(state, cond, caster, bf_id) {
+                if !super::layers::evaluate_condition(state, cond, source_controller, bf_id) {
                     continue;
                 }
             }

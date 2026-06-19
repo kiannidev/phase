@@ -2765,6 +2765,29 @@ fn static_opponent_spells_cost_more() {
 }
 
 #[test]
+fn static_opponent_spells_cost_more_during_your_turn() {
+    let def =
+        parse_static_line("Spells your opponents cast during your turn cost {1} more to cast.")
+            .unwrap();
+    assert!(matches!(
+        def.mode,
+        StaticMode::ModifyCost {
+            mode: CostModifyMode::Raise,
+            amount: ManaCost::Cost { generic: 1, .. },
+            ..
+        }
+    ));
+    assert_eq!(def.condition, Some(StaticCondition::DuringYourTurn));
+    assert!(matches!(
+        def.affected,
+        Some(TargetFilter::Typed(TypedFilter {
+            controller: Some(ControllerRef::Opponent),
+            ..
+        }))
+    ));
+}
+
+#[test]
 fn static_opponent_spells_targeting_commanders_cost_more() {
     let def = parse_static_line(
             "Spells your opponents cast that target one or more commanders you control cost {3} more to cast.",

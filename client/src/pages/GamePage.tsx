@@ -812,8 +812,7 @@ function GamePageContent({
     return orderedPlayers.filter((id) => id !== perspectivePlayerId && !eliminated.has(id));
   }, [eliminatedPlayers, perspectivePlayerId, players, seatOrder]);
   const activeOpponentId =
-    resolveFocusedOpponent(focusedOpponent, opponents)
-    ?? (perspectivePlayerId === 0 ? 1 : 0);
+    resolveFocusedOpponent(focusedOpponent, opponents) ?? opponents[0] ?? null;
 
   // Memoize the HUD elements passed to GameBoard. GameBoard is wrapped in
   // React.memo, which shallow-compares props; without stable element

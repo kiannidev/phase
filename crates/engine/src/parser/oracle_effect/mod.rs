@@ -51219,6 +51219,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn non_join_forces_x_mana_payment_remains_optional() {
+        let def = parse_effect_chain(
+            "you may pay {X}. if you do, draw X cards",
+            AbilityKind::Spell,
+        );
+        assert!(
+            matches!(
+                &*def.effect,
+                Effect::PayCost {
+                    cost: AbilityCost::Mana { .. },
+                    ..
+                }
+            ),
+            "expected PayCost, got {:?}",
+            def.effect
+        );
+        assert!(
+            def.optional,
+            "ordinary optional X payments must still prompt OptionalEffectChoice"
+        );
+    }
+
     // --- compound-subject-each object axis (CR 109.5 / 115.1 / 611.2c) ---
 
     /// Collect every link's recipient filter by walking the parent -> sub_ability

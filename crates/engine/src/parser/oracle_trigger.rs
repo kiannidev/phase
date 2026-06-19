@@ -1726,10 +1726,10 @@ fn condition_introduces_scoped_phase_player(cond_lower: &str) -> bool {
 /// player" in the effect body (War's Toll's "tap each land that player
 /// controls") must bind to `TriggeringPlayer`, not the ability's controller.
 fn condition_introduces_taps_for_mana_event(cond_lower: &str) -> bool {
-    cond_lower.contains("an opponent taps ")
-        || cond_lower.contains("a player taps ")
-        || cond_lower.starts_with("whenever you tap ")
-        || cond_lower.starts_with("when you tap ")
+    scan_contains(cond_lower, "an opponent taps ")
+        || scan_contains(cond_lower, "a player taps ")
+        || scan_contains(cond_lower, "whenever you tap ")
+        || scan_contains(cond_lower, "when you tap ")
 }
 
 /// CR 613.1 + CR 503.1a: "At the beginning of the chosen player's upkeep"

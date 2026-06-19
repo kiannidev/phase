@@ -6,6 +6,9 @@ use super::prelude::*;
 #[allow(unused_imports)]
 use super::support::*;
 use crate::types::ability::PlayerFilter;
+use nom::character::complete::{digit1, one_of};
+use nom::combinator::{all_consuming, opt, recognize};
+use nom::sequence::{delimited, pair};
 
 /// Lower a parsed rule-static predicate into the runtime static mode.
 pub(crate) fn lower_rule_static(
@@ -1176,27 +1179,10 @@ pub(crate) fn parse_quoted_ability(text: &str) -> AbilityDefinition {
 /// True when `trimmed_prefix` is a bracketed planeswalker loyalty cost (`[+N]`,
 /// `[−N]`, `[0]`, `[-N]`) as printed in granted-ability text (Ichormoon Gauntlet).
 fn is_bracket_loyalty_cost_prefix(trimmed_prefix: &str) -> bool {
-    let Some(inner) = trimmed_prefix
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-    else {
-        return false;
-    };
-    if inner == "0" {
-        return true;
-    }
-    if inner.parse::<i32>().is_ok() {
-        return true;
-    }
-    let Some(rest) = inner
-        .strip_prefix('+')
-        .or_else(|| inner.strip_prefix('−'))
-        .or_else(|| inner.strip_prefix('–'))
-        .or_else(|| inner.strip_prefix('-'))
-    else {
-        return false;
-    };
-    rest.parse::<i32>().is_ok()
+    let loyalty_number = recognize(pair(opt(one_of("+−–-")), digit1));
+    all_consuming(delimited(tag("["), loyalty_number, tag("]")))
+        .parse(trimmed_prefix)
+        .is_ok()
 }
 
 /// Find the position of the cost/effect separator colon in ability text.

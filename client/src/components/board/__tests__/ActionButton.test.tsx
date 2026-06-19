@@ -123,7 +123,14 @@ describe("ActionButton", () => {
         }),
         turn_decision_controller: 1,
         active_player: 0,
-        stack: [{ object_id: 1, card_id: 1, controller: 0, owner: 0 }],
+        stack: [
+          {
+            id: 1,
+            source_id: 1,
+            controller: 0,
+            kind: { type: "Spell", data: { card_id: 1 } },
+          },
+        ],
       },
       waitingFor: { type: "Priority", data: { player: 0 } },
       legalActions: [],

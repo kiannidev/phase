@@ -1,6 +1,29 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use std::cell::RefCell;
+
+thread_local! {
+    /// CR 613.1f: Objects that received `RemoveAllAbilities` during the
+    /// current layer pass must not apply their own printed static effects
+    /// (including CDAs) in later layers — issue #1321.
+    static ABILITIES_SUPPRESSED: RefCell<HashSet<ObjectId>> = RefCell::new(HashSet::new());
+}
+
+fn clear_abilities_suppressed() {
+    ABILITIES_SUPPRESSED.with(|slot| slot.borrow_mut().clear());
+}
+
+fn mark_abilities_suppressed(object_id: ObjectId) {
+    ABILITIES_SUPPRESSED.with(|slot| {
+        slot.borrow_mut().insert(object_id);
+    });
+}
+
+fn abilities_suppressed(object_id: ObjectId) -> bool {
+    ABILITIES_SUPPRESSED.with(|slot| slot.borrow().contains(&object_id))
+}
+
 use crate::database::synthesis::KeywordTriggerInstaller;
 use crate::game::arithmetic::saturating_pt_add;
 use crate::game::conditions::{
@@ -1269,6 +1292,7 @@ pub fn evaluate_layers(state: &mut GameState) {
     // taken by AI search or snapshot diffing retain their own roots, so this
     // does not break structural sharing across `GameState` clones.
     state.attribution.clear();
+    clear_abilities_suppressed();
     // CR 702.26b + CR 702.26e: Phased-out permanents are treated as though
     // they do not exist and are not included in continuous-effect affected
     // sets. Exclude them from the whole layer pass so the reset/apply invariant
@@ -3468,6 +3492,13 @@ fn apply_continuous_effect_filtered(
     effect: &ActiveContinuousEffect,
     restrict_to: Option<&HashSet<ObjectId>>,
 ) {
+    // CR 613.1f: A printed static on an object that lost all abilities this
+    // pass must not re-apply in later layers (Death's Shadow CDA after
+    // Abigale — issue #1321).
+    if effect.def_index.is_some() && abilities_suppressed(effect.source_id) {
+        return;
+    }
+
     let scan_zone = effect
         .affected_filter
         .extract_in_zone()
@@ -3889,6 +3920,7 @@ fn apply_continuous_effect_filtered(
                 obj.replacement_definitions.clear();
                 obj.static_definitions.clear();
                 obj.keywords.clear();
+                mark_abilities_suppressed(id);
             }
             ContinuousModification::AddType { core_type } => {
                 if !obj.card_types.core_types.contains(core_type) {

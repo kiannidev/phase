@@ -1546,22 +1546,27 @@ pub(crate) fn parse_event_context_quantity(text: &str) -> Option<QuantityExpr> {
 
     // Fall back to parse_quantity_ref for named quantity patterns
     // (e.g., "the life you've lost this turn" → LifeLostThisTurn).
-    // Strip leading "the " article before matching.
+    // Try the full phrase first — some refs (CommanderManaValue, greatest
+    // commander mana value) require the leading "the " article in their nom
+    // grammar (Stinging Study's "where X is the mana value of a commander…").
     // Exclude target-referent variants (TargetPower, TargetLifeTotal) — these
     // reference a targeting selection, not an event-context source object.
-    let stripped = tag::<_, _, OracleError<'_>>("the ")
-        .parse(lower)
-        .map_or(lower, |(r, _)| r);
-    if let Some(qty) = parse_quantity_ref(stripped) {
-        if !matches!(
-            qty,
-            QuantityRef::Power {
-                scope: crate::types::ability::ObjectScope::Target
-            } | QuantityRef::LifeTotal {
-                player: PlayerScope::Target
+    for candidate in [lower, {
+        tag::<_, _, OracleError<'_>>("the ")
+            .parse(lower)
+            .map_or(lower, |(r, _)| r)
+    }] {
+        if let Some(qty) = parse_quantity_ref(candidate) {
+            if !matches!(
+                qty,
+                QuantityRef::Power {
+                    scope: crate::types::ability::ObjectScope::Target
+                } | QuantityRef::LifeTotal {
+                    player: PlayerScope::Target
+                }
+            ) {
+                return Some(QuantityExpr::Ref { qty });
             }
-        ) {
-            return Some(QuantityExpr::Ref { qty });
         }
     }
 
@@ -4619,6 +4624,24 @@ mod tests {
                 qty: QuantityRef::ObjectManaValue {
                     scope: ObjectScope::Demonstrative
                 }
+            })
+        );
+    }
+
+    #[test]
+    fn parse_event_context_quantity_commander_mana_value() {
+        // CR 903.3d: Stinging Study's "where X is the mana value of a commander
+        // you own on the battlefield or in the command zone" must bind X via
+        // CommanderManaValue — the fallback must try the full "the …" phrase
+        // before stripping the article.
+        assert_eq!(
+            parse_event_context_quantity(
+                "the mana value of a commander you own on the battlefield or in the command zone"
+            ),
+            Some(QuantityExpr::Ref {
+                qty: QuantityRef::CommanderManaValue {
+                    owner: ControllerRef::You,
+                },
             })
         );
     }

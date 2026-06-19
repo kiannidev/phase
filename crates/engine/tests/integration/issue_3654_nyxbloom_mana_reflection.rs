@@ -42,7 +42,7 @@ fn nyxbloom_and_mana_reflection_stack_to_six_mana() {
         .find(|o| o.name == "Mana Reflection")
         .expect("Mana Reflection on battlefield");
     assert!(
-        reflection_obj.replacement_definitions.len() > 0,
+        !reflection_obj.replacement_definitions.is_empty(),
         "Mana Reflection must carry ProduceMana replacements"
     );
 

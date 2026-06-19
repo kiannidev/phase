@@ -919,6 +919,8 @@ pub(crate) fn parse_trigger_line_with_index_ir(
         effect_ctx.relative_player_scope = Some(ControllerRef::SourceChosenPlayer);
     } else if condition_introduces_scoped_phase_player(&cond_lower) {
         effect_ctx.relative_player_scope = Some(ControllerRef::ScopedPlayer);
+    } else if condition_introduces_taps_for_mana_event(&cond_lower) {
+        effect_ctx.relative_player_scope = Some(ControllerRef::TriggeringPlayer);
     }
     // Snapshot the condition-established scope before body parsing (which may
     // temporarily rebind it via `with_player_scope`) so lowering sees the scope
@@ -1717,6 +1719,17 @@ fn condition_introduces_scoped_phase_player(cond_lower: &str) -> bool {
     };
 
     scan_for_phase(phase_text).is_some()
+}
+
+/// CR 603.2 + CR 605.1a: "Whenever [an opponent / a player / you] taps … for
+/// mana" — the tapping player is the trigger event's `player_id`, so "that
+/// player" in the effect body (War's Toll's "tap each land that player
+/// controls") must bind to `TriggeringPlayer`, not the ability's controller.
+fn condition_introduces_taps_for_mana_event(cond_lower: &str) -> bool {
+    cond_lower.contains("an opponent taps ")
+        || cond_lower.contains("a player taps ")
+        || cond_lower.starts_with("whenever you tap ")
+        || cond_lower.starts_with("when you tap ")
 }
 
 /// CR 613.1 + CR 503.1a: "At the beginning of the chosen player's upkeep"
@@ -19621,6 +19634,31 @@ mod tests {
                 assert_eq!(tf.controller, Some(ControllerRef::Opponent));
             }
             other => panic!("expected Typed(Land) with Opponent controller, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trigger_opponent_taps_land_for_mana_wars_toll_tap_each_land() {
+        let def = parse_trigger_line(
+            "Whenever an opponent taps a land for mana, tap each land that player controls.",
+            "War's Toll",
+        );
+        assert_eq!(def.mode, TriggerMode::TapsForMana);
+        let execute = def.execute.expect("War's Toll must have tap-each execute");
+        match &*execute.effect {
+            Effect::SetTapState {
+                scope: EffectScope::All,
+                state: TapStateChange::Tap,
+                target: TargetFilter::Typed(ref tf),
+            } => {
+                assert_eq!(tf.type_filters, vec![TypeFilter::Land]);
+                assert_eq!(
+                    tf.controller,
+                    Some(ControllerRef::TriggeringPlayer),
+                    "that player controls must bind to the tapping opponent"
+                );
+            }
+            other => panic!("expected TapAll effect, got {other:?}"),
         }
     }
 

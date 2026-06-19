@@ -273,6 +273,7 @@ mod issue_3310_condemn_two_targets;
 mod issue_3311_manifest_dread_land;
 mod issue_3314_killian;
 mod issue_3316_stinging_study;
+mod issue_3319_wars_toll;
 mod issue_3320_peregrine_drake_untap_prompt;
 mod issue_3321_volcanic_spite_optional;
 mod issue_3322_airbend_owner_cast;

@@ -1546,28 +1546,30 @@ pub(crate) fn parse_event_context_quantity(text: &str) -> Option<QuantityExpr> {
 
     // Fall back to parse_quantity_ref for named quantity patterns
     // (e.g., "the life you've lost this turn" → LifeLostThisTurn).
-    // Try the full phrase first — some refs (CommanderManaValue, greatest
-    // commander mana value) require the leading "the " article in their nom
-    // grammar (Stinging Study's "where X is the mana value of a commander…").
+    // Strip leading "the " article before matching. If that fails, try the full
+    // phrase only for CommanderManaValue — that grammar requires the leading
+    // article (Stinging Study's "where X is the mana value of a commander…").
+    // Keep broader object-count phrases on the stripped path so context-aware
+    // callers can still bind "they control" through parse_cda_quantity_with_context.
     // Exclude target-referent variants (TargetPower, TargetLifeTotal) — these
     // reference a targeting selection, not an event-context source object.
-    for candidate in [lower, {
-        tag::<_, _, OracleError<'_>>("the ")
-            .parse(lower)
-            .map_or(lower, |(r, _)| r)
-    }] {
-        if let Some(qty) = parse_quantity_ref(candidate) {
-            if !matches!(
-                qty,
-                QuantityRef::Power {
-                    scope: crate::types::ability::ObjectScope::Target
-                } | QuantityRef::LifeTotal {
-                    player: PlayerScope::Target
-                }
-            ) {
-                return Some(QuantityExpr::Ref { qty });
+    let stripped = tag::<_, _, OracleError<'_>>("the ")
+        .parse(lower)
+        .map_or(lower, |(r, _)| r);
+    if let Some(qty) = parse_quantity_ref(stripped) {
+        if !matches!(
+            qty,
+            QuantityRef::Power {
+                scope: crate::types::ability::ObjectScope::Target
+            } | QuantityRef::LifeTotal {
+                player: PlayerScope::Target
             }
+        ) {
+            return Some(QuantityExpr::Ref { qty });
         }
+    }
+    if let Some(qty @ QuantityRef::CommanderManaValue { .. }) = parse_quantity_ref(lower) {
+        return Some(QuantityExpr::Ref { qty });
     }
 
     None
@@ -4643,6 +4645,14 @@ mod tests {
                     owner: ControllerRef::You,
                 },
             })
+        );
+    }
+
+    #[test]
+    fn parse_event_context_quantity_does_not_consume_context_scoped_object_count() {
+        assert_eq!(
+            parse_event_context_quantity("the number of artifacts they control"),
+            None
         );
     }
 

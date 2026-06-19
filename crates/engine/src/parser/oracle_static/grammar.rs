@@ -1179,10 +1179,12 @@ pub(crate) fn parse_quoted_ability(text: &str) -> AbilityDefinition {
 /// True when `trimmed_prefix` is a bracketed planeswalker loyalty cost (`[+N]`,
 /// `[−N]`, `[0]`, `[-N]`) as printed in granted-ability text (Ichormoon Gauntlet).
 fn is_bracket_loyalty_cost_prefix(trimmed_prefix: &str) -> bool {
+    parse_bracket_loyalty_cost_prefix(trimmed_prefix).is_ok()
+}
+
+fn parse_bracket_loyalty_cost_prefix(input: &str) -> nom::IResult<&str, &str, OracleError<'_>> {
     let loyalty_number = recognize(pair(opt(one_of("+−–-")), digit1));
-    all_consuming(delimited(tag("["), loyalty_number, tag("]")))
-        .parse(trimmed_prefix)
-        .is_ok()
+    all_consuming(delimited(tag("["), loyalty_number, tag("]"))).parse(input)
 }
 
 /// Find the position of the cost/effect separator colon in ability text.

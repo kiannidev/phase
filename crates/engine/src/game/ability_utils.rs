@@ -1699,6 +1699,56 @@ fn collect_target_slots(
                 optional: ability.optional_targeting,
             });
         }
+    } else if let Effect::EachDealsDamageEqualToPower { sources, recipient } = &ability.effect {
+        // CR 115.1d + CR 115.1: "Up to two target creatures you control each deal
+        // damage equal to their power to target creature." `target_filter()`
+        // returns None for this effect, so surface both axes here.
+        //
+        // ORDER IS LOAD-BEARING: the variable-count SOURCE slots are declared
+        // first (Oracle text order), then the single mandatory RECIPIENT slot
+        // last. The resolver (`deal_damage::resolve_each_deals_equal_to_power`)
+        // reads `ability.targets` as `[source.., recipient]`, treating the final
+        // object target as the recipient.
+        if ability.target_choice_timing == TargetChoiceTiming::Stack {
+            // CR 601.2c + CR 115.1d: the source count ("up to two" → 0..=2, or
+            // "two" → exactly 2) lives in the ability's `multi_target` spec.
+            let source_legal =
+                legal_targets_for_ability_filter(state, ability, sources, &acc.slots);
+            if let Some(spec) = ability.multi_target.as_ref() {
+                let bounds = resolve_multi_target_bounds(state, ability, spec, source_legal.len())?;
+                for slot_index in 0..bounds.max {
+                    acc.push(TargetSelectionSlot {
+                        legal_targets: source_legal.clone(),
+                        optional: slot_index >= bounds.min,
+                    });
+                }
+            } else {
+                // No spec means a single mandatory source (defensive — the parser
+                // always attaches an "up to two"/"two" spec for this effect).
+                if source_legal.is_empty() {
+                    return Err(EngineError::ActionNotAllowed(
+                        "No legal targets available".to_string(),
+                    ));
+                }
+                acc.push(TargetSelectionSlot {
+                    legal_targets: source_legal,
+                    optional: false,
+                });
+            }
+
+            // CR 115.1: the recipient is exactly one mandatory target.
+            let recipient_legal =
+                legal_targets_for_ability_filter(state, ability, recipient, &acc.slots);
+            if recipient_legal.is_empty() {
+                return Err(EngineError::ActionNotAllowed(
+                    "No legal targets available".to_string(),
+                ));
+            }
+            acc.push(TargetSelectionSlot {
+                legal_targets: recipient_legal,
+                optional: false,
+            });
+        }
     } else {
         if is_per_opponent_target_fanout(ability) {
             collect_per_opponent_target_fanout_slots(state, ability, acc)?;
@@ -2829,6 +2879,44 @@ fn collect_target_slot_specs(
                 instance: id,
             });
         }
+    } else if let Effect::EachDealsDamageEqualToPower { sources, recipient } = &ability.effect {
+        // CR 115.1d + CR 115.1: Mirror the `collect_target_slots` branch
+        // one-for-one — the variable-count SOURCE slots first (sharing one
+        // instance per CR 115.3 so the same creature can't fill two source
+        // slots), then the single mandatory RECIPIENT slot (its own instance).
+        if ability.target_choice_timing == TargetChoiceTiming::Stack {
+            let source_legal = legal_targets_for_ability_filter(state, ability, sources, &[]);
+            if let Some(spec) = ability.multi_target.as_ref() {
+                if let Ok(bounds) =
+                    resolve_multi_target_bounds(state, ability, spec, source_legal.len())
+                {
+                    let id = TargetInstanceId(*next_instance);
+                    *next_instance += 1;
+                    for slot_index in 0..bounds.max {
+                        specs.push(TargetSlotSpec {
+                            filter: sources.clone(),
+                            optional: slot_index >= bounds.min,
+                            instance: id,
+                        });
+                    }
+                }
+            } else {
+                let id = TargetInstanceId(*next_instance);
+                *next_instance += 1;
+                specs.push(TargetSlotSpec {
+                    filter: sources.clone(),
+                    optional: false,
+                    instance: id,
+                });
+            }
+            let id = TargetInstanceId(*next_instance);
+            *next_instance += 1;
+            specs.push(TargetSlotSpec {
+                filter: recipient.clone(),
+                optional: false,
+                instance: id,
+            });
+        }
     } else {
         if is_per_opponent_target_fanout(ability) {
             collect_per_opponent_target_fanout_specs(state, ability, specs, next_instance);
@@ -3588,6 +3676,11 @@ fn defers_conditional_target_selection(sub: &ResolvedAbility) -> bool {
             | Some(AbilityCondition::PreviousEffectAmount { .. })
             | Some(AbilityCondition::AdditionalCostPaidInstead)
     ) || sub.target_choice_timing == TargetChoiceTiming::Resolution
+        // CR 608.2d + CR 601.2c: "You may" sub-instructions (Nahiri, the
+        // Lithomancer +2 attach) choose whether to perform the action at
+        // resolution; their targets are announced only if the controller
+        // accepts, not when the loyalty ability is activated.
+        || sub.optional
 }
 
 fn defers_sub_ability_target_selection(effect: &Effect) -> bool {
@@ -5949,6 +6042,7 @@ mod tests {
                     expiry: RestrictionExpiry::EndOfTurn,
                     activity: ProhibitedActivity::ActivateAbilities {
                         exemption: ActivationExemption::ManaAbilities,
+                        only_tag: None,
                     },
                 },
             },
@@ -7766,6 +7860,7 @@ mod tests {
                 count: None,
                 selection: crate::types::ability::CardSelectionMode::Chosen,
                 choice_optional: false,
+                reveal: true,
             },
             vec![],
             ObjectId(10),
@@ -8008,6 +8103,42 @@ mod tests {
                 .legal_targets
                 .contains(&TargetRef::Player(PlayerId(0))),
             "target opponent library search must not allow targeting yourself"
+        );
+    }
+
+    #[test]
+    fn build_target_slots_surfaces_player_slot_for_reveal_until_target_opponent() {
+        let state = GameState::new_two_player(42);
+        let ability = ResolvedAbility::new(
+            Effect::RevealUntil {
+                player: TargetFilter::Typed(
+                    TypedFilter::default().controller(ControllerRef::Opponent),
+                ),
+                filter: TargetFilter::Typed(TypedFilter::default().with_type(TypeFilter::Land)),
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                matched_disposition: crate::types::ability::RevealUntilDisposition::KeepEach,
+                kept_destination: Zone::Battlefield,
+                rest_destination: Zone::Graveyard,
+                enter_tapped: crate::types::zones::EtbTapState::Tapped,
+                enters_attacking: false,
+                kept_optional_to: None,
+                enters_under: None,
+            },
+            vec![],
+            ObjectId(900),
+            PlayerId(0),
+        );
+
+        let slots = build_target_slots(&state, &ability).expect("should build");
+        assert_eq!(slots.len(), 1);
+        assert!(slots[0]
+            .legal_targets
+            .contains(&TargetRef::Player(PlayerId(1))));
+        assert!(
+            !slots[0]
+                .legal_targets
+                .contains(&TargetRef::Player(PlayerId(0))),
+            "target opponent reveal must not allow targeting yourself"
         );
     }
 

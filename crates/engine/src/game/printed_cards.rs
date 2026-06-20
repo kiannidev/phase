@@ -891,6 +891,10 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         Effect::StartYourEngines { .. }
         | Effect::ChangeSpeed { .. }
         | Effect::DealDamage { .. }
+        | Effect::ApplyPostReplacementDamage { .. }
+        // CR 120.1: leaf effect — the source/recipient filters carry no nested
+        // ability or effect to walk.
+        | Effect::EachDealsDamageEqualToPower { .. }
         | Effect::Draw { .. }
         | Effect::Pump { .. }
         | Effect::PairWith { .. }
@@ -984,6 +988,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::SolveCase
         | Effect::BecomePrepared { .. }
         | Effect::BecomeUnprepared { .. }
+        | Effect::BecomeSaddled { .. }
         | Effect::SetClassLevel { .. }
         | Effect::AddRestriction { .. }
         | Effect::ReduceNextSpellCost { .. }

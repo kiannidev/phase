@@ -173,6 +173,12 @@ fn is_data_carrying_static(mode: &StaticMode) -> bool {
             // modifier kind + action list (Giant Ox, Hotshot Mechanic). Runtime
             // enforcement is in static_abilities.rs::object_crew_power_contribution.
             | StaticMode::CrewContribution { .. }
+            // CR 702 + CR 613.1f: CantHaveKeyword carries the denied Keyword
+            // discriminant (Archetype cycle). Runtime enforcement is in
+            // layers.rs::apply_cant_have_keyword_denials (layer 6, ability-
+            // removing effects). Parameterized — no registry entry; coverage
+            // support here.
+            | StaticMode::CantHaveKeyword { .. }
     )
 }
 
@@ -762,6 +768,28 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
             FilterProp::BlockedThisTurn => parts.push("blocked this turn".into()),
             FilterProp::AttackedOrBlockedThisTurn => {
                 parts.push("attacked or blocked this turn".into());
+            }
+            FilterProp::CountersPutOnThisTurn {
+                actor,
+                counters,
+                comparator,
+                count,
+            } => {
+                let kind = match counters {
+                    CounterMatch::Any => "any".to_string(),
+                    CounterMatch::OfType(ct) => ct.as_str().to_string(),
+                };
+                let cmp = match comparator {
+                    Comparator::GE => "≥",
+                    Comparator::LE => "≤",
+                    Comparator::GT => ">",
+                    Comparator::LT => "<",
+                    Comparator::EQ => "=",
+                    Comparator::NE => "≠",
+                };
+                parts.push(format!(
+                    "{actor:?} put {cmp}{count} {kind} counters on this turn"
+                ));
             }
             FilterProp::HasSingleTarget => parts.push("single target".into()),
             FilterProp::FaceDown => parts.push("face-down".into()),
@@ -1865,6 +1893,11 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             d.push(("amount".into(), fmt_quantity(amount)));
             d.push(("target".into(), fmt_target(target)));
         }
+        Effect::ApplyPostReplacementDamage { .. } => {}
+        Effect::EachDealsDamageEqualToPower { sources, recipient } => {
+            d.push(("sources".into(), fmt_target(sources)));
+            d.push(("recipient".into(), fmt_target(recipient)));
+        }
         Effect::SearchOutsideGame {
             filter,
             count,
@@ -2113,12 +2146,26 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             ));
             d.push(("target".into(), fmt_target(target)));
         }
-        Effect::DoublePT { mode, target } => {
+        Effect::DoublePT {
+            mode,
+            target,
+            factor,
+        } => {
             d.push(("mode".into(), fmt_double_pt_mode(mode).into()));
+            if *factor != 2 {
+                d.push(("factor".into(), factor.to_string()));
+            }
             d.push(("target".into(), fmt_target(target)));
         }
-        Effect::DoublePTAll { mode, target } => {
+        Effect::DoublePTAll {
+            mode,
+            target,
+            factor,
+        } => {
             d.push(("mode".into(), fmt_double_pt_mode(mode).into()));
+            if *factor != 2 {
+                d.push(("factor".into(), factor.to_string()));
+            }
             d.push(("filter".into(), fmt_target(target)));
         }
         Effect::DiscardCard { count, target } => {
@@ -2786,6 +2833,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         }
         Effect::BecomePrepared { target }
         | Effect::BecomeUnprepared { target }
+        | Effect::BecomeSaddled { target }
         | Effect::PairWith { target } => {
             d.push(("target".into(), fmt_target(target)));
         }
@@ -5551,6 +5599,7 @@ fn extract_effect_quantity_features(
 ) {
     match effect {
         Effect::DealDamage { amount, .. } => extract_quantity_features(amount, features),
+        Effect::ApplyPostReplacementDamage { .. } => {}
         Effect::Draw { count, .. } => extract_quantity_features(count, features),
         Effect::Mill { count, .. } => extract_quantity_features(count, features),
         Effect::GainLife { amount, .. } => extract_quantity_features(amount, features),
@@ -5926,9 +5975,11 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         StaticCondition::Not { .. } => ("Not", Handled),
         StaticCondition::DefendingPlayerControls { .. } => ("DefendingPlayerControls", Unhandled),
         StaticCondition::SourceAttackingAlone => ("SourceAttackingAlone", Unhandled),
-        StaticCondition::SourceIsAttacking => ("SourceIsAttacking", Unhandled),
-        StaticCondition::SourceIsBlocking => ("SourceIsBlocking", Unhandled),
-        StaticCondition::SourceIsBlocked => ("SourceIsBlocked", Unhandled),
+        // CR 508.1k / 509.1g / 509.1h: runtime-evaluated against the live combat
+        // attacker/blocker sets (conditions.rs:81 / layers.rs:1118 / layers.rs:1123).
+        StaticCondition::SourceIsAttacking => ("SourceIsAttacking", Handled),
+        StaticCondition::SourceIsBlocking => ("SourceIsBlocking", Handled),
+        StaticCondition::SourceIsBlocked => ("SourceIsBlocked", Handled),
         StaticCondition::IsMonarch => ("IsMonarch", Handled),
         StaticCondition::IsInitiative => ("IsInitiative", Handled),
         StaticCondition::NoMonarch => ("NoMonarch", Handled),
@@ -5945,6 +5996,7 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         StaticCondition::UnlessPay { .. } => ("UnlessPay", Handled),
         StaticCondition::ControlsCommander { .. } => ("ControlsCommander", Unhandled),
         StaticCondition::SourceIsEquipped => ("SourceIsEquipped", Unhandled),
+        StaticCondition::SourceIsEnchanted => ("SourceIsEnchanted", Unhandled),
         StaticCondition::SourceIsMonstrous => ("SourceIsMonstrous", Unhandled),
         StaticCondition::SourceAttachedToCreature => ("SourceAttachedToCreature", Unhandled),
         StaticCondition::SourceMatchesFilter { .. } => ("SourceMatchesFilter", Unhandled),
@@ -11129,6 +11181,38 @@ mod tests {
         assert!(
             is_static_supported(&supported, &trigger_registry, &static_registry),
             "a plain keyword-grant continuous static must be supported"
+        );
+    }
+
+    /// CR 113.11: CantHaveKeyword is a data-carrying static (parameterized by
+    /// keyword). Archetype of Imagination et al. must be covered once this arm
+    /// is present in `is_data_carrying_static()`.
+    #[test]
+    fn cant_have_keyword_static_has_no_coverage_gap() {
+        let mut face = make_face();
+        let oracle = "Creatures your opponents control lose flying and can't have or gain flying.";
+        face.oracle_text = Some(oracle.to_string());
+        face.static_abilities.push(StaticDefinition {
+            mode: StaticMode::CantHaveKeyword {
+                keyword: Keyword::Flying,
+            },
+            affected: Some(TargetFilter::Typed(
+                TypedFilter::creature().controller(ControllerRef::Opponent),
+            )),
+            modifications: vec![],
+            condition: None,
+            per_player_condition: None,
+            affected_zone: None,
+            effect_zone: None,
+            active_zones: vec![],
+            characteristic_defining: false,
+            description: Some(oracle.to_string()),
+            attack_defended: None,
+        });
+
+        assert!(
+            card_face_gaps(&face).is_empty(),
+            "CantHaveKeyword(Flying) should be covered by is_data_carrying_static()"
         );
     }
 }

@@ -42,8 +42,8 @@ use super::mulligan;
 use super::planeswalker;
 use super::priority;
 use super::public_state::{
-    bump_state_revision, finalize_public_state, mark_public_state_all_dirty,
-    mark_public_state_from_events, sync_waiting_for,
+    bump_state_revision, finalize_display_state, finalize_public_state, finalize_rules_state,
+    mark_public_state_all_dirty, mark_public_state_from_events, sync_waiting_for,
 };
 use super::sba;
 use super::splice;
@@ -51,6 +51,10 @@ use super::triggers;
 use super::turn_control;
 use super::turns;
 use super::zones;
+
+pub use super::engine_resolve_batch::{
+    resolve_all_fast_forward, ResolveAllCallbackDecision, ResolveAllFastForwardResult,
+};
 
 #[derive(Debug, Clone, Error)]
 pub enum EngineError {
@@ -62,6 +66,12 @@ pub enum EngineError {
     NotYourPriority,
     #[error("Action not allowed: {0}")]
     ActionNotAllowed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublicFinalizeMode {
+    Immediate,
+    DeferredDisplay,
 }
 
 fn handle_unlock_room_door(
@@ -144,6 +154,25 @@ pub fn apply(
     actor: PlayerId,
     action: GameAction,
 ) -> Result<ActionResult, EngineError> {
+    apply_action_boundary(state, actor, action, PublicFinalizeMode::Immediate)
+}
+
+pub(super) fn apply_action_boundary(
+    state: &mut GameState,
+    actor: PlayerId,
+    action: GameAction,
+    mode: PublicFinalizeMode,
+) -> Result<ActionResult, EngineError> {
+    apply_action_boundary_with_stack_limit(state, actor, action, mode, None)
+}
+
+pub(super) fn apply_action_boundary_with_stack_limit(
+    state: &mut GameState,
+    actor: PlayerId,
+    action: GameAction,
+    mode: PublicFinalizeMode,
+    stack_resolution_limit: Option<u32>,
+) -> Result<ActionResult, EngineError> {
     // Clear transient inter-effect state at the start of each player action.
     // last_effect_count is set by interactive handlers (e.g., DiscardChoice) and
     // consumed by sub_ability continuations via EventContextAmount fallback.
@@ -152,7 +181,7 @@ pub fn apply(
     state.exiled_from_hand_this_resolution = 0;
     state.die_result_this_resolution = None;
     check_actor_authorization(state, actor, &action)?;
-    let mut result = apply_action(state, actor, action)?;
+    let mut result = apply_action(state, actor, action, stack_resolution_limit)?;
     reconcile_terminal_result(state, &mut result);
     bump_state_revision(state);
     sync_waiting_for(state, &result.waiting_for);
@@ -168,7 +197,10 @@ pub fn apply(
     // consumer of `public_state_dirty`, so marking once here over the complete
     // event stream is correct and cheapest.
     mark_public_state_from_events(state, &result.events);
-    finalize_public_state(state);
+    finalize_rules_state(state);
+    if matches!(mode, PublicFinalizeMode::Immediate) {
+        finalize_display_state(state);
+    }
     result.log_entries = super::log::resolve_log_entries(&result.events, state);
     Ok(result)
 }
@@ -356,6 +388,7 @@ fn phase_stop_hit(state: &GameState, player: PlayerId) -> bool {
 fn pass_priority_once_with_pipeline(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
+    stack_resolution_limit: Option<u32>,
 ) -> Result<WaitingFor, EngineError> {
     state.cancelled_casts.clear();
     // CR 117.4 + 608.1: When all players pass in succession the stack begins
@@ -369,7 +402,12 @@ fn pass_priority_once_with_pipeline(
     // submitter (the controller), which would mis-count consecutive passes and
     // soft-lock the game.
     let current_seat = turn_control::priority_seat(state);
-    let wf = priority::handle_priority_pass(current_seat, state, events);
+    let wf = priority::handle_priority_pass_with_limit(
+        current_seat,
+        state,
+        events,
+        stack_resolution_limit,
+    );
     sync_waiting_for(state, &wf);
 
     // CR 608.2 + CR 117.4: Drain any pending continuation queued during the
@@ -1111,7 +1149,7 @@ fn run_auto_pass_loop(state: &mut GameState, result: &mut ActionResult) {
                 }
 
                 let mut events = Vec::new();
-                match pass_priority_once_with_pipeline(state, &mut events) {
+                match pass_priority_once_with_pipeline(state, &mut events, None) {
                     Ok(wf) => {
                         let stack_empty_or_grew =
                             finish_completed_or_interrupted_until_stack_empty_sessions(state);
@@ -1320,6 +1358,7 @@ fn apply_action(
     state: &mut GameState,
     actor: PlayerId,
     action: GameAction,
+    stack_resolution_limit: Option<u32>,
 ) -> Result<ActionResult, EngineError> {
     // Clear stale revealed_cards from the previous action.
     // RevealTop reveals (e.g. Goblin Guide) are momentary — shown for one state update.
@@ -1339,9 +1378,13 @@ fn apply_action(
     // CR 701.20e: A bare "look at the top card" peek is visible to the looker
     // only until they act on it. The peek window must survive the action that
     // serves the dependent "you may reveal that card" optional (the looked-at
-    // card is shown while that `OptionalEffectChoice` is pending), then clear on
-    // the next action boundary — mirroring the momentary `revealed_cards` reveal.
-    if !matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }) {
+    // card is shown while that `OptionalEffectChoice` is pending) and any
+    // `RevealChoice` opened by a private look-at-hand, then clear on the next
+    // action boundary — mirroring the momentary `revealed_cards` reveal.
+    if !matches!(
+        state.waiting_for,
+        WaitingFor::OptionalEffectChoice { .. } | WaitingFor::RevealChoice { .. }
+    ) {
         state.private_look_ids.clear();
         state.private_look_player = None;
     }
@@ -1571,7 +1614,7 @@ fn apply_action(
             {
                 return Err(EngineError::NotYourPriority);
             }
-            let wf = pass_priority_once_with_pipeline(state, &mut events)?;
+            let wf = pass_priority_once_with_pipeline(state, &mut events, stack_resolution_limit)?;
             return Ok(ActionResult {
                 events,
                 waiting_for: wf,
@@ -2311,15 +2354,18 @@ fn apply_action(
                         &mut events,
                     )?
                 }
-                PayCostKind::TapCreatures => engine_casting::handle_tap_creatures_for_spell_cost(
-                    state,
-                    *player,
-                    *pending_cast.clone(),
-                    *count,
-                    choices,
-                    &chosen,
-                    &mut events,
-                )?,
+                PayCostKind::TapCreatures { aggregate } => {
+                    engine_casting::handle_tap_creatures_for_spell_cost(
+                        state,
+                        *player,
+                        *pending_cast.clone(),
+                        *count,
+                        *aggregate,
+                        choices,
+                        &chosen,
+                        &mut events,
+                    )?
+                }
                 PayCostKind::Behold { action } => engine_casting::handle_behold_for_cost(
                     state,
                     *player,
@@ -2342,14 +2388,18 @@ fn apply_action(
             CostResume::ManaAbility {
                 mana_ability: pending_mana_ability,
             } => match kind {
-                PayCostKind::TapCreatures => engine_casting::handle_tap_creatures_for_mana_ability(
-                    state,
-                    *count,
-                    choices,
-                    pending_mana_ability,
-                    &chosen,
-                    &mut events,
-                )?,
+                // CR 605.1a: mana-ability tap costs are always fixed-count; the
+                // aggregate form never resumes a mana ability.
+                PayCostKind::TapCreatures { .. } => {
+                    engine_casting::handle_tap_creatures_for_mana_ability(
+                        state,
+                        *count,
+                        choices,
+                        pending_mana_ability,
+                        &chosen,
+                        &mut events,
+                    )?
+                }
                 PayCostKind::Discard => engine_casting::handle_discard_for_mana_ability(
                     state,
                     *count,
@@ -3036,12 +3086,18 @@ fn apply_action(
                     .find(|p| p.id == player)
                     .map(|p| p.mana_pool.clone())
                     .ok_or_else(|| EngineError::InvalidAction("Player not found".to_string()))?;
-                let current_shards = if pending_ref.activation_ability_index.is_some() {
+                let activation_ability_index = pending_ref.activation_ability_index;
+                let current_shards = if let Some(ability_index) = activation_ability_index {
                     let (source_types, source_subtypes) =
                         casting::activation_source_types(state, spell_object);
                     let activation_ctx = crate::types::mana::PaymentContext::Activation {
                         source_types: &source_types,
                         source_subtypes: &source_subtypes,
+                        ability_tag: casting::activation_ability_tag(
+                            state,
+                            spell_object,
+                            ability_index,
+                        ),
                     };
                     let any_color = casting::player_can_spend_as_any_color_for_payment(
                         state,
@@ -4396,7 +4452,7 @@ fn apply_action(
                 AutoPassRequest::UntilEndOfTurn => AutoPassMode::UntilEndOfTurn,
             };
             state.auto_pass.insert(*player, stored_mode);
-            let wf = pass_priority_once_with_pipeline(state, &mut events)?;
+            let wf = pass_priority_once_with_pipeline(state, &mut events, None)?;
             return Ok(ActionResult {
                 events,
                 waiting_for: wf,
@@ -11921,7 +11977,7 @@ mod tests {
                     costs: vec![
                         AbilityCost::Tap,
                         AbilityCost::TapCreatures {
-                            count: 1,
+                            requirement: crate::types::ability::TapCreaturesRequirement::count(1),
                             filter: crate::types::ability::TypedFilter::creature()
                                 .controller(crate::types::ability::ControllerRef::You)
                                 .into(),
@@ -11959,7 +12015,7 @@ mod tests {
             result.waiting_for,
             WaitingFor::PayCost {
                 player: PlayerId(0),
-                kind: PayCostKind::TapCreatures,
+                kind: PayCostKind::TapCreatures { .. },
                 count: 1,
                 resume: CostResume::ManaAbility { .. },
                 ..
@@ -12392,7 +12448,7 @@ mod tests {
                     costs: vec![
                         AbilityCost::Tap,
                         AbilityCost::TapCreatures {
-                            count: 1,
+                            requirement: crate::types::ability::TapCreaturesRequirement::count(1),
                             filter: TypedFilter::creature()
                                 .controller(ControllerRef::You)
                                 .into(),
@@ -12448,7 +12504,7 @@ mod tests {
         match result.waiting_for {
             WaitingFor::PayCost {
                 player,
-                kind: PayCostKind::TapCreatures,
+                kind: PayCostKind::TapCreatures { .. },
                 count,
                 choices: creatures,
                 resume: CostResume::ManaAbility { .. },
@@ -12524,7 +12580,7 @@ mod tests {
                     costs: vec![
                         AbilityCost::Tap,
                         AbilityCost::TapCreatures {
-                            count: 2,
+                            requirement: crate::types::ability::TapCreaturesRequirement::count(2),
                             filter: TypedFilter::creature()
                                 .with_type(TypeFilter::Subtype("Elf".to_string()))
                                 .controller(ControllerRef::You)
@@ -12574,7 +12630,7 @@ mod tests {
         match result.waiting_for {
             WaitingFor::PayCost {
                 player,
-                kind: PayCostKind::TapCreatures,
+                kind: PayCostKind::TapCreatures { .. },
                 count,
                 choices: creatures,
                 resume: CostResume::Spell { .. },
@@ -12631,7 +12687,7 @@ mod tests {
                     costs: vec![
                         AbilityCost::Tap,
                         AbilityCost::TapCreatures {
-                            count: 1,
+                            requirement: crate::types::ability::TapCreaturesRequirement::count(1),
                             filter: TypedFilter::creature()
                                 .with_type(TypeFilter::Subtype("Elf".to_string()))
                                 .controller(ControllerRef::You)

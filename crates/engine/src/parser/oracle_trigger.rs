@@ -40,9 +40,9 @@ use crate::types::ability::{
     CoinFlipResult, Comparator, ControllerRef, CounterTriggerFilter, DamageKindFilter,
     DestinationConstraint, Effect, FilterProp, ObjectScope, OriginConstraint, ParsedCondition,
     PlayerFilter, PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, RenownSubject,
-    SacrificeAggregateStat, SacrificeCost, SacrificeRequirement, StaticCondition, TargetFilter,
-    TriggerCondition, TriggerConstraint, TriggerDefinition, TypeFilter, TypedFilter,
-    UnlessPayModifier, ZoneChangeClause,
+    SacrificeAggregateStat, SacrificeCost, SacrificeRequirement, StaticCondition,
+    TapCreaturesRequirement, TargetFilter, TriggerCondition, TriggerConstraint, TriggerDefinition,
+    TypeFilter, TypedFilter, UnlessPayModifier, ZoneChangeClause,
 };
 use crate::types::card_type::{is_land_subtype, CoreType};
 use crate::types::counter::CounterType;
@@ -1168,10 +1168,19 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     }
 
     // CR 109.4 + CR 603.7c: Surface TargetFilter::Player when execute
-    // references ControllerRef::TargetPlayer.
+    // references ControllerRef::TargetPlayer, when the effect text names a
+    // target opponent/player (Sméagol, Helpful Guide RingTemptsYou), or when a
+    // RevealUntil names an opponent library without TargetPlayer binding.
     if def.valid_target.is_none() {
-        if let Some(execute) = def.execute.as_deref() {
-            if execute_references_target_player(&execute.effect) {
+        let effect_lower = modifiers.effect_lower.as_str();
+        if scan_contains(effect_lower, "target opponent")
+            || scan_contains(effect_lower, "target player")
+        {
+            def.valid_target = Some(TargetFilter::Player);
+        } else if let Some(execute) = def.execute.as_deref() {
+            if execute_references_target_player(&execute.effect)
+                || execute_references_opponent_player(&execute.effect)
+            {
                 def.valid_target = Some(TargetFilter::Player);
             }
         }
@@ -1958,7 +1967,10 @@ fn parse_unless_alt_cost(after_unless: &str) -> Option<AbilityCost> {
 /// the shared target parser.
 fn parse_unless_tap_untapped_cost(rest: &str) -> Option<AbilityCost> {
     let (count, filter) = parse_unless_counted_target_filter(rest)?;
-    Some(AbilityCost::TapCreatures { count, filter })
+    Some(AbilityCost::TapCreatures {
+        requirement: TapCreaturesRequirement::count(count),
+        filter,
+    })
 }
 
 /// CR 118.12 + CR 701.7: Parse the tail of "you exile ..." unless costs.
@@ -2813,6 +2825,7 @@ fn static_condition_to_trigger_condition(sc: &StaticCondition) -> Option<Trigger
         | StaticCondition::SourceIsBlocking
         | StaticCondition::SourceIsBlocked
         | StaticCondition::SourceIsEquipped
+        | StaticCondition::SourceIsEnchanted
         | StaticCondition::SourceIsPaired
         | StaticCondition::SourceIsMonstrous
         // CR 110.5b + CR 611.2b: `IsTapped { scope }` is a duration-only
@@ -2907,6 +2920,22 @@ fn parse_graveyard_origin_intervening_if(input: &str) -> OracleResult<'_, Trigge
         |_| graveyard_origin_or_condition(Some(ControllerRef::You)),
     );
     alt((compact, split_your)).parse(rest)
+}
+
+/// CR 701.26 + CR 603.4: "if it's the first time that creature/permanent has become
+/// tapped this turn" — intervening-if gating a tap trigger on the triggering
+/// object's first tap of the turn (Captain America, Living Legend). The "it's" is
+/// the expletive subject; the real object is "that creature" / "that permanent" /
+/// "it", which binds to the tapped object carried by the `PermanentTapped` event.
+fn parse_first_time_tapped_intervening_if(input: &str) -> OracleResult<'_, TriggerCondition> {
+    let (rest, _) = alt((
+        tag("if it's the first time "),
+        tag("if it is the first time "),
+    ))
+    .parse(input)?;
+    let (rest, _) = alt((tag("that creature"), tag("that permanent"), tag("it"))).parse(rest)?;
+    let (rest, _) = tag(" has become tapped this turn").parse(rest)?;
+    Ok((rest, TriggerCondition::FirstTimeObjectTappedThisTurn))
 }
 
 /// Extract an intervening-if condition from effect text.
@@ -3027,6 +3056,20 @@ fn extract_if_condition(text: &str) -> (String, Option<TriggerCondition>) {
     // is a prefix of "if it was cast using web-slinging" and would shadow it.
     if let Some((before, condition, rest)) =
         scan_preceded(&lower, parse_cast_using_variant_intervening_if)
+    {
+        let pos = before.len();
+        let clause_len = lower.len() - before.len() - rest.len();
+        return (
+            strip_condition_clause(text, pos, clause_len),
+            Some(condition),
+        );
+    }
+
+    // CR 701.26 + CR 603.4: "if it's the first time that creature has become tapped
+    // this turn" — first-tap intervening-if (Captain America, Living Legend). Source/
+    // triggering-object-referential, so it cannot lower through a StaticCondition.
+    if let Some((before, condition, rest)) =
+        scan_preceded(&lower, parse_first_time_tapped_intervening_if)
     {
         let pos = before.len();
         let clause_len = lower.len() - before.len() - rest.len();
@@ -3907,6 +3950,20 @@ fn try_parse_keyword_activation_trigger(lower: &str) -> Option<(TriggerMode, Tri
             def.mode = TriggerMode::KeywordAbilityActivated(AbilityTag::Boast);
             return Some((TriggerMode::KeywordAbilityActivated(AbilityTag::Boast), def));
         }
+        // CR 602.1 + CR 603.1b: Match "a power-up ability" — Marvel Boy triggers
+        // when its controller activates a power-up ability (one of two trigger
+        // conditions split from the dual-condition text by `split_and_when_compound`).
+        if tag::<_, _, OracleError<'_>>("a power-up ability")
+            .parse(rest)
+            .is_ok()
+        {
+            let mut def = make_base();
+            def.mode = TriggerMode::KeywordAbilityActivated(AbilityTag::PowerUp);
+            return Some((
+                TriggerMode::KeywordAbilityActivated(AbilityTag::PowerUp),
+                def,
+            ));
+        }
         #[derive(Clone, Copy)]
         enum KeywordActivationSubject {
             SelfRef,
@@ -4727,9 +4784,17 @@ fn split_cross_subject_event_compound(cond_lower: &str, condition: &str) -> Opti
 
     // Check if what follows " or " starts with a valid subject phrase
     // (a/an/the + type word, or "a player", "an opponent", etc.)
-    if parse_cross_subject_phrase_start(after_lower.trim_start()).is_err() {
+    let after_trimmed = after_lower.trim_start();
+    if parse_cross_subject_phrase_start(after_trimmed).is_err() {
         return None;
     }
+
+    // CR 508.3a: The second half must contain an event verb to be a genuine
+    // cross-subject compound trigger. Without this guard, attack-target scope
+    // extensions ("attacks you or a planeswalker you control") are mis-split
+    // because "a planeswalker you control" starts with an article but has no
+    // event verb — it extends the attack target, not the trigger event.
+    scan_preceded(after_trimmed, |i| parse_event_verb_start(i))?;
 
     let (_, keyword) = parse_trigger_keyword_prefix(cond_lower).ok()?;
 
@@ -5633,6 +5698,28 @@ fn execute_references_target_player(effect: &crate::types::ability::Effect) -> b
     false
 }
 
+/// CR 115.1 + CR 701.20a: Returns `true` when a `RevealUntil` (or nested
+/// sub-ability) names an opponent/player library without `TargetPlayer`
+/// binding — e.g. Sméagol's "target opponent reveals..." RingTemptsYou trigger.
+fn execute_references_opponent_player(effect: &crate::types::ability::Effect) -> bool {
+    fn filter_references_opponent(filter: &TargetFilter) -> bool {
+        match filter {
+            TargetFilter::Typed(TypedFilter { controller, .. }) => {
+                matches!(controller, Some(ControllerRef::Opponent))
+            }
+            TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+                filters.iter().any(filter_references_opponent)
+            }
+            TargetFilter::Not { filter } => filter_references_opponent(filter),
+            _ => false,
+        }
+    }
+    match effect {
+        Effect::RevealUntil { player, .. } => filter_references_opponent(player),
+        _ => false,
+    }
+}
+
 /// CR 608.2k: Extract the trigger subject from condition text for pronoun context.
 /// Reuses `parse_trigger_subject` but only needs the `TargetFilter`, not the remainder.
 /// For subjectless triggers (phase, player-action, game mechanics), the result is `Any`
@@ -6183,6 +6270,7 @@ fn parse_damage_to_qualifier_with_rest(after_verb: &str) -> OracleResult<'_, Tar
             alt((
                 preceded(tag("an "), tag("opponent")),
                 preceded(tag("one of your "), tag("opponents")),
+                preceded(tag("one or more of your "), tag("opponents")),
                 preceded(tag("another "), tag("player")),
             )),
         )
@@ -7247,6 +7335,8 @@ fn try_parse_event(
         Exploits,
         /// CR 701.44b: A permanent "explores" after the explore process completes.
         Explores,
+        /// CR 701.50b: A permanent "connives" after the connive process completes.
+        Connives,
         /// CR 702.100b: A creature "evolves" when +1/+1 counters are put on it
         /// as a result of its evolve ability resolving.
         Evolves,
@@ -7401,6 +7491,9 @@ fn try_parse_event(
             // CR 701.44b: "explores" / "explore" — explore trigger
             value(SimpleEvent::Explores, tag("explores")),
             value(SimpleEvent::Explores, tag("explore")),
+            // CR 701.50b: "connives" — connive trigger (fires after the connive
+            // process completes).
+            value(SimpleEvent::Connives, tag("connives")),
             // CR 702.100b: "evolves" / "evolve" — evolve trigger
             value(SimpleEvent::Evolves, tag("evolves")),
             value(SimpleEvent::Evolves, tag("evolve")),
@@ -7558,6 +7651,15 @@ fn try_parse_event(
                 }
                 // CR 701.44b: "explores" fires after the explore process completes.
                 def.mode = TriggerMode::Explored;
+                def.valid_card = Some(subject.clone());
+            }
+            SimpleEvent::Connives => {
+                if !remaining.trim().is_empty() {
+                    return None;
+                }
+                // CR 701.50b: "connives" fires after the connive process completes.
+                // `subject` ("a creature you control" / "~") scopes the conniver.
+                def.mode = TriggerMode::Connives;
                 def.valid_card = Some(subject.clone());
             }
             SimpleEvent::Evolves => {
@@ -9938,10 +10040,15 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
     // both via `match_play_card`. Matched before the land-play arm; the
     // "a card" object cannot match the land-play helper's "a land"/"another land"
     // object, so neither shadows the other.
-    if parse_play_card_trigger_subject(lower).is_some() {
+    if let Some(origin) = parse_play_card_trigger_subject(lower) {
         let mut def = make_base();
         def.mode = TriggerMode::PlayCard;
         def.valid_target = Some(TargetFilter::Controller);
+        // CR 601.1a + CR 400.1: the cast half honors the play origin via
+        // `spell_cast_origin`; `match_play_card` gates the land half on the same
+        // constraint. `Any` (no "from <zone>" tail) preserves plain play-card
+        // triggers unchanged.
+        def.spell_cast_origin = origin;
         return Some((TriggerMode::PlayCard, def));
     }
 
@@ -10482,10 +10589,16 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
         return Some((TriggerMode::Cycled, def));
     }
 
-    // CR 120.1: "whenever you're dealt combat damage" — must precede generic "dealt damage"
+    // CR 120.2a (combat damage) + CR 120.1 (damage): the player is dealt combat
+    // damage. Both active ("you're dealt combat damage") and passive ("combat
+    // damage is dealt to you") voice describe the same event; this arm must
+    // precede the generic "dealt damage" arm below.
     if matches!(
         lower,
-        "whenever you're dealt combat damage" | "when you're dealt combat damage"
+        "whenever you're dealt combat damage"
+            | "when you're dealt combat damage"
+            | "whenever combat damage is dealt to you"
+            | "when combat damage is dealt to you"
     ) {
         let mut def = make_base();
         def.mode = TriggerMode::DamageReceived;
@@ -12445,13 +12558,15 @@ fn is_land_play_filter(tf: &TypedFilter) -> bool {
 /// (Recycle, Null Profusion, Jinxed Ring).
 ///
 /// Decomposed into axes (prefix × verb × object) via nom combinators, mirroring
-/// `parse_land_play_trigger_subject`. Returns `Some(())` when the full
-/// "you play a card" subject is present and is followed only by end-of-input or
-/// the effect comma (so "you play a card from your graveyard" does not match).
+/// `parse_land_play_trigger_subject`. Returns `Some(OriginConstraint)` when the
+/// full "you play a card" subject is present, capturing an optional `from <zone>`
+/// tail: "you play a card from exile" yields an exile-origin constraint, while
+/// bare "you play a card" yields the unrestricted (`Any`) origin. The subject
+/// must be followed only by end-of-input, the effect comma, or that zone tail.
 /// Restricted to the exact second-person bare-card form. Qualified variants
 /// such as "a player plays a card exiled with ~" need additional linked-card
 /// filtering before they can safely share this parser arm.
-fn parse_play_card_trigger_subject(lower: &str) -> Option<()> {
+fn parse_play_card_trigger_subject(lower: &str) -> Option<OriginConstraint> {
     let (after_prefix, _) = alt((
         tag::<_, _, OracleError<'_>>("whenever "),
         tag::<_, _, OracleError<'_>>("when "),
@@ -12467,13 +12582,20 @@ fn parse_play_card_trigger_subject(lower: &str) -> Option<()> {
     let (after_card, _) = tag::<_, _, OracleError<'_>>("a card")
         .parse(after_verb)
         .ok()?;
+    // CR 601.1a + CR 400.1: An optional "from <zone>" tail restricts the play
+    // origin ("whenever you play a card from exile"). The shared cast-origin
+    // combinator consumes the "from " prefix and the zone phrase; absent a
+    // "from" clause it returns `Any` (plain "whenever you play a card"). This
+    // mirrors the Rocco, Street Chef cast-from-zone shape.
+    let (after_origin, origin) =
+        parse_origin_constraint_tail(after_card.trim_start(), parse_cast_origin_zone).ok()?;
     // The subject must be the whole condition: either end-of-input, or the
     // effect comma ("..., draw a card.") follows directly. `eof` / `tag(",")`
     // reject any further qualifier text.
     alt((value((), eof), value((), tag::<_, _, OracleError<'_>>(","))))
-        .parse(after_card)
+        .parse(after_origin.trim_start())
         .ok()?;
-    Some(())
+    Some(origin)
 }
 
 /// CR 725.1: Parse "whenever/when [subject] become(s) the monarch" trigger.
@@ -13864,6 +13986,30 @@ mod tests {
         ));
     }
 
+    /// MSH Wave 2 (Molten Lavamancer): the batched "one or more of your opponents"
+    /// recipient must parse as a noncombat damage trigger whose recipient is an
+    /// opponent. Without the new `parse_opponent_player_recipient` arm, the
+    /// recipient is unmatched, `try_parse_source_deals_damage_trigger` bails on the
+    /// `valid_target.is_none()` guard, and `mode != DamageDone`.
+    #[test]
+    fn molten_lavamancer_one_or_more_opponents_recipient_parses() {
+        let def = parse_trigger_line(
+            "Whenever a source you control deals noncombat damage to one or more of your \
+             opponents during your turn, you create a 1/1 red Elemental creature token. \
+             This ability triggers only once each turn.",
+            "Molten Lavamancer",
+        );
+        assert_eq!(def.mode, TriggerMode::DamageDone);
+        assert_eq!(def.damage_kind, DamageKindFilter::NoncombatOnly);
+        assert_eq!(
+            def.valid_target,
+            Some(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::Opponent)
+            )),
+            "recipient must be an opponent-controlled player filter"
+        );
+    }
+
     #[test]
     fn hunters_insight_class_builds_whenever_event_delayed_trigger() {
         use crate::parser::oracle::parse_oracle_text;
@@ -14826,6 +14972,28 @@ mod tests {
             attack_trigger.valid_card,
             Some(TargetFilter::Typed(_))
         ));
+    }
+
+    /// CR 508.3a: "attacks you or a planeswalker you control" is a single
+    /// attack-target scope (PlayerOrPlaneswalker), NOT a cross-subject compound.
+    /// The production path (`parse_trigger_lines`) must produce exactly one
+    /// trigger — not mis-split at " or ".
+    #[test]
+    fn trigger_attacks_you_or_planeswalker_not_split() {
+        let triggers = parse_trigger_lines(
+            "Whenever a creature attacks you or a planeswalker you control, that creature's controller loses 1 life.",
+            "Revenge of Ravens",
+        );
+        assert_eq!(
+            triggers.len(),
+            1,
+            "attack-target scope extension must not be split into two triggers"
+        );
+        assert_eq!(triggers[0].mode, TriggerMode::Attacks);
+        assert_eq!(
+            triggers[0].attack_target_filter,
+            Some(AttackTargetFilter::PlayerOrPlaneswalker)
+        );
     }
 
     #[test]
@@ -19639,6 +19807,22 @@ mod tests {
         assert_eq!("~ deals 1 damage to you", cleaned);
     }
 
+    /// CR 701.26 + CR 603.4: Captain America, Living Legend — the first-tap
+    /// intervening-if lowers to `TriggerCondition::FirstTimeObjectTappedThisTurn`
+    /// and is stripped from the effect text, leaving the bare "untap it" effect.
+    #[test]
+    fn extract_if_condition_first_time_tapped_pattern() {
+        let (cleaned, cond) = super::extract_if_condition(
+            "if it's the first time that creature has become tapped this turn, untap it.",
+        );
+        assert_eq!(
+            cond,
+            Some(TriggerCondition::FirstTimeObjectTappedThisTurn),
+            "first-tap intervening-if must extract FirstTimeObjectTappedThisTurn"
+        );
+        assert_eq!("untap it", cleaned);
+    }
+
     #[test]
     fn trigger_enchanted_land_is_tapped_for_mana() {
         let def = parse_trigger_line(
@@ -20943,8 +21127,11 @@ mod tests {
         );
         let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
         match &unless_pay.cost {
-            AbilityCost::TapCreatures { count, filter } => {
-                assert_eq!(*count, 1);
+            AbilityCost::TapCreatures {
+                requirement,
+                filter,
+            } => {
+                assert_eq!(requirement.fixed_count(), Some(1));
                 let is_creature = match filter {
                     TargetFilter::Typed(tf) => {
                         tf.type_filters.contains(&TypeFilter::Creature)
@@ -20979,8 +21166,11 @@ mod tests {
         );
         let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
         match &unless_pay.cost {
-            AbilityCost::TapCreatures { count, filter: _ } => {
-                assert_eq!(*count, 1);
+            AbilityCost::TapCreatures {
+                requirement,
+                filter: _,
+            } => {
+                assert_eq!(requirement.fixed_count(), Some(1));
             }
             other => panic!("cost should be TapCreatures, got {:?}", other),
         }
@@ -20999,8 +21189,11 @@ mod tests {
         );
         let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
         match &unless_pay.cost {
-            AbilityCost::TapCreatures { count, filter } => {
-                assert_eq!(*count, 2);
+            AbilityCost::TapCreatures {
+                requirement,
+                filter,
+            } => {
+                assert_eq!(requirement.fixed_count(), Some(2));
                 let has_creature = match filter {
                     TargetFilter::Typed(tf) => tf.type_filters.contains(&TypeFilter::Creature),
                     TargetFilter::And { filters } => filters.iter().any(|f| {
@@ -21764,6 +21957,51 @@ mod tests {
             "Ringwraiths",
         );
         assert_eq!(def.mode, TriggerMode::RingTemptsYou);
+    }
+
+    #[test]
+    fn trigger_ring_tempts_you_target_opponent_reveal_sets_valid_target() {
+        let def = parse_trigger_line(
+            "Whenever the Ring tempts you, target opponent reveals cards from the top of their library until they reveal a land card. Put that card onto the battlefield tapped under your control and the rest into their graveyard.",
+            "Sméagol, Helpful Guide",
+        );
+        assert_eq!(def.mode, TriggerMode::RingTemptsYou);
+        assert_eq!(def.valid_target, Some(TargetFilter::Player));
+        let Effect::RevealUntil {
+            player,
+            filter,
+            kept_destination,
+            rest_destination,
+            enter_tapped,
+            enters_under,
+            ..
+        } = def.execute.as_ref().unwrap().effect.as_ref()
+        else {
+            panic!("expected RevealUntil");
+        };
+        assert!(
+            matches!(
+                player,
+                TargetFilter::Typed(tf) if tf.controller == Some(ControllerRef::Opponent)
+            ),
+            "reveal player must be opponent, got {player:?}"
+        );
+        assert!(
+            matches!(filter, TargetFilter::Typed(tf) if tf.type_filters.contains(&TypeFilter::Land)),
+            "filter must be land, got {filter:?}"
+        );
+        assert_eq!(*kept_destination, Zone::Battlefield);
+        assert_eq!(*rest_destination, Zone::Graveyard);
+        assert_eq!(
+            *enter_tapped,
+            crate::types::zones::EtbTapState::Tapped,
+            "land must enter tapped"
+        );
+        assert_eq!(
+            *enters_under,
+            Some(ControllerRef::You),
+            "stolen land must enter under ability controller"
+        );
     }
 
     #[test]
@@ -25624,7 +25862,7 @@ mod tests {
 
     #[test]
     fn trigger_you_dealt_combat_damage() {
-        // CR 120.1a: "whenever you're dealt combat damage" — combat-only variant.
+        // CR 120.2a: "whenever you're dealt combat damage" — combat-only variant.
         let def = parse_trigger_line(
             "Whenever you're dealt combat damage, draw a card.",
             "Test Card",
@@ -25632,6 +25870,56 @@ mod tests {
         assert_eq!(def.mode, TriggerMode::DamageReceived);
         assert_eq!(def.damage_kind, DamageKindFilter::CombatOnly);
         assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+    }
+
+    #[test]
+    fn trigger_combat_damage_dealt_to_you_passive() {
+        // CR 120.2a: passive voice "combat damage is dealt to you" is the same
+        // event as the active "you're dealt combat damage" (Risona, Asari
+        // Commander; I Am Untouchable).
+        let def = parse_trigger_line(
+            "Whenever combat damage is dealt to you, draw a card.",
+            "Test Card",
+        );
+        assert_eq!(def.mode, TriggerMode::DamageReceived);
+        assert_eq!(def.damage_kind, DamageKindFilter::CombatOnly);
+        assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+    }
+
+    #[test]
+    fn trigger_combat_damage_dealt_to_you_passive_when() {
+        // CR 120.2a: "When" variant of the passive combat-damage form.
+        let def = parse_trigger_line(
+            "When combat damage is dealt to you, create a 4/4 Scarecrow.",
+            "I Am Untouchable",
+        );
+        assert_eq!(def.mode, TriggerMode::DamageReceived);
+        assert_eq!(def.damage_kind, DamageKindFilter::CombatOnly);
+        assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+    }
+
+    #[test]
+    fn trigger_combat_damage_dealt_to_you_compound_unsupported() {
+        // GUARD: the compound "to you or a planeswalker you control" form
+        // (Vengeful Pharaoh) is not the bare literal; it stays Unknown — an
+        // honest gap, since the compound splitter is out of scope here.
+        let def = parse_trigger_line(
+            "Whenever combat damage is dealt to you or a planeswalker you control, return ~ from your graveyard to the battlefield.",
+            "Vengeful Pharaoh",
+        );
+        assert!(matches!(def.mode, TriggerMode::Unknown(_)));
+    }
+
+    #[test]
+    fn trigger_you_deal_combat_damage_to_player_not_intercepted() {
+        // NO-REGRESSION: the active deal-form ("deals combat damage to a
+        // player") is DamageDone, not DamageReceived — the new passive
+        // receive-literals must not capture it.
+        let def = parse_trigger_line(
+            "Whenever Risona deals combat damage to a player, you draw a card.",
+            "Risona, Asari Commander",
+        );
+        assert_eq!(def.mode, TriggerMode::DamageDone);
     }
 
     #[test]

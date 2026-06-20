@@ -1663,7 +1663,8 @@ pub(super) fn resolve_optional_effect_decision(
                         // Extraordinaire's declined Treasure sacrifice must not
                         // resolve the double-strike reflexive).
                         || (sub.sub_link == SubAbilityLink::SequentialSibling
-                            && !sub_ability_is_reflexive(sub))
+                            && !sub_ability_is_reflexive(sub)
+                            && !cast_from_zone::is_graveyard_exile_rider_subability(sub))
                 })
             });
             if let Some(branch) = decline_branch {

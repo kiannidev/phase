@@ -307,6 +307,7 @@ mod issue_3654_nyxbloom_mana_reflection;
 mod issue_3660_paradigm_multiple_offers;
 mod issue_3665_smugglers_share;
 mod issue_3681_inferno_titan_divided_damage;
+mod issue_3872_tithe_taker_turn_scoped_tax;
 mod issue_3878_go_shintai_combat_damage;
 mod issue_3881_feed_swarm_darksteel_mutation;
 mod issue_3883_kari_zev_ragavan;

@@ -7864,7 +7864,8 @@ mod tests {
     #[test]
     fn parse_nontoken_creature_died_this_turn_for_each() {
         let (_, q) =
-            parse_for_each_creature_died_this_turn("nontoken creature that died this turn").unwrap();
+            parse_for_each_creature_died_this_turn("nontoken creature that died this turn")
+                .unwrap();
         let QuantityRef::ZoneChangeCountThisTurn { filter, .. } = q else {
             panic!("expected ZoneChangeCountThisTurn, got {q:?}");
         };

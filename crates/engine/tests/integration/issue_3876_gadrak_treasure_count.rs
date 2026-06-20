@@ -19,10 +19,7 @@ fn treasure_count(runner: &engine::game::scenario::GameRunner) -> usize {
         .objects
         .values()
         .filter(|o| {
-            o.controller == P0
-                && o.zone == Zone::Battlefield
-                && o.is_token
-                && o.name == "Treasure"
+            o.controller == P0 && o.zone == Zone::Battlefield && o.is_token && o.name == "Treasure"
         })
         .count()
 }

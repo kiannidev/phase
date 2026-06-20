@@ -2809,9 +2809,7 @@ fn static_opponent_creature_spells_cost_more_during_your_turn() {
     else {
         panic!("expected RaiseCost");
     };
-    let TargetFilter::Typed(tf) = spell_filter
-        .as_ref()
-        .expect("expected typed spell filter")
+    let TargetFilter::Typed(tf) = spell_filter.as_ref().expect("expected typed spell filter")
     else {
         panic!("expected typed spell filter");
     };

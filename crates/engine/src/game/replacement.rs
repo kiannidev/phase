@@ -1592,9 +1592,10 @@ fn draw_replacement_count(
 
     match &*execute.effect {
         Effect::Draw { count: qty, .. } if execute.sub_ability.is_none() => {
-            // CR 614.11: "draw N cards instead" replacements (Teferi's Ageless
-            // Insight: Fixed(2)) apply per card in the draw event — Brainsurge
-            // drawing four becomes eight, not two.
+            // CR 121.2 + CR 614.11a: "draw N cards instead" replacements
+            // (Teferi's Ageless Insight: Fixed(2)) apply to each card draw
+            // in the draw sequence — Brainsurge drawing four becomes eight,
+            // not two.
             let resolved = match qty {
                 QuantityExpr::Fixed { value } => value.saturating_mul(*count as i32),
                 _ => resolve_event_replacement_quantity(qty, *count)?,

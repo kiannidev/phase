@@ -23,7 +23,7 @@ fn teferi_ageless_insight_doubles_multi_card_draws() {
         .add_creature_from_oracle(P0, "Teferi's Ageless Insight", 0, 0, TEFERI_ORACLE)
         .as_enchantment();
     let draw_four = scenario
-        .add_spell_to_hand_from_oracle(P0, " Inspiration", false, DRAW_FOUR_ORACLE)
+        .add_spell_to_hand_from_oracle(P0, "Inspiration", false, DRAW_FOUR_ORACLE)
         .id();
     let mana: Vec<ManaUnit> = (0..8)
         .map(|_| ManaUnit::new(ManaType::Blue, ObjectId(0), false, vec![]))

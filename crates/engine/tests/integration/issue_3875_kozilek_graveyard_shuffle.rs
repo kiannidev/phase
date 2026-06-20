@@ -4,8 +4,8 @@
 //! https://github.com/phase-rs/phase/issues/3875
 
 use engine::game::scenario::{GameScenario, P0};
-use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::identifiers::ObjectId;
+use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
@@ -26,8 +26,12 @@ fn kozilek_graveyard_trigger_shuffles_owners_graveyard_into_library() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
 
-    let filler_a = scenario.add_creature_to_graveyard(P0, "Filler A", 1, 1).id();
-    let filler_b = scenario.add_creature_to_graveyard(P0, "Filler B", 1, 1).id();
+    let filler_a = scenario
+        .add_creature_to_graveyard(P0, "Filler A", 1, 1)
+        .id();
+    let filler_b = scenario
+        .add_creature_to_graveyard(P0, "Filler B", 1, 1)
+        .id();
     let kozilek = scenario
         .add_creature_from_oracle(P0, "Kozilek, Butcher of Truth", 12, 12, KOZILEK_ORACLE)
         .id();

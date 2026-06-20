@@ -19,7 +19,8 @@ use crate::types::ability::{
     AbilityDefinition, AbilityKind, CastingPermission, Chooser, ContinuousModification,
     ControllerRef, CopyRetargetPermission, CounterSourceRider, Duration, Effect, FaceDownBody,
     FaceDownProfile, LibraryPosition, MultiTargetSpec, PermissionGrantee, PtValue, QuantityExpr,
-    QuantityRef, StaticDefinition, TargetChoiceTiming, TargetFilter, TypeFilter, TypedFilter,
+    QuantityRef, RevealUntilDisposition, StaticDefinition, TargetChoiceTiming, TargetFilter,
+    TypeFilter, TypedFilter,
 };
 use crate::types::card_type::CoreType;
 use crate::types::counter::CounterType;
@@ -941,6 +942,27 @@ fn split_comma_clause_boundary(current: &str, remainder: &str) -> Option<(Clause
         return None;
     }
 
+    // CR 707.9a: ", except <body>, [and] <body> [, …]" — inside a copy-effect
+    // (BecomeCopy / CopyTokenOf) except clause, a comma (with or without a
+    // following "and") between recognised body shapes is an internal delimiter,
+    // not a clause boundary. Suppress the split so the whole except body reaches
+    // the shared `become_copy_except` parser. Without this, a trailing keyword
+    // body like ", and has haste" (The Apprentice's Folly: "create a token
+    // that's a copy of it, except it isn't legendary, is a Reflection in
+    // addition to its other types, and has haste") is bisected at the comma —
+    // "has haste" deconjugates to the clause verb "have" — and orphaned as an
+    // Unimplemented sub_ability instead of becoming an `AddKeyword` modification.
+    // Mirrors the `inside_except_clause` guard on the bare-`and` chunk path.
+    //
+    // `scan_contains` matches at word boundaries, so probing for the bare word
+    // "except " (a leading comma never sits at a word start) detects the clause
+    // regardless of the leading "[,] " before "except".
+    if nom_primitives::scan_contains(&current_lower, "except ")
+        && starts_except_body_continuation(trimmed_lower.as_str())
+    {
+        return None;
+    }
+
     // CR 701.18a: "search [library] for X, put/reveal Y" is a single compound action.
     // The search verb may follow a sequence connector like "Then" from a prior sentence.
     // CR 701.18a: Enumerated "search" prefixes — do NOT use contains(" search ").
@@ -1100,6 +1122,41 @@ fn starts_with_damage_amount_continuation(trimmed_lower: &str) -> bool {
         return false;
     };
     tag::<_, _, OracleError<'_>>("damage").parse(rest).is_ok()
+}
+
+/// CR 707.9a: True when `trimmed_lower` (post-comma text) begins with a
+/// recognised "except ..." body continuation. Only meaningful when the
+/// chunk-so-far is already inside a copy-effect except clause (the caller gates
+/// on that). The leading "and " connector is optional — "..., and has haste"
+/// and "..., is a Reflection" are both internal except-body continuations.
+///
+/// The recognised heads mirror the body shapes in
+/// `become_copy_except::parse_except_body` (keyword grants, type additions,
+/// supertype removal, "has this ability", possessive name/loyalty overrides) so
+/// this gate stays in lockstep with what that parser actually consumes.
+fn starts_except_body_continuation(trimmed_lower: &str) -> bool {
+    let body = tag::<_, _, OracleError<'_>>("and ")
+        .parse(trimmed_lower)
+        .map(|(rest, _)| rest)
+        .unwrap_or(trimmed_lower);
+    alt((
+        value((), tag::<_, _, OracleError<'_>>("has ")),
+        value((), tag("have ")),
+        value((), tag("it has ")),
+        value((), tag("it's ")),
+        value((), tag("is ")),
+        value((), tag("isn't ")),
+        value((), tag("isnt ")),
+        value((), tag("doesn't ")),
+        value((), tag("doesnt ")),
+        value((), tag("its ")),
+        value((), tag("his ")),
+        value((), tag("her ")),
+        value((), tag("they're ")),
+        value((), tag("theyre ")),
+    ))
+    .parse(body)
+    .is_ok()
 }
 
 fn starts_prefix_clause(current_lower: &str) -> bool {
@@ -2895,7 +2952,9 @@ pub(super) fn apply_clause_continuation(
             destination,
             enter_tapped: tapped,
             enters_attacking: attacking,
+            any_number,
             rest_destination: rest_dest,
+            enters_under,
             optional_decline,
         } => {
             let Some(previous) = defs.last_mut() else {
@@ -2907,9 +2966,28 @@ pub(super) fn apply_clause_continuation(
                 enters_attacking,
                 rest_destination,
                 kept_optional_to,
+                matched_disposition,
+                enters_under: effect_enters_under,
                 ..
             } = &mut *previous.effect
             {
+                // CR 701.20a + CR 608.2c: "put any number of those [filter] cards
+                // onto [destination]" dispenses the *matched set* through a
+                // controller choice (Aurora Awakener). Set the disposition and the
+                // kept/rest destinations directly — the single-hit optional/decline
+                // refinement below does not apply to a set selection.
+                if any_number {
+                    *matched_disposition = RevealUntilDisposition::ChooseAnyNumber;
+                    *kept_destination = destination;
+                    if destination == Zone::Battlefield {
+                        *enter_tapped = crate::types::zones::EtbTapState::from_legacy_bool(tapped);
+                        *enters_attacking = attacking;
+                    }
+                    if let Some(rest) = rest_dest {
+                        *rest_destination = rest;
+                    }
+                    return;
+                }
                 match optional_decline {
                     // CR 701.20a + CR 608.2c: optional kept clause ("you may put
                     // that card onto the battlefield"). `destination` is the
@@ -2940,6 +3018,7 @@ pub(super) fn apply_clause_continuation(
                 if let Some(rest) = rest_dest {
                     *rest_destination = rest;
                 }
+                *effect_enters_under = enters_under;
             }
         }
         ContinuationAst::GrantExtraTurnAfterControlledTurn => {
@@ -4008,6 +4087,8 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
         | Effect::EpicCopy { .. }
         | Effect::ChangeSpeed { .. }
         | Effect::DealDamage { .. }
+        | Effect::ApplyPostReplacementDamage { .. }
+        | Effect::EachDealsDamageEqualToPower { .. }
         | Effect::Draw { .. }
         | Effect::Pump { .. }
         | Effect::PairWith { .. }
@@ -4101,6 +4182,7 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
         | Effect::SolveCase
         | Effect::BecomePrepared { .. }
         | Effect::BecomeUnprepared { .. }
+        | Effect::BecomeSaddled { .. }
         | Effect::SetClassLevel { .. }
         | Effect::CreateDelayedTrigger { .. }
         | Effect::AddTargetReplacement { .. }
@@ -4459,6 +4541,51 @@ pub(super) fn parse_followup_continuation_ast(
                 reorder_all: false,
             })
         }
+        // CR 701.20a + CR 608.2c: "Put any number of those [filter] cards onto the
+        // battlefield, then put the rest … on the bottom … in a random order"
+        // (Aurora Awakener). This is the multi-match disposition over the *set* of
+        // matched cards: the controller chooses any subset for the battlefield and
+        // every other revealed card goes to the rest pile. Absorbs into
+        // `RevealUntilDisposition::ChooseAnyNumber` via the `any_number` flag.
+        // Checked before "put that card" because "any number of those" is a
+        // distinct disposition and never contains the singular "that card".
+        Effect::RevealUntil { .. }
+            if nom_primitives::scan_contains(&lower, "put any number of those")
+                || nom_primitives::scan_contains(&lower, "puts any number of those") =>
+        {
+            // CR 701.20a: the only destination this disposition currently targets
+            // is the battlefield ("put any number of those permanent cards onto
+            // the battlefield"); a hand variant would slot in here identically.
+            let (destination, enter_tapped, enters_attacking) =
+                if nom_primitives::scan_contains(&lower, "onto the battlefield") {
+                    (
+                        Zone::Battlefield,
+                        nom_primitives::scan_contains(&lower, "tapped"),
+                        nom_primitives::scan_contains(&lower, "attacking"),
+                    )
+                } else {
+                    (Zone::Hand, false, false)
+                };
+            let rest_destination = parse_reveal_until_rest_zone(&lower);
+            // "under your control" stamps the controller of the kept cards; absent
+            // the clause they enter under the revealing player's control by default.
+            // Mirrors the singular "put that card" arm so the set-disposition path
+            // inherits the same enters-under building block.
+            let enters_under = if nom_primitives::scan_contains(&lower, "under your control") {
+                Some(ControllerRef::You)
+            } else {
+                None
+            };
+            Some(ContinuationAst::RevealUntilKept {
+                destination,
+                enter_tapped,
+                enters_attacking,
+                any_number: true,
+                rest_destination,
+                enters_under,
+                optional_decline: None,
+            })
+        }
         // CR 701.20a: "put that card into your hand / onto the battlefield" after RevealUntil
         // — overrides kept_destination. Also extracts rest_destination from a compound
         // rest clause merged on "and" (suppressed split because the rest-subject — "the
@@ -4498,11 +4625,18 @@ pub(super) fn parse_followup_continuation_ast(
             } else {
                 None
             };
+            let enters_under = if nom_primitives::scan_contains(&lower, "under your control") {
+                Some(ControllerRef::You)
+            } else {
+                None
+            };
             Some(ContinuationAst::RevealUntilKept {
                 destination,
                 enter_tapped,
                 enters_attacking,
+                any_number: false,
                 rest_destination: rest,
+                enters_under,
                 optional_decline,
             })
         }
@@ -5280,6 +5414,26 @@ mod tests {
             .into_iter()
             .map(|c| c.text)
             .collect()
+    }
+
+    // CR 707.9a: a copy-effect except clause that ends in ", and has <keyword>"
+    // must NOT be bisected at the comma. "has" deconjugates to the clause verb
+    // "have", so without the `inside_except_clause` guard in the comma splitter
+    // the trailing keyword body is orphaned (The Apprentice's Folly I/II:
+    // "create a token that's a copy of it, except it isn't legendary, is a
+    // Reflection in addition to its other types, and has haste").
+    #[test]
+    fn copy_except_comma_and_keyword_body_stays_one_chunk() {
+        let chunks = clause_texts(
+            "create a token that's a copy of it, except it isn't legendary, is a Reflection in addition to its other types, and has haste",
+        );
+        assert_eq!(
+            chunks,
+            vec![
+                "create a token that's a copy of it, except it isn't legendary, is a Reflection in addition to its other types, and has haste"
+            ],
+            "the entire except clause must remain a single chunk so the trailing \", and has haste\" body reaches the except parser"
+        );
     }
 
     #[test]

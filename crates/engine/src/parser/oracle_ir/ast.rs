@@ -342,7 +342,15 @@ pub(crate) enum ContinuationAst {
         /// CR 508.4: the kept card enters the battlefield attacking
         /// ("tapped and attacking"). Absorbs into `enters_attacking`.
         enters_attacking: bool,
+        /// CR 701.20a + CR 608.2c: `true` when the disposition is "put any number
+        /// of those [filter] cards onto [destination]" over the *set* of matched
+        /// cards (Aurora Awakener), absorbing into
+        /// `RevealUntilDisposition::ChooseAnyNumber`. `false` is the single-hit
+        /// "put that card …" form (`KeepEach`).
+        any_number: bool,
         rest_destination: Option<Zone>,
+        /// CR 110.2a: "under your control" on the kept-card clause.
+        enters_under: Option<ControllerRef>,
         /// CR 701.20a + CR 608.2c: `Some(decline_zone)` when the kept clause is
         /// optional ("you may put that card onto the battlefield"). `destination`
         /// is then the accept zone and `decline_zone` is where the kept card
@@ -1009,6 +1017,12 @@ pub(crate) enum HandRevealImperativeAst {
     /// effect's affected IDs (e.g. "look at top → reveal it" patterns).
     /// Lowers to `Effect::Reveal { target: ParentTarget }`.
     RevealBackRef,
+    /// CR 701.20: Reveal a specific object selected by a target phrase —
+    /// "Reveal target face-down permanent" (Hauntwoods Shrieker). Lowers to
+    /// `Effect::Reveal { target }`. Distinct from `RevealBackRef` (anaphoric
+    /// "it"/"that card") and `RevealAll`/`RevealPartial` (hand reveals): this
+    /// reveals a battlefield/zone object chosen via the targeting pipeline.
+    RevealObject { target: TargetFilter },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

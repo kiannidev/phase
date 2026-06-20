@@ -301,6 +301,7 @@ fn redundancy_delta(
             KIND_DEAL_DAMAGE_ZERO,
             /* delta= */ -3.0,
         ),
+        Effect::ApplyPostReplacementDamage { .. } => None,
         Effect::Draw { count, .. } => zero_quantity_redundancy(
             state,
             source_id,
@@ -391,6 +392,7 @@ fn redundancy_delta(
         | Effect::UnattachAll { .. }
         | Effect::Surveil { .. }
         | Effect::Fight { .. }
+        | Effect::EachDealsDamageEqualToPower { .. }
         | Effect::Explore
         | Effect::ExploreAll { .. }
         | Effect::Investigate
@@ -543,6 +545,9 @@ fn redundancy_delta(
         // CR 702.xxx: Prepare (Strixhaven) — no redundancy detection.
         | Effect::BecomePrepared { .. }
         | Effect::BecomeUnprepared { .. }
+        // CR 702.171b: a permanent cannot become saddled if already saddled; no
+        // static redundancy signal — leave to the resolver.
+        | Effect::BecomeSaddled { .. }
         // CR 702.95c-d: PairWith mutates the source/target pair relationship;
         // redundancy depends on trigger timing and revalidation, so this policy
         // leaves it to the resolver.

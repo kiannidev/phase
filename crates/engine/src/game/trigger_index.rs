@@ -398,6 +398,7 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
         TriggerMode::Explored => push(TriggerEventKey::Explored),
         TriggerMode::Discover => push(TriggerEventKey::DiscoverResolved),
         TriggerMode::Adapt => push(TriggerEventKey::AdaptResolved),
+        TriggerMode::Connives => push(TriggerEventKey::ConniveResolved),
         TriggerMode::Exerted => push(TriggerEventKey::Exerted),
         TriggerMode::Enlisted => push(TriggerEventKey::Enlisted),
         TriggerMode::Foretell => push(TriggerEventKey::Foretold),
@@ -440,7 +441,7 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
 /// consult time. Exhaustive `match` on `GameEvent` — adding a new variant is
 /// a compile error until classified. The nested `EffectResolved { kind }`
 /// dispatch on `EffectKind` is similarly exhaustive (no `_` arm).
-fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
+pub(crate) fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
     let mut out: Keys = SmallVec::new();
     let mut push = |k: TriggerEventKey| {
         if !out.contains(&k) {
@@ -680,6 +681,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         EffectKind::Explore => push(TriggerEventKey::Explored),
         EffectKind::Discover => push(TriggerEventKey::DiscoverResolved),
         EffectKind::Adapt => push(TriggerEventKey::AdaptResolved),
+        EffectKind::Connive => push(TriggerEventKey::ConniveResolved),
         EffectKind::Renown => push(TriggerEventKey::Renowned),
         EffectKind::Monstrosity => push(TriggerEventKey::BecomesMonstrous),
         EffectKind::ManifestDread => push(TriggerEventKey::ManifestDreadResolved),
@@ -692,6 +694,8 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         EffectKind::StartYourEngines
         | EffectKind::ChangeSpeed
         | EffectKind::DealDamage
+        | EffectKind::ApplyPostReplacementDamage
+        | EffectKind::EachDealsDamageEqualToPower
         | EffectKind::Draw
         | EffectKind::Pump
         | EffectKind::PairWith
@@ -769,7 +773,6 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::Choose
         | EffectKind::ChooseDamageSource
         | EffectKind::Suspect
-        | EffectKind::Connive
         | EffectKind::PhaseOut
         | EffectKind::PhaseIn
         | EffectKind::ForceBlock
@@ -860,6 +863,10 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::Crew
         | EffectKind::Station
         | EffectKind::Saddle
+        // CR 702.171b: the BecomeSaddled effect fires the saddled trigger via the
+        // separately-emitted `GameEvent::Saddled`, mirroring the keyword `Saddle`
+        // action; its own `EffectResolved` dispatches no trigger key.
+        | EffectKind::BecomeSaddled
         | EffectKind::Transform
         | EffectKind::TurnFaceUp
         // Added on origin/main after this branch point. No production

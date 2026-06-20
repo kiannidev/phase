@@ -88,7 +88,7 @@ use crate::game::triggers;
 use crate::parser::oracle_effect::subject::parse_subject_application;
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
+    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag, AggregateFunction,
     BounceSelection, CardPlayMode, CastPermissionConstraint, CastingPermission, ChoiceType,
     ChooseFromZoneConstraint, Chooser, CombatDamageScope, Comparator, ConjureCard, ConjureSource,
     ContinuousModification, ControllerRef, CopyRetargetPermission, DamageModification,
@@ -97,10 +97,11 @@ use crate::types::ability::{
     ManaSpendPermission, MultiTargetSpec, ObjectProperty, ObjectScope, OriginConstraint,
     PlayerFilter, PlayerRelation, PlayerScope, PreventionAmount, PreventionScope,
     ProhibitedActivity, PtValue, QuantityExpr, QuantityRef, ReplacementCondition,
-    ReplacementDefinition, RestrictionExpiry, RestrictionPlayerScope, RoundingMode, SharedQuality,
-    SharedQualityRelation, StaticCondition, StaticDefinition, StepSkipTarget, SubAbilityLink,
-    TapStateChange, TargetFilter, TargetSelectionMode, ThisWayCause, TriggerCondition,
-    TriggerDefinition, TypeFilter, TypedFilter, UnlessPayModifier, UntilCondition, ZoneOwner,
+    ReplacementDefinition, RestrictionExpiry, RestrictionPlayerScope, RevealUntilDisposition,
+    RoundingMode, SharedQuality, SharedQualityRelation, StaticCondition, StaticDefinition,
+    StepSkipTarget, SubAbilityLink, TapStateChange, TargetFilter, TargetSelectionMode,
+    ThisWayCause, TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter, UnlessPayModifier,
+    UntilCondition, ZoneOwner,
 };
 #[cfg(test)]
 use crate::types::ability::{AttackScope, AttackSubject};
@@ -134,7 +135,10 @@ use self::sequence::{
     parse_followup_continuation_ast, parse_intrinsic_continuation_ast, split_clause_sequence,
     try_parse_repeat_process_for_keywords, try_parse_same_is_true_continuation,
 };
-use self::subject::{try_parse_subject_predicate_ast, try_parse_targeted_controller_gain_life};
+use self::subject::{
+    try_parse_each_deals_damage_equal_to_power, try_parse_subject_predicate_ast,
+    try_parse_targeted_controller_gain_life,
+};
 use crate::parser::oracle_ir::ast::*;
 pub(crate) use crate::parser::oracle_ir::context::ParseContext;
 use crate::parser::oracle_ir::effect_chain::{ClauseIr, EffectChainIr, SpecialClause};
@@ -2027,6 +2031,13 @@ fn try_parse_cant_cast_spells_effect(tp: TextPair<'_>) -> Option<ParsedEffectCla
                 RestrictionPlayerScope::ParentTargetedPlayer,
                 tag("that player"),
             ),
+            // CR 508.5: "defending player" — the player being attacked by the
+            // source ("Whenever ~ attacks, defending player can't cast spells
+            // this turn." — Xantid Swarm).
+            value(
+                RestrictionPlayerScope::DefendingPlayer,
+                tag("defending player"),
+            ),
         ))
         .parse(input)
     })?;
@@ -2166,10 +2177,61 @@ fn try_parse_cant_activate_non_mana_abilities_effect(
                 expiry: RestrictionExpiry::EndOfTurn,
                 activity: ProhibitedActivity::ActivateAbilities {
                     exemption: ActivationExemption::ManaAbilities,
+                    only_tag: None,
                 },
             },
         },
         duration: None,
+        sub_ability: None,
+        distribute: None,
+        multi_target: None,
+        condition: None,
+        optional: false,
+        unless_pay: None,
+    })
+}
+
+/// CR 500.7 + CR 514.2 + CR 602.5: "During that turn, power-up abilities can't
+/// be activated" — Kang's clause appended after "Take an extra turn after this
+/// one." Prohibits the controller's power-up activations throughout the granted
+/// extra turn. The restriction is pre-armed (`Duration::UntilEndOfNextTurnOf`,
+/// lowered to `RestrictionExpiry::UntilEndOfNextTurnOf` and converted to
+/// `EndOfTurn` at the extra turn's untap step), so it persists through that whole
+/// turn and expires at its cleanup.
+fn try_parse_during_that_turn_powerup_prohibition(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
+    nom_on_lower(tp.original, tp.lower, |input| {
+        value(
+            (),
+            preceded(
+                tag("during that turn, "),
+                tag("power-up abilities can't be activated"),
+            ),
+        )
+        .parse(input)
+    })
+    .filter(|((), rest)| rest.trim_matches(['.', ' ']).is_empty())?;
+
+    Some(ParsedEffectClause {
+        effect: Effect::AddRestriction {
+            restriction: GameRestriction::ProhibitActivity {
+                source: ObjectId(0),
+                // CR 500.7: "power-up abilities can't be activated" during that
+                // turn is an unrestricted prohibition (no player subject) — no
+                // player is exempt, so it affects all players (and creates no
+                // target slot, unlike `TargetedPlayer`).
+                affected_players: RestrictionPlayerScope::AllPlayers,
+                expiry: RestrictionExpiry::EndOfTurn,
+                activity: ProhibitedActivity::ActivateAbilities {
+                    exemption: ActivationExemption::None,
+                    only_tag: Some(AbilityTag::PowerUp),
+                },
+            },
+        },
+        // Pre-armed end-of-next-turn anchor — `fill_runtime_fields` lowers this
+        // to `RestrictionExpiry::UntilEndOfNextTurnOf { player: controller }`.
+        duration: Some(Duration::UntilEndOfNextTurnOf {
+            player: PlayerScope::Controller,
+        }),
         sub_ability: None,
         distribute: None,
         multi_target: None,
@@ -3541,7 +3603,86 @@ fn try_parse_have_causative(
         return Some(rebind_controller_to_original(clause));
     }
 
+    // Pattern C: "have <subject>'s base power become equal to <quantity>"
+    if let Some(clause) = try_parse_have_base_pt_become(tp) {
+        return Some(clause);
+    }
+
     None
+}
+
+/// CR 613.4b + CR 208.1 + CR 608.2h + CR 611.2: Parse the causative
+/// "have <subject>'s base power become equal to <quantity>" construction
+/// (Belligerent Yearling: "you may have this creature's base power become equal
+/// to that creature's power until end of turn").
+///
+/// This is a base-P/T *set* effect (CR 613.4b, layer 7b), not an additive pump:
+/// the subject's base power is overwritten with the resolution-time value of the
+/// quantity (CR 608.2h — the value is determined once when the effect applies).
+/// It composes from the existing `Effect::Animate` building block, which already
+/// routes `PtValue::Quantity` to a `SetPowerDynamic`/`SetToughnessDynamic` layer
+/// modification; the `animate` resolver snapshots resolution-only-scoped
+/// quantities ("that creature's power" → `Power { CostPaidObject }`) into a fixed
+/// `SetPower` at resolution because such referents cannot be re-resolved at later
+/// layer-evaluation passes.
+///
+/// `base power` / `base power and base toughness` are each an independent `alt()`
+/// arm so the whole class — any "have ~'s base power [and base toughness] become
+/// equal to <quantity>" — is covered, not just one card. The subject is the
+/// ability source (the self-ref "~" / "this creature" / "it" left by the trigger
+/// frame), so the resulting `Effect::Animate` targets `TargetFilter::None`
+/// (= the source).
+fn try_parse_have_base_pt_become(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
+    // Strip a trailing duration first so the quantity parser sees a clean tail.
+    let (body, duration) = strip_trailing_duration(tp.original);
+    let body_lower = body.to_lowercase();
+
+    let parsed = nom_on_lower(body, &body_lower, |i| {
+        let (i, _) = tag("have ").parse(i)?;
+        // CR 113.7 + CR 201.4b: self-referential subject (the ability source).
+        let (i, _) = alt((
+            tag("~"),
+            tag("this creature"),
+            tag("this permanent"),
+            tag("it"),
+        ))
+        .parse(i)?;
+        // CR 208.1: which base characteristic(s) are set. Factored per the nom
+        // mandate (PATTERNS.md §8b) into independent axes — shared prefix
+        // "'s base power", an optional " and [base] toughness" axis, the
+        // become/becomes copula, and the shared " equal to " suffix — so the arm
+        // count is the SUM of per-axis choices, not their product.
+        let (i, _) = tag("'s base power").parse(i)?;
+        let (i, toughness) =
+            opt(alt((tag(" and base toughness"), tag(" and toughness")))).parse(i)?;
+        let set_toughness = toughness.is_some();
+        let (i, _) = tag(" become").parse(i)?;
+        let (i, _) = opt(tag("s")).parse(i)?;
+        let (i, _) = tag(" equal to ").parse(i)?;
+        let (i, qty) = nom_quantity::parse_quantity_ref(i)?;
+        let (i, _) = eof.parse(i)?;
+        Ok((i, (set_toughness, qty)))
+    })?;
+
+    let (set_toughness, qty) = parsed.0;
+    let value_expr = PtValue::Quantity(QuantityExpr::Ref { qty });
+    let effect = Effect::Animate {
+        power: Some(value_expr.clone()),
+        toughness: set_toughness.then_some(value_expr),
+        types: vec![],
+        remove_types: vec![],
+        target: TargetFilter::None,
+        keywords: vec![],
+    };
+
+    // CR 611.2 + CR 514.2: this set is a continuous effect from the resolution of
+    // a (triggered) ability. The card's "until end of turn" suffix is normally
+    // stripped onto the ability frame before this body parses; default to end of
+    // turn when no explicit suffix reaches here, an explicit suffix wins.
+    let duration = duration.or(Some(Duration::UntilEndOfTurn));
+    let mut clause = parsed_clause(effect);
+    clause.duration = duration;
+    Some(clause)
 }
 
 /// CR 109.5 + CR 121.3a: Rebind a recursed clause's `TargetFilter::Controller`
@@ -4457,8 +4598,34 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
             description: None,
         });
     }
+    // CR 601.2c + CR 115.1: A heterogeneous compound source set ("<group A> and
+    // up to one other target <group B> each deal damage equal to their power …",
+    // Graceful Takedown) cannot be represented by the single-filter `TargetOnly`
+    // source picker — the second group would be silently dropped. Defer the whole
+    // clause honestly so coverage stays red rather than claiming partial support.
+    if is_compound_source_each_power_damage(text) {
+        return parsed_clause(Effect::unimplemented(
+            "multi_source_compound_each_power_damage",
+            text,
+        ));
+    }
     if let Some(clause) = try_parse_player_draws_and_gains_control(text, ctx) {
         return clause;
+    }
+
+    // CR 810: the "two target creatures your team controls each deal damage equal
+    // to their power to target creature" shape (Combo Attack). Two-Headed Giant
+    // team control is not the caster's controller, so this is unmodeled and
+    // `try_parse_each_deals_damage_equal_to_power` returns an explicit
+    // `Unimplemented`. Intercept it HERE, before the generic exactly-two-targets
+    // parser further down would mis-accept the leading "two target creatures …" as
+    // a bare `TargetOnly` clause. The supported "you control" variants return the
+    // real `EachDealsDamageEqualToPower` effect (not `Unimplemented`) and fall
+    // through to their dedicated dispatch in `lower_imperative_clause`.
+    if let Some(clause) = try_parse_each_deals_damage_equal_to_power(text) {
+        if matches!(clause.effect, Effect::Unimplemented { .. }) {
+            return clause;
+        }
     }
 
     // CR 608.2c: Deconjugate bare third-person verbs that appear after ", then" splits
@@ -4821,6 +4988,13 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     // CR 101.2: "Your opponents can't cast spells this turn" — blanket temporary prohibition.
     // Must run AFTER cast_only_from_zones (more specific "from zones" check).
     if let Some(clause) = try_parse_cant_cast_spells_effect(tp) {
+        return clause;
+    }
+
+    // CR 500.7 + CR 602.5: "During that turn, power-up abilities can't be
+    // activated" (Kang). Tag-scoped prohibition for the granted extra turn — try
+    // before the generic non-mana-ability prohibition.
+    if let Some(clause) = try_parse_during_that_turn_powerup_prohibition(tp) {
         return clause;
     }
 
@@ -6514,6 +6688,10 @@ fn parse_reveal_cards_from_library_until(input: &str) -> nom::IResult<&str, (), 
     value((), tag("library until ")).parse(input)
 }
 
+/// CR 701.20a: Parse the active-voice prefix `"reveal[s] cards from the top of
+/// <possessive> library until <pronoun> reveal[s] "`, stopping *before* the
+/// count/article. The caller parses the count (article → `Fixed(1)`, or a
+/// number / `X` for "reveal X [filter] cards") and the filter phrase.
 fn parse_reveal_until_prefix(input: &str) -> nom::IResult<&str, (), OracleError<'_>> {
     let (input, _) = parse_reveal_cards_from_library_until(input)?;
     // Active-voice pronoun + matching verb form.
@@ -6525,8 +6703,40 @@ fn parse_reveal_until_prefix(input: &str) -> nom::IResult<&str, (), OracleError<
         tag("it reveals "),
     ))
     .parse(input)?;
-    let (input, _) = nom_primitives::parse_article(input)?;
     Ok((input, ()))
+}
+
+/// CR 701.20a + CR 608.2c: Parse the count phrase that follows
+/// "…until you reveal " — either the singular article ("a"/"an") for the
+/// dominant "reveal a [filter] card" form (yielding `Fixed(1)`), a spelled or
+/// numeric literal ("two"/"2"), or the variable `X` ("reveal X [filter] cards",
+/// bound by a trailing "where X is …" clause). Returns the count expression and
+/// the remaining input positioned at the filter phrase.
+fn parse_reveal_until_count(input: &str) -> OracleResult<'_, QuantityExpr> {
+    alt((
+        // CR 701.20a: singular article → exactly one match (the legacy form).
+        value(
+            QuantityExpr::Fixed { value: 1 },
+            nom_primitives::parse_article,
+        ),
+        // "reveal X [filter] cards" — bound later by "where X is …".
+        value(
+            QuantityExpr::Ref {
+                qty: QuantityRef::Variable {
+                    name: "X".to_string(),
+                },
+            },
+            (tag("x"), tag(" ")),
+        ),
+        // "reveal two [filter] cards" / "reveal 2 [filter] cards".
+        map(
+            terminated(nom_primitives::parse_number, tag(" ")),
+            |value| QuantityExpr::Fixed {
+                value: value as i32,
+            },
+        ),
+    ))
+    .parse(input)
 }
 
 /// CR 701.20a: Parse the **passive-voice** prefix `"reveal[s] cards from the top of
@@ -6541,14 +6751,21 @@ fn parse_reveal_until_passive_prefix(input: &str) -> nom::IResult<&str, (), Orac
 }
 
 fn parse_reveal_until_active_filter_text(input: &str) -> OracleResult<'_, &str> {
-    // Each arm is individually `all_consuming` so that when the leading
-    // `take_until(" card")` arm leaves a remainder (the filter is a disjunctive
-    // list with MORE THAN ONE `" card"`, e.g. An Unearthly Child's "doctor card,
-    // a card with doctor's companion, or a vehicle card."), `alt` backtracks to
-    // the period-terminated arm that captures the whole phrase. Wrapping the
-    // *whole* alt in one `all_consuming` would NOT backtrack: `alt` commits to
-    // the first matching arm before `all_consuming` checks the remainder.
+    // Each arm is individually `all_consuming` so that when a leading `take_until`
+    // arm leaves a remainder (the filter is a disjunctive list with MORE THAN ONE
+    // `" card"`, e.g. An Unearthly Child's "doctor card, a card with doctor's
+    // companion, or a vehicle card."), `alt` backtracks to the period-terminated
+    // arm that captures the whole phrase. Wrapping the *whole* alt in one
+    // `all_consuming` would NOT backtrack: `alt` commits to the first matching arm
+    // before `all_consuming` checks the remainder.
+    // CR 701.20a: the plural "cards" arm (the "reveal X [filter] cards" multi-match
+    // form) is tried before singular " card" so "permanent cards" strips the full
+    // noun, not "permanent" + a stray "s".
     alt((
+        all_consuming(terminated(
+            take_until(" cards"),
+            (tag(" cards"), opt(tag("."))),
+        )),
         all_consuming(terminated(
             take_until(" card"),
             (tag(" card"), opt(tag("."))),
@@ -6676,20 +6893,37 @@ fn build_reveal_until_filter(filter_text: &str) -> TargetFilter {
 /// passive voice (`"until a/an <filter> [card] is revealed [and exiles that card]"`).
 /// Builds [`Effect::RevealUntil`] with `player` identifying whose library is revealed.
 fn try_parse_reveal_until(tp: TextPair, player: TargetFilter) -> Option<ParsedEffectClause> {
-    // CR 701.20a: Active-voice form — "…until they reveal a <filter>".
-    let active_result = nom_on_lower(tp.original, tp.lower, parse_reveal_until_prefix);
+    // CR 701.20a + CR 608.2c: strip a trailing "where X is …" binding first so a
+    // dynamic count ("reveal X [filter] cards, where X is the number of colors
+    // among permanents you control" — Aurora Awakener, Sanar) is rewritten from
+    // the placeholder `Variable("X")` into its concrete `QuantityExpr` (e.g.
+    // `DistinctColorsAmongPermanents`). Mirrors the Discover "where X is …" wiring.
+    let (count_tp, where_x_expression) = strip_trailing_where_x(tp);
+
+    // CR 701.20a: Active-voice form — "…until they reveal a <filter>" (count =
+    // Fixed(1)) or "…until you reveal X [filter] cards" (dynamic count).
+    let active_result = nom_on_lower(count_tp.original, count_tp.lower, parse_reveal_until_prefix);
     if let Some((_, rest_orig)) = active_result {
-        let rest_lower = &tp.lower[tp.lower.len() - rest_orig.len()..];
-        let (_, filter_text) = parse_reveal_until_active_filter_text(rest_lower).ok()?;
+        let rest_lower = &count_tp.lower[count_tp.lower.len() - rest_orig.len()..];
+        let (after_count_lower, raw_count) = parse_reveal_until_count(rest_lower).ok()?;
+        let (_, filter_text) = parse_reveal_until_active_filter_text(after_count_lower).ok()?;
         let filter = build_reveal_until_filter(filter_text);
+        let count = apply_where_x_quantity_expression(raw_count, where_x_expression.as_deref());
         return Some(parsed_clause(Effect::RevealUntil {
             player,
             filter,
+            count,
+            // The matched-set disposition is refined by a following "Put any
+            // number of those [filter] cards onto the battlefield" continuation
+            // (`ContinuationAst::RevealUntilKept` with `any_number`); the default
+            // `KeepEach` covers the single-hit forms.
+            matched_disposition: RevealUntilDisposition::KeepEach,
             kept_destination: Zone::Hand,
             rest_destination: Zone::Library,
             enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             enters_attacking: false,
             kept_optional_to: None,
+            enters_under: None,
         }));
     }
 
@@ -6734,11 +6968,14 @@ fn try_parse_reveal_until(tp: TextPair, player: TargetFilter) -> Option<ParsedEf
     Some(parsed_clause(Effect::RevealUntil {
         player,
         filter,
+        count: QuantityExpr::Fixed { value: 1 },
+        matched_disposition: RevealUntilDisposition::KeepEach,
         kept_destination,
         rest_destination: Zone::Library,
         enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         enters_attacking: false,
         kept_optional_to: None,
+        enters_under: None,
     }))
 }
 
@@ -8016,9 +8253,15 @@ fn try_parse_gain_energy(tp: TextPair<'_>, ctx: &mut ParseContext) -> Option<Par
         let qty_text = qty_text.trim().trim_end_matches('.');
         let amount = crate::parser::oracle_quantity::parse_event_context_quantity(qty_text)
             .or_else(|| {
-                crate::parser::oracle_quantity::parse_quantity_ref(qty_text)
+                nom_quantity::parse_quantity_ref_complete(qty_text)
+                    .ok()
+                    .map(|(_, qty)| qty)
                     .map(|qty| QuantityExpr::Ref { qty })
             })?;
+        let amount = nom_quantity::parse_quantity_ref_complete(qty_text)
+            .ok()
+            .map(|(_, qty)| QuantityExpr::Ref { qty })
+            .unwrap_or(amount);
         return Some(parsed_clause(Effect::GainEnergy { amount }));
     }
 
@@ -8845,6 +9088,14 @@ fn lower_imperative_clause(text: &str, ctx: &mut ParseContext) -> ParsedEffectCl
         return clause;
     }
 
+    // CR 120.1 + CR 115.1d: "Up to two target creatures you control each deal
+    // damage equal to their power to target creature." The targeted source set
+    // and the recipient must both be preserved as independent targets, so this
+    // runs before generic subject stripping / damage-compound splitting.
+    if let Some(clause) = try_parse_each_deals_damage_equal_to_power(text) {
+        return clause;
+    }
+
     // CR 121.1 + CR 615.5: "{verb} cards equal to {quantity}" inside a
     // subject-aware predicate (e.g. "the source's controller draws cards equal
     // to the damage prevented this way" — Swans of Bryn Argoll). Mirrors the
@@ -9304,6 +9555,9 @@ fn try_parse_verb_and_target<'a>(
             parsed_target
         };
         let unless_pay = parse_unless_payment(rest_lower).map(counter_unless_pay_modifier);
+        if unless_pay.is_none() && scan_contains_phrase(rest_lower, "unless") {
+            return None;
+        }
         return Some((
             TargetedImperativeAst::ZoneCounterProxy(Box::new(ZoneCounterImperativeAst::Counter {
                 target,
@@ -9339,6 +9593,9 @@ fn try_parse_verb_and_target<'a>(
         };
         // CR 118.12: Parse "unless its controller pays {X}" for conditional counters
         let unless_pay = parse_unless_payment(rest_lower).map(counter_unless_pay_modifier);
+        if unless_pay.is_none() && scan_contains_phrase(rest_lower, "unless") {
+            return None;
+        }
         return Some((
             TargetedImperativeAst::ZoneCounterProxy(Box::new(ZoneCounterImperativeAst::Counter {
                 target,
@@ -11248,7 +11505,15 @@ fn replace_target_with_parent(effect: &mut Effect) {
         Effect::UnattachAll { target, .. } if !matches!(target, TargetFilter::LastCreated) => {
             *target = TargetFilter::ParentTarget;
         }
-        Effect::PutCounter { target, .. } | Effect::RemoveCounter { target, .. } => {
+        // CR 122.1 + CR 701.10e + CR 608.2c: the counter-target anaphor family.
+        // A bare "it"/"that creature" on a counter put/remove/multiply clause that
+        // follows a typed targeted clause binds to that parent target (Turtle Van:
+        // "put a +1/+1 counter on target creature …, then … double the number of
+        // +1/+1 counters on it"). `MultiplyCounter` shares the same anaphor as its
+        // `PutCounter`/`RemoveCounter` siblings.
+        Effect::PutCounter { target, .. }
+        | Effect::RemoveCounter { target, .. }
+        | Effect::MultiplyCounter { target, .. } => {
             *target = TargetFilter::ParentTarget;
         }
         // CR 608.2c: a self-referential zone change ("Exile Venture Forth with
@@ -11624,6 +11889,38 @@ fn rebind_source_amount(expr: &mut QuantityExpr, target: ObjectScope) {
             rebind_source_amount(right, target);
         }
         QuantityExpr::Fixed { .. } => {}
+    }
+}
+
+/// CR 603.6 + CR 608.2k + CR 208.1: Restore a reflexive zone-change trigger
+/// body's per-object anaphor ("it deals damage equal to its power") from the
+/// `ObjectScope::Source` the bare-pronoun subject-stamping pass produced back to
+/// `ObjectScope::Anaphoric`.
+///
+/// In "When a creature is put onto the battlefield this way, it deals damage
+/// equal to its power …" (Vivien's Invocation), the body's "it"/"its" is the
+/// object the trigger condition introduced — the creature that changed zones
+/// "this way" (CR 608.2k: an effect referring to an untargeted object the
+/// trigger condition referred to still affects that object; CR 603.6:
+/// zone-change triggers act on the moved object). It is NOT the resolving
+/// ability's source (the spell, which has no power). But `resolve_it_pronoun`
+/// classifies a bare "it" with no `ctx.subject` as `SelfRef`, so the
+/// subject-injection pass (`inject_subject_target`) rebinds "its power" to
+/// `Power{Source}` — reading the spell, power 0. `Anaphoric` is the correct
+/// scope: the runtime resolves it through the trigger-event-source slot
+/// (`game/quantity.rs` `object_id_for_scope(EventSource)`) to the entering
+/// creature's current power (CR 208.1: power is a modifiable characteristic).
+///
+/// Gated to a `ZoneChangedThisWay` condition so only the reflexive-trigger body
+/// pronoun is touched; a true self-reference ("~ deals damage equal to its
+/// power") never carries this condition and keeps its `Source` scope. Mirrors
+/// the one-sided-fight `Source → Anaphoric` coercion (`rebind_source_amount`).
+fn restore_this_way_trigger_anaphor(effect: &mut Effect) {
+    match effect {
+        Effect::DealDamage { amount, .. } | Effect::DamageEachPlayer { amount, .. } => {
+            rebind_source_amount(amount, ObjectScope::Anaphoric);
+        }
+        _ => {}
     }
 }
 
@@ -12603,6 +12900,88 @@ fn rebind_anaphoric_ref(qty: &mut QuantityRef, target: ObjectScope) {
     }
 }
 
+/// CR 120.1: True when a damage clause already carries the multi-source
+/// `EachTarget` marker (set by the parser for "their power" forms). Used to keep
+/// `wrap_target_subject_damage` from collapsing it to the single-source `Target`.
+fn damage_clause_is_each_target(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::DealDamage {
+            damage_source: Some(DamageSource::EachTarget),
+            ..
+        } | Effect::DamageAll {
+            damage_source: Some(DamageSource::EachTarget),
+            ..
+        }
+    )
+}
+
+/// CR 601.2c + CR 115.1: True when the subject of a multi-source per-power
+/// damage clause is a HETEROGENEOUS compound source set — two distinct targeted
+/// groups joined by "and", where the second is introduced by an "other target"
+/// quantifier (Graceful Takedown: "any number of target enchanted creatures you
+/// control **and up to one other target creature you control** each deal damage
+/// equal to their power …"). The single-`target` `TargetOnly` source picker can
+/// represent only ONE filter + ONE `MultiTargetSpec`, so the second group's
+/// targets would be silently dropped (unreachable as damage sources). This is a
+/// distinct targeting shape (two cardinality-constrained heterogeneous target
+/// slots), not a leaf parameterization of the single-group picker, so the clause
+/// is deferred to an honest `Unimplemented` rather than parsed wrong-but-green.
+///
+/// `text` is the full (original-case) clause text. Matches only when BOTH the
+/// multi-source per-power tail ("each deal damage equal to their power") AND a
+/// preceding "and <up-to-N / another / any number of> other target …" group are
+/// present, so single-group forms (Allies at Last, Coordinated Clobbering,
+/// Terrific Team-Up) are untouched.
+fn is_compound_source_each_power_damage(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    // The multi-source per-power tail must be present (this is the `EachTarget`
+    // class). Without it, a stray "and up to one other target …" belongs to some
+    // other effect and is not our concern.
+    if nom_primitives::scan_split_at_phrase(&lower, |i| {
+        tag::<_, _, OracleError<'_>>("each deal damage equal to their power").parse(i)
+    })
+    .is_none()
+    {
+        return false;
+    }
+    // A second targeted source group joined to the first by "and", introduced by
+    // an explicit cardinality quantifier and the "other target" marker. The
+    // quantifier alt covers the attested forms ("up to one/two …", "another",
+    // "any number of"); the trailing "other target" is the distinguishing token
+    // that separates a second source GROUP from an intra-filter "and" (e.g.
+    // "creature and planeswalker").
+    nom_primitives::scan_split_at_phrase(&lower, |i| {
+        preceded(
+            tag::<_, _, OracleError<'_>>("and "),
+            preceded(
+                alt((
+                    recognize(pair(tag("up to "), take_until(" other target"))),
+                    tag("another"),
+                    tag("any number of"),
+                )),
+                preceded(opt(tag(" ")), tag("other target ")),
+            ),
+        )
+        .parse(i)
+    })
+    .is_some()
+}
+
+/// CR 208.1 + CR 608.2: Rebind a multi-source damage clause's anaphoric
+/// per-object amount ("their power" → `Power{Anaphoric}`) to `power_scope`
+/// (`Target`) so each source's own power (a modifiable characteristic) is read at
+/// resolution. Leaves the `EachTarget` source marker intact (the runtime iterates
+/// every source slot).
+fn rebind_each_target_damage_amount(effect: &mut Effect, power_scope: ObjectScope) {
+    match effect {
+        Effect::DealDamage { amount, .. } | Effect::DamageAll { amount, .. } => {
+            rebind_anaphoric_object_scope(amount, power_scope);
+        }
+        _ => {}
+    }
+}
+
 fn bind_damage_clause_source(
     effect: &mut Effect,
     damage_source_ref: DamageSource,
@@ -12717,16 +13096,26 @@ fn wrap_target_subject_damage(
         return None;
     }
 
-    // CR 608.2c + CR 120.1: "target creature deals damage equal to its
-    // power..." makes the chosen source object, not the spell card, deal the
-    // damage. "Its power" is therefore the first target's current power.
-    // Both `DealDamage` (single recipient) and `DamageAll` (multi-recipient
-    // batch) carry this shape uniformly — `damage_source = Some(Target)` is
-    // honored by the resolver in `game/effects/deal_damage.rs` for protection
-    // (CR 702.16), wither/infect (CR 120.3b/d), and damage-source replacements
-    // (CR 614). The 2015-06-22 Chandra's Ignition rulings codify this for
-    // the multi-recipient case (DamageAll).
-    if !bind_damage_clause_source(
+    // CR 120.1 + CR 601.2c: "up to N / any number of target creatures you
+    // control each deal damage equal to their power..." — the parser already
+    // tagged the clause `EachTarget` (every chosen source deals its OWN power to
+    // the shared recipient). Preserve that source while still rebinding the
+    // anaphoric "their power" amount to the per-source `Target` scope; do NOT
+    // collapse it to the single-source `Target`. The `multi_target` source count
+    // flows onto the outer `TargetOnly` picker below.
+    if damage_clause_is_each_target(&clause.effect) {
+        rebind_each_target_damage_amount(&mut clause.effect, ObjectScope::Target);
+    } else if !bind_damage_clause_source(
+        // CR 608.2c + CR 120.1: "target creature deals damage equal to its
+        // power..." (single source) makes the chosen object, not the spell card,
+        // deal the damage. "Its power" is therefore the first target's current
+        // power. Both `DealDamage` (single recipient) and `DamageAll`
+        // (multi-recipient batch) carry this shape uniformly — `damage_source =
+        // Some(Target)` is honored by the resolver in
+        // `game/effects/deal_damage.rs` for protection (CR 702.16),
+        // wither/infect (CR 120.3b/d), and damage-source replacements (CR 614).
+        // The 2015-06-22 Chandra's Ignition rulings codify this for the
+        // multi-recipient case (DamageAll).
         &mut clause.effect,
         DamageSource::Target,
         ObjectScope::Target,
@@ -15667,6 +16056,9 @@ pub(crate) fn each_target_filter_mut(effect: &mut Effect, f: &mut impl FnMut(&mu
         | Effect::RevealTop { player: target, .. }
         | Effect::ExileTop { player: target, .. }
         | Effect::Manifest { target, .. }
+        // CR 701.60a: Suspect acts on a target permanent; expose its filter so
+        // anaphor rewrites (e.g. self-targeting "Otherwise, suspect it") reach it.
+        | Effect::Suspect { target }
         | Effect::TargetOnly { target, .. } => f(target),
         Effect::PutCounter { target, .. } | Effect::RemoveCounter { target, .. } => f(target),
         Effect::GoadAll { target } => f(target),
@@ -19431,6 +19823,19 @@ pub(crate) fn parse_effect_chain_ir(
             None
         };
 
+        // CR 603.6 + CR 608.2k: A reflexive zone-change trigger body ("When a
+        // creature is put onto the battlefield this way, it deals damage equal to
+        // its power …" — Vivien's Invocation) refers to the object the trigger
+        // condition introduced, not the resolving spell. The bare-pronoun "it"
+        // was classified `SelfRef` (no `ctx.subject`), so its "its power" anaphor
+        // was rebound to `Power{Source}` (the spell, power 0). Restore it to
+        // `Anaphoric` so the runtime reads the entering creature's power via the
+        // trigger-event-source slot. Gated to `ZoneChangedThisWay` so a true
+        // self-reference clause is untouched.
+        if matches!(condition, Some(AbilityCondition::ZoneChangedThisWay { .. })) {
+            restore_this_way_trigger_anaphor(&mut clause.effect);
+        }
+
         clauses.push(ClauseIr {
             parsed: clause,
             boundary: chunk.boundary_after,
@@ -20168,6 +20573,12 @@ fn parse_unless_mana_or_energy_payment(cost_str: &str) -> Option<AbilityCost> {
         if let Some(quantity) = parse_where_x_is(after_cost) {
             return Some(AbilityCost::ManaDynamic { quantity });
         }
+        if tag::<_, _, OracleError<'_>>("where x is ")
+            .parse(after_cost.trim().trim_start_matches(',').trim())
+            .is_ok()
+        {
+            return None;
+        }
         // CR 107.3a + CR 118.12: bare {X} unless-cost references the announced X
         // of the spell carrying this counter.
         return Some(AbilityCost::ManaDynamic {
@@ -20474,7 +20885,7 @@ pub(crate) fn parse_dynamic_energy_unless_cost(input: &str) -> Option<QuantityEx
         .parse(input.trim_start())
         .ok()?;
     let qty_text = rest.trim().trim_end_matches('.');
-    let qty = crate::parser::oracle_quantity::parse_quantity_ref(qty_text)?;
+    let (_, qty) = nom_quantity::parse_quantity_ref_complete(qty_text).ok()?;
     Some(QuantityExpr::Ref { qty })
 }
 
@@ -20605,24 +21016,8 @@ fn parse_where_x_is(text: &str) -> Option<QuantityExpr> {
         .parse(trimmed)
         .ok()?;
     let qty_text = rest.trim_end_matches('.').trim();
-    if let Some(qty) = crate::parser::oracle_quantity::parse_quantity_ref(qty_text) {
-        return Some(QuantityExpr::Ref { qty });
-    }
-    if scan_contains_phrase(rest, "power") {
-        Some(QuantityExpr::Ref {
-            qty: QuantityRef::Power {
-                scope: crate::types::ability::ObjectScope::Source,
-            },
-        })
-    } else if scan_contains_phrase(rest, "toughness") {
-        Some(QuantityExpr::Ref {
-            qty: QuantityRef::Toughness {
-                scope: crate::types::ability::ObjectScope::Source,
-            },
-        })
-    } else {
-        None
-    }
+    let (_, qty) = nom_quantity::parse_quantity_ref_complete(qty_text).ok()?;
+    Some(QuantityExpr::Ref { qty })
 }
 
 /// CR 608.2c: Parse the destination of a trailing "[and] the rest into <zone>"
@@ -21018,6 +21413,176 @@ fn extract_effect_verb(effect: &Effect) -> Option<&'static str> {
 mod tests {
     use super::*;
     use crate::parser::parse_oracle_text;
+
+    /// CR 601.2c + CR 115.1: HONEST DEFERRAL — Graceful Takedown's heterogeneous
+    /// compound source set ("any number of target enchanted creatures you control
+    /// AND up to one other target creature you control each deal damage equal to
+    /// their power …") cannot be represented by the single-filter `TargetOnly`
+    /// source picker, so the whole clause must lower to `Effect::Unimplemented`
+    /// rather than a partial (wrong-but-green) parse that drops the second group.
+    /// Guards the coverage-honesty fix: if the compound were silently folded to
+    /// the enchanted-creature group, this asserts the gap node is still present.
+    #[test]
+    fn graceful_takedown_compound_source_is_honest_unimplemented() {
+        let parsed = parse_oracle_text(
+            "Any number of target enchanted creatures you control and up to one other target creature you control each deal damage equal to their power to target creature you don't control.",
+            "Graceful Takedown",
+            &[],
+            &["Instant".to_string()],
+            &[],
+        );
+        assert_eq!(parsed.abilities.len(), 1, "expected one ability");
+        assert!(
+            matches!(*parsed.abilities[0].effect, Effect::Unimplemented { .. }),
+            "compound source group must defer to Unimplemented, got {:?}",
+            parsed.abilities[0].effect
+        );
+    }
+
+    /// CR 601.2c: the honest-deferral guard must NOT trip the single-group forms.
+    /// Allies at Last ("up to two target creatures you control each deal damage
+    /// equal to their power …") has no "and … other target" second group, so it
+    /// must still lower to the `EachTarget` source picker, not `Unimplemented`.
+    #[test]
+    fn single_group_each_power_damage_not_deferred() {
+        let clause = parse_effect_clause(
+            "up to two target creatures you control each deal damage equal to their power to target creature an opponent controls",
+            &mut ParseContext::default(),
+        );
+        assert!(
+            !matches!(clause.effect, Effect::Unimplemented { .. }),
+            "single-group form must not be deferred, got {:?}",
+            clause.effect
+        );
+        assert!(
+            !is_compound_source_each_power_damage(
+                "up to two target creatures you control each deal damage equal to their power to target creature an opponent controls"
+            ),
+            "single-group form must not match the compound-source detector"
+        );
+    }
+
+    /// CR 120.1 + CR 601.2c: SHAPE — the direct-subject multi-source damage
+    /// building block. "Up to N / any number of target creatures you control
+    /// each deal damage equal to their power to <recipient>" lowers to
+    /// `EachDealsDamageEqualToPower`, with the count `multi_target` attached to
+    /// the source target set.
+    /// Runtime damage semantics are covered by the cast-pipeline integration test
+    /// `tests/multi_source_each_power_damage.rs`.
+    #[test]
+    fn multi_source_each_power_damage_direct_subject_shape() {
+        let clause = parse_effect_clause(
+            "up to two target creatures you control each deal damage equal to their power to target creature an opponent controls",
+            &mut ParseContext::default(),
+        );
+        let Effect::EachDealsDamageEqualToPower { sources, recipient } = &clause.effect else {
+            panic!(
+                "expected EachDealsDamageEqualToPower, got {:?}",
+                clause.effect
+            );
+        };
+        assert!(matches!(sources, TargetFilter::Typed(_)));
+        assert!(matches!(recipient, TargetFilter::Typed(_)));
+        assert!(
+            clause.multi_target.is_some(),
+            "multi_target source count must flow onto the source picker"
+        );
+    }
+
+    /// CR 120.1: SHAPE — the "They each deal …" back-reference form (Coordinated
+    /// Clobbering, Terrific Team-Up). The damage sub carries `EachTarget`; the
+    /// source set is supplied at resolution by the prior sentence's chosen
+    /// targets (verified end-to-end in the integration test).
+    #[test]
+    fn multi_source_each_power_damage_back_reference_shape() {
+        let def = parse_effect_chain(
+            "Tap one or two target untapped creatures you control. They each deal damage equal to their power to target creature an opponent controls.",
+            AbilityKind::Spell,
+        );
+        let sub = def.sub_ability.as_ref().expect("damage sub-ability");
+        assert!(
+            matches!(
+                sub.effect.as_ref(),
+                Effect::DealDamage {
+                    damage_source: Some(DamageSource::EachTarget),
+                    ..
+                }
+            ),
+            "expected EachTarget damage in the 'They each' sub-ability, got {:?}",
+            sub.effect
+        );
+    }
+
+    // CR 120.1 + CR 115.1d: "Up to two target creatures you control each deal
+    // damage equal to their power to target creature" (Band Together) parses to
+    // `EachDealsDamageEqualToPower` with a you-control creature source filter and
+    // a creature recipient, and an "up to two" (0..=2) multi-target spec.
+    #[test]
+    fn each_deals_damage_equal_to_power_up_to_two() {
+        use crate::types::ability::ControllerRef;
+        let def = parse_effect_chain(
+            "Up to two target creatures you control each deal damage equal to their power to another target creature.",
+            AbilityKind::Spell,
+        );
+        let Effect::EachDealsDamageEqualToPower { sources, recipient } = &*def.effect else {
+            panic!("expected EachDealsDamageEqualToPower, got {:?}", def.effect);
+        };
+        // CR 115.1: the source set is a creature controlled by the caster.
+        let TargetFilter::Typed(tf) = sources else {
+            panic!("expected Typed source filter, got {sources:?}");
+        };
+        assert!(tf.type_filters.contains(&TypeFilter::Creature));
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+        // CR 115.1: the recipient is a creature ("another target creature").
+        assert!(matches!(recipient, TargetFilter::Typed(rt)
+            if rt.type_filters.contains(&TypeFilter::Creature)));
+        // CR 115.1d: "up to two" → 0..=2.
+        assert_eq!(def.multi_target, Some(MultiTargetSpec::fixed(0, 2)));
+    }
+
+    // CR 120.1: The in-scope cards' damage lines parse to the new effect (not
+    // `Unimplemented`), with the recipient's controller restriction carried on
+    // the recipient filter. Combo Attack ("Two target creatures *your team*
+    // controls") is intentionally out of scope — the Two-Headed Giant team scope
+    // is a separate, niche axis and is left as a known gap rather than mismodeled.
+    #[test]
+    fn each_deals_damage_equal_to_power_all_in_scope_cards() {
+        let lines = [
+            // Allies at Last
+            "Up to two target creatures you control each deal damage equal to their power to target creature an opponent controls.",
+            // Band Together
+            "Up to two target creatures you control each deal damage equal to their power to another target creature.",
+            // Friendly Rivalry / Graceful Takedown
+            "Up to two target creatures you control each deal damage equal to their power to target creature you don't control.",
+        ];
+        for line in lines {
+            let effect = parse_effect(line);
+            assert!(
+                matches!(effect, Effect::EachDealsDamageEqualToPower { .. }),
+                "line did not parse to EachDealsDamageEqualToPower: {line:?} -> {effect:?}"
+            );
+        }
+    }
+
+    // CR 810: Combo Attack's "two target creatures *your team* controls" must
+    // FAIL CLOSED (Unimplemented), not silently collapse to "you control" —
+    // Two-Headed Giant team control is not the caster's controller, so parsing
+    // it as one-player targeting would damage the wrong objects. Guards against
+    // re-introducing the team→you normalization.
+    #[test]
+    fn each_deals_damage_team_scope_fails_closed_not_mistargeted() {
+        let effect = parse_effect(
+            "Two target creatures your team controls each deal damage equal to their power to target creature.",
+        );
+        assert!(
+            !matches!(effect, Effect::EachDealsDamageEqualToPower { .. }),
+            "team-scope source must not be parsed as the each-deals effect, got {effect:?}"
+        );
+        assert!(
+            matches!(effect, Effect::Unimplemented { .. }),
+            "team-scope line must fall through to Unimplemented, got {effect:?}"
+        );
+    }
 
     // CR 701.20a: a comma+or disjunctive reveal-until filter list ("X card, a Y,
     // or a Z card") must split into an Or of three distinct filters. Building
@@ -21975,6 +22540,17 @@ mod tests {
     }
 
     #[test]
+    fn counter_suffix_body_dynamic_count_rejects_partial_quantity_tail() {
+        assert!(
+            parse_counter_suffix_body_combinator(
+                "a number of time counters on it equal to its mana value plus one",
+            )
+            .is_err(),
+            "partial quantity tail must not parse as bare ObjectManaValue"
+        );
+    }
+
+    #[test]
     fn dynamic_energy_unless_cost_parses_its_mana_value() {
         // CR 107.14 + CR 202.3: "an amount of {e} equal to its mana value" →
         // a `Recipient`-scoped object-mana-value reference.
@@ -21986,6 +22562,14 @@ mod tests {
                     scope: ObjectScope::Recipient,
                 },
             }),
+        );
+    }
+
+    #[test]
+    fn dynamic_energy_unless_cost_rejects_partial_quantity_tail() {
+        assert_eq!(
+            parse_dynamic_energy_unless_cost("an amount of {e} equal to its mana value plus one"),
+            None
         );
     }
 
@@ -25478,6 +26062,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn effect_counter_unless_pays_x_where_x_is_source_stat() {
+        for (text, expected) in [
+            (
+                "Counter target spell unless its controller pays {X}, where X is its power",
+                QuantityRef::Power {
+                    scope: ObjectScope::Source,
+                },
+            ),
+            (
+                "Counter target spell unless its controller pays {X}, where X is its toughness",
+                QuantityRef::Toughness {
+                    scope: ObjectScope::Source,
+                },
+            ),
+        ] {
+            let def = parse_effect_chain(text, AbilityKind::Spell);
+            let unless_pay = def.unless_pay.expect("should attach unless_pay");
+            assert_eq!(
+                unless_pay.cost,
+                AbilityCost::ManaDynamic {
+                    quantity: QuantityExpr::Ref { qty: expected },
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn effect_counter_unless_pays_x_where_x_partial_tail_stays_unimplemented() {
+        let def = parse_effect_chain(
+            "Counter target spell unless its controller pays {X}, where X is its power plus one",
+            AbilityKind::Spell,
+        );
+        assert!(
+            matches!(&*def.effect, Effect::Unimplemented { .. }),
+            "malformed where-X suffix must not silently parse as bare X, got {:?}",
+            def.effect
+        );
+        assert!(def.unless_pay.is_none());
+    }
+
     /// CR 107.3a + CR 118.12: bare {X} unless-cost on a counter references the
     /// announced X of the spell carrying the counter — no "where X is" clause.
     #[test]
@@ -26571,6 +27196,7 @@ mod tests {
             Effect::DoublePT {
                 mode: DoublePTMode::Power,
                 target: TargetFilter::Typed(_),
+                factor: 2,
             }
         ));
     }
@@ -26583,6 +27209,7 @@ mod tests {
             Effect::DoublePTAll {
                 mode: DoublePTMode::PowerAndToughness,
                 target: TargetFilter::Typed(_),
+                factor: 2,
             }
         ));
     }
@@ -26595,6 +27222,7 @@ mod tests {
             Effect::DoublePTAll {
                 mode: DoublePTMode::Toughness,
                 target: TargetFilter::Typed(_),
+                factor: 2,
             }
         ));
     }
@@ -26607,6 +27235,7 @@ mod tests {
             Effect::DoublePT {
                 mode: DoublePTMode::Power,
                 target: TargetFilter::SelfRef,
+                factor: 2,
             }
         ));
     }
@@ -26619,6 +27248,7 @@ mod tests {
             Effect::DoublePT {
                 mode: DoublePTMode::PowerAndToughness,
                 target: TargetFilter::SelfRef,
+                factor: 2,
             }
         ));
     }
@@ -26634,6 +27264,7 @@ mod tests {
             Effect::DoublePT {
                 mode: DoublePTMode::Power,
                 target: TargetFilter::SelfRef,
+                factor: 2,
             }
         ));
     }
@@ -26646,6 +27277,7 @@ mod tests {
             Effect::DoublePT {
                 mode: DoublePTMode::PowerAndToughness,
                 target: TargetFilter::SelfRef,
+                factor: 2,
             }
         ));
     }
@@ -26659,6 +27291,7 @@ mod tests {
             Effect::DoublePT {
                 mode: DoublePTMode::Power,
                 target: TargetFilter::Typed(_),
+                factor: 2,
             }
         ));
     }
@@ -30422,6 +31055,105 @@ mod tests {
             value: expected.clone(),
         }));
         assert!(mods.contains(&ContinuousModification::SetToughnessDynamic { value: expected }));
+    }
+
+    /// CR 613.4b + CR 208.1 + CR 608.2h: "have ~'s base power become equal to
+    /// <quantity>" — the base-power set causative (Belligerent Yearling class).
+    /// Parses to a self-targeted `Effect::Animate` whose `power` is the dynamic
+    /// quantity and whose `toughness` stays `None` (power only).
+    #[test]
+    fn effect_have_base_power_become_equal_to_that_creatures_power() {
+        let def = parse_effect_chain(
+            "have ~'s base power become equal to that creature's power until end of turn",
+            AbilityKind::Spell,
+        );
+        let Effect::Animate {
+            power: Some(PtValue::Quantity(power)),
+            toughness,
+            target,
+            types,
+            ..
+        } = def.effect.as_ref()
+        else {
+            panic!("expected Animate set-base-power, got {:?}", def.effect);
+        };
+        assert_eq!(
+            power,
+            &QuantityExpr::Ref {
+                qty: QuantityRef::Power {
+                    scope: ObjectScope::CostPaidObject,
+                },
+            },
+            "base power set value must read the triggering creature's power"
+        );
+        assert!(toughness.is_none(), "only base power is set, not toughness");
+        assert!(types.is_empty(), "no type change");
+        assert!(
+            matches!(target, TargetFilter::None),
+            "self-targeted (source), got {target:?}"
+        );
+        assert_eq!(def.duration, Some(Duration::UntilEndOfTurn));
+    }
+
+    /// The "base power and base toughness" axis sets both characteristics from
+    /// the same dynamic quantity — proves the class is parameterized, not a
+    /// single-card special case.
+    #[test]
+    fn effect_have_base_power_and_toughness_become_equal_parses_both() {
+        let def = parse_effect_chain(
+            "have ~'s base power and base toughness become equal to that creature's power",
+            AbilityKind::Spell,
+        );
+        let Effect::Animate {
+            power: Some(PtValue::Quantity(power)),
+            toughness: Some(PtValue::Quantity(toughness)),
+            ..
+        } = def.effect.as_ref()
+        else {
+            panic!(
+                "expected Animate setting both base P/T, got {:?}",
+                def.effect
+            );
+        };
+        let expected = QuantityExpr::Ref {
+            qty: QuantityRef::Power {
+                scope: ObjectScope::CostPaidObject,
+            },
+        };
+        assert_eq!(power, &expected);
+        assert_eq!(toughness, &expected);
+    }
+
+    /// Full-card parse: Belligerent Yearling produces zero `Unimplemented`
+    /// trigger effects (the GAP this change closes), with the optional ETB
+    /// trigger carrying the base-power-set `Effect::Animate`.
+    #[test]
+    fn belligerent_yearling_full_card_parses_without_unimplemented() {
+        let parsed = crate::parser::parse_oracle_text(
+            "Trample\nWhenever another Dinosaur you control enters, you may have this creature's base power become equal to that creature's power until end of turn.",
+            "Belligerent Yearling",
+            &["Trample".to_string()],
+            &["Creature".to_string()],
+            &["Dinosaur".to_string()],
+        );
+        for ability in &parsed.abilities {
+            assert!(
+                !matches!(ability.effect.as_ref(), Effect::Unimplemented { .. }),
+                "spell ability must not be Unimplemented: {ability:?}"
+            );
+        }
+        let trigger = parsed
+            .triggers
+            .iter()
+            .find(|t| {
+                t.execute
+                    .as_ref()
+                    .is_some_and(|e| matches!(e.effect.as_ref(), Effect::Animate { .. }))
+            })
+            .expect("optional base-power-set ETB trigger");
+        let execute = trigger.execute.as_ref().unwrap();
+        assert!(execute.optional, "the \"you may\" trigger must be optional");
+        assert_eq!(execute.duration, Some(Duration::UntilEndOfTurn));
     }
 
     #[test]
@@ -37057,10 +37789,14 @@ mod tests {
 
         for (text, expected_target) in cases {
             let def = parse_effect_chain(text, AbilityKind::Spell);
-            let Effect::RevealHand { target, .. } = &*def.effect else {
+            let Effect::RevealHand { target, reveal, .. } = &*def.effect else {
                 panic!("Expected RevealHand for {text}, got {:?}", def.effect);
             };
             assert_eq!(*target, expected_target, "{text}");
+            assert!(
+                !*reveal,
+                "look-at-hand phrases must lower to private RevealHand, got {text}"
+            );
         }
     }
 
@@ -42490,6 +43226,31 @@ mod tests {
     }
 
     #[test]
+    fn cant_cast_spells_this_turn_defending_player() {
+        // CR 508.5 + CR 101.2: Xantid Swarm — "defending player can't cast
+        // spells this turn" (the combat-attack-trigger effect).
+        let def = parse_effect_chain(
+            "Defending player can't cast spells this turn.",
+            AbilityKind::Spell,
+        );
+        assert!(
+            matches!(
+                *def.effect,
+                Effect::AddRestriction {
+                    restriction: GameRestriction::ProhibitActivity {
+                        affected_players: RestrictionPlayerScope::DefendingPlayer,
+                        expiry: RestrictionExpiry::EndOfTurn,
+                        activity: ProhibitedActivity::CastSpells { spell_filter: None },
+                        ..
+                    }
+                }
+            ),
+            "got {:?}",
+            def.effect
+        );
+    }
+
+    #[test]
     fn abeyance_clause_chain_parses_both_restrictions() {
         let def = parse_effect_chain(
             "Until end of turn, target player can't cast instant or sorcery spells, and that player can't activate abilities that aren't mana abilities. Draw a card.",
@@ -42517,6 +43278,7 @@ mod tests {
                     affected_players: RestrictionPlayerScope::ParentTargetedPlayer,
                     activity: ProhibitedActivity::ActivateAbilities {
                         exemption: ActivationExemption::ManaAbilities,
+                        ..
                     },
                     ..
                 }
@@ -43502,6 +44264,36 @@ mod tests {
                 }
             ),
             "expected dynamic GainEnergy triggering-spell spent-mana ref, got: {e:?}"
+        );
+    }
+
+    #[test]
+    fn effect_gain_energy_equal_to_its_mana_value() {
+        let e = parse_effect("you get an amount of {e} equal to its mana value");
+        assert_eq!(
+            e,
+            Effect::GainEnergy {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectManaValue {
+                        scope: ObjectScope::Recipient,
+                    },
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn effect_gain_energy_equal_to_dynamic_quantity_rejects_partial_tail() {
+        let e = parse_effect(
+            "you get an amount of {e} equal to the number of cards in your hand and draw a card",
+        );
+        assert!(
+            !matches!(e, Effect::GainEnergy { .. }),
+            "partial quantity tail must not silently parse as GainEnergy, got {e:?}"
+        );
+        assert!(
+            matches!(e, Effect::Unimplemented { .. }),
+            "partial quantity tail should stay visible as Unimplemented, got {e:?}"
         );
     }
 
@@ -44891,6 +45683,8 @@ mod tests {
                     enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     enters_attacking: false,
                     kept_optional_to: None,
+                    enters_under: None,
+                    ..
                 } if type_filters.contains(&TypeFilter::Creature)
             ),
             "expected RevealUntil player=Controller, creature->hand, rest->library, got: {:?}",
@@ -44957,6 +45751,8 @@ mod tests {
                     enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     enters_attacking: false,
                     kept_optional_to: None,
+                    enters_under: None,
+                    ..
                 } if type_filters.contains(&TypeFilter::Creature)
             ),
             "expected RevealUntil player=ParentTargetController, got: {:?}",
@@ -45033,6 +45829,8 @@ mod tests {
                     enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     enters_attacking: false,
                     kept_optional_to: None,
+                    enters_under: None,
+                    ..
                 } if type_filters.contains(&TypeFilter::Land)
             ),
             "expected RevealUntil(kept=Graveyard, rest=Graveyard), got: {:?}",
@@ -45110,6 +45908,8 @@ mod tests {
                     enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     enters_attacking: false,
                     kept_optional_to: None,
+                    enters_under: None,
+                    ..
                 } if type_filters.contains(&TypeFilter::Artifact)
             ),
             "expected RevealUntil player=Controller, artifact->battlefield, got: {:?}",
@@ -45421,6 +46221,108 @@ mod tests {
             "expected RevealUntil nonland, got: {:?}",
             def.effect
         );
+    }
+
+    /// CR 701.20a + CR 608.2c: "reveal until you reveal X permanent cards, where
+    /// X is the number of colors among permanents you control. Put any number of
+    /// those permanent cards onto the battlefield, then put the rest of the
+    /// revealed cards on the bottom of your library in a random order." (Aurora
+    /// Awakener) — the multi-match `count` + `ChooseAnyNumber` disposition.
+    /// Runtime semantics for this AST shape are covered by the
+    /// `aurora_awakener_reveal_until_n_permanents` integration test (the parser
+    /// shape test alone does not satisfy the discriminating-test gate).
+    #[test]
+    fn reveal_until_x_permanent_cards_choose_any_number_aurora() {
+        let def = parse_effect_chain(
+            "Reveal cards from the top of your library until you reveal X permanent cards, \
+             where X is the number of colors among permanents you control. Put any number of \
+             those permanent cards onto the battlefield, then put the rest of the revealed \
+             cards on the bottom of your library in a random order.",
+            AbilityKind::Spell,
+        );
+        let Effect::RevealUntil {
+            count,
+            matched_disposition,
+            kept_destination,
+            rest_destination,
+            ..
+        } = &*def.effect
+        else {
+            panic!("expected RevealUntil, got {:?}", def.effect);
+        };
+        assert!(
+            matches!(
+                count,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::DistinctColorsAmongPermanents { .. }
+                }
+            ),
+            "count must bind to DistinctColorsAmongPermanents via the where-X clause, got {count:?}"
+        );
+        assert_eq!(
+            *matched_disposition,
+            RevealUntilDisposition::ChooseAnyNumber
+        );
+        assert_eq!(*kept_destination, Zone::Battlefield);
+        assert_eq!(*rest_destination, Zone::Library);
+    }
+
+    /// CR 701.20a: "reveal until you reveal X nonland cards, where X is the
+    /// number of colors among permanents you control" (Sanar core). The
+    /// per-color exile + cast-this-turn tail is intentionally NOT yet parsed; the
+    /// CORE reveal-until-N-nonland must still bind the dynamic count.
+    #[test]
+    fn reveal_until_x_nonland_cards_binds_dynamic_count_sanar_core() {
+        let def = parse_effect_chain(
+            "Reveal cards from the top of your library until you reveal X nonland cards, \
+             where X is the number of colors among permanents you control.",
+            AbilityKind::Spell,
+        );
+        let Effect::RevealUntil {
+            count,
+            filter: TargetFilter::Typed(TypedFilter { type_filters, .. }),
+            ..
+        } = &*def.effect
+        else {
+            panic!(
+                "expected RevealUntil with a typed nonland filter, got {:?}",
+                def.effect
+            );
+        };
+        assert!(
+            matches!(
+                count,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::DistinctColorsAmongPermanents { .. }
+                }
+            ),
+            "Sanar's count must bind to DistinctColorsAmongPermanents, got {count:?}"
+        );
+        assert!(
+            matches!(&type_filters[..], [TypeFilter::Non(inner)] if matches!(**inner, TypeFilter::Land)),
+            "filter must be nonland, got {type_filters:?}"
+        );
+    }
+
+    /// The single-article form must still yield `Fixed(1)` and `KeepEach` — the
+    /// parameterization default preserves every existing single-hit reveal-until.
+    #[test]
+    fn reveal_until_single_article_stays_fixed_one_keep_each() {
+        let def = parse_effect_chain(
+            "Reveal cards from the top of your library until you reveal a creature card. \
+             Put that card into your hand and the rest on the bottom of your library in a random order.",
+            AbilityKind::Spell,
+        );
+        let Effect::RevealUntil {
+            count,
+            matched_disposition,
+            ..
+        } = &*def.effect
+        else {
+            panic!("expected RevealUntil, got {:?}", def.effect);
+        };
+        assert_eq!(*count, QuantityExpr::Fixed { value: 1 });
+        assert_eq!(*matched_disposition, RevealUntilDisposition::KeepEach);
     }
 
     #[test]

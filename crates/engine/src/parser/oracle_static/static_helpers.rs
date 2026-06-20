@@ -155,16 +155,16 @@ fn strip_cost_mod_cast_scope_suffix(input: &str) -> &str {
 /// a cost-modification subject before type parsing. Paladin Class: "Spells your
 /// opponents cast during your turn cost {1} more to cast."
 fn strip_cost_mod_during_your_turn_scope(text: &str) -> (&str, Option<StaticCondition>) {
-    if let Ok((_, before)) = preceded(
+    if let Ok((_, prefix)) = terminated(
         take_until(" during your turn"),
-        terminated(
+        (
             tag::<_, _, OracleError<'_>>(" during your turn"),
             nom::combinator::eof,
         ),
     )
     .parse(text)
     {
-        return (before, Some(StaticCondition::DuringYourTurn));
+        return (prefix.trim(), Some(StaticCondition::DuringYourTurn));
     }
     if let Some((before, _, _)) = nom_primitives::scan_preceded(text, |i| {
         all_consuming(tag::<_, _, OracleError<'_>>(" during your turn")).parse(i)

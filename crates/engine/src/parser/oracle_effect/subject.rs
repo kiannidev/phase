@@ -1,9 +1,10 @@
 use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_till, take_until};
+use nom::character::complete::multispace0;
 use nom::combinator::{all_consuming, map, opt, rest, value, verify};
 use nom::multi::separated_list1;
-use nom::sequence::{delimited, preceded, terminated};
+use nom::sequence::{delimited, pair, preceded, terminated};
 use nom::Parser;
 
 use super::animation::{
@@ -24,6 +25,7 @@ use crate::types::phase::Phase;
 use crate::types::statics::{ProhibitionScope, StaticMode};
 
 use super::super::oracle_keyword::parse_keyword_from_oracle;
+use super::super::oracle_nom::bridge::nom_on_lower;
 use super::super::oracle_nom::duration::parse_duration;
 use super::super::oracle_nom::error::OracleResult;
 use super::super::oracle_nom::primitives as nom_primitives;
@@ -45,6 +47,16 @@ pub(super) fn try_parse_subject_predicate_ast(
     ctx: &mut ParseContext,
 ) -> Option<ClauseAst> {
     if try_parse_targeted_controller_gain_life(text).is_some() {
+        return None;
+    }
+
+    // CR 120.1 + CR 115.1d: defer the "up to two target creatures you control each
+    // deal damage equal to their power to target creature" shape to the imperative
+    // path, which preserves both the targeted source set and the recipient as
+    // independent targets. Splitting it into subject + imperative-fallback here
+    // would drop the per-source damage semantics. (The team-scope variant fails
+    // closed to `Unimplemented` earlier, in `parse_effect_clause_inner`.)
+    if try_parse_each_deals_damage_equal_to_power(text).is_some() {
         return None;
     }
 
@@ -87,6 +99,16 @@ pub(super) fn try_parse_subject_predicate_ast(
             },
             ctx,
         ));
+    }
+
+    // CR 613.4b + CR 613.1f: "[subject]'s base power and toughness become N/M and
+    // (it/they) gain(s) <keywords>" — set-base-P/T + keyword grant on the
+    // possessor, no type change. Must run before `try_parse_subject_become_clause`
+    // (which assumes the verb "become" acts on the permanent's type, not its P/T).
+    // Returns a fully-built `ClauseAst` because the possessive subject ("~'s base
+    // power and toughness") cannot be re-derived by `find_predicate_start`.
+    if let Some(clause) = try_parse_subject_base_pt_set_clause_ast(text, ctx) {
+        return Some(clause);
     }
 
     if let Some(clause) = try_parse_subject_become_clause(text, ctx) {
@@ -172,7 +194,12 @@ where
 
 fn extract_subject_text(text: &str) -> Option<String> {
     let verb_start = find_predicate_start(text)?;
-    let subject = text[..verb_start].trim();
+    // CR 608.2c: drop the additive "also" connector (see
+    // `strip_trailing_additive_adverb`) so the re-extracted subject phrase used
+    // by `subject_predicate_ast_from_clause` matches the one parsed inside
+    // `try_parse_subject_continuous_clause`. Without this the AST subject falls
+    // back to `TargetFilter::Any` (broadcasting the grant to every permanent).
+    let subject = strip_trailing_additive_adverb(text[..verb_start].trim());
     if subject.is_empty() {
         None
     } else {
@@ -254,7 +281,17 @@ fn try_parse_subject_continuous_clause(
     ctx: &mut ParseContext,
 ) -> Option<ParsedEffectClause> {
     let verb_start = find_predicate_start(text)?;
-    let subject = text[..verb_start].trim();
+    // CR 608.2c: An additive "also" sitting between a filter subject and its
+    // continuous verb ("Kithkin creatures you control *also* gain first strike
+    // until end of turn") is a natural-language connector with no semantic
+    // weight — it chains this grant onto a preceding effect (the pump in
+    // "creatures you control get +1/+0 ... . <subtype> creatures you control
+    // also gain <keyword> ..."). Strip it so the residual filter subject routes
+    // through the standard subject grammar; without the strip the trailing
+    // "also" leaks into `parse_target`, which rejects the subject and drops the
+    // whole grant to `Effect::Unimplemented`. Mirrors the self-ref additive
+    // strip in `parse_effect_clause_inner` ("~ also gains ...").
+    let subject = strip_trailing_additive_adverb(text[..verb_start].trim());
     let predicate = text[verb_start..].trim();
     // CR 109.5: "you" as a player subject never participates in continuous-
     // clause parsing — the predicate is always an imperative effect (draw,
@@ -336,6 +373,145 @@ fn try_parse_subject_become_clause(
         .ok()?;
     let application = parse_subject_application(subject, ctx)?;
     build_become_clause(application, &predicate, ctx)
+}
+
+/// CR 613.4b + CR 613.1f: "[subject]'s base power and toughness become N/M [and
+/// (it/they) gain(s)/has/have <keywords>]" — a set-base-P/T plus keyword-grant
+/// continuous effect on the possessor, with NO type/subtype change.
+///
+/// This differs grammatically from the `becomes a [type] with base power and
+/// toughness N/M` animation form (handled by `parse_animation_spec`): here the
+/// grammatical subject is the *possessive* "[subject]'s base power and
+/// toughness", and the verb "become" acts on the P/T characteristics, not on the
+/// permanent's card type. So it produces a `GenericEffect` carrying
+/// `SetPower`/`SetToughness` (Layer 7b, CR 613.4b) and `AddKeyword` (Layer 6,
+/// CR 613.1f) modifications, without any `AddType`/`AddSubtype`. Covers Moon
+/// Girl and Devil Dinosaur ("~'s base power and toughness become 6/6 and they
+/// gain trample") and the class of "<permanent>'s base power and toughness
+/// become N/M …" effects.
+fn try_parse_subject_base_pt_set_clause_ast(
+    text: &str,
+    ctx: &mut ParseContext,
+) -> Option<ClauseAst> {
+    type VE<'a> = OracleError<'a>;
+
+    // CR 611.2a: A standalone effect line may carry a *leading* duration
+    // ("Until end of turn, ~'s base power and toughness become 6/6 …"). Strip it
+    // here and thread it onto the clause; inside a trigger the sequence layer has
+    // already stripped it, so this is a no-op in that path.
+    let (body, leading_duration) = strip_leading_duration(text);
+
+    let lower = body.to_lowercase();
+    // Split at the possessive characteristic phrase. The possessive marker may be
+    // ASCII `'s` or the Unicode right single quote `\u{2019}s`. `rest_lower` is the
+    // text after the marker; `to_lowercase` preserves byte offsets for this text
+    // (ASCII letters + apostrophes), so the same offsets index `body`.
+    let (rest_lower, (subject_lower, _marker)) = alt((
+        pair(
+            take_until::<_, _, VE>("'s base power and toughness become "),
+            tag("'s base power and toughness become "),
+        ),
+        pair(
+            take_until::<_, _, VE>("\u{2019}s base power and toughness become "),
+            tag("\u{2019}s base power and toughness become "),
+        ),
+    ))
+    .parse(lower.as_str())
+    .ok()?;
+
+    let subject = body[..subject_lower.len()].trim();
+    let remainder = &body[body.len() - rest_lower.len()..];
+
+    // Parse the fixed N/M P/T values.
+    let (power, toughness, after_pt) = super::animation::parse_fixed_become_pt_prefix(remainder)?;
+
+    // Parse the optional trailing keyword-grant conjunct ("and they gain trample").
+    let keywords = parse_base_pt_set_trailing_keywords(after_pt);
+
+    let application = parse_subject_application(subject, ctx)?;
+    let affected = static_affected_for_application(&application);
+
+    let mut modifications = vec![
+        ContinuousModification::SetPower { value: power },
+        ContinuousModification::SetToughness { value: toughness },
+    ];
+    modifications.extend(
+        keywords
+            .into_iter()
+            .map(|keyword| ContinuousModification::AddKeyword { keyword }),
+    );
+
+    let effect = Effect::GenericEffect {
+        static_abilities: vec![StaticDefinition::continuous()
+            .affected(affected)
+            .modifications(modifications)
+            .description(body.trim_end_matches('.').to_string())],
+        // CR 611.2a: a leading duration stripped above is threaded onto the
+        // GenericEffect; otherwise the sequence layer's wrapping duration (for
+        // the trigger-body path, where it is already stripped upstream) applies.
+        duration: leading_duration.clone(),
+        target: application.target.clone(),
+    };
+
+    Some(ClauseAst::SubjectPredicate {
+        subject: Box::new(SubjectPhraseAst {
+            affected: application.affected,
+            target: application.target,
+            multi_target: application.multi_target,
+            inherits_parent: application.inherits_parent,
+            is_optional: application.is_optional,
+        }),
+        predicate: Box::new(PredicateAst::Continuous {
+            effect,
+            duration: leading_duration,
+            sub_ability: None,
+        }),
+    })
+}
+
+/// Strip a leading duration phrase ("Until end of turn, " / "This turn, ") off a
+/// standalone effect line, returning `(remaining_body, duration)`. When no
+/// leading duration is present, returns `(text, None)` so the caller is a no-op.
+fn strip_leading_duration(text: &str) -> (&str, Option<Duration>) {
+    type VE<'a> = OracleError<'a>;
+    let lower = text.to_lowercase();
+
+    let parsed = (
+        parse_duration,
+        opt(tag::<_, _, VE>(",")),
+        nom::character::complete::multispace1,
+    )
+        .parse(lower.as_str());
+    let Ok((rest_lower, (duration, _, _))) = parsed else {
+        return (text, None);
+    };
+    let body = &text[text.len() - rest_lower.len()..];
+    (body, Some(duration))
+}
+
+/// Parse the trailing "[, ] and [it/they] gain(s)/has/have <keyword list>"
+/// conjunct after a "base power and toughness become N/M" clause. Returns the
+/// recognized keywords (empty when no trailing conjunct or no keywords parse).
+fn parse_base_pt_set_trailing_keywords(after_pt: &str) -> Vec<Keyword> {
+    type VE<'a> = OracleError<'a>;
+
+    let lower = after_pt.to_lowercase();
+    let intro = (
+        opt(tag::<_, _, VE>(",")),
+        multispace0,
+        tag("and "),
+        opt(alt((tag("it "), tag("they "), tag("he "), tag("she ")))),
+        alt((tag("gains "), tag("gain "), tag("has "), tag("have "))),
+    );
+    let Ok((rest, _)) = value((), intro).parse(lower.as_str()) else {
+        return Vec::new();
+    };
+
+    let raw = rest.trim().trim_end_matches('.');
+    super::token::split_token_keyword_list(raw)
+        .into_iter()
+        .filter_map(super::token::map_token_keyword)
+        .collect()
 }
 
 /// CR 508.1d + CR 508.1h: "[creatures] can't attack [you] unless [player] pays
@@ -454,6 +630,35 @@ fn try_parse_subject_restriction_clause(
     if let Some(verb_start) = find_predicate_start(text) {
         let subject = text[..verb_start].trim();
         let predicate = deconjugate_verb(text[verb_start..].trim());
+        // CR 508.1d + CR 509.1c: "[subject] attacks or blocks this turn/combat if
+        // able" (Hustle) — the combined requirement re-binds BOTH MustAttack and
+        // MustBlock statics to the subject. Tried before the plain attack
+        // recognizer since both share the "attacks" verb prefix; the combined
+        // form is the strict superset and must win.
+        if let Some(ImperativeFamilyAst::GainKeyword(Effect::GenericEffect { duration, .. })) =
+            imperative::try_parse_attack_or_block_if_able(&predicate)
+        {
+            let application = parse_subject_application(subject, ctx)?;
+            let affected = static_affected_for_application(&application);
+            let static_abilities = imperative::must_attack_or_block_static_definitions()
+                .into_iter()
+                .map(|def| def.affected(affected.clone()))
+                .collect();
+            return Some(ParsedEffectClause {
+                effect: Effect::GenericEffect {
+                    static_abilities,
+                    duration: duration.clone(),
+                    target: application.target,
+                },
+                distribute: None,
+                multi_target: application.multi_target,
+                duration,
+                sub_ability: None,
+                condition: None,
+                optional: application.is_optional,
+                unless_pay: None,
+            });
+        }
         // Classify via the existing recognizer. Only the bare GenericEffect form
         // (MustAttack) is re-bound here; the player-bound `ForceAttack` form
         // ("attacks you/that player …") has its own targeted handling and must
@@ -850,6 +1055,24 @@ pub(super) fn parse_subject_application(
     subject: &str,
     ctx: &mut ParseContext,
 ) -> Option<SubjectApplication> {
+    if subject.trim().is_empty() {
+        return None;
+    }
+
+    // CR 608.2c: A trailing "also" adverb is a natural-language additive
+    // connector ("it also has …", "that creature also gains …") with no
+    // semantic weight on the subject — it modifies the verb, not the
+    // referent. `find_predicate_start` leaves it on the subject side because
+    // it is not a predicate verb, so strip it here so the bare anaphor/typed
+    // subject resolves identically to its non-"also" form. Mirrors the
+    // self-ref "also" strip in `oracle_effect/mod.rs` (Expressive Firedancer),
+    // generalized to every subject the subject-predicate parser accepts.
+    let subject = subject
+        .trim()
+        // allow-noncombinator: structural adverb cleanup on already-isolated subject text (not parsing dispatch); mirrors the self-ref "also" strip in oracle_effect/mod.rs (PATTERNS.md §9)
+        .strip_suffix(" also")
+        .map(str::trim_end)
+        .unwrap_or(subject);
     if subject.trim().is_empty() {
         return None;
     }
@@ -2396,6 +2619,32 @@ fn build_become_clause(
         return Some(super::parsed_clause(effect));
     }
 
+    // CR 702.171b: "becomes saddled" toggles the saddled designation on the
+    // target permanent. Must intercept before parse_animation_spec which would
+    // mis-classify "saddled" as a subtype. The designation always clears at end
+    // of turn / when the permanent leaves the battlefield (handled by the
+    // engine's cleanup pass), so the trailing "until end of turn" duration that
+    // `strip_trailing_duration` already peeled is not re-attached — the effect
+    // carries no duration. Unlike a `GenericEffect` animation (whose typed
+    // selection filter lives on the effect's `target` field and whose static's
+    // `affected` is `ParentTarget`), `BecomeSaddled` is a single targeted effect
+    // whose `target` IS the selection slot: a "Target Mount you control"
+    // subject (Guidelight Matrix) carries its real `Typed(Mount, You)` filter so
+    // `build_target_slots` surfaces a target slot; an anaphoric subject ("it
+    // becomes saddled" — Kolodin's Mount-enters trigger lowers "it" to a
+    // `TriggeringSource` context ref) carries `affected`, which the resolver
+    // resolves from event context.
+    if all_consuming(tag::<_, _, OracleError<'_>>("saddled"))
+        .parse(become_lower.as_str())
+        .is_ok()
+    {
+        let target = application
+            .target
+            .clone()
+            .unwrap_or_else(|| application.affected.clone());
+        return Some(super::parsed_clause(Effect::BecomeSaddled { target }));
+    }
+
     // CR 707.2 / CR 613.1a: "become a copy of [target]" — copy copiable characteristics.
     // Must intercept before parse_animation_spec which rejects "copy of" patterns.
     //
@@ -3553,6 +3802,105 @@ pub(super) fn try_parse_targeted_controller_gain_life(text: &str) -> Option<Pars
     }))
 }
 
+/// CR 120.1 + CR 120.3 + CR 115.1d: "Up to two target creatures you control each
+/// deal damage equal to their power to target creature [restriction]." (Band
+/// Together, Allies at Last, Combo Attack, Friendly Rivalry, Graceful Takedown.)
+///
+/// The subject ("[up to two|two|one or two] target creatures you control" /
+/// "two target creatures your team controls") is a TARGETED source set — its
+/// count bound becomes the ability's `multi_target` spec and its per-object
+/// legality the `sources` filter. The "to <target creature>" tail is the single
+/// recipient. Produces `Effect::EachDealsDamageEqualToPower { sources, recipient }`
+/// with the count spec carried on the returned clause's `multi_target`.
+///
+/// Subject preservation matters: the sources are not the ability source (the
+/// spell), and the recipient is a second, independent target — so this must be
+/// recognized before generic subject stripping flattens the sentence.
+pub(super) fn try_parse_each_deals_damage_equal_to_power(text: &str) -> Option<ParsedEffectClause> {
+    let lower = text.to_lowercase();
+    // CR 115.1d: the source-count quantifier. "two" → exactly 2; "up to two" →
+    // 0..=2; "one or two" → 1..=2. Each axis is one `tag()` alternative.
+    let (after_count, multi_target) = parse_each_deals_source_count(lower.as_str())?;
+
+    // CR 115.1: the source set, as a TARGETED creature filter. "your team
+    // controls" (Two-Headed Giant team scope, CR 810) is intentionally NOT
+    // collapsed to "you control": a team is not the caster's controller, so a
+    // card that uses it (Combo Attack) must fail closed rather than mis-target a
+    // single player's creatures. `parse_target` does not consume the non-standard
+    // "your team controls" controller phrase, so it stays in `after_sources` and
+    // the verb-phrase `tag` below rejects the line (-> Unimplemented).
+    let (sources, after_sources) = parse_target(after_count);
+    if !target_filter_is_targeted_creature(&sources) {
+        return None;
+    }
+
+    // CR 120.1: the verb phrase. Each chosen source deals damage equal to its own
+    // power. `parse()` returns `(remaining, output)` — bind the remaining text.
+    let after_sources_trimmed = after_sources.trim_start();
+    let after_verb = match tag::<_, _, OracleError<'_>>("each deal damage equal to their power to ")
+        .parse(after_sources_trimmed)
+    {
+        Ok((rest, _)) => rest,
+        // CR 810: the team-up shape carrying an unmodelable "your team controls"
+        // source scope (Combo Attack). `parse_target` leaves "your team controls
+        // …" in the remainder, so the verb tag above misses. Fail CLOSED to a
+        // DETERMINISTIC `Unimplemented` rather than returning `None`: `None` would
+        // let a generic target-only fallback non-deterministically accept the
+        // leading "two target creatures …" as a bare `TargetOnly` clause (the
+        // fallback order is HashMap-seed dependent).
+        Err(_)
+            if tag::<_, _, OracleError<'_>>(
+                "your team controls each deal damage equal to their power to ",
+            )
+            .parse(after_sources_trimmed)
+            .is_ok() =>
+        {
+            return Some(super::parsed_clause(Effect::unimplemented("deal", text)));
+        }
+        Err(_) => return None,
+    };
+
+    // CR 115.1: the single recipient creature ("target creature", "target
+    // creature an opponent controls", "another target creature", "target
+    // creature you don't control").
+    let (recipient, _rest) = parse_target(after_verb);
+    if !target_filter_is_targeted_creature(&recipient) {
+        return None;
+    }
+
+    Some(ParsedEffectClause {
+        multi_target: Some(multi_target),
+        ..super::parsed_clause(Effect::EachDealsDamageEqualToPower { sources, recipient })
+    })
+}
+
+/// CR 115.1d: Parse the leading source-count quantifier of the team-up damage
+/// line and return the remaining text plus the `MultiTargetSpec` it encodes.
+/// "up to two" → 0..=2, "one or two" → 1..=2, "two" → exactly 2.
+fn parse_each_deals_source_count(lower: &str) -> Option<(&str, MultiTargetSpec)> {
+    alt((
+        map(tag::<_, _, OracleError<'_>>("up to two "), |_| {
+            MultiTargetSpec::fixed(0, 2)
+        }),
+        map(tag("one or two "), |_| MultiTargetSpec::fixed(1, 2)),
+        map(tag("two "), |_| MultiTargetSpec::fixed(2, 2)),
+    ))
+    .parse(lower)
+    .ok()
+}
+
+/// CR 115.1: True when `filter` is a "target creature" object filter (the
+/// `target` keyword present, restricted to creatures). Guards both the source
+/// set and the recipient of the team-up damage line so non-creature or
+/// non-targeted phrases fall through to the generic parser.
+fn target_filter_is_targeted_creature(filter: &TargetFilter) -> bool {
+    matches!(filter, TargetFilter::Typed(tf)
+    if tf.type_filters.iter().any(|t| matches!(
+        t,
+        crate::types::ability::TypeFilter::Creature
+    )))
+}
+
 /// Parse `~ <predicate-verb>` at the start of input, succeeding only when the
 /// first word after `~ ` deconjugates to a registered [`PREDICATE_VERBS`]
 /// entry. Used as the single authority for validating the tilde-subject form
@@ -3745,6 +4093,38 @@ pub(crate) const PREDICATE_VERBS: &[&str] = &[
     "win",
 ];
 
+/// CR 608.2c: Strip a trailing additive "also" connector from a filter-subject
+/// phrase. In a chained grant ("<subject> also gain <keyword> ...") the "also"
+/// is the additive adverb linking this continuous effect to a sibling clause and
+/// carries no selection semantics. `find_predicate_start` lands the verb split
+/// after the "also", so the residual subject is "<filter> also"; left intact the
+/// trailing word leaks into `parse_target` and fails the subject match. Returns
+/// the subject unchanged when no additive "also" is present, or when the head is
+/// empty (a bare "also" has no filter to grant against).
+///
+/// Pattern 2a (`oracle_nom/PATTERNS.md`): the whole subject is parsed and the
+/// fixed suffix is consumed last. `all_consuming` anchors " also" to the END, so
+/// a non-terminal "also" (e.g. "also creatures you control") is not matched. The
+/// lowercase head's byte length maps 1:1 onto `subject` for case preservation.
+fn strip_trailing_additive_adverb(subject: &str) -> &str {
+    let lower = subject.to_lowercase();
+    // Return the head's byte length (not a borrow of the temporary `lower`) so the
+    // closure result is owned; map it back onto `subject` for case preservation.
+    let parsed = nom_on_lower(subject, &lower, |input| {
+        all_consuming(terminated(
+            map(take_until::<_, _, OracleError<'_>>(" also"), str::len),
+            tag(" also"),
+        ))
+        .parse(input)
+    });
+    match parsed {
+        Some((head_len, _)) if !subject[..head_len].trim_end().is_empty() => {
+            subject[..head_len].trim_end()
+        }
+        _ => subject,
+    }
+}
+
 fn is_restriction_predicate_verb(token: &str) -> bool {
     // CR 613.1d: "isn't"/"aren't" head a layer-4 type-removal predicate ("~ isn't
     // a creature until end of turn", Blink's Alien Angel token). Recognizing the
@@ -3863,6 +4243,36 @@ mod tests {
     fn become_named_plain_captures_full_name() {
         let (_, name) = strip_become_name_override("becomes a creature named Serra Angel");
         assert_eq!(name.as_deref(), Some("Serra Angel"));
+    }
+
+    /// CR 608.2c: the additive-"also" strip is a building block — it removes the
+    /// trailing connector for any filter subject, is case-insensitive, leaves
+    /// non-additive subjects untouched, and refuses to strip a bare "also" that
+    /// would leave no filter.
+    #[test]
+    fn strip_trailing_additive_adverb_building_block() {
+        // Trailing additive "also" is stripped, original case preserved.
+        assert_eq!(
+            strip_trailing_additive_adverb("Kithkin creatures you control also"),
+            "Kithkin creatures you control"
+        );
+        // Case-insensitive on the connector.
+        assert_eq!(
+            strip_trailing_additive_adverb("Goblins you control ALSO"),
+            "Goblins you control"
+        );
+        // No trailing "also" → unchanged.
+        assert_eq!(
+            strip_trailing_additive_adverb("creatures you control"),
+            "creatures you control"
+        );
+        // A non-terminal "also" is not a trailing connector → unchanged.
+        assert_eq!(
+            strip_trailing_additive_adverb("also creatures you control"),
+            "also creatures you control"
+        );
+        // Bare "also" has no filter to grant against → not stripped to empty.
+        assert_eq!(strip_trailing_additive_adverb("also"), "also");
     }
 
     /// CR 702.3b: the subjectless conjunct recognizer accepts every grammatical
@@ -5565,5 +5975,75 @@ mod tests {
             )),
             "second disjunct (has-haste) dropped by repeated 'by': {filters:?}"
         );
+    }
+
+    /// CR 613.4b + CR 613.1f: the possessive base-P/T-set + keyword-grant clause
+    /// builds a `GenericEffect` with `SetPower`/`SetToughness` and `AddKeyword`,
+    /// across the trigger-body form ("~'s …, they gain …"), the singular pronoun
+    /// ("it gains"), the multi-keyword conjunct, and the standalone form with a
+    /// leading "Until end of turn," duration (which exercises
+    /// `strip_leading_duration`).
+    fn base_pt_set_mods(text: &str) -> (Vec<ContinuousModification>, Option<Duration>) {
+        let mut ctx = ParseContext::default();
+        let ast = try_parse_subject_base_pt_set_clause_ast(text, &mut ctx)
+            .unwrap_or_else(|| panic!("clause did not parse: {text:?}"));
+        let ClauseAst::SubjectPredicate { predicate, .. } = ast else {
+            panic!("expected SubjectPredicate");
+        };
+        let PredicateAst::Continuous {
+            effect, duration, ..
+        } = *predicate
+        else {
+            panic!("expected Continuous predicate");
+        };
+        let Effect::GenericEffect {
+            static_abilities, ..
+        } = effect
+        else {
+            panic!("expected GenericEffect");
+        };
+        (static_abilities[0].modifications.clone(), duration)
+    }
+
+    #[test]
+    fn base_pt_set_clause_trigger_body_form() {
+        // Moon Girl's trigger-body form (leading duration already stripped
+        // upstream). "they gain trample" plural pronoun.
+        let (mods, duration) =
+            base_pt_set_mods("~'s base power and toughness become 6/6 and they gain trample");
+        assert!(mods.contains(&ContinuousModification::SetPower { value: 6 }));
+        assert!(mods.contains(&ContinuousModification::SetToughness { value: 6 }));
+        assert!(mods.contains(&ContinuousModification::AddKeyword {
+            keyword: Keyword::Trample
+        }));
+        // No leading duration in the trigger-body form.
+        assert_eq!(duration, None);
+    }
+
+    #[test]
+    fn base_pt_set_clause_leading_duration_and_singular_pronoun() {
+        // Standalone form: leading "Until end of turn," + singular "it gains".
+        // The leading duration must be stripped and threaded onto the clause.
+        let (mods, duration) = base_pt_set_mods(
+            "Until end of turn, ~'s base power and toughness become 4/4 and it gains flying",
+        );
+        assert!(mods.contains(&ContinuousModification::SetPower { value: 4 }));
+        assert!(mods.contains(&ContinuousModification::SetToughness { value: 4 }));
+        assert!(mods.contains(&ContinuousModification::AddKeyword {
+            keyword: Keyword::Flying
+        }));
+        assert_eq!(duration, Some(Duration::UntilEndOfTurn));
+    }
+
+    #[test]
+    fn base_pt_set_clause_no_keyword_conjunct() {
+        // Bare "become N/M" with no trailing keyword grant is still a valid
+        // set-base-P/T clause.
+        let (mods, _) = base_pt_set_mods("~'s base power and toughness become 2/3");
+        assert!(mods.contains(&ContinuousModification::SetPower { value: 2 }));
+        assert!(mods.contains(&ContinuousModification::SetToughness { value: 3 }));
+        assert!(!mods
+            .iter()
+            .any(|m| matches!(m, ContinuousModification::AddKeyword { .. })));
     }
 }

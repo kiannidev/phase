@@ -70,7 +70,11 @@ fn kari_zev_attack_creates_ragavan_tapped_and_attacking() {
     resolve_attack_trigger(&mut runner);
 
     let tokens = ragavan_tokens(&runner);
-    assert_eq!(tokens.len(), 1, "Kari Zev must create exactly one Ragavan token");
+    assert_eq!(
+        tokens.len(),
+        1,
+        "Kari Zev must create exactly one Ragavan token"
+    );
 
     let token = tokens[0];
     let obj = runner.state().objects.get(&token).expect("token exists");

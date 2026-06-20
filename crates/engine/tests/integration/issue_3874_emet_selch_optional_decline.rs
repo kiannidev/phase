@@ -4,11 +4,10 @@
 //! https://github.com/phase-rs/phase/issues/3874
 
 use engine::game::scenario::{GameScenario, P0, P1};
-use engine::types::ability::TargetRef;
 use engine::types::actions::GameAction;
 use engine::types::game_state::WaitingFor;
-use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::identifiers::ObjectId;
+use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 

@@ -7,7 +7,7 @@ use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaType, ManaUnit};
 use engine::types::phase::Phase;
 
-const TEferi_ORACLE: &str =
+const TEFERI_ORACLE: &str =
     "If you would draw a card except the first one you draw in each of your draw steps, draw two cards instead.";
 
 const DRAW_FOUR_ORACLE: &str = "Draw four cards.";
@@ -20,7 +20,7 @@ fn teferi_ageless_insight_doubles_multi_card_draws() {
         scenario.add_spell_to_library_top(P0, &format!("Filler {i}"), true);
     }
     scenario
-        .add_creature_from_oracle(P0, "Teferi's Ageless Insight", 0, 0, TEferi_ORACLE)
+        .add_creature_from_oracle(P0, "Teferi's Ageless Insight", 0, 0, TEFERI_ORACLE)
         .as_enchantment();
     let draw_four = scenario
         .add_spell_to_hand_from_oracle(P0, " Inspiration", false, DRAW_FOUR_ORACLE)

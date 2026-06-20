@@ -1753,10 +1753,10 @@ fn collect_target_slots(
         if is_per_opponent_target_fanout(ability) {
             collect_per_opponent_target_fanout_slots(state, ability, acc)?;
             if let Some(sub_ability) = ability.sub_ability.as_deref() {
-                if !defers_conditional_target_selection(sub_ability) {
-                    if !sub_ability_inherits_parent_creature_target_only(ability, sub_ability) {
-                        collect_target_slots(state, sub_ability, acc)?;
-                    }
+                if !defers_conditional_target_selection(sub_ability)
+                    && !sub_ability_inherits_parent_creature_target_only(ability, sub_ability)
+                {
+                    collect_target_slots(state, sub_ability, acc)?;
                 }
             }
             return Ok(());
@@ -1871,10 +1871,10 @@ fn collect_target_slots(
         // `resolve_ability_chain`, not here. They are intentionally left
         // UNLABELLED for the modal targeting banner: no slot is surfaced at
         // mode-selection time, so there is no slot to attach a mode label to.
-        if !defers_conditional_target_selection(sub_ability) {
-            if !sub_ability_inherits_parent_creature_target_only(ability, sub_ability) {
-                collect_target_slots(state, sub_ability, acc)?;
-            }
+        if !defers_conditional_target_selection(sub_ability)
+            && !sub_ability_inherits_parent_creature_target_only(ability, sub_ability)
+        {
+            collect_target_slots(state, sub_ability, acc)?;
         }
     }
     Ok(())
@@ -3054,10 +3054,10 @@ fn collect_target_slot_specs(
         return;
     }
     if let Some(sub_ability) = ability.sub_ability.as_deref() {
-        if !defers_conditional_target_selection(sub_ability) {
-            if !sub_ability_inherits_parent_creature_target_only(ability, sub_ability) {
-                collect_target_slot_specs(state, sub_ability, specs, next_instance);
-            }
+        if !defers_conditional_target_selection(sub_ability)
+            && !sub_ability_inherits_parent_creature_target_only(ability, sub_ability)
+        {
+            collect_target_slot_specs(state, sub_ability, specs, next_instance);
         }
     }
 }

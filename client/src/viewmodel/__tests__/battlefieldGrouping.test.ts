@@ -155,7 +155,7 @@ describe("partitionByType", () => {
     expect(result.support).toEqual([]);
   });
 
-  it("excludes bestowed Aura-creature (Creature + Enchantment core types) when attached", () => {
+  it("excludes attached Aura subtype permanents from main rows", () => {
     // CR 702.103: Bestowed creatures are Auras as long as attached. Their
     // core_types still includes "Creature" — without the attached_to filter
     // running first, they'd land in the creatures row AND the chip row.
@@ -168,27 +168,6 @@ describe("partitionByType", () => {
           supertypes: [],
           core_types: ["Creature", "Enchantment"],
           subtypes: ["Satyr", "Aura"],
-        },
-      }),
-    ];
-
-    const result = partitionByType(objects);
-
-    expect(result.creatures).toEqual([1]);
-    expect(result.support).toEqual([]);
-  });
-
-  it("excludes bestowed enchantment-only Aura when attached without Aura subtype", () => {
-    const objects = [
-      makeGameObject({ id: 1, card_types: { supertypes: [], core_types: ["Creature"], subtypes: ["Bird"] } }),
-      makeGameObject({
-        id: 99,
-        name: "Springheart Nantuko",
-        attached_to: { type: "Object", data: 1 },
-        card_types: {
-          supertypes: [],
-          core_types: ["Enchantment"],
-          subtypes: ["Insect", "Monk"],
         },
       }),
     ];

@@ -55,23 +55,15 @@ export function partitionByType(objects: GameObject[]): BattlefieldPartition {
 
   for (const obj of objects) {
     const subtypes = obj.card_types.subtypes;
-    const coreTypes = obj.card_types.core_types;
     const isAttachmentKind =
       subtypes.includes("Aura")
       || subtypes.includes("Equipment")
-      || subtypes.includes("Fortification")
-      // CR 702.103b: bestowed permanents are enchantment Auras without the
-      // Creature core type. Hide them from the main rows whenever they are
-      // attached, even if the Aura subtype is momentarily absent in the view.
-      || (
-        obj.attached_to !== null
-        && coreTypes.includes("Enchantment")
-        && !coreTypes.includes("Creature")
-      );
+      || subtypes.includes("Fortification");
     // True attachment kinds render through their host surface instead of the
     // main battlefield rows. Do not hide arbitrary permanents just because the
     // engine gives them an attached_to relationship.
     if (obj.attached_to !== null && isAttachmentKind) continue;
+    const coreTypes = obj.card_types.core_types;
 
     if (coreTypes.includes("Creature")) {
       creatures.push(obj.id);

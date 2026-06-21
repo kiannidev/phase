@@ -89,6 +89,7 @@ pub fn convert_as_enters(
             token_owner_scope: None,
             token_owner_redirect: None,
             valid_player: None,
+            consume_on_apply: false,
             is_consumed: false,
             redirect_target: None,
             mana_modification: None,
@@ -170,6 +171,7 @@ pub fn convert_replace_would_enter(
             token_owner_scope: None,
             token_owner_redirect: None,
             valid_player: None,
+            consume_on_apply: false,
             is_consumed: false,
             redirect_target: None,
             mana_modification: None,
@@ -234,6 +236,7 @@ pub fn convert_replace_would_deal_damage(
             token_owner_scope: None,
             token_owner_redirect: None,
             valid_player: None,
+            consume_on_apply: false,
             is_consumed: false,
             redirect_target: None,
             mana_modification: None,
@@ -607,6 +610,7 @@ pub fn convert_replace_would_draw(
             token_owner_scope: None,
             token_owner_redirect: None,
             valid_player: valid_player.clone(),
+            consume_on_apply: false,
             is_consumed: false,
             redirect_target: None,
             mana_modification: None,
@@ -729,6 +733,7 @@ pub fn convert_replace_would_put_into_graveyard(
             token_owner_scope: None,
             token_owner_redirect: None,
             valid_player: None,
+            consume_on_apply: false,
             is_consumed: false,
             redirect_target: None,
             mana_modification: None,
@@ -976,6 +981,7 @@ pub fn convert_as_put_into_graveyard_from_anywhere(
             token_owner_scope: None,
             token_owner_redirect: None,
             valid_player: None,
+            consume_on_apply: false,
             is_consumed: false,
             redirect_target: None,
             mana_modification: None,
@@ -1065,6 +1071,7 @@ pub fn convert_replace_would_put_counters(
             token_owner_scope: None,
             token_owner_redirect: None,
             valid_player: None,
+            consume_on_apply: false,
             is_consumed: false,
             redirect_target: None,
             mana_modification: None,
@@ -1248,6 +1255,7 @@ pub fn convert_replace_would_gain_life(
             token_owner_scope: None,
             token_owner_redirect: None,
             valid_player: valid_player.clone(),
+            consume_on_apply: false,
             is_consumed: false,
             redirect_target: None,
             mana_modification: None,
@@ -1368,6 +1376,7 @@ fn try_build_may_cost_pair(
         token_owner_scope: None,
         token_owner_redirect: None,
         valid_player: None,
+        consume_on_apply: false,
         is_consumed: false,
         redirect_target: None,
         mana_modification: None,
@@ -2730,7 +2739,7 @@ fn rewrite_variable_x_to_cost_x_paid(expr: &mut QuantityExpr) {
         | QuantityExpr::ClampMin { inner, .. }
         | QuantityExpr::Offset { inner, .. }
         | QuantityExpr::Multiply { inner, .. } => rewrite_variable_x_to_cost_x_paid(inner),
-        QuantityExpr::Sum { exprs } => {
+        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => {
             for inner in exprs {
                 rewrite_variable_x_to_cost_x_paid(inner);
             }

@@ -79,6 +79,8 @@ pub enum BendingType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PlayerActionKind {
+    /// A player accepted a resolution-time optional effect.
+    AcceptedOptionalEffect,
     SearchedLibrary,
     Scry,
     Surveil,
@@ -564,6 +566,12 @@ pub enum GameEvent {
     },
     /// CR 701.60a: A creature was suspected.
     CreatureSuspected {
+        object_id: ObjectId,
+    },
+    /// CR 701.60a: A creature is no longer suspected — the un-designation
+    /// transition. Emitted only when the toggle actually flips (idempotent
+    /// resolver). Mirrors `BecameUnprepared`.
+    CreatureNoLongerSuspected {
         object_id: ObjectId,
     },
     /// CR 701.35a: A permanent was detained — until the detaining player's next

@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { GameObject, GameState } from "../../../adapter/types.ts";
@@ -118,14 +118,20 @@ function makeState(): GameState {
   } as unknown as GameState;
 }
 
-function renderPermanent(validTargetObjectIds = new Set<number>()) {
+function renderPermanent(
+  validTargetObjectIds = new Set<number>(),
+  selectableSacrificeObjectIds = new Set<number>(),
+  boardChoiceObjectIds = new Set<number>(),
+) {
   return render(
     <BoardInteractionContext.Provider
       value={{
         activatableObjectIds: new Set(),
+        boardChoiceObjectIds,
         committedAttackerIds: new Set(),
         incomingAttackerCounts: new Map(),
         manaTappableObjectIds: new Set(),
+        selectableSacrificeObjectIds,
         selectableManaCostCreatureIds: new Set(),
         undoableTapObjectIds: new Set(),
         validAttackerIds: new Set(),
@@ -209,6 +215,92 @@ describe("PermanentCard attachments", () => {
     expect(host.style.zIndex).toBe("80");
   });
 
+  it("collapses multiple direct attachments until the host is hovered", () => {
+    const secondEquipment = makeObject({
+      id: 4,
+      card_id: 400,
+      attached_to: { type: "Object", data: 1 },
+      name: "Second Equipment",
+      power: null,
+      toughness: null,
+      base_power: null,
+      base_toughness: null,
+      card_types: { supertypes: [], core_types: ["Artifact"], subtypes: ["Equipment"] },
+      color: [],
+      base_color: [],
+    });
+    const gameState = makeState();
+    gameState.objects[1].attachments = [2, 4];
+    gameState.objects[4] = secondEquipment;
+    gameState.battlefield = [1, 2, 3, 4];
+    useGameStore.setState({ gameState, waitingFor: gameState.waiting_for });
+
+    const { container } = renderPermanent();
+
+    expect(container.querySelector('[data-object-id="2"]')).not.toBeNull();
+    expect(container.querySelector('[data-object-id="4"]')).toBeNull();
+    expect(container.textContent).toContain("+1");
+
+    act(() => {
+      useUiStore.setState({ inspectedObjectId: 1 });
+    });
+    expect(container.querySelector('[data-object-id="4"]')).not.toBeNull();
+
+    act(() => {
+      useUiStore.setState({ inspectedObjectId: null });
+    });
+    fireEvent.mouseEnter(container.querySelector('[data-object-id="1"]') as HTMLElement);
+
+    expect(container.querySelector('[data-object-id="4"]')).not.toBeNull();
+  });
+
+  it("collapses multiple exiled cards hosted by one permanent until hover", () => {
+    const exiledOne = makeObject({
+      id: 10,
+      card_id: 1000,
+      zone: "Exile",
+      name: "Exiled One",
+      power: null,
+      toughness: null,
+      base_power: null,
+      base_toughness: null,
+    });
+    const exiledTwo = makeObject({
+      id: 11,
+      card_id: 1001,
+      zone: "Exile",
+      name: "Exiled Two",
+      power: null,
+      toughness: null,
+      base_power: null,
+      base_toughness: null,
+    });
+    const gameState = {
+      ...makeState(),
+      objects: {
+        ...makeState().objects,
+        10: exiledOne,
+        11: exiledTwo,
+      },
+      exile: [10, 11],
+      exile_links: [
+        { exiled_id: 10, source_id: 1, kind: "TrackedBySource" },
+        { exiled_id: 11, source_id: 1, kind: "TrackedBySource" },
+      ],
+    } as unknown as GameState;
+    useGameStore.setState({ gameState, waitingFor: gameState.waiting_for });
+
+    const { container, queryByLabelText } = renderPermanent();
+
+    expect(queryByLabelText("Exiled One")).not.toBeNull();
+    expect(queryByLabelText("Exiled Two")).toBeNull();
+    expect(container.textContent).toContain("+1");
+
+    fireEvent.mouseEnter(container.querySelector('[data-object-id="1"]') as HTMLElement);
+
+    expect(queryByLabelText("Exiled Two")).not.toBeNull();
+  });
+
   it("restores host preview when moving from an attachment back to its host", () => {
     const { container } = renderPermanent();
     const host = container.querySelector('[data-object-id="1"]') as HTMLElement;
@@ -235,6 +327,100 @@ describe("PermanentCard attachments", () => {
       type: "ChooseTarget",
       data: { target: { Object: 2 } },
     });
+  });
+
+  it("submits a single battlefield sacrifice choice from the board", () => {
+    const gameState = {
+      ...makeState(),
+      waiting_for: {
+        type: "EffectZoneChoice",
+        data: {
+          player: 0,
+          cards: [1],
+          count: 1,
+          source_id: 99,
+          effect_kind: "Sacrifice",
+          zone: "Battlefield",
+          destination: null,
+        },
+      },
+    } as unknown as GameState;
+    useGameStore.setState({
+      gameState,
+      waitingFor: gameState.waiting_for,
+    });
+    const { container } = renderPermanent(new Set(), new Set(), new Set([1]));
+    const permanent = container.querySelector('[data-object-id="1"]') as HTMLElement;
+
+    fireEvent.click(permanent);
+
+    expect(dispatchAction).toHaveBeenCalledWith({
+      type: "SelectCards",
+      data: { cards: [1] },
+    });
+  });
+
+  it("submits immediate board choices from the board", () => {
+    const gameState = {
+      ...makeState(),
+      waiting_for: {
+        type: "StationTarget",
+        data: {
+          player: 0,
+          spacecraft_id: 9,
+          eligible_creatures: [1],
+        },
+      },
+    } as unknown as GameState;
+    useGameStore.setState({
+      gameState,
+      waitingFor: gameState.waiting_for,
+    });
+    const { container } = renderPermanent(new Set(), new Set(), new Set([1]));
+    const permanent = container.querySelector('[data-object-id="1"]') as HTMLElement;
+
+    fireEvent.click(permanent);
+
+    expect(dispatchAction).toHaveBeenCalledWith({
+      type: "ActivateStation",
+      data: { spacecraft_id: 9, creature_id: 1 },
+    });
+  });
+
+  it("counts only active board-choice selections when enforcing count limits", () => {
+    const gameState = {
+      ...makeState(),
+      waiting_for: {
+        type: "PayCost",
+        data: {
+          player: 0,
+          kind: { type: "ReturnToHand" },
+          choices: [1],
+          count: 1,
+          min_count: 1,
+          resume: {
+            type: "Spell",
+            Spell: {
+              object_id: 9,
+              card_id: 90,
+              ability: { targets: [] },
+              cost: { type: "NoCost" },
+            },
+          },
+        },
+      },
+    } as unknown as GameState;
+    useGameStore.setState({
+      gameState,
+      waitingFor: gameState.waiting_for,
+    });
+    useUiStore.setState({ selectedCardIds: [99] });
+    const { container } = renderPermanent(new Set(), new Set(), new Set([1]));
+    const permanent = container.querySelector('[data-object-id="1"]') as HTMLElement;
+
+    fireEvent.click(permanent);
+
+    expect(useUiStore.getState().selectedCardIds).toEqual([99, 1]);
   });
 
   it("renders action affordance highlights above the card face", () => {
@@ -329,9 +515,11 @@ describe("PermanentCard attachments", () => {
       <BoardInteractionContext.Provider
         value={{
           activatableObjectIds: new Set([39]),
+          boardChoiceObjectIds: new Set(),
           committedAttackerIds: new Set(),
           incomingAttackerCounts: new Map(),
           manaTappableObjectIds: new Set([39]),
+          selectableSacrificeObjectIds: new Set(),
           selectableManaCostCreatureIds: new Set(),
           undoableTapObjectIds: new Set(),
           validAttackerIds: new Set(),
@@ -428,9 +616,11 @@ describe("PermanentCard attachments", () => {
       <BoardInteractionContext.Provider
         value={{
           activatableObjectIds: new Set(),
+          boardChoiceObjectIds: new Set(),
           committedAttackerIds: new Set(),
           incomingAttackerCounts: new Map(),
           manaTappableObjectIds: new Set([40]),
+          selectableSacrificeObjectIds: new Set(),
           selectableManaCostCreatureIds: new Set(),
           undoableTapObjectIds: new Set(),
           validAttackerIds: new Set(),
@@ -487,9 +677,11 @@ describe("PermanentCard attachments", () => {
       <BoardInteractionContext.Provider
         value={{
           activatableObjectIds: new Set(),
+          boardChoiceObjectIds: new Set(),
           committedAttackerIds: new Set(),
           incomingAttackerCounts: new Map(),
           manaTappableObjectIds: new Set([41]),
+          selectableSacrificeObjectIds: new Set(),
           selectableManaCostCreatureIds: new Set(),
           undoableTapObjectIds: new Set(),
           validAttackerIds: new Set(),
@@ -536,9 +728,11 @@ describe("PermanentCard attachments", () => {
       <BoardInteractionContext.Provider
         value={{
           activatableObjectIds: new Set(),
+          boardChoiceObjectIds: new Set(),
           committedAttackerIds: new Set(),
           incomingAttackerCounts: new Map(),
           manaTappableObjectIds: new Set(),
+          selectableSacrificeObjectIds: new Set(),
           selectableManaCostCreatureIds: new Set(),
           undoableTapObjectIds: new Set(),
           validAttackerIds: new Set(),
@@ -586,9 +780,11 @@ describe("PermanentCard attachments", () => {
       <BoardInteractionContext.Provider
         value={{
           activatableObjectIds: new Set(),
+          boardChoiceObjectIds: new Set(),
           committedAttackerIds: new Set(),
           incomingAttackerCounts: new Map(),
           manaTappableObjectIds: new Set(),
+          selectableSacrificeObjectIds: new Set(),
           selectableManaCostCreatureIds: new Set(),
           undoableTapObjectIds: new Set(),
           validAttackerIds: new Set(),
@@ -645,9 +841,11 @@ describe("PermanentCard attachments", () => {
       <BoardInteractionContext.Provider
         value={{
           activatableObjectIds: new Set([80]),
+          boardChoiceObjectIds: new Set(),
           committedAttackerIds: new Set(),
           incomingAttackerCounts: new Map(),
           manaTappableObjectIds: new Set(),
+          selectableSacrificeObjectIds: new Set(),
           selectableManaCostCreatureIds: new Set(),
           undoableTapObjectIds: new Set(),
           validAttackerIds: new Set(),
@@ -706,9 +904,11 @@ describe("PermanentCard attachments", () => {
       <BoardInteractionContext.Provider
         value={{
           activatableObjectIds: new Set([81]),
+          boardChoiceObjectIds: new Set(),
           committedAttackerIds: new Set(),
           incomingAttackerCounts: new Map(),
           manaTappableObjectIds: new Set(),
+          selectableSacrificeObjectIds: new Set(),
           selectableManaCostCreatureIds: new Set(),
           undoableTapObjectIds: new Set(),
           validAttackerIds: new Set(),

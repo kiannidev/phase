@@ -26,6 +26,7 @@ use crate::types::proposed_event::{
 use crate::types::replacements::ReplacementEvent;
 use crate::types::zones::Zone;
 
+use super::ability_utils::build_resolved_from_def;
 use super::game_object::GameObject;
 
 // CR 122.1c shield-counter effects are intrinsic to counters, not stored
@@ -737,6 +738,7 @@ fn pay_replacement_may_cost(
                         && matches!(
                             state.waiting_for,
                             WaitingFor::EffectZoneChoice {
+                                library_position: None,
                                 is_cost_payment: true,
                                 ..
                             }
@@ -1245,6 +1247,21 @@ fn damage_done_applier(
     ApplyResult::Modified(event)
 }
 
+/// CR 614.5: Mark a one-shot replacement as consumed after it successfully applies.
+fn mark_replacement_consumed(state: &mut GameState, rid: ReplacementId) {
+    let repl = if rid.source == ObjectId(0) {
+        state.pending_damage_replacements.get_mut(rid.index)
+    } else {
+        state
+            .objects
+            .get_mut(&rid.source)
+            .and_then(|obj| obj.replacement_definitions.get_mut(rid.index))
+    };
+    if let Some(repl) = repl {
+        repl.is_consumed = true;
+    }
+}
+
 /// Consume or update a prevention shield on either an object or the game-state registry.
 /// If `new_amount` is `None`, marks the shield as consumed.
 /// If `new_amount` is `Some(amount)`, updates the remaining shield capacity.
@@ -1575,7 +1592,14 @@ fn draw_replacement_count(
 
     match &*execute.effect {
         Effect::Draw { count: qty, .. } if execute.sub_ability.is_none() => {
-            let resolved = resolve_event_replacement_quantity(qty, *count)?;
+            // CR 121.2 + CR 614.11a: "draw N cards instead" replacements
+            // (Teferi's Ageless Insight: Fixed(2)) apply to each card draw
+            // in the draw sequence — Brainsurge drawing four becomes eight,
+            // not two.
+            let resolved = match qty {
+                QuantityExpr::Fixed { value } => value.saturating_mul(*count as i32),
+                _ => resolve_event_replacement_quantity(qty, *count)?,
+            };
             Some(resolved.max(0) as u32)
         }
         _ => None,
@@ -1839,6 +1863,15 @@ fn resolve_event_replacement_quantity(expr: &QuantityExpr, event_count: u32) -> 
                 total += resolve_event_replacement_quantity(inner, event_count)?;
             }
             Some(total)
+        }
+        // CR 107.1: the maximum of the computed operand values; empty → 0.
+        QuantityExpr::Max { exprs } => {
+            let mut best: Option<i32> = None;
+            for inner in exprs {
+                let value = resolve_event_replacement_quantity(inner, event_count)?;
+                best = Some(best.map_or(value, |b| b.max(value)));
+            }
+            Some(best.unwrap_or(0))
         }
         // CR 107.1c + CR 608.2d: For replacement quantity resolution, treat
         // `UpTo` transparently as its upper bound — the replacement-effect
@@ -2184,7 +2217,14 @@ fn create_token_applier(
     events: &mut Vec<GameEvent>,
 ) -> ApplyResult {
     use crate::types::ability::QuantityModification;
-    let (modification, additional_spec, ensure_specs, owner_redirect, source_controller) = state
+    let (
+        modification,
+        additional_spec,
+        ensure_specs,
+        owner_redirect,
+        substitute_effect,
+        source_controller,
+    ) = state
         .objects
         .get(&rid.source)
         .and_then(|obj| {
@@ -2198,10 +2238,17 @@ fn create_token_applier(
                 def.additional_token_spec.clone(),
                 def.ensure_token_specs.clone(),
                 def.token_owner_redirect.clone(),
+                // CR 614.1a + CR 111.1: Full token-substitution payload
+                // (Divine Visitation) — carried as an Effect::Token in the
+                // existing `execute` field (Approach A, no new field).
+                def.execute
+                    .as_deref()
+                    .map(|ability| (*ability.effect).clone())
+                    .filter(|effect| matches!(effect, Effect::Token { .. })),
                 controller,
             )
         })
-        .unwrap_or((None, None, None, None, PlayerId(0)));
+        .unwrap_or((None, None, None, None, None, PlayerId(0)));
 
     if let ProposedEvent::CreateToken {
         owner,
@@ -2254,6 +2301,27 @@ fn create_token_applier(
             Some(QuantityModification::Prevent) => return ApplyResult::Prevented,
             None => count,
         };
+
+        // CR 614.1a + CR 111.1: Full token substitution (Divine Visitation —
+        // "that many 4/4 white Angel creature tokens … are created instead").
+        // The `execute` Effect::Token describes the substitute token; resolve it
+        // to a TokenSpec and swap it for the proposed spec, keeping the event's
+        // `new_count` ("that many" — same count) and `owner`. The creature-type
+        // gate (`TokenCoreTypeMatches`) already passed in
+        // `find_applicable_replacements`, so non-creature tokens never reach here.
+        if let Some(token_effect) = substitute_effect {
+            let ability = crate::types::ability::ResolvedAbility::new(
+                token_effect,
+                Vec::new(),
+                rid.source,
+                source_controller,
+            );
+            if let Some((substitute_spec, _, _, _)) =
+                crate::game::effects::token::resolve_token_spec(state, &ability)
+            {
+                spec = Box::new(substitute_spec);
+            }
+        }
 
         // CR 614.1a + CR 111.1: "those tokens plus ..." — emit an additional
         // CreateToken for the appended spec class (Chatterfang Squirrels,
@@ -2627,6 +2695,53 @@ fn untap_applier(
     ApplyResult::Prevented
 }
 
+// --- 13. TurnFaceUp ---
+
+fn turn_face_up_matcher(event: &ProposedEvent, _source: ObjectId, _state: &GameState) -> bool {
+    matches!(event, ProposedEvent::TurnFaceUp { .. })
+}
+
+// CR 614.1e + CR 708.11: "As ~ is turned face up, [effect]"
+// applies its alternative action AS the permanent is turned face up. Unlike a
+// prevention the turn-up still happens, so the applier performs the replacement's
+// actions (bound to the permanent being turned up) and returns the event
+// unchanged. The effect's `it`/SelfRef anaphor binds to that permanent.
+fn turn_face_up_applier(
+    event: ProposedEvent,
+    rid: ReplacementId,
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> ApplyResult {
+    let ProposedEvent::TurnFaceUp { object_id, applied } = event else {
+        return ApplyResult::Modified(event);
+    };
+
+    let Some(source) = state.objects.get(&rid.source) else {
+        return ApplyResult::Modified(ProposedEvent::TurnFaceUp { object_id, applied });
+    };
+    let controller = source.controller;
+    let execute = source
+        .replacement_definitions
+        .get(rid.index)
+        .and_then(|def| def.execute.clone());
+
+    if let Some(execute) = execute {
+        // Bind only the anaphoric self-reference: the execute is resolved with the
+        // turned-up permanent as its `source_id`, so "it"/`SelfRef` references the
+        // permanent ("put five +1/+1 counters on it"). The permanent is NOT stuffed
+        // into ordinary target slots — effects with their own host/target (e.g.
+        // Gift of Doom's `Effect::Attach` "attach it to a creature") must resolve
+        // that target/host themselves rather than consuming the permanent as the
+        // host. `resolve_ability_chain` walks the typed `sub_ability` chain itself,
+        // so the root execute is resolved exactly once — iterating the chain here
+        // too would run each sub-ability a second time.
+        let ability = build_resolved_from_def(execute.as_ref(), object_id, controller);
+        let _ = crate::game::effects::resolve_ability_chain(state, &ability, events, 1);
+    }
+
+    ApplyResult::Modified(ProposedEvent::TurnFaceUp { object_id, applied })
+}
+
 // --- 14. Counter (spell countering) ---
 
 fn counter_matcher(event: &ProposedEvent, _source: ObjectId, _state: &GameState) -> bool {
@@ -2700,10 +2815,51 @@ fn dealt_damage_matcher(event: &ProposedEvent, source: ObjectId, state: &GameSta
 
 fn dealt_damage_applier(
     event: ProposedEvent,
-    _rid: ReplacementId,
-    _state: &mut GameState,
+    rid: ReplacementId,
+    state: &mut GameState,
     _events: &mut Vec<GameEvent>,
 ) -> ApplyResult {
+    // CR 614.1a + CR 120.6 + CR 510.2: Wolverine, Fierce Fighter — "instead
+    // that damage is dealt, but all other damage already dealt to him is
+    // healed." The new damage instance is delivered UNCHANGED (we return
+    // `Modified(event)` verbatim, NO prevention); we only clear the receiver's
+    // PRIOR marked damage here, when the replacement carries an
+    // `Effect::RemoveAllDamage` in `execute`.
+    //
+    // COMBAT-BATCH INVARIANT (load-bearing — do not break without updating the
+    // gang-block regression test): this applier runs in **Phase B**
+    // (`replace_combat_damage_batch`, combat_damage.rs:869-871) for EVERY damage
+    // event in the combat step, BEFORE any Phase-C delivery. The SOLE
+    // `damage_marked` increment lives in `apply_damage_after_replacement`
+    // (deal_damage.rs:446), reached only in **Phase C**. Therefore at the
+    // instant this heal runs, `damage_marked` holds exactly the PRE-BATCH value
+    // and ZERO same-batch combat instances are marked yet. Clearing it here
+    // heals only prior damage and preserves all simultaneous same-batch
+    // instances (CR 510.2). A future refactor that interleaves Phase-C delivery
+    // into the Phase-B loop would silently over-heal — the combat-batch test
+    // guards against exactly that.
+    let heals = matches!(
+        &event,
+        ProposedEvent::Damage {
+            target: crate::types::ability::TargetRef::Object(oid),
+            ..
+        } if *oid == rid.source
+    ) && state
+        .objects
+        .get(&rid.source)
+        .and_then(|obj| obj.replacement_definitions.get(rid.index))
+        .and_then(|def| def.execute.as_deref())
+        .is_some_and(|execute| {
+            execute.sub_ability.is_none()
+                && matches!(*execute.effect, Effect::RemoveAllDamage { .. })
+        });
+
+    if heals {
+        if let Some(obj) = state.objects.get_mut(&rid.source) {
+            crate::game::effects::remove_all_damage::heal_marked_damage(obj);
+        }
+    }
+
     ApplyResult::Modified(event)
 }
 
@@ -2770,21 +2926,6 @@ fn pay_life_matcher(event: &ProposedEvent, _source: ObjectId, _state: &GameState
 }
 
 fn pay_life_applier(
-    event: ProposedEvent,
-    _rid: ReplacementId,
-    _state: &mut GameState,
-    _events: &mut Vec<GameEvent>,
-) -> ApplyResult {
-    ApplyResult::Modified(event)
-}
-
-// --- Placeholder handlers (no ProposedEvent variant yet) ---
-
-fn placeholder_matcher(_event: &ProposedEvent, _source: ObjectId, _state: &GameState) -> bool {
-    false
-}
-
-fn placeholder_applier(
     event: ProposedEvent,
     _rid: ReplacementId,
     _state: &mut GameState,
@@ -3019,11 +3160,13 @@ pub fn build_replacement_registry() -> IndexMap<ReplacementEvent, ReplacementHan
             applier: produce_mana_applier,
         },
     );
-    let placeholder = || ReplacementHandlerEntry {
-        matcher: placeholder_matcher,
-        applier: placeholder_applier,
-    };
-    registry.insert(ReplacementEvent::TurnFaceUp, placeholder());
+    registry.insert(
+        ReplacementEvent::TurnFaceUp,
+        ReplacementHandlerEntry {
+            matcher: turn_face_up_matcher,
+            applier: turn_face_up_applier,
+        },
+    );
 
     // CR 614.1b + CR 614.10: BeginTurn skip replacements (Stranglehold, etc.)
     registry.insert(
@@ -3568,6 +3711,16 @@ fn evaluate_replacement_condition(
                     .iter()
                     .any(|got| got.eq_ignore_ascii_case(wanted))
             }),
+            _ => false,
+        },
+        // CR 614.1a + CR 111.1: "if one or more <core type> tokens would be
+        // created" — applies iff the proposed CreateToken event's spec core
+        // types overlap any listed core type (Divine Visitation gates on
+        // Creature). Non-CreateToken events never match this condition.
+        ReplacementCondition::TokenCoreTypeMatches { core_types } => match event {
+            ProposedEvent::CreateToken { spec, .. } => core_types
+                .iter()
+                .any(|wanted| spec.characteristics.core_types.contains(wanted)),
             _ => false,
         },
         // CR 121.1 + CR 504.1 + CR 614.6: "except the first one you draw in
@@ -4810,7 +4963,7 @@ fn apply_single_replacement(
     // the same resolution step, right after the ZoneChange completes. Without this,
     // the chooser would never be prompted. Optional replacements set
     // `post_replacement_continuation` in `continue_replacement` when the player accepts.
-    let (event_key, modifiers, mandatory_post_effect) = match repl_def_ref {
+    let (event_key, modifiers, mandatory_post_effect, consume_on_apply) = match repl_def_ref {
         Some(repl_def) => {
             let ability = match branch {
                 ReplacementBranch::Execute => repl_def.execute.as_deref(),
@@ -4919,7 +5072,12 @@ fn apply_single_replacement(
             // imperative `Effect::ChangeZone.enters_under` slot. Surface it as an
             // event modifier so it is written onto the `ZoneChange` below.
             modifiers.controller_override = repl_def.enters_under.clone();
-            (repl_def.event.clone(), modifiers, post_effect)
+            (
+                repl_def.event.clone(),
+                modifiers,
+                post_effect,
+                repl_def.consume_on_apply,
+            )
         }
         None => return Ok(proposed),
     };
@@ -4984,6 +5142,9 @@ fn apply_single_replacement(
                         _ => {}
                     }
                 }
+                if consume_on_apply {
+                    mark_replacement_consumed(state, rid);
+                }
                 // CR 614.12a: Stash the mandatory execute ability as a post-replacement
                 // effect when it has work beyond the event modifiers (e.g., a Choose
                 // prompt for Siege protector / Tribute opponent selection). Runs after
@@ -5003,6 +5164,9 @@ fn apply_single_replacement(
                 return Ok(new_event);
             }
             ApplyResult::Prevented => {
+                if consume_on_apply {
+                    mark_replacement_consumed(state, rid);
+                }
                 // CR 615.5: A prevention effect's additional effect (e.g.
                 // Phyrexian Hydra's "Put a -1/-1 counter on ~ for each 1 damage
                 // prevented this way") is stashed as a post-replacement effect
@@ -5174,6 +5338,17 @@ fn damage_commute_class(modification: &DamageModification) -> CommuteClass {
     }
 }
 
+/// CR 106.12b + CR 616.1: Mana-production modifiers on the same `ProduceMana`
+/// event. `Multiply` modifiers commute (×2 then ×3 == ×3 then ×2), so Mana
+/// Reflection + Nyxbloom Ancient auto-apply without a degenerate ordering prompt.
+fn mana_commute_class(modification: &crate::types::ability::ManaModification) -> CommuteClass {
+    use crate::types::ability::ManaModification;
+    match modification {
+        ManaModification::Multiply { .. } => CommuteClass::Multiplicative,
+        ManaModification::ReplaceWith { .. } => CommuteClass::NonCommuting,
+    }
+}
+
 /// CR 616.1 classification of a single replacement candidate.
 enum CandidateMateriality {
     /// An order-sensitive shape regardless of the other candidates (zone
@@ -5276,10 +5451,10 @@ fn candidate_materiality(
                 commute: quantity_commute_class(modification),
             };
         }
-        if repl_def.mana_modification.is_some() {
+        if let Some(modification) = repl_def.mana_modification.as_ref() {
             return CandidateMateriality::Writes {
                 field: EventField::ManaType,
-                commute: CommuteClass::NonCommuting,
+                commute: mana_commute_class(modification),
             };
         }
         if let Some(modification) = repl_def.damage_modification.as_ref() {
@@ -5791,12 +5966,13 @@ mod tests {
     use crate::game::effects::token::apply_create_token_after_replacement;
     use crate::game::game_object::{AttachTarget, GameObject};
     use crate::types::ability::{
-        AbilityCost, AbilityDefinition, AbilityKind, ChosenAttribute, Effect, FilterProp,
-        OriginConstraint, QuantityExpr, QuantityModification, QuantityRef, ReplacementDefinition,
-        ReplacementMode, ReplacementPlayerScope, TargetFilter, TargetRef, TypeFilter, TypedFilter,
+        AbilityCost, AbilityDefinition, AbilityKind, CastManaObjectScope, CastManaSpentMetric,
+        ChosenAttribute, ControllerRef, Effect, FilterProp, OriginConstraint, QuantityExpr,
+        QuantityModification, QuantityRef, ReplacementDefinition, ReplacementMode,
+        ReplacementPlayerScope, TargetFilter, TargetRef, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::CoreType;
-    use crate::types::game_state::DamageRecord;
+    use crate::types::game_state::{DamageRecord, ManaSpentSourceSnapshot};
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::keywords::Keyword;
     use crate::types::player::PlayerId;
@@ -8931,6 +9107,26 @@ mod tests {
         ReplacementDefinition::new(ReplacementEvent::DamageDone).damage_modification(modification)
     }
 
+    #[test]
+    fn consume_on_apply_prevention_is_consumed_when_damage_fully_prevented() {
+        // CR 614.5 + CR 615.1a: A one-shot replacement that fully prevents damage
+        // still successfully applied, so the live replacement must be consumed.
+        let mut repl = ReplacementDefinition::new(ReplacementEvent::DamageDone)
+            .prevention_shield(PreventionAmount::All);
+        repl.consume_on_apply = true;
+        let mut state = test_state_with_object(ObjectId(10), Zone::Battlefield, vec![repl]);
+        let mut events = Vec::new();
+
+        let result = replace_event(&mut state, damage_event(3), &mut events);
+
+        assert!(matches!(result, ReplacementResult::Prevented));
+        let obj = state.objects.get(&ObjectId(10)).unwrap();
+        assert!(
+            obj.replacement_definitions[0].is_consumed,
+            "consume_on_apply replacement should be consumed after full prevention"
+        );
+    }
+
     fn test_state_with_damage_repl(
         obj_id: ObjectId,
         controller: PlayerId,
@@ -10670,6 +10866,94 @@ mod tests {
                     enter_with_counters,
                     vec![(CounterType::Plus1Plus1, 3u32)],
                     "expected 3 P1P1 counters (3 distinct colors spent)"
+                );
+            }
+            other => panic!("expected Execute(ZoneChange), got {:?}", other),
+        }
+    }
+
+    /// CR 614.1c + CR 601.2h: Coin of Mastery — artifact-source mana spent to
+    /// cast the entering creature resolves via payment-time source snapshots on
+    /// the spell object, not the static replacement source.
+    #[test]
+    fn artifact_mana_spent_on_self_resolves_against_entering_object() {
+        let coin_id = ObjectId(10);
+        let creature_id = ObjectId(20);
+        let treasure_id = ObjectId(30);
+
+        let etb_counter_ability = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::PutCounter {
+                target: TargetFilter::SelfRef,
+                counter_type: CounterType::Plus1Plus1,
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::ManaSpentToCast {
+                        scope: CastManaObjectScope::SelfObject,
+                        metric: CastManaSpentMetric::FromSource {
+                            source_filter: TargetFilter::Typed(TypedFilter::new(
+                                TypeFilter::Artifact,
+                            )),
+                        },
+                    },
+                },
+            },
+        );
+
+        let creature_filter =
+            TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You));
+
+        let repl = ReplacementDefinition::new(ReplacementEvent::ChangeZone)
+            .execute(etb_counter_ability)
+            .valid_card(creature_filter)
+            .destination_zone(Zone::Battlefield);
+
+        let mut state = test_state_with_object(coin_id, Zone::Battlefield, vec![repl]);
+
+        let mut treasure = GameObject::new(
+            treasure_id,
+            CardId(98),
+            PlayerId(0),
+            "Treasure".to_string(),
+            Zone::Battlefield,
+        );
+        treasure.card_types.core_types.push(CoreType::Artifact);
+        treasure.card_types.subtypes.push("Treasure".to_string());
+        state.objects.insert(treasure_id, treasure);
+
+        let mut spell = GameObject::new(
+            creature_id,
+            CardId(99),
+            PlayerId(0),
+            "Creature".to_string(),
+            Zone::Stack,
+        );
+        spell.card_types.core_types.push(CoreType::Creature);
+        spell.mana_spent_source_snapshots = vec![
+            ManaSpentSourceSnapshot {
+                source_id: treasure_id,
+                lki: state.objects[&treasure_id].snapshot_for_mana_spent(),
+            },
+            ManaSpentSourceSnapshot {
+                source_id: treasure_id,
+                lki: state.objects[&treasure_id].snapshot_for_mana_spent(),
+            },
+        ];
+        state.objects.insert(creature_id, spell);
+
+        let mut events = Vec::new();
+        let proposed =
+            ProposedEvent::zone_change(creature_id, Zone::Stack, Zone::Battlefield, None);
+
+        let result = replace_event(&mut state, proposed, &mut events);
+        match result {
+            ReplacementResult::Execute(ProposedEvent::ZoneChange {
+                enter_with_counters,
+                ..
+            }) => {
+                assert_eq!(
+                    enter_with_counters,
+                    vec![(CounterType::Plus1Plus1, 2u32)],
+                    "expected 2 P1P1 counters (2 artifact-source mana units spent)"
                 );
             }
             other => panic!("expected Execute(ZoneChange), got {:?}", other),

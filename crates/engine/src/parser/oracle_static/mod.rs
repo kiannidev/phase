@@ -56,11 +56,11 @@ mod prelude {
     pub(super) use crate::types::mana::{ManaColor, ManaCost, ManaType};
     pub(super) use crate::types::phase::Phase;
     pub(super) use crate::types::statics::{
-        ActivationExemption, AdditionalCostTaxAction, BlockExceptionKind, CastFreeOrigin,
-        CastFrequency, CastingProhibitionCondition, CombatAloneAction, CombatAloneRequirement,
-        CostModifyMode, CostPaymentProhibition, CrewAction, CrewContributionKind, ExileCardPool,
-        ExileCastCost, ExileCastTiming, HandSizeModification, ProhibitionScope, StaticMode,
-        TriggerCause,
+        ActivationExemption, AdditionalCostTaxAction, AttackDefenderScope, BlockExceptionKind,
+        CastFreeOrigin, CastFrequency, CastingProhibitionCondition, CombatAloneAction,
+        CombatAloneRequirement, CostModifyMode, CostPaymentProhibition, CrewAction,
+        CrewContributionKind, ExileCardPool, ExileCastCost, ExileCastTiming, HandSizeModification,
+        ProhibitionScope, StaticMode, TriggerCause,
     };
     pub(super) use crate::types::zones::Zone;
 }
@@ -142,6 +142,7 @@ pub(crate) use keyword_grant::{
 };
 pub(crate) use mana_transform::try_parse_retain_unspent_mana_static;
 pub(crate) use restriction::parse_cant_be_activated_exemption_in_text;
+pub(crate) use shared::parse_dynamic_x_clause;
 pub use shared::parse_static_line_multi;
 pub(crate) use shared::parse_subtype_or_list_insensitive_prefix;
 pub(crate) use shared::GraveyardGrantedKeywordKind;

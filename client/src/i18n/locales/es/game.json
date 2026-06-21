@@ -1,6 +1,8 @@
 {
   "resolutionProgress": {
-    "label": "Resolviendo {{resolved}} / {{total}}"
+    "label": "Resolviendo {{resolved}} / {{total}}",
+    "collapse": "Contraer progreso de resolución",
+    "expand": "Expandir progreso de resolución"
   },
   "card": {
     "faceDownName": "Carta boca abajo",
@@ -137,7 +139,9 @@
       "incoming": "in",
       "mana": "mana",
       "selected": "sel",
-      "target": "target"
+      "target": "target",
+      "choice": "pick",
+      "sacrifice": "sac"
     },
     "badgeTooltips": {
       "activate": "Hidden objects with activated abilities available.",
@@ -146,7 +150,9 @@
       "incoming": "Attacks currently aimed at hidden objects in this drawer.",
       "mana": "Hidden objects that can be tapped for mana.",
       "selected": "Hidden objects currently selected for the active choice.",
-      "target": "Hidden objects that are legal targets."
+      "target": "Hidden objects that are legal targets.",
+      "choice": "Hidden objects eligible for the active board choice.",
+      "sacrifice": "Hidden objects that can be sacrificed."
     }
   },
   "permanent": {
@@ -166,7 +172,21 @@
     "copy": "Copia",
     "copyTooltip": "Ficha copia de una carta real",
     "ringBearer": "Anillo",
-    "ringBearerTooltip": "Portador del Anillo"
+    "ringBearerTooltip": "Portador del Anillo",
+    "hiddenAttachments": "+{{count}} more attached",
+    "hiddenExileCards": "+{{count}} more exiled",
+    "sacrifice": "Sacrifice",
+    "boardChoiceBadges": {
+      "sacrifice": "Sac",
+      "return": "Return",
+      "exile": "Exile",
+      "tap": "Tap",
+      "crew": "Crew",
+      "saddle": "Saddle",
+      "station": "Station",
+      "blight": "-1/-1",
+      "ringBearer": "Ring"
+    }
   },
   "player": {
     "opponent": "Op {{seat}}",
@@ -192,6 +212,7 @@
     "allTo": "Todas → <name>{{label}}</name>",
     "creatureFallback": "Criatura n.º {{id}}",
     "planeswalkerFallback": "Planeswalker n.º {{id}}",
+    "objectFallback": "Object #{{id}}",
     "you": "Tú",
     "ally": "Aliado",
     "restoreDialog": "Restaurar diálogo",
@@ -500,6 +521,7 @@
     "tapUntappedCreatures_other": "Gira {{count}} criaturas sin girar",
     "chooseTargetOf": "Elige el objetivo {{current}} de {{total}}",
     "chooseTarget": "Elige un objetivo",
+    "triggerDamageAmount": "This trigger: {{amount}} damage",
     "noLegalTargets": "No hay objetivos legales disponibles",
     "modeContext": "{{mode}} — {{prompt}}",
     "upToOne": "hasta un(a) {{target}}",
@@ -515,7 +537,15 @@
     "keepCurrentTargets": "Conservar objetivos actuales",
     "skip": "Omitir",
     "chooseNewTarget": "Elige el nuevo objetivo del hechizo",
-    "chooseNewTargetForSpell": "Elige un nuevo objetivo para {{spell}}"
+    "chooseNewTargetForSpell": "Elige un nuevo objetivo para {{spell}}",
+    "sacrificeExact_one": "Sacrifice {{count}} permanent",
+    "sacrificeExact_other": "Sacrifice {{count}} permanents",
+    "sacrificeUpTo_one": "Sacrifice up to {{count}} permanent",
+    "sacrificeUpTo_other": "Sacrifice up to {{count}} permanents",
+    "sacrificeRange_one": "Sacrifice {{min}}-{{count}} permanent",
+    "sacrificeRange_other": "Sacrifice {{min}}-{{count}} permanents",
+    "confirmSacrifice": "Sacrifice ({{selected}}/{{count}})",
+    "skipSacrifice": "Skip Sacrifice"
   },
   "log": {
     "title": "Registro de la partida",
@@ -1272,6 +1302,17 @@
     "red": "Rojo",
     "green": "Verde"
   },
+  "roomDoor": {
+    "title": "Elige una puerta",
+    "subtitle": "Elige sobre qué puerta de la Sala actuar",
+    "confirm": "Confirmar",
+    "option": "{{op}} {{door}}",
+    "unlock": "Abrir",
+    "lock": "Cerrar",
+    "lockOrUnlock": "Abrir o cerrar",
+    "left": "puerta izquierda",
+    "right": "puerta derecha"
+  },
   "dialogShell": {
     "eyebrow": "Elección de la partida",
     "restoreDialog": "Restaurar diálogo",
@@ -1489,6 +1530,9 @@
     "connectionBody": "phase.rs perdió su enlace con el motor de la partida — lo más habitual es que lo cause una actualización en segundo plano activándose a mitad de partida. Tu último turno guardado se conserva; recarga para restaurar la partida.",
     "diagnostic": "diagnóstico: {{reason}}",
     "showDetails": "Mostrar detalles",
+    "exportGameState": "Exportar estado de la partida",
+    "exported": "Exportado",
+    "exportFailed": "Error al exportar",
     "copyDiagnostic": "Copiar diagnóstico",
     "copied": "¡Copiado!",
     "reportOnGithub": "Informar en GitHub",
@@ -1737,5 +1781,34 @@
     "banner": "Spectating — read only",
     "leave": "Leave",
     "watchingWith": "Also watching: {{names}}"
+  },
+  "boardChoice": {
+    "actions": {
+      "sacrifice": "Sacrifice",
+      "return": "Return",
+      "exile": "Exile",
+      "tap": "Tap",
+      "crew": "Crew",
+      "saddle": "Saddle",
+      "station": "Station",
+      "blight": "Blight",
+      "ringBearer": "Choose"
+    },
+    "prompt": {
+      "single": "{{action}} a permanent",
+      "exactCount_one": "{{action}} {{count}} permanent",
+      "exactCount_other": "{{action}} {{count}} permanents",
+      "rangeCount_one": "{{action}} {{min}}-{{count}} permanent",
+      "rangeCount_other": "{{action}} {{min}}-{{count}} permanents",
+      "upToCount_one": "{{action}} up to {{count}} permanent",
+      "upToCount_other": "{{action}} up to {{count}} permanents",
+      "totalPower": "{{action}}: power {{selected}} / {{required}}"
+    },
+    "confirm": "Confirm",
+    "confirmCount": "Confirm ({{selected}}/{{count}})",
+    "confirmPower": "Confirm ({{selected}}/{{required}} power)",
+    "skip": "Skip",
+    "groupCount": "{{selected}} / {{count}} selected",
+    "groupPower": "Power {{selected}} / {{required}}"
   }
 }

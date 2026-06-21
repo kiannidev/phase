@@ -23,6 +23,9 @@ fn scenario_prefers_opponent_target_over_self() {
     let mut runner = GameScenario::new().build();
     runner.state_mut().waiting_for = WaitingFor::TriggerTargetSelection {
         player: P0,
+        trigger_controller: None,
+        trigger_event: None,
+        trigger_events: Vec::new(),
         target_slots: vec![TargetSelectionSlot {
             legal_targets: vec![TargetRef::Player(P0), TargetRef::Player(P1)],
             optional: false,
@@ -55,6 +58,9 @@ fn scenario_skips_optional_target_with_no_legal_choices() {
     let mut runner = GameScenario::new().build();
     runner.state_mut().waiting_for = WaitingFor::TriggerTargetSelection {
         player: P0,
+        trigger_controller: None,
+        trigger_event: None,
+        trigger_events: Vec::new(),
         target_slots: vec![TargetSelectionSlot {
             legal_targets: Vec::new(),
             optional: true,
@@ -422,5 +428,75 @@ fn scenario_harvester_of_misery_cast_is_preferred_over_pass() {
                 | Some(engine::types::actions::GameAction::PassPriority)
         ),
         "AI should either cast Harvester or pass, got {action:?}"
+    );
+}
+
+/// Regression (issue #1189): when a human controls an AI seat via Mindslaver,
+/// the server AI loop must not attempt to act for that seat — it would apply
+/// actions as the wrong player and hang or crash.
+#[test]
+fn mindslaver_human_control_stops_ai_loop() {
+    let mut runner = {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.add_land_to_hand(P1, "Forest");
+        scenario.build()
+    };
+    {
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.turn_decision_controller = Some(P0);
+        engine::game::public_state::sync_waiting_for(state, &WaitingFor::Priority { player: P1 });
+    }
+
+    let ai_players = HashSet::from([P1]);
+    let ai_configs = HashMap::from([(P1, create_config(AiDifficulty::VeryHard, Platform::Native))]);
+    let mut ai_rng = SmallRng::seed_from_u64(1189);
+    let ai_session = phase_ai::session::AiSession::arc_from_game(runner.state());
+    let results = run_ai_actions(
+        runner.state_mut(),
+        &ai_players,
+        &ai_configs,
+        &mut ai_rng,
+        &ai_session,
+    );
+
+    assert!(
+        results.is_empty(),
+        "AI must not act when a human controls the AI seat (Mindslaver)"
+    );
+}
+
+/// Under Emrakul-style control the AI controller must still act for the human seat.
+#[test]
+fn emrakul_ai_control_runs_for_controlled_human() {
+    let mut runner = {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.add_land_to_hand(P0, "Forest");
+        scenario.build()
+    };
+    {
+        let state = runner.state_mut();
+        state.active_player = P0;
+        state.turn_decision_controller = Some(P1);
+        engine::game::public_state::sync_waiting_for(state, &WaitingFor::Priority { player: P0 });
+    }
+
+    let ai_players = HashSet::from([P1]);
+    let ai_configs = HashMap::from([(P1, create_config(AiDifficulty::VeryHard, Platform::Native))]);
+    let mut ai_rng = SmallRng::seed_from_u64(2012);
+    let ai_session = phase_ai::session::AiSession::arc_from_game(runner.state());
+    let results = run_ai_actions(
+        runner.state_mut(),
+        &ai_players,
+        &ai_configs,
+        &mut ai_rng,
+        &ai_session,
+    );
+
+    assert!(
+        !results.is_empty(),
+        "AI controller must act during the controlled human turn"
     );
 }

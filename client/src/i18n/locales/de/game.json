@@ -1,6 +1,8 @@
 {
   "resolutionProgress": {
-    "label": "Auflösen {{resolved}} / {{total}}"
+    "label": "Auflösen {{resolved}} / {{total}}",
+    "collapse": "Auflösungsfortschritt einklappen",
+    "expand": "Auflösungsfortschritt ausklappen"
   },
   "card": {
     "faceDownName": "Verdeckte Karte",
@@ -137,7 +139,9 @@
       "incoming": "in",
       "mana": "mana",
       "selected": "sel",
-      "target": "target"
+      "target": "target",
+      "choice": "pick",
+      "sacrifice": "sac"
     },
     "badgeTooltips": {
       "activate": "Hidden objects with activated abilities available.",
@@ -146,7 +150,9 @@
       "incoming": "Attacks currently aimed at hidden objects in this drawer.",
       "mana": "Hidden objects that can be tapped for mana.",
       "selected": "Hidden objects currently selected for the active choice.",
-      "target": "Hidden objects that are legal targets."
+      "target": "Hidden objects that are legal targets.",
+      "choice": "Hidden objects eligible for the active board choice.",
+      "sacrifice": "Hidden objects that can be sacrificed."
     }
   },
   "permanent": {
@@ -166,7 +172,21 @@
     "copy": "Kopie",
     "copyTooltip": "Spielstein-Kopie einer echten Karte",
     "ringBearer": "Ring",
-    "ringBearerTooltip": "Ringträger"
+    "ringBearerTooltip": "Ringträger",
+    "hiddenAttachments": "+{{count}} more attached",
+    "hiddenExileCards": "+{{count}} more exiled",
+    "sacrifice": "Sacrifice",
+    "boardChoiceBadges": {
+      "sacrifice": "Sac",
+      "return": "Return",
+      "exile": "Exile",
+      "tap": "Tap",
+      "crew": "Crew",
+      "saddle": "Saddle",
+      "station": "Station",
+      "blight": "-1/-1",
+      "ringBearer": "Ring"
+    }
   },
   "player": {
     "opponent": "Geg {{seat}}",
@@ -192,6 +212,7 @@
     "allTo": "Alle → <name>{{label}}</name>",
     "creatureFallback": "Kreatur #{{id}}",
     "planeswalkerFallback": "Planeswalker #{{id}}",
+    "objectFallback": "Object #{{id}}",
     "you": "Du",
     "ally": "Verbündeter",
     "restoreDialog": "Dialog wiederherstellen",
@@ -500,6 +521,7 @@
     "tapUntappedCreatures_other": "Tappe {{count}} ungetappte Kreaturen",
     "chooseTargetOf": "Wähle Ziel {{current}} von {{total}}",
     "chooseTarget": "Wähle ein Ziel",
+    "triggerDamageAmount": "This trigger: {{amount}} damage",
     "noLegalTargets": "Keine legalen Ziele verfügbar",
     "modeContext": "{{mode}} — {{prompt}}",
     "upToOne": "bis zu eine {{target}}",
@@ -515,7 +537,15 @@
     "keepCurrentTargets": "Aktuelle Ziele behalten",
     "skip": "Überspringen",
     "chooseNewTarget": "Wähle das neue Ziel des Zauberspruchs",
-    "chooseNewTargetForSpell": "Wähle ein neues Ziel für {{spell}}"
+    "chooseNewTargetForSpell": "Wähle ein neues Ziel für {{spell}}",
+    "sacrificeExact_one": "Sacrifice {{count}} permanent",
+    "sacrificeExact_other": "Sacrifice {{count}} permanents",
+    "sacrificeUpTo_one": "Sacrifice up to {{count}} permanent",
+    "sacrificeUpTo_other": "Sacrifice up to {{count}} permanents",
+    "sacrificeRange_one": "Sacrifice {{min}}-{{count}} permanent",
+    "sacrificeRange_other": "Sacrifice {{min}}-{{count}} permanents",
+    "confirmSacrifice": "Sacrifice ({{selected}}/{{count}})",
+    "skipSacrifice": "Skip Sacrifice"
   },
   "log": {
     "title": "Spielprotokoll",
@@ -1272,6 +1302,17 @@
     "red": "Rot",
     "green": "Grün"
   },
+  "roomDoor": {
+    "title": "Wähle eine Tür",
+    "subtitle": "Wähle, auf welche Tür des Raums du einwirkst",
+    "confirm": "Bestätigen",
+    "option": "{{op}} {{door}}",
+    "unlock": "Aufschließen",
+    "lock": "Abschließen",
+    "lockOrUnlock": "Auf- oder abschließen",
+    "left": "linke Tür",
+    "right": "rechte Tür"
+  },
   "dialogShell": {
     "eyebrow": "Spielentscheidung",
     "restoreDialog": "Dialog wiederherstellen",
@@ -1489,6 +1530,9 @@
     "connectionBody": "phase.rs hat die Verbindung zur Spiel-Engine verloren — meist durch ein Hintergrund-Update verursacht, das mitten im Spiel aktiviert wurde. Dein zuletzt gespeicherter Zug bleibt erhalten; lade neu, um das Spiel wiederherzustellen.",
     "diagnostic": "Diagnose: {{reason}}",
     "showDetails": "Details anzeigen",
+    "exportGameState": "Spielzustand exportieren",
+    "exported": "Exportiert",
+    "exportFailed": "Export fehlgeschlagen",
     "copyDiagnostic": "Diagnose kopieren",
     "copied": "Kopiert!",
     "reportOnGithub": "Auf GitHub melden",
@@ -1737,5 +1781,34 @@
     "banner": "Spectating — read only",
     "leave": "Leave",
     "watchingWith": "Also watching: {{names}}"
+  },
+  "boardChoice": {
+    "actions": {
+      "sacrifice": "Sacrifice",
+      "return": "Return",
+      "exile": "Exile",
+      "tap": "Tap",
+      "crew": "Crew",
+      "saddle": "Saddle",
+      "station": "Station",
+      "blight": "Blight",
+      "ringBearer": "Choose"
+    },
+    "prompt": {
+      "single": "{{action}} a permanent",
+      "exactCount_one": "{{action}} {{count}} permanent",
+      "exactCount_other": "{{action}} {{count}} permanents",
+      "rangeCount_one": "{{action}} {{min}}-{{count}} permanent",
+      "rangeCount_other": "{{action}} {{min}}-{{count}} permanents",
+      "upToCount_one": "{{action}} up to {{count}} permanent",
+      "upToCount_other": "{{action}} up to {{count}} permanents",
+      "totalPower": "{{action}}: power {{selected}} / {{required}}"
+    },
+    "confirm": "Confirm",
+    "confirmCount": "Confirm ({{selected}}/{{count}})",
+    "confirmPower": "Confirm ({{selected}}/{{required}} power)",
+    "skip": "Skip",
+    "groupCount": "{{selected}} / {{count}} selected",
+    "groupPower": "Power {{selected}} / {{required}}"
   }
 }

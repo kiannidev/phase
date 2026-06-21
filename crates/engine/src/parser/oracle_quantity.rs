@@ -481,6 +481,13 @@ pub(crate) fn parse_quantity_ref_with_context(
                 });
             }
         }
+        if let Ok((remainder, (relation, action))) = parse_optional_offer_accepted_clause(rest) {
+            if remainder.trim().is_empty() {
+                return Some(QuantityRef::PlayerCount {
+                    filter: PlayerFilter::PerformedActionThisWay { relation, action },
+                });
+            }
+        }
         // CR 608.2c + CR 400.7: "the number of [filter] destroyed/sacrificed
         // this way" — count from the tracked set populated by the preceding
         // destroy/sacrifice in the sub_ability chain. Must run BEFORE
@@ -828,6 +835,15 @@ pub(crate) fn parse_cda_quantity_with_context(
         }
     }
 
+    // CR 107.1 + CR 120.4a/120.10: "A or B, whichever is greater" lives in the
+    // nom quantity grammar; this legacy entry point only delegates so dynamic
+    // quantity recognition has one authority.
+    if let Ok((rest, expr)) = nom_quantity::parse_max_quantity(text) {
+        if rest.is_empty() {
+            return Some(expr);
+        }
+    }
+
     // CR 107.x: Binary arithmetic over two dynamic quantities, e.g. "the number
     // of Caves you control plus the number of Cave cards in your graveyard"
     // (Calamitous Cave-In) or "the number of cards in their hand minus 4"
@@ -874,6 +890,20 @@ pub(crate) fn parse_cda_quantity_with_context(
         }
     }
 
+    // CR 202.3 + CR 208.2a: "the greatest <prop> among <A> and <B>" where A and B
+    // are filters that may span distinct zones (Dragon Man, Reformed Robot:
+    // noncreature permanents you control AND noncreature cards in your graveyard).
+    // Each operand resolves as an independent single-zone Aggregate; the
+    // cross-source extremum is their Max (empty → 0 per CR 208.2a). Mirrors the
+    // " plus "/" minus " Sum
+    // composition above: only fires when BOTH operands parse as non-empty typed
+    // filters, so single-filter aggregates fall through to the QuantityRef
+    // delegate below unchanged. Tried before the delegate so the conjunction is
+    // recognized as a unit rather than the bare leading aggregate.
+    if let Some(expr) = parse_greatest_among_conjunction(text, ctx) {
+        return Some(expr);
+    }
+
     // Delegate to existing parse_quantity_ref for patterns like
     // "the number of {type} you control", "your devotion to X"
     if let Some(qty) = parse_quantity_ref_with_context(text, ctx) {
@@ -881,6 +911,75 @@ pub(crate) fn parse_cda_quantity_with_context(
     }
 
     None
+}
+
+/// CR 202.3: aggregate prefix for the cross-zone "greatest <prop> among"
+/// extremum. Mirrors the single-aggregate prefix set in
+/// `parse_quantity_ref_with_context` so both paths decode the same grammar.
+fn parse_greatest_among_prefix(
+    input: &str,
+) -> OracleResult<'_, (AggregateFunction, ObjectProperty)> {
+    alt((
+        value(
+            (AggregateFunction::Max, ObjectProperty::Power),
+            tag("the greatest power among "),
+        ),
+        value(
+            (AggregateFunction::Max, ObjectProperty::Toughness),
+            tag("the greatest toughness among "),
+        ),
+        value(
+            (AggregateFunction::Max, ObjectProperty::ManaValue),
+            tag("the greatest mana value among "),
+        ),
+    ))
+    .parse(input)
+}
+
+/// CR 202.3 + CR 208.2a: "the greatest <prop> among <A> and <B>" → Max of two
+/// single-zone Aggregates. Each operand is decoded through the shared
+/// `parse_type_phrase_with_ctx` filter grammar, so per-arm zone/controller
+/// semantics (e.g. "noncreature cards in your graveyard" → InZone Graveyard) are
+/// unambiguous. Returns None unless both operands parse to non-empty typed
+/// filters with the conjunction fully consumed.
+fn parse_greatest_among_conjunction(text: &str, ctx: &mut ParseContext) -> Option<QuantityExpr> {
+    let (rest, (func, prop)) = parse_greatest_among_prefix(text).ok()?;
+
+    let (filter_a, remainder) = parse_type_phrase_with_ctx(rest, ctx);
+    if matches!(filter_a, TargetFilter::Any) || is_empty_typed_filter(&filter_a) {
+        return None;
+    }
+
+    let (after_and, _) = tag::<_, _, OracleError<'_>>(" and ")
+        .parse(remainder.trim_end())
+        .ok()?;
+
+    let (filter_b, tail) = parse_type_phrase_with_ctx(after_and, ctx);
+    if !tail.trim().is_empty()
+        || matches!(filter_b, TargetFilter::Any)
+        || is_empty_typed_filter(&filter_b)
+    {
+        return None;
+    }
+
+    Some(QuantityExpr::Max {
+        exprs: vec![
+            QuantityExpr::Ref {
+                qty: QuantityRef::Aggregate {
+                    function: func,
+                    property: prop,
+                    filter: filter_a,
+                },
+            },
+            QuantityExpr::Ref {
+                qty: QuantityRef::Aggregate {
+                    function: func,
+                    property: prop,
+                    filter: filter_b,
+                },
+            },
+        ],
+    })
 }
 
 // CR 604.3: "the total number of cards you own in exile and in your graveyard
@@ -1539,7 +1638,11 @@ pub(crate) fn parse_event_context_quantity(text: &str) -> Option<QuantityExpr> {
 
     // Fall back to parse_quantity_ref for named quantity patterns
     // (e.g., "the life you've lost this turn" → LifeLostThisTurn).
-    // Strip leading "the " article before matching.
+    // Strip leading "the " article before matching. If that fails, try the full
+    // phrase only for CommanderManaValue — that grammar requires the leading
+    // article (Stinging Study's "where X is the mana value of a commander…").
+    // Keep broader object-count phrases on the stripped path so context-aware
+    // callers can still bind "they control" through parse_cda_quantity_with_context.
     // Exclude target-referent variants (TargetPower, TargetLifeTotal) — these
     // reference a targeting selection, not an event-context source object.
     let stripped = tag::<_, _, OracleError<'_>>("the ")
@@ -1556,6 +1659,9 @@ pub(crate) fn parse_event_context_quantity(text: &str) -> Option<QuantityExpr> {
         ) {
             return Some(QuantityExpr::Ref { qty });
         }
+    }
+    if let Some(qty @ QuantityRef::CommanderManaValue { .. }) = parse_quantity_ref(lower) {
+        return Some(QuantityExpr::Ref { qty });
     }
 
     None
@@ -2112,6 +2218,22 @@ fn parse_investigated_arm(input: &str) -> nom::IResult<&str, PlayerActionKind, O
     .parse(input)
 }
 
+/// "opponent who does" / "players who do" → accepted the optional offer.
+fn parse_optional_offer_accepted_clause(
+    input: &str,
+) -> nom::IResult<&str, (PlayerRelation, PlayerActionKind), OracleError<'_>> {
+    let (input, relation) = alt((
+        value(PlayerRelation::Opponent, tag("opponents ")),
+        value(PlayerRelation::Opponent, tag("opponent ")),
+        value(PlayerRelation::All, tag("players ")),
+        value(PlayerRelation::All, tag("player ")),
+    ))
+    .parse(input)?;
+    let (input, _) = tag("who ").parse(input)?;
+    let (input, _) = alt((tag("does"), tag("do"), tag("did"))).parse(input)?;
+    Ok((input, (relation, PlayerActionKind::AcceptedOptionalEffect)))
+}
+
 /// Parse the clause after "for each" into a QuantityRef.
 /// CR 702.62b: A suspended card is a card in the exile zone with the suspend
 /// keyword and a time counter on it. Counting clauses (`for each suspended card
@@ -2346,6 +2468,14 @@ fn parse_for_each_clause_with_they_controller(
         let (filter, remainder) = parse_type_phrase(after_among);
         if remainder.trim().is_empty() && !matches!(filter, TargetFilter::Any) {
             return Some(QuantityRef::DistinctColorsAmongPermanents { filter });
+        }
+    }
+
+    if let Ok((rest, (relation, action))) = parse_optional_offer_accepted_clause(clause) {
+        if rest.is_empty() {
+            return Some(QuantityRef::PlayerCount {
+                filter: PlayerFilter::PerformedActionThisWay { relation, action },
+            });
         }
     }
 
@@ -4593,6 +4723,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_event_context_quantity_commander_mana_value() {
+        // CR 903.3d: Stinging Study's "where X is the mana value of a commander
+        // you own on the battlefield or in the command zone" must bind X via
+        // CommanderManaValue — the fallback must try the full "the …" phrase
+        // before stripping the article.
+        assert_eq!(
+            parse_event_context_quantity(
+                "the mana value of a commander you own on the battlefield or in the command zone"
+            ),
+            Some(QuantityExpr::Ref {
+                qty: QuantityRef::CommanderManaValue {
+                    owner: ControllerRef::You,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn parse_event_context_quantity_does_not_consume_context_scoped_object_count() {
+        assert_eq!(
+            parse_event_context_quantity("the number of artifacts they control"),
+            None
+        );
+    }
+
+    #[test]
     fn parse_event_context_quantity_unrecognized_returns_none() {
         assert_eq!(
             parse_event_context_quantity("the number of creatures you control"),
@@ -5117,6 +5273,20 @@ mod tests {
                 filter: PlayerFilter::PerformedActionThisWay {
                     relation: PlayerRelation::Opponent,
                     action: PlayerActionKind::SearchedLibrary,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn for_each_opponent_who_does_counts_accepted_optional_offer() {
+        let qty = parse_for_each_clause("opponent who does").unwrap();
+        assert_eq!(
+            qty,
+            QuantityRef::PlayerCount {
+                filter: PlayerFilter::PerformedActionThisWay {
+                    relation: PlayerRelation::Opponent,
+                    action: PlayerActionKind::AcceptedOptionalEffect,
                 },
             }
         );

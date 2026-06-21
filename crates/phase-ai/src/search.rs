@@ -571,6 +571,17 @@ fn fallback_action(state: &GameState) -> Option<GameAction> {
             .first()
             .map(|&source| GameAction::ChooseDamageSource { source }),
 
+        // CR 709.5f-g: room-door choice — pick the first offered (op, door).
+        WaitingFor::ChooseRoomDoor {
+            object_id, options, ..
+        } => options
+            .first()
+            .map(|&(op, door)| GameAction::ChooseRoomDoor {
+                object_id: *object_id,
+                op,
+                door,
+            }),
+
         // Mode choice: select first mode.
         WaitingFor::ModeChoice { .. } | WaitingFor::AbilityModeChoice { .. } => {
             Some(GameAction::SelectModes { indices: vec![0] })
@@ -2600,6 +2611,7 @@ mod tests {
             count: 1,
             reveal: false,
             up_to: false,
+            allows_partial_find: false,
             constraint: engine::types::ability::SearchSelectionConstraint::None,
             split: None,
         };
@@ -2617,6 +2629,9 @@ mod tests {
         let decision = AiDecisionContext {
             waiting_for: WaitingFor::TriggerTargetSelection {
                 player: PlayerId(0),
+                trigger_controller: None,
+                trigger_event: None,
+                trigger_events: Vec::new(),
                 target_slots: Vec::new(),
                 mode_labels: Vec::new(),
                 target_constraints: Vec::new(),
@@ -2673,6 +2688,9 @@ mod tests {
         let mut state = make_state();
         state.waiting_for = WaitingFor::TriggerTargetSelection {
             player: PlayerId(0),
+            trigger_controller: None,
+            trigger_event: None,
+            trigger_events: Vec::new(),
             target_slots: vec![engine::types::game_state::TargetSelectionSlot {
                 legal_targets: vec![
                     TargetRef::Player(PlayerId(0)),
@@ -2711,6 +2729,9 @@ mod tests {
         let mut state = make_state();
         state.waiting_for = WaitingFor::TriggerTargetSelection {
             player: PlayerId(0),
+            trigger_controller: None,
+            trigger_event: None,
+            trigger_events: Vec::new(),
             target_slots: vec![engine::types::game_state::TargetSelectionSlot {
                 legal_targets: Vec::new(),
                 optional: true,
@@ -2904,6 +2925,7 @@ mod tests {
             count: 4,
             reveal: true,
             up_to: true,
+            allows_partial_find: false,
             constraint: SearchSelectionConstraint::DistinctQualities {
                 qualities: vec![SharedQuality::Name],
             },
@@ -2965,6 +2987,7 @@ mod tests {
             controller,
             source_id: ObjectId(1),
             actor: engine::types::game_state::VoteActor::Delegated(controller),
+            tally_mode: engine::types::ability::VoteTally::PerVote,
         }
     }
 
@@ -3104,6 +3127,7 @@ mod tests {
             controller,
             source_id: ObjectId(1),
             actor: engine::types::game_state::VoteActor::SubjectActs,
+            tally_mode: engine::types::ability::VoteTally::PerVote,
         };
         let action = fallback_action(&state).expect("fallback returns an action");
         assert!(

@@ -19,6 +19,7 @@ use super::oracle_nom::bridge::{nom_on_lower, split_once_on_lower};
 use super::oracle_nom::condition::{parse_attached_subject_target_filter, parse_inner_condition};
 use super::oracle_nom::duration::parse_duration;
 use super::oracle_nom::primitives as nom_primitives;
+use super::oracle_nom::quantity as nom_quantity;
 use super::oracle_nom::target::parse_type_filter_word;
 use super::oracle_quantity::capitalize_first;
 use super::oracle_target::parse_type_phrase;
@@ -94,6 +95,13 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
     // --- "As ~ enters, choose a [type]" → Moved replacement with persisted Choose ---
     // Must be checked BEFORE shock lands, which may contain this as a sub-pattern.
     if let Some(def) = parse_as_enters_choose(&norm_lower, &text) {
+        return Some(def);
+    }
+
+    // --- "As ~ is turned face up, [effect]" → TurnFaceUp replacement (megamorph/
+    //     disguise). CR 614.1e + CR 708.11: the effect applies as the permanent is
+    //     turned face up, so it is a replacement, not a stack triggered ability. ---
+    if let Some(def) = parse_turned_face_up_replacement(&norm_lower, &text) {
         return Some(def);
     }
 
@@ -265,6 +273,16 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
     //       "If a nontoken creature an opponent controls would die, exile it instead." (Valentin)
     //       "If a creature an opponent controls would die, exile it instead." (Vren)
     if let Some(def) = parse_creature_die_exile_replacement(&norm_lower, &normalized) {
+        return Some(def);
+    }
+
+    // CR 614.1a + CR 120.6: Wolverine, Fierce Fighter — heal-prior-damage
+    // replacement ("instead that damage is dealt, but all other damage already
+    // dealt to him is healed"). The new damage IS dealt (no prevention); only
+    // prior marked damage clears. Tried before the generic self-instead
+    // followup, whose "<effect> instead" shape this mid-clause "instead" does
+    // not fit.
+    if let Some(def) = parse_damage_heal_self_replacement(&norm_lower, &text) {
         return Some(def);
     }
 
@@ -510,9 +528,14 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
 
     // --- "[Subject] enters/escapes with N [type] counter(s)" ---
     // CR 614.1c: Handles "enters with", "escapes with" (CR 702.138), and
-    // kicker-conditional "if was kicked, it enters with" (CR 702.33d).
+    // kicker-conditional "if was kicked, it enters with" (CR 702.33d). The
+    // bare-verb plural-subject forms ("Other creatures you control enter with …"
+    // — Gev, Scaled Scorch) use "enter"/"escape" rather than the singular
+    // "enters"/"escapes", so accept both at word boundaries.
     if (nom_primitives::scan_contains(&lower, "enters")
-        || nom_primitives::scan_contains(&lower, "escapes"))
+        || nom_primitives::scan_contains(&lower, "escapes")
+        || nom_primitives::scan_contains(&lower, "enter with")
+        || nom_primitives::scan_contains(&lower, "escape with"))
         && nom_primitives::scan_contains(&lower, "counter")
     {
         if let Some(def) = parse_enters_with_counters(&norm_lower, &text) {
@@ -2307,7 +2330,7 @@ pub(crate) fn rewrite_variable_x_to_cost_x_paid(expr: &mut QuantityExpr) {
         | QuantityExpr::Offset { inner, .. }
         | QuantityExpr::ClampMin { inner, .. }
         | QuantityExpr::Multiply { inner, .. } => rewrite_variable_x_to_cost_x_paid(inner),
-        QuantityExpr::Sum { exprs } => {
+        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => {
             for inner in exprs {
                 rewrite_variable_x_to_cost_x_paid(inner);
             }
@@ -2333,11 +2356,10 @@ fn parse_enters_with_counters(
     // CR 702.33d: kicker condition gates the replacement effect.
     let (kicker_condition, work_text) = extract_kicker_enters_condition(norm_lower);
 
-    // CR 702.138c: "escapes with" is semantically "enters with" gated on escape.
-    // Use nom take_until to scan for the "escapes with" phrase at word boundaries.
-    let is_escape = take_until::<_, _, OracleError<'_>>("escapes with")
-        .parse(work_text)
-        .is_ok();
+    // CR 702.138c: "escapes with" / plural-subject "escape with" is
+    // semantically "enters with" gated on escape.
+    let is_escape = nom_primitives::scan_contains(work_text, "escapes with")
+        || nom_primitives::scan_contains(work_text, "escape with");
 
     // Find "with [N] [type] counter" to extract count and counter type.
     // For escape, the "with" follows "escapes"; for enters, it follows "enters".
@@ -2494,6 +2516,8 @@ fn parse_enters_with_counters(
     }
     if let Some(qty) = parse_enters_with_where_x_suffix(work_text) {
         count_expr = qty;
+    } else if nom_primitives::split_once_on(work_text, ", where x is ").is_ok() {
+        return None;
     }
     // CR 614.12: Any `Variable("X")` that survived the dynamic-quantity
     // overrides above refers to the X paid on the *entering* object's cost, not
@@ -2650,7 +2674,7 @@ fn has_enters_tapped_phrase(text: &str) -> bool {
 fn parse_enters_with_where_x_suffix(text: &str) -> Option<QuantityExpr> {
     let (_, (_, qty_text)) = nom_primitives::split_once_on(text, ", where x is ").ok()?;
     let trimmed = qty_text.trim().trim_end_matches('.');
-    if let Some(qty_ref) = crate::parser::oracle_quantity::parse_quantity_ref(trimmed) {
+    if let Ok((_, qty_ref)) = nom_quantity::parse_quantity_ref_complete(trimmed) {
         return Some(QuantityExpr::Ref { qty: qty_ref });
     }
     if let Some(qty) = crate::parser::oracle_quantity::parse_cda_quantity(trimmed) {
@@ -2685,9 +2709,16 @@ fn parse_enters_counter_for_each_suffix(after_counter: &str) -> Option<QuantityE
     let (rest, _) = opt(tag::<_, _, OracleError<'_>>("s"))
         .parse(after_counter)
         .ok()?;
-    let (rest, _) = tag::<_, _, OracleError<'_>>(" on it for each ")
-        .parse(rest)
-        .ok()?;
+    // CR 614.12: the self-referential recipient is "it" for a single permanent
+    // and "them" for a distributive subject (e.g. Gev, Scaled Scorch's "Other
+    // creatures you control enter with … counter on them for each …"). Both
+    // forms precede the per-each scaling clause identically.
+    let (rest, _) = alt((
+        tag::<_, _, OracleError<'_>>(" on it for each "),
+        tag(" on them for each "),
+    ))
+    .parse(rest)
+    .ok()?;
     if let Ok((rest, qty)) = parse_for_each_convoked_creature_clause(rest) {
         if rest.trim().is_empty() {
             return Some(qty);
@@ -4009,13 +4040,22 @@ fn parse_damage_modification_static(
     let modification =
         nom_primitives::scan_at_word_boundaries(norm_lower, parse_damage_modification_quantifier)?;
 
-    // --- 2. Extract source filter from the subject clause (between "that" and "would deal") ---
-    // Pattern: "Double all damage that [subject] would deal"
-    // Split on "that" to get the modification prefix, then extract subject between "that" and "would deal"
-    let (_, (_, after_that)) = nom_primitives::split_once_on(norm_lower, "that ").ok()?;
+    // --- 2. Extract source filter from the subject clause ---
+    // Pattern: "Double all damage[ that] [subject] would deal" — the "that"
+    // relative-clause marker is OPTIONAL. "Double all damage that creature
+    // would deal" carries it; Mjölnir ("Double all damage equipped creature
+    // would deal") omits it. Consume it with opt(tag) rather than requiring a
+    // split on "that ", and extract the subject as the span between the
+    // "double all damage" quantifier and " would deal".
+    let (_, (_, after_quantifier)) =
+        nom_primitives::split_once_on(norm_lower, "double all damage").ok()?;
+    let after_quantifier = after_quantifier.trim_start();
+    let (after_that, _) = opt(tag::<_, _, OracleError<'_>>("that "))
+        .parse(after_quantifier)
+        .ok()?;
     let (_, (subject, _)) = nom_primitives::split_once_on(after_that, " would deal").ok()?;
 
-    let source_filter = parse_damage_source_subject(subject.trim());
+    let source_filter = parse_damage_source_subject_filter(subject.trim());
 
     // --- 3. Extract combat scope ---
     let combat_scope = scan_combat_scope(norm_lower);
@@ -4057,6 +4097,14 @@ pub(crate) fn parse_oneshot_damage_replacement(norm_lower: &str) -> Option<Effec
     // covered by the active "the next time [source] would deal" grammar below,
     // so try it first and fall through on mismatch.
     if let Some(effect) = parse_oneshot_next_n_damage_to_self_redirect(norm_lower) {
+        return Some(effect);
+    }
+
+    // CR 614.9: the mirror shape — the ORIGINAL recipient is a chosen TARGET and
+    // the damage is redirected to the source (`~`) or its controller (`you`)
+    // (Daughter of Autumn, Vassal's Duty). Tried after the self-recipient form so
+    // the en-Kor "...dealt to ~ this turn..." case is claimed there first.
+    if let Some(effect) = parse_oneshot_next_n_damage_to_target_redirect(norm_lower) {
         return Some(effect);
     }
 
@@ -4184,6 +4232,9 @@ fn parse_oneshot_next_n_damage_to_self_redirect(norm_lower: &str) -> Option<Effe
 
     // CR 115.1: redirect recipient — "target creature you control" (every en-Kor
     // card) or the looser "target creature"; both become a chosen object target.
+    // (An "any target" redirect is intentionally NOT accepted here: it can be a
+    // player, but the CreateDamageReplacement resolver stores only object redirect
+    // targets, so a player choice would silently drop the redirect — fail closed.)
     let (rest, redirect_object_filter) = alt((
         value(
             inject_controller(
@@ -4215,6 +4266,103 @@ fn parse_oneshot_next_n_damage_to_self_redirect(norm_lower: &str) -> Option<Effe
         redirect_amount: Some(PreventionAmount::Next(amount)),
         redirect_object_filter: Some(redirect_object_filter),
         recipient_object_filter: Some(TargetFilter::SelfRef),
+    })
+}
+
+/// CR 614.9: one-shot redirection whose ORIGINAL recipient is a CHOSEN TARGET.
+/// "the next N damage that would be dealt to <target> this turn is dealt to
+/// <destination> instead", where the destination is the source itself
+/// (`~` → `SourceObject`), its controller (`you` → `Controller`), or a SECOND
+/// chosen *object* target (`another target creature` → `ChosenObjectTarget` with
+/// its own redirect slot). Covers Daughter of Autumn / Vassal's Duty (→ ~ / you)
+/// and Razia, Boros Archangel (→ another target creature). The mirror of
+/// `parse_oneshot_next_n_damage_to_self_redirect` (recipient `~`); `Controller`/
+/// `SourceObject` need no chosen redirect slot, the chosen-object destination
+/// surfaces one (CR 115.1) alongside the recipient slot. An `any target` redirect
+/// is rejected (it can be a player, which the object-only redirect resolver can't
+/// store) — fail closed.
+fn parse_oneshot_next_n_damage_to_target_redirect(norm_lower: &str) -> Option<Effect> {
+    let (rest, (_, amount, _)) = (
+        tag::<_, _, OracleError<'_>>("the next "),
+        nom_primitives::parse_number,
+        tag::<_, _, OracleError<'_>>(" damage that would be dealt to "),
+    )
+        .parse(norm_lower)
+        .ok()?;
+
+    // CR 115.1: the original recipient is a chosen object target ("target white
+    // creature", "target legendary creature you control", …). Capture the target
+    // phrase up to the " this turn is dealt to " spine.
+    let (rest, recipient_text) = take_until::<_, _, OracleError<'_>>(" this turn is dealt to ")
+        .parse(rest)
+        .ok()?;
+    // CR 115.1: the original recipient must be an explicit chosen target
+    // ("target white creature", "target legendary creature you control"). Gate on
+    // the `target` keyword via a combinator — the en-Kor `~` recipient (owned by
+    // the sibling function above) and bare scopes ("a creature") fail closed here.
+    if tag::<_, _, OracleError<'_>>("target ")
+        .parse(recipient_text)
+        .is_err()
+    {
+        return None;
+    }
+    let (recipient_filter, leftover) = crate::parser::oracle_target::parse_target(recipient_text);
+    if !leftover.trim().is_empty() {
+        return None;
+    }
+
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" this turn is dealt to ")
+        .parse(rest)
+        .ok()?;
+
+    // CR 614.9: redirect destination. `~` (the source object) and `you` (its
+    // controller) need no chosen redirect slot; a second chosen target ("another
+    // target creature", "any target", "target creature ...") is a
+    // `ChosenObjectTarget` that surfaces its own redirect slot (Razia, Boros
+    // Archangel). Capture the recipient phrase up to the trailing " instead".
+    let (after_redirect, redirect_text) = take_until::<_, _, OracleError<'_>>(" instead")
+        .parse(rest)
+        .ok()?;
+    let (redirect_to, redirect_object_filter) = if all_consuming(tag::<_, _, OracleError<'_>>("~"))
+        .parse(redirect_text)
+        .is_ok()
+    {
+        (DamageRedirectTarget::SourceObject, None)
+    } else if all_consuming(tag::<_, _, OracleError<'_>>("you"))
+        .parse(redirect_text)
+        .is_ok()
+    {
+        (DamageRedirectTarget::Controller, None)
+    } else {
+        let (filter, leftover) = crate::parser::oracle_target::parse_target(redirect_text);
+        // CR 115.1: require a fully-consumed chosen *object* target. `TargetFilter::Any`
+        // is intentionally rejected: it can resolve to a player, but the
+        // CreateDamageReplacement resolver stores only object redirect targets
+        // (`chosen_redirect_object`), so a player choice would silently drop the
+        // redirect. Fail closed on `Any`, scopes, and unparsed remainders.
+        if !leftover.trim().is_empty() || !matches!(filter, TargetFilter::Typed(_)) {
+            return None;
+        }
+        (DamageRedirectTarget::ChosenObjectTarget, Some(filter))
+    };
+
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" instead")
+        .parse(after_redirect)
+        .ok()?;
+    let (rest, _) = opt(char::<_, OracleError<'_>>('.')).parse(rest).ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+
+    Some(Effect::CreateDamageReplacement {
+        source_filter: None,
+        combat_scope: None,
+        target_filter: None,
+        modification: None,
+        redirect_to: Some(redirect_to),
+        redirect_amount: Some(PreventionAmount::Next(amount)),
+        redirect_object_filter,
+        recipient_object_filter: Some(recipient_filter),
     })
 }
 
@@ -4381,13 +4529,46 @@ fn parse_damage_source_filter(norm_lower: &str) -> Option<TargetFilter> {
         return None;
     }
 
+    if let Some(filter) = parse_damage_source_subject_filter(subject) {
+        return Some(filter);
+    }
+
+    None
+}
+
+/// CR 301.5 + CR 702.6: "equipped creature" (Equipment) and "enchanted
+/// creature" (Aura) both name the host object the permanent is attached to,
+/// which the runtime resolves via `TargetFilter::AttachedTo`. Mirrors the
+/// `parse_damage_history_source` "enchanted creature" mapping so both the
+/// "instead" and no-"instead" damage-replacement surfaces agree.
+fn parse_attached_host_subject(input: &str) -> OracleResult<'_, TargetFilter> {
+    alt((
+        value(
+            TargetFilter::AttachedTo,
+            tag::<_, _, OracleError<'_>>("equipped creature"),
+        ),
+        value(TargetFilter::AttachedTo, tag("enchanted creature")),
+    ))
+    .parse(input)
+}
+
+fn parse_damage_source_subject_filter(subject: &str) -> Option<TargetFilter> {
+    // CR 301.5 + CR 702.6: host-relative subjects ("equipped creature",
+    // "enchanted creature") resolve to the attached object before the generic
+    // typed-source grammar, which would otherwise treat "creature" as a type.
+    if let Ok((rest, filter)) = parse_attached_host_subject(subject) {
+        if rest.trim().is_empty() {
+            return Some(filter);
+        }
+    }
     if let Some(filter) = parse_damage_source_subject(subject) {
         return Some(filter);
     }
 
-    // CR 614.1a: Typed damage sources ("creature you control with a +1/+1
-    // counter on it", …) — delegate to the shared type-phrase parser
-    // (Uncivil Unrest, Torbran-adjacent prints).
+    // Typed damage sources ("creature you control with a +1/+1 counter on it",
+    // "creatures you control with counters on them", ...) share the normal
+    // target grammar; damage replacement parsing should not maintain a parallel
+    // counter/property grammar.
     let (filter, rest) = parse_type_phrase(subject);
     if rest.trim().is_empty() && !matches!(filter, TargetFilter::Any) {
         return Some(filter);
@@ -5030,6 +5211,66 @@ fn parse_explore_replacement(lower: &str, original_text: &str) -> Option<Replace
 /// other times are unaffected). The alternative effect appears BEFORE "instead"
 /// ("remove all wind counters from it instead", "put two +1/+1 counters on it
 /// instead").
+/// CR 614.1e + CR 708.11: "As ~ is turned face up, [effect]"
+/// is a replacement effect — the alternative action applies AS the permanent is
+/// turned face up (no stack-response window), and the subject is always the
+/// permanent itself. Scoped to effects that resolve against the permanent itself
+/// (`SelfRef`): the self-counter class — Hooded Hydra "put five +1/+1 counters on
+/// it", Bubble Smuggler "put four +1/+1 counters on it". Forms that need an
+/// external target choice during the turn-up (Gift of Doom "you may attach it to
+/// a creature") are gapped by `turn_face_up_effect_is_self_resolving` rather than
+/// mis-resolved. `norm_lower` has self-references normalized to `~`.
+fn parse_turned_face_up_replacement(norm_lower: &str, text: &str) -> Option<ReplacementDefinition> {
+    // Anchored self-referential lead.
+    tag::<_, _, OracleError<'_>>("as ~ is turned face up, ")
+        .parse(norm_lower)
+        .ok()?;
+    // The effect is everything after the lead; pull it from the original line so
+    // `parse_effect_chain` sees the printed casing.
+    let lower = text.to_lowercase();
+    let (_head, effect_text) = split_once_on_lower(text, &lower, " is turned face up, ")?;
+    let effect_text = effect_text.trim().trim_end_matches('.').trim();
+    if effect_text.is_empty() {
+        return None;
+    }
+
+    // CR 708.11: the effect applies AS the permanent is turned face up — there is
+    // no point at which the controller can use the targeting system. Only effects
+    // that resolve against the permanent itself (`SelfRef`, e.g. Hooded Hydra's
+    // "put five +1/+1 counters on it") can be faithfully modeled at this seam.
+    // Effects that need an external target choice (Gift of Doom's "you may attach
+    // it to a creature") would require a turn-up-time choice the apply path does
+    // not provide; gap them rather than silently mis-resolve the host.
+    let execute = parse_effect_chain(effect_text, AbilityKind::Spell);
+    if !turn_face_up_effect_is_self_resolving(&execute) {
+        return None;
+    }
+
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::TurnFaceUp)
+            .valid_card(TargetFilter::SelfRef)
+            .execute(execute)
+            .description(text.to_string()),
+    )
+}
+
+/// CR 708.11: True when every effect in an "As ~ is turned face up" chain resolves
+/// against the permanent itself (`SelfRef`) or needs no target at all, so it can
+/// be applied during the turn-up with no targeting window. An effect whose target
+/// is an external filter (a creature/permanent/player chosen at resolution) needs
+/// a choice the replacement-apply path does not model and must be gapped.
+fn turn_face_up_effect_is_self_resolving(ability: &AbilityDefinition) -> bool {
+    let mut current = Some(ability);
+    while let Some(def) = current {
+        match def.effect.target_filter() {
+            None | Some(TargetFilter::SelfRef) => {}
+            Some(_) => return false,
+        }
+        current = def.sub_ability.as_deref();
+    }
+    true
+}
+
 fn parse_untap_step_replacement(original_text: &str, lower: &str) -> Option<ReplacementDefinition> {
     if !nom_primitives::scan_contains(lower, "untap step")
         || !nom_primitives::scan_contains(lower, "instead")
@@ -5338,6 +5579,23 @@ fn parse_token_replacement(lower: &str, original_text: &str) -> Option<Replaceme
         TokenReplacementShape::PlusSpec { spec } => {
             def = def.additional_token_spec(*spec);
         }
+        TokenReplacementShape::Substitute { token } => {
+            // CR 614.1a + CR 111.1: Full token substitution (Divine Visitation).
+            // Approach (A) — no new ReplacementDefinition field: carry the
+            // substitute characteristics as an Effect::Token in the existing
+            // `execute` field (mirrors `mill_applier` reading `def.execute`).
+            // `create_token_applier` resolves it to a TokenSpec and swaps it in,
+            // preserving the event's count and owner.
+            def = def.execute(AbilityDefinition::new(AbilityKind::Spell, *token));
+            // CR 111.1: gate the substitution on the proposed token's core card
+            // type ("if one or more CREATURE tokens would be created" — only
+            // creature tokens become Angels).
+            if let Some(core_type) = parse_token_core_type_gate(lower) {
+                def = def.condition(ReplacementCondition::TokenCoreTypeMatches {
+                    core_types: vec![core_type],
+                });
+            }
+        }
     }
 
     // Scope: "under your control" → restrict to controller's tokens
@@ -5363,6 +5621,10 @@ enum TokenReplacementShape {
     PlusSpec {
         spec: Box<crate::types::proposed_event::TokenSpec>,
     },
+    /// "that many [spec] are created instead" — full token substitution
+    /// (Divine Visitation). The substitute characteristics are carried as an
+    /// `Effect::Token` (resolved to a `TokenSpec` by the applier).
+    Substitute { token: Box<Effect> },
 }
 
 /// CR 614.1a: Nom dispatch on the two token-replacement shapes. Uses
@@ -5386,6 +5648,28 @@ fn parse_token_replacement_shape(lower: &str) -> Option<TokenReplacementShape> {
     }
 
     // "those tokens plus <spec> (is|are) created instead" → Chatterfang / Donatello.
+    if let Some(spec) = parse_token_plus_spec_shape(lower) {
+        return Some(TokenReplacementShape::PlusSpec {
+            spec: Box::new(spec),
+        });
+    }
+
+    // "that many <spec> (is|are) created instead" → full token SUBSTITUTION
+    // (Divine Visitation). Disjoint prefix from PlusSpec ("those tokens plus")
+    // and gated after Double ("twice that many"), so order is unambiguous.
+    if let Some(token) = parse_token_substitute_shape(lower) {
+        return Some(TokenReplacementShape::Substitute {
+            token: Box::new(token),
+        });
+    }
+
+    None
+}
+
+/// CR 614.1a + CR 111.1: Extract the "those tokens plus <spec> (is|are) created
+/// instead" appended-token spec (Chatterfang / Donatello). Returns the parsed
+/// `TokenSpec` for the appended token, or `None` if the phrase is absent.
+fn parse_token_plus_spec_shape(lower: &str) -> Option<crate::types::proposed_event::TokenSpec> {
     // Extract the spec descriptor between "those tokens plus " and the trailing
     // "are/is created instead" clause using nom combinators.
     let ((descriptor_start, descriptor_len), _rest) = nom_on_lower(lower, lower, |i| {
@@ -5405,10 +5689,49 @@ fn parse_token_replacement_shape(lower: &str) -> Option<TokenReplacementShape> {
         .trim();
     let descriptor = normalize_additional_token_descriptor(descriptor)?;
     let token = super::oracle_effect::parse_token_description(&descriptor)?;
-    let spec = token_description_to_spec(&token)?;
-    Some(TokenReplacementShape::PlusSpec {
-        spec: Box::new(spec),
-    })
+    token_description_to_spec(&token)
+}
+
+/// CR 614.1a + CR 111.1: Extract the "that many <spec> (is|are) created instead"
+/// substitution spec (Divine Visitation). The "that many " count prefix is left
+/// on the descriptor so `try_parse_token` binds it to `EventContextAmount`
+/// (the substitution keeps the proposed event's count at apply time, so this
+/// resolved count is ignored). Returns the substitute `Effect::Token`, or `None`
+/// when the phrase is absent or doesn't parse to a token effect.
+fn parse_token_substitute_shape(lower: &str) -> Option<Effect> {
+    let ((descriptor_start, descriptor_len), _rest) = nom_on_lower(lower, lower, |i| {
+        let (i, pre) = take_until::<_, _, OracleError<'_>>("that many ").parse(i)?;
+        let start_offset = pre.len();
+        let (i, _) = tag("that many ").parse(i)?;
+        let (_, descriptor) = alt((
+            take_until::<_, _, OracleError<'_>>(" are created instead"),
+            take_until::<_, _, OracleError<'_>>(" is created instead"),
+        ))
+        .parse(i)?;
+        Ok((i, (start_offset, "that many ".len() + descriptor.len())))
+    })?;
+
+    let descriptor = lower
+        .get(descriptor_start..descriptor_start + descriptor_len)?
+        .trim();
+    let mut ctx = ParseContext::default();
+    let effect = super::oracle_effect::try_parse_token(descriptor, descriptor, &mut ctx)?;
+    matches!(effect, Effect::Token { .. }).then_some(effect)
+}
+
+/// CR 111.1: Extract the gated core card type from "if one or more <core type>
+/// tokens would be created" (Divine Visitation gates on Creature). Returns
+/// `None` when no typed gate is present (e.g. Doubling Season's untyped "one or
+/// more tokens").
+fn parse_token_core_type_gate(lower: &str) -> Option<crate::types::card_type::CoreType> {
+    let (word, _) = nom_on_lower(lower, lower, |i| {
+        let (i, _) = take_until::<_, _, OracleError<'_>>("one or more ").parse(i)?;
+        let (i, _) = tag("one or more ").parse(i)?;
+        let (i, word) = take_until::<_, _, OracleError<'_>>(" tokens would be created").parse(i)?;
+        Ok((i, word.to_string()))
+    })?;
+    // The line is lowercased; `CoreType::from_str` expects title case ("Creature").
+    crate::types::card_type::CoreType::from_str(&capitalize_first(word.trim())).ok()
 }
 
 /// CR 614.1a + CR 111.1: Normalize the optional "additional" modifier on
@@ -6071,6 +6394,59 @@ fn parse_damage_redirection_replacement(
     }
 
     None
+}
+
+/// CR 614.1a + CR 120.6 + CR 510.2: Wolverine, Fierce Fighter — "If damage
+/// would be dealt to ~, instead that damage is dealt, but all other damage
+/// already dealt to him is healed."
+///
+/// Unlike the generic self-instead followup, the new damage instance is NOT
+/// prevented (it IS dealt); only the receiver's PRIOR marked damage is cleared.
+/// Emits a `DealtDamage` replacement with NO prevention shield, carrying an
+/// `Effect::RemoveAllDamage { SelfRef }` in `execute`. `dealt_damage_applier`
+/// runs the heal in Phase B (before delivery), so same-batch combat instances
+/// (CR 510.2) are preserved while prior damage clears.
+///
+/// The receiver self-reference may surface as `~` (the source's own normalized
+/// name) or an object pronoun (`him`/`her`/`it`/`them`), which `~`-normalization
+/// does not rewrite — both are accepted via a shared `alt`.
+fn parse_damage_heal_self_replacement(
+    norm_lower: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    fn self_ref(i: &str) -> OracleResult<'_, &str> {
+        alt((
+            tag::<_, _, OracleError<'_>>("~"),
+            tag("him"),
+            tag("her"),
+            tag("it"),
+            tag("them"),
+        ))
+        .parse(i)
+    }
+
+    let mut combinator = all_consuming(terminated(
+        (
+            tag::<_, _, OracleError<'_>>("if damage would be dealt to "),
+            self_ref,
+            tag(", instead that damage is dealt, but all other damage already dealt to "),
+            self_ref,
+            tag(" is healed"),
+        ),
+        opt(char('.')),
+    ));
+    combinator.parse(norm_lower.trim()).ok()?;
+
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::DealtDamage)
+            .execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::RemoveAllDamage {
+                    target: TargetFilter::SelfRef,
+                },
+            ))
+            .description(original_text.to_string()),
+    )
 }
 
 fn parse_damage_to_self_instead_followup(
@@ -7253,6 +7629,44 @@ mod tests {
         assert_eq!(def.event, ReplacementEvent::Untap);
         assert_eq!(def.condition, Some(ReplacementCondition::DuringUntapStep));
         assert!(def.execute.is_some());
+    }
+
+    #[test]
+    fn turned_face_up_replacement_megamorph() {
+        // CR 614.1e + CR 708.11: "As ~ is turned face up,
+        // [effect]" is a TurnFaceUp REPLACEMENT (applies as the permanent is
+        // turned up — no stack trigger), bound to the permanent itself.
+        let def = parse_replacement_line(
+            "As this creature is turned face up, put five +1/+1 counters on it.",
+            "Hooded Hydra",
+        )
+        .expect("turn-face-up replacement should parse");
+        assert_eq!(def.event, ReplacementEvent::TurnFaceUp);
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+        let execute = def.execute.expect("alternative effect must be parsed");
+        assert!(
+            matches!(&*execute.effect, Effect::PutCounter { .. }),
+            "expected PutCounter, got {:?}",
+            execute.effect
+        );
+    }
+
+    #[test]
+    fn turned_face_up_replacement_gaps_external_target_choice() {
+        // CR 708.11: an "As ~ is turned face up" effect applies during the
+        // turn-up with no targeting window. Gift of Doom's "you may attach it to a
+        // creature" needs an external host choice that cannot be made there, so it
+        // must NOT be modeled as a TurnFaceUp replacement (gapped honestly rather
+        // than mis-resolving the host) — only the self-resolving `SelfRef` class is.
+        let def = parse_replacement_line(
+            "As this permanent is turned face up, you may attach it to a creature.",
+            "Gift of Doom",
+        );
+        assert!(
+            !def.as_ref()
+                .is_some_and(|d| d.event == ReplacementEvent::TurnFaceUp),
+            "attach-to-external-creature must be gapped, got {def:?}"
+        );
     }
 
     /// CR 614.12a: Karoo artifact — Mox Diamond's "you may discard ..." cost.
@@ -9557,6 +9971,51 @@ mod tests {
     }
 
     #[test]
+    fn enters_with_x_counters_where_x_partial_quantity_tail_stays_unimplemented() {
+        assert!(
+            parse_replacement_line(
+                "This creature enters with X +1/+1 counters on it, where X is the total life lost by your opponents this turn and draw a card.",
+                "Test Creature",
+            )
+            .is_none(),
+            "malformed where-X suffix must not silently parse as CostXPaid"
+        );
+    }
+
+    #[test]
+    fn enters_with_x_counters_where_x_keeps_supported_arithmetic_quantity() {
+        let def = parse_replacement_line(
+            "This creature enters with X +1/+1 counters on it, where X is the total life lost by your opponents this turn plus one.",
+            "Test Creature",
+        )
+        .unwrap();
+        match &*def.execute.as_ref().unwrap().effect {
+            Effect::PutCounter { count, .. } => {
+                assert!(
+                    matches!(count, QuantityExpr::Offset { .. }),
+                    "supported arithmetic where-X suffix should parse as Offset, got {count:?}"
+                );
+            }
+            other => panic!("Expected PutCounter, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enters_with_fixed_counters_remains_unchanged() {
+        let def = parse_replacement_line(
+            "This creature enters with three +1/+1 counters on it.",
+            "Test Creature",
+        )
+        .unwrap();
+        match &*def.execute.as_ref().unwrap().effect {
+            Effect::PutCounter { count, .. } => {
+                assert_eq!(count, &QuantityExpr::Fixed { value: 3 });
+            }
+            other => panic!("Expected PutCounter, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn enters_with_x_plus1_plus1_counters_uses_cost_x_paid() {
         // CR 107.3m: Walking Ballista / Endless One / Hangarback Walker class —
         // "enters with X +1/+1 counters on it".
@@ -9803,6 +10262,27 @@ mod tests {
         let def = parse_replacement_line(
             "This creature escapes with a +1/+1 counter on it.",
             "Underworld Rage-Hound",
+        )
+        .unwrap();
+        assert_eq!(def.event, ReplacementEvent::Moved);
+        assert!(matches!(
+            *def.execute.as_ref().unwrap().effect,
+            Effect::PutCounter {
+                ref counter_type,
+                count: QuantityExpr::Fixed { value: 1 },
+                ..
+            } if *counter_type == CounterType::Plus1Plus1
+        ));
+        assert_eq!(def.condition, Some(ReplacementCondition::CastViaEscape));
+    }
+
+    #[test]
+    fn plural_subject_escape_with_counter_keeps_escape_condition() {
+        // CR 702.138c: plural-subject "escape with" is still escape-gated, not
+        // an unconditional battlefield-entry counter replacement.
+        let def = parse_replacement_line(
+            "Creatures you control escape with a +1/+1 counter on them.",
+            "Escape Anthem",
         )
         .unwrap();
         assert_eq!(def.event, ReplacementEvent::Moved);
@@ -10944,6 +11424,36 @@ mod tests {
             }
             other => panic!("Expected Typed filter with IsChosenCreatureType, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn damage_double_all_typed_subject_with_counters() {
+        let def = parse_replacement_line(
+            "Double all damage that creatures you control with counters on them would deal.",
+            "Raphael, the Muscle",
+        )
+        .expect("typed no-instead damage doubler should parse");
+        assert_eq!(def.damage_modification, Some(DamageModification::Double));
+        let Some(TargetFilter::Typed(tf)) = def.damage_source_filter else {
+            panic!(
+                "expected typed damage source filter, got {:?}",
+                def.damage_source_filter
+            );
+        };
+        assert!(tf.type_filters.contains(&TypeFilter::Creature));
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+        assert!(
+            tf.properties.iter().any(|p| matches!(
+                p,
+                FilterProp::Counters {
+                    counters: CounterMatch::Any,
+                    comparator: Comparator::GE,
+                    count: QuantityExpr::Fixed { value: 1 },
+                }
+            )),
+            "expected any-counter qualifier, got {:?}",
+            tf.properties
+        );
     }
 
     #[test]
@@ -13386,6 +13896,129 @@ mod snapshot_tests {
             "the next time you would draw a card this turn, draw two cards instead"
         )
         .is_none());
+    }
+
+    #[test]
+    fn oneshot_next_n_damage_to_target_redirected_to_source() {
+        // Daughter of Autumn — "{W}: The next 1 damage that would be dealt to
+        // target white creature this turn is dealt to ~ instead." The ORIGINAL
+        // recipient is a chosen target; the redirect destination is the source
+        // itself (`~` → SourceObject), which needs no redirect slot.
+        let effect = parse_oneshot_damage_replacement(
+            "the next 1 damage that would be dealt to target white creature this turn is dealt to ~ instead",
+        )
+        .expect("must parse redirect-target-to-source one-shot");
+        match effect {
+            Effect::CreateDamageReplacement {
+                modification: None,
+                redirect_to: Some(DamageRedirectTarget::SourceObject),
+                redirect_amount: Some(PreventionAmount::Next(1)),
+                // CR 115.1: the protected creature is a chosen original-recipient
+                // target (surfaces the recipient slot), not a broad scope.
+                recipient_object_filter: Some(TargetFilter::Typed(_)),
+                redirect_object_filter: None,
+                source_filter: None,
+                combat_scope: None,
+                target_filter: None,
+            } => {}
+            other => panic!("expected redirect-target->source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oneshot_next_n_damage_to_target_redirected_to_controller() {
+        // Vassal's Duty — "{1}: The next 1 damage that would be dealt to target
+        // legendary creature you control this turn is dealt to you instead." The
+        // redirect destination is the controller (`you` → Controller).
+        let effect = parse_oneshot_damage_replacement(
+            "the next 1 damage that would be dealt to target legendary creature you control this turn is dealt to you instead",
+        )
+        .expect("must parse redirect-target-to-controller one-shot");
+        match effect {
+            Effect::CreateDamageReplacement {
+                modification: None,
+                redirect_to: Some(DamageRedirectTarget::Controller),
+                redirect_amount: Some(PreventionAmount::Next(1)),
+                recipient_object_filter: Some(TargetFilter::Typed(_)),
+                redirect_object_filter: None,
+                source_filter: None,
+                combat_scope: None,
+                target_filter: None,
+            } => {}
+            other => panic!("expected redirect-target->controller, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oneshot_target_redirect_does_not_steal_en_kor_self_recipient() {
+        // The en-Kor self-recipient form ("...dealt to ~ this turn is dealt to
+        // target creature...") must still parse via its own sibling (recipient =
+        // SelfRef), NOT the new target-recipient arm.
+        let effect = parse_oneshot_damage_replacement(
+            "the next 1 damage that would be dealt to ~ this turn is dealt to target creature you control instead",
+        )
+        .expect("en-Kor self redirect must still parse");
+        assert!(
+            matches!(
+                effect,
+                Effect::CreateDamageReplacement {
+                    recipient_object_filter: Some(TargetFilter::SelfRef),
+                    redirect_to: Some(DamageRedirectTarget::ChosenObjectTarget),
+                    ..
+                }
+            ),
+            "en-Kor self-recipient form regressed: {effect:?}"
+        );
+    }
+
+    #[test]
+    fn oneshot_next_n_damage_to_target_redirected_to_chosen_target() {
+        // Razia, Boros Archangel — "{T}: The next 3 damage that would be dealt to
+        // target creature you control this turn is dealt to another target
+        // creature instead." Both the original recipient AND the redirect
+        // destination are chosen object targets (two slots).
+        let effect = parse_oneshot_damage_replacement(
+            "the next 3 damage that would be dealt to target creature you control this turn is dealt to another target creature instead",
+        )
+        .expect("must parse redirect-target-to-chosen-target one-shot");
+        match effect {
+            Effect::CreateDamageReplacement {
+                modification: None,
+                redirect_to: Some(DamageRedirectTarget::ChosenObjectTarget),
+                redirect_amount: Some(PreventionAmount::Next(3)),
+                recipient_object_filter: Some(TargetFilter::Typed(_)),
+                // CR 115.1: the "another target creature" redirect surfaces its
+                // own chosen-object slot.
+                redirect_object_filter: Some(TargetFilter::Typed(_)),
+                source_filter: None,
+                combat_scope: None,
+                target_filter: None,
+            } => {}
+            other => panic!("expected recipient+redirect both chosen targets, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oneshot_redirect_to_any_target_fails_closed() {
+        // CR 115.1: an "any target" redirect can resolve to a player, but the
+        // CreateDamageReplacement resolver stores only OBJECT redirect targets, so
+        // a player choice would silently drop the redirect. Both the `~`-recipient
+        // (Zhalfirin Crusader) and chosen-target-recipient forms must therefore
+        // fail closed on "any target" rather than mis-model it.
+        assert!(
+            parse_oneshot_damage_replacement(
+                "the next 1 damage that would be dealt to ~ this turn is dealt to any target instead",
+            )
+            .is_none(),
+            "en-Kor 'any target' redirect must fail closed (object-only resolver)"
+        );
+        assert!(
+            parse_oneshot_damage_replacement(
+                "the next 1 damage that would be dealt to target creature you control this turn is dealt to any target instead",
+            )
+            .is_none(),
+            "chosen-recipient 'any target' redirect must fail closed (object-only resolver)"
+        );
     }
 
     /// CR 614.1a + CR 614.6 + CR 121.6 + CR 701.20a: Abundance — the

@@ -19124,8 +19124,12 @@ pub(crate) fn parse_effect_chain_ir(
         let difference_lose = condition.as_ref().and_then(|cond| {
             let lower = text_no_qty.to_lowercase();
             let clean = lower.trim().trim_end_matches('.');
-            if clean == "lose life equal to the difference"
-                || clean == "they lose life equal to the difference"
+            if all_consuming(alt((
+                tag::<_, _, OracleError<'_>>("lose life equal to the difference"),
+                tag("they lose life equal to the difference"),
+            )))
+            .parse(clean)
+            .is_ok()
             {
                 conditions::difference_expr(cond).map(|diff| {
                     parsed_clause(Effect::LoseLife {
@@ -34159,7 +34163,10 @@ mod tests {
         let trigger = &triggers[0];
         assert_eq!(trigger.mode, TriggerMode::DamageReceived);
         assert!(
-            matches!(trigger.condition, Some(TriggerCondition::QuantityComparison { .. })),
+            matches!(
+                trigger.condition,
+                Some(TriggerCondition::QuantityComparison { .. })
+            ),
             "emblem trigger must gate on life lost < 8, got {:?}",
             trigger.condition
         );
@@ -34189,10 +34196,7 @@ mod tests {
         match &*def.effect {
             Effect::LoseLife { amount, target } => {
                 assert_eq!(*target, Some(TargetFilter::ParentTarget));
-                assert!(matches!(
-                    amount,
-                    QuantityExpr::Difference { .. }
-                ));
+                assert!(matches!(amount, QuantityExpr::Difference { .. }));
             }
             other => panic!("expected LoseLife, got {other:?}"),
         }

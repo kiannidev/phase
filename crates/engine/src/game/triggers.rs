@@ -3666,6 +3666,53 @@ pub(crate) fn take_pending_trigger_event_batch(
 /// callers can stash it in `state.pending_trigger_entry` when the entry is
 /// being constructed in pieces across multiple `WaitingFor` cycles (mode
 /// choice, target selection, distribute-among).
+/// CR 603.2c + CR 608.2c: Batched attack triggers whose resolving effect
+/// anaphorically binds `ParentTarget` to the attackers that satisfied the
+/// trigger ("those creatures get +4/+4") inherit that set as propagated
+/// targets at stack-push time.
+fn seed_batched_attack_parent_targets(
+    ability: &mut ResolvedAbility,
+    trigger_event: Option<&GameEvent>,
+) {
+    let Some(GameEvent::AttackersDeclared { attacker_ids, .. }) = trigger_event else {
+        return;
+    };
+    if attacker_ids.is_empty() {
+        return;
+    }
+    let refs: Vec<TargetRef> = attacker_ids
+        .iter()
+        .map(|id| TargetRef::Object(*id))
+        .collect();
+    seed_parent_targets_in_chain(ability, &refs);
+}
+
+fn seed_parent_targets_in_chain(ability: &mut ResolvedAbility, refs: &[TargetRef]) {
+    if ability.targets.is_empty() && effect_uses_parent_target(&ability.effect) {
+        ability.targets = refs.to_vec();
+    }
+    if let Some(sub) = ability.sub_ability.as_mut() {
+        seed_parent_targets_in_chain(sub, refs);
+    }
+    if let Some(else_ab) = ability.else_ability.as_mut() {
+        seed_parent_targets_in_chain(else_ab, refs);
+    }
+}
+
+fn effect_uses_parent_target(effect: &Effect) -> bool {
+    match effect {
+        Effect::Pump { target, .. } | Effect::PumpAll { target, .. } => {
+            matches!(target, TargetFilter::ParentTarget)
+        }
+        Effect::GenericEffect { target, .. } => {
+            matches!(target, Some(TargetFilter::ParentTarget))
+        }
+        _ => effect
+            .target_filter()
+            .is_some_and(|f| matches!(f, TargetFilter::ParentTarget)),
+    }
+}
+
 pub(crate) fn push_pending_trigger_to_stack_with_event_batch(
     state: &mut GameState,
     trigger: PendingTrigger,
@@ -3688,6 +3735,7 @@ pub(crate) fn push_pending_trigger_to_stack_with_event_batch(
     if let Some(origin) = may_trigger_origin {
         ability.set_may_trigger_origin_recursive(origin);
     }
+    seed_batched_attack_parent_targets(&mut ability, trigger_event.as_ref());
 
     let entry_id = ObjectId(state.next_object_id);
     state.next_object_id += 1;

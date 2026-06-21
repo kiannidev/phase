@@ -21044,6 +21044,8 @@ mod pipeline_snapshot_tests {
                             },
                         card_filter: Some(TargetFilter::Typed(TypedFilter { type_filters, .. })),
                         single_use: true,
+                        cast_cost_raise: None,
+                        land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                         ..
                     },
                 ..
@@ -21084,6 +21086,8 @@ mod pipeline_snapshot_tests {
                     permission: CastingPermission::PlayFromExile {
                         card_filter: None,
                         single_use: false,
+                        cast_cost_raise: None,
+                        land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                         ..
                     },
                     ..

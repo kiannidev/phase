@@ -12575,7 +12575,12 @@ mod tests {
             "Full Throttle must not emit printed triggers: {:?}",
             r.triggers
         );
-        assert_eq!(r.abilities.len(), 2, "expected two spell abilities, got {:?}", r.abilities);
+        assert_eq!(
+            r.abilities.len(),
+            2,
+            "expected two spell abilities, got {:?}",
+            r.abilities
+        );
         assert!(matches!(
             r.abilities[0].effect.as_ref(),
             Effect::AdditionalPhase {

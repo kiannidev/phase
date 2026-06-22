@@ -12341,7 +12341,10 @@ mod tests {
         let text = "After this main phase, there are two additional combat phases.";
         let lower = text.to_lowercase();
         let result = parse_imperative_family_ast(text, &lower, &mut ParseContext::default());
-        assert!(result.is_some(), "Should parse main-phase-anchored additional combats");
+        assert!(
+            result.is_some(),
+            "Should parse main-phase-anchored additional combats"
+        );
         let effect = lower_imperative_family_effect(result.unwrap());
         assert!(
             matches!(

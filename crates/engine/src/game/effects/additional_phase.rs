@@ -2,9 +2,9 @@ use crate::game::quantity::resolve_quantity;
 use crate::types::ability::{
     Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter, TargetRef,
 };
-use crate::types::phase::Phase;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{ExtraPhase, GameState};
+use crate::types::phase::Phase;
 
 /// CR 500.8: Add extra phases to the current turn via a LIFO stack.
 /// CR 500.10a: Only adds phases to the affected player's own turn.

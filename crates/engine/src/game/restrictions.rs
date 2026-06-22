@@ -277,6 +277,9 @@ pub fn record_discard(state: &mut crate::types::game_state::GameState, player: P
         .cards_discarded_this_turn_by_player
         .entry(player)
         .or_insert(0) += 1;
+    // CR 611.3a: hand-size-gated continuous effects (Carnage Interpreter, issue
+    // #3991) must re-evaluate when a discard changes the controller's hand.
+    state.layers_dirty.mark_full();
 }
 
 /// CR 702.187b: Stamp a card that was just put into a graveyard by a discard

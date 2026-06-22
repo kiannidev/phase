@@ -1278,6 +1278,7 @@ pub fn execute_draw(state: &mut GameState, events: &mut Vec<GameEvent>) -> Optio
                 }
             }
 
+            let drew = cards_to_draw.len();
             for obj_id in cards_to_draw {
                 zones::move_to_zone(state, obj_id, Zone::Hand, events);
                 // CR 121.1 + CR 504.1: Increment counters BEFORE emitting so
@@ -1303,6 +1304,11 @@ pub fn execute_draw(state: &mut GameState, events: &mut Vec<GameEvent>) -> Optio
                 crate::game::effects::drawn_this_turn_choice::record_drawn_card(
                     state, player_id, obj_id,
                 );
+            }
+            if drew > 0 {
+                // CR 611.3a: hand-size-gated continuous effects must re-evaluate
+                // when a draw changes the controller's hand (issue #3991).
+                state.layers_dirty.mark_full();
             }
         },
     );

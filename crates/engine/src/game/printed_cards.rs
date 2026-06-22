@@ -777,6 +777,7 @@ fn walk_cost(cost: &AbilityCost, out: &mut Vec<String>) {
 fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
     match effect {
         Effect::Intensify { .. } => {}
+        Effect::ApplyPerpetual { .. } => {}
         // Heist exiles a card from an opponent's library at random; it does not
         // name a conjure card, so there is no static face to preload.
         Effect::Heist { .. } | Effect::HeistExile => {}
@@ -981,6 +982,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::Choose { .. }
         | Effect::ChooseDamageSource { .. }
         | Effect::Suspect { .. }
+        | Effect::Unsuspect { .. }
         | Effect::Connive { .. }
         | Effect::PhaseOut { .. }
         | Effect::PhaseIn { .. }
@@ -1012,6 +1014,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::ProcessRadCounters
         | Effect::GrantCastingPermission { .. }
         | Effect::ChooseFromZone { .. }
+        | Effect::ForEachCategoryExile { .. }
         | Effect::ChooseObjectsIntoTrackedSet { .. }
         | Effect::ChooseAndSacrificeRest { .. }
         | Effect::Exploit { .. }
@@ -1527,7 +1530,7 @@ fn shard_colors(shard: &ManaCostShard) -> Vec<ManaColor> {
 
 pub fn derive_colors_from_mana_cost(mana_cost: &ManaCost) -> Vec<ManaColor> {
     match mana_cost {
-        ManaCost::NoCost | ManaCost::SelfManaCost => vec![],
+        ManaCost::NoCost | ManaCost::SelfManaCost | ManaCost::SelfManaValue => vec![],
         ManaCost::Cost { shards, .. } => {
             let mut colors = Vec::new();
             for shard in shards {

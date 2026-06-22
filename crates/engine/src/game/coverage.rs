@@ -49,6 +49,12 @@ fn is_data_carrying_static(mode: &StaticMode) -> bool {
         // marked damage from permanents matching an active such static's
         // `affected` filter. Not registry-keyed (mirrors the marker cluster).
         StaticMode::DamageNotRemovedDuringCleanup
+            // CR 701.60a + CR 701.60d: nullary marker static — runtime
+            // enforcement is the suspect resolver's `can_become_suspected` gate
+            // (effects/suspect.rs), which refuses to designate a permanent
+            // carrying this static. The `affected` filter scopes the protected
+            // permanents. Not registry-keyed (mirrors the marker cluster).
+            | StaticMode::CantBecomeSuspected
             | StaticMode::ReduceAbilityCost { .. }
             | StaticMode::ModifyActivationLimit { .. }
             | StaticMode::AdditionalLandDrop { .. }
@@ -133,6 +139,13 @@ fn is_data_carrying_static(mode: &StaticMode) -> bool {
             // CR 107.4f: PayLifeAsColoredMana carries the `ManaColor` axis
             // (K'rrik = Black; future printings any other color).
             | StaticMode::PayLifeAsColoredMana { .. }
+            // CR 609.4b: SpendManaAsAnyColor carries an optional spell-class
+            // `TargetFilter`. The board-wide `None` shape is registry-keyed;
+            // the spell-filtered `Some` shape (Vizier of the Menagerie) carries
+            // an unbounded filter value space, so coverage support lives here.
+            // Runtime enforcement is in
+            // casting.rs::player_can_spend_as_any_color_for_optional_spell.
+            | StaticMode::SpendManaAsAnyColor { .. }
             // CR 121.6: CantDraw carries `who` (controller vs all_players) —
             // runtime enforcement is in game/effects/draw.rs::allowed_draw_count.
             | StaticMode::CantDraw { .. }
@@ -179,6 +192,17 @@ fn is_data_carrying_static(mode: &StaticMode) -> bool {
             // removing effects). Parameterized — no registry entry; coverage
             // support here.
             | StaticMode::CantHaveKeyword { .. }
+            // CR 708.5: MayLookAtFaceDown is a nullary permission whose affected
+            // filter selects the face-down permanents the controller may look at
+            // (Found Footage, Lumbering Laundry). Runtime enforcement is in
+            // visibility.rs face-down identity redaction. Not registry-keyed.
+            | StaticMode::MayLookAtFaceDown
+            // CR 116.2b + CR 708.7: CantBeTurnedFaceUp is a nullary prohibition
+            // whose affected filter selects the permanents that can't be turned
+            // face up; the optional timing rides on `condition` (Karlov
+            // Watchdog). Runtime enforcement is in morph::turn_face_up. Not
+            // registry-keyed.
+            | StaticMode::CantBeTurnedFaceUp
     )
 }
 
@@ -465,6 +489,7 @@ fn fmt_target(filter: &TargetFilter) -> String {
         TargetFilter::CostPaidObject => "cost-paid object".into(),
         TargetFilter::TriggeringSpellController => "triggering spell's controller".into(),
         TargetFilter::TriggeringSpellOwner => "triggering spell's owner".into(),
+        TargetFilter::TriggeringSourceController => "triggering source's controller".into(),
         TargetFilter::TriggeringPlayer => "triggering player".into(),
         TargetFilter::TriggeringSource => "triggering source".into(),
         TargetFilter::DefendingPlayer => "defending player".into(),
@@ -528,6 +553,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
             FilterProp::BlockingAlone => parts.push("blocking alone".into()),
             FilterProp::Tapped => parts.push("tapped".into()),
             FilterProp::IsSaddled => parts.push("saddled".into()),
+            FilterProp::SaddledSource => parts.push("saddled the source".into()),
             FilterProp::ProtectorMatches { .. } => parts.push("protector matches".into()),
             FilterProp::Untapped => parts.push("untapped".into()),
             FilterProp::HasHasteOrControlledSinceTurnBegan => {
@@ -874,6 +900,7 @@ fn fmt_type_filter(tf: &TypeFilter) -> String {
         TypeFilter::Sorcery => "sorcery",
         TypeFilter::Planeswalker => "planeswalker",
         TypeFilter::Battle => "battle",
+        TypeFilter::Kindred => "kindred",
         TypeFilter::Permanent => "permanent",
         TypeFilter::Card => "card",
         TypeFilter::Any => "any",
@@ -1981,7 +2008,8 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         | Effect::CopySpell { target, .. }
         | Effect::CastCopyOfCard { target, .. }
         | Effect::BecomeCopy { target, .. }
-        | Effect::Suspect { target }
+        | Effect::Suspect { target, .. }
+        | Effect::Unsuspect { target, .. }
         | Effect::Connive { target, .. }
         | Effect::PhaseOut { target }
         | Effect::PhaseIn { target }
@@ -1997,6 +2025,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         // CR 702.50a: EpicCopy's parameters live in its snapshotted ability.
         Effect::EpicCopy { .. } => {}
         Effect::Intensify { .. } => {}
+        Effect::ApplyPerpetual { .. } => {}
         Effect::TurnFaceUp { .. } => {}
         Effect::DestroyAll { target, .. }
         // CR 613.1b: mass gain-control reports its population `filter` like the
@@ -2588,6 +2617,16 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             d.push(("count".into(), count.to_string()));
             d.push(("zone".into(), fmt_zone(zone)));
         }
+        Effect::ForEachCategoryExile { category, zone, .. } => {
+            d.push((
+                "category".into(),
+                match category {
+                    crate::types::ability::IterationCategory::Color => "color".to_string(),
+                    crate::types::ability::IterationCategory::CardType => "card type".to_string(),
+                },
+            ));
+            d.push(("zone".into(), fmt_zone(zone)));
+        }
         Effect::ChooseObjectsIntoTrackedSet {
             chooser,
             filter,
@@ -2663,8 +2702,12 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             d.push(("kept".into(), format!("{:?}", kept_destination)));
             d.push(("rest".into(), format!("{:?}", rest_destination)));
         }
-        Effect::Discover { mana_value_limit } => {
+        Effect::Discover {
+            mana_value_limit,
+            player,
+        } => {
             d.push(("mv limit".into(), format!("{:?}", mana_value_limit)));
+            d.push(("player".into(), format!("{player:?}")));
         }
         // Heist (Arena digital-only): look step records the look count.
         Effect::Heist { look_count, .. } => {
@@ -2797,8 +2840,9 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         Effect::Endure { amount } => {
             d.push(("amount".into(), amount.to_string()));
         }
-        Effect::BlightEffect { count } => {
+        Effect::BlightEffect { count, player } => {
             d.push(("count".into(), count.to_string()));
+            d.push(("player".into(), format!("{player:?}")));
         }
         Effect::Seek {
             filter,
@@ -5705,6 +5749,7 @@ fn condition_feature(cond: &AbilityCondition) -> (&'static str, FeatureSupport) 
         // CR 500.8 + CR 506.1 + CR 608.2c: combat-phase count check; handled by
         // `evaluate_condition` (effects/mod.rs).
         AbilityCondition::FirstCombatPhaseOfTurn => ("FirstCombatPhaseOfTurn", Handled),
+        AbilityCondition::FirstEndStepOfTurn => ("FirstEndStepOfTurn", Handled),
         // CR 614.1a: `ConditionInstead` wraps a general condition with swap-on-true semantics.
         AbilityCondition::ConditionInstead { .. } => ("ConditionInstead", Handled),
         // CR 608.2c + CR 614.1d: "you control a/no [filter]" — handled by
@@ -6024,11 +6069,16 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         StaticCondition::OpponentPoisonAtLeast { .. } => ("OpponentPoisonAtLeast", Unhandled),
         StaticCondition::UnlessPay { .. } => ("UnlessPay", Handled),
         StaticCondition::ControlsCommander { .. } => ("ControlsCommander", Unhandled),
-        StaticCondition::SourceIsEquipped => ("SourceIsEquipped", Unhandled),
-        StaticCondition::SourceIsEnchanted => ("SourceIsEnchanted", Unhandled),
-        StaticCondition::SourceIsMonstrous => ("SourceIsMonstrous", Unhandled),
-        StaticCondition::SourceAttachedToCreature => ("SourceAttachedToCreature", Unhandled),
-        StaticCondition::SourceMatchesFilter { .. } => ("SourceMatchesFilter", Unhandled),
+        // SourceIsEquipped resolved by layers::evaluate_condition (layers.rs:1057)
+        StaticCondition::SourceIsEquipped => ("SourceIsEquipped", Handled),
+        // SourceIsEnchanted resolved by layers::evaluate_condition (layers.rs:1066)
+        StaticCondition::SourceIsEnchanted => ("SourceIsEnchanted", Handled),
+        // SourceIsMonstrous resolved by layers::evaluate_condition (layers.rs:1071)
+        StaticCondition::SourceIsMonstrous => ("SourceIsMonstrous", Handled),
+        // SourceAttachedToCreature resolved by layers::evaluate_condition (layers.rs:1078)
+        StaticCondition::SourceAttachedToCreature => ("SourceAttachedToCreature", Handled),
+        // SourceMatchesFilter resolved by layers::evaluate_condition (layers.rs:1104)
+        StaticCondition::SourceMatchesFilter { .. } => ("SourceMatchesFilter", Handled),
         StaticCondition::SourceIsPaired => ("SourceIsPaired", Handled),
         // CR 113.6b: evaluated by `layers::evaluate_condition` — checks source
         // object's zone against the specified zone. Runtime-handled.
@@ -7252,6 +7302,8 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
             StaticMode::CantAttack => effective_lower.contains("can't attack"),
             StaticMode::CantBlock => effective_lower.contains("can't block"),
             StaticMode::CantAttackOrBlock => effective_lower.contains("can't attack or block"),
+            // CR 701.60a + CR 701.60d: Airtight Alibi's "can't become suspected".
+            StaticMode::CantBecomeSuspected => effective_lower.contains("can't become suspected"),
             StaticMode::CantCrew => {
                 effective_lower.contains("can't crew") || effective_lower.contains("cannot crew")
             }
@@ -10907,6 +10959,41 @@ mod tests {
             FeatureSupport::Handled,
             "StaticCondition::UnlessPay is resolved by combat-tax payment handling",
         );
+    }
+
+    /// Drift guard for MSH Wave 5a Group I: the five source-state static
+    /// conditions are resolved at runtime by `layers::evaluate_condition`, so the
+    /// classifier must report them `Handled` (their cards — Armed Assailant,
+    /// Fleecemane Lion, Patriot — were falsely flagged unsupported). Pins EXACTLY
+    /// the flipped variants; sibling stubs (UnlessPay, Unrecognized, etc.) are
+    /// intentionally NOT asserted here so a future stub does not silently pass.
+    #[test]
+    fn source_state_static_conditions_are_marked_handled() {
+        let conditions: [(StaticCondition, &str); 5] = [
+            (StaticCondition::SourceIsEquipped, "SourceIsEquipped"),
+            (StaticCondition::SourceIsEnchanted, "SourceIsEnchanted"),
+            (StaticCondition::SourceIsMonstrous, "SourceIsMonstrous"),
+            (
+                StaticCondition::SourceAttachedToCreature,
+                "SourceAttachedToCreature",
+            ),
+            (
+                StaticCondition::SourceMatchesFilter {
+                    filter: TargetFilter::Any,
+                },
+                "SourceMatchesFilter",
+            ),
+        ];
+
+        for (condition, expected_name) in conditions {
+            let (name, support) = static_condition_feature(&condition);
+            assert_eq!(name, expected_name);
+            assert_eq!(
+                support,
+                FeatureSupport::Handled,
+                "StaticCondition::{expected_name} is resolved by layers::evaluate_condition",
+            );
+        }
     }
 
     /// CR 614.1b + CR 614.10: `SkipStep { step: Draw }` must be recognised by

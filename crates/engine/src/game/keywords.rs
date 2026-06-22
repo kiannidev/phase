@@ -8,11 +8,13 @@ use crate::types::ability::{AbilityCost, CastVariantPaid, NinjutsuVariant};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{GameState, WaitingFor};
 use crate::types::identifiers::{CardId, ObjectId};
-use crate::types::keywords::{FlashbackCost, Keyword, KeywordKind, ProtectionTarget};
+use crate::types::keywords::{
+    EmbalmCost, EternalizeCost, FlashbackCost, Keyword, KeywordKind, ProtectionTarget,
+};
 use crate::types::mana::ManaCost;
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
-use crate::types::statics::StaticMode;
+use crate::types::statics::{CostModifyMode, StaticMode};
 use crate::types::zones::Zone;
 
 /// Check if a game object has a specific keyword, using discriminant-based matching
@@ -160,6 +162,22 @@ pub fn effective_mayhem_cost(state: &GameState, object_id: ObjectId) -> Option<M
     }
 }
 
+/// CR 702.180a: Effective Harmonize alt-cost for a card in the graveyard,
+/// honoring off-zone keyword grants (e.g. Songcrafter Mage's "target instant or
+/// sorcery card in your graveyard gains harmonize until end of turn. Its
+/// harmonize cost is equal to its mana cost.") in addition to a printed Harmonize
+/// keyword. Resolves `ManaCost::SelfManaCost` to the card's own mana cost via
+/// `resolve_keyword_mana_cost`, mirroring `effective_mayhem_cost`. The
+/// tap-a-creature cost reduction (CR 702.180a/b) is applied separately at
+/// payment time.
+pub fn effective_harmonize_cost(state: &GameState, object_id: ObjectId) -> Option<ManaCost> {
+    let keyword = effective_keyword_for_object(state, object_id, KeywordKind::Harmonize)?;
+    match keyword {
+        Keyword::Harmonize(cost) => Some(resolve_keyword_mana_cost(state, object_id, &cost)),
+        _ => None,
+    }
+}
+
 /// CR 702.190a: Effective Sneak alt-cost for an object, honoring off-zone characteristic
 /// grants (e.g., Ninja Teen's "creature cards in your graveyard have sneak {cost}").
 pub fn effective_sneak_cost(state: &GameState, object_id: ObjectId) -> Option<ManaCost> {
@@ -210,7 +228,43 @@ fn resolve_keyword_mana_cost(state: &GameState, object_id: ObjectId, cost: &Mana
             .get(&object_id)
             .map(|obj| obj.mana_cost.clone())
             .unwrap_or(ManaCost::NoCost),
+        // CR 202.3: Mana value is a single number; keyword costs bound to mana
+        // value resolve to that much generic mana, not the card's colored cost.
+        ManaCost::SelfManaValue => state
+            .objects
+            .get(&object_id)
+            .map(|obj| ManaCost::generic(obj.mana_cost.mana_value()))
+            .unwrap_or(ManaCost::NoCost),
         _ => cost.clone(),
+    }
+}
+
+/// CR 702.97a / CR 702.128a / CR 702.129a / CR 702.141a + CR 602.1a: Resolve a
+/// `ManaCost::SelfManaCost` or `ManaCost::SelfManaValue` payload carried by a
+/// granted graveyard activated keyword to the recipient card's concrete mana
+/// sub-cost. Encore / Scavenge / Embalm / Eternalize are graveyard *activated*
+/// abilities whose mana sub-cost is paid through `AbilityCost::Mana`, and that
+/// payment path treats self-referential placeholders as free — so they must be
+/// concretized before the activated ability is synthesized. Non-self-referential
+/// keywords (printed Embalm `{3}{W}`, Encore `{5}`, or any other keyword) pass
+/// through unchanged.
+pub fn resolve_self_cost_graveyard_activated_keyword(
+    state: &GameState,
+    object_id: ObjectId,
+    keyword: &Keyword,
+) -> Keyword {
+    match keyword {
+        Keyword::Encore(cost) => Keyword::Encore(resolve_keyword_mana_cost(state, object_id, cost)),
+        Keyword::Scavenge(cost) => {
+            Keyword::Scavenge(resolve_keyword_mana_cost(state, object_id, cost))
+        }
+        Keyword::Embalm(EmbalmCost::Mana(cost)) => Keyword::Embalm(EmbalmCost::Mana(
+            resolve_keyword_mana_cost(state, object_id, cost),
+        )),
+        Keyword::Eternalize(EternalizeCost::Mana(cost)) => Keyword::Eternalize(
+            EternalizeCost::Mana(resolve_keyword_mana_cost(state, object_id, cost)),
+        ),
+        other => other.clone(),
     }
 }
 
@@ -753,12 +807,20 @@ fn apply_ability_cost_reduction(
             continue;
         }
         if let StaticMode::ReduceAbilityCost {
+            ref mode,
             ref keyword,
             amount,
             ref dynamic_count,
             ..
         } = static_def.mode
         {
+            // CR 118.7: This ninjutsu-cost path only subtracts. A directional
+            // static in the `Raise` direction keyed on the same keyword must not
+            // reach the subtraction below — skip it (cost increases on ninjutsu
+            // are not modeled here; this path is reduction-only by construction).
+            if !matches!(mode, CostModifyMode::Reduce) {
+                continue;
+            }
             if keyword == ability_keyword {
                 // CR 601.2f: When dynamic_count is present, the total reduction is
                 // amount * resolve_quantity(dynamic_count). E.g., "cost {1} less for each Dragon".

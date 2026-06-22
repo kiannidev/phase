@@ -1442,6 +1442,7 @@ fn mana_cost_string(cost: &ManaCost) -> String {
     match cost {
         ManaCost::NoCost => String::new(),
         ManaCost::SelfManaCost => "its mana cost".to_string(),
+        ManaCost::SelfManaValue => "its mana value".to_string(),
         ManaCost::Cost { shards, generic } => {
             let mut out = String::new();
             if *generic > 0 {
@@ -2160,6 +2161,9 @@ mod tests {
                 "chooseTargetCard",
                 WaitingFor::TriggerTargetSelection {
                     player: PlayerId(0),
+                    trigger_controller: None,
+                    trigger_event: None,
+                    trigger_events: Vec::new(),
                     target_slots: vec![TargetSelectionSlot {
                         legal_targets: vec![TargetRef::Object(ObjectId(1))],
                         optional: false,

@@ -1266,6 +1266,42 @@ fn rebuild_static_index_at_top() -> bool {
     true
 }
 
+/// CR 701.60c: A suspected permanent has menace and "This creature can't block"
+/// for as long as it's suspected. The suspected designation (`is_suspected`,
+/// CR 701.60b) is the source of truth; the menace + "can't block" abilities are
+/// a continuous effect *derived* from it, not stored on the permanent's copiable
+/// values. Re-deriving them here — directly onto the just-reset live `keywords`
+/// / `static_definitions` (NOT `base_*`) every layers pass — keeps them present
+/// exactly while the designation holds and leaves the permanent's printed
+/// abilities untouched: clearing the designation (Effect::Unsuspect) simply
+/// stops re-deriving them, and a naturally-menace creature keeps its printed
+/// menace when it stops being suspected.
+///
+/// Called from the Step-1 reset of both the full (`evaluate_layers`) and
+/// incremental (`apply_layers_incremental`) passes, immediately after the live
+/// fields are reset to base, so the derived grant rides along with every reset.
+fn derive_suspected_abilities(obj: &mut crate::game::game_object::GameObject) {
+    if !obj.is_suspected {
+        return;
+    }
+    // CR 701.60c: menace. Skip if the permanent already has it (printed or
+    // otherwise granted) so the derivation is idempotent and a later removal of
+    // the printed copy still leaves exactly the derived one.
+    if !obj.keywords.iter().any(|k| matches!(k, Keyword::Menace)) {
+        obj.keywords.push(Keyword::Menace);
+    }
+    // CR 701.60c: "This creature can't block." Skip if a `CantBlock` static is
+    // already present (printed or otherwise granted).
+    if !obj
+        .static_definitions
+        .iter_all()
+        .any(|s| s.mode == StaticMode::CantBlock)
+    {
+        obj.static_definitions
+            .push(StaticDefinition::new(StaticMode::CantBlock));
+    }
+}
+
 /// Unconditional full layer evaluation (CR 613.1).
 ///
 /// Production code must NOT call this directly — go through [`flush_layers`],
@@ -1361,6 +1397,10 @@ pub fn evaluate_layers(state: &mut GameState) {
             obj.assigns_damage_from_toughness = false;
             obj.assigns_damage_as_though_unblocked = false;
             obj.assigns_no_combat_damage = false;
+            // CR 701.60c: re-derive the suspected designation's menace +
+            // "can't block" onto the just-reset live fields (not base), so the
+            // grant lasts exactly as long as the designation.
+            derive_suspected_abilities(obj);
         }
     }
     // CR 702.94a + CR 400.3: Hand-zone continuous effects (Lorehold-style
@@ -2038,6 +2078,10 @@ fn apply_layers_incremental(state: &mut GameState, entered_ids: &HashSet<ObjectI
             obj.assigns_damage_from_toughness = false;
             obj.assigns_damage_as_though_unblocked = false;
             obj.assigns_no_combat_damage = false;
+            // CR 701.60c: re-derive the suspected designation's menace +
+            // "can't block" onto the just-reset live fields (mirrors the full
+            // pass) so the incremental path agrees with `evaluate_layers`.
+            derive_suspected_abilities(obj);
         }
     }
 
@@ -2761,6 +2805,24 @@ pub(crate) fn gather_transient_continuous_effects(
 
         for (mod_index, modification) in tce.modifications.iter().enumerate() {
             if is_combat_assignment_rule_modification(modification) {
+                continue;
+            }
+            // CR 708.5: A `MayLookAtFaceDown` look permission (Lumbering Laundry's
+            // duration-bound grant) is a player-scoped visibility permission read
+            // directly off the TCE by `visibility::viewer_may_look_at_face_down`
+            // — never applied to an object's `static_definitions` through the
+            // layer system. Its `affected` filter (face-down creatures you don't
+            // control) matches OPPONENT permanents, so feeding it into the object
+            // layer gather would erroneously stamp the permission onto each
+            // opponent's face-down creature. Skip it here, mirroring the printed
+            // `MayLookAtFaceDown` static (built with empty `modifications`, read
+            // by mode in `battlefield_active_statics`).
+            if matches!(
+                modification,
+                ContinuousModification::AddStaticMode {
+                    mode: StaticMode::MayLookAtFaceDown,
+                }
+            ) {
                 continue;
             }
             effects.push(ActiveContinuousEffect {
@@ -4166,8 +4228,13 @@ fn apply_continuous_effect_filtered(
             // subtypes (e.g., creature subtypes on Land Creatures) are preserved.
             // Abilities granted by other effects are re-added in Layer 6.
             // Intrinsic mana abilities are derived from subtypes in mana_sources.rs.
+            // CR 613.1f: mirror RemoveAllAbilities — suppress the recipient's
+            // own printed continuous statics for the rest of this pass so layer
+            // 6 cannot re-install rules-text abilities the subtype change removed
+            // (Song of the Dryads class — issue #3279).
             ContinuousModification::SetBasicLandType { land_type } => {
                 set_land_subtype_replacing(obj, land_type.as_subtype_str().to_string());
+                abilities_suppressed.insert(id);
             }
             // CR 305.7 + CR 305.6: Set the land's subtype to the basic land type
             // chosen by the granting source (Phantasmal Terrain, Convincing
@@ -4181,6 +4248,7 @@ fn apply_continuous_effect_filtered(
             ContinuousModification::SetChosenBasicLandType => {
                 if let Some(ref subtype) = chosen_subtype {
                     set_land_subtype_replacing(obj, subtype.clone());
+                    abilities_suppressed.insert(id);
                 }
             }
             // CR 707.9a: Retain the source's printed trigger on the copy.
@@ -4642,6 +4710,93 @@ mod tests {
             PlayerId(0),
             src,
         ));
+    }
+
+    /// Cavernous Maw (std BATCH 12): the `{2}` animation turns the land into a
+    /// 3/3 Elemental creature while "It's still a Cave land" (CR 205.1b, CR 305.7)
+    /// retains the Land card type and Cave subtype. This drives the parsed
+    /// modification set through the real layer engine and asserts the composition
+    /// is runtime-sound: the animated permanent is a 3/3 Creature that is STILL a
+    /// Cave Land (CR 613.1d Layer 4 additive type/subtype ordering). The
+    /// animation's `RemoveAllSubtypes { Creature }` (CR 205.1a) wipes only the
+    /// creature-type set, so the Cave land subtype survives.
+    #[test]
+    fn cavernous_maw_animation_retains_cave_land_through_layers() {
+        let mut state = setup();
+        let id = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Cavernous Maw".to_string(),
+            Zone::Battlefield,
+        );
+        let ts = state.next_timestamp();
+        {
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.card_types.core_types.push(CoreType::Land);
+            obj.card_types.subtypes.push("Cave".to_string());
+            obj.base_card_types = obj.card_types.clone();
+            obj.timestamp = ts;
+        }
+
+        // The full `{2}` activated-ability animation as parsed: the
+        // "becomes a 3/3 Elemental creature" modifications followed by the
+        // "It's still a Cave land" retention re-assertions.
+        let animation = StaticDefinition::continuous()
+            .affected(TargetFilter::SelfRef)
+            .modifications(vec![
+                ContinuousModification::SetPower { value: 3 },
+                ContinuousModification::SetToughness { value: 3 },
+                ContinuousModification::AddType {
+                    core_type: CoreType::Creature,
+                },
+                ContinuousModification::RemoveAllSubtypes {
+                    set: crate::types::card_type::SubtypeSet::Creature,
+                },
+                ContinuousModification::AddSubtype {
+                    subtype: "Elemental".to_string(),
+                },
+                // "It's still a Cave land" — the clause this batch unblocks.
+                ContinuousModification::AddType {
+                    core_type: CoreType::Land,
+                },
+                ContinuousModification::AddSubtype {
+                    subtype: "Cave".to_string(),
+                },
+            ]);
+        {
+            let obj = state.objects.get_mut(&id).unwrap();
+            Arc::make_mut(&mut obj.base_static_definitions).push(animation.clone());
+            obj.static_definitions.push(animation);
+        }
+
+        evaluate_layers(&mut state);
+
+        let obj = &state.objects[&id];
+        assert_eq!(obj.power, Some(3), "animated to 3 power");
+        assert_eq!(obj.toughness, Some(3), "animated to 3 toughness");
+        assert!(
+            obj.card_types.core_types.contains(&CoreType::Creature),
+            "must be a creature, got {:?}",
+            obj.card_types.core_types
+        );
+        // CR 205.1b: "still a Cave land" — both the Land card type and the Cave
+        // land subtype must survive the animation.
+        assert!(
+            obj.card_types.core_types.contains(&CoreType::Land),
+            "must still be a Land, got {:?}",
+            obj.card_types.core_types
+        );
+        assert!(
+            obj.card_types.subtypes.iter().any(|s| s == "Cave"),
+            "must still be a Cave, got {:?}",
+            obj.card_types.subtypes
+        );
+        assert!(
+            obj.card_types.subtypes.iter().any(|s| s == "Elemental"),
+            "must gain the Elemental creature type, got {:?}",
+            obj.card_types.subtypes
+        );
     }
 
     /// CR 613.4c + CR 704.5f: A runaway `+X/+X` chain (e.g. from a `ObjectCount`
@@ -9839,6 +9994,86 @@ mod tests {
         ));
     }
 
+    // CR 301.5 + CR 303.4: `SourceAttachedToCreature` gates a continuous
+    // modification on the source Aura/Equipment being attached to a CREATURE
+    // host. No attachment → false; attached to a non-creature (e.g. a land) →
+    // false; attached to a creature → true. Discriminating: revert the eval arm
+    // (or the `as_object` / creature-core-type filter) and the negative cases
+    // start reporting true, re-exposing the always-true `Unrecognized` fallback.
+    #[test]
+    fn source_attached_to_creature_gates() {
+        use crate::game::game_object::AttachTarget;
+        let mut state = setup();
+        let aura = make_creature(&mut state, "Roving Aura", 0, 0, PlayerId(0));
+
+        // No attachment → false.
+        assert!(!evaluate_condition_for_test(
+            &state,
+            &StaticCondition::SourceAttachedToCreature,
+            PlayerId(0),
+            aura,
+        ));
+
+        // Attached to a non-creature host (a land) → false.
+        let land = make_land(&mut state, "Forest", PlayerId(0));
+        state.objects.get_mut(&aura).unwrap().attached_to = Some(AttachTarget::Object(land));
+        assert!(!evaluate_condition_for_test(
+            &state,
+            &StaticCondition::SourceAttachedToCreature,
+            PlayerId(0),
+            aura,
+        ));
+
+        // Attached to a creature host → true.
+        let bear = make_creature(&mut state, "Host Bear", 2, 2, PlayerId(0));
+        state.objects.get_mut(&aura).unwrap().attached_to = Some(AttachTarget::Object(bear));
+        assert!(evaluate_condition_for_test(
+            &state,
+            &StaticCondition::SourceAttachedToCreature,
+            PlayerId(0),
+            aura,
+        ));
+    }
+
+    // CR 608.2c: `SourceMatchesFilter` gates a continuous modification on the
+    // source matching a `TargetFilter` (leveler-style cards). A creature filter
+    // matches a creature source → true; once the source loses its Creature core
+    // type → false. Discriminating: revert the eval arm and the mismatched case
+    // reports true, re-exposing the always-true `Unrecognized` fallback.
+    #[test]
+    fn source_matches_filter_gates() {
+        let mut state = setup();
+        let creature = make_creature(&mut state, "Figure", 2, 2, PlayerId(0));
+        let filter = TargetFilter::Typed(TypedFilter::creature());
+
+        // Source is a creature → matches.
+        assert!(evaluate_condition_for_test(
+            &state,
+            &StaticCondition::SourceMatchesFilter {
+                filter: filter.clone(),
+            },
+            PlayerId(0),
+            creature,
+        ));
+
+        // Strip the Creature core type → no longer matches a creature filter.
+        {
+            let obj = state.objects.get_mut(&creature).unwrap();
+            obj.card_types
+                .core_types
+                .retain(|t| *t != CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+        }
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+        assert!(!evaluate_condition_for_test(
+            &state,
+            &StaticCondition::SourceMatchesFilter { filter },
+            PlayerId(0),
+            creature,
+        ));
+    }
+
     // --- CR 305.7: SetBasicLandType tests ---
 
     fn make_land(state: &mut GameState, name: &str, player: PlayerId) -> ObjectId {
@@ -10076,6 +10311,49 @@ mod tests {
                 .iter()
                 .any(|ability| matches!(&*ability.effect, Effect::GainLife { .. })),
             "CR 305.7: attach_to must flush layers so rules-text abilities are removed"
+        );
+    }
+
+    #[test]
+    fn song_of_dryads_from_oracle_strips_host_triggers_and_statics() {
+        use crate::game::effects::attach::attach_to;
+
+        let mut scenario = GameScenario::new();
+        let host = {
+            let mut card = scenario.add_creature(PlayerId(0), "Obuun, Mul Daya Ancestor", 3, 3);
+            card.from_oracle_text(
+                "At the beginning of combat on your turn, up to one target land you control becomes an X/X Elemental creature with trample and haste until end of turn, where X is Obuun's power. It's still a land.\nLandfall — Whenever a land you control enters, put a +1/+1 counter on target creature.",
+            );
+            card.with_trigger(TriggerMode::Attacks);
+            card.id()
+        };
+        let song = scenario
+            .add_creature(PlayerId(0), "Song of the Dryads", 0, 0)
+            .as_enchantment()
+            .from_oracle_text("Enchant permanent\nEnchanted permanent is a colorless Forest land.")
+            .id();
+
+        let mut state = scenario.build().state().clone();
+        state
+            .objects
+            .get_mut(&song)
+            .unwrap()
+            .card_types
+            .subtypes
+            .push("Aura".to_string());
+
+        attach_to(&mut state, song, host);
+
+        let host_obj = state.objects.get(&host).unwrap();
+        assert_eq!(host_obj.card_types.core_types, vec![CoreType::Land]);
+        assert!(host_obj.card_types.subtypes.contains(&"Forest".to_string()));
+        assert!(
+            host_obj.trigger_definitions.is_empty(),
+            "CR 305.7: printed triggers must be removed"
+        );
+        assert!(
+            host_obj.static_definitions.is_empty(),
+            "CR 305.7: printed statics must be removed"
         );
     }
 
@@ -10670,6 +10948,8 @@ mod tests {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
+                cast_cost_raise: None,
+                land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
 
         prune_end_of_turn_casting_permissions(&mut state);
@@ -10697,6 +10977,8 @@ mod tests {
             card_filter: None,
             single_use_group: None,
             single_use: false,
+            cast_cost_raise: None,
+            land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         });
         perms.push(CastingPermission::PlayFromExile {
             duration: Duration::Permanent,
@@ -10708,6 +10990,8 @@ mod tests {
             card_filter: None,
             single_use_group: None,
             single_use: false,
+            cast_cost_raise: None,
+            land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         });
         perms.push(CastingPermission::AdventureCreature);
 
@@ -10747,6 +11031,8 @@ mod tests {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
+                cast_cost_raise: None,
+                land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
 
         // Untap step of the grantee's next turn: armed to UntilEndOfTurn, kept.
@@ -10835,6 +11121,8 @@ mod tests {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
+                cast_cost_raise: None,
+                land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
         state
             .objects
@@ -10853,6 +11141,8 @@ mod tests {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
+                cast_cost_raise: None,
+                land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
 
         // Active player is P0 — only P0's permission should expire.
@@ -10888,6 +11178,8 @@ mod tests {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
+                cast_cost_raise: None,
+                land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
 
         prune_until_next_turn_casting_permissions(&mut state, PlayerId(0));

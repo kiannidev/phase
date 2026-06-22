@@ -118,6 +118,7 @@ pub mod heist;
 pub mod hideaway;
 pub mod incubate;
 pub mod intensify;
+pub mod perpetual;
 // Tests for `heist` live in a sibling file (declared here, not in `heist.rs`,
 // so `heist.rs` stays implementation-only — no inline `#[cfg(test)]` token).
 #[cfg(test)]
@@ -621,6 +622,29 @@ fn drain_pending_repeat_until(state: &mut GameState) {
             }
             let mut events = Vec::new();
             let _ = resolve_ability_chain(state, &ability, &mut events, 1);
+        }
+        // CR 608.2c: resume a paused `WhileCondition` loop after the iteration's
+        // interactive choice (Claim Jumper's library search) has drained. The
+        // stashed ability carries the remaining cap on its own `repeat_until`;
+        // re-evaluate the condition and re-enter `resolve_ability_chain` (which
+        // re-runs the body and re-checks the loop) only when both gates hold.
+        Some(RepeatContinuation::WhileCondition {
+            condition,
+            max_iterations,
+        }) => {
+            let mut remaining = *max_iterations;
+            if !should_repeat_while_condition(state, &ability, condition, &mut remaining) {
+                return;
+            }
+            // Thread the decremented cap into the re-entered loop so a bounded
+            // "once" repeat is not granted an extra iteration on resume.
+            let mut next = (*ability).clone();
+            next.repeat_until = Some(RepeatContinuation::WhileCondition {
+                condition: condition.clone(),
+                max_iterations: remaining,
+            });
+            let mut events = Vec::new();
+            let _ = resolve_ability_chain(state, &next, &mut events, 1);
         }
         None => {}
     }
@@ -1443,6 +1467,8 @@ fn try_begin_reflexive_target_selection(
     };
     let trigger_events = crate::game::triggers::take_pending_trigger_event_batch(state, &pending);
     let pending_for_state = pending.clone();
+    let prompt_trigger_event = pending_for_state.trigger_event.clone();
+    let prompt_trigger_events = trigger_events.clone();
     let entry_id = crate::game::triggers::push_pending_trigger_to_stack_with_event_batch(
         state,
         pending,
@@ -1456,6 +1482,9 @@ fn try_begin_reflexive_target_selection(
     // the controller completes TriggerTargetSelection.
     state.waiting_for = WaitingFor::TriggerTargetSelection {
         player: controller,
+        trigger_controller: Some(controller),
+        trigger_event: prompt_trigger_event,
+        trigger_events: prompt_trigger_events,
         target_slots,
         mode_labels: Vec::new(),
         target_constraints: reflexive.target_constraints.clone(),
@@ -1669,7 +1698,14 @@ pub(super) fn resolve_optional_effect_decision(
                         || (sub.sub_link == SubAbilityLink::SequentialSibling
                             && !sub_ability_is_reflexive(sub)
                             && !(matches!(&ability.effect, Effect::CastFromZone { .. })
-                                && cast_from_zone::is_graveyard_exile_rider_subability(sub)))
+                                && (cast_from_zone::is_graveyard_exile_rider_subability(sub)
+                                    // CR 614.1c + CR 122.1: the enters-with-counter
+                                    // rider is permission metadata (Osteomancer
+                                    // Adept, The Tomb of Aclazotz), not a printed
+                                    // follow-up to execute on decline.
+                                    || cast_from_zone::is_enters_with_counter_rider_subability(
+                                        sub,
+                                    ))))
                 })
             });
             if let Some(branch) = decline_branch {
@@ -1889,6 +1925,7 @@ fn should_resolve_subability_on_optional_decline(ability: &ResolvedAbility) -> b
             | AbilityCondition::WasStartingPlayer { .. }
             | AbilityCondition::SpellCastWithVariantThisTurn { .. }
             | AbilityCondition::FirstCombatPhaseOfTurn
+            | AbilityCondition::FirstEndStepOfTurn
             | AbilityCondition::ZoneChangedThisWay { .. }
             | AbilityCondition::CostPaidObjectMatchesFilter { .. }
             | AbilityCondition::SourceIsTapped
@@ -2263,6 +2300,7 @@ fn collect_effect_quantity_exprs<'a>(effect: &'a Effect, out: &mut Vec<&'a Quant
         | Effect::GainEnergy { amount, .. }
         | Effect::Discover {
             mana_value_limit: amount,
+            ..
         }
         | Effect::PutAtLibraryPosition { count: amount, .. }
         | Effect::GrantExtraLoyaltyActivations { amount, .. }
@@ -2669,6 +2707,7 @@ pub fn resolve_effect(
         Effect::Choose { .. } => choose::resolve(state, ability, events),
         Effect::ChooseDamageSource { .. } => choose_damage_source::resolve(state, ability, events),
         Effect::Suspect { .. } => suspect::resolve(state, ability, events),
+        Effect::Unsuspect { .. } => suspect::resolve_unsuspect(state, ability, events),
         Effect::Connive { .. } => connive::resolve(state, ability, events),
         Effect::PhaseOut { .. } => phase_out::resolve(state, ability, events),
         Effect::PhaseIn { .. } => phase_out::resolve_phase_in(state, ability, events),
@@ -2715,6 +2754,9 @@ pub fn resolve_effect(
         Effect::RingTemptsYou => ring::resolve(state, ability, events),
         Effect::GrantCastingPermission { .. } => grant_permission::resolve(state, ability, events),
         Effect::ChooseFromZone { .. } => choose_from_zone::resolve(state, ability, events),
+        Effect::ForEachCategoryExile { .. } => {
+            choose_from_zone::resolve_for_each_category(state, ability, events)
+        }
         Effect::ChooseObjectsIntoTrackedSet { .. } => {
             choose_objects_into_tracked_set::resolve(state, ability, events)
         }
@@ -2816,6 +2858,7 @@ pub fn resolve_effect(
         Effect::ProcessRadCounters => rad_counters::resolve(state, ability, events),
         Effect::Conjure { .. } => conjure::resolve(state, ability, events),
         Effect::Intensify { .. } => intensify::resolve(state, ability, events),
+        Effect::ApplyPerpetual { .. } => perpetual::resolve(state, ability, events),
         Effect::DraftFromSpellbook { .. } => spellbook::resolve(state, ability, events),
         Effect::ChooseOneOf { .. } => choose_one_of::resolve(state, ability, events),
         Effect::Unimplemented { name, .. } => {
@@ -2855,6 +2898,17 @@ pub(crate) fn next_sub_needs_tracked_set(ability: &ResolvedAbility) -> bool {
         .sub_ability
         .as_deref()
         .is_some_and(ability_or_branch_references_tracked_set)
+}
+
+/// CR 608.2c: Does `ability` (or any of its continuation branches) consume the
+/// chain's tracked set — e.g. a `GrantCastingPermission { target: TrackedSet }`
+/// ("you may play that card") chained after an interactive `ChooseFromZone`?
+/// The interactive `ChooseFromZoneChoice` answer handler uses this to decide
+/// whether the chosen cards must be published as the fresh tracked set the
+/// continuation reads (End-Blaze Epiphany: "choose a card exiled this way …
+/// you may play that card").
+pub(crate) fn chain_references_tracked_set(ability: &ResolvedAbility) -> bool {
+    ability_or_branch_references_tracked_set(ability)
 }
 
 fn ability_or_branch_references_tracked_set(ability: &ResolvedAbility) -> bool {
@@ -3435,6 +3489,20 @@ fn mandatory_parent_effect_performed(effect: &Effect, events: &[GameEvent]) -> b
                 } | GameEvent::ControllerChanged { .. }
             )
         }),
+        // CR 708.7 + CR 608.2c: A resolving "turn this creature face up" (Etrata,
+        // Deadly Fugitive's granted ability) "did anything" iff a permanent
+        // actually became face up. `turn_face_up::resolve` emits `TurnedFaceUp`
+        // only on success — it is skipped when the object was already face up or
+        // when a `CantBeTurnedFaceUp` static (CR 116.2b + CR 708.7) blocks it.
+        // The event's presence is therefore the authoritative "the turn-up
+        // happened" signal, which drives Etrata's "If you can't, exile it …"
+        // rider: that rider gates on `Not { OptionalEffectPerformed }`, so it
+        // fires ONLY when no `TurnedFaceUp` occurred. Without this arm the effect
+        // would fall into the `_ => true` default and always claim success,
+        // suppressing the exile branch even when the turn-up was blocked.
+        Effect::TurnFaceUp { .. } => events
+            .iter()
+            .any(|event| matches!(event, GameEvent::TurnedFaceUp { .. })),
         _ => true,
     }
 }
@@ -4510,7 +4578,71 @@ pub fn resolve_ability_chain(
                 return Ok(());
             }
         },
+        // CR 608.2c: "[if <condition>,] repeat this process [once]" — re-follow
+        // the whole chain while `condition` holds against the just-resolved
+        // state, capped by `max_iterations` additional repeats. Iterates the
+        // same `resolve_chain_body` as `UntilStopConditions`, stashing on an
+        // inner pause so `drain_pending_repeat_until` resumes the loop.
+        Some(RepeatContinuation::WhileCondition {
+            condition,
+            max_iterations,
+        }) => {
+            let mut remaining = max_iterations;
+            loop {
+                // CR 608.2c: each repeated process is a FRESH execution of the
+                // instructions, so its "that card"/"those cards" tracked set must
+                // not extend the prior iteration's. Reset the chain-local
+                // tracked-set identity before every iteration so a producer→copy
+                // chain (Sin: exile a card, then copy THAT card) binds only to the
+                // current iteration's object — otherwise the set accumulates and
+                // the copy multiplies (and the loop never terminates once the
+                // accumulated set keeps the predicate true).
+                state.chain_tracked_set_id = None;
+                let initial_waiting_for = state.waiting_for.clone();
+                resolve_chain_body(state, ability, events, depth)?;
+                if state.waiting_for != initial_waiting_for {
+                    // Inner pause: stash the loop ability with its remaining cap
+                    // so the drain re-evaluates the condition after the choice.
+                    let mut paused = ability.clone();
+                    paused.repeat_until = Some(RepeatContinuation::WhileCondition {
+                        condition: condition.clone(),
+                        max_iterations: remaining,
+                    });
+                    state.pending_repeat_until =
+                        Some(crate::types::game_state::PendingRepeatUntil {
+                            ability: Box::new(paused),
+                        });
+                    return Ok(());
+                }
+                if !should_repeat_while_condition(state, ability, &condition, &mut remaining) {
+                    return Ok(());
+                }
+            }
+        }
     }
+}
+
+/// CR 608.2c: Loop-continuation predicate for `RepeatContinuation::WhileCondition`.
+/// Returns `true` when another iteration must run: the game-state `condition`
+/// holds against the just-resolved state AND the remaining additional-iteration
+/// cap (if any) is not exhausted. When a cap is present it is decremented on each
+/// `true` return so callers thread the running count by re-passing `remaining`.
+fn should_repeat_while_condition(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    condition: &AbilityCondition,
+    remaining: &mut Option<u32>,
+) -> bool {
+    if matches!(remaining, Some(0)) {
+        return false;
+    }
+    if !evaluate_condition(condition, state, ability) {
+        return false;
+    }
+    if let Some(n) = remaining.as_mut() {
+        *n -= 1;
+    }
+    true
 }
 
 /// One full pass of an ability's resolution chain — the parent effect (with its
@@ -5833,6 +5965,18 @@ fn resolve_chain_body(
             return Ok(());
         }
 
+        // CR 614.1c + CR 122.1: CastFromZone consumes the "creature cast this way
+        // enters with a [counter] counter on it" rider as permission metadata
+        // (recorded on the granted `ExileWithAltCost`). Resolving the structural
+        // `AddPendingETBCounters` rider here would read the (absent) SpellCast
+        // trigger event of the granting ability, not the future graveyard cast —
+        // so skip it (Osteomancer Adept, The Tomb of Aclazotz).
+        if matches!(&ability.effect, Effect::CastFromZone { .. })
+            && cast_from_zone::is_enters_with_counter_rider_subability(sub)
+        {
+            return Ok(());
+        }
+
         // Check if the sub_ability has a condition that gates its execution.
         // Casting-time conditions are evaluated against the parent's SpellContext.
         if let Some(ref condition) = sub.condition {
@@ -6595,10 +6739,23 @@ pub(crate) fn evaluate_condition(
                         _ => false,
                     }
                 }
-                Some(_) => {
-                    // Other filter properties not yet supported for revealed card checks
-                    true
-                }
+                // CR 202.3 + CR 700.1: Generic property gates on the revealed card
+                // (e.g. Kellan, Daring Traveler's "creature card with mana value 3
+                // or less" → `FilterProp::Cmc`). Evaluate the property against the
+                // revealed subject through the shared filter evaluator, exactly as
+                // `subtype_filter` does above.
+                Some(prop) => subject_id.is_some_and(|id| {
+                    crate::game::filter::matches_target_filter(
+                        state,
+                        id,
+                        &TargetFilter::Typed(crate::types::ability::TypedFilter {
+                            type_filters: vec![],
+                            controller: None,
+                            properties: vec![prop.clone()],
+                        }),
+                        &crate::game::filter::FilterContext::from_ability(ability),
+                    )
+                }),
                 None => true,
             };
             type_matches && subtype_matches && filter_matches
@@ -6882,6 +7039,10 @@ pub(crate) fn evaluate_condition(
         // CR 500.8 + CR 506.1 + CR 608.2c: "if it's the first combat phase
         // of the turn" gates follow-up effects such as additional combats.
         AbilityCondition::FirstCombatPhaseOfTurn => state.combat_phases_started_this_turn == 1,
+        // CR 500.8 + CR 513.1 + CR 608.2c: "if it's the first end step of the
+        // turn" gates the additional-end-step follow-up (Y'shtola Rhul); only
+        // the first end step schedules another, preventing an infinite loop.
+        AbilityCondition::FirstEndStepOfTurn => state.end_steps_started_this_turn == 1,
         // CR 608.2c: "If a [noun] was [verb]ed this way" — check if any zone-changed
         // object matches the type filter. For optional-targeting parents with no targets
         // chosen, last_zone_changed_ids is empty → returns false.
@@ -11370,6 +11531,7 @@ mod tests {
                         duration: None,
 
                         exile_instead_of_graveyard_on_resolve: false,
+                        enters_with_counter: None,
                     },
                     target: TargetFilter::TrackedSet {
                         id: TrackedSetId(0),
@@ -11466,6 +11628,7 @@ mod tests {
                         duration: None,
 
                         exile_instead_of_graveyard_on_resolve: false,
+                        enters_with_counter: None,
                     },
                     target: TargetFilter::TrackedSet {
                         id: TrackedSetId(0),
@@ -11536,6 +11699,7 @@ mod tests {
                     duration: None,
 
                     exile_instead_of_graveyard_on_resolve: false,
+                    enters_with_counter: None,
                 },
                 target: TargetFilter::TrackedSet {
                     id: TrackedSetId(0),
@@ -13230,6 +13394,8 @@ mod tests {
                     card_filter: None,
                     single_use_group: None,
                     single_use: false,
+                    cast_cost_raise: None,
+                    land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 },
                 target: TargetFilter::TrackedSet {
                     id: TrackedSetId(0),
@@ -15957,6 +16123,8 @@ mod tests {
                     card_filter: None,
                     single_use_group: None,
                     single_use: false,
+                    cast_cost_raise: None,
+                    land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 },
                 target: TargetFilter::TrackedSet {
                     id: TrackedSetId(0),

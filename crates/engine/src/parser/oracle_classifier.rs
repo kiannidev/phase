@@ -198,12 +198,26 @@ fn is_spell_resolution_cast_from_hand_free(lower: &str) -> bool {
 }
 
 fn is_self_spell_cost_modification(lower: &str) -> bool {
+    if is_self_spell_cost_modification_body(lower) {
+        return true;
+    }
+    // CR 207.2c: an ability-word prefix ("Void — This spell costs {2} less to
+    // cast if …", Temporal Intervention) has no rules meaning — strip it so the
+    // self-cost-modification guard recognizes the body. Without this, the
+    // "this turn" inside the gating condition makes `should_defer_spell_to_effect`
+    // route the line to the effect parser, dropping the cost reduction.
+    super::oracle_modal::strip_ability_word(lower)
+        .as_deref()
+        .is_some_and(is_self_spell_cost_modification_body)
+}
+
+fn is_self_spell_cost_modification_body(body: &str) -> bool {
     let Ok((after_subject, _)) = alt((
         tag::<_, _, OracleError<'_>>("this spell costs "),
         tag("this card costs "),
         tag("~ costs "),
     ))
-    .parse(lower) else {
+    .parse(body) else {
         return false;
     };
     let Some((_, after_cost)) = parse_mana_symbols(after_subject) else {
@@ -241,6 +255,10 @@ const STATIC_CONTAINS_PATTERNS: &[&str] = &[
     "can't be copied",
     "can't be the target",
     "can't be sacrificed",
+    // CR 116.2b + CR 708.7: "Permanents your opponents control can't be turned
+    // face up during your turn" (Karlov Watchdog) — prohibition static. Routes
+    // to parse_static_line so it lowers to StaticMode::CantBeTurnedFaceUp.
+    "can't be turned face up",
     "doesn't untap",
     "don't untap",
     "attacks or blocks each combat if able",
@@ -385,6 +403,10 @@ const STATIC_PREFIX_PATTERNS: &[&str] = &[
     "spells you cast ",
     "spells your opponents cast ",
     "you may look at the top card of your library",
+    // CR 708.5: "You may look at face-down creatures [you don't control | your
+    // opponents control] any time." (Found Footage) — top-level look-permission
+    // static. Routed to `parse_static_line` so it lowers to MayLookAtFaceDown.
+    "you may look at face-down creatures",
     "once during each of your turns, you may cast",
     // CR 601.3e: shorter sibling of "once during each of your turns, you may
     // cast" — Maralen, Fae Ascendant prints "Once each turn, you may cast a

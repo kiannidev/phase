@@ -1552,6 +1552,22 @@ fn draw_applier(
     state: &mut GameState,
     _events: &mut Vec<GameEvent>,
 ) -> ApplyResult {
+    use crate::types::ability::QuantityModification;
+    // CR 614.6 + CR 121.6: A `Prevent` draw replacement ("skip that draw
+    // instead", Living Conundrum) fully suppresses the draw — the replaced
+    // event never happens. Carried as a structured `quantity_modification`
+    // (no `execute`), mirroring the lifegain-negation / counter-prevention
+    // surface. Checked before the count-substitution path because a prevented
+    // draw has no surviving count to scale.
+    let prevents = state
+        .objects
+        .get(&rid.source)
+        .and_then(|obj| obj.replacement_definitions.get(rid.index))
+        .and_then(|def| def.quantity_modification.as_ref())
+        .is_some_and(|m| matches!(m, QuantityModification::Prevent));
+    if prevents {
+        return ApplyResult::Prevented;
+    }
     // CR 614.6 + CR 614.11: Count-modifying replacements (Alhammarret's Archive:
     // `count -> 2 * count`) substitute the count via `draw_replacement_count`.
     // Full-substitution replacements (Jace WinTheGame, Abundance reveal-until)
@@ -1931,7 +1947,7 @@ fn gain_life_applier(
         } = event
         {
             let new_amount = match modification {
-                QuantityModification::Double => amount.saturating_mul(2),
+                QuantityModification::Times { factor } => amount.saturating_mul(factor),
                 QuantityModification::Half => amount / 2,
                 QuantityModification::Plus { value } => amount.saturating_add(value),
                 QuantityModification::Minus { value } => amount.saturating_sub(value),
@@ -2139,7 +2155,7 @@ fn add_counter_applier(
         return ApplyResult::Prevented;
     }
     let new_count = |count: u32| match modification {
-        QuantityModification::Double => count.saturating_mul(2),
+        QuantityModification::Times { factor } => count.saturating_mul(factor),
         QuantityModification::Half => count / 2,
         QuantityModification::Plus { value } => count.saturating_add(value),
         QuantityModification::Minus { value } => count.saturating_sub(value),
@@ -2289,7 +2305,7 @@ fn create_token_applier(
         }
         // CR 614.1a: Modify token count per replacement effect.
         let new_count = match modification {
-            Some(QuantityModification::Double) => count.saturating_mul(2),
+            Some(QuantityModification::Times { factor }) => count.saturating_mul(factor),
             Some(QuantityModification::Half) => count / 2,
             Some(QuantityModification::Plus { value }) => count.saturating_add(value),
             Some(QuantityModification::Minus { value }) => count.saturating_sub(value),
@@ -4239,7 +4255,7 @@ pub fn find_applicable_replacements(
                             if !matches!(
                                 repl_def.quantity_modification,
                                 Some(
-                                    QuantityModification::Double
+                                    QuantityModification::Times { .. }
                                         | QuantityModification::Half
                                         | QuantityModification::Plus { .. }
                                         | QuantityModification::Minus { .. }
@@ -5315,7 +5331,11 @@ impl CommuteClass {
 
 fn quantity_commute_class(modification: &QuantityModification) -> CommuteClass {
     match modification {
-        QuantityModification::Double => CommuteClass::Multiplicative,
+        // CR 616.1: all multiplicative modifiers commute with each other
+        // (×2 then ×3 == ×3 then ×2), so Doubling Season + Ojer Taq auto-apply
+        // without a degenerate ordering prompt — the same Multiplicative class
+        // as `ManaModification::Multiply` and `DamageModification::Double/Triple`.
+        QuantityModification::Times { .. } => CommuteClass::Multiplicative,
         // CR 616.1: integer halving (rounded down) does NOT commute with ×2 —
         // e.g. count 3 gives ×2÷2 = 3 but ÷2×2 = 2 — so it cannot share the
         // Multiplicative commuting class. The affected player must always choose
@@ -5469,7 +5489,7 @@ fn candidate_materiality(
     // Tekuthal) multiplies the proliferate action count via a `Multiply`
     // `repeat_for`. Two such doublers commute (x2 then x2 == x2 then x2 == x4),
     // so the ordering is immaterial and they must auto-apply — mirroring the
-    // `QuantityModification::Double` -> `Multiplicative` count-write path. Without
+    // `QuantityModification::DOUBLE` -> `Multiplicative` count-write path. Without
     // this they fall to the conservative `Unconditional` default below and force
     // a degenerate CR 616.1 ordering choice. (A non-`Multiply` `repeat_for` is not
     // a doubler and correctly falls through to the conservative default.)
@@ -6427,7 +6447,7 @@ mod tests {
         );
         doubler.replacement_definitions =
             vec![ReplacementDefinition::new(ReplacementEvent::AddCounter)
-                .quantity_modification(QuantityModification::Double)]
+                .quantity_modification(QuantityModification::DOUBLE)]
             .into();
         state.objects.insert(doubling_season, doubler);
         state.battlefield.push_back(doubling_season);
@@ -6655,7 +6675,7 @@ mod tests {
         use crate::types::counter::CounterType;
 
         let doubling_season = ReplacementDefinition::new(ReplacementEvent::AddCounter)
-            .quantity_modification(QuantityModification::Double);
+            .quantity_modification(QuantityModification::DOUBLE);
         let hardened_scales = ReplacementDefinition::new(ReplacementEvent::AddCounter)
             .quantity_modification(QuantityModification::Plus { value: 1 });
 
@@ -6716,7 +6736,7 @@ mod tests {
         let prevent_repl = ReplacementDefinition::new(ReplacementEvent::AddCounter)
             .quantity_modification(QuantityModification::Prevent);
         let double_repl = ReplacementDefinition::new(ReplacementEvent::AddCounter)
-            .quantity_modification(QuantityModification::Double);
+            .quantity_modification(QuantityModification::DOUBLE);
 
         let mut state = GameState::new_two_player(42);
         let mut solemnity = GameObject::new(
@@ -11198,7 +11218,7 @@ mod tests {
         let primal_vigor = ObjectId(30);
 
         let doubler_repl = ReplacementDefinition::new(ReplacementEvent::CreateToken)
-            .quantity_modification(QuantityModification::Double);
+            .quantity_modification(QuantityModification::DOUBLE);
 
         let mut state = GameState::new_two_player(42);
         let mut ds = GameObject::new(
@@ -11279,6 +11299,117 @@ mod tests {
         assert_eq!(
             count, 8,
             "Three doublers should multiply: 1 * 2 * 2 * 2 = 8"
+        );
+    }
+
+    /// Build a `TokenSpec` of the given core type for replacement-pipeline tests.
+    fn token_spec_of(name: &str, core: CoreType, subtype: &str) -> TokenSpec {
+        use crate::types::proposed_event::TokenCharacteristics;
+        TokenSpec {
+            characteristics: TokenCharacteristics {
+                display_name: name.to_string(),
+                power: (core == CoreType::Creature).then_some(1),
+                toughness: (core == CoreType::Creature).then_some(1),
+                core_types: vec![core],
+                subtypes: vec![subtype.to_string()],
+                supertypes: Vec::new(),
+                colors: Vec::new(),
+                keywords: Vec::new(),
+            },
+            script_name: name.to_string(),
+            static_abilities: Vec::new(),
+            enter_with_counters: Vec::new(),
+            tapped: false,
+            enters_attacking: false,
+            sacrifice_at: None,
+            source_id: ObjectId(0),
+            controller: PlayerId(0),
+            attach_to: None,
+        }
+    }
+
+    /// Run the Ojer Taq creature-token replacement against `spec` with the given
+    /// proposed `count`, returning the post-replacement count. Parses the real
+    /// Oracle line so the test exercises parser → pipeline end-to-end.
+    fn ojer_taq_replaced_count(spec: TokenSpec, count: u32) -> u32 {
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            "If one or more creature tokens would be created under your control, \
+             three times that many of those tokens are created instead.",
+            "Ojer Taq, Deepest Foundation",
+            &[],
+            &["Creature".to_string()],
+            &["God".to_string()],
+        );
+        assert_eq!(
+            parsed.replacements.len(),
+            1,
+            "Ojer Taq token-multiplier line must parse to exactly one replacement"
+        );
+        let repl = parsed.replacements[0].clone();
+        // CR 614.1a: the multiplier is the parameterized ×N factor (×3 here),
+        // not the legacy ×2 `Double`.
+        assert_eq!(
+            repl.quantity_modification,
+            Some(QuantityModification::Times { factor: 3 }),
+            "Ojer Taq must parse to Times {{ factor: 3 }}"
+        );
+
+        let ojer = ObjectId(10);
+        let mut state = GameState::new_two_player(42);
+        let mut obj = GameObject::new(
+            ojer,
+            CardId(1),
+            PlayerId(0),
+            "Ojer Taq, Deepest Foundation".to_string(),
+            Zone::Battlefield,
+        );
+        obj.replacement_definitions = vec![repl].into();
+        state.objects.insert(ojer, obj);
+        state.battlefield.push_back(ojer);
+
+        let proposed = ProposedEvent::CreateToken {
+            owner: PlayerId(0),
+            spec: Box::new(spec),
+            copy: None,
+            enter_tapped: EtbTapState::Unspecified,
+            count,
+            applied: HashSet::new(),
+        };
+        let mut events = Vec::new();
+        match replace_event(&mut state, proposed, &mut events) {
+            ReplacementResult::Execute(ProposedEvent::CreateToken { count, .. }) => count,
+            other => panic!("expected Execute(CreateToken), got {other:?}"),
+        }
+    }
+
+    /// CR 614.1a + CR 111.1: Ojer Taq, Deepest Foundation triplicates creature
+    /// tokens created under its controller ("three times that many"). Drives the
+    /// real parser output through `replace_event`: a proposed 2 creature tokens
+    /// resolves to 6. Reverting the ×N parameterization (factor 3 → the old ×2
+    /// `Double`) would yield 4, and dropping the replacement entirely yields 2 —
+    /// so the `== 6` assertion flips on either regression.
+    #[test]
+    fn ojer_taq_triplicates_creature_tokens() {
+        let spec = token_spec_of("Soldier", CoreType::Creature, "Soldier");
+        assert_eq!(
+            ojer_taq_replaced_count(spec, 2),
+            6,
+            "Ojer Taq must triple creature-token creation: 2 * 3 = 6"
+        );
+    }
+
+    /// CR 111.1: Ojer Taq's multiplier is gated on creature tokens ("if one or
+    /// more CREATURE tokens would be created") via `TokenCoreTypeMatches`. A
+    /// non-creature (Treasure artifact) token is NOT triplicated — the proposed
+    /// count passes through unchanged. Discriminates the core-type gate: without
+    /// it, the artifact count would become 6.
+    #[test]
+    fn ojer_taq_does_not_multiply_noncreature_tokens() {
+        let spec = token_spec_of("Treasure", CoreType::Artifact, "Treasure");
+        assert_eq!(
+            ojer_taq_replaced_count(spec, 2),
+            2,
+            "Ojer Taq must leave non-creature token creation untouched"
         );
     }
 
@@ -11562,7 +11693,7 @@ mod tests {
         let bloodletter = ObjectId(10);
         let repl = {
             let mut repl = ReplacementDefinition::new(ReplacementEvent::LoseLife)
-                .quantity_modification(QuantityModification::Double);
+                .quantity_modification(QuantityModification::DOUBLE);
             repl.valid_player = Some(ReplacementPlayerScope::Opponent);
             repl
         };
@@ -11599,7 +11730,7 @@ mod tests {
         let bloodletter = ObjectId(10);
         let repl = {
             let mut repl = ReplacementDefinition::new(ReplacementEvent::LoseLife)
-                .quantity_modification(QuantityModification::Double);
+                .quantity_modification(QuantityModification::DOUBLE);
             repl.valid_player = Some(ReplacementPlayerScope::Opponent);
             repl
         };
@@ -11642,7 +11773,7 @@ mod tests {
         let hardened_scales = ObjectId(20);
 
         let doubler_repl = ReplacementDefinition::new(ReplacementEvent::AddCounter)
-            .quantity_modification(QuantityModification::Double);
+            .quantity_modification(QuantityModification::DOUBLE);
         let plus_repl = ReplacementDefinition::new(ReplacementEvent::AddCounter)
             .quantity_modification(QuantityModification::Plus { value: 1 });
 
@@ -11711,7 +11842,7 @@ mod tests {
         use crate::types::counter::CounterType;
 
         let doubler_repl = ReplacementDefinition::new(ReplacementEvent::AddCounter)
-            .quantity_modification(QuantityModification::Double);
+            .quantity_modification(QuantityModification::DOUBLE);
         let halver_repl = ReplacementDefinition::new(ReplacementEvent::AddCounter)
             .quantity_modification(QuantityModification::Half);
 
@@ -11820,7 +11951,7 @@ mod tests {
             ]);
 
         let doubler_repl = ReplacementDefinition::new(ReplacementEvent::CreateToken)
-            .quantity_modification(QuantityModification::Double);
+            .quantity_modification(QuantityModification::DOUBLE);
 
         let mut state = GameState::new_two_player(42);
         let mut m = GameObject::new(
@@ -12008,7 +12139,7 @@ mod tests {
         let tap_effect2 = ObjectId(25);
 
         let doubler_repl = ReplacementDefinition::new(ReplacementEvent::CreateToken)
-            .quantity_modification(QuantityModification::Double);
+            .quantity_modification(QuantityModification::DOUBLE);
 
         let tap_repl = ReplacementDefinition::new(ReplacementEvent::CreateToken).execute(
             AbilityDefinition::new(
@@ -12337,7 +12468,7 @@ mod tests {
         let target = ObjectId(40);
 
         let repl = ReplacementDefinition::new(ReplacementEvent::AddCounter)
-            .quantity_modification(crate::types::ability::QuantityModification::Double);
+            .quantity_modification(crate::types::ability::QuantityModification::DOUBLE);
         // Note: counter_match is left as None.
         let mut state = test_state_with_object(source, Zone::Battlefield, vec![repl]);
         let mut creature = crate::game::game_object::GameObject::new(
@@ -12376,6 +12507,111 @@ mod tests {
                 "counter_match=None must accept any counter type, including {ct:?}"
             );
         }
+    }
+
+    /// CR 614.6 + CR 303.4b: Blossombind — "Enchanted creature can't have
+    /// counters put on it" lowers to an AddCounter-prevention replacement scoped
+    /// to the Aura's enchanted host (CR 303.4b). Parsed from the real Oracle text, installed
+    /// on an attached Aura, and driven through `replace_event`: a counter on the
+    /// enchanted creature is Prevented, while a counter on an unrelated creature
+    /// is not. Reverting the "enchanted creature" subject arm in
+    /// `parse_no_counters_replacement` (or the Priority-6e split that routes
+    /// Blossombind's compound line) leaves no replacement and the prevention
+    /// assertion fails.
+    #[test]
+    fn blossombind_prevents_counters_on_enchanted_creature_only() {
+        let mut state = GameState::new_two_player(42);
+
+        let host = crate::game::zones::create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Bound Bear".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&host)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+
+        let other = crate::game::zones::create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Free Bear".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&other)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+
+        // Parse the real Blossombind static line and pull the counter-prohibition
+        // replacement out of the cross-layer split.
+        let parsed = crate::parser::parse_oracle_text(
+            "Enchant creature\nWhen this Aura enters, tap enchanted creature.\nEnchanted creature can't become untapped and can't have counters put on it.",
+            "Blossombind",
+            &[],
+            &["Enchantment".to_string()],
+            &["Aura".to_string()],
+        );
+        assert!(
+            !parsed.replacements.is_empty(),
+            "Blossombind must yield a counter-prohibition replacement"
+        );
+
+        let aura = crate::game::zones::create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Blossombind".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&aura).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.card_types.subtypes.push("Aura".to_string());
+            obj.replacement_definitions = parsed.replacements.clone().into();
+            obj.attached_to = Some(host.into());
+        }
+        state.objects.get_mut(&host).unwrap().attachments.push(aura);
+
+        let on_host = ProposedEvent::AddCounter {
+            placement: CounterPlacement::Object {
+                actor: PlayerId(0),
+                object_id: host,
+                counter_type: CounterType::Plus1Plus1,
+            },
+            count: 1,
+            applied: HashSet::new(),
+        };
+        let mut events = Vec::new();
+        assert_eq!(
+            replace_event(&mut state, on_host, &mut events),
+            ReplacementResult::Prevented,
+            "counters on the enchanted creature must be prevented"
+        );
+
+        let on_other = ProposedEvent::AddCounter {
+            placement: CounterPlacement::Object {
+                actor: PlayerId(0),
+                object_id: other,
+                counter_type: CounterType::Plus1Plus1,
+            },
+            count: 1,
+            applied: HashSet::new(),
+        };
+        let registry = build_replacement_registry();
+        assert!(
+            find_applicable_replacements(&state, &on_other, &registry).is_empty(),
+            "counters on a non-enchanted creature must not be prevented"
+        );
     }
 
     #[test]
@@ -12612,7 +12848,7 @@ mod tests {
     fn object_counter_replacement_without_player_scope_ignores_player_counter_events() {
         let source = ObjectId(90);
         let repl = ReplacementDefinition::new(ReplacementEvent::AddCounter)
-            .quantity_modification(QuantityModification::Double);
+            .quantity_modification(QuantityModification::DOUBLE);
         let state = test_state_with_object(source, Zone::Battlefield, vec![repl]);
         let registry = build_replacement_registry();
 

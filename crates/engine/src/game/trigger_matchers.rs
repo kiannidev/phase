@@ -733,6 +733,7 @@ pub(super) fn target_filter_matches_object(
         TargetFilter::Neighbor { .. } => false,
         TargetFilter::TriggeringSpellController
         | TargetFilter::TriggeringSpellOwner
+        | TargetFilter::TriggeringSourceController
         | TargetFilter::TriggeringPlayer
         | TargetFilter::TriggeringSource
         | TargetFilter::DefendingPlayer
@@ -892,6 +893,7 @@ fn count_matching_trigger_event_subjects(
         | GameEvent::PlayerPerformedAction { .. }
         | GameEvent::Regenerated { .. }
         | GameEvent::CreatureSuspected { .. }
+        | GameEvent::CreatureNoLongerSuspected { .. }
         | GameEvent::Detained { .. }
         | GameEvent::BecamePrepared { .. }
         | GameEvent::BecameUnprepared { .. }

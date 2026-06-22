@@ -73,8 +73,11 @@ fn narrow_core_type(filter: &Option<TargetFilter>) -> Option<CoreType> {
         TypeFilter::Planeswalker => Some(CoreType::Planeswalker),
         TypeFilter::Battle => Some(CoreType::Battle),
         // Non-narrow filter shapes — broad emission carries the trigger.
+        // CR 308.1: Kindred is a non-permanent supplemental type, never a
+        // narrowing battlefield-trigger card type.
         TypeFilter::Instant
         | TypeFilter::Sorcery
+        | TypeFilter::Kindred
         | TypeFilter::Permanent
         | TypeFilter::Card
         | TypeFilter::Any
@@ -596,6 +599,7 @@ pub(crate) fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
         GameEvent::PlayerPerformedAction { .. } => push(TriggerEventKey::PlayerActionPerformed),
         GameEvent::Regenerated { .. }
         | GameEvent::CreatureSuspected { .. }
+        | GameEvent::CreatureNoLongerSuspected { .. }
         | GameEvent::Detained { .. }
         | GameEvent::BecamePrepared { .. }
         | GameEvent::BecameUnprepared { .. } => {}
@@ -773,6 +777,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::Choose
         | EffectKind::ChooseDamageSource
         | EffectKind::Suspect
+        | EffectKind::Unsuspect
         | EffectKind::PhaseOut
         | EffectKind::PhaseIn
         | EffectKind::ForceBlock
@@ -860,6 +865,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::RemoveFromCombat
         | EffectKind::Conjure
         | EffectKind::Intensify
+        | EffectKind::ApplyPerpetual
         | EffectKind::DraftFromSpellbook
         | EffectKind::ChooseOneOf
         | EffectKind::Specialize

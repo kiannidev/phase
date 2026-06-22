@@ -1041,6 +1041,19 @@ pub(super) fn handle_resolution_choice(
                         "Counter amount choices require a pending mana ability".to_string(),
                     ));
                 }
+                PayableResource::Life => {
+                    // CR 119.4: pay N life via the life-loss-as-cost authority
+                    // (replacement pipeline + CantLoseLife) — NOT inline life
+                    // subtraction.
+                    match crate::game::life_costs::pay_life_as_cost(state, player, amount, events) {
+                        crate::game::life_costs::PayLifeCostResult::Paid { .. } => {}
+                        _ => {
+                            return Err(EngineError::InvalidAction(format!(
+                                "Player {player:?} cannot pay {amount} life"
+                            )))
+                        }
+                    }
+                }
             }
             // CR 603.7c: Bind the paid amount for downstream chain steps that
             // read `QuantityRef::EventContextAmount` (e.g. "deals that much
@@ -2118,6 +2131,40 @@ pub(super) fn handle_resolution_choice(
                 return Ok(ResolutionChoiceOutcome::WaitingFor(
                     state.waiting_for.clone(),
                 ));
+            }
+            // CR 608.2c + CR 105.1 / CR 205.2a: A per-category-member
+            // `Effect::ForEachCategoryExile` iteration accumulates each pick into
+            // the chain's tracked set and prompts the next member, exactly like
+            // the per-player path (Sanar, Portent of Calamity). The continuation
+            // ("from among them" / "put the rest …") reads that tracked set.
+            if state.pending_per_category_zone_choice.is_some() {
+                effects::choose_from_zone::drain_pending_per_category_zone_choice(
+                    state, &chosen, events,
+                );
+                effects::drain_pending_continuation(state, events);
+                return Ok(ResolutionChoiceOutcome::WaitingFor(
+                    state.waiting_for.clone(),
+                ));
+            }
+            // CR 608.2c: When the parked continuation consumes the chain's
+            // tracked set (a `GrantCastingPermission { target: TrackedSet }` /
+            // any `TrackedSet`-referencing downstream effect — e.g. End-Blaze
+            // Epiphany's "choose a card exiled this way … you may play that
+            // card"), the interactive choose is the producer of that set, so the
+            // chosen cards must be published as the fresh tracked set the
+            // continuation reads. This mirrors the per-player drain
+            // (`publish_fresh_tracked_set`) and the random-choose path
+            // (`apply_parent_chain_context`); without it the grant's
+            // `TrackedSet(0)` sentinel binds to a stale/empty set and the
+            // permission lands nowhere. Gated on the continuation actually
+            // referencing a tracked set so non-consuming continuations
+            // (partition sub-abilities reading `ParentTarget`) are unaffected.
+            let continuation_consumes_tracked_set = state
+                .pending_continuation
+                .as_ref()
+                .is_some_and(|cont| effects::chain_references_tracked_set(&cont.chain));
+            if continuation_consumes_tracked_set {
+                effects::publish_fresh_tracked_set(state, chosen.clone());
             }
             if let Some(cont) = state.pending_continuation.as_mut() {
                 cont.chain.targets = chosen.iter().map(|&id| TargetRef::Object(id)).collect();

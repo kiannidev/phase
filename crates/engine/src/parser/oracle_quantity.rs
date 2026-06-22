@@ -115,6 +115,10 @@ pub(crate) fn parse_quantity_ref_with_context(
         return Some(qty);
     }
 
+    if let Some(qty) = parse_shuffled_this_way_count(trimmed) {
+        return Some(qty);
+    }
+
     if all_consuming(pair(
         tag::<_, _, OracleError<'_>>("the number of"),
         alt((tag(" counters on ~"), tag(" counters on it"))),
@@ -543,6 +547,35 @@ fn parse_milled_this_way_count(text: &str) -> Option<QuantityRef> {
         opt(tag("nonland ")),
         alt((tag("cards"), tag("card"))),
         tag(" milled this way"),
+    ))
+    .parse(text)
+    .is_ok()
+    .then_some(QuantityRef::EventContextAmount)
+}
+
+/// CR 608.2c + CR 701.24: "the number of [nonland] cards shuffled into [a]
+/// library this way" — the count of cards moved into a library by the preceding
+/// shuffle/move instruction in this resolution (Elixir: "Shuffle all nonland
+/// cards from your graveyard into your library. You gain life equal to the
+/// number of cards shuffled into your library this way."). The preceding mass
+/// `ChangeZone` (Graveyard → Library) stamps `last_effect_count`, which
+/// `EventContextAmount` reads — mirroring `parse_milled_this_way_count`. The
+/// possessive (`your` / `their` / `its owner's` / `a`) library is the same
+/// library the move just populated, so the destination article is a leaf
+/// variation that does not change the resolved count.
+fn parse_shuffled_this_way_count(text: &str) -> Option<QuantityRef> {
+    all_consuming((
+        tag::<_, _, OracleError<'_>>("the number of "),
+        opt(tag("nonland ")),
+        alt((tag("cards"), tag("card"))),
+        tag(" shuffled into "),
+        alt((
+            tag("your library"),
+            tag("their library"),
+            tag("its owner's library"),
+            tag("a library"),
+        )),
+        tag(" this way"),
     ))
     .parse(text)
     .is_ok()
@@ -1994,6 +2027,28 @@ fn parse_destroyed_or_sacrificed_this_way_filter(
     None
 }
 
+fn parse_filtered_revealed_this_way(lower: &str) -> Option<QuantityRef> {
+    for suffix in [" revealed this way", "revealed this way"] {
+        let result: OracleResult<'_, &str> =
+            terminated(take_until(suffix), tag(suffix)).parse(lower);
+        if let Ok(("", filter_phrase)) = result {
+            let (filter, remainder) =
+                crate::parser::oracle_target::parse_type_phrase(filter_phrase.trim());
+            if !remainder.trim().is_empty() {
+                continue;
+            }
+            if filter_is_nontrivial_for_tracked_set(&filter) {
+                return Some(QuantityRef::FilteredTrackedSetSize {
+                    filter: Box::new(filter),
+                    caused_by: None,
+                });
+            }
+            return Some(QuantityRef::TrackedSetSize);
+        }
+    }
+    None
+}
+
 fn parse_filtered_destroyed_this_way(lower: &str) -> Option<QuantityRef> {
     match parse_destroyed_or_sacrificed_this_way_filter(lower)? {
         (Some(filter), cause) if filter_is_nontrivial_for_tracked_set(&filter) => {
@@ -2540,6 +2595,9 @@ fn parse_for_each_clause_with_they_controller(
         // Only emit `FilteredTrackedSetSize` when the filter restricts the
         // tracked set. Bare "destroyed this way" still falls through to the
         // unfiltered `TrackedSetSize`.
+        if let Some(qty) = parse_filtered_revealed_this_way(&lower) {
+            return Some(qty);
+        }
         if let Some(qty) = parse_filtered_destroyed_this_way(&lower) {
             return Some(qty);
         }
@@ -6243,6 +6301,30 @@ mod tests {
                                 .as_ref()
                                 .is_some_and(|c| matches!(c, ControllerRef::You)),
                             "filter must require controller=You"
+                        );
+                    }
+                    other => panic!("expected Typed filter, got {other:?}"),
+                }
+            }
+            other => panic!("expected FilteredTrackedSetSize, got {other:?}"),
+        }
+    }
+
+    /// CR 608.2c + CR 701.20b: "nonland card revealed this way" (Selvala,
+    /// Explorer Returned parley) must emit `FilteredTrackedSetSize` with a
+    /// nonland filter and no producer-action binding.
+    #[test]
+    fn nonland_card_revealed_this_way_uses_filtered_tracked_set_nonland() {
+        let qty = parse_for_each_clause("nonland card revealed this way").expect("must parse");
+        match qty {
+            QuantityRef::FilteredTrackedSetSize { filter, caused_by } => {
+                assert_eq!(caused_by, None, "revealed-this-way is action-agnostic");
+                match *filter {
+                    TargetFilter::Typed(ref tf) => {
+                        assert!(
+                            tf.type_filters
+                                .contains(&TypeFilter::Non(Box::new(TypeFilter::Land))),
+                            "filter must include NonLand; got {tf:?}"
                         );
                     }
                     other => panic!("expected Typed filter, got {other:?}"),

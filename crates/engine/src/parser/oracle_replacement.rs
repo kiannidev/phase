@@ -369,6 +369,29 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
         let effect_text = extract_replacement_effect(&normalized);
         let mut def =
             ReplacementDefinition::new(ReplacementEvent::Draw).description(text.to_string());
+        // CR 614.6 + CR 121.6: "skip that draw instead" fully suppresses the
+        // draw (Living Conundrum: "If you would draw a card while your library
+        // has no cards in it, skip that draw instead"). The body lowers to a
+        // bare "skip that draw" which `parse_effect_chain` would turn into an
+        // `Unimplemented` no-op (a silent runtime passthrough that still draws).
+        // Instead, emit the structured `Prevent` quantity modification — the
+        // same negation surface the lifegain-negation arm uses — which the draw
+        // pipeline honors via `ReplacementResult::Prevented` (no draw happens).
+        // A `Prevent` replacement carries no `execute`, so no stray
+        // `Unimplemented` pollutes the AST.
+        let body_skips_draw = effect_text
+            .as_deref()
+            .is_some_and(|e| body_is_draw_skip(&e.to_lowercase()));
+        if body_skips_draw {
+            def = def.quantity_modification(QuantityModification::Prevent);
+            apply_draw_player_scope(&lower, &mut def);
+            match parse_while_antecedent(&lower, "would draw a card") {
+                WhileAntecedent::Parsed(condition) => def = def.condition(condition),
+                WhileAntecedent::Unparsed => return None,
+                WhileAntecedent::Absent => {}
+            }
+            return Some(def);
+        }
         if let Some(e) = effect_text {
             // CR 614.1a + CR 614.6 + CR 121.6: "you may instead {effect}" makes
             // the draw replacement optional. The player is offered an
@@ -627,6 +650,20 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
     // (CR 614.6 — "if an event is replaced, it never happens"). Melira's
     // Keepers class.
     if let Some(def) = parse_no_counters_replacement(&norm_lower, &text) {
+        return Some(def);
+    }
+
+    // --- Continuous untap prohibition: "~ can't become untapped." /
+    // "Enchanted creature can't be untapped." (Blossombind class). CR 701.26b +
+    // CR 614.6 + CR 614.1a: a blanket "can't become untapped" forbids untapping
+    // in ANY way — not just the untap step (CR 502.3, the "doesn't untap during
+    // its untap step" class, which is a SEPARATE `DuringUntapStep`-gated
+    // replacement parsed by `parse_untap_step_replacement`). Modeled as an
+    // unconditional `ProposedEvent::Untap` prevention (no `execute`, no
+    // `DuringUntapStep` condition), exactly like CR 122.1d's stun-counter
+    // untap-prevention model, so every untap path (`process_one_untap`) consults
+    // it — including spell/ability untaps, which the untap-step loop never sees.
+    if let Some(def) = parse_cant_become_untapped_replacement(&norm_lower, &text) {
         return Some(def);
     }
 
@@ -1086,7 +1123,7 @@ fn parse_lose_life_replacement(text: &str, lower: &str) -> Option<ReplacementDef
         let (i, _) = tag(", ").parse(i)?;
         let (i, quantity_modification) = alt((
             value(
-                Some(QuantityModification::Double),
+                Some(QuantityModification::DOUBLE),
                 terminated(parse_double_lose_life_consequence, opt(char('.'))),
             ),
             value(None, parse_lose_life_instead_consequence),
@@ -4894,6 +4931,39 @@ fn body_is_lifegain_negation(lower_body: &str) -> bool {
     combinator.parse(lower_body.trim()).is_ok()
 }
 
+/// CR 614.6 + CR 121.6: Recognize a PURE draw-suppression replacement body
+/// "[subject] skip[s] that/the draw" (Living Conundrum). The optional subject
+/// prefix mirrors `body_is_lifegain_negation`; "that draw" and "the draw" are
+/// leaf variants of the same anaphor back to the replaced draw event.
+///
+/// `all_consuming` (modulo a trailing period) is load-bearing: a compound body
+/// that only *begins* with a skip and then adds a follow-on effect — Notion
+/// Thief / Hullbreacher's "that player skips that draw AND you draw a card" —
+/// must NOT collapse to a bare `Prevent`, which would drop the "you draw a card"
+/// execute (and the except-first-draw condition). Those compound bodies fall
+/// through to the normal `execute` path.
+fn body_is_draw_skip(lower_body: &str) -> bool {
+    let subject = opt(alt((
+        tag::<_, _, OracleError<'_>>("that player "),
+        tag("the player "),
+        tag("you "),
+        tag("they "),
+    )));
+    let mut combinator = all_consuming(preceded(
+        subject,
+        value(
+            (),
+            (
+                alt((tag("skips "), tag("skip "))),
+                alt((tag("that draw"), tag("the draw"))),
+            ),
+        ),
+    ));
+    combinator
+        .parse(lower_body.trim().trim_end_matches('.').trim_end())
+        .is_ok()
+}
+
 /// CR 614.1a: Assign the replacement's player scope from the antecedent subject
 /// ("an opponent" → Opponent, "a player" / "its controller" → AnyPlayer,
 /// "you" → controller-only/None). Shared by the `Prevent` short-circuit and the
@@ -5558,9 +5628,11 @@ fn parse_copy_count_replacement(lower: &str, original_text: &str) -> Option<Repl
 }
 
 /// CR 614.1a: Parse token creation replacement effects.
-/// Handles "twice that many tokens" (Primal Vigor, Doubling Season, Parallel Lives)
-/// and "those tokens plus [spec]" (Chatterfang — "that many 1/1 green Squirrel
-/// creature tokens"; Donatello — "a Mutagen token").
+/// Handles the multiplicative family "twice that many tokens" (×2 — Primal Vigor,
+/// Doubling Season, Parallel Lives) and "<N> times that many" (×N — Ojer Taq,
+/// Deepest Foundation's "three times that many"), plus "those tokens plus [spec]"
+/// (Chatterfang — "that many 1/1 green Squirrel creature tokens"; Donatello —
+/// "a Mutagen token").
 fn parse_token_replacement(lower: &str, original_text: &str) -> Option<ReplacementDefinition> {
     use crate::types::ability::QuantityModification;
 
@@ -5570,8 +5642,8 @@ fn parse_token_replacement(lower: &str, original_text: &str) -> Option<Replaceme
         .description(original_text.to_string());
 
     match modification_mode {
-        TokenReplacementShape::Double => {
-            def = def.quantity_modification(QuantityModification::Double);
+        TokenReplacementShape::Times { factor } => {
+            def = def.quantity_modification(QuantityModification::Times { factor });
         }
         TokenReplacementShape::Half => {
             def = def.quantity_modification(QuantityModification::Half);
@@ -5587,15 +5659,18 @@ fn parse_token_replacement(lower: &str, original_text: &str) -> Option<Replaceme
             // `create_token_applier` resolves it to a TokenSpec and swaps it in,
             // preserving the event's count and owner.
             def = def.execute(AbilityDefinition::new(AbilityKind::Spell, *token));
-            // CR 111.1: gate the substitution on the proposed token's core card
-            // type ("if one or more CREATURE tokens would be created" — only
-            // creature tokens become Angels).
-            if let Some(core_type) = parse_token_core_type_gate(lower) {
-                def = def.condition(ReplacementCondition::TokenCoreTypeMatches {
-                    core_types: vec![core_type],
-                });
-            }
         }
+    }
+
+    // CR 111.1: gate on the proposed token's core card type when the trigger
+    // names one ("if one or more CREATURE tokens would be created" — Divine
+    // Visitation only affects creature tokens; Ojer Taq, Deepest Foundation
+    // only triplicates creature tokens). Untyped "one or more tokens"
+    // (Doubling Season) emits no gate and applies to every token type.
+    if let Some(core_type) = parse_token_core_type_gate(lower) {
+        def = def.condition(ReplacementCondition::TokenCoreTypeMatches {
+            core_types: vec![core_type],
+        });
     }
 
     // Scope: "under your control" → restrict to controller's tokens
@@ -5613,8 +5688,10 @@ fn parse_token_replacement(lower: &str, original_text: &str) -> Option<Replaceme
 }
 
 enum TokenReplacementShape {
-    /// "twice that many tokens … are created instead" (Doubling Season).
-    Double,
+    /// "twice that many tokens … are created instead" (Doubling Season, factor 2)
+    /// or "three times that many of those tokens are created instead" (Ojer Taq,
+    /// Deepest Foundation, factor 3) — the general ×N multiplier.
+    Times { factor: u32 },
     /// "half that many … tokens … instead, rounded down" (Halving Season).
     Half,
     /// "those tokens plus [spec] are created instead" (Chatterfang, Donatello).
@@ -5636,15 +5713,14 @@ fn parse_token_replacement_shape(lower: &str) -> Option<TokenReplacementShape> {
         return Some(TokenReplacementShape::Half);
     }
 
-    // "twice that many" → Doubling Season pattern.
-    if nom_on_lower(lower, lower, |i| {
-        let (i, _) = take_until::<_, _, OracleError<'_>>("twice that many").parse(i)?;
-        let (i, _) = tag("twice that many").parse(i)?;
-        Ok((i, ()))
-    })
-    .is_some()
-    {
-        return Some(TokenReplacementShape::Double);
+    // "twice that many" (factor 2) or "<N> times that many" (factor N) →
+    // multiplicative pattern. Doubling Season uses "twice"; Ojer Taq, Deepest
+    // Foundation uses "three times that many of those tokens are created
+    // instead." Composed along one axis (the multiplier phrase) via `alt`,
+    // delegating the number word to `parse_number`, so any future ×N card
+    // ("four times that many") is covered without a new tag.
+    if let Some(factor) = scan_token_multiplier_factor(lower) {
+        return Some(TokenReplacementShape::Times { factor });
     }
 
     // "those tokens plus <spec> (is|are) created instead" → Chatterfang / Donatello.
@@ -5664,6 +5740,36 @@ fn parse_token_replacement_shape(lower: &str) -> Option<TokenReplacementShape> {
     }
 
     None
+}
+
+/// CR 614.1a: Scan for a multiplicative token-count phrase and return its
+/// factor. Recognizes "twice that many" (factor 2 — Doubling Season) and
+/// "<number> times that many" (factor N — Ojer Taq's "three times that many").
+/// The number word is parsed by the shared `parse_number` combinator, so the
+/// pattern covers every ×N multiplier card in the class, not just ×3.
+///
+/// The multiplier phrase appears mid-sentence (after "instead"), so the
+/// combinator is tried at each word boundary using the documented word-boundary
+/// scanning idiom — `parse_number` is anchored on the trailing `" times that
+/// many"` tag at each position rather than scanning the string for a substring.
+fn scan_token_multiplier_factor(lower: &str) -> Option<u32> {
+    // The multiplier head anchored at the current word boundary: either the ×2
+    // leaf "twice that many" or the general ×N form "<number> times that many"
+    // (number axis × fixed tail, so any ×N word is covered without per-factor
+    // tags). A standalone fn so it carries no capture lifetime into the scan.
+    fn multiplier_head(i: &str) -> OracleResult<'_, u32> {
+        let n_times = |i| {
+            let (i, factor) = nom_primitives::parse_number.parse(i)?;
+            let (i, _) = tag(" times that many").parse(i)?;
+            Ok((i, factor))
+        };
+        alt((value(2u32, tag("twice that many")), n_times)).parse(i)
+    }
+
+    // Input is already lowercase, so try `multiplier_head` at each word boundary
+    // via the shared scan helper (cf. `scan_for_phase`) rather than re-rolling
+    // the loop.
+    nom_primitives::scan_at_word_boundaries(lower, multiplier_head)
 }
 
 /// CR 614.1a + CR 111.1: Extract the "those tokens plus <spec> (is|are) created
@@ -6082,7 +6188,7 @@ fn parse_counter_replacement(lower: &str, original_text: &str) -> Option<Replace
     let modification = if nom_primitives::scan_contains(lower, "half that many") {
         QuantityModification::Half
     } else if nom_primitives::scan_contains(lower, "twice that many") {
-        QuantityModification::Double
+        QuantityModification::DOUBLE
     } else if let Some(rest) = strip_after(lower, "that many plus ") {
         // "that many plus one ... counters are put on it instead"
         // Delegate to nom_primitives::parse_number (input already lowercase)
@@ -6320,19 +6426,99 @@ fn parse_no_counters_replacement(
     // `parse_replacement_line_inner`, not here. `terminated(.., opt(tag(".")))`
     // absorbs the optional trailing period inside the combinator, keeping
     // the entire dispatch in idiomatic nom.
-    let mut combinator = all_consuming(terminated(
+    // CR 303.4b + CR 614.6: the prohibition may name the Aura's attached host
+    // ("Enchanted creature can't have counters put on it" — Blossombind) instead
+    // of the source itself (CR 303.4b — the enchanted permanent). Both lower to
+    // the same AddCounter prevention; only the scoped object set differs (SelfRef
+    // vs the EnchantedBy host).
+    let mut subject_combinator = all_consuming(terminated(
         (
-            tag::<_, _, OracleError<'_>>("~ can't have counters put on "),
+            terminated(
+                parse_counter_prohibition_subject_filter,
+                tag(" can't have counters put on "),
+            ),
             alt((tag("it"), tag("them"))),
         ),
         opt(tag(".")),
     ));
-    combinator.parse(norm_lower.trim()).ok()?;
+    let (_, (valid_card, _)) = subject_combinator.parse(norm_lower.trim()).ok()?;
 
     Some(
         ReplacementDefinition::new(ReplacementEvent::AddCounter)
-            .valid_card(TargetFilter::SelfRef)
+            .valid_card(valid_card)
             .quantity_modification(QuantityModification::Prevent)
+            .description(original_text.to_string()),
+    )
+}
+
+/// CR 303.4b + CR 614.6: Subject of a counter-placement prohibition, as a
+/// `valid_card` filter. CR 303.4b: the object an Aura is attached to is the
+/// "enchanted" permanent. Covers the source itself (`~` → `SelfRef`) and the
+/// Aura's attached host across the type hierarchy ("enchanted creature" /
+/// "enchanted permanent"). Composed as one `alt` over typed subjects so a future
+/// "enchanted land" / "enchanted artifact" form is one new arm, not a new
+/// parser. Longest-host-phrase-first is unnecessary here — the host nouns are
+/// disjoint tokens — but ordering keeps SelfRef (the most common form) first.
+fn parse_counter_prohibition_subject_filter(input: &str) -> OracleResult<'_, TargetFilter> {
+    use crate::types::ability::{FilterProp, TypedFilter};
+    alt((
+        value(TargetFilter::SelfRef, tag("~")),
+        value(
+            TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::EnchantedBy])),
+            tag("enchanted creature"),
+        ),
+        value(
+            TargetFilter::Typed(TypedFilter::permanent().properties(vec![FilterProp::EnchantedBy])),
+            tag("enchanted permanent"),
+        ),
+    ))
+    .parse(input)
+}
+
+/// CR 701.26b + CR 614.6 + CR 614.1a: Parse a blanket continuous untap
+/// prohibition — "<subject> can't become untapped" / "can't be untapped" — into
+/// an unconditional `ProposedEvent::Untap` prevention scoped to the subject.
+///
+/// This is the BROAD untap prohibition (CR 701.26b): it forbids untapping in any
+/// way. It is deliberately NOT a `StaticMode::CantUntap` static, because that
+/// class is used for the untap-step-only "doesn't untap during its untap step"
+/// wording (CR 502.3) and is only enforced by the untap-step turn-based action
+/// loop in `turns.rs` — a spell/ability that untaps the permanent would bypass
+/// it. Modeling it as an untap-event replacement (no `execute`, no
+/// `DuringUntapStep` condition) mirrors CR 122.1d's stun-counter prevention and
+/// routes every untap path (`process_one_untap` → `replace_event`) through the
+/// prohibition. The `parse_untap_step_replacement` path keeps the narrow
+/// untap-step class separate (`ReplacementCondition::DuringUntapStep`).
+///
+/// The subject is reused from the counter-prohibition subject combinator
+/// (`~`, "enchanted creature", "enchanted permanent") so the same host class is
+/// covered for both halves of a Blossombind-style compound.
+fn parse_cant_become_untapped_replacement(
+    norm_lower: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    let mut combinator = all_consuming(terminated(
+        terminated(
+            parse_counter_prohibition_subject_filter,
+            (
+                tag(" can"),
+                alt((tag("'t"), tag("\u{2019}t"))),
+                tag(" "),
+                alt((tag("become "), tag("be "))),
+                tag("untapped"),
+            ),
+        ),
+        opt(tag(".")),
+    ));
+    let (_, valid_card) = combinator.parse(norm_lower.trim()).ok()?;
+
+    // CR 614.6: a bare prevention (no alternative effect). The `untap_applier`
+    // returns `Prevented` when the replacement carries no `execute`, so the
+    // permanent never untaps. No `DuringUntapStep` condition — this applies to
+    // every untap, not just the untap step.
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::Untap)
+            .valid_card(valid_card)
             .description(original_text.to_string()),
     )
 }
@@ -7631,6 +7817,52 @@ mod tests {
         assert!(def.execute.is_some());
     }
 
+    /// CR 701.26b + CR 614.6: BROAD "can't become untapped" / "can't be untapped"
+    /// prohibition (Blossombind class). Distinct from the untap-step class above:
+    /// an UNCONDITIONAL `Untap` prevention (no `DuringUntapStep` condition, no
+    /// alternative `execute`) so it applies to every untap path — not just the
+    /// untap step. Covers the source (`~`) and the enchanted host
+    /// (creature/permanent). Reverting `parse_cant_become_untapped_replacement`
+    /// makes these return None (the prohibition would silently vanish).
+    #[test]
+    fn cant_become_untapped_is_unconditional_untap_prevention() {
+        use crate::types::ability::{FilterProp, TypedFilter};
+        for (text, name, expected) in [
+            (
+                "This creature can't become untapped.",
+                "Imprisoned Bear",
+                TargetFilter::SelfRef,
+            ),
+            (
+                "Enchanted creature can't be untapped.",
+                "Some Aura",
+                TargetFilter::Typed(
+                    TypedFilter::creature().properties(vec![FilterProp::EnchantedBy]),
+                ),
+            ),
+            (
+                "Enchanted permanent can't become untapped.",
+                "Some Aura",
+                TargetFilter::Typed(
+                    TypedFilter::permanent().properties(vec![FilterProp::EnchantedBy]),
+                ),
+            ),
+        ] {
+            let def = parse_replacement_line(text, name)
+                .unwrap_or_else(|| panic!("must parse: {text:?}"));
+            assert_eq!(def.event, ReplacementEvent::Untap);
+            assert_eq!(def.valid_card, Some(expected), "subject for {text:?}");
+            assert_eq!(
+                def.condition, None,
+                "broad untap prohibition must be unconditional for {text:?}"
+            );
+            assert!(
+                def.execute.is_none(),
+                "bare prohibition has no alternative effect for {text:?}"
+            );
+        }
+    }
+
     #[test]
     fn turned_face_up_replacement_megamorph() {
         // CR 614.1e + CR 708.11: "As ~ is turned face up,
@@ -8687,7 +8919,7 @@ mod tests {
         assert_eq!(def.event, ReplacementEvent::LoseLife);
         assert_eq!(
             def.quantity_modification,
-            Some(QuantityModification::Double)
+            Some(QuantityModification::DOUBLE)
         );
         assert_eq!(def.valid_player, Some(ReplacementPlayerScope::Opponent));
     }
@@ -12080,9 +12312,47 @@ mod tests {
         assert_eq!(def.event, ReplacementEvent::CreateToken);
         assert_eq!(
             def.quantity_modification,
-            Some(QuantityModification::Double)
+            Some(QuantityModification::DOUBLE)
         );
         assert_eq!(def.token_owner_scope, Some(ControllerRef::You));
+    }
+
+    #[test]
+    fn ojer_taq_token_triplication_replacement() {
+        // CR 614.1a + CR 111.1: "three times that many" parameterizes the ×N
+        // token multiplier (factor 3), gated to creature tokens.
+        let def = parse_replacement_line(
+            "If one or more creature tokens would be created under your control, three times that many of those tokens are created instead.",
+            "Ojer Taq, Deepest Foundation",
+        )
+        .unwrap();
+        assert_eq!(def.event, ReplacementEvent::CreateToken);
+        assert_eq!(
+            def.quantity_modification,
+            Some(QuantityModification::Times { factor: 3 })
+        );
+        assert_eq!(def.token_owner_scope, Some(ControllerRef::You));
+        // CR 111.1: gated on creature tokens only.
+        assert!(matches!(
+            def.condition,
+            Some(ReplacementCondition::TokenCoreTypeMatches { ref core_types })
+                if core_types == &vec![crate::types::card_type::CoreType::Creature]
+        ));
+    }
+
+    #[test]
+    fn token_doubling_via_twice_is_factor_two() {
+        // Regression: "twice that many" still parameterizes to factor 2 after
+        // the Double → Times { factor } migration.
+        let def = parse_replacement_line(
+            "If one or more tokens would be created under your control, twice that many tokens are created instead.",
+            "Parallel Lives",
+        )
+        .unwrap();
+        assert_eq!(
+            def.quantity_modification,
+            Some(QuantityModification::Times { factor: 2 })
+        );
     }
 
     #[test]
@@ -12175,7 +12445,7 @@ mod tests {
         assert_eq!(def.event, ReplacementEvent::AddCounter);
         assert_eq!(
             def.quantity_modification,
-            Some(QuantityModification::Double)
+            Some(QuantityModification::DOUBLE)
         );
         assert!(matches!(
             def.valid_card,
@@ -12287,6 +12557,44 @@ mod tests {
             def.quantity_modification,
             Some(QuantityModification::Prevent)
         );
+    }
+
+    /// CR 303.4b + CR 614.6: The counter-placement prohibition may name the Aura's
+    /// enchanted host across the type hierarchy. Both "enchanted creature" and
+    /// "enchanted permanent" lower to the AddCounter+Prevent replacement scoped to
+    /// the `EnchantedBy` host (creature- vs permanent-typed). Reverting the
+    /// "enchanted permanent" arm in `parse_counter_prohibition_subject_filter`
+    /// makes the permanent form return None (a parser gap for future Auras).
+    #[test]
+    fn no_counters_replacement_enchanted_host_variants() {
+        use crate::types::ability::{FilterProp, QuantityModification, TypedFilter};
+        for (text, expected) in [
+            (
+                "Enchanted creature can't have counters put on it.",
+                TargetFilter::Typed(
+                    TypedFilter::creature().properties(vec![FilterProp::EnchantedBy]),
+                ),
+            ),
+            (
+                "Enchanted permanent can't have counters put on it.",
+                TargetFilter::Typed(
+                    TypedFilter::permanent().properties(vec![FilterProp::EnchantedBy]),
+                ),
+            ),
+        ] {
+            let def = parse_replacement_line(text, "Some Aura")
+                .unwrap_or_else(|| panic!("must parse: {text:?}"));
+            assert_eq!(def.event, ReplacementEvent::AddCounter);
+            assert_eq!(
+                def.valid_card,
+                Some(expected),
+                "subject filter for {text:?}"
+            );
+            assert_eq!(
+                def.quantity_modification,
+                Some(QuantityModification::Prevent)
+            );
+        }
     }
 
     #[test]
@@ -12966,7 +13274,7 @@ mod tests {
         let def = parse_token_replacement(lower, lower).expect("double shape parses");
         assert!(matches!(
             def.quantity_modification,
-            Some(crate::types::ability::QuantityModification::Double)
+            Some(crate::types::ability::QuantityModification::DOUBLE)
         ));
         assert!(def.additional_token_spec.is_none());
     }

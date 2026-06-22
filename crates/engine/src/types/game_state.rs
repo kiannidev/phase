@@ -1100,6 +1100,29 @@ pub struct PendingPerPlayerZoneChoice {
     pub accumulated: bool,
 }
 
+/// CR 608.2c + CR 105.1 / CR 205.2a: Per-category-member
+/// `Effect::ForEachCategoryExile` iteration paused by the current member's
+/// interactive choice. Mirrors [`PendingPerPlayerZoneChoice`], but the
+/// iteration unit is a fixed-category member (a color or card type) rather than
+/// a player: each `remaining_member_filters` entry is the `TargetFilter`
+/// restricting the shared pool to cards of that member ("a card of that color/
+/// type"). Each pick accumulates into the resolution chain's tracked object set
+/// so a downstream "from among them" / "put the rest …" reads exactly the cards
+/// exiled across all members.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingPerCategoryZoneChoice {
+    /// The `Effect::ForEachCategoryExile` ability whose per-member body repeats.
+    pub ability: Box<ResolvedAbility>,
+    /// CR 608.2c: The full revealed/exiled pool snapshot, captured once at the
+    /// start of the iteration. Each member filters THIS pool (minus cards
+    /// already exiled by an earlier member) — it must not read the mutating
+    /// chain tracked set, which the drain rebinds to the exiled cards.
+    pub pool: Vec<ObjectId>,
+    /// Per-member candidate filters not yet prompted, in category member order
+    /// (WUBRG for colors, CR 205.2a order for card types).
+    pub remaining_member_filters: Vec<crate::types::ability::TargetFilter>,
+}
+
 /// CR 701.38d + CR 608.2c: Stores the remaining voters whose per-ballot
 /// interactive body has not yet been resolved. Created when the first
 /// ballot's ChooseFromZone parks WaitingFor::ChooseFromZoneChoice; drained
@@ -2416,6 +2439,12 @@ pub enum AlternativeCastKeyword {
     /// an opponent lost life this turn. A pure cost substitution — the spell
     /// resolves normally (no riders); spectacle changes only how the cost is paid.
     Spectacle,
+    /// CR 702.76a: Prowl alternative cost paid from hand, available only if a
+    /// creature the caster controlled dealt combat damage to a player this turn
+    /// while sharing one of the spell's creature types. A pure cost substitution
+    /// — the spell resolves normally; the prowl provenance is recorded so "if
+    /// its prowl cost was paid" intervening-ifs (Latchkey Faerie) can read it.
+    Prowl,
 }
 
 /// CR 601.2b: Engine-authored cast-variant option for spells with more than
@@ -3185,6 +3214,17 @@ pub enum WaitingFor {
     },
     TriggerTargetSelection {
         player: PlayerId,
+        /// Controller of the triggered ability whose targets are being chosen.
+        /// This can differ from `player` for "of their choice" prompts.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger_controller: Option<PlayerId>,
+        /// Event that caused this triggered ability, if the trigger needs it for
+        /// display or event-context quantities while targets are being chosen.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        trigger_event: Option<GameEvent>,
+        /// Full simultaneous-event batch for this trigger instance.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        trigger_events: Vec<GameEvent>,
         target_slots: Vec<TargetSelectionSlot>,
         /// CR 700.2 / CR 601.2b: Per-slot mode display label, parallel to
         /// `target_slots` (`mode_labels[i]` ↔ `target_slots[i]`). Populated for
@@ -4203,6 +4243,9 @@ pub enum PayableResource {
     },
     /// CR 107.1c + CR 122.1: Choose how many counters to remove.
     Counters,
+    /// CR 119.4: Pay any amount of life — N is deducted as life loss via
+    /// life_costs::pay_life_as_cost (life-loss replacement pipeline + CantLoseLife).
+    Life,
 }
 
 fn default_one() -> u32 {
@@ -6072,6 +6115,12 @@ pub struct GameState {
     /// Used by intervening-if triggers that only fire during the first combat phase.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub combat_phases_started_this_turn: u32,
+    /// CR 500.8 + CR 513.1: Number of end steps that have begun this turn.
+    /// Mirrors `combat_phases_started_this_turn` for the end-step axis; used by
+    /// conditions that gate a follow-up only during the first end step
+    /// (Y'shtola Rhul's "if it's the first end step of the turn" loop guard).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub end_steps_started_this_turn: u32,
     /// CR 508.1a: Object IDs of creatures declared as attackers this turn.
     /// Persists after combat ends for post-combat filtering.
     #[serde(default)]
@@ -6275,6 +6324,15 @@ pub struct GameState {
     /// tracked set before "put those cards onto the battlefield" resolves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_per_player_zone_choice: Option<PendingPerPlayerZoneChoice>,
+    /// CR 608.2c + CR 105.1 / CR 205.2a: Per-category-member
+    /// `Effect::ForEachCategoryExile` iteration paused by the current member's
+    /// interactive choice ("for each color/card type, you may exile a card of
+    /// that color/type"). Drained alongside `pending_per_player_zone_choice`,
+    /// BEFORE `pending_continuation` runs, so every member's pool pick
+    /// accumulates into the chain's tracked set before a downstream
+    /// "from among them" clause resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_per_category_zone_choice: Option<PendingPerCategoryZoneChoice>,
 
     /// CR 122.5: Pending atomic counter moves selected during a resolution-time
     /// distribution prompt. Drained before normal pending continuations so
@@ -7154,6 +7212,7 @@ impl GameState {
             attacked_defenders_this_turn: HashMap::new(),
             creature_attacked_defenders_this_turn: HashMap::new(),
             combat_phases_started_this_turn: 0,
+            end_steps_started_this_turn: 0,
             creatures_attacked_this_turn: HashSet::new(),
             attacker_declarations_this_turn: Vec::new(),
             creatures_blocked_this_turn: HashSet::new(),
@@ -7188,6 +7247,7 @@ impl GameState {
             pending_choose_one_of: None,
             pending_vote_ballot_iteration: None,
             pending_per_player_zone_choice: None,
+            pending_per_category_zone_choice: None,
             pending_counter_moves: None,
             pending_batch_deliveries: None,
             pending_counter_additions: None,
@@ -7610,6 +7670,7 @@ impl PartialEq for GameState {
             && self.creature_attacked_defenders_this_turn
                 == other.creature_attacked_defenders_this_turn
             && self.combat_phases_started_this_turn == other.combat_phases_started_this_turn
+            && self.end_steps_started_this_turn == other.end_steps_started_this_turn
             && self.creatures_attacked_this_turn == other.creatures_attacked_this_turn
             && self.attacker_declarations_this_turn == other.attacker_declarations_this_turn
             && self.creatures_blocked_this_turn == other.creatures_blocked_this_turn
@@ -8120,6 +8181,9 @@ mod tests {
         }));
         variants.push(Box::new(WaitingFor::TriggerTargetSelection {
             player: PlayerId(0),
+            trigger_controller: None,
+            trigger_event: None,
+            trigger_events: Vec::new(),
             target_slots: vec![TargetSelectionSlot {
                 legal_targets: vec![TargetRef::Object(ObjectId(1))],
                 optional: false,
@@ -8491,6 +8555,9 @@ mod tests {
         use crate::types::ability::TargetRef;
         let wf = WaitingFor::TriggerTargetSelection {
             player: PlayerId(0),
+            trigger_controller: None,
+            trigger_event: None,
+            trigger_events: Vec::new(),
             target_slots: vec![TargetSelectionSlot {
                 legal_targets: vec![
                     TargetRef::Object(ObjectId(1)),

@@ -1069,13 +1069,14 @@ fn has_later_sentence_if(lower: &str) -> bool {
     })
 }
 
-/// True when the trigger body names a player-chosen target that must be
-/// announced when the triggered ability is put on the stack (CR 603.3d).
+/// True when a resolution-time optional cast names a player-chosen target that
+/// must be announced when the triggered ability is put on the stack (CR 603.3d).
 fn trigger_effect_requires_stack_time_targets(ability: &AbilityDefinition) -> bool {
-    ability
-        .effect
-        .target_filter()
-        .is_some_and(|filter| !filter.is_context_ref())
+    matches!(ability.effect.as_ref(), Effect::CastFromZone { .. })
+        && ability
+            .effect
+            .target_filter()
+            .is_some_and(|filter| !filter.is_context_ref())
 }
 
 /// Lowering: assemble a `TriggerDefinition` from a `TriggerIr`.

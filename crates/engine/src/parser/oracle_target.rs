@@ -2749,12 +2749,7 @@ fn starts_with_type_phrase_lead(text: &str) -> bool {
 /// Minion / issue #847).
 fn starts_with_or_article_type_segment(text: &str) -> bool {
     let text = text.trim_start();
-    if let Ok((rest, _)) = alt((
-        tag::<_, _, OracleError<'_>>("an "),
-        tag("a "),
-    ))
-    .parse(text)
-    {
+    if let Ok((rest, _)) = alt((tag::<_, _, OracleError<'_>>("an "), tag("a "))).parse(text) {
         return starts_with_type_phrase_lead(rest);
     }
     starts_with_type_phrase_lead(text)

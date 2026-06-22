@@ -5,8 +5,8 @@
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::types::actions::GameAction;
 use engine::types::game_state::WaitingFor;
-use engine::types::phase::Phase;
 use engine::types::mana::ManaColor;
+use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
 const BRAIDS_CABAL_MINION: &str =
@@ -53,12 +53,21 @@ fn braids_cabal_minion_upkeep_sacrifice_prompts_active_player() {
     assert_eq!(runner.state().phase, Phase::Upkeep);
 
     let chosen = match &runner.state().waiting_for {
-        WaitingFor::EffectZoneChoice { player, cards, count, .. } => {
+        WaitingFor::EffectZoneChoice {
+            player,
+            cards,
+            count,
+            ..
+        } => {
             assert_eq!(
                 *player, P1,
                 "the upkeep player must choose what to sacrifice, not Braids's controller"
             );
-            assert_eq!(cards.len(), 2, "P1 must choose among multiple eligible permanents");
+            assert_eq!(
+                cards.len(),
+                2,
+                "P1 must choose among multiple eligible permanents"
+            );
             assert_eq!(*count, 1);
             assert!(
                 cards.contains(&p1_creature_a) && cards.contains(&p1_creature_b),
@@ -66,10 +75,7 @@ fn braids_cabal_minion_upkeep_sacrifice_prompts_active_player() {
             );
             p1_creature_a
         }
-        other => panic!(
-            "expected a sacrifice choice at P1 upkeep, got {:?}",
-            other
-        ),
+        other => panic!("expected a sacrifice choice at P1 upkeep, got {:?}", other),
     };
 
     runner

@@ -1972,7 +1972,7 @@ pub fn parse_type_phrase_with_ctx<'a>(
     for separator in TYPE_SEPARATORS {
         if let Ok((after_sep, _)) = tag::<_, _, OracleError<'_>>(*separator).parse(rest_lower) {
             let after_trimmed = after_sep.trim_start();
-            if starts_with_type_word(after_trimmed) {
+            if starts_with_or_article_type_segment(after_trimmed) {
                 let sep_text = &text[pos + rest_offset + separator.len()..];
                 let (other_filter, final_rest) = parse_type_phrase_with_ctx(sep_text, ctx);
                 // CR 205.2a: The left branch of a type disjunction must retain
@@ -2742,6 +2742,22 @@ fn starts_with_type_phrase_lead(text: &str) -> bool {
         // CR 208.1 (#2912): "1/1 creature" leads a type phrase (the P/T
         // designation is followed by a type word).
         || parse_leading_pt_designation(text).is_some()
+}
+
+/// Guard for comma/and/or type-list continuations where each segment may carry
+/// its own article — e.g. "an artifact, a creature, or a land" (Braids, Cabal
+/// Minion / issue #847).
+fn starts_with_or_article_type_segment(text: &str) -> bool {
+    let text = text.trim_start();
+    if let Ok((rest, _)) = alt((
+        tag::<_, _, OracleError<'_>>("an "),
+        tag("a "),
+    ))
+    .parse(text)
+    {
+        return starts_with_type_phrase_lead(rest);
+    }
+    starts_with_type_phrase_lead(text)
 }
 
 fn target_filter_has_meaningful_content(filter: &TargetFilter) -> bool {
@@ -10206,6 +10222,27 @@ mod tests {
                 );
                 assert_eq!(
                     filters[3],
+                    TargetFilter::Typed(TypedFilter::new(TypeFilter::Land))
+                );
+            }
+            other => panic!("Expected Or filter, got {:?}", other),
+        }
+        assert_eq!(rest.trim(), "");
+    }
+
+    #[test]
+    fn comma_list_per_item_articles() {
+        let (f, rest) = parse_type_phrase("an artifact, a creature, or a land");
+        match f {
+            TargetFilter::Or { ref filters } => {
+                assert_eq!(filters.len(), 3);
+                assert_eq!(
+                    filters[0],
+                    TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact))
+                );
+                assert_eq!(filters[1], TargetFilter::Typed(TypedFilter::creature()));
+                assert_eq!(
+                    filters[2],
                     TargetFilter::Typed(TypedFilter::new(TypeFilter::Land))
                 );
             }

@@ -2058,17 +2058,26 @@ fn mill_for_mana_cost(
 /// couples a player-announced X to both cost and effect (CR 601.2b), which the
 /// non-announcing delegation path cannot express — it is handled on its own.
 fn is_self_contained_mana_subcost(cost: &AbilityCost) -> bool {
-    matches!(
-        cost,
+    match cost {
         AbilityCost::Untap
-            | AbilityCost::Exert
-            | AbilityCost::PayEnergy { .. }
-            | AbilityCost::EffectCost { .. }
-            | AbilityCost::ReturnToHand {
-                filter: Some(TargetFilter::SelfRef),
-                ..
-            }
-    )
+        | AbilityCost::Exert
+        | AbilityCost::PayEnergy { .. }
+        | AbilityCost::EffectCost { .. }
+        | AbilityCost::ReturnToHand {
+            filter: Some(TargetFilter::SelfRef),
+            ..
+        } => true,
+        // CR 122.1 + CR 601.2b: Pentad Prism / Everflowing Chalice — bare
+        // self-RemoveCounter mana-ability costs (no tap) delegate to the
+        // activated-ability cost payer. "Remove any number" stays on the
+        // interactive mana-ability path in `advance_mana_ability_activation`.
+        AbilityCost::RemoveCounter {
+            target: None,
+            count,
+            ..
+        } => !crate::types::ability::is_chosen_remove_counter_cost_count(*count),
+        _ => false,
+    }
 }
 
 fn pay_life_cost(

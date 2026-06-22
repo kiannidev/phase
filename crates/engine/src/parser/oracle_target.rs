@@ -2749,15 +2749,31 @@ fn starts_with_type_phrase_lead(text: &str) -> bool {
         || parse_leading_pt_designation(text).is_some()
 }
 
-/// Guard for comma/and/or type-list continuations where each segment may carry
-/// its own article — e.g. "an artifact, a creature, or a land" (Braids, Cabal
-/// Minion / issue #847).
+/// Guard for comma/and/or type-list continuations where core-type segments may
+/// carry their own article — e.g. "an artifact, a creature, or a land" (Braids,
+/// Cabal Minion / issue #847).
 fn starts_with_or_article_type_segment(text: &str) -> bool {
     let text = text.trim_start();
     if let Ok((rest, _)) = alt((tag::<_, _, OracleError<'_>>("an "), tag("a "))).parse(text) {
-        return starts_with_type_phrase_lead(rest);
+        return starts_with_article_core_type_segment(rest);
     }
     starts_with_type_phrase_lead(text)
+}
+
+fn starts_with_article_core_type_segment(text: &str) -> bool {
+    let text = text.trim_start();
+    if parse_core_type(text).0.is_some() {
+        return true;
+    }
+    if let Ok((rest, _)) = nom_primitives::parse_color(text) {
+        if let Ok((after_space, _)) = tag::<_, _, OracleError<'_>>(" ").parse(rest) {
+            return starts_with_article_core_type_segment(after_space);
+        }
+    }
+    if let Some((_prop, consumed)) = parse_color_quality_prefix(text) {
+        return starts_with_article_core_type_segment(&text[consumed..]);
+    }
+    false
 }
 
 fn target_filter_has_meaningful_content(filter: &TargetFilter) -> bool {

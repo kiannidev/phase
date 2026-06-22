@@ -1304,6 +1304,33 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
         }
     }
 
+    // CR 603.4 + CR 111.1: Token intervening-ifs parsed via
+    // `zone_change_object_token_condition` default to destination Battlefield
+    // (correct for ETB). On dies/leave triggers the zone-change event's `to`
+    // is Graveyard — rewrite so "if it's not a token" can match (Vaultborn
+    // Tyrant, issue #3988).
+    if def.destination == Some(Zone::Graveyard) {
+        if let Some(TriggerCondition::ZoneChangeObjectMatchesFilter {
+            destination,
+            filter,
+            ..
+        }) = def.condition.as_mut()
+        {
+            if *destination == Zone::Battlefield {
+                let is_token_predicate = matches!(
+                    filter,
+                    TargetFilter::Typed(typed)
+                        if typed.properties.iter().any(|p| {
+                            matches!(p, FilterProp::NonToken | FilterProp::Token)
+                        })
+                );
+                if is_token_predicate {
+                    *destination = Zone::Graveyard;
+                }
+            }
+        }
+    }
+
     // CR 608.2k + CR 603.7c: For event-source-bearing trigger modes, the "that
     // card / that creature / that permanent" anaphor in the effect body
     // refers to the *triggering object* carried by the event (the just-

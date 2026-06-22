@@ -82,7 +82,7 @@ fn return_the_favor_copy_mode_available_against_sorcery_on_stack() {
     scenario.add_basic_land(P0, engine::types::mana::ManaColor::Red);
 
     let mut runner = scenario.build();
-    let opponent_sorcery = put_sorcery_on_stack(&mut runner, P1);
+    let _opponent_sorcery = put_sorcery_on_stack(&mut runner, P1);
 
     let card_id = runner.state().objects[&favor].card_id;
     runner

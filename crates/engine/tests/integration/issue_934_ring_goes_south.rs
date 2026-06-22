@@ -174,8 +174,7 @@ fn ring_goes_south_puts_two_lands_when_x_is_two() {
         .objects
         .values()
         .filter(|obj| {
-            obj.zone == Zone::Battlefield
-                && obj.card_types.core_types.contains(&CoreType::Land)
+            obj.zone == Zone::Battlefield && obj.card_types.core_types.contains(&CoreType::Land)
         })
         .map(|obj| (&obj.name, obj.tapped))
         .collect();

@@ -288,12 +288,6 @@ pub fn apply_draw_after_replacement(
         super::drawn_this_turn_choice::record_drawn_card(state, player_id, obj_id);
         record_first_draw_and_enqueue_miracle(state, player_id, obj_id);
     }
-
-    if drawn_count > 0 {
-        // CR 611.3a: hand-size-gated continuous effects must re-evaluate when
-        // a draw changes the controller's hand (issue #3991).
-        state.layers_dirty.mark_full();
-    }
 }
 
 /// CR 702.94a + CR 603.11: Shared first-draw hook — record the drawn

@@ -79,6 +79,7 @@ pub(crate) fn affected_filter_uses_object_population(filter: &TargetFilter) -> b
         | TargetFilter::ExiledCardByIndex { .. }
         | TargetFilter::TriggeringSpellController
         | TargetFilter::TriggeringSpellOwner
+        | TargetFilter::TriggeringSourceController
         | TargetFilter::TriggeringPlayer
         | TargetFilter::TriggeringSource
         | TargetFilter::ParentTarget
@@ -158,6 +159,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         | FilterProp::BlockingAlone
         | FilterProp::Tapped
         | FilterProp::IsSaddled
+        | FilterProp::SaddledSource
         | FilterProp::ProtectorMatches { .. }
         | FilterProp::Untapped
         | FilterProp::HasHasteOrControlledSinceTurnBegan
@@ -274,6 +276,7 @@ pub(crate) fn entered_object_perturbs_affected_filter(
         | TargetFilter::ExiledCardByIndex { .. }
         | TargetFilter::TriggeringSpellController
         | TargetFilter::TriggeringSpellOwner
+        | TargetFilter::TriggeringSourceController
         | TargetFilter::TriggeringPlayer
         | TargetFilter::TriggeringSource
         | TargetFilter::ParentTarget
@@ -365,6 +368,7 @@ fn entered_object_perturbs_filter_prop(
         | FilterProp::BlockingAlone
         | FilterProp::Tapped
         | FilterProp::IsSaddled
+        | FilterProp::SaddledSource
         | FilterProp::ProtectorMatches { .. }
         | FilterProp::Untapped
         | FilterProp::HasHasteOrControlledSinceTurnBegan
@@ -960,6 +964,8 @@ pub(crate) fn matches_type_filter_against_face(face: &CardFace, filter: &TypeFil
         TypeFilter::Sorcery => face.card_type.core_types.contains(&CoreType::Sorcery),
         TypeFilter::Planeswalker => face.card_type.core_types.contains(&CoreType::Planeswalker),
         TypeFilter::Battle => face.card_type.core_types.contains(&CoreType::Battle),
+        // CR 308.1: Kindred card-type check.
+        TypeFilter::Kindred => face.card_type.core_types.contains(&CoreType::Kindred),
         TypeFilter::Permanent => face
             .card_type
             .core_types
@@ -1391,6 +1397,12 @@ fn filter_inner_for_object(
                         if source_controller == Some(obj_ctrl) {
                             return false;
                         }
+                        // CR 102.3 + CR 800.4a: A player who has left the game is
+                        // not an opponent; cards in their zones are not legal
+                        // targets (Captain N'ghathrod class).
+                        if !super::players::is_alive(state, obj_ctrl) {
+                            return false;
+                        }
                     }
                     ControllerRef::ScopedPlayer => {
                         match scoped_player_or_controller(
@@ -1664,6 +1676,7 @@ fn filter_inner_for_object(
         // CR 603.7c: Event-context references resolve to players, not objects.
         TargetFilter::TriggeringSpellController
         | TargetFilter::TriggeringSpellOwner
+        | TargetFilter::TriggeringSourceController
         | TargetFilter::TriggeringPlayer
         | TargetFilter::TriggeringSource
         | TargetFilter::DefendingPlayer => false,
@@ -1906,6 +1919,7 @@ fn zone_change_filter_inner(
         | TargetFilter::ExiledCardByIndex { .. }
         | TargetFilter::TriggeringSpellController
         | TargetFilter::TriggeringSpellOwner
+        | TargetFilter::TriggeringSourceController
         | TargetFilter::TriggeringPlayer
         | TargetFilter::TriggeringSource
         | TargetFilter::ParentTarget
@@ -1982,6 +1996,8 @@ pub fn type_filter_matches(
         TypeFilter::Planeswalker => obj.card_types.core_types.contains(&CoreType::Planeswalker),
         // CR 310: Battle type check.
         TypeFilter::Battle => obj.card_types.core_types.contains(&CoreType::Battle),
+        // CR 308.1: Kindred type check.
+        TypeFilter::Kindred => obj.card_types.core_types.contains(&CoreType::Kindred),
         // CR 403.3: Permanents exist only on the battlefield — creatures, artifacts, enchantments, lands, planeswalkers, battles.
         TypeFilter::Permanent => {
             obj.card_types.core_types.contains(&CoreType::Creature)
@@ -2024,6 +2040,8 @@ fn zone_change_record_matches_type_filter(
         TypeFilter::Sorcery => record.core_types.contains(&CoreType::Sorcery),
         TypeFilter::Planeswalker => record.core_types.contains(&CoreType::Planeswalker),
         TypeFilter::Battle => record.core_types.contains(&CoreType::Battle),
+        // CR 308.1: Kindred type check.
+        TypeFilter::Kindred => record.core_types.contains(&CoreType::Kindred),
         TypeFilter::Permanent => {
             record.core_types.contains(&CoreType::Creature)
                 || record.core_types.contains(&CoreType::Artifact)
@@ -2138,6 +2156,7 @@ pub fn spell_record_matches_filter(
         | TargetFilter::ExiledCardByIndex { .. }
         | TargetFilter::TriggeringSpellController
         | TargetFilter::TriggeringSpellOwner
+        | TargetFilter::TriggeringSourceController
         | TargetFilter::TriggeringPlayer
         | TargetFilter::TriggeringSource
         | TargetFilter::ParentTarget
@@ -2379,6 +2398,7 @@ fn spell_object_matches_filter_inner(
         | TargetFilter::ExiledCardByIndex { .. }
         | TargetFilter::TriggeringSpellController
         | TargetFilter::TriggeringSpellOwner
+        | TargetFilter::TriggeringSourceController
         | TargetFilter::TriggeringPlayer
         | TargetFilter::TriggeringSource
         | TargetFilter::ParentTarget
@@ -2541,6 +2561,8 @@ fn spell_record_matches_type_filter(
         TypeFilter::Sorcery => record.core_types.contains(&CoreType::Sorcery),
         TypeFilter::Planeswalker => record.core_types.contains(&CoreType::Planeswalker),
         TypeFilter::Battle => record.core_types.contains(&CoreType::Battle),
+        // CR 308.1: Kindred type check.
+        TypeFilter::Kindred => record.core_types.contains(&CoreType::Kindred),
         TypeFilter::Permanent => {
             record.core_types.contains(&CoreType::Creature)
                 || record.core_types.contains(&CoreType::Artifact)
@@ -2655,6 +2677,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         | FilterProp::BlockingAlone
         | FilterProp::Tapped
         | FilterProp::IsSaddled
+        | FilterProp::SaddledSource
         | FilterProp::ProtectorMatches { .. }
         | FilterProp::Untapped
         | FilterProp::HasHasteOrControlledSinceTurnBegan
@@ -3035,6 +3058,13 @@ fn matches_filter_prop(
         FilterProp::Tapped => obj.tapped,
         // CR 702.171b: Matches permanents with the saddled designation.
         FilterProp::IsSaddled => obj.is_saddled,
+        // CR 702.171c: Matches a creature that saddled the filter source this turn
+        // (tapped to pay the source's saddle cost — recorded in `saddled_by`,
+        // cleared at end of turn). Source-relative, mirroring `BlockingSource`.
+        FilterProp::SaddledSource => state
+            .objects
+            .get(&source.id)
+            .is_some_and(|src| src.saddled_by.contains(&object_id)),
         // CR 310.8a: "each battle they protect" — protector is an opponent of
         // the source controller (Joyful Stormsculptor class).
         FilterProp::ProtectorMatches { controller } => {
@@ -3204,7 +3234,9 @@ fn matches_filter_prop(
         FilterProp::Owned { controller } => match controller {
             ControllerRef::You => source.controller == Some(obj.owner),
             ControllerRef::Opponent => {
-                source.controller.is_some() && source.controller != Some(obj.owner)
+                source.controller.is_some()
+                    && source.controller != Some(obj.owner)
+                    && super::players::is_alive(state, obj.owner)
             }
             ControllerRef::ScopedPlayer => {
                 scoped_player_or_controller(state, source.ability, source.controller, None)
@@ -3818,7 +3850,9 @@ fn zone_change_record_matches_property(
         FilterProp::Owned { controller } => match controller {
             ControllerRef::You => source.controller == Some(record.owner),
             ControllerRef::Opponent => {
-                source.controller.is_some() && source.controller != Some(record.owner)
+                source.controller.is_some()
+                    && source.controller != Some(record.owner)
+                    && super::players::is_alive(state, record.owner)
             }
             ControllerRef::ScopedPlayer => {
                 scoped_player_or_controller(state, source.ability, source.controller, None)
@@ -3966,6 +4000,7 @@ fn zone_change_record_matches_property(
         }),
         FilterProp::Tapped
         | FilterProp::IsSaddled
+        | FilterProp::SaddledSource
         | FilterProp::ProtectorMatches { .. }
         | FilterProp::Untapped
         | FilterProp::HasHasteOrControlledSinceTurnBegan

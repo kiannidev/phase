@@ -7,7 +7,7 @@ use crate::types::ability::{
     CounteredSpellDestination, DoorLockOp, Duration, Effect, FaceDownProfile, LibraryPosition,
     ManaProduction, ManaSpendRestriction, ModalSelectionConstraint, OutsideGameSourcePool,
     PlayerFilter, PtStat, PtValue, QuantityExpr, SearchDestinationSplit, SearchSelectionConstraint,
-    StaticDefinition, TargetFilter,
+    StaticCondition, StaticDefinition, TargetFilter,
 };
 use crate::types::card_type::Supertype;
 use crate::types::counter::CounterType;
@@ -242,8 +242,12 @@ pub(crate) enum ContinuationAst {
     /// CR 701.15a + CR 701.15b: "The token(s) (is|are) goaded [duration]" after token
     /// creation — grants `StaticMode::Goaded` on `TargetFilter::LastCreated`.
     GoadLastCreated { duration: Option<Duration> },
-    /// "The flashback cost is equal to its mana cost." after a flashback grant.
-    FlashbackCostEqualsManaCost,
+    /// CR 702.34a / CR 702.128a / CR 702.180a: "The/Its [flashback|embalm|harmonize]
+    /// cost is equal to its/that card's mana cost." after a self-cost graveyard
+    /// keyword grant. Redundant reminder text — the grant already carries
+    /// `ManaCost::SelfManaCost`, so this continuation is absorbed as a no-op
+    /// rather than lowering to `Effect::Unimplemented`.
+    SelfCostKeywordCostClarification,
     /// CR 701.19c: "It can't be regenerated" / "They can't be regenerated" — sets
     /// `cant_regenerate: true` on the preceding Destroy/DestroyAll effect.
     CantRegenerate,
@@ -974,10 +978,11 @@ pub(crate) enum SearchCreationImperativeAst {
         extra_filters: Vec<TargetFilter>,
     },
     /// CR 400.7 + CR 701.23 + CR 701.24: "Search [possessive] graveyard, hand,
-    /// and library for any number of cards with that name and exile them."
+    /// and library for all cards with that name and exile them."
     /// Lowered to `Effect::ChangeZoneAll` with multi-zone origin
     /// (`InAnyZone[Graveyard, Hand, Library]`) + `SameNameAsParentTarget` filter,
-    /// scoped to the player named by the possessive zone phrase.
+    /// scoped to the player named by the possessive zone phrase. "Any number of
+    /// cards" / "a card" variants are excluded — they require SearchChoice.
     MultiZoneSameNameExile {
         owner: ControllerRef,
     },
@@ -1217,9 +1222,18 @@ pub(crate) enum ShuffleImperativeAst {
     },
     /// "shuffle target card from {origin} into {owner}'s library" —
     /// targeted zone change + shuffle composition.
+    ///
+    /// `all` distinguishes a single-target move ("shuffle target card from your
+    /// graveyard into your library", `false`) from a filtered mass move
+    /// ("shuffle all nonland cards from your graveyard into your library",
+    /// `true`). When `true`, the lowering emits `Effect::ChangeZoneAll` so every
+    /// eligible object moves with no interactive choice (CR 400.6) and the move
+    /// stamps `last_effect_count`; when `false` it emits a single
+    /// `Effect::ChangeZone`.
     TargetedChangeZoneToLibrary {
         target: TargetFilter,
         origin: Option<Zone>,
+        all: bool,
     },
     Unimplemented {
         text: String,
@@ -1402,7 +1416,7 @@ pub(crate) fn with_clause_duration(
                 },
             ..
         } => {
-            *perm_dur = duration;
+            *perm_dur = normalize_play_from_exile_duration(duration);
         }
         Effect::CastFromZone {
             duration: ref mut effect_duration,
@@ -1419,6 +1433,27 @@ pub(crate) fn with_clause_duration(
         _ => {}
     }
     clause
+}
+
+fn normalize_play_from_exile_duration(duration: Duration) -> Duration {
+    match duration {
+        Duration::ForAsLongAs {
+            condition: StaticCondition::Unrecognized { text },
+        } if matches!(
+            text.as_str(),
+            "it remains exiled"
+                | "that card remains exiled"
+                | "those cards remain exiled"
+                | "they remain exiled"
+        ) =>
+        {
+            // CR 400.7i + CR 611.2a: exile-play permissions persist until the
+            // referenced object leaves exile; zone-exit cleanup removes the
+            // object-tagged permission.
+            Duration::Permanent
+        }
+        other => other,
+    }
 }
 
 // --- Modal types (moved from oracle_modal.rs) ---

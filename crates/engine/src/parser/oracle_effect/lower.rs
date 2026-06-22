@@ -24,16 +24,19 @@ use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::parser::oracle_ir::effect_chain::{ClauseIr, EffectChainIr, SpecialClause};
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AttackScope, AttackSubject,
-    CastFromZoneDriver, Comparator, ContinuousModification, ControllerRef, DamageSource,
-    DelayedTriggerCondition, Duration, Effect, EffectScope, FilterProp, LibraryPosition,
-    MultiTargetSpec, ObjectScope, PlayerFilter, PreventionAmount, PreventionScope, PtValue,
-    QuantityExpr, QuantityRef, RoundingMode, StaticCondition, StaticDefinition, SubAbilityLink,
-    TargetChoiceTiming, TargetFilter, TypeFilter, TypedFilter,
+    CastFromZoneDriver, CastingPermission, Comparator, ContinuousModification, ControllerRef,
+    DamageSource, DelayedTriggerCondition, Duration, Effect, EffectScope, FilterProp,
+    LibraryPosition, ManaSpendPermission, MultiTargetSpec, ObjectScope, PlayerFilter,
+    PreventionAmount, PreventionScope, PtValue, QuantityExpr, QuantityRef, RoundingMode,
+    StaticCondition, StaticDefinition, SubAbilityLink, TargetChoiceTiming, TargetFilter,
+    TypeFilter, TypedFilter,
 };
 use crate::types::counter::CounterType;
 use crate::types::game_state::{DistributionUnit, TargetSelectionConstraint};
+use crate::types::mana::ManaCost;
 use crate::types::phase::Phase;
-use crate::types::zones::Zone;
+use crate::types::statics::StaticMode;
+use crate::types::zones::{EtbTapState, Zone};
 
 // Parse-phase functions from the parent module (oracle_effect/mod.rs).
 // These are private to oracle_effect but accessible here as a descendant module.
@@ -163,6 +166,157 @@ pub(super) fn normalize_linked_exile_cast_bottom_cleanup(effect: &mut Effect) {
             *count = QuantityExpr::Fixed { value: 0 };
         }
     }
+}
+
+fn is_spend_mana_as_any_color_rider(clause: &ClauseIr) -> bool {
+    let Effect::GenericEffect {
+        static_abilities, ..
+    } = &clause.parsed.effect
+    else {
+        return false;
+    };
+    if static_abilities.len() != 1
+        || static_abilities[0].mode != (StaticMode::SpendManaAsAnyColor { spell_filter: None })
+    {
+        return false;
+    }
+
+    let lower = clause.source_text.to_ascii_lowercase();
+    let parsed = all_consuming((
+        opt(alt((
+            tag::<_, _, OracleError<'_>>("if you cast a spell this way, "),
+            tag("if you cast it this way, "),
+        ))),
+        tag("you may spend mana as though it were mana of any "),
+        alt((tag("color"), tag("type"))),
+        tag(" to cast "),
+        alt((
+            tag("it"),
+            tag("that spell"),
+            tag("a spell this way"),
+            tag("spells this way"),
+            tag("those spells"),
+        )),
+        opt(tag(".")),
+    ))
+    .parse(lower.trim())
+    .is_ok();
+    parsed
+}
+
+fn attach_any_color_mana_rider_to_previous_play_from_exile(defs: &mut [AbilityDefinition]) -> bool {
+    let Some(previous) = defs.last_mut() else {
+        return false;
+    };
+    let Effect::GrantCastingPermission {
+        permission:
+            CastingPermission::PlayFromExile {
+                mana_spend_permission,
+                ..
+            },
+        ..
+    } = previous.effect.as_mut()
+    else {
+        return false;
+    };
+
+    *mana_spend_permission = Some(ManaSpendPermission::AnyTypeOrColor);
+    true
+}
+
+/// CR 601.2f: Detect the "each spell cast this way costs {N} more to cast"
+/// rider sentence (Lightstall Inquisitor) and return the cost increase. This is
+/// a cost-raise scoped to spells cast via the immediately-preceding
+/// `PlayFromExile` grant ("this way" = the just-granted exile play), not a
+/// global static cost increase — so it folds into the grant's `cast_cost_raise`
+/// rather than emitting a standalone `StaticMode::ModifyCost`. Generic over the
+/// printed increase (`{1}`, `{2}`, …); the mana symbols are case-insensitive
+/// digits in the common generic case.
+fn cast_cost_raise_rider(clause: &ClauseIr) -> Option<ManaCost> {
+    let lower = clause.source_text.to_ascii_lowercase();
+    nom_on_lower(clause.source_text.trim(), lower.trim(), |i| {
+        let (i, _) = tag("each spell cast this way costs ").parse(i)?;
+        let (i, cost) = nom_primitives::parse_mana_cost(i)?;
+        let (i, _) = tag(" more to cast").parse(i)?;
+        let (i, _) = opt(tag(".")).parse(i)?;
+        eof(i)?;
+        Ok((i, cost))
+    })
+    .map(|(cost, _)| cost)
+}
+
+fn parses_land_enters_tapped_rider(input: &str) -> bool {
+    all_consuming(tag::<_, _, OracleError<'_>>(
+        "each land played this way enters tapped",
+    ))
+    .parse(input)
+    .is_ok()
+}
+
+/// CR 614.1c: Detect the "each land played this way enters tapped" rider
+/// sentence (Lightstall Inquisitor) — "enters tapped" is a CR 614.1c
+/// "[permanent] enters ..." replacement. Scoped to lands played via the
+/// preceding `PlayFromExile` grant ("this way"), so it folds into the grant's
+/// `land_enter_tapped` rather than emitting a board-wide ETB-tapped replacement.
+fn is_land_enters_tapped_rider(clause: &ClauseIr) -> bool {
+    let lower = clause.source_text.to_ascii_lowercase();
+    let trimmed = lower.trim().trim_end_matches('.').trim();
+    parses_land_enters_tapped_rider(trimmed)
+}
+
+/// Walk the previous def and its `sub_ability` chain for a `PlayFromExile`
+/// permission. The grant produced by the compound "exile … and may play that
+/// card" chain (Lightstall Inquisitor) lands as a sibling def during the lower
+/// loop, but a self-contained "exile …. You may play …" chain (Gonti) nests it
+/// as a sub-ability — handle both so the rider absorbs in either shape.
+fn find_prev_play_from_exile_permission_mut(
+    defs: &mut [AbilityDefinition],
+) -> Option<&mut CastingPermission> {
+    fn walk(def: &mut AbilityDefinition) -> Option<&mut CastingPermission> {
+        let is_pfe = matches!(
+            def.effect.as_ref(),
+            Effect::GrantCastingPermission {
+                permission: CastingPermission::PlayFromExile { .. },
+                ..
+            }
+        );
+        if is_pfe {
+            if let Effect::GrantCastingPermission { permission, .. } = def.effect.as_mut() {
+                return Some(permission);
+            }
+        }
+        def.sub_ability.as_mut().and_then(|sub| walk(sub))
+    }
+    defs.last_mut().and_then(walk)
+}
+
+/// CR 601.2f: Fold an "each spell cast this way costs {N} more" rider into the
+/// preceding `PlayFromExile` grant's `cast_cost_raise`.
+fn attach_cast_cost_raise_to_previous_play_from_exile(
+    defs: &mut [AbilityDefinition],
+    cost: ManaCost,
+) -> bool {
+    let Some(CastingPermission::PlayFromExile {
+        cast_cost_raise, ..
+    }) = find_prev_play_from_exile_permission_mut(defs)
+    else {
+        return false;
+    };
+    *cast_cost_raise = Some(cost);
+    true
+}
+
+/// CR 614.1c: Fold an "each land played this way enters tapped" rider into the
+/// preceding `PlayFromExile` grant's `land_enter_tapped`.
+fn attach_land_enters_tapped_to_previous_play_from_exile(defs: &mut [AbilityDefinition]) -> bool {
+    let Some(CastingPermission::PlayFromExile {
+        land_enter_tapped, ..
+    }) = find_prev_play_from_exile_permission_mut(defs)
+    else {
+        return false;
+    };
+    *land_enter_tapped = EtbTapState::Tapped;
+    true
 }
 
 pub(super) fn is_linked_exile_cast_bottom_cleanup(
@@ -579,6 +733,38 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
             continue;
         }
 
+        // CR 609.4b + CR 608.2c: Brainstealer/Daxos-class any-color mana
+        // riders may be split into their own sentence or comma sibling after a
+        // `PlayFromExile` grant. They scope the existing exile-play
+        // permission, so fold the rider into the prior grant instead of
+        // emitting a broad standalone `SpendManaAsAnyColor` effect.
+        if is_spend_mana_as_any_color_rider(clause_ir)
+            && attach_any_color_mana_rider_to_previous_play_from_exile(&mut defs)
+        {
+            prev_boundary = clause_ir.boundary;
+            continue;
+        }
+
+        // CR 601.2f + CR 614.1c: Lightstall Inquisitor's "Each spell cast this
+        // way costs {1} more to cast." / "Each land played this way enters
+        // tapped." rider sentences scope to the preceding `PlayFromExile`
+        // grant. Fold each into the grant (`cast_cost_raise` /
+        // `land_enter_tapped`) instead of emitting a standalone cost-modify
+        // static or board-wide ETB-tapped replacement — "this way" binds them
+        // to the exile-play permission, not to all spells/lands.
+        if let Some(cost) = cast_cost_raise_rider(clause_ir) {
+            if attach_cast_cost_raise_to_previous_play_from_exile(&mut defs, cost) {
+                prev_boundary = clause_ir.boundary;
+                continue;
+            }
+        }
+        if is_land_enters_tapped_rider(clause_ir)
+            && attach_land_enters_tapped_to_previous_play_from_exile(&mut defs)
+        {
+            prev_boundary = clause_ir.boundary;
+            continue;
+        }
+
         // Non-absorbed, non-special followup continuation — apply it to the
         // previous defs before building this clause's def.
         if let Some(ref continuation) = clause_ir.followup_continuation {
@@ -664,6 +850,10 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
                     ..
                 } if crate::game::casting_costs::cost_has_x(cost)
             );
+        let is_pay_to_end_effect_termination =
+            crate::parser::clause_shell::is_you_may_pay_to_end_effect_phrase(
+                &clause_ir.source_text.to_ascii_lowercase(),
+            );
         if clause_ir.is_optional
             && !matches!(&clause_ir.parsed.effect, Effect::SearchOutsideGame { .. })
             && !matches!(
@@ -672,6 +862,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
             )
             && !is_lingering_cast_from_zone
             && !is_join_forces_pay_any_amount_mana_cost
+            && !is_pay_to_end_effect_termination
         {
             def.optional = true;
             def.optional_for = clause_ir.opponent_may_scope;
@@ -684,6 +875,7 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
             )
             && !is_lingering_cast_from_zone
             && !is_join_forces_pay_any_amount_mana_cost
+            && !is_pay_to_end_effect_termination
         {
             def.optional = true;
         }
@@ -1595,24 +1787,31 @@ fn rewire_cross_sentence_token_counter_attach(def: &mut AbilityDefinition) {
 /// it") — the bare-"it" host anaphor must target `LastCreated`, not
 /// `ParentTarget` (the token-creating effect has no parent target slot).
 fn rewire_token_attach_sibling(def: &mut AbilityDefinition) {
-    if !matches!(&*def.effect, Effect::Token { .. }) {
-        return;
-    }
-    let Some(attach_sub) = def.sub_ability.as_mut() else {
-        return;
-    };
-    // Token → PutCounter → Attach is owned by `rewire_cross_sentence_token_counter_attach`.
-    if matches!(&*attach_sub.effect, Effect::PutCounter { .. }) {
-        return;
-    }
-    let Effect::Attach { target, .. } = attach_sub.effect.as_mut() else {
-        return;
-    };
-    if matches!(
-        target,
-        TargetFilter::ParentTarget | TargetFilter::TriggeringSource
-    ) {
-        *target = TargetFilter::LastCreated;
+    // Walk the whole sub-ability chain: the token + bare-Attach pair is not
+    // always at the root. Field-Tested Frying Pan ("create a Food token, then
+    // create a 1/1 white Halfling creature token and attach this Equipment to
+    // it") nests the Attach under the *second* token, so a root-only check would
+    // miss it and leave "it" bound to ParentTarget/TriggeringSource (which has no
+    // referent here) instead of the just-created token.
+    let mut node: Option<&mut AbilityDefinition> = Some(def);
+    while let Some(current) = node {
+        if matches!(&*current.effect, Effect::Token { .. }) {
+            if let Some(sub) = current.sub_ability.as_mut() {
+                // Token → PutCounter → Attach is owned by
+                // `rewire_cross_sentence_token_counter_attach`.
+                if !matches!(&*sub.effect, Effect::PutCounter { .. }) {
+                    if let Effect::Attach { target, .. } = sub.effect.as_mut() {
+                        if matches!(
+                            target,
+                            TargetFilter::ParentTarget | TargetFilter::TriggeringSource
+                        ) {
+                            *target = TargetFilter::LastCreated;
+                        }
+                    }
+                }
+            }
+        }
+        node = current.sub_ability.as_deref_mut();
     }
 }
 
@@ -3340,6 +3539,17 @@ pub(super) fn strip_temporal_prefix(text: &str) -> (&str, Option<DelayedTriggerC
                 },
                 tag("at this turn's next end of combat, "),
             ),
+            // CR 511.2 + CR 603.7a: bare "at end of combat, …" prefix — the
+            // companion of the existing suffix arm in `strip_temporal_suffix`.
+            // An attack/combat trigger whose effect body is deferred to the
+            // end-of-combat step (Fortune, Loyal Steed: "Whenever Fortune
+            // attacks while saddled, at end of combat, exile it and …").
+            value(
+                DelayedTriggerCondition::AtNextPhase {
+                    phase: Phase::EndCombat,
+                },
+                tag("at end of combat, "),
+            ),
         ))
         .parse(i)
     }) {
@@ -3435,11 +3645,29 @@ pub(crate) fn extract_verb_up_to_multi_target(text: &str) -> Option<MultiTargetS
     multi_target
 }
 
+/// CR 115.1: the "controlled by different players" target-set constraint phrase.
+/// Single source of truth shared by the detector
+/// (`parse_controlled_by_different_players_target_constraint`) and the per-slot
+/// stripper (`strip_controlled_by_different_players` →
+/// `try_parse_exchange_control_targets`).
+pub(crate) const CONTROLLED_BY_DIFFERENT_PLAYERS: &str = " controlled by different players";
+
+/// Locate the `CONTROLLED_BY_DIFFERENT_PLAYERS` constraint with a `take_until`
+/// combinator and return the span BEFORE it (trimmed). Returns `None` when the
+/// constraint is absent, so callers keep the original span. Composed from the
+/// shared constraint phrase so the detector and the stripper can never drift.
+pub(crate) fn strip_controlled_by_different_players(span: &str) -> Option<&str> {
+    take_until::<_, _, OracleError<'_>>(CONTROLLED_BY_DIFFERENT_PLAYERS)
+        .parse(span)
+        .ok()
+        .map(|(_, before)| before.trim_end())
+}
+
 fn parse_controlled_by_different_players_target_constraint(text: &str) -> bool {
     let lower = text.to_lowercase();
     let mut parser = preceded(
-        take_until::<_, _, OracleError<'_>>(" controlled by different players"),
-        tag(" controlled by different players"),
+        take_until::<_, _, OracleError<'_>>(CONTROLLED_BY_DIFFERENT_PLAYERS),
+        tag(CONTROLLED_BY_DIFFERENT_PLAYERS),
     );
     parser.parse(lower.as_str()).is_ok()
 }
@@ -4618,7 +4846,15 @@ pub(super) fn try_parse_damage_with_remainder<'a>(
             },
             &after[consumed..],
         )
-    } else if let Ok((rem, _)) = tag::<_, _, OracleError<'_>>("that much damage").parse(after_lower)
+    } else if let Ok((rem, _)) = alt((
+        tag::<_, _, OracleError<'_>>("that much damage"),
+        // CR 120.1: "that amount of damage" is the synonym used when the
+        // antecedent reads "N damage" rather than "this much damage" (Fear of
+        // Burning Alive: "deals that amount of damage to target creature that
+        // player controls"). Both anaphors resolve to the just-dealt amount.
+        tag("that amount of damage"),
+    ))
+    .parse(after_lower)
     {
         let consumed = after_lower.len() - rem.len();
         (
@@ -4648,11 +4884,21 @@ pub(super) fn try_parse_damage_with_remainder<'a>(
                 nom::combinator::all_consuming(tag::<_, _, OracleError<'_>>("defending player"))
                     .parse(target_phrase)
                     .is_ok();
+            // CR 120.3: "deals damage to each player equal to the number of [X]
+            // THEY control" — the third-person "they" binds to the iterating
+            // player (DamageEachPlayer resolves per recipient), NOT the caster.
+            // Classify the recipient scope BEFORE parsing the amount so the
+            // count's controller threads to `ScopedPlayer` (Acidic Soil).
+            let each_player_scope = parse_damage_each_player_scope(target_phrase).is_some();
             // Parse amount using existing helpers
             let qty = crate::parser::oracle_quantity::parse_event_context_quantity(amount_phrase)
                 .or_else(|| {
                     if references_defending_player {
                         ctx.with_player_scope(ControllerRef::DefendingPlayer, |amount_ctx| {
+                            parse_cda_quantity_with_context(amount_phrase, amount_ctx)
+                        })
+                    } else if each_player_scope {
+                        ctx.with_player_scope(ControllerRef::ScopedPlayer, |amount_ctx| {
                             parse_cda_quantity_with_context(amount_phrase, amount_ctx)
                         })
                     } else {
@@ -5893,6 +6139,7 @@ pub(super) fn apply_where_x_effect_expression(
         | Effect::ExileTop { count: amount, .. }
         | Effect::Discover {
             mana_value_limit: amount,
+            ..
         }
         | Effect::Incubate { count: amount } => {
             *amount = apply_where_x_quantity_expression(amount.clone(), where_x_expression);

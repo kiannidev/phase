@@ -1531,6 +1531,32 @@ pub(crate) fn try_parse_compound_subtypes(
     Some(TargetFilter::Or { filters })
 }
 
+/// CR 510.1a + CR 613.11: The "assign[s] combat damage equal to <poss> toughness
+/// rather than <poss> power" predicate, in both the singular ("assigns … its …
+/// its") and plural ("assign … their … their") surface forms. CR 510.1a is the
+/// default ("assigns combat damage equal to its power"); this is a continuous
+/// rule-modification effect (CR 613.11) that substitutes toughness for power.
+///
+/// Both forms map to the same [`ContinuousModification::AssignDamageFromToughness`]
+/// rule — only the subject's grammatical number differs (singular "each creature
+/// … assigns" vs plural "creatures you control … assign"). Centralizing the
+/// phrase here keeps the static-line parser and the one-shot continuous-effect
+/// parser (`parse_continuous_modifications`) in lockstep so a new subject scope
+/// never silently drops the plural form. Returns the post-phrase remainder.
+pub(crate) fn parse_assigns_damage_from_toughness_predicate(input: &str) -> OracleResult<'_, ()> {
+    alt((
+        value(
+            (),
+            tag("assigns combat damage equal to its toughness rather than its power"),
+        ),
+        value(
+            (),
+            tag("assign combat damage equal to their toughness rather than their power"),
+        ),
+    ))
+    .parse(input)
+}
+
 /// CR 510.1c: Parse "each creature [you control] [with condition] assigns combat damage
 /// equal to its toughness rather than its power" patterns.
 ///
@@ -1976,6 +2002,10 @@ fn parse_crew_contribution_predicate_nom(
             tag("crews vehicles and stations permanents"),
         ),
         value(vec![CrewAction::Crew], tag("crews vehicles")),
+        // CR 702.184a: bare "stations permanents" — station-only contribution
+        // modifier (Tapestry Warden: "… stations permanents using its toughness
+        // rather than its power").
+        value(vec![CrewAction::Station], tag("stations permanents")),
     ))
     .parse(input)?;
     let (input, _) = space1.parse(input)?;
@@ -2122,6 +2152,12 @@ pub(crate) fn parse_combat_tax_body(input: &str) -> OracleResult<'_, CombatTaxPa
     // so the longer phrase wins (nom `alt` is leftmost-match).
     use crate::types::triggers::AttackTargetFilter;
     let (input, defended) = opt(alt((
+        // CR 508.1c + CR 310.5: " you or permanents you control" also defends
+        // battles — a distinct filter from the planeswalker-only phrase.
+        value(
+            AttackTargetFilter::PlayerOrPermanents,
+            tag_no_case::<_, _, OracleError<'_>>(" you or permanents you control"),
+        ),
         value(
             AttackTargetFilter::PlayerOrPlaneswalker,
             tag_no_case::<_, _, OracleError<'_>>(" you or planeswalkers you control"),

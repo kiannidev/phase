@@ -592,6 +592,9 @@ fn static_mode_is_optional_permission(mode: &StaticMode) -> bool {
     matches!(
         mode,
         StaticMode::MayLookAtTopOfLibrary
+            // CR 708.5: "you may look at face-down creatures [you don't control |
+            // your opponents control] any time" — opt-in look permission.
+            | StaticMode::MayLookAtFaceDown
             | StaticMode::MayChooseNotToUntap
             | StaticMode::MayPlayAdditionalLand
             | StaticMode::TopOfLibraryCastPermission { .. }
@@ -635,9 +638,10 @@ fn static_mode_is_optional_permission(mode: &StaticMode) -> bool {
             // CR 601.2f: Defiler-style cost reductions encode the optional
             // life payment inside the static cost-modification primitive.
             | StaticMode::DefilerCostReduction { .. }
-            // CR 609.4b: "You may spend mana as though it were mana of any color" —
-            // opt-in mana-color substitution, inherently optional by the "you may" surface.
-            | StaticMode::SpendManaAsAnyColor
+            // CR 609.4b: "You may spend mana as though it were mana of any color" /
+            // "you may spend mana of any type to cast [filtered] spells" — opt-in
+            // mana substitution, inherently optional by the "you may" surface.
+            | StaticMode::SpendManaAsAnyColor { .. }
             // CR 602.5a + CR 702.10c: "You may activate abilities of X as though those
             // creatures had haste" — lifts the summoning-sickness gate on {T}/{Q}
             // activated abilities; the permission is opt-in by the "you may" surface.
@@ -1433,6 +1437,7 @@ fn detect_dynamic_qty(
         // Replicate "cost equal to its mana cost" — encoded as a dynamic
         // mana-cost reference rather than a fixed cost.
         "SelfManaCost",
+        "SelfManaValue",
         "TargetManaCost",
         // CR 702.20a: "assigns combat damage equal to its toughness
         // rather than its power" — Brontodon class. Encoded as a typed
@@ -2249,6 +2254,7 @@ fn detect_condition_as_long_as(
         "as long as it remains exiled",
         "as long as that card remains exiled",
         "as long as those cards remain exiled",
+        "as long as they remain exiled",
     ]
     .iter()
     .any(|phrase| cleaned.contains(phrase));
@@ -2466,6 +2472,13 @@ fn detect_duration_this_turn(
         "regenerated this turn",
         "scryed this turn",
         "surveiled this turn",
+        // CR 702.171c: "creature that saddled it this turn" — a relative-clause
+        // target filter (`FilterProp::SaddledSource`), not an effect duration.
+        // Same turn-history-quantity class as "attacked this turn" / "died this
+        // turn": the "this turn" scopes the saddler-membership window (cleared at
+        // cleanup), never a forward-looking duration. Calamity / Giant Beaver /
+        // The Gitrog, Ravenous Ride.
+        "saddled it this turn",
     ];
     // Only exempt when EVERY occurrence of "this turn" is part of a quantity
     // context. Counting occurrences ensures we still fire on cards that have
@@ -3029,14 +3042,32 @@ mod tests {
             &["Artifact"],
         );
         assert!(
-            parsed
-                .statics
-                .iter()
-                .any(|s| matches!(s.mode, StaticMode::SpendManaAsAnyColor)),
+            parsed.statics.iter().any(|s| matches!(
+                s.mode,
+                StaticMode::SpendManaAsAnyColor { spell_filter: None }
+            )),
             "expected SpendManaAsAnyColor static to parse, got statics: {:#?}",
             parsed.statics
         );
         assert!(!has_swallowed_detector(&parsed, "Optional_YouMay"));
+    }
+
+    #[test]
+    fn condition_as_long_as_accepts_play_from_exile_they_remain_exiled() {
+        // CR 400.7i + CR 609.4b: Brainstealer Dragon's tracked-set
+        // PlayFromExile permission represents the "for as long as they remain
+        // exiled" duration; the following any-color mana rider folds into that
+        // same permission, not a swallowed condition.
+        let parsed = parse_named(
+            "Flying\n\
+             At the beginning of your end step, exile the top card of each opponent's library. \
+             You may play those cards for as long as they remain exiled. \
+             If you cast a spell this way, you may spend mana as though it were mana of any color to cast it.",
+            "Brainstealer Dragon",
+            &["Creature", "Dragon"],
+        );
+
+        assert!(!has_swallowed_detector(&parsed, "Condition_AsLongAs"));
     }
 
     #[test]
@@ -3669,6 +3700,22 @@ mod tests {
         let parsed = parse_named(
             "Reach\nThis creature has indestructible as long as it attacked a battle this turn.",
             "War Historian",
+            &["Creature"],
+        );
+
+        assert!(!has_swallowed_detector(&parsed, "Duration_ThisTurn"));
+    }
+
+    /// CR 702.171c: "creature that saddled it this turn" is a relative-clause
+    /// target filter (`FilterProp::SaddledSource`), a turn-history-quantity
+    /// context — not a forward-looking effect duration. After the saddler-ref
+    /// filter suffix parses, `detect_duration_this_turn` must not fire (Giant
+    /// Beaver / The Gitrog, Ravenous Ride regression).
+    #[test]
+    fn duration_this_turn_accepts_saddled_it_this_turn_filter() {
+        let parsed = parse_named(
+            "Vigilance\nWhenever this creature attacks while saddled, put a +1/+1 counter on target creature that saddled it this turn.",
+            "Giant Beaver",
             &["Creature"],
         );
 
@@ -4800,12 +4847,13 @@ mod tests {
         )));
     }
 
-    /// CR 122.1 + CR 603.2: Construct a Cosmic Cube's second-draw trigger body
-    /// (token + plan counter) parses with zero Unimplemented. The
-    /// seventh-plan-counter sacrifice parses too; ONLY the heavy "you control
-    /// target opponent during their next turn" rider stays honestly
-    /// `Effect::Unimplemented` (intentionally deferred). Shape gate paired with
-    /// `tests/construct_cosmic_cube_second_draw_token.rs`.
+    /// CR 122.1 + CR 603.2 + CR 723.1: Construct a Cosmic Cube parses with zero
+    /// Unimplemented across the whole card. The second-draw trigger body (token +
+    /// plan counter) is fully supported; the seventh-plan-counter sacrifice
+    /// parses; and the reflexive "you control target opponent during their next
+    /// turn" rider now lowers to `Effect::ControlNextTurn` via the shared
+    /// turn-control subsystem (CR 723) rather than staying `Unimplemented`. Shape
+    /// gate paired with `tests/construct_cosmic_cube_second_draw_token.rs`.
     #[test]
     fn construct_second_draw_body_parses_token_and_plan_counter() {
         let parsed = parse_named(
@@ -4830,8 +4878,8 @@ mod tests {
             !def_tree_has_unimplemented(second_draw),
             "the token + plan-counter body must be fully supported"
         );
-        // The deferred control-opponent rider remains honest: exactly one
-        // Unimplemented across the whole card.
+        // CR 723.1: the entire card — including the reflexive control-opponent
+        // rider — now parses with zero Unimplemented effects.
         let total_unimpl: usize = parsed
             .triggers
             .iter()
@@ -4839,8 +4887,36 @@ mod tests {
             .filter(|d| def_tree_has_unimplemented(d))
             .count();
         assert_eq!(
-            total_unimpl, 1,
-            "only the deferred 'you control target opponent' rider stays Unimplemented"
+            total_unimpl, 0,
+            "every effect on Construct a Cosmic Cube must be supported (control-opponent rider now lowers to ControlNextTurn)"
+        );
+
+        // CR 723.1: the reflexive rider lowers to `Effect::ControlNextTurn` —
+        // the discriminating shape assertion. Without the "their next turn"
+        // possessive variant in the suffix combinator this would be Unimplemented.
+        fn def_tree_has_control_next_turn(def: &AbilityDefinition) -> bool {
+            if matches!(*def.effect, Effect::ControlNextTurn { .. }) {
+                return true;
+            }
+            def.sub_ability
+                .as_deref()
+                .is_some_and(def_tree_has_control_next_turn)
+                || def
+                    .else_ability
+                    .as_deref()
+                    .is_some_and(def_tree_has_control_next_turn)
+                || def
+                    .mode_abilities
+                    .iter()
+                    .any(def_tree_has_control_next_turn)
+        }
+        assert!(
+            parsed
+                .triggers
+                .iter()
+                .filter_map(|t| t.execute.as_deref())
+                .any(def_tree_has_control_next_turn),
+            "the seventh-counter reflexive rider must lower to Effect::ControlNextTurn"
         );
     }
 }

@@ -128,7 +128,18 @@ fn handle_unlock_room_door(
         }
     };
 
-    casting::pay_unless_cost(state, player, &cost, events)?;
+    // CR 116.2m + CR 709.5e + CR 106.6: The unlock cost is a special action's
+    // mana cost. Route payment through `PaymentContext::SpecialAction(UnlockDoor)`
+    // so spend-restricted mana ("only to … unlock doors", Smoky Lounge) is
+    // eligible here and spell/activation-restricted mana is correctly rejected.
+    casting::pay_special_action_mana_cost(
+        state,
+        player,
+        object_id,
+        &cost,
+        crate::types::mana::SpecialAction::UnlockDoor,
+        events,
+    )?;
 
     super::room::unlock_door_designation(state, object_id, player, door, events);
     Ok(WaitingFor::Priority { player })
@@ -1929,6 +1940,17 @@ fn apply_action(
                 }
                 AlternativeCastKeyword::Spectacle => {
                     casting::handle_spectacle_cost_choice_with_payment_mode(
+                        state,
+                        *player,
+                        *object_id,
+                        *card_id,
+                        choice,
+                        *payment_mode,
+                        &mut events,
+                    )?
+                }
+                AlternativeCastKeyword::Prowl => {
+                    casting::handle_prowl_cost_choice_with_payment_mode(
                         state,
                         *player,
                         *object_id,
@@ -5575,6 +5597,23 @@ fn handle_play_land(
         }
     }
 
+    // CR 614.1c: A land played via a `PlayFromExile` grant that carries
+    // `land_enter_tapped` enters the battlefield tapped (Lightstall Inquisitor:
+    // "Each land played this way enters tapped."). Seed the tap state on the
+    // proposed event so the replacement pipeline applies it like any other
+    // ETB-tapped land. Only the exile-play path can carry this grant field.
+    if in_exile_with_permission {
+        let enters_tapped = state
+            .objects
+            .get(&object_id)
+            .is_some_and(|obj| super::casting::exile_play_land_enters_tapped(obj, player));
+        if enters_tapped {
+            if let Some(slot) = proposed.battlefield_entry_tap_state_mut() {
+                *slot = crate::types::zones::EtbTapState::Tapped;
+            }
+        }
+    }
+
     match super::replacement::replace_event(state, proposed, events) {
         super::replacement::ReplacementResult::Execute(event) => {
             if let crate::types::proposed_event::ProposedEvent::ZoneChange { object_id, .. } = event
@@ -8180,6 +8219,121 @@ mod tests {
                 ..
             } if *object_id == room
         )));
+    }
+
+    /// CR 106.6 + CR 116.2m + CR 709.5e: Smoky Lounge produces {R}{R} restricted
+    /// to "cast Room spells and unlock doors". The door-unlock half lowers to
+    /// `OnlyForSpecialAction(UnlockDoor)`; paying a Room's unlock cost routes
+    /// through `PaymentContext::SpecialAction(UnlockDoor)`, so the restricted {R}
+    /// IS eligible. Before this fix the unlock cost paid via
+    /// `PaymentContext::Effect`, which rejects every restriction — the restricted
+    /// {R} could not pay and the unlock failed. Reverting the
+    /// `pay_special_action_mana_cost` wiring flips this assertion (the unlock
+    /// would error "Cannot pay mana cost").
+    #[test]
+    fn unlock_door_restricted_mana_pays_room_unlock_cost() {
+        use crate::types::mana::{ManaRestriction, ManaType, ManaUnit, SpecialAction};
+
+        let mut state = setup_game_at_main_phase();
+        let room = create_object(
+            &mut state,
+            CardId(901),
+            PlayerId(0),
+            "Bottomless Pool".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&room).unwrap();
+            obj.card_types.subtypes.push("Room".to_string());
+            obj.room_unlocks = Some(Default::default());
+            // CR 709.5e: left door's unlock cost is the object's mana cost ({R}).
+            obj.mana_cost = ManaCost::Cost {
+                shards: vec![crate::types::mana::ManaCostShard::Red],
+                generic: 0,
+            };
+        }
+
+        // Smoky Lounge's restricted {R}: only for casting Room spells OR unlocking
+        // doors. Mirrors the lowering of `ManaSpendRestriction::Any([SpellType,
+        // UnlockDoor])`.
+        let restriction = ManaRestriction::OnlyForAny(vec![
+            ManaRestriction::OnlyForSpellType("Room".to_string()),
+            ManaRestriction::OnlyForSpecialAction(SpecialAction::UnlockDoor),
+        ]);
+        {
+            let player = state
+                .players
+                .iter_mut()
+                .find(|p| p.id == PlayerId(0))
+                .unwrap();
+            player
+                .mana_pool
+                .add(ManaUnit::new(ManaType::Red, room, false, vec![restriction]));
+        }
+
+        let result = apply_as_current(
+            &mut state,
+            GameAction::UnlockRoomDoor {
+                object_id: room,
+                door: RoomDoor::Left,
+            },
+        )
+        .expect("restricted mana must be able to pay a door's unlock cost");
+
+        let room_obj = state.objects.get(&room).unwrap();
+        assert!(
+            room_obj.room_unlocks.unwrap().left_unlocked,
+            "the door must be unlocked after paying its cost with door-restricted mana"
+        );
+        assert!(result.events.iter().any(|event| matches!(
+            event,
+            GameEvent::RoomDoorUnlocked { object_id, door: RoomDoor::Left, .. } if *object_id == room
+        )));
+        // The restricted {R} was consumed paying the unlock cost.
+        let pool_left = state
+            .players
+            .iter()
+            .find(|p| p.id == PlayerId(0))
+            .unwrap()
+            .mana_pool
+            .mana
+            .len();
+        assert_eq!(
+            pool_left, 0,
+            "the restricted mana must be spent on the unlock"
+        );
+    }
+
+    /// CR 106.6 + CR 116.2m: Door-restricted mana is rejected for unrelated
+    /// payments. The unlock cost is the ONLY thing this {R} can pay (besides Room
+    /// spell casts) — a generic effect cost must not draw on it. Reverting the
+    /// `OnlyForSpecialAction` gate (e.g. making it `true` for `Effect`) flips this.
+    #[test]
+    fn unlock_door_restricted_mana_rejected_for_effect_and_spell_payments() {
+        use crate::types::mana::{
+            ManaRestriction, ManaType, PaymentContext, SpecialAction, SpellMeta,
+        };
+
+        let restriction = ManaRestriction::OnlyForSpecialAction(SpecialAction::UnlockDoor);
+
+        // Accepts the matching special action.
+        assert!(restriction.allows(&PaymentContext::SpecialAction(SpecialAction::UnlockDoor)));
+        // Rejects generic effect-resolution payments (the pre-fix unlock path).
+        assert!(!restriction.allows(&PaymentContext::Effect));
+        // Rejects a Room spell cast (this leaf is the door half only).
+        let room_spell = SpellMeta {
+            types: vec!["Enchantment".to_string()],
+            subtypes: vec!["Room".to_string()],
+            ..SpellMeta::default()
+        };
+        assert!(!restriction.allows(&PaymentContext::Spell(&room_spell)));
+        // Rejects ability activation.
+        assert!(!restriction.allows(&PaymentContext::Activation {
+            source_types: &["Artifact".to_string()],
+            source_subtypes: &["Equipment".to_string()],
+            ability_tag: None,
+        }));
+        let _ = ManaType::Red;
     }
 
     #[test]

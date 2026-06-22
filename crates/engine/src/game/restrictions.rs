@@ -135,8 +135,12 @@ pub fn flash_timing_cost(
 
 pub fn add_mana_cost(base: &ManaCost, extra: &ManaCost) -> ManaCost {
     match (base, extra) {
-        (ManaCost::NoCost, other) | (ManaCost::SelfManaCost, other) => other.clone(),
-        (other, ManaCost::NoCost) | (other, ManaCost::SelfManaCost) => other.clone(),
+        (ManaCost::NoCost, other)
+        | (ManaCost::SelfManaCost, other)
+        | (ManaCost::SelfManaValue, other) => other.clone(),
+        (other, ManaCost::NoCost)
+        | (other, ManaCost::SelfManaCost)
+        | (other, ManaCost::SelfManaValue) => other.clone(),
         (
             ManaCost::Cost {
                 shards: base_shards,
@@ -386,6 +390,8 @@ fn entry_type_filter_matches(record: &BattlefieldEntryRecord, type_filter: &Type
         TypeFilter::AnyOf(filters) => filters
             .iter()
             .any(|inner| entry_type_filter_matches(record, inner)),
+        // CR 308.1: Kindred type check.
+        TypeFilter::Kindred => record.core_types.contains(&CoreType::Kindred),
         _ => false,
     }
 }
@@ -1934,6 +1940,22 @@ pub(crate) fn attack_target_matches_defended_scope(
         (AttackTargetFilter::OwnerOrPlaneswalker, AttackTarget::Player(p)) => *p == source_owner,
         (AttackTargetFilter::OwnerOrPlaneswalker, AttackTarget::Planeswalker(pw_id)) => {
             permanent_controller(*pw_id) == Some(source_owner)
+        }
+        // CR 508.1c + CR 109.5: "can't attack you or permanents you control" — the
+        // "you" being defended is the static's/restriction's controller.
+        (AttackTargetFilter::PlayerOrPermanents, AttackTarget::Player(p)) => {
+            *p == source_controller
+        }
+        // CR 109.4 + CR 508.5: a defended planeswalker compares its controller
+        // against the protected player.
+        (AttackTargetFilter::PlayerOrPermanents, AttackTarget::Planeswalker(pw_id)) => {
+            permanent_controller(*pw_id) == Some(source_controller)
+        }
+        // CR 109.4 + CR 508.5 + CR 310.5: battles are attackable permanents, so
+        // "permanents you control" also defends a battle the protected player
+        // controls (the distinctive arm vs `PlayerOrPlaneswalker`, which has none).
+        (AttackTargetFilter::PlayerOrPermanents, AttackTarget::Battle(b_id)) => {
+            permanent_controller(*b_id) == Some(source_controller)
         }
         _ => false,
     }

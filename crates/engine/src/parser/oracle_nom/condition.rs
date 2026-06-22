@@ -99,6 +99,7 @@ fn parse_state_presence_conditions(input: &str) -> OracleResult<'_, StaticCondit
         parse_player_state_conditions,
         parse_you_have_conditions,
         parse_that_player_has_conditions,
+        parse_there_are_conditions,
         // CR 201.2 + CR 603.4: Named-pair MUST precede the generic compound
         // control combinator so " and " between named cards binds to the
         // names list, not interpreted as a second `you control` clause.
@@ -3788,6 +3789,27 @@ fn parse_life_history_condition(input: &str) -> OracleResult<'_, StaticCondition
                 tag("that player lost life this turn"),
             )),
         ),
+        // CR 119.3 + CR 603.4: "that player lost less than N life this turn"
+        // (Lolth, Spider Queen emblem intervening-if).
+        |i| {
+            let (rest, _) = tag("that player lost less than ").parse(i)?;
+            let (rest, n) = parse_number(rest)?;
+            let (rest, _) = tag(" life this turn").parse(rest)?;
+            Ok((
+                rest,
+                StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::LifeLostThisTurn {
+                            player: PlayerScope::ScopedPlayer,
+                        },
+                    },
+                    comparator: Comparator::LT,
+                    rhs: QuantityExpr::Fixed {
+                        value: i32::try_from(n).unwrap_or(i32::MAX),
+                    },
+                },
+            ))
+        },
         parse_opponent_lost_life_this_turn,
         // CR 119.4 + CR 603.4: "an opponent gained life this turn" — sum across
         // opponents, mirroring the lost-life sibling. Unlocks Needlebite Trap
@@ -4087,18 +4109,32 @@ fn parse_source_qualified_mana_spent_condition(input: &str) -> OracleResult<'_, 
 }
 
 /// CR 106.3 + CR 601.2h + CR 603.4: Parse
-/// "[N] or more mana from <source-filter> was spent to cast <self>".
+/// "[N] or more mana from <source-filter> was spent to cast <self>" and
+/// "at least [N] mana from <source-filter> was spent to cast <self>".
 ///
 /// CR 400.7d: the subject anaphora selects the scope (see
 /// `parse_source_qualified_mana_spent_condition`).
 fn parse_source_qualified_mana_spent_threshold(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, n) = parse_number(input)?;
-    let (rest, comparator) = alt((
-        value(Comparator::GE, tag(" or more")),
-        value(Comparator::LE, tag(" or fewer")),
-        value(Comparator::LE, tag(" or less")),
+    let (rest, (n, comparator)) = alt((
+        // "at least N " → GE
+        |i| {
+            let (rest, _) = tag("at least ").parse(i)?;
+            let (rest, n) = parse_number(rest)?;
+            Ok((rest, (n, Comparator::GE)))
+        },
+        // "N or more/less/fewer"
+        |i| {
+            let (rest, n) = parse_number(i)?;
+            let (rest, cmp) = alt((
+                value(Comparator::GE, tag(" or more")),
+                value(Comparator::LE, tag(" or fewer")),
+                value(Comparator::LE, tag(" or less")),
+            ))
+            .parse(rest)?;
+            Ok((rest, (n, cmp)))
+        },
     ))
-    .parse(rest)?;
+    .parse(input)?;
     let (rest, _) = tag(" mana from ").parse(rest)?;
     let (rest, source_filter) = nom_quantity::parse_mana_source_filter(rest)?;
     let (rest, _) = tag(" was spent to cast ").parse(rest)?;
@@ -4217,30 +4253,48 @@ fn parse_mana_spent_vs_source_pt(input: &str) -> OracleResult<'_, StaticConditio
 /// CR 601.2h + CR 603.4: Intervening-if comparing the total amount of mana
 /// spent to cast the triggering spell against a fixed threshold.
 ///
-/// Recognizes "[N] or more mana was spent to cast [that/this] spell/it/~" and
-/// the inverse "[N] or less mana was spent to cast …". Produces a
+/// Recognizes "[N] or more mana was spent to cast [that/this] spell/it/~",
+/// "at least [N] mana was spent to cast …", and the inverse
+/// "[N] or less mana was spent to cast …". Produces a
 /// `StaticCondition::QuantityComparison` with LHS
 /// triggering-spell spent-mana ref that bridges to `TriggerCondition::QuantityComparison`
 /// via the existing `static_condition_to_trigger_condition` path.
 ///
 /// Used by Expressive Firedancer's conditional rider ("If five or more mana
-/// was spent to cast that spell, ..."), Opus/Increment family cards with
-/// mana-threshold riders, and any future card that gates on triggering-spell
-/// cost magnitude. Complementary to `parse_mana_spent_vs_source_pt` (which
-/// handles Increment-style `greater than this creature's P/T`).
+/// was spent to cast that spell, ..."), The Emperor of Palamecia's
+/// intervening-if ("if at least four mana was spent to cast it, ..."),
+/// Opus/Increment family cards with mana-threshold riders, and any future
+/// card that gates on triggering-spell cost magnitude. Complementary to
+/// `parse_mana_spent_vs_source_pt` (which handles Increment-style
+/// `greater than this creature's P/T`).
 ///
 /// CR 400.7d: the subject anaphora selects the scope — "that spell" stays
 /// `TriggeringSpell`; "this spell"/"it" on a resolving spell is `SelfObject`.
 fn parse_mana_spent_threshold(input: &str) -> OracleResult<'_, StaticCondition> {
-    // Number first — combinator verifies word boundary via existing helper.
-    let (rest, n) = parse_number(input)?;
-    // "or more" / "or fewer" / "or less" threshold word — map to comparator.
-    let (rest, comparator) = alt((
-        value(Comparator::GE, tag(" or more")),
-        value(Comparator::LE, tag(" or fewer")),
-        value(Comparator::LE, tag(" or less")),
+    // Two surface forms — both are `>= N` thresholds:
+    //   "N or more mana was spent to cast …"
+    //   "at least N mana was spent to cast …"
+    // Plus the inverse: "N or less/fewer mana was spent to cast …"
+    let (rest, (n, comparator)) = alt((
+        // "at least N " → GE
+        |i| {
+            let (rest, _) = tag("at least ").parse(i)?;
+            let (rest, n) = parse_number(rest)?;
+            Ok((rest, (n, Comparator::GE)))
+        },
+        // "N or more/less/fewer"
+        |i| {
+            let (rest, n) = parse_number(i)?;
+            let (rest, cmp) = alt((
+                value(Comparator::GE, tag(" or more")),
+                value(Comparator::LE, tag(" or fewer")),
+                value(Comparator::LE, tag(" or less")),
+            ))
+            .parse(rest)?;
+            Ok((rest, (n, cmp)))
+        },
     ))
-    .parse(rest)?;
+    .parse(input)?;
     // Fixed tail: " mana was spent to cast " + subject anaphora.
     let (rest, _) = tag(" mana was spent to cast ").parse(rest)?;
     let (rest, scope) = nom_quantity::parse_mana_spent_self_subject(rest)?;
@@ -5222,6 +5276,30 @@ fn parse_there_are_conditions(input: &str) -> OracleResult<'_, StaticCondition> 
     let (rest, n) = parse_number(rest)?;
     let (rest, _) = tag(" ").parse(rest)?;
     let (rest, or_more) = opt(tag("or more ")).parse(rest)?;
+    if let Ok((rest_after_type, type_text)) =
+        take_until::<_, _, OracleError<'_>>(" cards total in ").parse(rest)
+    {
+        let (rest_after_zone, _) = tag(" cards total in ").parse(rest_after_type)?;
+        let (rest_after_zone, (zone, scope)) = parse_scoped_zone_count_ref(rest_after_zone)?;
+        let comparator = if or_more.is_some() {
+            Comparator::GE
+        } else {
+            Comparator::EQ
+        };
+        return Ok((
+            rest_after_zone,
+            make_quantity_comparison(
+                QuantityRef::ZoneCardCount {
+                    zone,
+                    card_types: parse_zone_card_type_text(type_text),
+                    filter: None,
+                    scope,
+                },
+                comparator,
+                n,
+            ),
+        ));
+    }
     let (rest, qty) = nom_quantity::parse_quantity_ref.parse(rest)?;
     let comparator = if or_more.is_some() {
         Comparator::GE
@@ -5399,7 +5477,7 @@ fn parse_zone_count_ref(input: &str) -> OracleResult<'_, ZoneRef> {
     alt((
         value(
             ZoneRef::Graveyard,
-            alt((tag("graveyard"), tag("graveyards"))),
+            alt((tag("graveyards"), tag("graveyard"))),
         ),
         value(ZoneRef::Exile, tag("exile")),
         value(ZoneRef::Hand, alt((tag("hand"), tag("hands")))),
@@ -5661,6 +5739,25 @@ fn parse_triggering_player_has_unattacked_opponent(
 /// refs on the LHS and controller-scoped refs on the RHS.
 fn parse_opponent_comparison_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("an opponent ").parse(input)?;
+
+    // CR 102.2 + CR 402.1: "an opponent has no cards in hand" is existential
+    // over opponents. The condition holds when the minimum opponent hand size is 0.
+    if let Ok((rest2, _)) = tag::<_, _, OracleError<'_>>("has no cards in hand").parse(rest) {
+        return Ok((
+            rest2,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::HandSize {
+                        player: PlayerScope::Opponent {
+                            aggregate: AggregateFunction::Min,
+                        },
+                    },
+                },
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Fixed { value: 0 },
+            },
+        ));
+    }
 
     // CR 109.4 + CR 109.5: "an opponent controls at least N more [type] than you"
     // — existential over opponents (at least one opponent's count is >= yours + N;
@@ -7583,6 +7680,33 @@ mod tests {
                 assert_eq!(card_types, vec![TypeFilter::Creature]);
             }
             other => panic!("expected ZoneCardCount Creature GE 4, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_all_graveyards_typed_card_total_ge() {
+        let (rest, c) =
+            parse_inner_condition("there are ten or more creature cards total in all graveyards")
+                .unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::ZoneCardCount {
+                                zone: ZoneRef::Graveyard,
+                                card_types,
+                                scope: CountScope::All,
+                                ..
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 10 },
+            } => {
+                assert_eq!(card_types, vec![TypeFilter::Creature]);
+            }
+            other => panic!("expected all-graveyards creature count GE 10, got {other:?}"),
         }
     }
 
@@ -11563,6 +11687,54 @@ mod tests {
             scope_of("five or more mana was spent to cast that spell"),
             CastManaObjectScope::TriggeringSpell,
         );
+
+        // Site D — "at least N" bare total threshold (Emperor of Palamecia).
+        // "it" maps to SelfObject at the condition level; the trigger bridge
+        // handles context-specific scope adjustment.
+        assert_eq!(
+            scope_of("at least four mana was spent to cast it"),
+            CastManaObjectScope::SelfObject,
+        );
+        assert_eq!(
+            scope_of("at least seven mana was spent to cast it"),
+            CastManaObjectScope::SelfObject,
+        );
+        assert_eq!(
+            scope_of("at least four mana was spent to cast this spell"),
+            CastManaObjectScope::SelfObject,
+        );
+        assert_eq!(
+            scope_of("at least four mana was spent to cast that spell"),
+            CastManaObjectScope::TriggeringSpell,
+        );
+    }
+
+    /// CR 601.2h: "at least N mana was spent to cast it" must parse identically
+    /// to "N or more mana was spent to cast it" — both are `>= N` thresholds.
+    #[test]
+    fn test_at_least_mana_spent_threshold_parses() {
+        let (rest, c) = parse_condition("if at least four mana was spent to cast it").unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::ManaSpentToCast {
+                                scope,
+                                metric: crate::types::ability::CastManaSpentMetric::Total,
+                            },
+                    },
+                comparator,
+                rhs: QuantityExpr::Fixed { value },
+            } => {
+                // "it" → SelfObject at condition level; trigger bridge adjusts.
+                assert_eq!(scope, CastManaObjectScope::SelfObject);
+                assert_eq!(comparator, Comparator::GE);
+                assert_eq!(value, 4);
+            }
+            other => panic!("expected ManaSpentToCast QuantityComparison, got {other:?}"),
+        }
     }
 
     #[test]

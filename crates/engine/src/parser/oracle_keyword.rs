@@ -1055,6 +1055,15 @@ pub(crate) fn parse_keyword_from_oracle(text: &str) -> Option<Keyword> {
         return result;
     }
 
+    // CR 702.24: Cumulative upkeep granted via a quoted ability ("[enchanted
+    // creature] has \"Cumulative upkeep {1}\"") routes through this shared keyword
+    // parser; the top-level keyword-line path calls the dedicated cost-aware
+    // parser directly, so delegate to it here too (Mana Chains, Dreams of the
+    // Dead, Decomposition).
+    if let Some(kw) = super::oracle_special::parse_cumulative_upkeep_keyword(text) {
+        return Some(kw);
+    }
+
     if let Some(kw) = parse_bloodthirst_keyword_line(text) {
         return Some(kw);
     }
@@ -1819,12 +1828,14 @@ fn format_cumulative_upkeep_cost(cost: &AbilityCost) -> String {
 }
 
 /// Render a `ManaCost` as MTG-style brace symbols (e.g. `{2}{U}{U}`).
-/// `NoCost` collapses to `{0}`; `SelfManaCost` renders the Oracle phrase
-/// players see on cards like Snapcaster Mage's flashback.
+/// `NoCost` collapses to `{0}`; `SelfManaCost` / `SelfManaValue` render the Oracle
+/// phrase players see on cards like Snapcaster Mage's flashback or Sliver
+/// Gravemother's encore grant.
 fn format_mana_cost_symbols(cost: &ManaCost) -> String {
     match cost {
         ManaCost::NoCost => "{0}".to_string(),
         ManaCost::SelfManaCost => "its mana cost".to_string(),
+        ManaCost::SelfManaValue => "its mana value".to_string(),
         ManaCost::Cost { shards, generic } => {
             let mut out = String::new();
             if *generic > 0 {
@@ -1919,6 +1930,7 @@ fn type_filter_subject_name(tf: &TypeFilter) -> String {
         TypeFilter::Sorcery => "sorcery".to_string(),
         TypeFilter::Planeswalker => "planeswalker".to_string(),
         TypeFilter::Battle => "battle".to_string(),
+        TypeFilter::Kindred => "kindred".to_string(),
         TypeFilter::Permanent => "permanent".to_string(),
         TypeFilter::Card => "card".to_string(),
         TypeFilter::Any => "permanent".to_string(),
@@ -2058,6 +2070,26 @@ mod tests {
         // CR 702.85a: Cascade is a no-parameter keyword.
         let kw = parse_keyword_from_oracle("cascade").unwrap();
         assert_eq!(kw, Keyword::Cascade);
+    }
+
+    /// CR 702.24: a GRANTED cumulative upkeep (the quoted-ability grant path
+    /// routes through `parse_keyword_from_oracle`) must parse with its cost, like
+    /// the top-level keyword-line path — Mana Chains / Dreams of the Dead (mana),
+    /// Decomposition (pay-life em-dash form).
+    #[test]
+    fn parse_keyword_from_oracle_granted_cumulative_upkeep() {
+        assert!(matches!(
+            parse_keyword_from_oracle("cumulative upkeep {1}"),
+            Some(Keyword::CumulativeUpkeep(AbilityCost::Mana { .. }))
+        ));
+        assert!(matches!(
+            parse_keyword_from_oracle("cumulative upkeep {2}"),
+            Some(Keyword::CumulativeUpkeep(AbilityCost::Mana { .. }))
+        ));
+        assert!(matches!(
+            parse_keyword_from_oracle("cumulative upkeep\u{2014}pay 1 life"),
+            Some(Keyword::CumulativeUpkeep(AbilityCost::PayLife { .. }))
+        ));
     }
 
     /// CR 702.85c: a spell printing cascade as repeated bare words has one instance

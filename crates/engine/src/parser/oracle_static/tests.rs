@@ -2638,6 +2638,71 @@ fn self_cost_reduction_if_control_wizard_still_uses_presence_condition() {
 }
 
 #[test]
+fn self_cost_reduction_leading_if_keeps_condition() {
+    let def = parse_static_line(
+        "If an opponent has no cards in hand, this spell costs {6} less to cast.",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        def.mode,
+        StaticMode::ModifyCost {
+            mode: CostModifyMode::Reduce,
+            amount: ManaCost::Cost { generic: 6, .. },
+            ..
+        }
+    ));
+    assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
+    assert_eq!(
+        def.active_zones,
+        crate::types::zones::self_spell_cost_mod_active_zones()
+    );
+    assert!(matches!(
+        def.condition,
+        Some(StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::HandSize {
+                    player: PlayerScope::Opponent {
+                        aggregate: AggregateFunction::Min
+                    }
+                }
+            },
+            comparator: Comparator::EQ,
+            rhs: QuantityExpr::Fixed { value: 0 },
+        })
+    ));
+}
+
+#[test]
+fn self_cost_reduction_leading_if_supports_avatar_cycle_conditions() {
+    for text in [
+        "If you have 3 or less life, this spell costs {6} less to cast.",
+        "If an opponent controls at least four more creatures than you, this spell costs {6} less to cast.",
+        "If there are ten or more creature cards total in all graveyards, this spell costs {6} less to cast.",
+        "If you weren't the starting player, this spell costs {1} less to cast.",
+    ] {
+        let def =
+            parse_static_line(text).unwrap_or_else(|| panic!("expected cost static for {text:?}"));
+        assert!(
+            matches!(
+                def.mode,
+                StaticMode::ModifyCost {
+                    mode: CostModifyMode::Reduce,
+                    ..
+                }
+            ),
+            "expected Reduce cost static for {text:?}, got {:?}",
+            def.mode
+        );
+        assert!(
+            def.condition.is_some(),
+            "leading condition must not be dropped for {text:?}"
+        );
+        assert!(matches!(def.affected, Some(TargetFilter::SelfRef)));
+    }
+}
+
+#[test]
 fn static_this_spell_cost_less_if_it_targets_creature_filter() {
     let def = parse_static_line("This spell costs {2} less to cast if it targets a red creature.")
         .unwrap();
@@ -5206,6 +5271,29 @@ fn parse_continuous_modifications_are_goaded_emits_goaded_static_mode() {
     )));
 }
 
+/// CR 701.60a + CR 701.60d: Airtight Alibi's compound static "Enchanted creature
+/// gets +2/+2 and can't become suspected" emits the P/T buff AND a
+/// `CantBecomeSuspected` rider (mirrors the goaded designation rider) so the
+/// prohibition is not silently dropped.
+#[test]
+fn parse_continuous_modifications_cant_become_suspected_emits_static_mode() {
+    let mods = parse_continuous_modifications("gets +2/+2 and can't become suspected");
+    assert!(
+        mods.iter()
+            .any(|m| matches!(m, ContinuousModification::AddPower { value: 2 })),
+        "P/T buff preserved alongside the prohibition rider"
+    );
+    assert!(
+        mods.iter().any(|m| matches!(
+            m,
+            ContinuousModification::AddStaticMode {
+                mode: StaticMode::CantBecomeSuspected
+            }
+        )),
+        "can't-become-suspected rider must not be dropped, got {mods:?}"
+    );
+}
+
 /// CR 613.1f + CR 113.3: "all activated abilities of all cards exiled with it" /
 /// "the exiled card" → `GrantAllActivatedAbilitiesOf { ExiledBySource }` (Myr
 /// Welder, Territory Forge). Issue #3101. Both the bare-predicate building-block
@@ -7747,7 +7835,7 @@ fn graveyard_cast_permission_oathsworn_vampire_if_gate() {
 
 #[test]
 fn graveyard_keyword_grant_clause_flashback() {
-    let (filter, kind) = try_parse_graveyard_keyword_grant_clause(
+    let (filter, kind, _) = try_parse_graveyard_keyword_grant_clause(
         "Each instant and sorcery card in your graveyard has flashback.",
     )
     .expect("should parse flashback grant clause");
@@ -7771,7 +7859,7 @@ fn graveyard_keyword_grant_clause_flashback() {
 
 #[test]
 fn graveyard_keyword_grant_clause_escape() {
-    let (filter, kind) =
+    let (filter, kind, _) =
         try_parse_graveyard_keyword_grant_clause("Each nonland card in your graveyard has escape.")
             .expect("should parse escape grant clause");
     assert_eq!(kind, GraveyardGrantedKeywordKind::Escape);
@@ -7795,8 +7883,64 @@ fn graveyard_keyword_grant_clause_escape() {
 }
 
 #[test]
+fn parse_keyword_with_where_x_accepts_uppercase_x() {
+    let (keyword, where_x) = parse_keyword_with_where_x("encore {X}, where X is its mana value")
+        .expect("uppercase X in where-clause must parse");
+    assert!(matches!(keyword, Keyword::Encore(_)));
+    assert!(matches!(
+        where_x,
+        Some(QuantityRef::ObjectManaValue {
+            scope: ObjectScope::Recipient,
+        })
+    ));
+}
+
+#[test]
+fn graveyard_keyword_grant_static_inline_encore_where_x_is_mana_value() {
+    use crate::parser::oracle_static::keyword_grant::try_parse_graveyard_keyword_grant_static;
+
+    let def = try_parse_graveyard_keyword_grant_static(
+        "Each Sliver creature card in your graveyard has encore {X}, where X is its mana value.",
+    )
+    .expect("Sliver Gravemother inline encore grant must parse");
+    match &def.modifications[0] {
+        ContinuousModification::AddKeyword {
+            keyword: Keyword::Encore(ManaCost::SelfManaValue),
+        } => {}
+        other => panic!("expected Encore(SelfManaValue), got {other:?}"),
+    }
+    let TargetFilter::Typed(tf) = def.affected.as_ref().expect("affected filter") else {
+        panic!("expected typed affected filter");
+    };
+    assert!(
+        tf.type_filters.contains(&TypeFilter::Creature)
+            && tf
+                .type_filters
+                .iter()
+                .any(|t| matches!(t, TypeFilter::Subtype(s) if s == "Sliver"))
+            && tf.properties.contains(&FilterProp::InZone {
+                zone: Zone::Graveyard
+            }),
+        "expected Sliver creature in your graveyard filter, got {tf:?}"
+    );
+}
+
+#[test]
+fn graveyard_keyword_grant_static_rejects_continuation_sentence() {
+    use crate::parser::oracle_static::keyword_grant::try_parse_graveyard_keyword_grant_static;
+
+    assert!(
+        try_parse_graveyard_keyword_grant_static(
+            "Each artifact creature card in your graveyard has encore. Its encore cost is equal to its mana cost."
+        )
+        .is_none(),
+        "continuation-sentence grants must stay on the period-split parser"
+    );
+}
+
+#[test]
 fn graveyard_keyword_grant_clause_non_lesson_instant_sorcery() {
-    let (filter, kind) = try_parse_graveyard_keyword_grant_clause(
+    let (filter, kind, _) = try_parse_graveyard_keyword_grant_clause(
         "Each non-Lesson instant and sorcery card in your graveyard has flashback.",
     )
     .expect("non-Lesson instant/sorcery graveyard flashback");
@@ -8232,6 +8376,8 @@ fn exile_cast_permission_maralen_fae_ascendant() {
             cost: ExileCastCost::WithoutPayingManaCost,
             pool: ExileCardPool::ThisTurn,
             timing: ExileCastTiming::AnyTime,
+            mana_spend_permission: None,
+            grants_flash: false,
         },
         "expected ExileCastPermission, got {:?}",
         def.mode
@@ -8277,6 +8423,7 @@ fn exile_cast_permission_during_each_of_your_turns_synonym() {
                 cost: ExileCastCost::WithoutPayingManaCost,
                 pool: ExileCardPool::ThisTurn,
                 timing: ExileCastTiming::AnyTime,
+                ..
             }
         ),
         "expected ExileCastPermission(OncePerTurn, Cast, free), got {:?}",
@@ -8331,6 +8478,8 @@ fn persistent_exile_play_permission_matrix_form() {
             cost: ExileCastCost::PayNormalCost,
             pool: ExileCardPool::Persistent,
             timing: ExileCastTiming::YourTurnOnly,
+            mana_spend_permission: None,
+            grants_flash: false,
         },
         "expected persistent your-turn Play permission, got {:?}",
         def.mode
@@ -8359,6 +8508,8 @@ fn persistent_exile_play_permission_evendo_sacrificed_permanent_gate() {
             cost: ExileCastCost::PayNormalCost,
             pool: ExileCardPool::Persistent,
             timing: ExileCastTiming::YourTurnOnly,
+            mana_spend_permission: None,
+            grants_flash: false,
         },
         "expected persistent your-turn Play permission, got {:?}",
         def.mode
@@ -8433,9 +8584,62 @@ fn persistent_exile_play_permission_look_at_variant() {
             cost: ExileCastCost::PayNormalCost,
             pool: ExileCardPool::Persistent,
             timing: ExileCastTiming::AnyTime,
+            mana_spend_permission: None,
+            grants_flash: false,
         },
         "expected persistent any-time Play permission, got {:?}",
         def.mode
+    );
+}
+
+/// CR 601.2a + CR 609.4b + CR 702.8a: Azula, Cunning Usurper — "During your
+/// turn, you may cast cards exiled with ~ and you may cast them as though they
+/// had flash. Mana of any type can be spent to cast those spells." lowers to a
+/// persistent, your-turn-only, Cast-mode permission carrying both the any-type
+/// mana spend concession and the flash grant.
+#[test]
+fn persistent_exile_cast_permission_azula_flash_and_any_mana() {
+    let text = "During your turn, you may cast cards exiled with ~ and you may cast them as though they had flash. Mana of any type can be spent to cast those spells.";
+    let def = parse_static_line(text).expect("Azula static must parse");
+    assert_eq!(
+        def.mode,
+        StaticMode::ExileCastPermission {
+            frequency: CastFrequency::Unlimited,
+            // CR 601.2a: "you may cast cards exiled with ~" is spell-cast only.
+            play_mode: CardPlayMode::Cast,
+            cost: ExileCastCost::PayNormalCost,
+            pool: ExileCardPool::Persistent,
+            timing: ExileCastTiming::YourTurnOnly,
+            mana_spend_permission: Some(crate::types::ability::ManaSpendPermission::AnyTypeOrColor),
+            grants_flash: true,
+        },
+        "expected persistent Cast permission with flash + any-mana, got {:?}",
+        def.mode
+    );
+    assert_eq!(
+        def.affected,
+        Some(TargetFilter::Any),
+        "the persistent pool is the scope; affected must be Any"
+    );
+
+    // Full Oracle dispatch (with the real "~" normalization of "Azula, Cunning
+    // Usurper" → "Azula" → "~") must route the line to the same static, leaving
+    // no Unimplemented node behind.
+    let card_text = "During your turn, you may cast cards exiled with Azula and you may cast them as though they had flash. Mana of any type can be spent to cast those spells.";
+    let parsed = crate::parser::oracle::parse_oracle_text(
+        card_text,
+        "Azula, Cunning Usurper",
+        &[],
+        &["Creature".to_string()],
+        &["Human".to_string()],
+    );
+    assert!(
+        parsed
+            .statics
+            .iter()
+            .any(|parsed_def| parsed_def.mode == def.mode),
+        "full Oracle dispatch must route Azula's line to the flash+any-mana static, got {:?}",
+        parsed.statics
     );
 }
 
@@ -8465,6 +8669,8 @@ fn exile_cast_permission_soul_jar_persistent_creature_pool() {
             cost: ExileCastCost::PayNormalCost,
             pool: ExileCardPool::Persistent,
             timing: ExileCastTiming::AnyTime,
+            mana_spend_permission: None,
+            grants_flash: false,
         },
         "expected persistent ExileCastPermission, got {:?}",
         def.mode
@@ -9444,6 +9650,7 @@ fn static_reduce_ability_cost_ninjutsu() {
         matches!(
             def.mode,
             StaticMode::ReduceAbilityCost {
+                mode: CostModifyMode::Reduce,
                 ref keyword,
                 amount: 1,
                 minimum_mana: None,
@@ -9464,6 +9671,7 @@ fn static_reduce_equip_abilities_with_object_qualifier() {
     assert_eq!(
         def.mode,
         StaticMode::ReduceAbilityCost {
+            mode: CostModifyMode::Reduce,
             keyword: "equip".to_string(),
             amount: 1,
             minimum_mana: None,
@@ -14099,6 +14307,7 @@ fn static_reduce_activated_ability_cost_generic() {
     assert_eq!(
         def.mode,
         StaticMode::ReduceAbilityCost {
+            mode: CostModifyMode::Reduce,
             keyword: "activated".to_string(),
             amount: 2,
             minimum_mana: None,
@@ -14116,6 +14325,7 @@ fn static_reduce_activated_ability_cost_generic_with_minimum() {
     assert_eq!(
         def.mode,
         StaticMode::ReduceAbilityCost {
+            mode: CostModifyMode::Reduce,
             keyword: "activated".to_string(),
             amount: 2,
             minimum_mana: Some(1),
@@ -14133,6 +14343,7 @@ fn static_reduce_activated_ability_cost_enchanted_artifact_with_minimum() {
     assert_eq!(
         def.mode,
         StaticMode::ReduceAbilityCost {
+            mode: CostModifyMode::Reduce,
             keyword: "activated".to_string(),
             amount: 2,
             minimum_mana: Some(1),
@@ -14154,6 +14365,7 @@ fn static_reduce_activated_ability_cost_equipped_artifact_with_minimum() {
     assert_eq!(
         def.mode,
         StaticMode::ReduceAbilityCost {
+            mode: CostModifyMode::Reduce,
             keyword: "activated".to_string(),
             amount: 2,
             minimum_mana: Some(1),
@@ -14164,6 +14376,164 @@ fn static_reduce_activated_ability_cost_equipped_artifact_with_minimum() {
         def.affected,
         Some(TargetFilter::Typed(TypedFilter { .. }))
     ));
+}
+
+#[test]
+fn static_reduce_exhaust_ability_cost_other_permanents() {
+    // Boom Scholar: "Exhaust abilities of other permanents you control cost {2}
+    // less to activate." The generalized "<keyword> abilities of [subject]" arm
+    // keys the reduction on the "exhaust" ability tag (CR 602.1 / CR 601.2f) and
+    // routes the "other permanents you control" self-exclusion through
+    // parse_type_phrase.
+    let def = parse_static_line(
+        "Exhaust abilities of other permanents you control cost {2} less to activate.",
+    )
+    .unwrap();
+    assert_eq!(
+        def.mode,
+        StaticMode::ReduceAbilityCost {
+            mode: CostModifyMode::Reduce,
+            keyword: "exhaust".to_string(),
+            amount: 2,
+            minimum_mana: None,
+            dynamic_count: None,
+        }
+    );
+    // "other ... you control" must exclude the source permanent (CR 109.5).
+    match &def.affected {
+        Some(TargetFilter::Typed(tf)) => {
+            assert_eq!(tf.controller, Some(ControllerRef::You));
+            assert!(
+                tf.properties.contains(&FilterProp::Another),
+                "\"other permanents you control\" must carry FilterProp::Another"
+            );
+        }
+        other => panic!("Expected Some(Typed filter), got {other:?}"),
+    }
+
+    // Full card: the static line + the exhaust activated ability both parse with
+    // no Unimplemented node remaining.
+    let parsed = crate::parser::oracle::parse_oracle_text(
+        "Exhaust abilities of other permanents you control cost {2} less to activate.\nExhaust — {4}{R}{G}: Creatures and Vehicles you control gain trample until end of turn. Put two +1/+1 counters on this creature.",
+        "Boom Scholar",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    let json = serde_json::to_string(&parsed).unwrap();
+    assert!(
+        !json.contains("Unimplemented"), // allow-noncombinator: coverage assertion over serialized AST, not parser dispatch
+        "Boom Scholar must parse with no Unimplemented node: {json}"
+    );
+    assert_eq!(parsed.statics.len(), 1);
+    assert_eq!(parsed.abilities.len(), 1);
+}
+
+// --- CR 118.7: Directional activated-ability cost modifier (Reduce vs Raise) ---
+
+#[test]
+fn static_activated_ability_cost_increase_chosen_name() {
+    // Skyseer's Chariot: the Raise direction with a chosen-name source filter.
+    // This is the parameterization that forces reduce → directional.
+    let def = parse_static_line(
+        "Activated abilities of sources with the chosen name cost {2} more to activate.",
+    )
+    .expect("Skyseer cost-increase static must parse");
+    assert_eq!(
+        def.mode,
+        StaticMode::ReduceAbilityCost {
+            mode: CostModifyMode::Raise,
+            keyword: "activated".to_string(),
+            amount: 2,
+            // CR 118.7: increases never floor.
+            minimum_mana: None,
+            dynamic_count: None,
+        }
+    );
+    assert_eq!(
+        def.affected,
+        Some(TargetFilter::HasChosenName),
+        "Skyseer must scope the increase to sources with the chosen name"
+    );
+}
+
+#[test]
+fn static_activated_ability_cost_generic_reduce_vs_raise_discriminates() {
+    // CR 118.7: the same grammar with only the direction word changed must yield
+    // opposite `CostModifyMode`s. Pins reduce ≠ increase at the parser layer.
+    let reduce = parse_static_line(
+        "Activated abilities of creatures you control cost {2} less to activate.",
+    )
+    .expect("reduce form parses");
+    let raise = parse_static_line(
+        "Activated abilities of creatures you control cost {2} more to activate.",
+    )
+    .expect("raise form parses");
+    let reduce_mode = match reduce.mode {
+        StaticMode::ReduceAbilityCost { mode, .. } => mode,
+        other => panic!("expected ReduceAbilityCost, got {other:?}"),
+    };
+    let raise_mode = match raise.mode {
+        StaticMode::ReduceAbilityCost { mode, .. } => mode,
+        other => panic!("expected ReduceAbilityCost, got {other:?}"),
+    };
+    assert_eq!(reduce_mode, CostModifyMode::Reduce);
+    assert_eq!(raise_mode, CostModifyMode::Raise);
+    assert_ne!(reduce_mode, raise_mode);
+}
+
+#[test]
+fn static_possessive_equip_ability_cost_reduction_self_ref() {
+    // Firion, Wild Rose Warrior's granted equip-cost reduction leaf:
+    // "This Equipment's equip abilities cost {2} less to activate." Keyed on the
+    // tagged Equip keyword (CR 702.6a), scoped to the source object (SelfRef).
+    let def = parse_static_line("This Equipment's equip abilities cost {2} less to activate.")
+        .expect("Firion equip-cost reduction must parse");
+    assert_eq!(
+        def.mode,
+        StaticMode::ReduceAbilityCost {
+            mode: CostModifyMode::Reduce,
+            keyword: "equip".to_string(),
+            amount: 2,
+            minimum_mana: None,
+            dynamic_count: None,
+        }
+    );
+    assert_eq!(
+        def.affected,
+        Some(TargetFilter::SelfRef),
+        "\"This Equipment's …\" must self-reference the source (CR 109.5)"
+    );
+}
+
+#[test]
+fn static_reduce_ability_cost_registry_round_trip_preserves_direction() {
+    // CR 118.7: the Display/from_str registry encoding must round-trip the
+    // direction so a serialized Raise static does not silently decode as Reduce.
+    for mode in [CostModifyMode::Reduce, CostModifyMode::Raise] {
+        let original = StaticMode::ReduceAbilityCost {
+            mode,
+            keyword: "activated".to_string(),
+            amount: 3,
+            minimum_mana: None,
+            dynamic_count: None,
+        };
+        let encoded = original.to_string();
+        let decoded = encoded
+            .parse::<StaticMode>()
+            .expect("registry string parses back into a StaticMode");
+        match decoded {
+            StaticMode::ReduceAbilityCost {
+                mode: decoded_mode,
+                amount: 3,
+                ..
+            } => assert_eq!(
+                decoded_mode, mode,
+                "direction lost in round trip: {encoded}"
+            ),
+            other => panic!("registry round trip dropped variant: {other:?}"),
+        }
+    }
 }
 
 // --- Group C: Spells you cast have keyword ---
@@ -17246,6 +17616,55 @@ fn top_of_library_cast_permission_future_sight_compound() {
     assert!(matches!(def.affected, Some(TargetFilter::Any)));
 }
 
+/// CR 700.6 + CR 401.5: Crystal Skull — "You may play historic lands and cast
+/// historic spells from the top of your library." lowers to a disjunctive
+/// `TopOfLibraryCastPermission` whose `affected` is an `Or` of historic Land
+/// and historic Card filters.
+#[test]
+fn top_of_library_cast_permission_crystal_skull_historic_disjunctive() {
+    let text = "You may play historic lands and cast historic spells from the top of your library.";
+    let lower = text.to_lowercase();
+    let def = try_parse_top_of_library_cast_permission(text, &lower)
+        .expect("Crystal Skull static must parse");
+    match def.mode {
+        StaticMode::TopOfLibraryCastPermission {
+            play_mode,
+            frequency,
+            ref alt_cost,
+        } => {
+            assert_eq!(play_mode, CardPlayMode::Play);
+            assert_eq!(frequency, CastFrequency::Unlimited);
+            assert!(alt_cost.is_none());
+        }
+        other => panic!("expected TopOfLibraryCastPermission, got {other:?}"),
+    }
+    let filter = def.affected.expect("affected filter set");
+    let TargetFilter::Or { filters } = filter else {
+        panic!("expected Or over historic land / historic spell branches, got {filter:?}");
+    };
+    assert_eq!(filters.len(), 2);
+    assert!(
+        matches!(
+            &filters[0],
+            TargetFilter::Typed(tf)
+                if tf.type_filters.contains(&TypeFilter::Land)
+                    && tf.properties.contains(&FilterProp::Historic)
+        ),
+        "expected historic Land branch, got {:?}",
+        filters[0]
+    );
+    assert!(
+        matches!(
+            &filters[1],
+            TargetFilter::Typed(tf)
+                if tf.type_filters.contains(&TypeFilter::Card)
+                    && tf.properties.contains(&FilterProp::Historic)
+        ),
+        "expected historic Card branch, got {:?}",
+        filters[1]
+    );
+}
+
 #[test]
 fn top_of_library_cast_permission_keeps_as_long_as_condition() {
     let text = "You may cast creature spells from the top of your library as long as you control three or more creatures with different powers.";
@@ -19211,5 +19630,246 @@ fn top_of_library_frequency_display_roundtrip() {
     assert_eq!(
         StaticMode::from_str("TopOfLibraryCastPermission").unwrap(),
         unlimited
+    );
+}
+
+/// CR 613.4b + CR 208.1: Porcelain Gallery's "Creatures you control have base
+/// power and toughness each equal to the number of creatures you control" is a
+/// layer-7b dynamic base-P/T set on a controller-scoped group. The dynamic
+/// value routes through the shared CDA quantity grammar to an `ObjectCount`,
+/// proving the base-P/T set composes with arbitrary count quantities (not just
+/// "its mana value"). Each tick re-evaluates the count via the layer system.
+#[test]
+fn porcelain_gallery_base_pt_equal_to_creature_count() {
+    let def = parse_static_line(
+        "Creatures you control have base power and toughness each equal to the number of creatures you control.",
+    )
+    .expect("Porcelain Gallery static must parse");
+
+    // Group scope: creatures you control.
+    match &def.affected {
+        Some(TargetFilter::Typed(tf)) => {
+            assert!(tf.type_filters.contains(&TypeFilter::Creature));
+            assert_eq!(tf.controller, Some(ControllerRef::You));
+        }
+        other => panic!("expected creatures-you-control scope, got {other:?}"),
+    }
+
+    let expected = QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCount {
+            filter: TargetFilter::Typed(
+                TypedFilter::default()
+                    .with_type(TypeFilter::Creature)
+                    .controller(ControllerRef::You),
+            ),
+        },
+    };
+    assert!(
+        def.modifications
+            .contains(&ContinuousModification::SetPowerDynamic {
+                value: expected.clone(),
+            }),
+        "missing SetPowerDynamic(creature count) in {:?}",
+        def.modifications
+    );
+    assert!(
+        def.modifications
+            .contains(&ContinuousModification::SetToughnessDynamic { value: expected }),
+        "missing SetToughnessDynamic(creature count) in {:?}",
+        def.modifications
+    );
+}
+
+/// CR 105.2: A "that are <color> and/or <color>" relative clause is a color
+/// disjunction (Rowan/Will, Scion of …). The `and/or` separator was previously
+/// absent from `parse_color_disjunction`, so "black and/or red" parsed only
+/// "black", stranded " and/or red", and the whole spell filter was dropped to
+/// `None` (over-reducing EVERY spell). This pins the disjunction shape for the
+/// class so the regression cannot recur.
+#[test]
+fn cost_mod_color_and_or_disjunction_builds_anyof_filter() {
+    use crate::types::ability::TargetFilter as TF;
+    use crate::types::mana::ManaColor;
+
+    let def = parse_static_line(
+        "Spells you cast this turn that are black and/or red cost {X} less to cast, where X is the amount of life you lost this turn.",
+    )
+    .unwrap();
+
+    let StaticMode::ModifyCost {
+        mode: CostModifyMode::Reduce,
+        amount,
+        spell_filter,
+        dynamic_count,
+    } = def.mode
+    else {
+        panic!("expected ModifyCost{{Reduce}}, got {:?}", def.mode);
+    };
+    assert_eq!(amount, ManaCost::generic(1));
+    assert_eq!(
+        dynamic_count,
+        Some(QuantityRef::LifeLostThisTurn {
+            player: PlayerScope::Controller,
+        }),
+    );
+
+    // The discriminating assertion: the color disjunction is NOT dropped. The
+    // pre-fix parser produced `spell_filter: None`.
+    let Some(TF::Typed(tf)) = spell_filter else {
+        panic!("expected a typed color-disjunction spell_filter, got None/other");
+    };
+    assert!(
+        tf.properties.iter().any(|p| matches!(
+            p,
+            FilterProp::AnyOf { props }
+                if props.contains(&FilterProp::HasColor { color: ManaColor::Black })
+                    && props.contains(&FilterProp::HasColor { color: ManaColor::Red })
+        )),
+        "spell_filter must carry AnyOf(HasColor Black, HasColor Red), got {:?}",
+        tf.properties
+    );
+}
+
+/// CR 601.2f + CR 611.2c + CR 119.3: Rowan, Scion of War's activated ability
+/// parses with zero `Unimplemented` nodes and lowers the cost-modification
+/// effect clause to a turn-duration `GenericEffect` that grants a `ModifyCost`
+/// static keyed to life LOST this turn for black/red spells.
+#[test]
+fn rowan_scion_of_war_activated_ability_parses_clean() {
+    use crate::types::ability::{ContinuousModification, Effect, TargetFilter as TF};
+    use crate::types::mana::ManaColor;
+
+    let parsed = crate::parser::parse_oracle_text(
+        "Menace\n{T}: Spells you cast this turn that are black and/or red cost {X} less to cast, where X is the amount of life you lost this turn. Activate only as a sorcery.",
+        "Rowan, Scion of War",
+        &["Menace".to_string()],
+        &["Legendary".to_string(), "Creature".to_string()],
+        &["Human".to_string()],
+    );
+    assert!(
+        parsed
+            .abilities
+            .iter()
+            .all(|a| !crate::parser::oracle::has_unimplemented(a)),
+        "Rowan must have zero Unimplemented abilities, got {:?}",
+        parsed
+            .abilities
+            .iter()
+            .map(|a| &a.effect)
+            .collect::<Vec<_>>()
+    );
+
+    let cost_ability = parsed
+        .abilities
+        .iter()
+        .find(|a| matches!(*a.effect, Effect::GenericEffect { .. }))
+        .expect("expected a GenericEffect cost-modification ability");
+    assert_eq!(cost_ability.duration, Some(Duration::UntilEndOfTurn));
+    let Effect::GenericEffect {
+        static_abilities, ..
+    } = &*cost_ability.effect
+    else {
+        unreachable!()
+    };
+    let [granting] = static_abilities.as_slice() else {
+        panic!("expected exactly one granting static, got {static_abilities:?}");
+    };
+    let [ContinuousModification::GrantStaticAbility { definition }] =
+        granting.modifications.as_slice()
+    else {
+        panic!(
+            "expected a single GrantStaticAbility, got {:?}",
+            granting.modifications
+        );
+    };
+    let StaticMode::ModifyCost {
+        dynamic_count: Some(QuantityRef::LifeLostThisTurn { .. }),
+        spell_filter: Some(TF::Typed(tf)),
+        ..
+    } = &definition.mode
+    else {
+        panic!(
+            "expected ModifyCost keyed to LifeLostThisTurn, got {:?}",
+            definition.mode
+        );
+    };
+    assert!(
+        tf.properties.iter().any(|p| matches!(
+            p,
+            FilterProp::AnyOf { props }
+                if props.contains(&FilterProp::HasColor { color: ManaColor::Black })
+                    && props.contains(&FilterProp::HasColor { color: ManaColor::Red })
+        )),
+        "granted static must reduce only black/red spells, got {:?}",
+        tf.properties
+    );
+}
+
+/// CR 601.2f + CR 611.2c + CR 119.3: Will, Scion of Peace mirrors Rowan with the
+/// white/blue color axis and life GAINED this turn.
+#[test]
+fn will_scion_of_peace_activated_ability_parses_clean() {
+    use crate::types::ability::{ContinuousModification, Effect, TargetFilter as TF};
+    use crate::types::mana::ManaColor;
+
+    let parsed = crate::parser::parse_oracle_text(
+        "Vigilance\n{T}: Spells you cast this turn that are white and/or blue cost {X} less to cast, where X is the amount of life you gained this turn. Activate only as a sorcery.",
+        "Will, Scion of Peace",
+        &["Vigilance".to_string()],
+        &["Legendary".to_string(), "Creature".to_string()],
+        &["Human".to_string()],
+    );
+    assert!(
+        parsed
+            .abilities
+            .iter()
+            .all(|a| !crate::parser::oracle::has_unimplemented(a)),
+        "Will must have zero Unimplemented abilities, got {:?}",
+        parsed
+            .abilities
+            .iter()
+            .map(|a| &a.effect)
+            .collect::<Vec<_>>()
+    );
+
+    let cost_ability = parsed
+        .abilities
+        .iter()
+        .find(|a| matches!(*a.effect, Effect::GenericEffect { .. }))
+        .expect("expected a GenericEffect cost-modification ability");
+    let Effect::GenericEffect {
+        static_abilities, ..
+    } = &*cost_ability.effect
+    else {
+        unreachable!()
+    };
+    let [granting] = static_abilities.as_slice() else {
+        panic!("expected exactly one granting static, got {static_abilities:?}");
+    };
+    let [ContinuousModification::GrantStaticAbility { definition }] =
+        granting.modifications.as_slice()
+    else {
+        panic!("expected a single GrantStaticAbility");
+    };
+    let StaticMode::ModifyCost {
+        dynamic_count: Some(QuantityRef::LifeGainedThisTurn { .. }),
+        spell_filter: Some(TF::Typed(tf)),
+        ..
+    } = &definition.mode
+    else {
+        panic!(
+            "expected ModifyCost keyed to LifeGainedThisTurn, got {:?}",
+            definition.mode
+        );
+    };
+    assert!(
+        tf.properties.iter().any(|p| matches!(
+            p,
+            FilterProp::AnyOf { props }
+                if props.contains(&FilterProp::HasColor { color: ManaColor::White })
+                    && props.contains(&FilterProp::HasColor { color: ManaColor::Blue })
+        )),
+        "granted static must reduce only white/blue spells, got {:?}",
+        tf.properties
     );
 }

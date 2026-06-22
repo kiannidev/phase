@@ -13087,9 +13087,32 @@ pub fn handle_cancel_cast(
             obj.tapped = false;
         }
     }
+    let delved_cards = state
+        .cards_exiled_with_source_this_turn
+        .get(&pending.object_id)
+        .cloned()
+        .unwrap_or_default();
+    for object_id in &delved_cards {
+        if state
+            .objects
+            .get(object_id)
+            .is_some_and(|obj| obj.zone == Zone::Exile)
+        {
+            super::zones::move_to_zone(state, *object_id, Zone::Graveyard, _events);
+        }
+    }
+    if !delved_cards.is_empty() {
+        state.exile_links.retain(|link| {
+            link.source_id != pending.object_id || !delved_cards.contains(&link.exiled_id)
+        });
+        state
+            .cards_exiled_with_source_this_turn
+            .remove(&pending.object_id);
+    }
     for player in &mut state.players {
         player.mana_pool.mana.retain(|unit| {
             !(unit.is_convoke_payment() && convoked_creatures.contains(&unit.source_id))
+                && !(unit.is_convoke_payment() && delved_cards.contains(&unit.source_id))
         });
     }
     if let Some(obj) = state.objects.get_mut(&pending.object_id) {
@@ -25902,6 +25925,55 @@ mod tests {
                 .get(&obj_id)
                 .is_some_and(|ids| ids.contains(&gy)),
             "delved card must be tracked as exiled with the casting spell"
+        );
+    }
+
+    #[test]
+    fn delve_cancel_cast_returns_exiled_cards_to_graveyard() {
+        use super::super::engine::apply_as_current;
+        let mut state = setup_game_at_main_phase();
+        let obj_id = make_delve_spell(&mut state);
+        let gy = create_object(
+            &mut state,
+            CardId(70),
+            PlayerId(0),
+            "Old Spell".to_string(),
+            Zone::Graveyard,
+        );
+        add_mana(&mut state, PlayerId(0), ManaType::Colorless, 3);
+        add_mana(&mut state, PlayerId(0), ManaType::Red, 1);
+
+        let result =
+            handle_cast_spell(&mut state, PlayerId(0), obj_id, CardId(22), &mut Vec::new())
+                .expect("delve spell should begin casting");
+        state.waiting_for = result;
+
+        apply_as_current(
+            &mut state,
+            crate::types::actions::GameAction::TapForConvoke {
+                object_id: gy,
+                mana_type: ManaType::Colorless,
+            },
+        )
+        .expect("delving a graveyard card is legal");
+
+        apply_as_current(&mut state, GameAction::CancelCast).expect("cancel cast is legal");
+
+        assert_eq!(
+            state.objects.get(&gy).unwrap().zone,
+            Zone::Graveyard,
+            "cancelled delve payment must return the card to the graveyard"
+        );
+        assert!(
+            !state
+                .cards_exiled_with_source_this_turn
+                .get(&obj_id)
+                .is_some_and(|ids| ids.contains(&gy)),
+            "delve tracking must be cleared on cancel"
+        );
+        assert!(
+            state.stack.iter().all(|e| e.id != obj_id),
+            "cancelled spell must be removed from the stack"
         );
     }
 

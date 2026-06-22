@@ -3,9 +3,9 @@
 //!
 //! https://github.com/phase-rs/phase/issues/934
 
-use engine::game::scenario::{GameScenario, P0};
+use engine::game::scenario::{GameRunner, GameScenario, P0};
 use engine::parser::oracle::parse_oracle_text;
-use engine::types::ability::{Effect, TargetFilter, TypedFilter, TypeFilter};
+use engine::types::ability::{Effect, TargetFilter, TypeFilter, TypedFilter};
 use engine::types::actions::GameAction;
 use engine::types::card_type::{CoreType, Supertype};
 use engine::types::game_state::WaitingFor;
@@ -46,14 +46,39 @@ fn ring_goes_south_parses_reveal_until_lands_to_battlefield_tapped() {
     }
 }
 
+fn resolve_ring_goes_south(runner: &mut GameRunner) {
+    let mut resolved = false;
+    for _ in 0..96 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::ChooseRingBearer { candidates, .. } => {
+                runner
+                    .act(GameAction::ChooseRingBearer {
+                        target: candidates[0],
+                    })
+                    .expect("choose ring bearer");
+            }
+            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => {
+                resolved = true;
+                break;
+            }
+            _ => {
+                runner.act(GameAction::PassPriority).ok();
+            }
+        }
+    }
+    assert!(
+        resolved,
+        "Ring Goes South must resolve; waiting_for={:?}",
+        runner.state().waiting_for
+    );
+}
+
 #[test]
 fn ring_goes_south_puts_revealed_lands_onto_battlefield_tapped() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
 
-    let legendary = scenario
-        .add_creature(P0, "Legendary Hero", 2, 2)
-        .id();
+    let legendary = scenario.add_creature(P0, "Legendary Hero", 2, 2).id();
 
     let island = scenario.add_card_to_library_top(P0, "Island");
     let forest = scenario.add_card_to_library_top(P0, "Forest");
@@ -81,34 +106,14 @@ fn ring_goes_south_puts_revealed_lands_onto_battlefield_tapped() {
     }
 
     runner.cast(spell).resolve();
+    resolve_ring_goes_south(&mut runner);
 
-    let mut resolved = false;
-    for _ in 0..96 {
-        match runner.state().waiting_for.clone() {
-            WaitingFor::ChooseRingBearer { candidates, .. } => {
-                runner
-                    .act(GameAction::ChooseRingBearer {
-                        target: candidates[0],
-                    })
-                    .expect("choose ring bearer");
-            }
-            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => {
-                resolved = true;
-                break;
-            }
-            _ => {
-                runner.act(GameAction::PassPriority).ok();
-            }
-        }
-    }
-
-    assert!(resolved, "Ring Goes South must resolve; waiting_for={:?}", runner.state().waiting_for);
     assert!(
-        runner.state().objects.values().any(|obj| {
-            obj.zone == Zone::Battlefield
-                && obj.name == "Forest"
-                && obj.tapped
-        }),
+        runner
+            .state()
+            .objects
+            .values()
+            .any(|obj| { obj.zone == Zone::Battlefield && obj.name == "Forest" && obj.tapped }),
         "revealed Forest must enter the battlefield tapped; bf={:?}",
         runner
             .state()
@@ -124,5 +129,70 @@ fn ring_goes_south_puts_revealed_lands_onto_battlefield_tapped() {
             .iter()
             .any(|id| runner.state().objects[id].name == "Island"),
         "nonland cards revealed before the land must go to the bottom of the library"
+    );
+}
+
+#[test]
+fn ring_goes_south_puts_two_lands_when_x_is_two() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let legendary_one = scenario.add_creature(P0, "Legendary Hero", 2, 2).id();
+    let legendary_two = scenario.add_creature(P0, "Legendary Ally", 2, 2).id();
+
+    let island = scenario.add_card_to_library_top(P0, "Island");
+    let forest = scenario.add_card_to_library_top(P0, "Forest");
+    let mountain = scenario.add_card_to_library_top(P0, "Mountain");
+
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "The Ring Goes South", false, RING_GOES_SOUTH_ORACLE)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+
+    let mut runner = scenario.build();
+    for legendary in [legendary_one, legendary_two] {
+        let obj = runner.state_mut().objects.get_mut(&legendary).unwrap();
+        obj.card_types.supertypes.push(Supertype::Legendary);
+        obj.base_card_types = obj.card_types.clone();
+    }
+    {
+        let island_obj = runner.state_mut().objects.get_mut(&island).unwrap();
+        island_obj.card_types.core_types.push(CoreType::Instant);
+        island_obj.base_card_types = island_obj.card_types.clone();
+    }
+    for land in [forest, mountain] {
+        let land_obj = runner.state_mut().objects.get_mut(&land).unwrap();
+        land_obj.card_types.core_types.push(CoreType::Land);
+        land_obj.base_card_types = land_obj.card_types.clone();
+    }
+
+    runner.cast(spell).resolve();
+    resolve_ring_goes_south(&mut runner);
+
+    let battlefield_lands: Vec<_> = runner
+        .state()
+        .objects
+        .values()
+        .filter(|obj| {
+            obj.zone == Zone::Battlefield
+                && obj.card_types.core_types.contains(&CoreType::Land)
+        })
+        .map(|obj| (&obj.name, obj.tapped))
+        .collect();
+    assert_eq!(
+        battlefield_lands.len(),
+        2,
+        "both revealed lands must enter the battlefield; got {battlefield_lands:?}"
+    );
+    assert!(
+        battlefield_lands.iter().all(|(_, tapped)| *tapped),
+        "each revealed land must enter tapped; got {battlefield_lands:?}"
+    );
+    assert!(
+        runner.state().players[0]
+            .library
+            .iter()
+            .any(|id| runner.state().objects[id].name == "Island"),
+        "nonland cards revealed before the lands must go to the bottom of the library"
     );
 }

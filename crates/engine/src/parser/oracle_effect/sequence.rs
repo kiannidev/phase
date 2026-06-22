@@ -6449,7 +6449,7 @@ mod tests {
     #[test]
     fn reveal_until_ring_goes_south_followup_continuation() {
         use crate::types::ability::{
-            RevealUntilDisposition, TargetFilter, TypedFilter, TypeFilter,
+            RevealUntilDisposition, TargetFilter, TypeFilter, TypedFilter,
         };
         let reveal = Effect::RevealUntil {
             player: TargetFilter::Controller,

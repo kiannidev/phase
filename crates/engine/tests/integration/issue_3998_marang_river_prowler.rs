@@ -13,12 +13,18 @@ use engine::types::phase::Phase;
 const MARANG_ORACLE: &str = "This creature can't block and can't be blocked.\n\
 You may cast this card from your graveyard as long as you control a black or green permanent.";
 
-fn add_black_creature(scenario: &mut GameScenario, player: engine::types::player::PlayerId) -> engine::types::identifiers::ObjectId {
+fn add_black_creature(
+    scenario: &mut GameScenario,
+    player: engine::types::player::PlayerId,
+) -> engine::types::identifiers::ObjectId {
     let id = scenario.add_creature(player, "Black Permanent", 2, 2).id();
     id
 }
 
-fn paint_black(state: &mut engine::types::game_state::GameState, id: engine::types::identifiers::ObjectId) {
+fn paint_black(
+    state: &mut engine::types::game_state::GameState,
+    id: engine::types::identifiers::ObjectId,
+) {
     let obj = state.objects.get_mut(&id).unwrap();
     obj.card_types.core_types.push(CoreType::Creature);
     obj.color = vec![ManaColor::Black];

@@ -7800,8 +7800,11 @@ fn graveyard_cast_permission_marang_river_prowler_color_disjunction_scoped_to_yo
                         assert!(
                             tf.properties.iter().any(|prop| matches!(
                                 prop,
-                                FilterProp::HasColor { color: ManaColor::Black }
-                                    | FilterProp::HasColor { color: ManaColor::Green }
+                                FilterProp::HasColor {
+                                    color: ManaColor::Black
+                                } | FilterProp::HasColor {
+                                    color: ManaColor::Green
+                                }
                             )),
                             "expected black or green color property, got: {:?}",
                             tf.properties

@@ -2946,12 +2946,14 @@ pub(crate) fn inject_controller(filter: TargetFilter, ctrl: ControllerRef) -> Ta
             }
             TargetFilter::Typed(tf)
         }
+        // CR 109.5: Words like 'you' or 'your' on an object refer to the object's controller.
         TargetFilter::Or { filters } => TargetFilter::Or {
             filters: filters
                 .into_iter()
                 .map(|filter| inject_controller(filter, ctrl.clone()))
                 .collect(),
         },
+        // CR 109.5: Words like 'you' or 'your' on an object refer to the object's controller.
         TargetFilter::And { filters } => TargetFilter::And {
             filters: filters
                 .into_iter()

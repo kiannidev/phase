@@ -337,6 +337,7 @@ mod issue_3988_vaultborn_tyrant;
 mod issue_3991_carnage_interpreter;
 mod issue_3994_malevolent_rumble;
 mod issue_3996_return_the_favor;
+mod issue_3998_marang_river_prowler;
 mod issue_3999_latchkey_faerie_prowl_etb;
 mod issue_4000_dominating_licid;
 mod issue_4050_adamaro_extremum_hand_size;

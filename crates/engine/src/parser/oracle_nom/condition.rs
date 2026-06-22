@@ -2946,6 +2946,18 @@ pub(crate) fn inject_controller(filter: TargetFilter, ctrl: ControllerRef) -> Ta
             }
             TargetFilter::Typed(tf)
         }
+        TargetFilter::Or { filters } => TargetFilter::Or {
+            filters: filters
+                .into_iter()
+                .map(|filter| inject_controller(filter, ctrl.clone()))
+                .collect(),
+        },
+        TargetFilter::And { filters } => TargetFilter::And {
+            filters: filters
+                .into_iter()
+                .map(|filter| inject_controller(filter, ctrl.clone()))
+                .collect(),
+        },
         other => other,
     }
 }

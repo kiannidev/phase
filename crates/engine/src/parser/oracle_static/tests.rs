@@ -7770,6 +7770,52 @@ fn graveyard_cast_permission_gravecrawler_self_ref_condition() {
 }
 
 #[test]
+fn graveyard_cast_permission_marang_river_prowler_color_disjunction_scoped_to_you() {
+    let text = "You may cast this card from your graveyard as long as you control a black or green permanent.";
+    let def = parse_static_line(text).expect("should parse Marang River Prowler text");
+    assert!(matches!(
+        def.mode,
+        StaticMode::GraveyardCastPermission {
+            frequency: CastFrequency::Unlimited,
+            play_mode: CardPlayMode::Cast,
+            ..
+        }
+    ));
+    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+    match def.condition {
+        Some(StaticCondition::IsPresent {
+            filter: Some(TargetFilter::Or { filters }),
+        }) => {
+            for filter in filters {
+                match filter {
+                    TargetFilter::Typed(tf) => {
+                        assert_eq!(tf.controller, Some(ControllerRef::You));
+                        assert!(
+                            tf.properties.contains(&FilterProp::InZone {
+                                zone: Zone::Battlefield,
+                            }),
+                            "expected battlefield control condition, got: {:?}",
+                            tf.properties
+                        );
+                        assert!(
+                            tf.properties.iter().any(|prop| matches!(
+                                prop,
+                                FilterProp::HasColor { color: ManaColor::Black }
+                                    | FilterProp::HasColor { color: ManaColor::Green }
+                            )),
+                            "expected black or green color property, got: {:?}",
+                            tf.properties
+                        );
+                    }
+                    other => panic!("expected typed color filter, got {other:?}"),
+                }
+            }
+        }
+        other => panic!("expected black-or-green presence condition, got {other:?}"),
+    }
+}
+
+#[test]
 fn graveyard_cast_permission_scourge_of_nel_toth_self_ref() {
     // Regression for #525: Scourge of Nel Toth's "this creature" self-reference
     // is normalized to the `~` token by `normalize_self_references` before the

@@ -552,6 +552,7 @@ pub(super) fn handle_resolution_choice(
                     }),
                     false,
                     cleanup,
+                    false,
                     events,
                 )?;
                 ResolutionChoiceOutcome::WaitingFor(result)
@@ -782,6 +783,7 @@ pub(super) fn handle_resolution_choice(
                     }),
                     false,
                     cleanup,
+                    false,
                     events,
                 )?;
                 ResolutionChoiceOutcome::WaitingFor(result)
@@ -822,7 +824,7 @@ pub(super) fn handle_resolution_choice(
                         },
                 };
                 let result = casting::initiate_cast_during_resolution(
-                    state, player, hit_card, None, false, cleanup, events,
+                    state, player, hit_card, None, false, cleanup, false, events,
                 )?;
                 ResolutionChoiceOutcome::WaitingFor(result)
             } else {
@@ -906,7 +908,7 @@ pub(super) fn handle_resolution_choice(
                     },
             };
             let result = casting::initiate_cast_during_resolution(
-                state, player, chosen, None, false, cleanup, events,
+                state, player, chosen, None, false, cleanup, false, events,
             )?;
             ResolutionChoiceOutcome::WaitingFor(result)
         }

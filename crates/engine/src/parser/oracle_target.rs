@@ -1972,7 +1972,12 @@ pub fn parse_type_phrase_with_ctx<'a>(
     for separator in TYPE_SEPARATORS {
         if let Ok((after_sep, _)) = tag::<_, _, OracleError<'_>>(*separator).parse(rest_lower) {
             let after_trimmed = after_sep.trim_start();
-            if starts_with_or_article_type_segment(after_trimmed) {
+            let can_recurse = if separator.starts_with(',') {
+                starts_with_or_article_type_segment(after_trimmed)
+            } else {
+                starts_with_type_word(after_trimmed)
+            };
+            if can_recurse {
                 let sep_text = &text[pos + rest_offset + separator.len()..];
                 let (other_filter, final_rest) = parse_type_phrase_with_ctx(sep_text, ctx);
                 // CR 205.2a: The left branch of a type disjunction must retain

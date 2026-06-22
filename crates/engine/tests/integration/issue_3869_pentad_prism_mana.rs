@@ -29,7 +29,8 @@ fn pentad_prism_remove_charge_counter_adds_mana() {
 
     {
         let obj = runner.state_mut().objects.get_mut(&prism).unwrap();
-        obj.counters.insert(CounterType::Generic("charge".to_string()), 2);
+        obj.counters
+            .insert(CounterType::Generic("charge".to_string()), 2);
     }
 
     runner

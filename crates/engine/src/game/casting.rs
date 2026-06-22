@@ -7432,6 +7432,13 @@ pub fn handle_cast_spell_as_madness_with_payment_mode(
     continue_with_prepared(state, player, prepared, events)
 }
 
+pub(super) struct ResolutionCastRequest {
+    pub(super) constraint: Option<crate::types::ability::CastPermissionConstraint>,
+    pub(super) cast_transformed: bool,
+    pub(super) cleanup: crate::types::ability::ResolutionCastCleanup,
+    pub(super) exile_instead_of_graveyard_on_resolve: bool,
+}
+
 /// CR 608.2g: Cast a Cascade/Discover hit *during resolution* of its source
 /// spell, rather than granting a lingering permission that requires a separate
 /// later `CastSpell`. The single authority that constructs the
@@ -7460,12 +7467,15 @@ pub(super) fn initiate_cast_during_resolution(
     state: &mut GameState,
     player: PlayerId,
     hit_card: ObjectId,
-    constraint: Option<crate::types::ability::CastPermissionConstraint>,
-    cast_transformed: bool,
-    cleanup: crate::types::ability::ResolutionCastCleanup,
-    exile_instead_of_graveyard_on_resolve: bool,
+    request: ResolutionCastRequest,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
+    let ResolutionCastRequest {
+        constraint,
+        cast_transformed,
+        cleanup,
+        exile_instead_of_graveyard_on_resolve,
+    } = request;
     if let Some(obj) = state.objects.get_mut(&hit_card) {
         // CR 601.2a + CR 601.2i: zero-cost permission consumed by
         // `prepare_spell_cast_with_variant_override`'s exile alt-cost scan.

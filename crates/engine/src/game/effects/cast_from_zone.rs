@@ -387,10 +387,12 @@ fn cast_single_target_during_resolution(
         state,
         ability.controller,
         card,
-        constraint,
-        cast_transformed,
-        cleanup,
-        exile_instead_of_graveyard_on_resolve,
+        crate::game::casting::ResolutionCastRequest {
+            constraint,
+            cast_transformed,
+            cleanup,
+            exile_instead_of_graveyard_on_resolve,
+        },
         events,
     )
     .map_err(|e| EffectError::InvalidParam(e.to_string()))?;

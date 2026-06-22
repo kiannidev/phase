@@ -1126,14 +1126,13 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     // may" is resolution-time optionality on the cast (`execute.optional`), not
     // permission to skip putting the triggered ability on the stack. Target
     // selection happens when the ability is put on the stack (CR 603.3d).
-    if def.optional {
-        if def
+    if def.optional
+        && def
             .execute
             .as_ref()
             .is_some_and(|ability| trigger_effect_requires_stack_time_targets(ability))
-        {
-            def.optional = false;
-        }
+    {
+        def.optional = false;
     }
     def.unless_pay = modifiers.unless_pay.clone();
 

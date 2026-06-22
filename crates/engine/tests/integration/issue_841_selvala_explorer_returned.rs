@@ -9,9 +9,17 @@ use engine::types::phase::Phase;
 
 const SELVALA_ORACLE: &str = "Parley — {T}: Each player reveals the top card of their library. For each nonland card revealed this way, add {G} and you gain 1 life. Then each player draws a card.";
 
-fn stamp_library_top(runner: &mut engine::game::scenario::GameRunner, player: engine::types::PlayerId, core_type: CoreType) {
+fn stamp_library_top(
+    runner: &mut engine::game::scenario::GameRunner,
+    player: engine::types::PlayerId,
+    core_type: CoreType,
+) {
     let top = runner.state().players[player.0 as usize].library[0];
-    let obj = runner.state_mut().objects.get_mut(&top).expect("library top");
+    let obj = runner
+        .state_mut()
+        .objects
+        .get_mut(&top)
+        .expect("library top");
     obj.card_types.core_types.push(core_type);
     obj.base_card_types = obj.card_types.clone();
 }
@@ -41,7 +49,9 @@ fn selvala_parley_adds_green_only_for_nonland_reveals() {
     runner.advance_until_stack_empty();
 
     assert_eq!(
-        runner.state().players[P0.0 as usize].mana_pool.count_color(ManaType::Green),
+        runner.state().players[P0.0 as usize]
+            .mana_pool
+            .count_color(ManaType::Green),
         1,
         "one nonland reveal across both players must produce exactly one green mana"
     );

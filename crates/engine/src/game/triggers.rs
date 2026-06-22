@@ -3666,10 +3666,13 @@ pub(crate) fn take_pending_trigger_event_batch(
 /// callers can stash it in `state.pending_trigger_entry` when the entry is
 /// being constructed in pieces across multiple `WaitingFor` cycles (mode
 /// choice, target selection, distribute-among).
-/// CR 603.2c + CR 608.2c: Batched attack triggers whose resolving effect
+///
+/// CR 603.2c + CR 608.2c: Batched attack triggers whose root resolving effect
 /// anaphorically binds `ParentTarget` to the attackers that satisfied the
 /// trigger ("those creatures get +4/+4") inherit that set as propagated
-/// targets at stack-push time.
+/// targets at stack-push time. Only the root ability is seeded — downstream
+/// sub-abilities that produce a new parent referent during resolution (The
+/// Tenth Doctor's Allons-y! Suspend grant) keep the existing rebinding path.
 fn seed_batched_attack_parent_targets(
     ability: &mut ResolvedAbility,
     trigger_event: Option<&GameEvent>,
@@ -3680,23 +3683,13 @@ fn seed_batched_attack_parent_targets(
     if attacker_ids.is_empty() {
         return;
     }
-    let refs: Vec<TargetRef> = attacker_ids
+    if !effect_uses_parent_target(&ability.effect) || !ability.targets.is_empty() {
+        return;
+    }
+    ability.targets = attacker_ids
         .iter()
         .map(|id| TargetRef::Object(*id))
         .collect();
-    seed_parent_targets_in_chain(ability, &refs);
-}
-
-fn seed_parent_targets_in_chain(ability: &mut ResolvedAbility, refs: &[TargetRef]) {
-    if ability.targets.is_empty() && effect_uses_parent_target(&ability.effect) {
-        ability.targets = refs.to_vec();
-    }
-    if let Some(sub) = ability.sub_ability.as_mut() {
-        seed_parent_targets_in_chain(sub, refs);
-    }
-    if let Some(else_ab) = ability.else_ability.as_mut() {
-        seed_parent_targets_in_chain(else_ab, refs);
-    }
 }
 
 fn effect_uses_parent_target(effect: &Effect) -> bool {

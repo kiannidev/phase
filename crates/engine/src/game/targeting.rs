@@ -429,11 +429,6 @@ pub fn resolve_event_context_targets(
                 .map(|id| TargetRef::Object(*id))
                 .collect();
         }
-        TargetFilter::ParentTarget => {
-            if let Some(targets) = parent_target_refs_from_attack_trigger_context(state) {
-                return targets;
-            }
-        }
         _ => {}
     }
 
@@ -777,9 +772,6 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
         }
         TargetFilter::ParentTarget => {
             let event = event?;
-            if let GameEvent::AttackersDeclared { attacker_ids, .. } = event {
-                return attacker_ids.first().map(|id| TargetRef::Object(*id));
-            }
             blocked_attacker_from_event(event, source_id).map(TargetRef::Object)
         }
         TargetFilter::StackSpell => {

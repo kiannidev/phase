@@ -2,6 +2,7 @@ use crate::game::quantity::resolve_quantity;
 use crate::types::ability::{
     Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter, TargetRef,
 };
+use crate::types::phase::Phase;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{ExtraPhase, GameState};
 
@@ -38,6 +39,17 @@ pub fn resolve(
                 ability.controller
             }
         }
+    };
+
+    // CR 500.8 (Full Throttle): "After this main phase, there are N additional
+    // combat phases" anchors to whichever main phase the spell resolves in.
+    // The parser emits `after: PreCombatMain` as a sentinel for this wording.
+    let after = if after == Phase::PreCombatMain
+        && matches!(state.phase, Phase::PreCombatMain | Phase::PostCombatMain)
+    {
+        state.phase
+    } else {
+        after
     };
 
     // CR 500.10a: "If an effect that says 'you get' an additional step or phase
@@ -172,6 +184,32 @@ mod tests {
             modal: None,
             mode_abilities: vec![],
         }
+    }
+
+    #[test]
+    fn additional_phase_after_this_main_phase_uses_active_main_as_anchor() {
+        let mut state = GameState {
+            active_player: PlayerId(0),
+            phase: Phase::PostCombatMain,
+            ..Default::default()
+        };
+        let mut events = Vec::new();
+        let ability = make_ability_with_count(
+            TargetFilter::Controller,
+            Phase::BeginCombat,
+            Phase::PreCombatMain,
+            vec![],
+            PlayerId(0),
+            QuantityExpr::Fixed { value: 2 },
+        );
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(state.extra_phases.len(), 2);
+        assert!(state
+            .extra_phases
+            .iter()
+            .all(|ep| ep.anchor == Phase::PostCombatMain && ep.phase == Phase::BeginCombat));
     }
 
     #[test]

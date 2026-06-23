@@ -6205,6 +6205,12 @@ pub struct GameState {
     /// CR 400.7: Zone-change snapshots this turn, enabling data-driven condition queries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub zone_changes_this_turn: Vec<ZoneChangeRecord>,
+    /// CR 603.2c: Batched zone-change triggers already collected for
+    /// `(source_id, trig_idx, moved_object, from, to)`. Prevents a second
+    /// `process_triggers` pass over the same `ZoneChanged` events from
+    /// stacking duplicate batched triggers (issue #3866).
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub batched_zone_change_trigger_fired: HashSet<(ObjectId, usize, ObjectId, Option<Zone>, Zone)>,
     /// CR 403.3: Battlefield entry snapshots this turn, enabling data-driven ETB queries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub battlefield_entries_this_turn: Vec<BattlefieldEntryRecord>,
@@ -7295,6 +7301,7 @@ impl GameState {
             players_who_sacrificed_artifact_this_turn: HashSet::new(),
             sacrificed_permanents_this_turn: Vec::new(),
             zone_changes_this_turn: Vec::new(),
+            batched_zone_change_trigger_fired: HashSet::new(),
             battlefield_entries_this_turn: Vec::new(),
             damage_dealt_this_turn: im::Vector::new(),
             assassin_or_commander_dealt_combat_damage_this_turn: HashSet::new(),
@@ -7756,6 +7763,7 @@ impl PartialEq for GameState {
                 == other.players_who_sacrificed_artifact_this_turn
             && self.sacrificed_permanents_this_turn == other.sacrificed_permanents_this_turn
             && self.zone_changes_this_turn == other.zone_changes_this_turn
+            && self.batched_zone_change_trigger_fired == other.batched_zone_change_trigger_fired
             && self.battlefield_entries_this_turn == other.battlefield_entries_this_turn
             && self.damage_dealt_this_turn == other.damage_dealt_this_turn
             && self.assassin_or_commander_dealt_combat_damage_this_turn

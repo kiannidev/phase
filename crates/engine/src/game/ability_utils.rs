@@ -1501,6 +1501,28 @@ fn damaged_player_targets_for_companion_slot(state: &GameState) -> Option<Vec<Ta
     (!players.is_empty()).then_some(players)
 }
 
+/// CR 701.14a: True when a fight's `subject` filter must surface its own target
+/// slot ("target creature you control fights another target creature"). False
+/// for "~ fights", ParentTarget anaphors, and enchanted/equipped hosts.
+fn fight_subject_needs_target_slot(subject: &TargetFilter) -> bool {
+    use crate::types::ability::FilterProp;
+    if subject.is_context_ref() {
+        return false;
+    }
+    match subject {
+        TargetFilter::SelfRef | TargetFilter::ParentTarget | TargetFilter::AttachedTo => false,
+        TargetFilter::Typed(tf)
+            if tf
+                .properties
+                .iter()
+                .any(|p| matches!(p, FilterProp::EnchantedBy | FilterProp::EquippedBy)) =>
+        {
+            false
+        }
+        _ => true,
+    }
+}
+
 /// Legal targets for the companion `TargetFilter::Player` slot — the player
 /// whose permanents a `ControllerRef::TargetPlayer` ("that player controls")
 /// filter scopes to. Single authority shared by the static slot build
@@ -1602,6 +1624,35 @@ fn collect_target_slots(
     if let Effect::ExchangeLifeTotals { player_a, player_b } = &ability.effect {
         for filter in [player_a, player_b] {
             if filter.is_context_ref() {
+                continue;
+            }
+            let legal_targets =
+                legal_targets_for_ability_filter(state, ability, filter, &acc.slots);
+            if legal_targets.is_empty() && !ability.optional_targeting {
+                return Err(EngineError::ActionNotAllowed(
+                    "No legal targets available".to_string(),
+                ));
+            }
+            acc.push(TargetSelectionSlot {
+                legal_targets,
+                optional: ability.optional_targeting,
+            });
+        }
+        return Ok(());
+    }
+
+    // CR 701.14a + CR 115.1: "Target creature you control fights another target
+    // creature" names two chosen fighters. "~ fights …" and "enchanted creature
+    // fights …" only surface the opponent as a target slot — the fighter is the
+    // ability source or the host permanent.
+    if let Effect::Fight { subject, target } = &ability.effect {
+        let mut filters: Vec<&TargetFilter> = Vec::new();
+        if fight_subject_needs_target_slot(subject) {
+            filters.push(subject);
+        }
+        filters.push(target);
+        for filter in filters {
+            if matches!(filter, TargetFilter::SelfRef | TargetFilter::ParentTarget) {
                 continue;
             }
             let legal_targets =
@@ -2855,6 +2906,29 @@ fn collect_target_slot_specs(
     if let Effect::ExchangeLifeTotals { player_a, player_b } = &ability.effect {
         for filter in [player_a, player_b] {
             if filter.is_context_ref() {
+                continue;
+            }
+            let id = TargetInstanceId(*next_instance);
+            *next_instance += 1;
+            specs.push(TargetSlotSpec {
+                filter: filter.clone(),
+                optional: ability.optional_targeting,
+                instance: id,
+            });
+        }
+        return;
+    }
+
+    // CR 701.14a + CR 115.1: Mirror the dual-fighter `Fight` branch in
+    // `collect_target_slots` so per-slot specs line up one-for-one.
+    if let Effect::Fight { subject, target } = &ability.effect {
+        let mut filters: Vec<&TargetFilter> = Vec::new();
+        if fight_subject_needs_target_slot(subject) {
+            filters.push(subject);
+        }
+        filters.push(target);
+        for filter in filters {
+            if matches!(filter, TargetFilter::SelfRef | TargetFilter::ParentTarget) {
                 continue;
             }
             let id = TargetInstanceId(*next_instance);
@@ -4459,6 +4533,34 @@ fn assign_targets_recursive(
         return Ok(());
     }
 
+    if let Effect::Fight { subject, target } = &ability.effect {
+        let mut filters: Vec<&TargetFilter> = Vec::new();
+        if fight_subject_needs_target_slot(subject) {
+            filters.push(subject);
+        }
+        filters.push(target);
+        for filter in filters {
+            if matches!(filter, TargetFilter::SelfRef | TargetFilter::ParentTarget) {
+                continue;
+            }
+            if let Some(chosen) = targets.get(*next_target) {
+                ability.targets.push(chosen.clone());
+                *next_target += 1;
+            } else if !ability.optional_targeting {
+                return Err(EngineError::InvalidAction(
+                    "Missing required target".to_string(),
+                ));
+            }
+        }
+        if let Some(sub_ability) = ability.sub_ability.as_mut() {
+            if defers_conditional_target_selection(sub_ability) {
+                return Ok(());
+            }
+            assign_targets_recursive(state, sub_ability, targets, next_target)?;
+        }
+        return Ok(());
+    }
+
     // CR 609.7 + CR 601.2c: Mirror the source-scoped `PreventDamage` slot pushed
     // by `collect_target_slots`. The chosen source spell is consumed into THIS
     // node's `targets` (the PreventDamage HEAD node) BEFORE descending into the
@@ -4681,6 +4783,41 @@ fn assign_selected_slots_recursive(
                 next_slot,
             )?;
             return Ok(());
+        }
+        if let Some(sub_ability) = ability.sub_ability.as_mut() {
+            if defers_conditional_target_selection(sub_ability) {
+                return Ok(());
+            }
+            assign_selected_slots_recursive(state, sub_ability, selected_slots, next_slot)?;
+        }
+        return Ok(());
+    }
+
+    if let Effect::Fight { subject, target } = &ability.effect {
+        let mut filters: Vec<&TargetFilter> = Vec::new();
+        if fight_subject_needs_target_slot(subject) {
+            filters.push(subject);
+        }
+        filters.push(target);
+        for filter in filters {
+            if matches!(filter, TargetFilter::SelfRef | TargetFilter::ParentTarget) {
+                continue;
+            }
+            let Some(selected_slot) = selected_slots.get(*next_slot) else {
+                return Err(EngineError::InvalidAction(
+                    "Missing target selection".to_string(),
+                ));
+            };
+            match selected_slot {
+                Some(chosen) => ability.targets.push(chosen.clone()),
+                None if ability.optional_targeting => {}
+                None => {
+                    return Err(EngineError::InvalidAction(
+                        "Missing required target".to_string(),
+                    ));
+                }
+            }
+            *next_slot += 1;
         }
         if let Some(sub_ability) = ability.sub_ability.as_mut() {
             if defers_conditional_target_selection(sub_ability) {
@@ -5015,6 +5152,13 @@ fn validate_target_constraints(
 }
 
 fn chain_has_target_sink(ability: &ResolvedAbility) -> bool {
+    if let Effect::Fight { subject, target } = &ability.effect {
+        if fight_subject_needs_target_slot(subject) {
+            return true;
+        }
+        return !matches!(target, TargetFilter::SelfRef | TargetFilter::ParentTarget);
+    }
+
     if let Effect::Attach { attachment, target } = &ability.effect {
         if attach_side_needs_target_slot(attachment, true)
             || attach_side_needs_target_slot(target, false)

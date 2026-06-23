@@ -9996,7 +9996,9 @@ pub fn can_cast_object_now(state: &GameState, player: PlayerId, object_id: Objec
         // castable even when `prepare_spell_cast` fails on the creature face —
         // most commonly the sorcery-speed timing gate outside main phases.
         if let Some(obj) = state.objects.get(&object_id) {
-            if alternative_spell_layout(obj).is_some() {
+            if alternative_spell_layout(obj).is_some()
+                && cast_face_choice_offered_from_zone(state, obj)
+            {
                 let mut sim = state.clone();
                 if let Some(sim_obj) = sim.objects.get_mut(&object_id) {
                     swap_to_alternative_spell_face(sim_obj);
@@ -10330,7 +10332,7 @@ fn can_cast_prepared_now(
     // alternative spell face. The creature face may be unaffordable while the
     // spell face is castable; in that case the card is still legally castable
     // and will prompt AdventureCastChoice.
-    if alternative_spell_layout(obj).is_some() {
+    if alternative_spell_layout(obj).is_some() && cast_face_choice_offered_from_zone(state, obj) {
         let mut sim = state.clone();
         if let Some(sim_obj) = sim.objects.get_mut(&prepared.object_id) {
             swap_to_alternative_spell_face(sim_obj);

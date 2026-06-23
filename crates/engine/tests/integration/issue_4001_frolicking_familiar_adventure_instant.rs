@@ -118,3 +118,33 @@ fn issue_4001_adventure_instant_castable_outside_main_phase() {
         result.waiting_for
     );
 }
+
+#[test]
+fn issue_4001_exiled_adventure_creature_does_not_simulate_instant_face() {
+    use engine::game::zones::move_to_zone;
+    use engine::types::ability::CastingPermission;
+    use engine::types::zones::Zone;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::DeclareAttackers);
+    let obj_id = add_frolicking_familiar_to_hand(&mut scenario);
+
+    let mut runner = scenario.build();
+    setup_frolicking_familiar_adventure(&mut runner, obj_id);
+    add_mana(&mut runner, P0, ManaType::Red, 2);
+
+    let mut events = Vec::new();
+    move_to_zone(runner.state_mut(), obj_id, Zone::Exile, &mut events);
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&obj_id)
+        .unwrap()
+        .casting_permissions
+        .push(CastingPermission::AdventureCreature);
+
+    assert!(
+        !can_cast_object_now(runner.state(), P0, obj_id),
+        "exiled Adventure creature must not simulate the instant Adventure face outside main phase"
+    );
+}

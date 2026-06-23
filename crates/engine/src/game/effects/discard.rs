@@ -702,6 +702,8 @@ mod tests {
 
     #[test]
     fn discard_specific_target() {
+        use crate::types::ability::{FilterProp, TypedFilter};
+
         let mut state = GameState::new_two_player(42);
         let c1 = create_object(
             &mut state,
@@ -720,7 +722,10 @@ mod tests {
         let ability = ResolvedAbility::new(
             Effect::DiscardCard {
                 count: 1,
-                target: TargetFilter::Any,
+                target: TargetFilter::Typed(
+                    TypedFilter::default()
+                        .properties(vec![FilterProp::InZone { zone: Zone::Hand }]),
+                ),
             },
             vec![TargetRef::Object(c2)],
             ObjectId(100),

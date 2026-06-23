@@ -9993,6 +9993,22 @@ pub fn can_cast_object_now(state: &GameState, player: PlayerId, object_id: Objec
         return false;
     }
     let Ok(prepared) = prepare_spell_cast(state, player, object_id) else {
+        // CR 715.3a / CR 720.3a: An Adventure instant/sorcery face may be
+        // castable even when `prepare_spell_cast` fails on the creature face —
+        // most commonly the sorcery-speed timing gate outside main phases.
+        if let Some(obj) = state.objects.get(&object_id) {
+            if alternative_spell_layout(obj).is_some()
+                && cast_face_choice_offered_from_zone(state, obj)
+            {
+                let mut sim = state.clone();
+                if let Some(sim_obj) = sim.objects.get_mut(&object_id) {
+                    swap_to_alternative_spell_face(sim_obj);
+                }
+                if let Ok(prepared) = prepare_spell_cast(&sim, player, object_id) {
+                    return can_cast_prepared_now(&sim, player, &prepared);
+                }
+            }
+        }
         let choices = casting_variant_choice_set(state, player, object_id);
         return !choices.options.is_empty();
     };
@@ -10317,7 +10333,7 @@ fn can_cast_prepared_now(
     // alternative spell face. The creature face may be unaffordable while the
     // spell face is castable; in that case the card is still legally castable
     // and will prompt AdventureCastChoice.
-    if alternative_spell_layout(obj).is_some() {
+    if alternative_spell_layout(obj).is_some() && cast_face_choice_offered_from_zone(state, obj) {
         let mut sim = state.clone();
         if let Some(sim_obj) = sim.objects.get_mut(&prepared.object_id) {
             swap_to_alternative_spell_face(sim_obj);
@@ -31944,6 +31960,39 @@ mod tests {
         });
 
         obj_id
+    }
+
+    /// CR 715.3a + CR 304.1: Adventure instant faces (Blow Off Steam, Stomp)
+    /// must be castable at instant speed even when the creature face fails
+    /// sorcery-speed timing outside main phases (issue #4001).
+    #[test]
+    fn issue_4001_adventure_instant_castable_outside_main_phase() {
+        let mut state = setup_game_at_main_phase();
+        state.phase = Phase::DeclareAttackers;
+        let obj_id = create_adventure_in_hand(&mut state, PlayerId(0));
+        // Enough mana for Stomp ({1}{R}) but not Bonecrusher Giant ({2}{R}).
+        add_mana(&mut state, PlayerId(0), ManaType::Red, 2);
+
+        assert!(
+            can_cast_object_now(&state, PlayerId(0), obj_id),
+            "Adventure instant face must be castable outside main phases"
+        );
+
+        let mut events = Vec::new();
+        let result =
+            handle_cast_spell(&mut state, PlayerId(0), obj_id, CardId(70), &mut events).unwrap();
+
+        assert!(
+            matches!(
+                result,
+                WaitingFor::CastOffer {
+                    player,
+                    kind: CastOfferKind::Adventure { .. }
+                } if player == PlayerId(0)
+            ),
+            "Expected Adventure cast offer outside main phase, got {:?}",
+            result
+        );
     }
 
     /// Enchantment adventure (Virtue of Courage // Embereth Blaze class).

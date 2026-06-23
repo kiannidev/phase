@@ -12,16 +12,13 @@ use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
+use crate::support::shared_card_db;
+
 const REANIMATE_ORACLE: &str =
     "Return target creature card from your graveyard to the battlefield.";
 
 fn card_db() -> &'static CardDatabase {
-    static DB: std::sync::OnceLock<CardDatabase> = std::sync::OnceLock::new();
-    DB.get_or_init(|| {
-        let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/card-data.json");
-        CardDatabase::from_export(&path).expect("card-data.json must load")
-    })
+    shared_card_db().expect("integration card fixture must load")
 }
 
 fn plant_token_count(runner: &engine::game::scenario::GameRunner) -> usize {

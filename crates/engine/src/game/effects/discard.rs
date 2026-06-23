@@ -155,6 +155,12 @@ pub fn resolve(
     // Check if targets specify specific cards to discard. Parent chain
     // propagation can inherit non-hand object targets (e.g. Traumatic Critique's
     // damage recipient) — those must not short-circuit the hand-choice path.
+    //
+    // Issue #3257: A bounce head's chosen graveyard creatures are propagated onto
+    // a trailing "discard a card" sub-ability for chain context, but they are NOT
+    // discard targets. Once the bounce moves them to hand they must not bypass the
+    // interactive DiscardChoice path via this fast path — only a *declared* targeted
+    // discard (Oracle uses "target") may consume `ability.targets` here.
     let specific_targets: Vec<_> = ability
         .targets
         .iter()
@@ -171,7 +177,10 @@ pub fn resolve(
         })
         .collect();
 
-    if !specific_targets.is_empty() {
+    let declared_target_discard =
+        crate::game::triggers::extract_target_filter_from_effect(&ability.effect).is_some();
+
+    if !specific_targets.is_empty() && declared_target_discard {
         // Discard specific targeted cards
         for obj_id in specific_targets {
             let obj = state
@@ -1628,6 +1637,61 @@ mod tests {
         assert!(
             state.players[0].hand.contains(&c1),
             "c1 should still be in hand"
+        );
+    }
+
+    /// Issue #3257: Macabre Waltz — bounce targets propagated onto a trailing
+    /// "discard a card" sub must not auto-discard the just-returned creature.
+    #[test]
+    fn bounce_then_discard_does_not_auto_discard_propagated_return_targets() {
+        use crate::game::ability_utils::build_resolved_from_def_with_targets;
+        use crate::game::effects::resolve_ability_chain;
+        use crate::parser::oracle_effect::parse_effect_chain;
+        use crate::types::ability::AbilityKind;
+
+        let mut state = GameState::new_two_player(42);
+        let returned = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Returned Bear".into(),
+            Zone::Graveyard,
+        );
+        let other = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Other Rat".into(),
+            Zone::Hand,
+        );
+
+        let def = parse_effect_chain(
+            "Return up to two target creature cards from your graveyard to your hand, then discard a card.",
+            AbilityKind::Spell,
+        );
+        let ability = build_resolved_from_def_with_targets(
+            &def,
+            ObjectId(100),
+            PlayerId(0),
+            vec![TargetRef::Object(returned)],
+        );
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        assert!(
+            matches!(state.waiting_for, WaitingFor::DiscardChoice { .. }),
+            "non-targeted discard must prompt, got {:?}",
+            state.waiting_for
+        );
+        assert_eq!(
+            state.objects.get(&returned).map(|o| o.zone),
+            Some(Zone::Hand),
+            "returned creature must remain in hand pending the discard choice"
+        );
+        assert_eq!(
+            state.objects.get(&other).map(|o| o.zone),
+            Some(Zone::Hand),
+            "other hand card must not be discarded automatically"
         );
     }
 }

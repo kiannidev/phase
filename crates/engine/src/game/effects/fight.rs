@@ -86,6 +86,22 @@ pub fn resolve(
 
     let (source_id, target_id) = if object_targets.len() >= 2 {
         (object_targets[0], object_targets[1])
+    } else if let Effect::Fight { subject, .. } = &ability.effect {
+        if crate::game::ability_utils::fight_subject_needs_target_slot(subject) {
+            // CR 701.14a: Dual-target fights require both chosen fighters; do
+            // not reinterpret a lone survivor as "~ fights target creature".
+            events.push(GameEvent::EffectResolved {
+                kind: EffectKind::Fight,
+                source_id: ability.source_id,
+            });
+            return Ok(());
+        }
+        let source_id = resolve_fight_subject(state, ability)?;
+        let target_id = object_targets
+            .first()
+            .copied()
+            .ok_or_else(|| EffectError::MissingParam("Fight target".to_string()))?;
+        (source_id, target_id)
     } else {
         let source_id = resolve_fight_subject(state, ability)?;
         let target_id = object_targets

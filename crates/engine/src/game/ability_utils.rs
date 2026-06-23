@@ -1353,6 +1353,37 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
             }
         }
         kept
+    } else if let Effect::Fight { subject, target } = &validated.effect {
+        // CR 608.2b + CR 701.14a: Dual-fighter fights validate each chosen
+        // fighter against its own slot filter so one illegal fighter does not
+        // collapse into the single-target "~ fights" fallback shape.
+        let mut filters: Vec<&TargetFilter> = Vec::new();
+        if fight_subject_needs_target_slot(subject) {
+            filters.push(subject);
+        }
+        filters.push(target);
+        let mut kept = Vec::new();
+        let mut target_iter = validated.targets.iter();
+        for filter in filters {
+            if matches!(filter, TargetFilter::SelfRef | TargetFilter::ParentTarget) {
+                continue;
+            }
+            let Some(target_ref) = target_iter.next() else {
+                continue;
+            };
+            if let Some(legal) = targeting::validate_targets_for_ability(
+                state,
+                std::slice::from_ref(target_ref),
+                filter,
+                &validated,
+            )
+            .into_iter()
+            .next()
+            {
+                kept.push(legal);
+            }
+        }
+        kept
     } else if let Some(src_leaf) = prevent_damage_source_slot_filter(&validated.effect).cloned() {
         // CR 608.2b + CR 609.7a: A source-scoped `PreventDamage` carries its
         // chosen source spell in `targets[0]`. `extract_target_filter_from_effect`
@@ -1504,7 +1535,7 @@ fn damaged_player_targets_for_companion_slot(state: &GameState) -> Option<Vec<Ta
 /// CR 701.14a: True when a fight's `subject` filter must surface its own target
 /// slot ("target creature you control fights another target creature"). False
 /// for "~ fights", ParentTarget anaphors, and enchanted/equipped hosts.
-fn fight_subject_needs_target_slot(subject: &TargetFilter) -> bool {
+pub(crate) fn fight_subject_needs_target_slot(subject: &TargetFilter) -> bool {
     use crate::types::ability::FilterProp;
     if subject.is_context_ref() {
         return false;

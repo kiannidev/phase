@@ -58,3 +58,90 @@ fn ulvenwald_tracker_dual_target_fight_does_not_include_tracker() {
         "Ulvenwald Tracker is not a fighter in this fight"
     );
 }
+
+#[test]
+fn ulvenwald_tracker_dual_target_fight_no_fallback_when_one_fighter_leaves() {
+    use engine::game::zones::move_to_zone;
+    use engine::types::actions::GameAction;
+    use engine::types::game_state::WaitingFor;
+    use engine::types::zones::Zone;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let tracker = scenario
+        .add_creature_from_oracle(P0, "Ulvenwald Tracker", 1, 1, ULVENWALD_TRACKER_ORACLE)
+        .id();
+    let bear = scenario.add_creature(P0, "Bear", 3, 3).id();
+    let wolf = scenario.add_creature(P1, "Wolf", 2, 2).id();
+    scenario.with_mana_pool(
+        P0,
+        floating_mana(1, ManaType::Colorless)
+            .into_iter()
+            .chain(floating_mana(1, ManaType::Green))
+            .collect(),
+    );
+
+    let mut runner = scenario.build();
+    let mut remaining_objects = vec![bear, wolf];
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: tracker,
+            ability_index: 0,
+        })
+        .expect("activate Ulvenwald Tracker");
+
+    let mut events = Vec::new();
+    for _ in 0..24 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::TargetSelection {
+                target_slots,
+                selection,
+                ..
+            } => {
+                let slot = &target_slots[selection.current_slot];
+                let choice = remaining_objects
+                    .iter()
+                    .position(|&o| {
+                        slot.legal_targets
+                            .contains(&engine::types::ability::TargetRef::Object(o))
+                    })
+                    .map(|pos| {
+                        engine::types::ability::TargetRef::Object(remaining_objects.remove(pos))
+                    })
+                    .expect("fighter target for slot");
+                runner
+                    .act(GameAction::ChooseTarget {
+                        target: Some(choice),
+                    })
+                    .expect("choose fighter");
+            }
+            WaitingFor::ManaPayment { .. } => {
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("pay activation cost");
+            }
+            WaitingFor::Priority { .. } if !runner.state().stack.is_empty() => {
+                move_to_zone(runner.state_mut(), wolf, Zone::Graveyard, &mut events);
+                runner.act(GameAction::PassPriority).expect("resolve stack");
+                break;
+            }
+            WaitingFor::Priority { .. } => break,
+            other => panic!("unexpected prompt while activating fight: {other:?}"),
+        }
+    }
+
+    runner.advance_until_stack_empty();
+
+    assert_eq!(
+        runner.state().objects[&bear].damage_marked,
+        0,
+        "Bear must not fight when the other chosen fighter left the battlefield"
+    );
+    assert_eq!(
+        runner.state().objects[&tracker].damage_marked,
+        0,
+        "Tracker must not become the fallback fighter"
+    );
+}

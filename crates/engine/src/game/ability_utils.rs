@@ -8479,6 +8479,8 @@ mod tests {
                 aggregate: AggregateFunction::Sum,
                 group_by: None,
                 damage_kind: DamageKindFilter::Any,
+
+                excess_only: false,
             },
         };
         assert!(quantity_expr_references_target_creature(&damage));
@@ -8578,6 +8580,8 @@ mod tests {
             aggregate: AggregateFunction::Sum,
             group_by: None,
             damage_kind: DamageKindFilter::Any,
+
+            excess_only: false,
         };
         let spec = quantity_ref_target_slot_spec(&targeted_damage)
             .expect("targeted DamageDealtThisTurn must surface a slot");
@@ -8600,6 +8604,8 @@ mod tests {
             aggregate: AggregateFunction::Sum,
             group_by: None,
             damage_kind: DamageKindFilter::Any,
+
+            excess_only: false,
         };
         assert_eq!(
             quantity_ref_target_slot_spec(&opponents_damage),

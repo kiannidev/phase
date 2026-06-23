@@ -177,6 +177,7 @@ pub fn resolve(
         })
         .collect();
 
+    // CR 115.1d: Only a declared targeted discard (using the word "target") may consume targets chosen at cast time.
     let declared_target_discard =
         crate::game::triggers::extract_target_filter_from_effect(&ability.effect).is_some();
 

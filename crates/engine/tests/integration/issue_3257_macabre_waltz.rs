@@ -30,7 +30,9 @@ fn macabre_waltz_returns_creature_from_graveyard_to_hand() {
     let spell = scenario
         .add_spell_to_hand_from_oracle(P0, "Macabre Waltz", false, MACABRE_WALTZ_ORACLE)
         .id();
-    let gy_creature = scenario.add_creature_to_graveyard(P0, "Graveyard Bear", 2, 2).id();
+    let gy_creature = scenario
+        .add_creature_to_graveyard(P0, "Graveyard Bear", 2, 2)
+        .id();
     let hand_discard = scenario.add_creature_to_hand(P0, "Hand Rat", 1, 1).id();
     scenario.with_mana_pool(
         P0,
@@ -49,10 +51,7 @@ fn macabre_waltz_returns_creature_from_graveyard_to_hand() {
         .resolve();
 
     assert!(
-        matches!(
-            runner.state().waiting_for,
-            WaitingFor::DiscardChoice { .. }
-        ),
+        matches!(runner.state().waiting_for, WaitingFor::DiscardChoice { .. }),
         "discard rider must pause for a hand choice, got {:?}",
         runner.state().waiting_for
     );
@@ -100,7 +99,10 @@ fn macabre_waltz_parses_bounce_then_discard_chain() {
         .multi_target
         .as_ref()
         .expect("up-to-two must carry multi_target");
-    assert!(spec.min_is_fixed_zero(), "up-to-two must allow zero targets");
+    assert!(
+        spec.min_is_fixed_zero(),
+        "up-to-two must allow zero targets"
+    );
     let discard = def
         .sub_ability
         .as_ref()

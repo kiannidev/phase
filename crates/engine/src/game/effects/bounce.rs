@@ -1513,7 +1513,7 @@ mod tests {
     #[test]
     fn targeted_up_to_two_graveyard_bounce_moves_chosen_creature() {
         use crate::parser::oracle_effect::parse_effect_chain;
-        use crate::types::ability::{AbilityKind, FilterProp, MultiTargetSpec, TypeFilter};
+        use crate::types::ability::{AbilityKind, FilterProp, TypeFilter};
         use crate::types::card_type::CoreType;
 
         let mut state = GameState::new_two_player(42);

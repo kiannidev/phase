@@ -424,6 +424,8 @@ fn batched_zone_change_batch(events: &[GameEvent]) -> bool {
             .all(|event| matches!(event, GameEvent::ZoneChanged { .. }))
 }
 
+// CR 603.2c: An ability triggers only once each time its trigger event occurs.
+// This helper checks if the replay guard applies to a batched zone-change trigger.
 fn batched_zone_change_replay_guard_applies(
     trig_def: &TriggerDefinition,
     trigger_events: &[GameEvent],
@@ -442,7 +444,7 @@ fn batched_zone_change_already_collected(
     trig_idx: usize,
     trigger_events: &[GameEvent],
 ) -> bool {
-    let keys: Vec<(ObjectId, Option<Zone>, Zone)> = trigger_events
+    let mut zone_changes = trigger_events
         .iter()
         .filter_map(|event| {
             if let GameEvent::ZoneChanged {
@@ -457,15 +459,15 @@ fn batched_zone_change_already_collected(
                 None
             }
         })
-        .collect();
-    !keys.is_empty()
-        && keys.iter().all(|(moved_object, from, to)| {
+        .peekable();
+    zone_changes.peek().is_some()
+        && zone_changes.all(|(moved_object, from, to)| {
             state.batched_zone_change_trigger_fired.contains(&(
                 source_id,
                 trig_idx,
-                *moved_object,
-                *from,
-                *to,
+                moved_object,
+                from,
+                to,
             ))
         })
 }

@@ -7,8 +7,6 @@ use engine::database::card_db::CardDatabase;
 use engine::game::scenario::{GameScenario, P0};
 use engine::game::scenario_db::GameScenarioDbExt;
 use engine::game::zones::move_to_zone;
-use engine::types::actions::GameAction;
-use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
@@ -49,23 +47,6 @@ fn insidious_roots_stack_triggers(
         .iter()
         .filter(|e| e.source_id == roots)
         .count()
-}
-
-fn drain_stack(runner: &mut engine::game::scenario::GameRunner) {
-    for _ in 0..200 {
-        if matches!(runner.state().waiting_for, WaitingFor::OrderTriggers { .. }) {
-            engine::game::triggers::drain_order_triggers_with_identity(runner.state_mut());
-            continue;
-        }
-        match &runner.state().waiting_for {
-            WaitingFor::Priority { .. } if runner.state().stack.is_empty() => break,
-            _ => {
-                if runner.act(GameAction::PassPriority).is_err() {
-                    break;
-                }
-            }
-        }
-    }
 }
 
 #[test]

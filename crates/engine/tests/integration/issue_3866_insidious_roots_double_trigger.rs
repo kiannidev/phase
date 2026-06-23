@@ -191,6 +191,68 @@ fn issue_3866_double_process_triggers_on_same_events_is_regression_guard() {
 }
 
 #[test]
+fn issue_3866_insidious_roots_fires_again_when_same_card_leaves_graveyard_twice_same_turn() {
+    let db = card_db();
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let roots = scenario.add_real_card(P0, "Insidious Roots", Zone::Battlefield, db);
+    let gy_creature = scenario.add_real_card(P0, "Grizzly Bears", Zone::Graveyard, db);
+
+    let mut runner = scenario.build();
+    let plants_before = plant_token_count(&runner);
+
+    let mut first_leave = Vec::new();
+    move_to_zone(
+        runner.state_mut(),
+        gy_creature,
+        Zone::Battlefield,
+        &mut first_leave,
+    );
+    engine::game::triggers::process_triggers(runner.state_mut(), &first_leave);
+    engine::game::triggers::drain_order_triggers_with_identity(runner.state_mut());
+    assert_eq!(
+        insidious_roots_stack_triggers(&runner, roots),
+        1,
+        "first graveyard leave must trigger once"
+    );
+    runner.advance_until_stack_empty();
+
+    let mut return_to_graveyard = Vec::new();
+    move_to_zone(
+        runner.state_mut(),
+        gy_creature,
+        Zone::Graveyard,
+        &mut return_to_graveyard,
+    );
+    engine::game::triggers::process_triggers(runner.state_mut(), &return_to_graveyard);
+
+    let mut second_leave = Vec::new();
+    move_to_zone(
+        runner.state_mut(),
+        gy_creature,
+        Zone::Battlefield,
+        &mut second_leave,
+    );
+    engine::game::triggers::process_triggers(runner.state_mut(), &second_leave);
+    engine::game::triggers::drain_order_triggers_with_identity(runner.state_mut());
+    assert_eq!(
+        insidious_roots_stack_triggers(&runner, roots),
+        1,
+        "second distinct graveyard leave by the same card must trigger again"
+    );
+
+    runner.advance_until_stack_empty();
+
+    assert_eq!(
+        plant_token_count(&runner) - plants_before,
+        2,
+        "each distinct graveyard leave must create one Plant token"
+    );
+}
+
+#[test]
 fn issue_3866_insidious_roots_fires_once_via_reanimate_spell() {
     let db = card_db();
 

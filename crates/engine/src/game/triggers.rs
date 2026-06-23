@@ -447,27 +447,19 @@ fn batched_zone_change_already_collected(
     let mut zone_changes = trigger_events
         .iter()
         .filter_map(|event| {
-            if let GameEvent::ZoneChanged {
-                object_id,
-                from,
-                to,
-                ..
-            } = event
-            {
-                Some((*object_id, *from, *to))
+            if let GameEvent::ZoneChanged { record, .. } = event {
+                Some(record.turn_zone_change_index)
             } else {
                 None
             }
         })
         .peekable();
     zone_changes.peek().is_some()
-        && zone_changes.all(|(moved_object, from, to)| {
+        && zone_changes.all(|turn_zone_change_index| {
             state.batched_zone_change_trigger_fired.contains(&(
                 source_id,
                 trig_idx,
-                moved_object,
-                from,
-                to,
+                turn_zone_change_index,
             ))
         })
 }
@@ -479,16 +471,12 @@ fn record_batched_zone_change_collected(
     trigger_events: &[GameEvent],
 ) {
     for event in trigger_events {
-        if let GameEvent::ZoneChanged {
-            object_id,
-            from,
-            to,
-            ..
-        } = event
-        {
-            state
-                .batched_zone_change_trigger_fired
-                .insert((source_id, trig_idx, *object_id, *from, *to));
+        if let GameEvent::ZoneChanged { record, .. } = event {
+            state.batched_zone_change_trigger_fired.insert((
+                source_id,
+                trig_idx,
+                record.turn_zone_change_index,
+            ));
         }
     }
 }

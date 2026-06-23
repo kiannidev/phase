@@ -446,6 +446,11 @@ pub struct ZoneChangeRecord {
     /// accumulated event vector.
     #[serde(default)]
     pub co_departed: Vec<ObjectId>,
+    /// Per-turn monotonic index assigned when the zone change is recorded (CR
+    /// 400.7). Distinguishes repeated identical `(object, from, to)` transitions
+    /// within the same turn for batched trigger replay guards (issue #3866).
+    #[serde(default)]
+    pub turn_zone_change_index: usize,
 }
 
 /// CR 506.4 / CR 508.1k / CR 509.1g / CR 509.1h: Combat role snapshot for an
@@ -6223,11 +6228,12 @@ pub struct GameState {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub zone_changes_this_turn: Vec<ZoneChangeRecord>,
     /// CR 603.2c: Batched zone-change triggers already collected for
-    /// `(source_id, trig_idx, moved_object, from, to)`. Prevents a second
+    /// `(source_id, trig_idx, turn_zone_change_index)`. Prevents a second
     /// `process_triggers` pass over the same `ZoneChanged` events from
-    /// stacking duplicate batched triggers (issue #3866).
+    /// stacking duplicate batched triggers (issue #3866) without suppressing a
+    /// later distinct leave by the same object in the same turn.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
-    pub batched_zone_change_trigger_fired: HashSet<(ObjectId, usize, ObjectId, Option<Zone>, Zone)>,
+    pub batched_zone_change_trigger_fired: HashSet<(ObjectId, usize, usize)>,
     /// CR 403.3: Battlefield entry snapshots this turn, enabling data-driven ETB queries.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub battlefield_entries_this_turn: Vec<BattlefieldEntryRecord>,

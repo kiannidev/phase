@@ -322,19 +322,18 @@ pub fn kicker_instead_spell_has_legal_targets(
     ) {
         return false;
     }
-    if triggers::extract_target_filter_from_effect(&sub.effect).is_none() {
-        return false;
-    }
     let mut resolved = build_resolved_from_def(ability_def, object_id, player);
     resolved.context.additional_cost_paid = true;
     match build_target_slots(state, &resolved) {
         Ok(slots) if slots.is_empty() => true,
-        Ok(slots) => has_legal_target_assignment_for_ability(
-            state,
-            &resolved,
-            &slots,
-            &ability_def.target_constraints,
-        ),
+        Ok(slots) => {
+            let constraints = resolved
+                .sub_ability
+                .as_ref()
+                .map(|sub| &sub.target_constraints)
+                .unwrap_or(&resolved.target_constraints);
+            has_legal_target_assignment_for_ability(state, &resolved, &slots, constraints)
+        }
         Err(_) => false,
     }
 }

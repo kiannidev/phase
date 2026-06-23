@@ -180,8 +180,25 @@ pub fn resolve(
     // CR 115.1d: Only a declared targeted discard (using the word "target") may consume targets chosen at cast time.
     let declared_target_discard =
         crate::game::triggers::extract_target_filter_from_effect(&ability.effect).is_some();
+    // CR 608.2c: "That player discards that card" (Dread Fugue) binds the reveal
+    // choice via `ParentTarget` — not a cast-time target slot, but the forwarded
+    // object id must still be discarded. Controller-scoped "discard a card"
+    // (Macabre Waltz) must not consume propagated bounce targets (issue #3257).
+    let object_bound_discard = ability.effect.target_filter().is_some_and(|t| {
+        matches!(
+            t,
+            TargetFilter::ParentTarget
+                | TargetFilter::ParentTargetSlot { .. }
+                | TargetFilter::LastRevealed
+                | TargetFilter::SelfRef
+                | TargetFilter::TriggeringSource
+                | TargetFilter::LastCreated
+                | TargetFilter::AttachedTo
+                | TargetFilter::CostPaidObject
+        )
+    });
 
-    if !specific_targets.is_empty() && declared_target_discard {
+    if !specific_targets.is_empty() && (declared_target_discard || object_bound_discard) {
         // Discard specific targeted cards
         for obj_id in specific_targets {
             let obj = state

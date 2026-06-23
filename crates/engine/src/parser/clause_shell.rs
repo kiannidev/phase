@@ -303,7 +303,7 @@ fn try_peel_opponent_may_prefix(
         value((), tag("each player may ")).parse(i)
     }) {
         let rest_lower = rest.trim_start().to_lowercase();
-        if alt((tag("play "), tag("cast ")))
+        if alt((tag::<_, _, OracleError<'_>>("play "), tag("cast ")))
             .parse(rest_lower.as_str())
             .is_err()
         {

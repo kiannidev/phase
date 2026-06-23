@@ -196,3 +196,137 @@ fn show_and_tell_acceptor_puts_one_card_from_hand() {
         "accepted card should be on the battlefield"
     );
 }
+
+#[test]
+fn show_and_tell_change_zone_filter_uses_scoped_player() {
+    use engine::parser::oracle::parse_oracle_text;
+    use engine::types::ability::{Effect, FilterProp, TargetFilter};
+    use engine::types::zones::Zone;
+    use engine::types::ControllerRef;
+
+    let parsed = parse_oracle_text(
+        SHOW_AND_TELL_ORACLE,
+        "Show and Tell",
+        &[],
+        &["Sorcery".to_string()],
+        &[],
+    );
+    let ability = parsed.abilities.first().expect("spell ability");
+    let Effect::ChangeZone { origin, target, .. } = &*ability.effect else {
+        panic!("expected ChangeZone, got {:?}", ability.effect);
+    };
+    assert_eq!(origin.as_ref(), Some(&Zone::Hand));
+    let TargetFilter::Or { filters } = target else {
+        panic!("expected or-filter, got {target:?}");
+    };
+    assert!(
+        filters.iter().any(|filter| {
+            matches!(
+                filter,
+                TargetFilter::Typed(tf) if tf.properties.iter().any(|prop| {
+                    matches!(
+                        prop,
+                        FilterProp::Owned {
+                            controller: ControllerRef::ScopedPlayer
+                        }
+                    )
+                })
+            )
+        }),
+        "their hand must bind to the iterating scoped player"
+    );
+}
+
+#[test]
+fn show_and_tell_p0_declines_p1_accepts_from_own_hand() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let island = scenario.add_land_to_hand(P0, "Island").id();
+    let plains = scenario.add_land_to_hand(P1, "Plains").id();
+    scenario.add_creature_to_hand(P1, "Elvish Mystic", 1, 1);
+
+    let show_and_tell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Show and Tell", false, SHOW_AND_TELL_ORACLE)
+        .with_mana_cost(ManaCost::generic(0))
+        .id();
+
+    let mut runner = scenario.build();
+    let bf_before = battlefield_count(runner.state());
+    let mut p1_optional_prompted = false;
+    let mut p1_zone_choice_prompted = false;
+
+    runner.cast(show_and_tell).commit();
+
+    while matches!(
+        runner.state().waiting_for,
+        WaitingFor::OptionalEffectChoice { .. }
+            | WaitingFor::EffectZoneChoice { .. }
+            | WaitingFor::Priority { .. }
+    ) {
+        match &runner.state().waiting_for {
+            WaitingFor::Priority { .. } => {
+                if runner.state().stack.is_empty() {
+                    break;
+                }
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+            WaitingFor::OptionalEffectChoice { player, .. } => {
+                let accept = *player == P1;
+                if *player == P1 {
+                    p1_optional_prompted = true;
+                }
+                runner
+                    .act(GameAction::DecideOptionalEffect { accept })
+                    .expect("optional decision");
+            }
+            WaitingFor::EffectZoneChoice { cards, .. } => {
+                assert!(
+                    cards.contains(&plains),
+                    "P1 zone choice must include P1's Plains, got {cards:?}"
+                );
+                p1_zone_choice_prompted = true;
+                runner
+                    .act(GameAction::SelectCards {
+                        cards: vec![plains],
+                    })
+                    .expect("zone choice");
+            }
+            other => panic!("unexpected prompt: {other:?}"),
+        }
+    }
+
+    assert!(
+        p1_optional_prompted,
+        "P1 must receive its own OptionalEffectChoice after P0 declines"
+    );
+    assert!(
+        p1_zone_choice_prompted,
+        "P1 must receive an EffectZoneChoice scoped to its hand"
+    );
+    assert_eq!(
+        hand_size(runner.state(), P0),
+        1,
+        "P0's Island must stay in hand when P0 declines"
+    );
+    assert_eq!(
+        runner.state().objects[&island].zone,
+        Zone::Hand,
+        "P0's Island must not move to the battlefield"
+    );
+    assert_eq!(
+        hand_size(runner.state(), P1),
+        1,
+        "P1 should put Plains from hand when accepting and keep the other card"
+    );
+    assert_eq!(
+        battlefield_count(runner.state()),
+        bf_before + 1,
+        "exactly one permanent should enter from P1's accept"
+    );
+    assert_eq!(
+        runner.state().objects[&plains].zone,
+        Zone::Battlefield,
+        "P1's Plains should be on the battlefield"
+    );
+}

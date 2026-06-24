@@ -4659,10 +4659,10 @@ mod tests {
                 "color_override": ["Green"], "scryfall_oracle_id": null,
                 "legalities": { "commander": "legal" }
             },
-            "plains": {
-                "name": "Plains",
+            "forest": {
+                "name": "Forest",
                 "mana_cost": { "type": "NoCost" },
-                "card_type": { "supertypes": ["Basic"], "core_types": ["Land"], "subtypes": ["Plains"] },
+                "card_type": { "supertypes": ["Basic"], "core_types": ["Land"], "subtypes": ["Forest"] },
                 "power": null, "toughness": null, "loyalty": null, "defense": null,
                 "oracle_text": null, "non_ability_text": null, "flavor_name": null,
                 "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
@@ -4673,7 +4673,7 @@ mod tests {
         .to_string();
         let db = CardDatabase::from_json_str(&db_json).unwrap();
         let mut main = expand("Slime Against Humanity", 10);
-        main.extend(expand("Plains", 89));
+        main.extend(expand("Forest", 89));
         let request = DeckCompatibilityRequest {
             main_deck: main,
             sideboard: Vec::new(),

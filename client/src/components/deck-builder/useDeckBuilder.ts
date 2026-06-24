@@ -254,8 +254,23 @@ export function useDeckBuilder({
     [deckCopyLimits, maxCopies],
   );
 
+  const maxCopiesRef = useRef(maxCopies);
+  useEffect(() => {
+    maxCopiesRef.current = maxCopies;
+  }, [maxCopies]);
+
+  const deckCopyLimitsRef = useRef(deckCopyLimits);
+  useEffect(() => {
+    deckCopyLimitsRef.current = deckCopyLimits;
+  }, [deckCopyLimits]);
+
+  const noOverrideCardsRef = useRef<Set<string>>(new Set());
+
   const cacheDeckCopyLimit = useCallback((name: string, limit: Awaited<ReturnType<typeof deckCopyLimit>>) => {
-    if (!limit) return;
+    if (!limit) {
+      noOverrideCardsRef.current.add(name);
+      return;
+    }
     setDeckCopyLimits((prev) => {
       const next = new Map(prev);
       next.set(name, limit.type === "Unlimited" ? Infinity : limit.data);
@@ -268,16 +283,18 @@ export function useDeckBuilder({
   // while the async prefetch batch is still in flight.
   const resolveEffectiveCap = useCallback(
     async (name: string): Promise<number> => {
-      const cached = deckCopyLimits.get(name);
+      const cached = deckCopyLimitsRef.current.get(name);
       if (cached !== undefined) return cached;
+      if (noOverrideCardsRef.current.has(name)) return maxCopiesRef.current;
       const limit = await deckCopyLimit(name);
       if (limit) {
         cacheDeckCopyLimit(name, limit);
         return limit.type === "Unlimited" ? Infinity : limit.data;
       }
-      return maxCopies;
+      noOverrideCardsRef.current.add(name);
+      return maxCopiesRef.current;
     },
-    [cacheDeckCopyLimit, deckCopyLimits, maxCopies],
+    [cacheDeckCopyLimit],
   );
 
   const { estimate, unsupported: bracketUnsupported } = useBracketEstimate({

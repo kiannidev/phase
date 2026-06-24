@@ -65,24 +65,11 @@ pub fn resolve(
         // CR 701.20e: Look-then-cast tails put uncast looked-at cards on the
         // bottom via `ExiledBySource`, but those cards remain in the library.
         if collected_targets.is_empty() && !state.last_revealed_ids.is_empty() {
-            let looked_filter =
-                crate::game::filter::remap_exiled_by_source_for_looked_cards(&target_filter);
-            collected_targets = state
-                .last_revealed_ids
-                .iter()
-                .filter(|id| {
-                    state.objects.get(id).is_some_and(|obj| {
-                        obj.zone == Zone::Library
-                            && crate::game::filter::matches_target_filter(
-                                state,
-                                **id,
-                                &looked_filter,
-                                &ctx,
-                            )
-                    })
-                })
-                .copied()
-                .collect();
+            collected_targets = crate::game::filter::last_revealed_library_ids_matching(
+                state,
+                &target_filter,
+                &ctx,
+            );
         }
     }
     if collected_targets.is_empty()

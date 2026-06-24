@@ -128,6 +128,17 @@ pub fn resolve(
         })
         .collect();
 
+    if !target_ids.is_empty() {
+        let ctx = crate::game::filter::FilterContext::from_ability(ability);
+        let looked_filter =
+            crate::game::filter::remap_exiled_by_source_for_looked_cards(target_filter);
+        target_ids.retain(|id| {
+            state.objects.get(id).is_some_and(|_| {
+                crate::game::filter::matches_target_filter(state, *id, &looked_filter, &ctx)
+            })
+        });
+    }
+
     if target_ids.is_empty() && target_filter.references_exiled_by_source() {
         let ctx = crate::game::filter::FilterContext::from_ability(ability);
         target_ids = crate::game::players::linked_exile_cards_for_source(state, ability.source_id)
@@ -146,24 +157,8 @@ pub fn resolve(
         // 0 }` publishes them via `last_revealed_ids`, not exile links, but the
         // parser still binds the cast step to `ExiledBySource`.
         if target_ids.is_empty() && !state.last_revealed_ids.is_empty() {
-            let looked_filter =
-                crate::game::filter::remap_exiled_by_source_for_looked_cards(target_filter);
-            target_ids = state
-                .last_revealed_ids
-                .iter()
-                .filter(|id| {
-                    state.objects.get(id).is_some_and(|obj| {
-                        obj.zone == Zone::Library
-                            && crate::game::filter::matches_target_filter(
-                                state,
-                                **id,
-                                &looked_filter,
-                                &ctx,
-                            )
-                    })
-                })
-                .copied()
-                .collect();
+            target_ids =
+                crate::game::filter::last_revealed_library_ids_matching(state, target_filter, &ctx);
         }
     }
 

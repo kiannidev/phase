@@ -3,6 +3,8 @@
 //!
 //! https://github.com/phase-rs/phase/issues/1135
 
+use engine::game::game_object::PhaseOutCause;
+use engine::game::phasing::phase_out_object;
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaType, ManaUnit};
@@ -56,9 +58,6 @@ fn ents_fury_fights_boosted_creature_against_opponent_creature() {
 
 #[test]
 fn ents_fury_fight_fizzles_when_opponent_phases_out_before_resolution() {
-    use engine::game::game_object::PhaseOutCause;
-    use engine::game::phasing::phase_out_object;
-
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
 

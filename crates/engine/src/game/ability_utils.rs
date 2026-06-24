@@ -1422,16 +1422,13 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
             // this effect's `target` filter; pairing targets[0] against that filter
             // wrongly drops the ally (Ent's Fury, issue #1135). Nested chain links keep
             // chosen targets on the resolving spell, not on the fight sub-clause itself.
-            let candidate_targets = if validated.targets.is_empty() {
-                state
-                    .resolving_stack_entry
-                    .as_ref()
-                    .and_then(|entry| entry.ability())
-                    .map(flatten_targets_in_chain)
-                    .unwrap_or_default()
-            } else {
-                validated.targets.clone()
-            };
+            let candidate_targets = state
+                .resolving_stack_entry
+                .as_ref()
+                .and_then(|entry| entry.ability())
+                .map(flatten_targets_in_chain)
+                .filter(|targets| !targets.is_empty())
+                .unwrap_or_else(|| validated.targets.clone());
 
             fn fight_creature_on_battlefield(
                 state: &GameState,
@@ -1464,13 +1461,15 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
                 .collect();
 
             let mut kept = Vec::new();
-            if let Some(ally) = candidate_targets.iter().find(|t| {
-                let TargetRef::Object(id) = t else {
-                    return false;
-                };
-                !explicit.contains(t) && fight_creature_on_battlefield(state, *id)
-            }) {
-                kept.push(ally.clone());
+            if explicit.len() == 1 {
+                if let Some(ally) = candidate_targets.iter().find(|t| {
+                    let TargetRef::Object(id) = t else {
+                        return false;
+                    };
+                    !explicit.contains(t) && fight_creature_on_battlefield(state, *id)
+                }) {
+                    kept.push(ally.clone());
+                }
             }
             kept.extend(explicit);
             kept

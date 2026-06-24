@@ -1,4 +1,4 @@
-use crate::game::ability_utils::{append_to_sub_chain, flatten_targets_in_chain};
+use crate::game::ability_utils::append_to_sub_chain;
 use crate::game::effects::deal_damage::{apply_damage_to_target, DamageContext, DamageResult};
 use crate::game::effects::{append_to_pending_continuation, mark_pending_continuation_parent};
 use crate::types::ability::{
@@ -83,27 +83,6 @@ pub fn resolve(
             _ => None,
         })
         .collect();
-
-    // CR 701.14a: nested anaphoric fights inherit chosen targets on the resolving
-    // spell, not on the fight sub-link (Ent's Fury, issue #1135).
-    if object_targets.len() < 2 {
-        if let Some(root) = state
-            .resolving_stack_entry
-            .as_ref()
-            .and_then(|entry| entry.ability())
-        {
-            let root_targets: Vec<ObjectId> = flatten_targets_in_chain(root)
-                .iter()
-                .filter_map(|t| match t {
-                    TargetRef::Object(id) => Some(*id),
-                    _ => None,
-                })
-                .collect();
-            if root_targets.len() >= 2 {
-                object_targets = root_targets;
-            }
-        }
-    }
 
     let (source_id, target_id) = if object_targets.len() >= 2 {
         (object_targets[0], object_targets[1])

@@ -254,6 +254,32 @@ export function useDeckBuilder({
     [deckCopyLimits, maxCopies],
   );
 
+  const cacheDeckCopyLimit = useCallback((name: string, limit: Awaited<ReturnType<typeof deckCopyLimit>>) => {
+    if (!limit) return;
+    setDeckCopyLimits((prev) => {
+      const next = new Map(prev);
+      next.set(name, limit.type === "Unlimited" ? Infinity : limit.data);
+      return next;
+    });
+  }, []);
+
+  // Issue #1138: resolve the engine copy-limit override before enforcing the cap
+  // so cards like Slime Against Humanity are not stuck at the format default (4)
+  // while the async prefetch batch is still in flight.
+  const resolveEffectiveCap = useCallback(
+    async (name: string): Promise<number> => {
+      const cached = deckCopyLimits.get(name);
+      if (cached !== undefined) return cached;
+      const limit = await deckCopyLimit(name);
+      if (limit) {
+        cacheDeckCopyLimit(name, limit);
+        return limit.type === "Unlimited" ? Infinity : limit.data;
+      }
+      return maxCopies;
+    },
+    [cacheDeckCopyLimit, deckCopyLimits, maxCopies],
+  );
+
   const { estimate, unsupported: bracketUnsupported } = useBracketEstimate({
     deck,
     commanders,
@@ -309,26 +335,28 @@ export function useDeckBuilder({
     cacheCards([card]);
     setDirty(true);
 
-    setDeck((prev) => {
-      const existing = prev.main.find((e) => e.name === card.name);
-      if (existing && existing.count >= effectiveCap(card.name) && !BASIC_LAND_NAMES.has(card.name)) {
-        return prev;
-      }
+    void resolveEffectiveCap(card.name).then((cap) => {
+      setDeck((prev) => {
+        const existing = prev.main.find((e) => e.name === card.name);
+        if (existing && existing.count >= cap && !BASIC_LAND_NAMES.has(card.name)) {
+          return prev;
+        }
 
-      if (existing) {
+        if (existing) {
+          return {
+            ...prev,
+            main: prev.main.map((e) =>
+              e.name === card.name ? { ...e, count: e.count + 1 } : e,
+            ),
+          };
+        }
         return {
           ...prev,
-          main: prev.main.map((e) =>
-            e.name === card.name ? { ...e, count: e.count + 1 } : e,
-          ),
+          main: [...prev.main, { count: 1, name: card.name }],
         };
-      }
-      return {
-        ...prev,
-        main: [...prev.main, { count: 1, name: card.name }],
-      };
+      });
     });
-  }, [cacheCards, effectiveCap]);
+  }, [cacheCards, resolveEffectiveCap]);
 
   const handleAddCardByName = useCallback((name: string) => {
     const card = cardDataCache.get(name);
@@ -365,43 +393,45 @@ export function useDeckBuilder({
     (name: string, from: "main" | "sideboard") => {
       const to: "main" | "sideboard" = from === "main" ? "sideboard" : "main";
       setDirty(true);
-      setDeck((prev) => {
-        const source = prev[from];
-        const target = prev[to];
-        const sourceEntry = source.find((e) => e.name === name);
-        if (!sourceEntry) return prev;
+      void resolveEffectiveCap(name).then((cap) => {
+        setDeck((prev) => {
+          const source = prev[from];
+          const target = prev[to];
+          const sourceEntry = source.find((e) => e.name === name);
+          if (!sourceEntry) return prev;
 
-        const targetEntry = target.find((e) => e.name === name);
-        if (
-          to === "main" &&
-          targetEntry &&
-          targetEntry.count >= effectiveCap(name) &&
-          !BASIC_LAND_NAMES.has(name)
-        ) {
-          return prev;
-        }
+          const targetEntry = target.find((e) => e.name === name);
+          if (
+            to === "main" &&
+            targetEntry &&
+            targetEntry.count >= cap &&
+            !BASIC_LAND_NAMES.has(name)
+          ) {
+            return prev;
+          }
 
-        const nextSource =
-          sourceEntry.count <= 1
-            ? source.filter((e) => e.name !== name)
-            : source.map((e) =>
-                e.name === name ? { ...e, count: e.count - 1 } : e,
-              );
+          const nextSource =
+            sourceEntry.count <= 1
+              ? source.filter((e) => e.name !== name)
+              : source.map((e) =>
+                  e.name === name ? { ...e, count: e.count - 1 } : e,
+                );
 
-        const nextTarget = targetEntry
-          ? target.map((e) =>
-              e.name === name ? { ...e, count: e.count + 1 } : e,
-            )
-          : [...target, { count: 1, name }];
+          const nextTarget = targetEntry
+            ? target.map((e) =>
+                e.name === name ? { ...e, count: e.count + 1 } : e,
+              )
+            : [...target, { count: 1, name }];
 
-        return {
-          ...prev,
-          [from]: nextSource,
-          [to]: nextTarget,
-        };
+          return {
+            ...prev,
+            [from]: nextSource,
+            [to]: nextTarget,
+          };
+        });
       });
     },
-    [effectiveCap],
+    [resolveEffectiveCap],
   );
 
   const applyDeckToEditor = useCallback((next: ParsedDeck) => {

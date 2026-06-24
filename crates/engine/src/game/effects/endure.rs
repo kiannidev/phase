@@ -432,7 +432,13 @@ mod tests {
             other => panic!("expected ChooseOneOfBranch, got {other:?}"),
         };
 
-        apply_as_current(&mut state, GameAction::ChooseBranch { index: counter_index }).unwrap();
+        apply_as_current(
+            &mut state,
+            GameAction::ChooseBranch {
+                index: counter_index,
+            },
+        )
+        .unwrap();
 
         assert_eq!(
             state.objects[&bear]

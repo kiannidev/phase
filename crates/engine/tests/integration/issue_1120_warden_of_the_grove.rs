@@ -20,10 +20,7 @@ fn floating_mana(n: usize, ty: ManaType) -> Vec<ManaUnit> {
         .collect()
 }
 
-fn plus_one_counters(
-    runner: &engine::game::scenario::GameRunner,
-    id: ObjectId,
-) -> u32 {
+fn plus_one_counters(runner: &engine::game::scenario::GameRunner, id: ObjectId) -> u32 {
     runner
         .state()
         .objects
@@ -41,7 +38,9 @@ fn warden_endure_counter_branch_puts_warden_counters_on_entering_creature() {
     let warden = scenario
         .add_creature_from_oracle(P0, "Warden of the Grove", 2, 2, WARDEN_ORACLE)
         .id();
-    let bear = scenario.add_creature_to_hand(P0, "Grizzly Bears", 2, 2).id();
+    let bear = scenario
+        .add_creature_to_hand(P0, "Grizzly Bears", 2, 2)
+        .id();
     scenario.with_mana_pool(
         P0,
         floating_mana(1, ManaType::Colorless)

@@ -128,17 +128,14 @@ pub fn resolve(
         })
         .collect();
 
-    if !target_ids.is_empty() {
-        let ctx = crate::game::filter::FilterContext::from_ability(ability);
-        let looked_filter =
-            crate::game::filter::remap_exiled_by_source_for_looked_cards(target_filter);
-        target_ids.retain(|id| {
-            state.objects.get(id).is_some_and(|_| {
-                crate::game::filter::matches_target_filter(state, *id, &looked_filter, &ctx)
-            })
-        });
-    }
-
+    // CR 701.20e + CR 608.2c: Look-then-cast chains (Kiora) inject the legal
+    // looked-at library cards as targets at the chain seam
+    // (`inject_last_revealed_targets`), already filtered through this cast
+    // filter's `ExiledBySource`→`LastRevealed` remap. Explicitly-supplied
+    // targets from ordinary CastFromZone paths (graveyard/exile free-cast,
+    // Bring to Light, Urza) must NOT be re-filtered through that remap, which
+    // would drop every target not in `last_revealed_ids`. The remap therefore
+    // only applies on the empty-target fallback below.
     if target_ids.is_empty() && target_filter.references_exiled_by_source() {
         let ctx = crate::game::filter::FilterContext::from_ability(ability);
         target_ids = crate::game::players::linked_exile_cards_for_source(state, ability.source_id)

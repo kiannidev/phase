@@ -10162,7 +10162,8 @@ pub enum Effect {
     ///
     /// `subject` is the permanent that endures. Defaults to the ability source
     /// ("~ endures N"). Triggered "it endures X" on another creature entering
-    /// uses `CostPaidObject` (issue #1120 — Warden of the Grove).
+    /// uses `TargetFilter::TriggeringSource` (resolved from the trigger event
+    /// source at runtime; issue #1120 — Warden of the Grove).
     Endure {
         amount: QuantityExpr,
         #[serde(default = "default_target_filter_self_ref")]

@@ -11,7 +11,9 @@ use super::counter::{
     parse_counter_anaphor, try_parse_double_effect, try_parse_move_counters_from,
     try_parse_multiply_pt_effect, try_parse_put_counter, try_parse_remove_counter,
 };
-use super::lower::parse_for_each_multiplier_prefix;
+use super::lower::{
+    parse_for_each_multiplier_prefix, parse_where_x_quantity_expression, strip_trailing_where_x,
+};
 use super::mana::{try_parse_activate_only_condition, try_parse_add_mana_effect};
 use super::token::try_parse_token;
 use super::{
@@ -7758,11 +7760,6 @@ pub(super) fn parse_imperative_family_ast(
         }
         // Endure N keyword action
         "endure" | "endures" => {
-            use crate::parser::oracle_effect::lower::{
-                parse_where_x_quantity_expression, strip_trailing_where_x,
-            };
-            use crate::parser::oracle_effect::TextPair;
-
             let (text_pair, where_x) = strip_trailing_where_x(TextPair::new(text, lower));
             let rest = alt((tag::<_, _, OracleError<'_>>("endure "), tag("endures ")))
                 .parse(text_pair.lower)

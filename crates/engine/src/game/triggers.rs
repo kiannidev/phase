@@ -20143,6 +20143,7 @@ pub mod tests {
                 p0.mana_pool.add(ManaUnit {
                     color: ManaType::Colorless,
                     source_id: ObjectId(0),
+                    pip_id: crate::types::mana::ManaPipId(0),
                     supertype: None,
                     source_could_produce_two_or_more_colors: false,
                     restrictions: Vec::new(),
@@ -20152,6 +20153,7 @@ pub mod tests {
                 p0.mana_pool.add(ManaUnit {
                     color: ManaType::Black,
                     source_id: ObjectId(0),
+                    pip_id: crate::types::mana::ManaPipId(0),
                     supertype: None,
                     source_could_produce_two_or_more_colors: false,
                     restrictions: Vec::new(),
@@ -20300,6 +20302,7 @@ pub mod tests {
             p0.mana_pool.add(ManaUnit {
                 color: ManaType::Colorless,
                 source_id: ObjectId(0),
+                pip_id: crate::types::mana::ManaPipId(0),
                 supertype: None,
                 source_could_produce_two_or_more_colors: false,
                 restrictions: Vec::new(),
@@ -20480,6 +20483,7 @@ pub mod tests {
             p0.mana_pool.add(ManaUnit {
                 color: ManaType::Red,
                 source_id: ObjectId(0),
+                pip_id: crate::types::mana::ManaPipId(0),
                 supertype: None,
                 source_could_produce_two_or_more_colors: false,
                 restrictions: Vec::new(),
@@ -23025,6 +23029,7 @@ mod dedup_regression_tests {
             state.players[0].mana_pool.add(ManaUnit {
                 color,
                 source_id: ObjectId(0),
+                pip_id: crate::types::mana::ManaPipId(0),
                 supertype: None,
                 source_could_produce_two_or_more_colors: false,
                 restrictions: Vec::new(),

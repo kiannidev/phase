@@ -2258,6 +2258,7 @@ mod tests {
         state.players[0].mana_pool.add(ManaUnit {
             color: ManaType::Black,
             source_id: crate::types::identifiers::ObjectId(0),
+            pip_id: crate::types::mana::ManaPipId(0),
             supertype: None,
             source_could_produce_two_or_more_colors: false,
             restrictions: Vec::new(),

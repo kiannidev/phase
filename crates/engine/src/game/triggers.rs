@@ -3127,6 +3127,23 @@ pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
     }
 }
 
+/// CR 700.13 + CR 601.2c: Target-lock events (`BecomesTarget`,
+/// `CrimeCommitted`, etc.) emitted while putting a triggered ability on the
+/// stack must be scanned for dependent triggers in the same pass. Without this,
+/// auto-targeted Desert ETB pings commit a crime at target lock but outlaw
+/// abilities never fire because the events were dropped in `events_out`.
+fn process_target_lock_side_effects(
+    state: &mut GameState,
+    events_out: &[GameEvent],
+    from: usize,
+) {
+    if from >= events_out.len() {
+        return;
+    }
+    let batch = events_out[from..].to_vec();
+    process_triggers(state, &batch);
+}
+
 /// CR 113.2c + CR 603.2 + CR 603.3b: Drive each collected trigger through
 /// its disposition (pushed to stack, resolved inline as a mana ability, or
 /// paused for player input). If `dispatch_pending_trigger_context` reports
@@ -3138,13 +3155,16 @@ fn dispatch_collected_triggers(state: &mut GameState, pending: Vec<PendingTrigge
     let mut events_out = Vec::new();
     let mut iter = pending.into_iter();
     while let Some(trigger_context) = iter.next() {
+        let events_before = events_out.len();
         if dispatch_pending_trigger_context(state, trigger_context, &mut events_out).paused() {
+            process_target_lock_side_effects(state, &events_out, events_before);
             // Active trigger paused on player input. Stash the remaining
             // contexts to be drained by `drain_deferred_trigger_queue` after
             // the active trigger is finalized.
             state.deferred_triggers.extend(iter);
             return;
         }
+        process_target_lock_side_effects(state, &events_out, events_before);
     }
 }
 
@@ -4404,7 +4424,9 @@ fn dispatch_deferred_triggers_in_order(
 ) -> Option<crate::types::game_state::WaitingFor> {
     let mut iter = pending.into_iter();
     while let Some(trigger_context) = iter.next() {
+        let events_before = events_out.len();
         if dispatch_pending_trigger_context(state, trigger_context, events_out).paused() {
+            process_target_lock_side_effects(state, events_out, events_before);
             state.deferred_triggers.extend(iter);
             if matches!(
                 state.waiting_for,
@@ -4416,6 +4438,7 @@ fn dispatch_deferred_triggers_in_order(
                 .ok()
                 .flatten();
         }
+        process_target_lock_side_effects(state, events_out, events_before);
     }
     None
 }
@@ -9902,6 +9925,106 @@ pub mod tests {
         assert_eq!(
             crate::types::ability::effect_variant_name(&sub.effect),
             "GainLife"
+        );
+    }
+
+    /// Issue #2008: desert ETB must surface a stack-time opponent target slot.
+    #[test]
+    fn desert_etb_trigger_surfaces_opponent_target_slot() {
+        use crate::game::ability_utils::build_target_slots;
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::parser::oracle_trigger::parse_trigger_line;
+
+        const DESERT_ETB: &str = "When this land enters, it deals 1 damage to target opponent.";
+
+        let mut scenario = GameScenario::new();
+        let land = scenario.add_creature(P0, "Abraded Bluffs", 0, 0).id();
+        let runner = scenario.build();
+
+        let trig = parse_trigger_line(DESERT_ETB, "Abraded Bluffs");
+        let ability = build_triggered_ability(runner.state(), &trig, land, P0);
+        let slots = build_target_slots(runner.state(), &ability).expect("target slots");
+        assert!(
+            !slots.is_empty(),
+            "desert ETB must require a target slot for crime at target-lock time"
+        );
+        assert!(
+            slots[0]
+                .legal_targets
+                .contains(&TargetRef::Player(PlayerId(1))),
+            "opponent must be a legal target, got {:?}",
+            slots[0].legal_targets
+        );
+    }
+
+    /// Issue #2008: auto-targeted desert ETB commits a crime and outlaw triggers fire.
+    #[test]
+    fn desert_etb_auto_dispatch_commits_crime_and_triggers_outlaws() {
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::parser::oracle_trigger::parse_trigger_line;
+        use crate::types::events::GameEvent;
+        use crate::types::triggers::TriggerMode;
+
+        const DESERT_ETB: &str = "When this land enters, it deals 1 damage to target opponent.";
+
+        let mut scenario = GameScenario::new();
+        let land = scenario.add_creature(P0, "Abraded Bluffs", 0, 0).id();
+        let outlaw = scenario.add_creature(P0, "Vadmir, New Blood", 1, 1).id();
+        let mut runner = scenario.build();
+
+        let outlaw_trigger =
+            make_trigger(TriggerMode::CommitCrime).valid_target(TargetFilter::Controller);
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&outlaw)
+            .unwrap()
+            .trigger_definitions
+            .push(outlaw_trigger);
+
+        let trig = parse_trigger_line(DESERT_ETB, "Abraded Bluffs");
+        let ability = build_triggered_ability(runner.state(), &trig, land, P0);
+        let pending = PendingTrigger {
+            source_id: land,
+            controller: P0,
+            condition: trig.condition,
+            ability,
+            timestamp: 0,
+            target_constraints: Vec::new(),
+            distribute: None,
+            modal: None,
+            mode_abilities: Vec::new(),
+            trigger_event: None,
+            description: None,
+            may_trigger_origin: None,
+            subject_match_count: None,
+            die_result: None,
+        };
+
+        let mut events = Vec::new();
+        let events_before = events.len();
+        let disposition = dispatch_pending_trigger_context(
+            runner.state_mut(),
+            PendingTriggerContext::single(pending),
+            &mut events,
+        );
+        assert!(
+            matches!(disposition, TriggerDispatchDisposition::Pushed),
+            "expected auto-target push, got {disposition:?}"
+        );
+        assert!(
+            events.iter().any(|e| {
+                matches!(e, GameEvent::CrimeCommitted { player_id } if *player_id == P0)
+            }),
+            "desert ETB target lock must emit CrimeCommitted, events={events:?}"
+        );
+
+        process_target_lock_side_effects(runner.state_mut(), &events, events_before);
+
+        assert_eq!(
+            runner.state().stack.len(),
+            2,
+            "desert ETB and outlaw CommitCrime triggers must both reach the stack"
         );
     }
 

@@ -568,17 +568,6 @@ pub(crate) fn apply_damage_after_replacement(
 
     // CR 120.1: Record damage for "was dealt damage by" condition queries.
     if actual_amount > 0 {
-        // CR 700.13: Dealing damage to an opponent commits a crime (Desert ping
-        // lands, Tor Wauki the Elder, etc.). The source's controller is the
-        // outlaw who committed it.
-        if let TargetRef::Player(player_id) = &t {
-            if *player_id != ctx.controller {
-                events.push(GameEvent::CrimeCommitted {
-                    player_id: ctx.controller,
-                });
-            }
-        }
-
         let target_controller = match t {
             TargetRef::Player(player_id) => *player_id,
             TargetRef::Object(object_id) => state
@@ -5404,36 +5393,5 @@ mod tests {
         // Silence the unused CounterType import on builds where the matches! arm
         // already consumed it via the qualified path.
         let _ = CounterType::Plus1Plus1;
-    }
-
-    /// CR 700.13: Dealing damage to an opponent commits a crime (Desert ping).
-    #[test]
-    fn dealing_damage_to_opponent_emits_crime_committed() {
-        let mut state = GameState::new_two_player(42);
-        let source = create_object(
-            &mut state,
-            CardId(1),
-            PlayerId(0),
-            "Desert".to_string(),
-            Zone::Battlefield,
-        );
-        let ctx = DamageContext::from_source(&state, source).expect("source on battlefield");
-        let mut events = Vec::new();
-        apply_damage_to_target(
-            &mut state,
-            &ctx,
-            TargetRef::Player(PlayerId(1)),
-            1,
-            false,
-            &mut events,
-        )
-        .expect("damage to opponent");
-
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, GameEvent::CrimeCommitted { player_id } if *player_id == PlayerId(0))),
-            "dealing damage to an opponent must emit CrimeCommitted for the source controller"
-        );
     }
 }

@@ -75,7 +75,7 @@ pub fn resolve(
     // - "Target creature you control fights another target creature": two chosen
     //   object targets are the fighters; the ability's source (e.g. Ulvenwald
     //   Tracker) is not a participant.
-    let mut object_targets: Vec<ObjectId> = ability
+    let object_targets: Vec<ObjectId> = ability
         .targets
         .iter()
         .filter_map(|t| match t {

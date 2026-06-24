@@ -12790,7 +12790,6 @@ pub mod tests {
         use crate::types::counter::CounterType;
         use crate::types::game_state::TriggerIndex;
         use crate::types::keywords::Keyword;
-        use crate::types::triggers::TriggerMode;
 
         const ROT_WOLF_TRIGGER: &str =
             "Whenever a creature dealt damage by ~ this turn dies, you may draw a card.";

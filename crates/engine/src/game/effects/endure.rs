@@ -109,6 +109,8 @@ pub fn resolve(
     Ok(())
 }
 
+// CR 608.2k + CR 701.63a: Resolve the enduring permanent from the parsed subject;
+// `SelfRef` is always the ability source, never the current trigger event.
 fn enduring_object_id(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -120,17 +122,10 @@ fn enduring_object_id(
         .and_then(extract_source_from_event);
 
     match subject {
-        TargetFilter::SelfRef => {
-            // Issue #1120: "it endures" on another creature entering — the parser
-            // may leave SelfRef, but the enduring permanent is the trigger object.
-            if let Some(event_src) = event_source {
-                if event_src != ability.source_id {
-                    return event_src;
-                }
-            }
-            ability.source_id
+        TargetFilter::SelfRef => ability.source_id,
+        TargetFilter::CostPaidObject | TargetFilter::TriggeringSource => {
+            event_source.unwrap_or(ability.source_id)
         }
-        TargetFilter::CostPaidObject => event_source.unwrap_or(ability.source_id),
         TargetFilter::SpecificObject { id } => *id,
         _ => ability.source_id,
     }
@@ -328,7 +323,7 @@ mod tests {
                         counter_type: None,
                     },
                 },
-                subject: TargetFilter::CostPaidObject,
+                subject: TargetFilter::TriggeringSource,
             },
             vec![],
             warden,
@@ -349,6 +344,104 @@ mod tests {
         assert_eq!(
             enduring, bear,
             "it endures must target the entering creature"
+        );
+    }
+
+    #[test]
+    fn endure_production_path_counter_branch_targets_entering_creature() {
+        use crate::types::ability::{ObjectScope, QuantityExpr, QuantityRef};
+        use crate::types::events::GameEvent;
+        use crate::types::game_state::ZoneChangeRecord;
+
+        let mut state = GameState::new_two_player(42);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        let warden = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Warden".to_string(),
+            Zone::Battlefield,
+        );
+        let bear = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Bear".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [warden, bear] {
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+        }
+        state
+            .objects
+            .get_mut(&warden)
+            .unwrap()
+            .counters
+            .insert(CounterType::Plus1Plus1, 2);
+        state.current_trigger_event = Some(GameEvent::ZoneChanged {
+            object_id: bear,
+            from: Some(Zone::Hand),
+            to: Zone::Battlefield,
+            record: Box::new(ZoneChangeRecord::test_minimal(
+                bear,
+                Some(Zone::Hand),
+                Zone::Battlefield,
+            )),
+        });
+
+        let ability = ResolvedAbility::new(
+            Effect::Endure {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::CountersOn {
+                        scope: ObjectScope::Source,
+                        counter_type: None,
+                    },
+                },
+                subject: TargetFilter::TriggeringSource,
+            },
+            vec![],
+            warden,
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        effects::resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        let counter_index = match &state.waiting_for {
+            WaitingFor::ChooseOneOfBranch {
+                source_id,
+                player,
+                branches,
+                ..
+            } => {
+                assert_eq!(*source_id, bear);
+                assert_eq!(*player, PlayerId(0));
+                branches
+                    .iter()
+                    .position(|b| matches!(*b.effect, Effect::PutCounter { .. }))
+                    .expect("counter branch present")
+            }
+            other => panic!("expected ChooseOneOfBranch, got {other:?}"),
+        };
+
+        apply_as_current(&mut state, GameAction::ChooseBranch { index: counter_index }).unwrap();
+
+        assert_eq!(
+            state.objects[&bear]
+                .counters
+                .get(&CounterType::Plus1Plus1)
+                .copied()
+                .unwrap_or(0),
+            2,
+            "counter branch must land on the entering creature"
         );
     }
 

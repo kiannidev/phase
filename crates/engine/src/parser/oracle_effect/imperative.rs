@@ -7781,7 +7781,7 @@ pub(super) fn parse_imperative_family_ast(
             // CR 608.2k: subject-shifted "it endures" in a trigger names the
             // event object (the entering creature), not the ability source.
             let subject = if ctx.subject.is_some() {
-                TargetFilter::CostPaidObject
+                resolve_it_pronoun(ctx)
             } else {
                 TargetFilter::SelfRef
             };

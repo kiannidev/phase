@@ -58,7 +58,6 @@ fn ents_fury_fights_boosted_creature_against_opponent_creature() {
 fn ents_fury_fight_fizzles_when_opponent_phases_out_before_resolution() {
     use engine::game::game_object::PhaseOutCause;
     use engine::game::phasing::phase_out_object;
-    use engine::types::events::GameEvent;
 
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);

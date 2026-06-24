@@ -12705,7 +12705,10 @@ fn replace_fight_subject_with_parent_if_anaphoric_subject(
     ))
     .parse(lower)
     .is_ok();
-    if !is_anaphoric_subject {
+    // Ent's Fury class: "that creature gets … and fights target …"
+    let is_compound_anaphoric_fight =
+        lower.contains("that creature") && lower.contains(" and fights ");
+    if !is_anaphoric_subject && !is_compound_anaphoric_fight {
         return false;
     }
 

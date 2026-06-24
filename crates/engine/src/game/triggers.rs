@@ -3132,11 +3132,7 @@ pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
 /// stack must be scanned for dependent triggers in the same pass. Without this,
 /// auto-targeted Desert ETB pings commit a crime at target lock but outlaw
 /// abilities never fire because the events were dropped in `events_out`.
-fn process_target_lock_side_effects(
-    state: &mut GameState,
-    events_out: &[GameEvent],
-    from: usize,
-) {
+fn process_target_lock_side_effects(state: &mut GameState, events_out: &[GameEvent], from: usize) {
     if from >= events_out.len() {
         return;
     }

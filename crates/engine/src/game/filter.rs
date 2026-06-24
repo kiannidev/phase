@@ -747,6 +747,29 @@ pub fn matches_target_filter(
     filter_inner(state, object_id, filter, ctx)
 }
 
+/// CR 701.20e + CR 608.2c: Look-then-cast chains publish cards via
+/// `last_revealed_ids` while the parser still binds later steps to
+/// `ExiledBySource`. When resolving those steps against library cards,
+/// treat the exile reference as `LastRevealed`.
+pub fn remap_exiled_by_source_for_looked_cards(filter: &TargetFilter) -> TargetFilter {
+    match filter {
+        TargetFilter::ExiledBySource => TargetFilter::LastRevealed,
+        TargetFilter::And { filters } => TargetFilter::And {
+            filters: filters
+                .iter()
+                .map(remap_exiled_by_source_for_looked_cards)
+                .collect(),
+        },
+        TargetFilter::Or { filters } => TargetFilter::Or {
+            filters: filters
+                .iter()
+                .map(remap_exiled_by_source_for_looked_cards)
+                .collect(),
+        },
+        other => other.clone(),
+    }
+}
+
 /// CR 405.1 + CR 115.9b: Match filters against a spell or ability on the
 /// stack, including nested "targets ..." predicates on that stack entry.
 pub(crate) fn matches_stack_target_filter(

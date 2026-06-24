@@ -62,6 +62,28 @@ pub fn resolve(
             })
             .map(|(id, _)| *id)
             .collect();
+        // CR 701.20e: Look-then-cast tails put uncast looked-at cards on the
+        // bottom via `ExiledBySource`, but those cards remain in the library.
+        if collected_targets.is_empty() && !state.last_revealed_ids.is_empty() {
+            let looked_filter =
+                crate::game::filter::remap_exiled_by_source_for_looked_cards(&target_filter);
+            collected_targets = state
+                .last_revealed_ids
+                .iter()
+                .filter(|id| {
+                    state.objects.get(id).is_some_and(|obj| {
+                        obj.zone == Zone::Library
+                            && crate::game::filter::matches_target_filter(
+                                state,
+                                **id,
+                                &looked_filter,
+                                &ctx,
+                            )
+                    })
+                })
+                .copied()
+                .collect();
+        }
     }
     if collected_targets.is_empty()
         && matches!(
@@ -430,6 +452,56 @@ mod tests {
         let lib = &state.players[0].library;
         let after_order: Vec<_> = lib.iter().copied().collect();
         assert_eq!(after_order, vec![id2, id1, id3]);
+    }
+
+    /// Issue #2019 — look-then-cast cleanup binds `ExiledBySource` but cards
+    /// remain in the library; the bottom step must read `last_revealed_ids`.
+    #[test]
+    fn exiled_by_source_bottom_cleanup_uses_last_revealed_library_cards() {
+        let mut state = GameState::new_two_player(42);
+        let bottom_marker = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Bottom Marker".to_string(),
+            Zone::Library,
+        );
+        let looked_a = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Looked A".to_string(),
+            Zone::Library,
+        );
+        let looked_b = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Looked B".to_string(),
+            Zone::Library,
+        );
+        state.last_revealed_ids = vec![looked_a, looked_b];
+
+        let ability = ResolvedAbility::new(
+            Effect::PutAtLibraryPosition {
+                target: TargetFilter::ExiledBySource,
+                count: QuantityExpr::Fixed { value: 0 },
+                position: LibraryPosition::Bottom,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+
+        let mut events = vec![];
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let lib = &state.players[0].library;
+        assert_eq!(lib[0], bottom_marker, "untouched card stays on top");
+        assert_eq!(lib[lib.len() - 2], looked_a, "first looked card on bottom");
+        assert_eq!(lib[lib.len() - 1], looked_b, "second looked card on bottom");
+        assert_eq!(state.objects[&looked_a].zone, Zone::Library);
+        assert_eq!(state.objects[&looked_b].zone, Zone::Library);
     }
 
     #[test]

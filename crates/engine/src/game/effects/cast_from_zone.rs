@@ -141,6 +141,30 @@ pub fn resolve(
                     && crate::game::filter::matches_target_filter(state, *id, target_filter, &ctx)
             })
             .collect();
+        // CR 701.20e + CR 608.2c: Look-then-cast chains (Kiora, Sovereign of
+        // the Deep) leave the looked-at cards in the library. `Dig { keep_count:
+        // 0 }` publishes them via `last_revealed_ids`, not exile links, but the
+        // parser still binds the cast step to `ExiledBySource`.
+        if target_ids.is_empty() && !state.last_revealed_ids.is_empty() {
+            let looked_filter =
+                crate::game::filter::remap_exiled_by_source_for_looked_cards(target_filter);
+            target_ids = state
+                .last_revealed_ids
+                .iter()
+                .filter(|id| {
+                    state.objects.get(id).is_some_and(|obj| {
+                        obj.zone == Zone::Library
+                            && crate::game::filter::matches_target_filter(
+                                state,
+                                **id,
+                                &looked_filter,
+                                &ctx,
+                            )
+                    })
+                })
+                .copied()
+                .collect();
+        }
     }
 
     // CR 310.11b + CR 608.2c: "exile it, then you may cast it transformed" —
@@ -1136,6 +1160,72 @@ mod tests {
         assert!(
             state.objects[&creature].casting_permissions.is_empty(),
             "composed filter must preserve the typed restriction"
+        );
+    }
+
+    /// Issue #2019 — Kiora, Sovereign of the Deep: look-then-cast chains leave
+    /// cards in the library via `last_revealed_ids`, but the parser binds the
+    /// cast step to `ExiledBySource`. Without the library fallback the cast
+    /// sub-ability silently no-ops.
+    #[test]
+    fn look_peek_exiled_by_source_cast_uses_last_revealed_library_cards() {
+        let mut state = make_test_state();
+        let source = create_object(
+            &mut state,
+            CardId(999),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let instant = create_object(
+            &mut state,
+            CardId(301),
+            PlayerId(0),
+            "Looked Instant".to_string(),
+            Zone::Library,
+        );
+        state
+            .objects
+            .get_mut(&instant)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Instant);
+        state.objects.get_mut(&instant).unwrap().mana_cost = ManaCost::generic(3);
+        state.last_revealed_ids = vec![instant];
+
+        let ability = ResolvedAbility::new(
+            Effect::CastFromZone {
+                target: TargetFilter::And {
+                    filters: vec![
+                        TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant)),
+                        TargetFilter::ExiledBySource,
+                    ],
+                },
+                without_paying_mana_cost: true,
+                mode: CardPlayMode::Cast,
+                cast_transformed: false,
+                alt_ability_cost: None,
+                constraint: None,
+                duration: None,
+                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+
+        let mut events = vec![];
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let obj = state.objects.get(&instant).expect("looked card");
+        assert_eq!(obj.zone, Zone::Exile, "library cast grant exiles the card");
+        assert!(
+            obj.casting_permissions.iter().any(|p| matches!(
+                p,
+                CastingPermission::ExileWithAltCost { cost, .. } if *cost == ManaCost::zero()
+            )),
+            "looked library card must receive a free cast permission"
         );
     }
 

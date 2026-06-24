@@ -19151,7 +19151,7 @@ mod tests {
     #[test]
     fn look_then_cast_chain_filters_injected_targets_by_cast_filter() {
         use crate::game::ability_utils::build_resolved_from_def;
-        use crate::types::ability::{CardPlayMode, CastFromZoneDriver, TypeFilter};
+        use crate::types::ability::{CardPlayMode, CastFromZoneDriver, DigSource, TypeFilter};
 
         let mut state = GameState::new_two_player(42);
         let source = create_object(
@@ -19222,6 +19222,7 @@ mod tests {
                 rest_destination: None,
                 reveal: false,
                 enter_tapped: false,
+                source: DigSource::Library,
             },
         )
         .sub_ability(cast_sub);

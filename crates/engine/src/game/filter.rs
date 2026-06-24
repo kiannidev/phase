@@ -766,6 +766,18 @@ pub fn remap_exiled_by_source_for_looked_cards(filter: &TargetFilter) -> TargetF
                 .map(remap_exiled_by_source_for_looked_cards)
                 .collect(),
         },
+        TargetFilter::Not { filter } => TargetFilter::Not {
+            filter: Box::new(remap_exiled_by_source_for_looked_cards(filter)),
+        },
+        TargetFilter::TrackedSetFiltered {
+            id,
+            filter,
+            caused_by,
+        } => TargetFilter::TrackedSetFiltered {
+            id: *id,
+            filter: Box::new(remap_exiled_by_source_for_looked_cards(filter)),
+            caused_by: *caused_by,
+        },
         other => other.clone(),
     }
 }

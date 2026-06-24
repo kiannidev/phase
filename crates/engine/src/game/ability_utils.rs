@@ -1416,13 +1416,12 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
             }
             kept
         } else {
-            // CR 701.14a: "~ fights" / anaphoric "it fights" / chained "that
-            // creature … and fights" — the ally fighter is implicit. Propagated
-            // targets are ordered [ally, opponent], but only the opponent must
-            // satisfy this effect's `target` filter; pairing targets[0] against
-            // that filter wrongly drops the ally (Ent's Fury, issue #1135).
-            // Nested chain links keep chosen targets on the resolving spell, not
-            // on the fight sub-clause itself.
+            // CR 701.14a + CR 608.2b: "~ fights" / anaphoric "it fights" / chained
+            // "that creature … and fights" — the ally fighter is implicit. Propagated
+            // targets are ordered [ally, opponent], but only the opponent must satisfy
+            // this effect's `target` filter; pairing targets[0] against that filter
+            // wrongly drops the ally (Ent's Fury, issue #1135). Nested chain links keep
+            // chosen targets on the resolving spell, not on the fight sub-clause itself.
             let candidate_targets = if validated.targets.is_empty() {
                 state
                     .resolving_stack_entry
@@ -1433,22 +1432,48 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
             } else {
                 validated.targets.clone()
             };
-            candidate_targets
+
+            fn fight_creature_on_battlefield(
+                state: &GameState,
+                id: crate::types::identifiers::ObjectId,
+            ) -> bool {
+                state.objects.get(&id).is_some_and(|obj| {
+                    obj.zone == crate::types::zones::Zone::Battlefield
+                        && obj.is_phased_in()
+                        && obj
+                            .card_types
+                            .core_types
+                            .contains(&crate::types::card_type::CoreType::Creature)
+                })
+            }
+
+            let explicit: Vec<TargetRef> = candidate_targets
                 .iter()
                 .filter(|t| {
-                    let TargetRef::Object(id) = t else {
-                        return false;
-                    };
-                    state.objects.get(id).is_some_and(|obj| {
-                        obj.zone == crate::types::zones::Zone::Battlefield
-                            && obj
-                                .card_types
-                                .core_types
-                                .contains(&crate::types::card_type::CoreType::Creature)
-                    })
+                    targeting::validate_targets_for_ability(
+                        state,
+                        std::slice::from_ref(t),
+                        target,
+                        &validated,
+                    )
+                    .into_iter()
+                    .next()
+                    .is_some()
                 })
                 .cloned()
-                .collect()
+                .collect();
+
+            let mut kept = Vec::new();
+            if let Some(ally) = candidate_targets.iter().find(|t| {
+                let TargetRef::Object(id) = t else {
+                    return false;
+                };
+                !explicit.contains(t) && fight_creature_on_battlefield(state, *id)
+            }) {
+                kept.push(ally.clone());
+            }
+            kept.extend(explicit);
+            kept
         }
     } else if let Some(src_leaf) = prevent_damage_source_slot_filter(&validated.effect).cloned() {
         // CR 608.2b + CR 609.7a: A source-scoped `PreventDamage` carries its
@@ -10684,16 +10709,21 @@ mod tests {
             AbilityKind::Spell,
         );
         let mut state = GameState::new_two_player(42);
-        let mut card_id = 10u64;
-        for (player, name) in [(PlayerId(0), "Bear"), (PlayerId(1), "Wolf")] {
-            let id = create_object(
-                &mut state,
-                CardId(card_id),
-                player,
-                name.to_string(),
-                Zone::Battlefield,
-            );
-            card_id += 1;
+        let bear = create_object(
+            &mut state,
+            CardId(10),
+            PlayerId(0),
+            "Bear".to_string(),
+            Zone::Battlefield,
+        );
+        let wolf = create_object(
+            &mut state,
+            CardId(11),
+            PlayerId(1),
+            "Wolf".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [bear, wolf] {
             state
                 .objects
                 .get_mut(&id)
@@ -10742,16 +10772,21 @@ mod tests {
             }
         }
         let mut state = GameState::new_two_player(42);
-        let mut card_id = 10u64;
-        for (player, name) in [(PlayerId(0), "Bear"), (PlayerId(1), "Wolf")] {
-            let id = create_object(
-                &mut state,
-                CardId(card_id),
-                player,
-                name.to_string(),
-                Zone::Battlefield,
-            );
-            card_id += 1;
+        let bear = create_object(
+            &mut state,
+            CardId(10),
+            PlayerId(0),
+            "Bear".to_string(),
+            Zone::Battlefield,
+        );
+        let wolf = create_object(
+            &mut state,
+            CardId(11),
+            PlayerId(1),
+            "Wolf".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [bear, wolf] {
             state
                 .objects
                 .get_mut(&id)

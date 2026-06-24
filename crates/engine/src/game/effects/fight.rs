@@ -84,8 +84,8 @@ pub fn resolve(
         })
         .collect();
 
-    // Issue #1135: nested anaphoric fights inherit chosen targets on the
-    // resolving spell, not on the fight sub-link.
+    // CR 701.14a: nested anaphoric fights inherit chosen targets on the resolving
+    // spell, not on the fight sub-link (Ent's Fury, issue #1135).
     if object_targets.len() < 2 {
         if let Some(root) = state
             .resolving_stack_entry

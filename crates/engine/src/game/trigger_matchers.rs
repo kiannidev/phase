@@ -1014,36 +1014,6 @@ fn zone_change_clause_matches(
     true
 }
 
-/// CR 704.5f + CR 603.6: `CreatureDestroyed` is the SBA die event; dies triggers
-/// parsed as `ChangesZone { origin: Battlefield, destination: Graveyard }` must
-/// still match so intervening-if conditions (e.g. `DealtDamageBySourceThisTurn`
-/// on Rot Wolf) can gate on the dying creature.
-fn match_creature_destroyed_as_dies(
-    object_id: ObjectId,
-    trigger: &TriggerDefinition,
-    source_id: ObjectId,
-    state: &GameState,
-) -> bool {
-    if !trigger.zone_change_clauses.is_empty() {
-        return false;
-    }
-    if !matches!(trigger.destination, Some(Zone::Graveyard)) {
-        return false;
-    }
-    if !destination_matches_constraint(Zone::Graveyard, &trigger.destination_constraint) {
-        return false;
-    }
-    let origin_ok = if !trigger.origin_zones.is_empty() {
-        trigger.origin_zones.contains(&Zone::Battlefield)
-    } else {
-        matches!(trigger.origin, Some(Zone::Battlefield) | None)
-    };
-    if !origin_ok {
-        return false;
-    }
-    valid_card_matches(trigger, state, object_id, source_id)
-}
-
 // CR 603.6: ZoneChange triggers when an object enters or leaves a zone.
 pub(super) fn match_changes_zone(
     event: &GameEvent,
@@ -1051,9 +1021,6 @@ pub(super) fn match_changes_zone(
     source_id: ObjectId,
     state: &GameState,
 ) -> bool {
-    if let GameEvent::CreatureDestroyed { object_id } = event {
-        return match_creature_destroyed_as_dies(*object_id, trigger, source_id, state);
-    }
     if let GameEvent::ZoneChanged {
         object_id: _,
         from,
@@ -5882,31 +5849,6 @@ mod tests {
             Vec::new(),
         );
         assert!(match_changes_zone(&event, &trigger, ObjectId(1), &state));
-    }
-
-    /// CR 704.5f: SBA creature deaths emit `CreatureDestroyed`, not `ZoneChanged`.
-    /// Dies triggers parsed as scalar `ChangesZone { Battlefield → Graveyard }`
-    /// must still match (Rot Wolf — issue #1996).
-    #[test]
-    fn changes_zone_dies_matches_creature_destroyed() {
-        let state = setup();
-        let mut trigger = make_trigger(TriggerMode::ChangesZone);
-        trigger.origin = Some(Zone::Battlefield);
-        trigger.destination = Some(Zone::Graveyard);
-
-        let event = GameEvent::CreatureDestroyed {
-            object_id: ObjectId(5),
-        };
-        assert!(match_changes_zone(&event, &trigger, ObjectId(1), &state));
-
-        let etb = zone_changed_event(
-            ObjectId(6),
-            Zone::Hand,
-            Zone::Battlefield,
-            vec![CoreType::Creature],
-            Vec::new(),
-        );
-        assert!(!match_changes_zone(&etb, &trigger, ObjectId(1), &state));
     }
 
     #[test]

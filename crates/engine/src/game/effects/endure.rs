@@ -1,4 +1,6 @@
 use crate::game::effects::choose_one_of;
+use crate::game::quantity::resolve_quantity_with_targets;
+use crate::game::targeting::extract_source_from_event;
 use crate::types::ability::{
     AbilityDefinition, AbilityKind, Effect, EffectError, EffectKind, PtValue, QuantityExpr,
     ResolvedAbility, TargetFilter,
@@ -6,6 +8,7 @@ use crate::types::ability::{
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::GameState;
+use crate::types::identifiers::ObjectId;
 use crate::types::mana::ManaColor;
 
 /// CR 701.63a: Endure N.
@@ -23,10 +26,12 @@ pub fn resolve(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let amount = match &ability.effect {
-        Effect::Endure { amount } => *amount,
+    let (amount_expr, subject) = match &ability.effect {
+        Effect::Endure { amount, subject } => (amount, subject),
         _ => return Ok(()),
     };
+
+    let amount = resolve_quantity_with_targets(state, amount_expr, ability).max(0) as u32;
 
     // CR 701.63b: Endure 0 — nothing happens, no prompt is presented.
     if amount == 0 {
@@ -36,6 +41,8 @@ pub fn resolve(
         });
         return Ok(());
     }
+
+    let enduring_id = enduring_object_id(state, ability, subject);
 
     // CR 701.63a + CR 111.1/111.4: Branch A creates one N/N white Spirit
     // creature token. The N is the token's power/toughness, not the count —
@@ -62,8 +69,7 @@ pub fn resolve(
     token_branch.description = Some(format!("Create a {amount}/{amount} white Spirit token."));
 
     // CR 701.63a + CR 122.1: Branch B puts N +1/+1 counters on the enduring
-    // permanent. `SelfRef` resolves to the ability source (the permanent that
-    // is enduring).
+    // permanent.
     let mut counter_branch = AbilityDefinition::new(
         AbilityKind::Spell,
         Effect::PutCounter {
@@ -76,25 +82,58 @@ pub fn resolve(
     );
     counter_branch.description = Some(format!("Put {amount} +1/+1 counters on it."));
 
+    let enduring_controller = state
+        .objects
+        .get(&enduring_id)
+        .map(|o| o.controller)
+        .unwrap_or(ability.controller);
+
     // CR 701.63a: "that permanent's controller" makes the choice — a single
     // chooser. Delegate to the modal machine, which sets
     // `WaitingFor::ChooseOneOfBranch` and owns AI/multiplayer/frontend wiring.
     choose_one_of::prompt_next(
         state,
-        ability.controller,
-        ability.source_id,
+        enduring_controller,
+        enduring_id,
         vec![token_branch, counter_branch],
         ability.targets.clone(),
         ability.context.clone(),
-        vec![ability.controller],
+        vec![enduring_controller],
     );
 
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::Endure,
-        source_id: ability.source_id,
+        source_id: enduring_id,
     });
 
     Ok(())
+}
+
+fn enduring_object_id(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    subject: &TargetFilter,
+) -> ObjectId {
+    let event_source = state
+        .current_trigger_event
+        .as_ref()
+        .and_then(extract_source_from_event);
+
+    match subject {
+        TargetFilter::SelfRef => {
+            // Issue #1120: "it endures" on another creature entering — the parser
+            // may leave SelfRef, but the enduring permanent is the trigger object.
+            if let Some(event_src) = event_source {
+                if event_src != ability.source_id {
+                    return event_src;
+                }
+            }
+            ability.source_id
+        }
+        TargetFilter::CostPaidObject => event_source.unwrap_or(ability.source_id),
+        TargetFilter::SpecificObject { id } => *id,
+        _ => ability.source_id,
+    }
 }
 
 #[cfg(test)]
@@ -133,8 +172,17 @@ mod tests {
             .card_types
             .core_types
             .push(CoreType::Creature);
-        let ability =
-            ResolvedAbility::new(Effect::Endure { amount }, vec![], source_id, PlayerId(0));
+        let ability = ResolvedAbility::new(
+            Effect::Endure {
+                amount: QuantityExpr::Fixed {
+                    value: amount as i32,
+                },
+                subject: TargetFilter::SelfRef,
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
         (state, source_id, ability)
     }
 
@@ -234,7 +282,78 @@ mod tests {
     }
 
     #[test]
-    fn endure_zero_does_nothing() {
+    fn endure_dynamic_amount_uses_source_counters_for_entering_creature() {
+        use crate::game::quantity::resolve_quantity_with_targets;
+        use crate::types::ability::{ObjectScope, QuantityExpr, QuantityRef};
+        use crate::types::events::GameEvent;
+        use crate::types::game_state::ZoneChangeRecord;
+
+        let mut state = GameState::new_two_player(42);
+        let warden = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Warden".to_string(),
+            Zone::Battlefield,
+        );
+        let bear = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Bear".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&warden)
+            .unwrap()
+            .counters
+            .insert(CounterType::Plus1Plus1, 2);
+        state.current_trigger_event = Some(GameEvent::ZoneChanged {
+            object_id: bear,
+            from: Some(Zone::Hand),
+            to: Zone::Battlefield,
+            record: Box::new(ZoneChangeRecord::test_minimal(
+                bear,
+                Some(Zone::Hand),
+                Zone::Battlefield,
+            )),
+        });
+
+        let ability = ResolvedAbility::new(
+            Effect::Endure {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::CountersOn {
+                        scope: ObjectScope::Source,
+                        counter_type: None,
+                    },
+                },
+                subject: TargetFilter::CostPaidObject,
+            },
+            vec![],
+            warden,
+            PlayerId(0),
+        );
+
+        let amount = resolve_quantity_with_targets(
+            &state,
+            match &ability.effect {
+                Effect::Endure { amount, .. } => amount,
+                _ => unreachable!(),
+            },
+            &ability,
+        );
+        assert_eq!(amount, 2, "X should equal Warden's counters");
+
+        let enduring = enduring_object_id(&state, &ability, &TargetFilter::CostPaidObject);
+        assert_eq!(
+            enduring, bear,
+            "it endures must target the entering creature"
+        );
+    }
+
+    #[test]
+    fn endure_zero_skips_branch_choice() {
         let (mut state, source_id, ability) = setup(0);
         let mut events = Vec::new();
 

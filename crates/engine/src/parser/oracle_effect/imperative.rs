@@ -7758,20 +7758,34 @@ pub(super) fn parse_imperative_family_ast(
         }
         // Endure N keyword action
         "endure" | "endures" => {
+            use crate::parser::oracle_effect::lower::{
+                parse_where_x_quantity_expression, strip_trailing_where_x,
+            };
+            use crate::parser::oracle_effect::TextPair;
+
+            let (text_pair, where_x) = strip_trailing_where_x(TextPair::new(text, lower));
             let rest = alt((tag::<_, _, OracleError<'_>>("endure "), tag("endures ")))
-                .parse(lower)
+                .parse(text_pair.lower)
                 .map(|(r, _)| r)
                 .unwrap_or("");
-            // CR 701.63b: "endure X" degrades to 0 (nothing happens). parse_number_or_x
-            // maps a bare "x" to 0; the unwrap fallback only applies when no count token
-            // is present at all.
-            let count = nom_primitives::parse_number_or_x
-                .parse(rest.trim())
-                .map(|(_, n)| n)
-                .unwrap_or(1);
-            Some(ImperativeFamilyAst::GainKeyword(Effect::Endure {
-                amount: count,
-            }))
+            let amount = if let Some(expr) = where_x {
+                parse_where_x_quantity_expression(&expr)
+                    .unwrap_or(QuantityExpr::Fixed { value: 0 })
+            } else {
+                let count = nom_primitives::parse_number_or_x
+                    .parse(rest.trim())
+                    .map(|(_, n)| n as i32)
+                    .unwrap_or(1);
+                QuantityExpr::Fixed { value: count }
+            };
+            // CR 608.2k: subject-shifted "it endures" in a trigger names the
+            // event object (the entering creature), not the ability source.
+            let subject = if ctx.subject.is_some() {
+                TargetFilter::CostPaidObject
+            } else {
+                TargetFilter::SelfRef
+            };
+            Some(ImperativeFamilyAst::GainKeyword(Effect::Endure { amount, subject }))
         }
         // CR 701.53a: "incubate N"
         "incubate" => try_parse_incubate(lower).map(ImperativeFamilyAst::GainKeyword),

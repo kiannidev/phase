@@ -48800,12 +48800,13 @@ mod tests {
             matches!(
                 &*def.effect,
                 Effect::RevealUntil {
+                    matched_disposition: RevealUntilDisposition::RevealOnly,
                     kept_destination: Zone::Library,
                     rest_destination: Zone::Library,
                     ..
                 }
             ),
-            "Sanar reveal-until must not route hits to hand; got {:?}",
+            "Sanar reveal-until must stay reveal-only in the library, got {:?}",
             def.effect
         );
         let exile = def

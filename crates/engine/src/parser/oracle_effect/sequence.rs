@@ -363,6 +363,7 @@ pub(super) fn patch_reveal_until_for_library_category_exile(def: &mut AbilityDef
         patch_reveal_until_for_library_category_exile(sub);
         if let (
             Effect::RevealUntil {
+                matched_disposition,
                 kept_destination,
                 rest_destination,
                 ..
@@ -373,6 +374,7 @@ pub(super) fn patch_reveal_until_for_library_category_exile(def: &mut AbilityDef
             },
         ) = (&mut *def.effect, &*sub.effect)
         {
+            *matched_disposition = RevealUntilDisposition::RevealOnly;
             *kept_destination = Zone::Library;
             *rest_destination = Zone::Library;
         }

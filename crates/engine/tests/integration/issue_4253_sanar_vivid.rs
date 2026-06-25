@@ -44,7 +44,7 @@ fn sanar_vivid_chain(source: ObjectId) -> ResolvedAbility {
                 properties: vec![],
             }),
             count: distinct_colors_count(),
-            matched_disposition: RevealUntilDisposition::KeepEach,
+            matched_disposition: RevealUntilDisposition::RevealOnly,
             kept_destination: Zone::Library,
             rest_destination: Zone::Library,
             enter_tapped: EtbTapState::Unspecified,
@@ -77,6 +77,7 @@ fn sanar_vivid_parses_library_reveal_then_per_color_exile() {
         matches!(
             &*def.effect,
             Effect::RevealUntil {
+                matched_disposition: RevealUntilDisposition::RevealOnly,
                 kept_destination: Zone::Library,
                 rest_destination: Zone::Library,
                 ..

@@ -153,10 +153,9 @@ pub fn resolve(
     // Store revealed IDs for downstream reference.
     state.last_revealed_ids = all_revealed;
 
-    // CR 701.20b: reveal-only until-loop — cards stay in the library zone when
-    // both destinations are Library (Sanar: per-color exile follows from among
-    // the revealed cards still in the library).
-    if kept_destination == Zone::Library && rest_destination == Zone::Library {
+    // CR 701.20b: reveal-only until-loop — cards stay in their zones (Sanar's
+    // Vivid draws nothing to hand before per-color exile from the library).
+    if matches!(matched_disposition, RevealUntilDisposition::RevealOnly) {
         events.push(GameEvent::EffectResolved {
             kind: EffectKind::RevealUntil,
             source_id: ability.source_id,

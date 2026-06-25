@@ -33,6 +33,9 @@ fn once_upon_a_time_free_as_first_spell_of_game() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
     let once = scenario.add_real_card(P0, "Once Upon a Time", Zone::Hand, db);
+    // A second copy proves the free-cast window closes through the *real* cast
+    // pipeline (not just a hand-mutated counter) once the first is cast.
+    let once_again = scenario.add_real_card(P0, "Once Upon a Time", Zone::Hand, db);
     let mut runner = scenario.build();
     engine::game::rehydrate_game_from_card_db(runner.state_mut(), db);
 
@@ -105,5 +108,25 @@ fn once_upon_a_time_free_as_first_spell_of_game() {
     assert!(
         matches!(runner.state().stack[0].kind, StackEntryKind::Spell { .. }),
         "the stack entry should be the cast spell"
+    );
+
+    // The real cast pipeline must record the spell so the first-spell gate
+    // actually closes — not just the hand-mutated counter checked above.
+    assert_eq!(
+        runner
+            .state()
+            .spells_cast_this_game
+            .get(&P0)
+            .copied()
+            .unwrap_or(0),
+        1,
+        "casting Once Upon a Time must increment spells_cast_this_game via the real pipeline"
+    );
+
+    // A second copy is no longer the first spell of the game, so with no mana
+    // it is uncastable — proving the window closed through the actual cast.
+    assert!(
+        !can_cast_object_now(runner.state(), P0, once_again),
+        "a second Once Upon a Time must not be free-castable after the first was cast"
     );
 }

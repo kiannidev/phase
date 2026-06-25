@@ -12,7 +12,7 @@ use engine::game::scenario::{GameScenario, P0};
 use engine::parser::oracle_effect::parse_effect_chain;
 use engine::types::ability::{
     AbilityKind, Chooser, ControllerRef, Effect, IterationCategory, QuantityExpr, QuantityRef,
-    ResolvedAbility, RevealUntilDisposition, TargetFilter, TypedFilter, TypeFilter,
+    ResolvedAbility, RevealUntilDisposition, TargetFilter, TypeFilter, TypedFilter,
 };
 use engine::types::card_type::CoreType;
 use engine::types::game_state::WaitingFor;
@@ -128,12 +128,7 @@ fn sanar_vivid_per_color_exile_offers_revealed_library_cards() {
         .get_mut(&white_perm)
         .unwrap()
         .color = vec![ManaColor::White];
-    runner
-        .state_mut()
-        .objects
-        .get_mut(&red_perm)
-        .unwrap()
-        .color = vec![ManaColor::Red];
+    runner.state_mut().objects.get_mut(&red_perm).unwrap().color = vec![ManaColor::Red];
 
     for (id, core) in [
         (red_spell, CoreType::Sorcery),
@@ -176,9 +171,7 @@ fn sanar_vivid_per_color_exile_offers_revealed_library_cards() {
                 "WUBRG iteration offers the white sorcery first while it remains in the library"
             );
         }
-        other => panic!(
-            "expected ChooseFromZoneChoice for the first color member, got {other:?}"
-        ),
+        other => panic!("expected ChooseFromZoneChoice for the first color member, got {other:?}"),
     }
 
     assert_eq!(

@@ -49,7 +49,9 @@ fn intruder_alarm_untaps_creatures_when_pilot_token_enters_from_shorikai() {
         .from_oracle_text(SHORIKAI)
         .id();
     let tapped_bear = scenario.add_creature(P0, "Tapped Bear", 2, 2).id();
-    let _hand_card = scenario.add_creature_to_hand(P0, "Discard Fodder", 1, 1).id();
+    let _hand_card = scenario
+        .add_creature_to_hand(P0, "Discard Fodder", 1, 1)
+        .id();
     scenario.with_mana_pool(P0, colorless_mana(1));
 
     let mut runner = scenario.build();
@@ -63,13 +65,10 @@ fn intruder_alarm_untaps_creatures_when_pilot_token_enters_from_shorikai() {
         .next()
         .expect("Shorikai activated ability")
         .0;
-    runner
-        .activate(shorikai, ability_index)
-        .resolve();
+    runner.activate(shorikai, ability_index).resolve();
 
     // Discard prompt for Shorikai's ability.
-    if let engine::types::game_state::WaitingFor::DiscardChoice { .. } =
-        runner.state().waiting_for
+    if let engine::types::game_state::WaitingFor::DiscardChoice { .. } = runner.state().waiting_for
     {
         let hand_card = runner.state().players[P0.0 as usize].hand[0];
         runner

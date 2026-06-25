@@ -2587,7 +2587,7 @@ pub(super) fn handle_resolution_choice(
             // Megrim, Bone Miser) across the `DiscardChoice` pause — exactly
             // as the `Sacrifice` branch does for dies-triggers.
             //
-            // CR 603.6a: A reflexive continuation stashed behind this interactive
+            // CR 608.2c: A sequential continuation stashed behind this interactive
             // discard (e.g. Shorikai's "then create a Pilot creature token")
             // emits ZoneChanged/TokenCreated during `finish_with_continuation`.
             // Collect BOTH the discard slice and the continuation slice into

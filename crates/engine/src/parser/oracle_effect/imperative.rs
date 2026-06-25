@@ -4451,8 +4451,15 @@ fn parse_prevent_effect(text: &str) -> Effect {
         nom_primitives::scan_preceded(rest, crate::parser::oracle_nom::duration::parse_duration)
             .map(|(_, d, _)| d);
 
-    // Determine amount: "all damage" vs "the next N damage"
-    let amount = if tag::<_, _, OracleError<'_>>("all ").parse(rest).is_ok() {
+    // Determine amount: "all damage" vs "all but N" vs "the next N damage"
+    let amount = if let Some(after_all_but) =
+        crate::parser::oracle_util::strip_after(&lower, "prevent all but ")
+    {
+        let n = crate::parser::oracle_util::parse_number(after_all_but)
+            .map(|(n, _)| n)
+            .unwrap_or(1);
+        PreventionAmount::AllBut(n)
+    } else if tag::<_, _, OracleError<'_>>("all ").parse(rest).is_ok() {
         PreventionAmount::All
     } else if let Ok((after_next, _)) = tag::<_, _, OracleError<'_>>("the next ").parse(rest) {
         let n = nom_primitives::parse_number

@@ -1072,6 +1072,60 @@ fn damage_done_applier(
                         applied,
                     });
                 }
+                PreventionAmount::AllBut(keep) => {
+                    let redirected_amount = damage_amount.saturating_sub(keep);
+                    if redirected_amount == 0 {
+                        return ApplyResult::Modified(ProposedEvent::Damage {
+                            source_id,
+                            target,
+                            amount: damage_amount,
+                            is_combat,
+                            applied,
+                        });
+                    }
+                    consume_prevention_shield(state, rid, None);
+                    if let Some(new_target) = new_recipient.filter(|_| redirected_amount > 0) {
+                        let redirected_event = ProposedEvent::Damage {
+                            source_id,
+                            target: new_target,
+                            amount: redirected_amount,
+                            is_combat,
+                            applied: applied.clone(),
+                        };
+                        match replace_event(state, redirected_event, events) {
+                            ReplacementResult::Execute(event) => {
+                                let ctx = super::effects::deal_damage::DamageContext::from_source(
+                                    state, source_id,
+                                )
+                                .unwrap_or_else(|| {
+                                    let controller = state
+                                        .objects
+                                        .get(&source_id)
+                                        .map(|obj| obj.controller)
+                                        .unwrap_or(PlayerId(0));
+                                    super::effects::deal_damage::DamageContext::fallback(
+                                        source_id, controller,
+                                    )
+                                });
+                                let _ = super::effects::deal_damage::apply_damage_after_replacement(
+                                    state, &ctx, event, is_combat, events,
+                                );
+                            }
+                            ReplacementResult::Prevented => {}
+                            ReplacementResult::NeedsChoice(_) => {
+                                state.pending_replacement = None;
+                            }
+                        }
+                    }
+                    let remaining_amount = damage_amount.saturating_sub(redirected_amount);
+                    return ApplyResult::Modified(ProposedEvent::Damage {
+                        source_id,
+                        target,
+                        amount: remaining_amount,
+                        is_combat,
+                        applied,
+                    });
+                }
                 PreventionAmount::Next(n) => {
                     let redirected_amount = damage_amount.min(n);
                     let remaining_amount = damage_amount.saturating_sub(redirected_amount);
@@ -1201,6 +1255,29 @@ fn damage_done_applier(
                     if let Some(tally) = state.combat_prevention_tally.as_mut() {
                         *tally.entry(rid).or_insert(0) += prevented_amount as i32;
                         accumulated_in_batch = true;
+                    }
+                }
+                PreventionAmount::AllBut(keep) => {
+                    // CR 615.1a: "Prevent all but N" — continuous shield like
+                    // `All`, but only the excess above `keep` is prevented.
+                    let remaining_damage = dmg.min(keep);
+                    prevented_amount = dmg.saturating_sub(remaining_damage);
+                    if prevented_amount == 0 {
+                        result = ApplyResult::Modified(ProposedEvent::Damage {
+                            source_id,
+                            target: target.clone(),
+                            amount: dmg,
+                            is_combat,
+                            applied,
+                        });
+                    } else {
+                        result = ApplyResult::Modified(ProposedEvent::Damage {
+                            source_id,
+                            target: target.clone(),
+                            amount: remaining_damage,
+                            is_combat,
+                            applied,
+                        });
                     }
                 }
                 PreventionAmount::Next(n) => {

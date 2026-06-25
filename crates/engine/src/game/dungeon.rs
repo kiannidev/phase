@@ -950,8 +950,8 @@ fn throne_of_dead_three(source_id: ObjectId, controller: PlayerId) -> ResolvedAb
     patch_throne_parsed_chain(build_resolved_from_def(&def, source_id, controller))
 }
 
-/// Dungeon of the Mad Mage room 8 (Mad Wizard's Lair): draw three, reveal them,
-/// optionally cast one without paying its mana cost.
+/// CR 309.4c: Dungeon of the Mad Mage room 8 (Mad Wizard's Lair) — draw three,
+/// reveal them, optionally cast one without paying its mana cost.
 fn mad_wizards_lair(source_id: ObjectId, controller: PlayerId) -> ResolvedAbility {
     let mut draw = simple(
         Effect::Draw {

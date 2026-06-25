@@ -13,6 +13,7 @@ use engine::types::ability::{Effect, QuantityExpr, ResolvedAbility};
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::WaitingFor;
+use engine::types::zones::Zone;
 
 fn assert_no_unimplemented(ability: &ResolvedAbility) {
     assert!(
@@ -48,7 +49,7 @@ fn deep_mines_room_effect_is_implemented_scry_three() {
 }
 
 #[test]
-fn mad_wizards_lair_draws_reveals_and_offers_free_cast() {
+fn mad_wizards_lair_draws_reveals_and_casts_one_revealed_card_free() {
     let mut scenario = GameScenario::new();
     for i in 0..5 {
         scenario.add_card_to_library_top(P0, &format!("Library Card {i}"));
@@ -89,13 +90,56 @@ fn mad_wizards_lair_draws_reveals_and_offers_free_cast() {
         "the three drawn cards must be recorded as revealed (events={events:?})"
     );
 
-    match runner.state().waiting_for.clone() {
-        WaitingFor::EffectZoneChoice { .. } | WaitingFor::OptionalEffectChoice { .. } => {}
-        other => panic!("expected an optional free-cast prompt after reveal, got {other:?}"),
-    }
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::OptionalEffectChoice { .. }
+        ),
+        "optional free cast must pause for accept/decline, got {:?}",
+        runner.state().waiting_for
+    );
 
-    let _ = apply_as_current(
+    apply_as_current(
         runner.state_mut(),
-        GameAction::DecideOptionalEffect { accept: false },
+        GameAction::DecideOptionalEffect { accept: true },
+    )
+    .expect("accept optional free cast");
+
+    let WaitingFor::EffectZoneChoice {
+        cards,
+        count,
+        up_to,
+        ..
+    } = runner.state().waiting_for.clone()
+    else {
+        panic!(
+            "accepting must offer a hand pick among the revealed cards, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(count, 1);
+    assert!(up_to);
+    assert_eq!(
+        cards.len(),
+        3,
+        "all three revealed hand cards must be eligible"
+    );
+    assert!(cards.contains(&bolt), "Shock must be in the cast pool");
+
+    apply_as_current(
+        runner.state_mut(),
+        GameAction::SelectCards { cards: vec![bolt] },
+    )
+    .expect("select Shock to cast free");
+
+    assert_eq!(
+        runner.state().objects[&bolt].zone,
+        Zone::Stack,
+        "the chosen revealed card must be cast during resolution"
+    );
+    assert_eq!(
+        runner.state().players[0].hand.len(),
+        hand_before + 2,
+        "the two unchosen revealed cards must remain in hand"
     );
 }

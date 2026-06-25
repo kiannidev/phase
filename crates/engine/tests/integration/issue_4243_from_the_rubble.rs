@@ -39,10 +39,7 @@ fn from_the_rubble_end_step_trigger_targets_graveyard_creature_cards() {
     let trigger = &runner.state().objects[&rubble].trigger_definitions[0];
     let execute = trigger.execute.as_ref().expect("trigger execute");
     let Effect::ChangeZone { target, origin, .. } = &*execute.effect else {
-        panic!(
-            "expected ChangeZone trigger, got {:?}",
-            execute.effect
-        );
+        panic!("expected ChangeZone trigger, got {:?}", execute.effect);
     };
     assert_eq!(*origin, Some(Zone::Graveyard));
     assert_eq!(

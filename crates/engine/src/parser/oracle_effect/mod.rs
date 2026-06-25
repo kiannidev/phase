@@ -22340,6 +22340,18 @@ fn add_inferred_origin_constraints_to_target(
     let Some(zone) = origin else {
         return target;
     };
+    // CR 115.2: A zone constraint is only meaningful on an object filter that
+    // enumerates candidates ("target creature card … from your graveyard").
+    // Anaphoric/self targets (`SelfRef` "return this card from your graveyard",
+    // `LastCreated`, player refs, etc.) already bind to a specific object and
+    // must NOT be wrapped into an `And` — doing so rewrites a self-return
+    // bounce target and breaks its graveyard `trigger_zones` derivation.
+    if !matches!(
+        target,
+        TargetFilter::Typed(_) | TargetFilter::Or { .. } | TargetFilter::And { .. }
+    ) {
+        return target;
+    }
     if let Some((matched_zone, _, props)) = super::oracle_target::scan_zone_phrase(lower) {
         if matched_zone == zone
             && props.iter().any(|prop| {

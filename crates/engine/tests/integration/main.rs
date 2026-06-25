@@ -363,6 +363,7 @@ mod issue_4243_from_the_rubble;
 mod issue_4244_temple_altisaur;
 mod issue_4245_intruder_alarm_untap;
 mod issue_4247_well_rested;
+mod issue_4248_room_cast_both_halves;
 mod issue_4249_elspeth_divine_visitation;
 mod issue_4271_birthing_ritual_cmc_filter;
 mod issue_4272_birthing_ritual_etb_triggers;

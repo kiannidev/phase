@@ -1969,17 +1969,25 @@ fn should_resolve_subability_on_optional_decline(ability: &ResolvedAbility) -> b
         // Selecting the `IfYouDo` head here lets `resolve_ability_chain`'s
         // condition-false path descend into the `Not(IfYouDo)` tail so the
         // Insect token is still created when the optional pay is declined.
+        //
+        // CR 608.2c: A `player_scope`-scoped `IfYouDo` sub is the next printed
+        // instruction after the parent action ("If you do, each opponent may …"),
+        // not a decline alternative for the parent's optional decision. Braids,
+        // Arisen Nightmare: declining the controller's sacrifice must skip the
+        // entire scoped opponent chain — its nested `Not{IfYouDo}` decline body
+        // is per-opponent, not a fallback for the controller's decline.
         Some(AbilityCondition::EffectOutcome {
             signal: EffectOutcomeSignal::OptionalEffectPerformed,
         }) => {
             ability.else_ability.is_some()
-                || ability.sub_ability.as_ref().is_some_and(|s| {
-                    matches!(
-                        &s.condition,
-                        Some(AbilityCondition::Not { condition })
-                            if condition.is_optional_effect_performed()
-                    )
-                })
+                || (ability.player_scope.is_none()
+                    && ability.sub_ability.as_ref().is_some_and(|s| {
+                        matches!(
+                            &s.condition,
+                            Some(AbilityCondition::Not { condition })
+                                if condition.is_optional_effect_performed()
+                        )
+                    }))
         }
         // CR 608.2c + CR 608.2d: A composite `And`/`Or` condition that contains
         // a performed-gate is a valid decline branch — declining the

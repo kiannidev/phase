@@ -27,7 +27,12 @@ fn assert_no_unimplemented(ability: &ResolvedAbility) {
 
 #[test]
 fn deep_mines_room_effect_is_implemented_scry_three() {
-    let (ability, _) = room_effects(DungeonId::DungeonOfTheMadMage, 7, dungeon_sentinel_id(P0), P0);
+    let (ability, _) = room_effects(
+        DungeonId::DungeonOfTheMadMage,
+        7,
+        dungeon_sentinel_id(P0),
+        P0,
+    );
     assert_no_unimplemented(&ability);
     assert!(
         matches!(
@@ -85,11 +90,8 @@ fn mad_wizards_lair_draws_reveals_and_offers_free_cast() {
     );
 
     match runner.state().waiting_for.clone() {
-        WaitingFor::EffectZoneChoice { .. }
-        | WaitingFor::OptionalEffectChoice { .. } => {}
-        other => panic!(
-            "expected an optional free-cast prompt after reveal, got {other:?}"
-        ),
+        WaitingFor::EffectZoneChoice { .. } | WaitingFor::OptionalEffectChoice { .. } => {}
+        other => panic!("expected an optional free-cast prompt after reveal, got {other:?}"),
     }
 
     let _ = apply_as_current(

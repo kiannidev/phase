@@ -151,9 +151,9 @@ use crate::game::ability_utils::build_resolved_from_def;
 use crate::parser::oracle_effect::parse_effect_chain;
 use crate::types::ability::{
     AbilityCondition, AbilityKind, CardPlayMode, CastFromZoneDriver, CastingPermission,
-    ContinuousModification, ControllerRef, Duration, Effect, FilterProp, PlayerFilter,
-    PlayerScope, PtValue, QuantityExpr, ResolvedAbility, SearchSelectionConstraint,
-    StaticDefinition, TargetFilter, TypeFilter, TypedFilter,
+    ContinuousModification, ControllerRef, Duration, Effect, FilterProp, PlayerFilter, PlayerScope,
+    PtValue, QuantityExpr, ResolvedAbility, SearchSelectionConstraint, StaticDefinition,
+    TargetFilter, TypeFilter, TypedFilter,
 };
 use crate::types::card_type::Supertype;
 use crate::types::counter::CounterType;
@@ -1622,7 +1622,13 @@ mod tests {
     }
 
     fn mad_mage_effect(room: u8) -> ResolvedAbility {
-        room_effects(DungeonId::DungeonOfTheMadMage, room, ObjectId(1), PlayerId(0)).0
+        room_effects(
+            DungeonId::DungeonOfTheMadMage,
+            room,
+            ObjectId(1),
+            PlayerId(0),
+        )
+        .0
     }
 
     #[test]

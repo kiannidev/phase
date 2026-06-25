@@ -3,10 +3,10 @@ use std::collections::{HashMap, HashSet};
 use crate::database::synthesis::KeywordTriggerInstaller;
 use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, AdditionalCostOrigin, BounceSelection,
-    ChosenAttribute, CommanderOwnership, ControllerRef, CopyRetargetPermission,
-    DelayedTriggerCondition, Effect, ModalChoice, PlayerFilter, QuantityExpr, RenownSubject,
-    ResolvedAbility, SacrificeCost, TargetFilter, TargetRef, TributeOutcome, TriggerCondition,
-    TriggerDefinition, TypeFilter, TypedFilter,
+    ChosenAttribute, CommanderOwnership, ContinuousModification, ControllerRef,
+    CopyRetargetPermission, DelayedTriggerCondition, Effect, ModalChoice, PlayerFilter,
+    QuantityExpr, RenownSubject, ResolvedAbility, SacrificeCost, TargetFilter, TargetRef,
+    TributeOutcome, TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter,
 };
 #[cfg(test)]
 use crate::types::ability::{EffectScope, TapStateChange};
@@ -537,7 +537,6 @@ fn collect_matching_triggers_inner(
 ) -> Vec<MatchedTrigger> {
     let mut pending = Vec::new();
     let obj_id = source_obj.id;
-    let controller = source_obj.controller;
 
     // CR 604.1 + CR 702.62a: Companion triggered abilities for keywords granted
     // to an *off-zone* card. `evaluate_layers` (Layer 6) only installs
@@ -623,6 +622,7 @@ fn collect_matching_triggers_inner(
             .map(|(i, (kind, def))| (printed_trigger_count + i, def, Some(*kind))),
     );
     for (trig_idx, trig_def, granted_keyword_kind) in all_triggers {
+        let controller = trigger_controller_for_object(state, source_obj, trig_idx, trig_def);
         // Synthesized granted-keyword companion triggers carry a keyword-keyed
         // `MayTriggerOrigin` — the synthetic `trig_idx` points past
         // `trigger_definitions` and must not be used as a `Printed` index.
@@ -6337,6 +6337,49 @@ fn record_trigger_fired(
             *state.trigger_fire_counts_this_turn.entry(key).or_insert(0) += 1;
         }
     }
+}
+
+/// CR 303.4e + CR 603.3a: An Aura that grants a triggered ability to its
+/// enchanted host ("Enchanted creature has …") is controlled by the Aura's
+/// controller, not the host permanent's controller.
+fn aura_granted_trigger_controller(
+    state: &GameState,
+    host: &crate::game::game_object::GameObject,
+    trig_idx: usize,
+    trig_def: &TriggerDefinition,
+) -> Option<PlayerId> {
+    if host.base_trigger_definitions.get(trig_idx) == Some(trig_def) {
+        return None;
+    }
+    let host_id = host.id;
+    for &aura_id in &host.attachments {
+        let aura = state.objects.get(&aura_id)?;
+        if !aura.card_types.subtypes.iter().any(|s| s == "Aura") {
+            continue;
+        }
+        if aura.attached_to != Some(crate::game::game_object::AttachTarget::Object(host_id)) {
+            continue;
+        }
+        for static_def in aura.static_definitions.iter_all() {
+            for modification in &static_def.modifications {
+                if let ContinuousModification::GrantTrigger { trigger } = modification {
+                    if trigger.as_ref() == trig_def {
+                        return Some(aura.controller);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+pub(super) fn trigger_controller_for_object(
+    state: &GameState,
+    obj: &crate::game::game_object::GameObject,
+    trig_idx: usize,
+    trig_def: &TriggerDefinition,
+) -> PlayerId {
+    aura_granted_trigger_controller(state, obj, trig_idx, trig_def).unwrap_or(obj.controller)
 }
 
 /// Build a ResolvedAbility from a TriggerDefinition using typed fields.

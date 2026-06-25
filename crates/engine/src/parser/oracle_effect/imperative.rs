@@ -1665,11 +1665,6 @@ pub(super) fn parse_targeted_action_ast(
         };
         let is_mass = is_mass || count.is_some();
         let origin = super::infer_origin_zone(rest_lower);
-        // CR 115.2: A target described as being in a non-battlefield zone
-        // ("return target creature card … from your graveyard") must carry that
-        // zone on its target filter so candidate enumeration is constrained to
-        // the named zone rather than defaulting to the battlefield.
-        let target = super::add_inferred_origin_constraints_to_target(target, origin, rest_lower);
 
         // CR 400.7: Single-object battlefield destinations use ChangeZone;
         // mass destinations use ChangeZoneAll. Only pure mass-bounce

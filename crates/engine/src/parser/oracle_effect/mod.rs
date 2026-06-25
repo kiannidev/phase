@@ -22340,18 +22340,6 @@ fn add_inferred_origin_constraints_to_target(
     let Some(zone) = origin else {
         return target;
     };
-    // CR 115.2: A zone constraint is only meaningful on an object filter that
-    // enumerates candidates ("target creature card … from your graveyard").
-    // Anaphoric/self targets (`SelfRef` "return this card from your graveyard",
-    // `LastCreated`, player refs, etc.) already bind to a specific object and
-    // must NOT be wrapped into an `And` — doing so rewrites a self-return
-    // bounce target and breaks its graveyard `trigger_zones` derivation.
-    if !matches!(
-        target,
-        TargetFilter::Typed(_) | TargetFilter::Or { .. } | TargetFilter::And { .. }
-    ) {
-        return target;
-    }
     if let Some((matched_zone, _, props)) = super::oracle_target::scan_zone_phrase(lower) {
         if matched_zone == zone
             && props.iter().any(|prop| {
@@ -45283,7 +45271,7 @@ mod tests {
         }
     }
 
-    /// CR 400.7 + CR 608.2c: From the Rubble — "return target creature card of
+    /// CR 115.2 + CR 608.2c: From the Rubble — "return target creature card of
     /// the chosen type from your graveyard to the battlefield" must target
     /// graveyard cards, not battlefield creatures.
     #[test]
@@ -45319,6 +45307,55 @@ mod tests {
             }
             other => panic!("expected Effect::ChangeZone, got {other:?}"),
         }
+    }
+
+    /// CR 115.2: An already zone-qualified reanimation target ("return target
+    /// creature card from your graveyard to the battlefield") must NOT be
+    /// re-scoped by the inferred-origin pass. `parse_type_phrase` already parses
+    /// "from your graveyard" into `InZone { Graveyard }` plus a single owner
+    /// scope on the filter's `controller` field, so the candidate filter must
+    /// carry exactly one owner-`You` scope — guarding against the 905-card
+    /// double-`you control` parse-diff regression.
+    #[test]
+    fn effect_plain_graveyard_reanimation_target_not_double_scoped() {
+        let e = parse_effect("return target creature card from your graveyard to the battlefield");
+        let Effect::ChangeZone { target, .. } = e else {
+            panic!("expected Effect::ChangeZone, got {e:?}");
+        };
+        assert_eq!(
+            target.extract_in_zone(),
+            Some(Zone::Graveyard),
+            "the graveyard zone must be present exactly once"
+        );
+        let TargetFilter::Typed(tf) = target else {
+            panic!("expected typed graveyard target, got {target:?}");
+        };
+        let zone_count = tf
+            .properties
+            .iter()
+            .filter(|p| matches!(p, FilterProp::InZone { zone } if *zone == Zone::Graveyard))
+            .count();
+        assert_eq!(zone_count, 1, "the graveyard zone must not be duplicated");
+        // "from your graveyard" parses its owner into the `controller` field;
+        // re-adding an `Owned { You }` prop would render a second "you control".
+        // Total owner-`You` scopes (controller field + props) must be exactly one.
+        let owner_you_scopes = usize::from(tf.controller == Some(ControllerRef::You))
+            + tf.properties
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p,
+                        FilterProp::Owned {
+                            controller: ControllerRef::You
+                        }
+                    )
+                })
+                .count();
+        assert_eq!(
+            owner_you_scopes, 1,
+            "inferred-origin must not double-scope an already `from your graveyard` \
+             target; expected exactly one owner-`You` scope, found {owner_you_scopes}"
+        );
     }
 
     /// Collect all effects in a sub_ability chain into a flat Vec.

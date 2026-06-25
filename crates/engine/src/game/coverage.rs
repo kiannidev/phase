@@ -727,6 +727,8 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
                     ControllerRef::SourceChosenPlayer => "the chosen player's",
                     ControllerRef::ChosenPlayer { .. } => "chosen player's",
                     ControllerRef::TriggeringPlayer => "triggering player's",
+                    // CR 303.4b: Display label for enchanted-player controller scope.
+                    ControllerRef::EnchantedPlayer => "enchanted player's",
                 };
                 let zone_str = format!("{zone:?}").to_lowercase();
                 parts.push(format!(
@@ -860,6 +862,8 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
                 ControllerRef::SourceChosenPlayer => "the chosen player",
                 ControllerRef::ChosenPlayer { .. } => "chosen player",
                 ControllerRef::TriggeringPlayer => "triggering player",
+                // CR 303.4b: Display label for enchanted-player controller scope.
+                ControllerRef::EnchantedPlayer => "enchanted player",
             };
             parts.push(label.into());
         } else {
@@ -930,6 +934,8 @@ fn fmt_controller(ctrl: &ControllerRef) -> String {
         ControllerRef::SourceChosenPlayer => "the chosen player controls",
         ControllerRef::ChosenPlayer { .. } => "chosen player controls",
         ControllerRef::TriggeringPlayer => "triggering player controls",
+        // CR 303.4b: Display label for enchanted-player controller scope.
+        ControllerRef::EnchantedPlayer => "enchanted player controls",
     }
     .into()
 }
@@ -1237,6 +1243,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 ObjectProperty::Power => "power",
                 ObjectProperty::Toughness => "toughness",
                 ObjectProperty::ManaValue => "mana value",
+                ObjectProperty::ManaSymbolCount(_) => "mana symbols",
             };
             format!("{func} {prop} of {}", fmt_target(filter))
         }
@@ -1332,6 +1339,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 ObjectProperty::Power => "power",
                 ObjectProperty::Toughness => "toughness",
                 ObjectProperty::ManaValue => "mana value",
+                ObjectProperty::ManaSymbolCount(_) => "mana symbols",
             };
             format!("{func} {prop} of those cards")
         }
@@ -2113,6 +2121,9 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
                 Some(CounteredSpellDestination::Library {
                     position: LibraryPosition::NthFromTop { n },
                 }) => d.push(("redirect".into(), format!("library #{n} from top"))),
+                Some(CounteredSpellDestination::Library {
+                    position: LibraryPosition::BeneathTop { .. },
+                }) => d.push(("redirect".into(), "library beneath top X".into())),
                 Some(CounteredSpellDestination::Hand) => {
                     d.push(("redirect".into(), "hand".into()))
                 }
@@ -2751,6 +2762,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
                                 ObjectProperty::Power => "power",
                                 ObjectProperty::Toughness => "toughness",
                                 ObjectProperty::ManaValue => "mana value",
+                                ObjectProperty::ManaSymbolCount(_) => "mana symbols",
                             },
                             match comparator {
                                 crate::types::ability::Comparator::GE => "≥",

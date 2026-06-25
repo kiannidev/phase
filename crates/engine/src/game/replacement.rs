@@ -368,6 +368,25 @@ pub fn replacement_choice_waiting_for(player: PlayerId, state: &GameState) -> Wa
         })
         .unwrap_or((0, vec![]));
 
+    // Issue #4277 softlock guard: a zero-candidate `ReplacementChoice` is
+    // unactionable. `candidate_actions_exact` enumerates `(0..candidate_count)`,
+    // so count 0 yields an empty legal-action set, and the frontend
+    // `ReplacementModal` returns null on `candidate_count == 0` — the game wedges
+    // and `stuck_decision_diagnostic` reports "Waiting for: ReplacementChoice".
+    // Every legitimate park flows from `pipeline_loop`, which only returns
+    // `NeedsChoice` for an Optional candidate (count 2) or 2+ materially-ordered
+    // candidates; reaching count 0 here means an upstream caller re-parked after
+    // `continue_replacement` already `.take()`-consumed the record (or an
+    // `EmptyManaPool` handler list emptied) — i.e. there is nothing left to
+    // choose. Return to a clean priority state so the drain machinery resumes any
+    // paused iteration (e.g. a mass simultaneous battlefield entry) instead of
+    // softlocking.
+    if candidate_count == 0 {
+        return WaitingFor::Priority {
+            player: state.active_player,
+        };
+    }
+
     WaitingFor::ReplacementChoice {
         player,
         candidate_count,
@@ -1053,6 +1072,20 @@ fn damage_done_applier(
                         applied,
                     });
                 }
+                PreventionAmount::AllBut(_) => {
+                    // CR 615.1a vs CR 614.9: `AllBut` is exclusively a *prevention*
+                    // amount ("prevent all but N damage", Temple Altisaur) and is
+                    // never produced for a redirection shield — `redirection_shield`
+                    // defaults a missing amount to `PreventionAmount::All` and every
+                    // other redirect constructor uses `PreventionAmount::Next`.
+                    // Inventing a partial-redirect rule here would violate CR 614.9
+                    // (an illegal recipient must make the redirection do nothing
+                    // rather than silently drop the excess), so this state is
+                    // treated as impossible rather than guessed at.
+                    unreachable!(
+                        "PreventionAmount::AllBut is never assigned to a ShieldKind::Redirection"
+                    )
+                }
                 PreventionAmount::Next(n) => {
                     let redirected_amount = damage_amount.min(n);
                     let remaining_amount = damage_amount.saturating_sub(redirected_amount);
@@ -1182,6 +1215,34 @@ fn damage_done_applier(
                     if let Some(tally) = state.combat_prevention_tally.as_mut() {
                         *tally.entry(rid).or_insert(0) += prevented_amount as i32;
                         accumulated_in_batch = true;
+                    }
+                }
+                PreventionAmount::AllBut(keep) => {
+                    // CR 615.1a + CR 615.6: "Prevent all but N damage" is a
+                    // continuous prevention shield like `All`, but only the
+                    // excess above `keep` is prevented; the first `keep` points
+                    // of each damage event are still dealt. Like `All`, it is
+                    // duration-bound (not depletion-based per CR 615.7), so the
+                    // shield is never consumed here and re-fires for every damage
+                    // event within its lifetime.
+                    let remaining_damage = dmg.min(keep);
+                    prevented_amount = dmg.saturating_sub(remaining_damage);
+                    if prevented_amount == 0 {
+                        result = ApplyResult::Modified(ProposedEvent::Damage {
+                            source_id,
+                            target: target.clone(),
+                            amount: dmg,
+                            is_combat,
+                            applied,
+                        });
+                    } else {
+                        result = ApplyResult::Modified(ProposedEvent::Damage {
+                            source_id,
+                            target: target.clone(),
+                            amount: remaining_damage,
+                            is_combat,
+                            applied,
+                        });
                     }
                 }
                 PreventionAmount::Next(n) => {
@@ -3745,6 +3806,8 @@ fn evaluate_replacement_condition(
                 // CR 603.2 + CR 109.4: Triggering-player scope is undefined at
                 // replacement-check time (no event context). Fail closed.
                 Some(ControllerRef::TriggeringPlayer) => false,
+                // CR 303.4b: Enchanted-player scope is undefined at replacement-check time. Fail closed.
+                Some(ControllerRef::EnchantedPlayer) => false,
                 None => true,
             };
             if !turn_ok {
@@ -3781,6 +3844,8 @@ fn evaluate_replacement_condition(
                 // CR 603.2 + CR 109.4: Triggering-player scope is undefined at
                 // replacement-check time (no event context). Fail closed.
                 Some(ControllerRef::TriggeringPlayer) => false,
+                // CR 303.4b: Enchanted-player scope is undefined at replacement-check time. Fail closed.
+                Some(ControllerRef::EnchantedPlayer) => false,
                 None => true,
             };
             if !turn_ok {
@@ -3939,7 +4004,9 @@ fn evaluate_replacement_condition(
                 | ControllerRef::DefendingPlayer
                 | ControllerRef::SourceChosenPlayer
                 | ControllerRef::ChosenPlayer { .. }
-                | ControllerRef::TriggeringPlayer => false,
+                | ControllerRef::TriggeringPlayer
+                // CR 303.4b: Enchanted-player scope is undefined at replacement-check time. Fail closed.
+                | ControllerRef::EnchantedPlayer => false,
             }
         }
         ReplacementCondition::EffectCausedDiscard => matches!(
@@ -4446,6 +4513,8 @@ pub fn find_applicable_replacements(
                                 // has no meaning for static token-creation
                                 // replacements. Fail closed.
                                 crate::types::ability::ControllerRef::TriggeringPlayer => false,
+                                // CR 303.4b: Enchanted-player scope is undefined at replacement-check time. Fail closed.
+                                crate::types::ability::ControllerRef::EnchantedPlayer => false,
                             };
                             if !matches {
                                 continue;
@@ -10153,6 +10222,73 @@ mod tests {
         );
         assert!(state.battlefield.contains(&hyena_umbra));
         assert!(state.battlefield.contains(&bear_umbra));
+    }
+
+    #[test]
+    fn zero_candidate_replacement_choice_returns_priority_not_softlock() {
+        // Issue #4277: a `ReplacementChoice` parked with `candidate_count == 0`
+        // is unactionable — `candidate_actions_exact` enumerates
+        // `(0..candidate_count)` (empty) and the frontend `ReplacementModal`
+        // renders nothing on count 0, wedging the game ("Waiting for:
+        // ReplacementChoice, Stuck players: 0"). The builder must never emit
+        // such a choice: when there is no pending replacement record to choose
+        // among (e.g. an upstream resume/drain re-parked after the record was
+        // already consumed), it must hand control back to priority so the drain
+        // machinery resumes instead of softlocking.
+        let state = GameState::new_two_player(42);
+        assert!(
+            state.pending_replacement.is_none(),
+            "precondition: no pending replacement"
+        );
+
+        let waiting_for = replacement_choice_waiting_for(PlayerId(0), &state);
+
+        assert!(
+            matches!(waiting_for, WaitingFor::Priority { .. }),
+            "a no-candidate replacement choice must resolve to Priority, not an \
+             actionless ReplacementChoice; got {waiting_for:?}"
+        );
+
+        // Defense-in-depth: whatever it is, it must not be a wedged
+        // ReplacementChoice. This is the exact softlock the diagnostic reported.
+        assert!(
+            !matches!(
+                waiting_for,
+                WaitingFor::ReplacementChoice {
+                    candidate_count: 0,
+                    ..
+                }
+            ),
+            "must never park on a zero-candidate ReplacementChoice"
+        );
+    }
+
+    #[test]
+    fn empty_candidates_replacement_record_returns_priority_not_softlock() {
+        // Issue #4277, sibling count-0 producer: the softlock arises not only when
+        // `pending_replacement` is None, but also when a `Some(record)` carries an
+        // empty `candidates` list. `replacement_choice_waiting_for` takes the
+        // `_ =>` arm and computes `count = candidates.len() == 0` (replacement.rs
+        // ~298), which must still route to Priority rather than an actionless
+        // ReplacementChoice — covering the non-None branch of the guard.
+        let mut state = GameState::new_two_player(42);
+        state.pending_replacement = Some(PendingReplacement {
+            proposed: ProposedEvent::zone_change(ObjectId(20), Zone::Hand, Zone::Battlefield, None),
+            candidates: vec![],
+            depth: 0,
+            is_optional: false,
+            library_placement: None,
+            may_cost_paid: false,
+            may_cost_remaining: None,
+        });
+
+        let waiting_for = replacement_choice_waiting_for(PlayerId(0), &state);
+
+        assert!(
+            matches!(waiting_for, WaitingFor::Priority { .. }),
+            "an empty-candidates replacement record must resolve to Priority, not an \
+             actionless ReplacementChoice; got {waiting_for:?}"
+        );
     }
 
     #[test]

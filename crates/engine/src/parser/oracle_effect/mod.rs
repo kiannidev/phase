@@ -13427,6 +13427,13 @@ fn lower_subject_predicate_ast(
                     let mut sub_ability =
                         AbilityDefinition::new(AbilityKind::Spell, clause.effect.clone());
                     sub_ability.sub_ability = clause.sub_ability;
+                    // CR 115.1d: an "up to N target" count on the moved-object
+                    // clause (Memory's Journey — "shuffles up to three target
+                    // cards from their graveyard …") belongs to the inner
+                    // ChangeZone slot, not the singular player `TargetOnly`
+                    // wrapper. Carry it onto the sub-ability so the cast
+                    // surfaces N card slots.
+                    sub_ability.multi_target = clause.multi_target;
                     return ParsedEffectClause {
                         effect: Effect::TargetOnly {
                             target: player_target.clone(),
@@ -45262,6 +45269,93 @@ mod tests {
             }
             other => panic!("expected Effect::ChangeZone, got {other:?}"),
         }
+    }
+
+    /// CR 115.2 + CR 608.2c: From the Rubble — "return target creature card of
+    /// the chosen type from your graveyard to the battlefield" must target
+    /// graveyard cards, not battlefield creatures.
+    #[test]
+    fn effect_from_the_rubble_chosen_type_graveyard_target() {
+        let e = parse_effect(
+            "return target creature card of the chosen type from your graveyard to the battlefield with a finality counter on it",
+        );
+        match e {
+            Effect::ChangeZone {
+                origin,
+                destination,
+                target,
+                enter_with_counters,
+                ..
+            } => {
+                assert_eq!(origin, Some(Zone::Graveyard));
+                assert_eq!(destination, Zone::Battlefield);
+                assert_eq!(target.extract_in_zone(), Some(Zone::Graveyard));
+                match target {
+                    TargetFilter::Typed(tf) => {
+                        assert!(tf.type_filters.contains(&TypeFilter::Creature));
+                        assert!(tf.properties.contains(&FilterProp::IsChosenCreatureType));
+                        assert!(tf.properties.iter().any(|p| matches!(
+                            p,
+                            FilterProp::InZone { zone } if *zone == Zone::Graveyard
+                        )));
+                    }
+                    other => panic!("expected typed graveyard target, got {other:?}"),
+                }
+                assert!(enter_with_counters.iter().any(|(ct, _)| {
+                    matches!(ct, CounterType::Generic(name) if name == "finality")
+                }));
+            }
+            other => panic!("expected Effect::ChangeZone, got {other:?}"),
+        }
+    }
+
+    /// CR 115.2: An already zone-qualified reanimation target ("return target
+    /// creature card from your graveyard to the battlefield") must NOT be
+    /// re-scoped by the inferred-origin pass. `parse_type_phrase` already parses
+    /// "from your graveyard" into `InZone { Graveyard }` plus a single owner
+    /// scope on the filter's `controller` field, so the candidate filter must
+    /// carry exactly one owner-`You` scope — guarding against the 905-card
+    /// double-`you control` parse-diff regression.
+    #[test]
+    fn effect_plain_graveyard_reanimation_target_not_double_scoped() {
+        let e = parse_effect("return target creature card from your graveyard to the battlefield");
+        let Effect::ChangeZone { target, .. } = e else {
+            panic!("expected Effect::ChangeZone, got {e:?}");
+        };
+        assert_eq!(
+            target.extract_in_zone(),
+            Some(Zone::Graveyard),
+            "the graveyard zone must be present exactly once"
+        );
+        let TargetFilter::Typed(tf) = target else {
+            panic!("expected typed graveyard target, got {target:?}");
+        };
+        let zone_count = tf
+            .properties
+            .iter()
+            .filter(|p| matches!(p, FilterProp::InZone { zone } if *zone == Zone::Graveyard))
+            .count();
+        assert_eq!(zone_count, 1, "the graveyard zone must not be duplicated");
+        // "from your graveyard" parses its owner into the `controller` field;
+        // re-adding an `Owned { You }` prop would render a second "you control".
+        // Total owner-`You` scopes (controller field + props) must be exactly one.
+        let owner_you_scopes = usize::from(tf.controller == Some(ControllerRef::You))
+            + tf.properties
+                .iter()
+                .filter(|p| {
+                    matches!(
+                        p,
+                        FilterProp::Owned {
+                            controller: ControllerRef::You
+                        }
+                    )
+                })
+                .count();
+        assert_eq!(
+            owner_you_scopes, 1,
+            "inferred-origin must not double-scope an already `from your graveyard` \
+             target; expected exactly one owner-`You` scope, found {owner_you_scopes}"
+        );
     }
 
     /// Collect all effects in a sub_ability chain into a flat Vec.

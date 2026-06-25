@@ -671,6 +671,8 @@ pub enum PreventionAmount {
     Next(u32),
     /// "Prevent all damage"
     All,
+    /// "Prevent all but N of that damage" (Temple Altisaur)
+    AllBut(u32),
 }
 
 /// CR 614.9: Recipient of a one-shot damage-redirection effect — the
@@ -1726,10 +1728,8 @@ impl ManaSpendRestriction {
     pub fn has_payable_branch(&self) -> bool {
         match self {
             // DEAD — no reachable production payment site makes the lowered gate
-            // return true today:
-            // CR 106.6: `OnlyForXCosts` is hardcoded `false` in both `allows_spell`
-            // and `allows_activation` (no {X}-in-cost data check at any call site).
-            ManaSpendRestriction::XCostOnly => false,
+            // return true today (except `XCostOnly`, live via `SpellMeta.has_x_in_cost`):
+            ManaSpendRestriction::XCostOnly => true,
             // CR 708.4: gate is `meta.is_face_down`, which `build_spell_meta` never
             // sets `true` at a payment site (no production path casts a spell face
             // down *through spell payment*), so the gate is never satisfied.
@@ -2495,6 +2495,13 @@ pub enum ControllerRef {
     /// Used by control-relative trigger restrictions
     /// ("an opponent who controls F draws a card").
     TriggeringPlayer,
+    /// CR 303.4b + CR 702.5a: Filter controller is the player the source Aura
+    /// is attached to ("enchanted player controls"). Resolved at runtime by
+    /// reading `source.attached_to` and extracting the `PlayerId` via
+    /// `AttachTarget::as_player`. Powers the Curse cycle (Trespasser's Curse,
+    /// Curse of Clinging Webs, Curse of the Restless Dead) where the trigger
+    /// watches objects controlled by the enchanted player.
+    EnchantedPlayer,
 }
 
 /// CR 301 / CR 303: Kinds of attachments to permanents.
@@ -4589,6 +4596,13 @@ pub enum ObjectProperty {
     Power,
     Toughness,
     ManaValue,
+    /// CR 107.4a + CR 202.1: The number of colored mana symbols of `color` in
+    /// this object's mana cost. Summed (via `QuantityRef::Aggregate`) over a
+    /// zone-scoped filter, this expresses chroma in any zone — "the number of
+    /// black mana symbols in the mana costs of cards in your graveyard" (Umbra
+    /// Stalker) is `Sum` of `ManaSymbolCount(Black)` over cards in your
+    /// graveyard. Hybrid symbols count for each of their colors (CR 107.4e).
+    ManaSymbolCount(ManaColor),
 }
 
 /// CR 701.13a + CR 608.2c: Termination predicate for an iterative exile-from-top
@@ -7270,6 +7284,15 @@ pub enum LibraryPosition {
     /// "second from the top", "third from the top", "seventh from the top"
     NthFromTop {
         n: u32,
+    },
+    /// CR 401.7: "just beneath the top N cards of that library" (Unexpectedly
+    /// Absent class), where N is resolved at resolution time — e.g. the spell's
+    /// announced `{X}`. The object is inserted at the 0-based index equal to the
+    /// resolved depth, i.e. with exactly `depth` cards left above it. Per CR
+    /// 401.7 a depth at or beyond the library size puts the card on the bottom
+    /// (clamped in `move_to_library_at_index`).
+    BeneathTop {
+        depth: QuantityExpr,
     },
 }
 
@@ -17271,7 +17294,7 @@ mod tests {
         assert!(ManaSpendRestriction::ActivateOnly.has_payable_branch());
 
         // DEAD: every lowered gate is hardcoded-false or never reached today.
-        assert!(!ManaSpendRestriction::XCostOnly.has_payable_branch());
+        assert!(ManaSpendRestriction::XCostOnly.has_payable_branch());
         assert!(!ManaSpendRestriction::FaceDownSpell.has_payable_branch());
         assert!(!ManaSpendRestriction::TurnPermanentFaceUp.has_payable_branch());
 

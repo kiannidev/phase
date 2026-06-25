@@ -731,9 +731,14 @@ pub(crate) fn controller_ref_player(
         }
         // CR 603.2 + CR 109.4: The player identified by the triggering event.
         ControllerRef::TriggeringPlayer => crate::game::quantity::triggering_event_player(state),
+        // CR 303.4b + CR 702.5a: The player the source Aura is attached to.
+        ControllerRef::EnchantedPlayer => state
+            .objects
+            .get(&source_id)
+            .and_then(|source| source.attached_to)
+            .and_then(|host| host.as_player()),
     }
 }
-
 /// Check if an object matches a typed TargetFilter against the given context.
 ///
 /// This is the unified entry point for filter evaluation. Build a
@@ -745,6 +750,60 @@ pub fn matches_target_filter(
     ctx: &FilterContext<'_>,
 ) -> bool {
     filter_inner(state, object_id, filter, ctx)
+}
+
+/// CR 701.20e + CR 608.2c: Look-then-cast chains publish cards via
+/// `last_revealed_ids` while the parser still binds later steps to
+/// `ExiledBySource`. When resolving those steps against library cards,
+/// treat the exile reference as `LastRevealed`.
+pub fn remap_exiled_by_source_for_looked_cards(filter: &TargetFilter) -> TargetFilter {
+    match filter {
+        TargetFilter::ExiledBySource => TargetFilter::LastRevealed,
+        TargetFilter::And { filters } => TargetFilter::And {
+            filters: filters
+                .iter()
+                .map(remap_exiled_by_source_for_looked_cards)
+                .collect(),
+        },
+        TargetFilter::Or { filters } => TargetFilter::Or {
+            filters: filters
+                .iter()
+                .map(remap_exiled_by_source_for_looked_cards)
+                .collect(),
+        },
+        TargetFilter::Not { filter } => TargetFilter::Not {
+            filter: Box::new(remap_exiled_by_source_for_looked_cards(filter)),
+        },
+        TargetFilter::TrackedSetFiltered {
+            id,
+            filter,
+            caused_by,
+        } => TargetFilter::TrackedSetFiltered {
+            id: *id,
+            filter: Box::new(remap_exiled_by_source_for_looked_cards(filter)),
+            caused_by: *caused_by,
+        },
+        other => other.clone(),
+    }
+}
+
+/// Library cards from `last_revealed_ids` matching a look-then-cast filter.
+pub fn last_revealed_library_ids_matching(
+    state: &GameState,
+    filter: &TargetFilter,
+    ctx: &FilterContext<'_>,
+) -> Vec<ObjectId> {
+    let looked_filter = remap_exiled_by_source_for_looked_cards(filter);
+    state
+        .last_revealed_ids
+        .iter()
+        .copied()
+        .filter(|id| {
+            state.objects.get(id).is_some_and(|obj| {
+                obj.zone == Zone::Library && matches_target_filter(state, *id, &looked_filter, ctx)
+            })
+        })
+        .collect()
 }
 
 /// CR 405.1 + CR 115.9b: Match filters against a spell or ability on the
@@ -887,6 +946,13 @@ fn stack_entry_controller_matches(
             crate::game::quantity::triggering_event_player(state)
                 .is_some_and(|pid| pid == entry_controller)
         }
+        // CR 303.4b: The player the source Aura is attached to.
+        Some(ControllerRef::EnchantedPlayer) => state
+            .objects
+            .get(&ctx.source_id)
+            .and_then(|source| source.attached_to)
+            .and_then(|host| host.as_player())
+            .is_some_and(|pid| pid == entry_controller),
     }
 }
 
@@ -1265,6 +1331,7 @@ pub fn matches_target_filter_on_lki_snapshot(
         is_token: false,
         combat_status: Default::default(),
         co_departed: Vec::new(),
+        attached_to: None,
         entered_incarnation: None,
         turn_zone_change_index: 0,
     };
@@ -1525,6 +1592,21 @@ fn filter_inner_for_object(
                     // the object's controller against the triggering player.
                     ControllerRef::TriggeringPlayer => {
                         match crate::game::quantity::triggering_event_player(state) {
+                            Some(pid) if pid == obj_ctrl => {}
+                            _ => return false,
+                        }
+                    }
+                    // CR 303.4b: "enchanted player controls" — match the
+                    // object's controller against the player the source Aura
+                    // is attached to.
+                    // CR 303.4b: Resolve enchanted player via source's attached_to.
+                    ControllerRef::EnchantedPlayer => {
+                        match state
+                            .objects
+                            .get(&source_id)
+                            .and_then(|source| source.attached_to)
+                            .and_then(|host| host.as_player())
+                        {
                             Some(pid) if pid == obj_ctrl => {}
                             _ => return false,
                         }
@@ -1886,6 +1968,21 @@ fn zone_change_filter_inner(
                             _ => return false,
                         }
                     }
+                    // CR 303.4b: "enchanted player controls" — match the
+                    // record's controller against the player the source Aura
+                    // is attached to.
+                    // CR 303.4b: Resolve enchanted player via source's attached_to.
+                    ControllerRef::EnchantedPlayer => {
+                        match state
+                            .objects
+                            .get(&source_id)
+                            .and_then(|source| source.attached_to)
+                            .and_then(|host| host.as_player())
+                        {
+                            Some(pid) if pid == record.controller => {}
+                            _ => return false,
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -2173,6 +2270,8 @@ pub fn spell_record_matches_filter(
                     // meaning for a spell-history record (no event context).
                     // Fail closed.
                     ControllerRef::TriggeringPlayer => return false,
+                    // CR 303.4b: Resolve enchanted player via source's attached_to.
+                    ControllerRef::EnchantedPlayer => return false,
                 }
             }
 
@@ -3288,6 +3387,8 @@ fn matches_filter_prop(
                     (Some(ControllerRef::ChosenPlayer { .. }), Some(pid)) => perm.controller == pid,
                     // CR 603.2 + CR 109.4: triggering-player-scoped name match.
                     (Some(ControllerRef::TriggeringPlayer), Some(pid)) => perm.controller == pid,
+                    // CR 303.4b: Resolve enchanted player via source's attached_to.
+                    (Some(ControllerRef::EnchantedPlayer), Some(pid)) => perm.controller == pid,
                     (Some(_), None) => false,
                     (None, _) => true,
                 };
@@ -3342,6 +3443,16 @@ fn matches_filter_prop(
                 crate::game::quantity::triggering_event_player(state)
                     .is_some_and(|pid| pid == obj.owner)
             }
+            // CR 303.4b: Resolve enchanted player via source's attached_to.
+            ControllerRef::EnchantedPlayer => controller_ref_player(
+                state,
+                source.id,
+                source.controller,
+                source.ability,
+                // CR 303.4b: Resolve enchanted player via source's attached_to.
+                &ControllerRef::EnchantedPlayer,
+            )
+            .is_some_and(|pid| pid == obj.owner),
         },
         // CR 303.4 + CR 301.5f: `EnchantedBy` is source-relative when the
         // source is an Aura ("enchanted creature gets +1/+1"). When the source
@@ -3956,6 +4067,11 @@ fn zone_change_record_matches_property(
             ControllerRef::TriggeringPlayer => {
                 crate::game::quantity::triggering_event_player(state).is_some_and(|pid| pid == record.owner)
             }
+            // CR 303.4b: Resolve enchanted player via source's attached_to.
+            ControllerRef::EnchantedPlayer => {
+                controller_ref_player(state, source.id, source.controller, source.ability, &ControllerRef::EnchantedPlayer)
+                    .is_some_and(|pid| pid == record.owner)
+            }
         },
         // CR 205.3e + CR 205.3m + CR 702.73a: Source's chosen creature type
         // applied to the snapshot subtypes, including changeling snapshots.
@@ -4184,6 +4300,16 @@ fn attachment_controller_matches(
             crate::game::quantity::triggering_event_player(state)
                 .is_some_and(|pid| pid == attachment_controller)
         }
+        // CR 303.4b: Resolve enchanted player via source's attached_to.
+        Some(ControllerRef::EnchantedPlayer) => controller_ref_player(
+            state,
+            source.id,
+            source.controller,
+            source.ability,
+            // CR 303.4b: Resolve enchanted player via source's attached_to.
+            &ControllerRef::EnchantedPlayer,
+        )
+        .is_some_and(|pid| pid == attachment_controller),
     }
 }
 
@@ -4755,6 +4881,8 @@ fn player_matches_target_filter_with(
             // CR 603.2 + CR 109.4: Triggering-player scope has no meaning
             // without event/game-state context here. Fail closed.
             Some(ControllerRef::TriggeringPlayer) => false,
+            // CR 303.4b: Resolve enchanted player via source's attached_to.
+            Some(ControllerRef::EnchantedPlayer) => false,
             None => true,
         },
         // Typed filters with type_filters don't match players
@@ -9324,6 +9452,7 @@ mod tests {
             is_token: false,
             combat_status: Default::default(),
             co_departed: Vec::new(),
+            attached_to: None,
             entered_incarnation: None,
             turn_zone_change_index: 0,
         };

@@ -1184,6 +1184,14 @@ pub(crate) enum PutImperativeAst {
     NthFromTop {
         n: u32,
     },
+    /// CR 401.7 (Unexpectedly Absent class): "into its owner's library just
+    /// beneath the top N cards of that library." The placed object ends with
+    /// exactly `depth` cards above it (0-based insertion index = resolved
+    /// `depth`). `depth` is a `QuantityExpr` so the count can be the spell's
+    /// announced `{X}` resolved at resolution time.
+    BeneathTop {
+        depth: QuantityExpr,
+    },
     /// CR 121.5: "put that many cards from the top of your library into your
     /// hand" moves library cards without drawing them (Scroll Rack).
     PutTopCardsIntoHandMatchingExileCount,
@@ -1244,10 +1252,16 @@ pub(crate) enum ShuffleImperativeAst {
     /// eligible object moves with no interactive choice (CR 400.6) and the move
     /// stamps `last_effect_count`; when `false` it emits a single
     /// `Effect::ChangeZone`.
+    ///
+    /// CR 115.1d: `multi_target` carries an "up to N target" count ("shuffle up
+    /// to three target cards from your graveyard into your library" — Memory's
+    /// Journey) so the lowering surfaces N target slots instead of one. `None`
+    /// for the single-target form; only meaningful when `all` is `false`.
     TargetedChangeZoneToLibrary {
         target: TargetFilter,
         origin: Option<Zone>,
         all: bool,
+        multi_target: Option<MultiTargetSpec>,
     },
     Unimplemented {
         text: String,

@@ -5035,6 +5035,55 @@ fn static_unlicensed_hearse_counts_cards_exiled_with_it() {
     );
 }
 
+/// CR 107.4a + CR 202.1 + CR 404.2: Umbra Stalker's graveyard-scope chroma CDA
+/// routes through `parse_static_line` → `parse_cda_quantity` →
+/// `parse_graveyard_chroma_ref` to produce SetDynamic{Power,Toughness} backed by
+/// `QuantityRef::Aggregate { Sum, ManaSymbolCount(Black), InZone{Graveyard} }`.
+/// The `Owned { You }` scope (not controller) is correct per CR 404.2: a
+/// graveyard belongs to its owner.
+#[test]
+fn static_umbra_stalker_graveyard_chroma_cda() {
+    let def = parse_static_line(
+        "Umbra Stalker's power and toughness are each equal to the number of black mana symbols \
+         in the mana costs of cards in your graveyard.",
+    )
+    .expect("graveyard chroma CDA must parse, not fall through to Unimplemented");
+
+    assert_eq!(def.mode, StaticMode::Continuous);
+    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+    assert!(def.characteristic_defining, "must be a CDA");
+    assert_eq!(
+        def.modifications.len(),
+        2,
+        "power + toughness modifications"
+    );
+
+    let expected_qty = QuantityExpr::Ref {
+        qty: QuantityRef::Aggregate {
+            function: AggregateFunction::Sum,
+            property: ObjectProperty::ManaSymbolCount(ManaColor::Black),
+            filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
+                FilterProp::Owned {
+                    controller: ControllerRef::You,
+                },
+                FilterProp::InZone {
+                    zone: Zone::Graveyard,
+                },
+            ])),
+        },
+    };
+
+    for m in &def.modifications {
+        match m {
+            ContinuousModification::SetDynamicPower { value }
+            | ContinuousModification::SetDynamicToughness { value } => {
+                assert_eq!(value, &expected_qty, "unexpected CDA quantity: {value:?}")
+            }
+            other => panic!("unexpected modification {other:?}"),
+        }
+    }
+}
+
 #[test]
 fn static_crackling_drake_counts_owned_instant_sorcery_exile_and_graveyard() {
     let def = parse_static_line(
@@ -20247,5 +20296,62 @@ fn will_scion_of_peace_activated_ability_parses_clean() {
         )),
         "granted static must reduce only white/blue spells, got {:?}",
         tf.properties
+    );
+}
+
+#[test]
+fn static_creatures_enchanted_player_controls_get_minus_1_minus_1() {
+    // CR 303.4b + CR 613.4c: Curse of Death's Hold — continuous P/T debuff
+    // scoped to the enchanted player's creatures. The subject "Creatures
+    // enchanted player controls" must parse into a creature TypedFilter with
+    // `ControllerRef::EnchantedPlayer`.
+    let def = parse_static_line("Creatures enchanted player controls get -1/-1.").unwrap();
+    assert_eq!(def.mode, StaticMode::Continuous);
+    assert!(matches!(
+        def.affected,
+        Some(TargetFilter::Typed(TypedFilter {
+            controller: Some(ControllerRef::EnchantedPlayer),
+            ..
+        }))
+    ));
+}
+
+#[test]
+fn static_creatures_target_player_controls_not_via_suffix_parser() {
+    // Negative test: "target player controls" must NOT be accepted by
+    // parse_static_controller_suffix (the restricted subject-suffix grammar).
+    // The full parse_static_line may still succeed via the parse_type_phrase
+    // fallback, but the controller must NOT originate from our suffix helper.
+    // We verify by checking parse_creature_subject_filter directly — it should
+    // return None for this subject since the suffix parser rejects TargetPlayer.
+    let result = parse_creature_subject_filter("Creatures target player controls");
+    assert!(
+        result.is_none(),
+        "parse_creature_subject_filter must not accept 'target player controls' as a controller suffix"
+    );
+}
+
+#[test]
+fn static_creatures_defending_player_controls_not_via_suffix_parser() {
+    // Negative test: "defending player controls" is combat-context only and
+    // must NOT be accepted by parse_static_controller_suffix.
+    let result = parse_creature_subject_filter("Creatures defending player controls");
+    assert!(
+        result.is_none(),
+        "parse_creature_subject_filter must not accept 'defending player controls' as a controller suffix"
+    );
+}
+#[test]
+fn static_creatures_enchanted_player_controls_attack_each_combat_if_able() {
+    // Curse of the Nightly Hunt: "Creatures enchanted player controls attack each combat if able."
+    // CR 508.1d + CR 303.4b: MustAttack scoped to the enchanted player.
+    let def = parse_static_line("Creatures enchanted player controls attack each combat if able.")
+        .unwrap();
+    assert_eq!(def.mode, StaticMode::MustAttack);
+    assert_eq!(
+        def.affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::creature().controller(ControllerRef::EnchantedPlayer)
+        ))
     );
 }

@@ -4451,23 +4451,33 @@ fn parse_prevent_effect(text: &str) -> Effect {
         nom_primitives::scan_preceded(rest, crate::parser::oracle_nom::duration::parse_duration)
             .map(|(_, d, _)| d);
 
-    // Determine amount: "all damage" vs "the next N damage"
-    let amount = if tag::<_, _, OracleError<'_>>("all ").parse(rest).is_ok() {
-        PreventionAmount::All
-    } else if let Ok((after_next, _)) = tag::<_, _, OracleError<'_>>("the next ").parse(rest) {
-        let n = nom_primitives::parse_number
-            .parse(after_next)
-            .map(|(_, n)| n)
-            .unwrap_or(1);
-        PreventionAmount::Next(n)
-    } else {
-        // Fallback: try to extract a number
-        let n = nom_primitives::parse_number
-            .parse(rest)
-            .map(|(_, n)| n)
-            .unwrap_or(1);
-        PreventionAmount::Next(n)
-    };
+    // Determine amount: "all damage" vs "all but N" vs "the next N damage".
+    // CR 615.1a: decompose the prevention amount from the LOCAL parser stream
+    // (`rest`, positioned just past "prevent ") with nom combinators. "all but "
+    // must be tried before the bare "all " arm because it shares that prefix.
+    let amount =
+        if let Ok((after_all_but, _)) = tag::<_, _, OracleError<'_>>("all but ").parse(rest) {
+            let n = nom_primitives::parse_number
+                .parse(after_all_but)
+                .map(|(_, n)| n)
+                .unwrap_or(1);
+            PreventionAmount::AllBut(n)
+        } else if tag::<_, _, OracleError<'_>>("all ").parse(rest).is_ok() {
+            PreventionAmount::All
+        } else if let Ok((after_next, _)) = tag::<_, _, OracleError<'_>>("the next ").parse(rest) {
+            let n = nom_primitives::parse_number
+                .parse(after_next)
+                .map(|(_, n)| n)
+                .unwrap_or(1);
+            PreventionAmount::Next(n)
+        } else {
+            // Fallback: try to extract a number
+            let n = nom_primitives::parse_number
+                .parse(rest)
+                .map(|(_, n)| n)
+                .unwrap_or(1);
+            PreventionAmount::Next(n)
+        };
 
     // CR 609.7 + CR 615.2: prevention scoped to a chosen source (a targeted
     // spell). "Prevent all damage target instant or sorcery spell would deal
@@ -4909,6 +4919,21 @@ pub(super) fn parse_put_ast(
         return Some(PutImperativeAst::BottomOfLibrary);
     }
 
+    // CR 401.7 (Unexpectedly Absent): "into its owner's library just beneath
+    // the top X cards of that library" — the placed permanent ends with exactly
+    // the named number of cards above it. The bare "X" is the spell's announced
+    // {X}, resolved at resolution time. The "where X is ..." rebinding forms
+    // (Quarry Colossus's Plains count, the die-roll cards) carry their own count
+    // source and stay out of scope, so a present "where x is" clause is skipped.
+    if take_until::<_, _, OracleError<'_>>("where x is")
+        .parse(lower)
+        .is_err()
+    {
+        if let Some(depth) = parse_beneath_top_depth(lower) {
+            return Some(PutImperativeAst::BeneathTop { depth });
+        }
+    }
+
     // "put X into Y's library Nth from the top" —
     // specific positional placement (God-Eternals, Approach, Bury in Books).
     if let Ok((_, before_from)) = take_until::<_, _, OracleError<'_>>("from the top").parse(lower) {
@@ -5006,6 +5031,38 @@ pub(super) fn parse_put_ast(
     }
 
     None
+}
+
+/// Extract the depth N from a "...beneath the top N cards..." clause (CR
+/// 401.7). The bare "X" form resolves to the spell's announced `{X}` via
+/// `QuantityRef::Variable { name: "X" }`; an explicit integer yields a literal.
+/// Any other phrasing returns `None` so the clause falls through unchanged.
+fn parse_beneath_top_depth(lower: &str) -> Option<QuantityExpr> {
+    // Combinator scan to the depth token: "...beneath the top <DEPTH> cards...".
+    let (rest, _) = take_until::<_, _, OracleError<'_>>("beneath the top ")
+        .parse(lower)
+        .ok()?;
+    let (_, depth_token) = preceded(
+        tag::<_, _, OracleError<'_>>("beneath the top "),
+        take_until::<_, _, OracleError<'_>>(" cards"),
+    )
+    .parse(rest)
+    .ok()?;
+    // `all_consuming` keeps the bare "X" / literal-integer arms from matching a
+    // longer token (e.g. "xenagos") — the whole depth token must be the count.
+    all_consuming(alt((
+        map(tag::<_, _, OracleError<'_>>("x"), |_| QuantityExpr::Ref {
+            qty: QuantityRef::Variable {
+                name: "X".to_string(),
+            },
+        }),
+        map(nom::character::complete::i32, |value| QuantityExpr::Fixed {
+            value,
+        }),
+    )))
+    .parse(depth_token)
+    .ok()
+    .map(|(_, expr)| expr)
 }
 
 pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
@@ -5125,6 +5182,11 @@ pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
             target: TargetFilter::Any,
             count: QuantityExpr::Fixed { value: 1 },
             position: LibraryPosition::NthFromTop { n },
+        },
+        PutImperativeAst::BeneathTop { depth } => Effect::PutAtLibraryPosition {
+            target: TargetFilter::Any,
+            count: QuantityExpr::Fixed { value: 1 },
+            position: LibraryPosition::BeneathTop { depth },
         },
         PutImperativeAst::PutTopCardsIntoHandMatchingExileCount => Effect::Mill {
             count: QuantityExpr::Ref {
@@ -5592,6 +5654,12 @@ pub(super) fn parse_shuffle_ast(text: &str, lower: &str) -> Option<ShuffleImpera
                 value((), alt((tag("all "), tag("each ")))).parse(input)
             })
             .is_some();
+            // CR 115.1d: "shuffle up to N target cards from <zone> into <library>"
+            // (Memory's Journey) carries an "up to N" count on the target slot.
+            // Recover it as a `MultiTargetSpec` so the lowering surfaces N slots;
+            // `parse_target` itself strips the quantifier and only returns the
+            // filter. The mass-move (`all`) form ignores it.
+            let (_, multi_target) = super::strip_optional_target_prefix(after_shuffle);
             let (target, _) = parse_target(after_shuffle);
             let origin = if nom_primitives::scan_contains(lower, "graveyard") {
                 Some(Zone::Graveyard)
@@ -5606,6 +5674,7 @@ pub(super) fn parse_shuffle_ast(text: &str, lower: &str) -> Option<ShuffleImpera
                 target,
                 origin,
                 all,
+                multi_target: if all { None } else { multi_target },
             });
         }
     }
@@ -5688,6 +5757,7 @@ pub(super) fn lower_shuffle_ast(ast: ShuffleImperativeAst) -> ParsedEffectClause
             target,
             origin,
             all,
+            multi_target,
         } => {
             // CR 400.6: "shuffle all <filter> from <zone> into your library"
             // (Elixir) is a mandatory mass move of every eligible object — no
@@ -5722,7 +5792,11 @@ pub(super) fn lower_shuffle_ast(ast: ShuffleImperativeAst) -> ParsedEffectClause
                     enter_with_counters: vec![],
                     face_down_profile: None,
                 };
-                with_shuffle_sub_ability(effect)
+                // CR 115.1d: propagate the "up to N target" count so the cast
+                // surfaces N target slots (Memory's Journey: up to three).
+                let mut clause = with_shuffle_sub_ability(effect);
+                clause.multi_target = multi_target;
+                clause
             }
         }
         ShuffleImperativeAst::Unimplemented { text } => parsed_clause(Effect::Unimplemented {
@@ -14471,6 +14545,47 @@ mod tests {
                 panic!("Expected ChangeZoneToLibrary with EnchantedBy target, got {other:?}")
             }
         }
+    }
+
+    /// Issue #4255 — Memory's Journey: "Target player shuffles up to three
+    /// target cards from their graveyard into their library." The "up to three
+    /// target cards" count must survive onto the `ChangeZone` ability as a
+    /// `MultiTargetSpec` so the cast surfaces three target slots rather than
+    /// one. CR 115.1d. Drives the full `parse_effect_chain` pipeline (subject
+    /// shift → shuffle imperative → lowering) and fails if the count is dropped.
+    #[test]
+    fn memorys_journey_up_to_three_targets_survives_to_change_zone() {
+        let def = super::super::parse_effect_chain(
+            "Target player shuffles up to three target cards from their graveyard into their library.",
+            AbilityKind::Spell,
+        );
+
+        // Walk the sub_ability chain to the ChangeZone(Library) link.
+        fn find_change_zone_multi_target(
+            def: &AbilityDefinition,
+        ) -> Option<Option<MultiTargetSpec>> {
+            if matches!(
+                &*def.effect,
+                Effect::ChangeZone {
+                    destination: Zone::Library,
+                    ..
+                }
+            ) {
+                return Some(def.multi_target.clone());
+            }
+            def.sub_ability
+                .as_deref()
+                .and_then(find_change_zone_multi_target)
+        }
+
+        let multi_target = find_change_zone_multi_target(&def).unwrap_or_else(|| {
+            panic!("expected a ChangeZone(Library) link in the chain, got {def:?}")
+        });
+        assert_eq!(
+            multi_target,
+            Some(MultiTargetSpec::up_to(QuantityExpr::Fixed { value: 3 })),
+            "the 'up to three target cards' count must surface as a MultiTargetSpec"
+        );
     }
 
     /// CR 400.7 + CR 701.23: Multi-zone same-name exile combinator covers

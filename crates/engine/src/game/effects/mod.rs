@@ -3430,6 +3430,20 @@ fn affected_objects_from_events(
             })
             .flat_map(|ids| ids.iter().copied())
             .collect(),
+        // CR 701.20b: reveal-only RevealUntil (Sanar) publishes the full revealed
+        // pile from `CardsRevealed` — no zone changes occurred.
+        Effect::RevealUntil {
+            kept_destination: Zone::Library,
+            rest_destination: Zone::Library,
+            ..
+        } => events
+            .iter()
+            .filter_map(|event| match event {
+                GameEvent::CardsRevealed { card_ids, .. } => Some(card_ids.as_slice()),
+                _ => None,
+            })
+            .flat_map(|ids| ids.iter().copied())
+            .collect(),
         _ => {
             let dest_zone = match effect {
                 Effect::ChangeZone { destination, .. }

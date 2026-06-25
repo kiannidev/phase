@@ -6907,8 +6907,17 @@ fn parse_damage_prevention_replacement(
     // CR 615.7: "prevent the next N damage" → specific shield amount
     // CR 615.1a: "prevent all but N of that damage" → leave N through (Temple Altisaur)
     // CR 615.1a: "prevent all damage" → prevent everything
-    let amount = if let Some(rest) = strip_after(working_lower, "prevent all but ") {
-        let (n, _) = parse_number(rest)?;
+    //
+    // CR 615.1a: Decompose "all but <number>" from the local position
+    // immediately following the "prevent " verb rather than scanning the whole
+    // clause, so a sibling phrase elsewhere in the text can't be mis-bound as
+    // the amount. The bare "all" arm below must stay ordered after this one
+    // because it shares the "all" prefix.
+    let after_prevent = strip_after(working_lower, "prevent ");
+    let amount = if let Some((after_all_but, _)) =
+        after_prevent.and_then(|s| tag::<_, _, OracleError<'_>>("all but ").parse(s).ok())
+    {
+        let (n, _) = parse_number(after_all_but)?;
         PreventionAmount::AllBut(n)
     } else if nom_primitives::scan_contains(working_lower, "prevent all") {
         PreventionAmount::All

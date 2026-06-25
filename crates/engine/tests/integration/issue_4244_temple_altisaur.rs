@@ -32,7 +32,7 @@ fn damage_ability(
 #[test]
 fn temple_altisaur_prevents_all_but_one_to_other_dinosaurs_you_control() {
     let mut scenario = GameScenario::new();
-    let _temple = scenario
+    let temple = scenario
         .add_creature_from_oracle(P0, "Temple Altisaur", 3, 4, TEMPLE_ALTISAUR)
         .id();
     let ally_dino = scenario
@@ -42,7 +42,7 @@ fn temple_altisaur_prevents_all_but_one_to_other_dinosaurs_you_control() {
     let source = scenario.add_creature(P1, "Damage Source", 5, 5).id();
     let mut runner = scenario.build();
 
-    let repl = &runner.state().objects[&_temple].replacement_definitions[0];
+    let repl = &runner.state().objects[&temple].replacement_definitions[0];
     assert!(
         matches!(
             repl.shield_kind,
@@ -56,11 +56,10 @@ fn temple_altisaur_prevents_all_but_one_to_other_dinosaurs_you_control() {
     let valid_card = repl.valid_card.as_ref().expect("recipient filter required");
     match valid_card {
         TargetFilter::Typed(tf) => {
-            assert!(
-                tf.type_filters
-                    .iter()
-                    .any(|t| matches!(t, TypeFilter::Subtype(s) if s == "Dinosaur"))
-            );
+            assert!(tf
+                .type_filters
+                .iter()
+                .any(|t| matches!(t, TypeFilter::Subtype(s) if s == "Dinosaur")));
             assert!(tf.properties.contains(&FilterProp::Another));
         }
         other => panic!("expected typed dinosaur recipient filter, got {other:?}"),
@@ -98,5 +97,26 @@ fn temple_altisaur_prevents_all_but_one_to_other_dinosaurs_you_control() {
         runner.life(P0),
         p0_life_before - 5,
         "Temple Altisaur must not reduce damage dealt to players"
+    );
+
+    // CR 615.1a: the "another Dinosaur" restriction excludes Temple Altisaur
+    // itself, so damage dealt to the Temple is taken in full.
+    let mut events = Vec::new();
+    deal_damage::resolve(
+        runner.state_mut(),
+        &damage_ability(source, TargetRef::Object(temple), 5),
+        &mut events,
+    )
+    .expect("damage to Temple Altisaur itself resolves");
+    assert_eq!(
+        runner.state().objects[&temple].damage_marked,
+        5,
+        "Temple Altisaur must not prevent damage dealt to itself (\"another\")"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, GameEvent::DamagePrevented { .. })),
+        "no damage should be prevented when the Temple itself is the recipient"
     );
 }

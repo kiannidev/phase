@@ -1072,59 +1072,19 @@ fn damage_done_applier(
                         applied,
                     });
                 }
-                PreventionAmount::AllBut(keep) => {
-                    let redirected_amount = damage_amount.saturating_sub(keep);
-                    if redirected_amount == 0 {
-                        return ApplyResult::Modified(ProposedEvent::Damage {
-                            source_id,
-                            target,
-                            amount: damage_amount,
-                            is_combat,
-                            applied,
-                        });
-                    }
-                    consume_prevention_shield(state, rid, None);
-                    if let Some(new_target) = new_recipient.filter(|_| redirected_amount > 0) {
-                        let redirected_event = ProposedEvent::Damage {
-                            source_id,
-                            target: new_target,
-                            amount: redirected_amount,
-                            is_combat,
-                            applied: applied.clone(),
-                        };
-                        match replace_event(state, redirected_event, events) {
-                            ReplacementResult::Execute(event) => {
-                                let ctx = super::effects::deal_damage::DamageContext::from_source(
-                                    state, source_id,
-                                )
-                                .unwrap_or_else(|| {
-                                    let controller = state
-                                        .objects
-                                        .get(&source_id)
-                                        .map(|obj| obj.controller)
-                                        .unwrap_or(PlayerId(0));
-                                    super::effects::deal_damage::DamageContext::fallback(
-                                        source_id, controller,
-                                    )
-                                });
-                                let _ = super::effects::deal_damage::apply_damage_after_replacement(
-                                    state, &ctx, event, is_combat, events,
-                                );
-                            }
-                            ReplacementResult::Prevented => {}
-                            ReplacementResult::NeedsChoice(_) => {
-                                state.pending_replacement = None;
-                            }
-                        }
-                    }
-                    let remaining_amount = damage_amount.saturating_sub(redirected_amount);
-                    return ApplyResult::Modified(ProposedEvent::Damage {
-                        source_id,
-                        target,
-                        amount: remaining_amount,
-                        is_combat,
-                        applied,
-                    });
+                PreventionAmount::AllBut(_) => {
+                    // CR 615.1a vs CR 614.9: `AllBut` is exclusively a *prevention*
+                    // amount ("prevent all but N damage", Temple Altisaur) and is
+                    // never produced for a redirection shield — `redirection_shield`
+                    // defaults a missing amount to `PreventionAmount::All` and every
+                    // other redirect constructor uses `PreventionAmount::Next`.
+                    // Inventing a partial-redirect rule here would violate CR 614.9
+                    // (an illegal recipient must make the redirection do nothing
+                    // rather than silently drop the excess), so this state is
+                    // treated as impossible rather than guessed at.
+                    unreachable!(
+                        "PreventionAmount::AllBut is never assigned to a ShieldKind::Redirection"
+                    )
                 }
                 PreventionAmount::Next(n) => {
                     let redirected_amount = damage_amount.min(n);
@@ -1258,8 +1218,13 @@ fn damage_done_applier(
                     }
                 }
                 PreventionAmount::AllBut(keep) => {
-                    // CR 615.1a: "Prevent all but N" — continuous shield like
-                    // `All`, but only the excess above `keep` is prevented.
+                    // CR 615.1a + CR 615.6: "Prevent all but N damage" is a
+                    // continuous prevention shield like `All`, but only the
+                    // excess above `keep` is prevented; the first `keep` points
+                    // of each damage event are still dealt. Like `All`, it is
+                    // duration-bound (not depletion-based per CR 615.7), so the
+                    // shield is never consumed here and re-fires for every damage
+                    // event within its lifetime.
                     let remaining_damage = dmg.min(keep);
                     prevented_amount = dmg.saturating_sub(remaining_damage);
                     if prevented_amount == 0 {

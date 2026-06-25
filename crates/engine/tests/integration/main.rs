@@ -49,6 +49,7 @@ mod copy_token_except_keyword_and_quoted_ability;
 mod council_of_four_nth_per_turn;
 mod counter_double_redirect_choice;
 mod counter_spell_zone_redirect;
+mod court_of_cunning_multi_target_mill;
 mod cr_annotations;
 mod craft_tithing_blade_transform;
 mod crossway_troublemakers_attacking_keywords;

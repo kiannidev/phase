@@ -6018,12 +6018,14 @@ fn alternative_spell_layout(obj: &crate::game::game_object::GameObject) -> Optio
     }
 }
 
-/// CR 709.3 / CR 709.3a-b: Split cards whose two faces are both spells
-/// (Life // Death, etc.) require a cast-time face choice — the same player
-/// decision as spell//spell MDFCs. Fuse split cards (Breaking // Entering) keep
+/// CR 709.3 / CR 709.3a-b: Split cards whose two faces are both castable
+/// require a cast-time face choice — the same player decision as spell//spell
+/// MDFCs. This covers spell//spell splits (Life // Death) and Room split
+/// enchantments (Spiked Corridor // Torture Pit), whose halves are both cast as
+/// the Room enchantment (CR 709.3) — without the choice only the front half
+/// (left door) is ever reachable. Fuse split cards (Breaking // Entering) keep
 /// the existing `CastingVariant::Fuse` prompt instead.
 fn split_spell_face_choice_available(obj: &crate::game::game_object::GameObject) -> bool {
-    use crate::types::card_type::CoreType;
     let Some(back) = obj.back_face.as_ref() else {
         return false;
     };
@@ -6037,13 +6039,20 @@ fn split_spell_face_choice_available(obj: &crate::game::game_object::GameObject)
     {
         return false;
     }
-    let face_is_castable_spell = |types: &crate::types::card_type::CardType| {
-        types
-            .core_types
-            .iter()
-            .any(|ct| matches!(ct, CoreType::Instant | CoreType::Sorcery))
-    };
-    face_is_castable_spell(&obj.card_types) && face_is_castable_spell(&back.card_types)
+    is_castable_split_face(&obj.card_types) && is_castable_split_face(&back.card_types)
+}
+
+/// CR 709.3: A split-card face is independently castable when it is an
+/// instant/sorcery spell or a Room enchantment half (each Room door is a
+/// separately castable enchantment spell, CR 709.3 / CR 709.5c).
+fn is_castable_split_face(types: &crate::types::card_type::CardType) -> bool {
+    use crate::types::card_type::CoreType;
+    types
+        .core_types
+        .iter()
+        .any(|ct| matches!(ct, CoreType::Instant | CoreType::Sorcery))
+        || (types.core_types.contains(&CoreType::Enchantment)
+            && types.subtypes.iter().any(|s| s == "Room"))
 }
 
 /// CR 712.11b + CR 709.3: Cast-time face choice for spell//spell MDFCs and
@@ -11716,6 +11725,24 @@ fn find_waterbend_cost(cost: &AbilityCost) -> Option<&ManaCost> {
     match cost {
         AbilityCost::Waterbend { cost } => Some(cost),
         AbilityCost::Composite { costs } => costs.iter().find_map(find_waterbend_cost),
+        _ => None,
+    }
+}
+
+/// Walk a cost tree and return the first static `AbilityCost::Mana` leg's
+/// `ManaCost`, if any. Mirrors `find_waterbend_cost` /
+/// `find_non_self_sacrifice_cost`.
+///
+/// Deliberate scope limit (CR 118.4): only `AbilityCost::Mana` (a fully static
+/// `ManaCost`) is matched. `AbilityCost::ManaDynamic` (X-cost) returns `None`,
+/// so an X-cost composite falls through to the unchanged over-approximation in
+/// `can_pay`'s supplemental witness check — no regression, intentional. For a
+/// composite with multiple `Mana` legs, `find_map` returns the first; no
+/// in-scope conditional-mana card has two independent static `Mana` legs.
+pub(super) fn composite_mana_leg(cost: &AbilityCost) -> Option<&ManaCost> {
+    match cost {
+        AbilityCost::Mana { cost } => Some(cost),
+        AbilityCost::Composite { costs } => costs.iter().find_map(composite_mana_leg),
         _ => None,
     }
 }

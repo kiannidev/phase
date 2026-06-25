@@ -364,6 +364,7 @@ mod issue_4244_temple_altisaur;
 mod issue_4245_intruder_alarm_untap;
 mod issue_4247_well_rested;
 mod issue_4249_elspeth_divine_visitation;
+mod issue_4250_octavia_cost_reduction;
 mod issue_4271_birthing_ritual_cmc_filter;
 mod issue_4272_birthing_ritual_etb_triggers;
 mod issue_536_six_grants_retrace;

@@ -9,7 +9,8 @@
 //! CR 603.3d + CR 601.2c: the upkeep trigger's controller chooses any number
 //! of target players as the ability goes on the stack.
 //! CR 101.4 + CR 608.2c: the effect resolves once per chosen player.
-//! CR 614.1 ("instead") + CR 603.4 monarch designation (CR 725).
+//! CR 614.1 + CR 608.2c: the "mills ten instead" rider replaces the mill
+//! during resolution. CR 725: monarch designation gates that rider.
 
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::types::ability::TargetRef;

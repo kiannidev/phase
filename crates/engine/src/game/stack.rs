@@ -1813,24 +1813,20 @@ fn observer_candidates_are_inert(
 ) -> bool {
     let event_keys = crate::game::trigger_index::keys_from_event(event, state);
     for candidate in candidates.iter().copied() {
-        let Some(triggers) = state.objects.get(&candidate).map(|obj| {
-            obj.trigger_definitions
-                .iter_all()
-                .cloned()
-                .enumerate()
-                .collect::<Vec<_>>()
+        let Some((controller, triggers)) = state.objects.get(&candidate).map(|obj| {
+            (
+                obj.controller,
+                obj.trigger_definitions
+                    .iter_all()
+                    .cloned()
+                    .enumerate()
+                    .collect::<Vec<_>>(),
+            )
         }) else {
             continue;
         };
 
         for (trigger_index, trigger) in triggers {
-            let controller = {
-                let obj = state
-                    .objects
-                    .get(&candidate)
-                    .expect("candidate object must still exist");
-                super::triggers::trigger_controller_for_object(state, obj, trigger_index, &trigger)
-            };
             let (trigger_keys, unclassified) =
                 crate::game::trigger_index::keys_from_trigger_def(&trigger);
             if !unclassified && !trigger_keys.iter().any(|key| event_keys.contains(key)) {

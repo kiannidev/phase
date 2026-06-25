@@ -1,5 +1,6 @@
-//! Regression for issue #4247: Well Rested's granted untap trigger must be
-//! controlled by the Aura's controller, not the enchanted creature's owner.
+//! Regression for issue #4247: Well Rested's granted untap trigger is
+//! controlled by the *enchanted creature's* controller, not the Aura's
+//! controller.
 //!
 //! Oracle text:
 //!   Enchant creature
@@ -7,9 +8,15 @@
 //!   +1/+1 counters on it, then you gain 2 life and draw a card. This ability
 //!   triggers only once each turn."
 //!
-//! CR 303.4e: an Aura's controller is separate from its enchanted permanent's
-//! controller, so P0 must draw and gain life when P0's Well Rested is attached
-//! to a creature P1 controls.
+//! CR 109.5 + CR 113.7/113.8 + CR 603.3a: a triggered ability's controller is
+//! the player who controlled its source when it triggered. The granted ability
+//! is an ability *of the enchanted creature*, so the enchanted creature's
+//! controller is the "you" that gains life and draws — even when an opponent
+//! controls the Aura. CR 303.4e only carves out *activated* abilities for the
+//! Aura's controller; granted triggered abilities follow the host.
+//!
+//! So with P0's Well Rested attached to P1's creature, P1 (the host's
+//! controller) gains life and draws; P0 (the Aura's controller) does not.
 
 use engine::game::game_object::AttachTarget;
 use engine::game::layers::evaluate_layers;
@@ -24,10 +31,11 @@ const WELL_RESTED_ORACLE: &str = "Enchant creature\nEnchanted creature has \
 then you gain 2 life and draw a card. This ability triggers only once each turn.\"";
 
 #[test]
-fn well_rested_granted_untap_trigger_routes_to_aura_controller() {
+fn well_rested_granted_untap_trigger_routes_to_host_controller() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    scenario.with_library_top(P0, &["Forest"]);
+    // The host's controller (P1) is the "you" that draws — seed P1's library.
+    scenario.with_library_top(P1, &["Forest"]);
 
     let host = scenario.add_creature(P1, "Grizzly Bears", 2, 2).id();
     let well_rested = {
@@ -40,6 +48,7 @@ fn well_rested_granted_untap_trigger_routes_to_aura_controller() {
 
     let mut runner = scenario.build();
 
+    // Attach P0's Well Rested to P1's creature.
     {
         let state = runner.state_mut();
         let aura_obj = state.objects.get_mut(&well_rested).unwrap();
@@ -67,23 +76,23 @@ fn well_rested_granted_untap_trigger_routes_to_aura_controller() {
     runner.advance_until_stack_empty();
 
     assert_eq!(
-        runner.life(P0),
-        p0_life_before + 2,
-        "Well Rested's controller (P0) must gain 2 life from the granted trigger"
-    );
-    assert_eq!(
-        runner.state().players[0].hand.len(),
-        p0_hand_before + 1,
-        "Well Rested's controller (P0) must draw from the granted trigger"
-    );
-    assert_eq!(
         runner.life(P1),
-        p1_life_before,
-        "the enchanted creature's controller (P1) must not gain life"
+        p1_life_before + 2,
+        "the enchanted creature's controller (P1) is the granted ability's \"you\" and gains 2 life"
     );
     assert_eq!(
         runner.state().players[1].hand.len(),
-        p1_hand_before,
-        "the enchanted creature's controller (P1) must not draw"
+        p1_hand_before + 1,
+        "the enchanted creature's controller (P1) draws from the granted trigger"
+    );
+    assert_eq!(
+        runner.life(P0),
+        p0_life_before,
+        "the Aura's controller (P0) must NOT gain life from a granted triggered ability (CR 303.4e)"
+    );
+    assert_eq!(
+        runner.state().players[0].hand.len(),
+        p0_hand_before,
+        "the Aura's controller (P0) must NOT draw from a granted triggered ability"
     );
 }

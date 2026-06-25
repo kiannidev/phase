@@ -4589,6 +4589,13 @@ pub enum ObjectProperty {
     Power,
     Toughness,
     ManaValue,
+    /// CR 107.4a + CR 202.1: The number of colored mana symbols of `color` in
+    /// this object's mana cost. Summed (via `QuantityRef::Aggregate`) over a
+    /// zone-scoped filter, this expresses chroma in any zone — "the number of
+    /// black mana symbols in the mana costs of cards in your graveyard" (Umbra
+    /// Stalker) is `Sum` of `ManaSymbolCount(Black)` over cards in your
+    /// graveyard. Hybrid symbols count for each of their colors (CR 107.4e).
+    ManaSymbolCount(ManaColor),
 }
 
 /// CR 701.13a + CR 608.2c: Termination predicate for an iterative exile-from-top

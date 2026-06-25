@@ -1237,6 +1237,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 ObjectProperty::Power => "power",
                 ObjectProperty::Toughness => "toughness",
                 ObjectProperty::ManaValue => "mana value",
+                ObjectProperty::ManaSymbolCount(_) => "mana symbols",
             };
             format!("{func} {prop} of {}", fmt_target(filter))
         }
@@ -1332,6 +1333,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 ObjectProperty::Power => "power",
                 ObjectProperty::Toughness => "toughness",
                 ObjectProperty::ManaValue => "mana value",
+                ObjectProperty::ManaSymbolCount(_) => "mana symbols",
             };
             format!("{func} {prop} of those cards")
         }
@@ -2751,6 +2753,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
                                 ObjectProperty::Power => "power",
                                 ObjectProperty::Toughness => "toughness",
                                 ObjectProperty::ManaValue => "mana value",
+                                ObjectProperty::ManaSymbolCount(_) => "mana symbols",
                             },
                             match comparator {
                                 crate::types::ability::Comparator::GE => "≥",

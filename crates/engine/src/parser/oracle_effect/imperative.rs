@@ -1665,6 +1665,7 @@ pub(super) fn parse_targeted_action_ast(
         };
         let is_mass = is_mass || count.is_some();
         let origin = super::infer_origin_zone(rest_lower);
+        let target = super::add_inferred_origin_constraints_to_target(target, origin, rest_lower);
 
         // CR 400.7: Single-object battlefield destinations use ChangeZone;
         // mass destinations use ChangeZoneAll. Only pure mass-bounce

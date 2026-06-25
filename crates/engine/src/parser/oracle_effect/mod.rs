@@ -45271,6 +45271,44 @@ mod tests {
         }
     }
 
+    /// CR 400.7 + CR 608.2c: From the Rubble — "return target creature card of
+    /// the chosen type from your graveyard to the battlefield" must target
+    /// graveyard cards, not battlefield creatures.
+    #[test]
+    fn effect_from_the_rubble_chosen_type_graveyard_target() {
+        let e = parse_effect(
+            "return target creature card of the chosen type from your graveyard to the battlefield with a finality counter on it",
+        );
+        match e {
+            Effect::ChangeZone {
+                origin,
+                destination,
+                target,
+                enter_with_counters,
+                ..
+            } => {
+                assert_eq!(origin, Some(Zone::Graveyard));
+                assert_eq!(destination, Zone::Battlefield);
+                assert_eq!(target.extract_in_zone(), Some(Zone::Graveyard));
+                match target {
+                    TargetFilter::Typed(tf) => {
+                        assert!(tf.type_filters.contains(&TypeFilter::Creature));
+                        assert!(tf.properties.contains(&FilterProp::IsChosenCreatureType));
+                        assert!(tf.properties.iter().any(|p| matches!(
+                            p,
+                            FilterProp::InZone { zone } if *zone == Zone::Graveyard
+                        )));
+                    }
+                    other => panic!("expected typed graveyard target, got {other:?}"),
+                }
+                assert!(enter_with_counters.iter().any(|(ct, _)| {
+                    matches!(ct, CounterType::Generic(name) if name == "finality")
+                }));
+            }
+            other => panic!("expected Effect::ChangeZone, got {other:?}"),
+        }
+    }
+
     /// Collect all effects in a sub_ability chain into a flat Vec.
     fn collect_chain_effects(def: &AbilityDefinition) -> Vec<&Effect> {
         let mut effects = vec![&*def.effect];

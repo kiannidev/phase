@@ -2263,6 +2263,17 @@ pub fn parse_type_phrase_with_ctx<'a>(
         pos += remaining_offset + of_chosen_len;
     }
 
+    // CR 400.7: Zone phrases may trail "of the chosen type" ("target creature
+    // card of the chosen type from your graveyard", From the Rubble). The
+    // primary `parse_zone_suffix` arm above runs before this suffix.
+    if let Some((zone_props, zone_ctrl, consumed)) = parse_zone_suffix(&lower[pos..]) {
+        properties.extend(zone_props);
+        pos += consumed;
+        if controller.is_none() {
+            controller = zone_ctrl;
+        }
+    }
+
     let mut exclude_chosen_type = false;
     let mut exclude_owned_by_controller: Option<ControllerRef> = None;
     let remaining_not_owned = lower[pos..].trim_start();

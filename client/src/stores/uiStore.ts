@@ -337,12 +337,15 @@ export const useUiStore = create<UiStore>()((set, get) => ({
       if (pendingClearTimer != null) return; // already scheduled
       pendingClearTimer = setTimeout(() => {
         pendingClearTimer = null;
-        // Suppress clear only if cursor is over the preview panel itself, so Alt-mode
-        // reading of the parsed abilities panel isn't dismissed when mousing onto it.
-        // We intentionally do NOT suppress when cursor is over another card-hover: the
-        // next card's onMouseEnter already cancels this timer via the id != null branch.
+        // Suppress clear when the cursor is over the preview panel (Alt-mode
+        // reading) or still over a card tile after a spurious mouseleave.
         const el = document.elementFromPoint(lastPointer.x, lastPointer.y);
         if (el?.closest("[data-card-preview]")) return;
+        // Spurious mouseleave from layout shifts (common with follow-cursor
+        // preview + hover delay) should not dismiss while the cursor is still
+        // over a card tile — the next card's mouseenter cancels this timer via
+        // the id != null branch when actually moving between cards.
+        if (el?.closest("[data-card-hover]")) return;
         set({ inspectedObjectId: null, inspectedFaceIndex: 0, previewSticky: false, altHeld: false });
       }, 50);
     }

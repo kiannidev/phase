@@ -1,5 +1,5 @@
 import { act } from "react";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { useUiStore } from "../uiStore";
 
@@ -95,5 +95,21 @@ describe("uiStore", () => {
     expect(useUiStore.getState().autoPass).toBe(false);
     act(() => useUiStore.getState().toggleAutoPass());
     expect(useUiStore.getState().autoPass).toBe(true);
+  });
+
+  it("inspectObject deferred clear keeps preview when cursor remains on card-hover", async () => {
+    const card = document.createElement("div");
+    card.setAttribute("data-card-hover", "");
+    document.body.appendChild(card);
+    vi.spyOn(document, "elementFromPoint").mockReturnValue(card);
+
+    act(() => useUiStore.getState().inspectObject(99));
+    act(() => useUiStore.getState().inspectObject(null));
+
+    await new Promise((r) => setTimeout(r, 60));
+    expect(useUiStore.getState().inspectedObjectId).toBe(99);
+
+    card.remove();
+    vi.restoreAllMocks();
   });
 });

@@ -16,9 +16,10 @@ use crate::game::filter::{
 use crate::game::speed::effective_speed;
 use crate::types::ability::{
     AggregateFunction, AttackScope, BasicLandType, CardTypeSetSource, CastManaObjectScope,
-    CastManaSpentMetric, ControllerRef, CountScope, FilterProp, ObjectProperty, ObjectScope,
-    PlayerFilter, PlayerScope, QuantityExpr, QuantityRef, ResolvedAbility, RoundingMode,
-    TargetFilter, TargetRef, TypeFilter, TypedFilter, ZoneRef,
+    CastManaSpentMetric, ContinuousModification, ControllerRef, CountScope, FilterProp,
+    ObjectProperty, ObjectScope, PlayerFilter, PlayerScope, QuantityExpr, QuantityRef,
+    ResolvedAbility, RoundingMode, StaticCondition, TargetFilter, TargetRef, TypeFilter,
+    TypedFilter, ZoneRef,
 };
 use crate::types::card_type::CoreType;
 use crate::types::counter::{positive_counter_types, CounterType};
@@ -193,11 +194,79 @@ pub(crate) fn quantity_expr_uses_recipient(expr: &QuantityExpr) -> bool {
         | QuantityExpr::Offset { inner, .. }
         | QuantityExpr::ClampMin { inner, .. }
         | QuantityExpr::Multiply { inner, .. } => quantity_expr_uses_recipient(inner),
-        QuantityExpr::Sum { exprs } => exprs.iter().any(quantity_expr_uses_recipient),
+        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => {
+            exprs.iter().any(quantity_expr_uses_recipient)
+        }
         QuantityExpr::UpTo { max } => quantity_expr_uses_recipient(max),
         QuantityExpr::Power { exponent, .. } => quantity_expr_uses_recipient(exponent),
         QuantityExpr::Difference { left, right } => {
             quantity_expr_uses_recipient(left) || quantity_expr_uses_recipient(right)
+        }
+    }
+}
+
+/// CR 608.2h + CR 608.2k + CR 608.2c: True when the QuantityExpr reads an object
+/// characteristic through a scope whose referent only exists during the resolving
+/// ability's resolution — the triggering/cost/instruction-order object
+/// (`EventSource`, `EventTarget`, `CostPaidObject`, `Anaphoric`, `Demonstrative`)
+/// or a chosen target (`Target`).
+///
+/// Such a value MUST be snapshotted to a fixed number at resolution: CR 608.2h
+/// determines the information once, when the effect applies, and the layer system
+/// cannot re-resolve these scopes on later evaluation passes (no resolving
+/// ability / trigger event is in context then — `object_id_for_scope` returns
+/// `None` for them). A `SetPowerDynamic { Power { CostPaidObject } }` left
+/// un-snapshotted would silently read 0 every layer tick.
+///
+/// `Source` / `Recipient` are deliberately NOT included: the layer evaluator
+/// resolves them per-effect (`effect.source_id`) / per-recipient, so CDA-style
+/// "becomes an X/X creature where X is its power" set effects stay dynamic.
+/// `Variable` (CostXPaid) is a number snapshotted onto the resolving ability, not
+/// an object scope, and is likewise left dynamic.
+///
+/// Mirrors the structural recursion of `quantity_expr_uses_recipient`; the
+/// `QuantityRef` leaf classifies the object-scoped variants exhaustively so a new
+/// object-scoped reference forces a decision here.
+pub(crate) fn quantity_expr_uses_resolution_only_object_scope(expr: &QuantityExpr) -> bool {
+    fn scope_is_resolution_only(scope: ObjectScope) -> bool {
+        match scope {
+            ObjectScope::Source | ObjectScope::Recipient => false,
+            ObjectScope::Target
+            | ObjectScope::EventSource
+            | ObjectScope::EventTarget
+            | ObjectScope::CostPaidObject
+            | ObjectScope::Anaphoric
+            | ObjectScope::Demonstrative => true,
+        }
+    }
+    match expr {
+        QuantityExpr::Fixed { .. } => false,
+        QuantityExpr::Ref { qty } => match qty {
+            QuantityRef::Power { scope }
+            | QuantityRef::Toughness { scope }
+            | QuantityRef::ObjectManaValue { scope }
+            | QuantityRef::ObjectColorCount { scope }
+            | QuantityRef::ObjectNameWordCount { scope }
+            | QuantityRef::ObjectTypelineComponentCount { scope }
+            | QuantityRef::ManaSymbolsInManaCost { scope, .. } => scope_is_resolution_only(*scope),
+            _ => false,
+        },
+        QuantityExpr::DivideRounded { inner, .. }
+        | QuantityExpr::Offset { inner, .. }
+        | QuantityExpr::ClampMin { inner, .. }
+        | QuantityExpr::Multiply { inner, .. } => {
+            quantity_expr_uses_resolution_only_object_scope(inner)
+        }
+        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => exprs
+            .iter()
+            .any(quantity_expr_uses_resolution_only_object_scope),
+        QuantityExpr::UpTo { max } => quantity_expr_uses_resolution_only_object_scope(max),
+        QuantityExpr::Power { exponent, .. } => {
+            quantity_expr_uses_resolution_only_object_scope(exponent)
+        }
+        QuantityExpr::Difference { left, right } => {
+            quantity_expr_uses_resolution_only_object_scope(left)
+                || quantity_expr_uses_resolution_only_object_scope(right)
         }
     }
 }
@@ -226,12 +295,269 @@ pub(crate) fn quantity_expr_uses_object_count(expr: &QuantityExpr) -> bool {
         | QuantityExpr::Offset { inner, .. }
         | QuantityExpr::ClampMin { inner, .. }
         | QuantityExpr::Multiply { inner, .. } => quantity_expr_uses_object_count(inner),
-        QuantityExpr::Sum { exprs } => exprs.iter().any(quantity_expr_uses_object_count),
+        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => {
+            exprs.iter().any(quantity_expr_uses_object_count)
+        }
         QuantityExpr::UpTo { max } => quantity_expr_uses_object_count(max),
         QuantityExpr::Power { exponent, .. } => quantity_expr_uses_object_count(exponent),
         QuantityExpr::Difference { left, right } => {
             quantity_expr_uses_object_count(left) || quantity_expr_uses_object_count(right)
         }
+    }
+}
+
+/// True when the QuantityExpr's magnitude depends on floating mana in a mana
+/// pool. Mana production only needs a layer pass for continuous effects whose
+/// dynamic quantity reads this value (Omnath-style "unspent mana" effects).
+///
+/// Mirrors the structural recursion of `quantity_expr_uses_object_count` so
+/// composite expressions are classified through the same expression tree.
+pub(crate) fn quantity_expr_uses_unspent_mana(expr: &QuantityExpr) -> bool {
+    match expr {
+        QuantityExpr::Fixed { .. } => false,
+        QuantityExpr::Ref { qty } => quantity_ref_uses_unspent_mana(qty),
+        QuantityExpr::DivideRounded { inner, .. }
+        | QuantityExpr::Offset { inner, .. }
+        | QuantityExpr::ClampMin { inner, .. }
+        | QuantityExpr::Multiply { inner, .. } => quantity_expr_uses_unspent_mana(inner),
+        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => {
+            exprs.iter().any(quantity_expr_uses_unspent_mana)
+        }
+        QuantityExpr::UpTo { max } => quantity_expr_uses_unspent_mana(max),
+        QuantityExpr::Power { exponent, .. } => quantity_expr_uses_unspent_mana(exponent),
+        QuantityExpr::Difference { left, right } => {
+            quantity_expr_uses_unspent_mana(left) || quantity_expr_uses_unspent_mana(right)
+        }
+    }
+}
+
+/// CR 106.4: Leaf classification for `quantity_expr_uses_unspent_mana`.
+/// EXHAUSTIVE and wildcard-free so any future quantity reference that reads
+/// floating mana must be classified intentionally.
+fn quantity_ref_uses_unspent_mana(qty: &QuantityRef) -> bool {
+    match qty {
+        QuantityRef::UnspentMana { .. } => true,
+        QuantityRef::HandSize { .. }
+        | QuantityRef::LifeTotal { .. }
+        | QuantityRef::GraveyardSize { .. }
+        | QuantityRef::LifeAboveStarting
+        | QuantityRef::StartingLifeTotal
+        | QuantityRef::ObjectCount { .. }
+        | QuantityRef::ObjectCountDistinct { .. }
+        | QuantityRef::ObjectCountBySharedQuality { .. }
+        | QuantityRef::PlayerCount { .. }
+        | QuantityRef::CountersOn { .. }
+        | QuantityRef::CountersOnObjects { .. }
+        | QuantityRef::PlayerCounter { .. }
+        | QuantityRef::Variable { .. }
+        | QuantityRef::Power { .. }
+        | QuantityRef::Intensity { .. }
+        | QuantityRef::Toughness { .. }
+        | QuantityRef::ObjectManaValue { .. }
+        | QuantityRef::TargetObjectManaValue { .. }
+        | QuantityRef::ObjectColorCount { .. }
+        | QuantityRef::ObjectNameWordCount { .. }
+        | QuantityRef::ObjectTypelineComponentCount { .. }
+        | QuantityRef::ManaSymbolsInManaCost { .. }
+        | QuantityRef::SelfManaValue
+        | QuantityRef::Aggregate { .. }
+        | QuantityRef::ControlledByEachPlayer { .. }
+        | QuantityRef::TargetZoneCardCount { .. }
+        | QuantityRef::Devotion { .. }
+        | QuantityRef::DistinctCardTypes { .. }
+        | QuantityRef::CardsExiledBySource
+        | QuantityRef::ExiledCardPower { .. }
+        | QuantityRef::ZoneCardCount { .. }
+        | QuantityRef::BasicLandTypeCount { .. }
+        | QuantityRef::TrackedSetSize
+        | QuantityRef::FilteredTrackedSetSize { .. }
+        | QuantityRef::TrackedSetAggregate { .. }
+        | QuantityRef::ExiledFromHandThisResolution
+        | QuantityRef::PreviousEffectAmount
+        | QuantityRef::LifeLostThisTurn { .. }
+        | QuantityRef::PartySize { .. }
+        | QuantityRef::Speed { .. }
+        | QuantityRef::EventContextAmount
+        | QuantityRef::AttachmentsOnLeavingObject { .. }
+        | QuantityRef::EventContextSourceCostX
+        | QuantityRef::SpellsCastThisTurn { .. }
+        | QuantityRef::SacrificedThisTurn { .. }
+        | QuantityRef::CrimesCommittedThisTurn
+        | QuantityRef::LifeGainedThisTurn { .. }
+        | QuantityRef::CardsDrawnThisTurn { .. }
+        | QuantityRef::BattlefieldEntriesThisTurn { .. }
+        | QuantityRef::LandsPlayedThisTurn { .. }
+        | QuantityRef::TurnsTaken
+        | QuantityRef::ZoneChangeCountThisTurn { .. }
+        | QuantityRef::ZoneChangeAggregateThisTurn { .. }
+        | QuantityRef::DamageDealtThisTurn { .. }
+        | QuantityRef::ChosenNumber
+        | QuantityRef::AttackedThisTurn { .. }
+        | QuantityRef::DescendedThisTurn
+        | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. }
+        | QuantityRef::SpellsCastLastTurn
+        | QuantityRef::SpellsCastThisGame { .. }
+        | QuantityRef::CounterAddedThisTurn { .. }
+        | QuantityRef::CardsDiscardedThisTurn { .. }
+        | QuantityRef::TokensCreatedThisTurn { .. }
+        | QuantityRef::PlayerActionsThisTurn { .. }
+        | QuantityRef::DungeonsCompleted
+        | QuantityRef::CostXPaid
+        | QuantityRef::KickerCount
+        | QuantityRef::AdditionalCostPaymentCount
+        | QuantityRef::AdditionalCostPaymentCountFor { .. }
+        | QuantityRef::ConvokedCreatureCount
+        | QuantityRef::ManaSpentToCast { .. }
+        | QuantityRef::ColorsInCommandersColorIdentity
+        | QuantityRef::VoteCount { .. }
+        | QuantityRef::DistinctColorsAmongPermanents { .. }
+        | QuantityRef::DistinctCounterKindsAmong { .. }
+        | QuantityRef::EnteredThisTurn { .. }
+        | QuantityRef::CommanderManaValue { .. }
+        | QuantityRef::CommanderCastFromCommandZoneCount => false,
+    }
+}
+
+/// Single authority extracting the dynamic `QuantityExpr` magnitude carried by
+/// a `ContinuousModification`, if any. Layer application, incremental-flush
+/// escalation, and mana-production dirty marking all use this helper so there
+/// is one place that decides which modifications carry a runtime-resolved
+/// magnitude.
+///
+/// EXHAUSTIVE and wildcard-free over `ContinuousModification` so a future
+/// variant that carries a `QuantityExpr` must be classified here at compile
+/// time. `AddCounterOnEnter` also carries a `QuantityExpr` but is
+/// resolution-time-consumed by the BecomeCopy / CopyTokenOf resolvers and never
+/// reaches active continuous-effect application, so it is excluded.
+/// CR 613.1: Dynamic continuous modifications are evaluated while applying
+/// continuous effects through the layer system.
+pub(crate) fn continuous_modification_dynamic_quantity(
+    m: &ContinuousModification,
+) -> Option<&QuantityExpr> {
+    match m {
+        ContinuousModification::SetDynamicPower { value }
+        | ContinuousModification::SetDynamicToughness { value }
+        | ContinuousModification::SetPowerDynamic { value }
+        | ContinuousModification::SetToughnessDynamic { value }
+        | ContinuousModification::AddDynamicPower { value }
+        | ContinuousModification::AddDynamicToughness { value }
+        | ContinuousModification::AddDynamicKeyword { value, .. } => Some(value),
+        // Resolution-time-consumed; never an active continuous effect.
+        ContinuousModification::AddCounterOnEnter { .. }
+        | ContinuousModification::SetStartingLoyalty { .. } => None,
+        // Non-dynamic modifications carry plain i32 / enum payloads, no dynamic
+        // magnitude. Enumerated explicitly (no wildcard) so a future
+        // QuantityExpr-carrying variant forces a decision here.
+        ContinuousModification::CopyValues { .. }
+        | ContinuousModification::SetName { .. }
+        | ContinuousModification::AddPower { .. }
+        | ContinuousModification::AddToughness { .. }
+        | ContinuousModification::SetPower { .. }
+        | ContinuousModification::SetToughness { .. }
+        | ContinuousModification::AddKeyword { .. }
+        | ContinuousModification::RemoveKeyword { .. }
+        | ContinuousModification::GrantAbility { .. }
+        | ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
+        | ContinuousModification::GrantTrigger { .. }
+        | ContinuousModification::RemoveAllAbilities
+        | ContinuousModification::AddType { .. }
+        | ContinuousModification::RemoveType { .. }
+        | ContinuousModification::AddSubtype { .. }
+        | ContinuousModification::RemoveSubtype { .. }
+        | ContinuousModification::SetCardTypes { .. }
+        | ContinuousModification::RemoveAllSubtypes { .. }
+        | ContinuousModification::AddAllCreatureTypes
+        | ContinuousModification::AddAllBasicLandTypes
+        | ContinuousModification::AddAllLandTypes
+        | ContinuousModification::AddChosenSubtype { .. }
+        | ContinuousModification::AddChosenColor
+        | ContinuousModification::RemoveChosenKeyword
+        | ContinuousModification::AddChosenKeyword
+        | ContinuousModification::SetColor { .. }
+        | ContinuousModification::AddColor { .. }
+        | ContinuousModification::AddStaticMode { .. }
+        | ContinuousModification::GrantStaticAbility { .. }
+        | ContinuousModification::SwitchPowerToughness
+        | ContinuousModification::AssignDamageFromToughness
+        | ContinuousModification::AssignDamageAsThoughUnblocked
+        | ContinuousModification::AssignNoCombatDamage
+        | ContinuousModification::ChangeController
+        | ContinuousModification::SetBasicLandType { .. }
+        | ContinuousModification::SetChosenBasicLandType
+        | ContinuousModification::RetainPrintedTriggerFromSource { .. }
+        | ContinuousModification::RetainPrintedAbilityFromSource { .. }
+        | ContinuousModification::AddSupertype { .. }
+        | ContinuousModification::RemoveSupertype { .. }
+        | ContinuousModification::RemoveManaCost => None,
+    }
+}
+
+pub(crate) fn continuous_modification_uses_unspent_mana(
+    modification: &ContinuousModification,
+) -> bool {
+    continuous_modification_dynamic_quantity(modification)
+        .is_some_and(quantity_expr_uses_unspent_mana)
+}
+
+pub(crate) fn static_condition_uses_unspent_mana(condition: &StaticCondition) -> bool {
+    match condition {
+        StaticCondition::QuantityComparison { lhs, rhs, .. } => {
+            quantity_expr_uses_unspent_mana(lhs) || quantity_expr_uses_unspent_mana(rhs)
+        }
+        StaticCondition::And { conditions } | StaticCondition::Or { conditions } => {
+            conditions.iter().any(static_condition_uses_unspent_mana)
+        }
+        StaticCondition::Not { condition } => static_condition_uses_unspent_mana(condition),
+        StaticCondition::DevotionGE { .. }
+        | StaticCondition::IsPresent { .. }
+        | StaticCondition::ChosenColorIs { .. }
+        | StaticCondition::ChosenLabelIs { .. }
+        | StaticCondition::HasMaxSpeed
+        | StaticCondition::SpeedGE { .. }
+        | StaticCondition::DayNightIs { .. }
+        | StaticCondition::HasCounters { .. }
+        | StaticCondition::CastVariantPaid { .. }
+        | StaticCondition::RecipientHasCounters { .. }
+        | StaticCondition::ClassLevelGE { .. }
+        | StaticCondition::DefendingPlayerControls { .. }
+        | StaticCondition::SourceAttackingAlone
+        | StaticCondition::SourceIsAttacking
+        | StaticCondition::SourceIsBlocking
+        | StaticCondition::SourceIsBlocked
+        | StaticCondition::IsMonarch
+        | StaticCondition::IsInitiative
+        | StaticCondition::NoMonarch
+        | StaticCondition::HasCityBlessing
+        | StaticCondition::CompletedADungeon
+        | StaticCondition::WasStartingPlayer { .. }
+        | StaticCondition::SpellCastWithVariantThisTurn { .. }
+        | StaticCondition::OpponentPoisonAtLeast { .. }
+        | StaticCondition::UnlessPay { .. }
+        | StaticCondition::Unrecognized { .. }
+        | StaticCondition::DuringYourTurn
+        | StaticCondition::SourceEnteredThisTurn
+        | StaticCondition::SourceHasDealtDamage
+        | StaticCondition::WasCast { .. }
+        | StaticCondition::IsRingBearer
+        | StaticCondition::RingLevelAtLeast { .. }
+        | StaticCondition::ControlsCommander { .. }
+        | StaticCondition::SourceIsTapped
+        | StaticCondition::IsTapped { .. }
+        | StaticCondition::SourceIsSaddled
+        | StaticCondition::SourceControllerEquals { .. }
+        | StaticCondition::SourceIsEquipped
+        | StaticCondition::SourceIsEnchanted
+        | StaticCondition::SourceIsMonstrous
+        | StaticCondition::SourceIsHarnessed
+        | StaticCondition::SourceAttachedToCreature
+        | StaticCondition::SourceMatchesFilter { .. }
+        | StaticCondition::RecipientMatchesFilter { .. }
+        | StaticCondition::RecipientAttackingOwnerTarget { .. }
+        | StaticCondition::SourceIsPaired
+        | StaticCondition::SourceInZone { .. }
+        | StaticCondition::EnchantedIsFaceDown
+        | StaticCondition::AdditionalCostPaid
+        | StaticCondition::None => false,
     }
 }
 
@@ -367,7 +693,7 @@ pub(crate) fn entered_object_perturbs_quantity_expr(
         | QuantityExpr::Multiply { inner, .. } => {
             entered_object_perturbs_quantity_expr(state, entered, ctx, inner)
         }
-        QuantityExpr::Sum { exprs } => exprs
+        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => exprs
             .iter()
             .any(|e| entered_object_perturbs_quantity_expr(state, entered, ctx, e)),
         QuantityExpr::UpTo { max } => {
@@ -580,7 +906,7 @@ pub fn resolve_quantity_with_ctx(
 
 /// Compose recursively-resolved inner values for the non-leaf
 /// `QuantityExpr` variants (`DivideRounded`, `Offset`, `Multiply`, `Sum`,
-/// `Power`, `UpTo`, `Difference`). All resolver entry points share this
+/// `Power`, `UpTo`, `Difference`, `Max`). All resolver entry points share this
 /// logic; only the leaf arms (`Fixed`, `Ref`) differ in context handling.
 /// `recurse` is a closure the caller supplies that re-enters its own
 /// resolver with the inner expression.
@@ -630,6 +956,12 @@ fn fold_compose(expr: &QuantityExpr, recurse: impl Fn(&QuantityExpr) -> i32) -> 
         // same operation as an absolute value; it confirms only that the
         // resulting amount is non-negative.)
         QuantityExpr::Difference { left, right } => (recurse(left) - recurse(right)).abs(),
+        // CR 107.1: the maximum of the computed integer operands. CR 120.4a /
+        // CR 120.10 establish the in-rules "the greatest of the calculated
+        // amounts" precedent for taking a maximum over multiple computed
+        // values; "whichever is greater" itself has no dedicated CR number.
+        // CR 107.2: an empty operand list (undeterminable) resolves to 0.
+        QuantityExpr::Max { exprs } => exprs.iter().map(&recurse).max().unwrap_or(0),
         QuantityExpr::Fixed { .. } | QuantityExpr::Ref { .. } => {
             unreachable!("fold_compose called on leaf variant — caller must dispatch leaves first")
         }
@@ -658,7 +990,11 @@ pub(crate) fn resolve_quantity_for_trigger_check(
     // for hand-event triggers, etc. Without this binding, intervening-if
     // checks for `that player has X` silently resolve against the source's
     // controller and produce wrong results.
-    let resolution_event = state.current_trigger_event.as_ref().or(event);
+    // CR 603.4: The explicit `event` (stack entry / detection pass) wins over
+    // `current_trigger_event`, which may still hold a stale event from an
+    // unrelated in-flight resolution in the same step (Keeper of the Accord
+    // intervening-if at opponent end step — issue #1323).
+    let resolution_event = event.or(state.current_trigger_event.as_ref());
     let scoped_player =
         resolution_event.and_then(|e| crate::game::targeting::extract_player_from_event(e, state));
     let ctx = QuantityContext {
@@ -670,7 +1006,8 @@ pub(crate) fn resolve_quantity_for_trigger_check(
 
     // Fast path: when current_trigger_event is already set (resolution-time
     // re-check in stack::resolve_top), the default resolver reads it directly.
-    if state.current_trigger_event.is_some() {
+    // Skip when an explicit override was supplied — that event is authoritative.
+    if event.is_none() && state.current_trigger_event.is_some() {
         return resolve_quantity_with_ctx(state, expr, controller, ctx);
     }
     if let Some(event) = event {
@@ -737,6 +1074,23 @@ pub(crate) fn triggering_event_player(state: &GameState) -> Option<PlayerId> {
         .cloned()
         .or_else(detection_trigger_event)
         .and_then(|e| crate::game::targeting::extract_player_from_event(&e, state))
+}
+
+/// CR 603.2 + CR 120.1: Resolve the *object that received the damage* referenced
+/// by the current triggering event, preferring the resolution-time
+/// `current_trigger_event` and falling back to the detection-time thread-local
+/// override (the same dual-path `triggering_event_player` uses).
+///
+/// Single authority for `TargetFilter::EventTarget` resolution — `filter.rs`
+/// calls this rather than duplicating the detection/resolution dual-path. Lives
+/// here because this module owns the `DETECTION_TRIGGER_EVENT` thread-local.
+pub(crate) fn triggering_event_target_object(state: &GameState) -> Option<ObjectId> {
+    state
+        .current_trigger_event
+        .as_ref()
+        .cloned()
+        .or_else(detection_trigger_event)
+        .and_then(|e| crate::game::targeting::extract_target_object_from_event(&e))
 }
 
 /// CR 603.4 + CR 109.3: Recursively check whether a `TargetFilter` carries
@@ -1117,9 +1471,15 @@ fn resolve_ref(
                 usize_to_i32_saturating(p.hand.len())
             })
         }
-        // CR 119: life total for the scoped player(s).
+        // CR 119 + CR 810.9a: a single player's life total reads the team's
+        // shared total in a team format; aggregate scopes fold over team
+        // totals (deduped). Off-team this is byte-identical (singleton teams,
+        // team_life_total == p.life). CR 810.9d confirms the per-team extremum.
         QuantityRef::LifeTotal { player: scope } => {
-            resolve_per_player_scalar(state, scope, controller, ctx, targets, ability, |p| p.life)
+            match resolve_single_player_scope(state, scope, controller, ctx, targets, ability) {
+                Some(pid) => crate::game::players::team_life_total(state, pid),
+                None => resolve_per_team_life(state, scope, controller, ctx, targets, ability),
+            }
         }
         // CR 106.4: floating mana of `color` (or any color) in the controller's
         // mana pool. Controller-scoped — `player` is the controller. Omnath,
@@ -1150,9 +1510,11 @@ fn resolve_ref(
                 usize_to_i32_saturating(p.graveyard.len())
             })
         }
-        QuantityRef::LifeAboveStarting => {
-            player.map_or(0, |p| p.life - state.format_config.starting_life)
-        }
+        // CR 810.9a + CR 810.4: team total minus the (already team-correct, 30)
+        // starting life. Single controller bind — no double-count.
+        QuantityRef::LifeAboveStarting => player.map_or(0, |p| {
+            crate::game::players::team_life_total(state, p.id) - state.format_config.starting_life
+        }),
         // CR 103.4: The format's starting life total.
         QuantityRef::StartingLifeTotal => state.format_config.starting_life,
         // CR 118.4 + CR 119.3: Life lost this turn, scoped via PlayerScope (Π-3).
@@ -1435,12 +1797,22 @@ fn resolve_ref(
                     ObjectProperty::ManaValue => Some(u32_to_i32_saturating(
                         obj.mana_cost.mana_value_with_x(obj.zone, obj.cost_x_paid),
                     )),
+                    // CR 107.4a + CR 107.4e + CR 202.1: count colored mana symbols
+                    // of `color` in the object's printed cost; hybrid symbols
+                    // contribute to each of their colors. Always defined (0 when
+                    // the object has no mana cost), so no LKI fallback is needed.
+                    ObjectProperty::ManaSymbolCount(color) => Some(u32_to_i32_saturating(
+                        crate::game::devotion::count_cost_color_symbols(&obj.mana_cost, *color),
+                    )),
                 });
                 live.or_else(|| {
                     state.lki_cache.get(&id).and_then(|lki| match property {
                         ObjectProperty::Power => lki.power,
                         ObjectProperty::Toughness => lki.toughness,
                         ObjectProperty::ManaValue => Some(u32_to_i32_saturating(lki.mana_value)),
+                        // The live cost is authoritative for symbol counting; the
+                        // LKI snapshot does not retain individual shards.
+                        ObjectProperty::ManaSymbolCount(_) => None,
                     })
                 })
             };
@@ -1815,12 +2187,17 @@ fn resolve_ref(
                     ObjectProperty::ManaValue => Some(u32_to_i32_saturating(
                         obj.mana_cost.mana_value_with_x(obj.zone, obj.cost_x_paid),
                     )),
+                    // CR 107.4a + CR 202.1: colored mana symbols of `color`.
+                    ObjectProperty::ManaSymbolCount(color) => Some(u32_to_i32_saturating(
+                        crate::game::devotion::count_cost_color_symbols(&obj.mana_cost, *color),
+                    )),
                 });
                 live.or_else(|| {
                     state.lki_cache.get(&id).and_then(|lki| match property {
                         ObjectProperty::Power => lki.power,
                         ObjectProperty::Toughness => lki.toughness,
                         ObjectProperty::ManaValue => Some(u32_to_i32_saturating(lki.mana_value)),
+                        ObjectProperty::ManaSymbolCount(_) => None,
                     })
                 })
             };
@@ -2169,7 +2546,10 @@ fn resolve_ref(
                             .filter(|record| {
                                 record.controller == scoped_player.id
                                     && crate::game::restrictions::battlefield_entry_matches_filter(
-                                        record, filter, controller,
+                                        record,
+                                        filter,
+                                        controller,
+                                        Some(filter_ctx.source_id),
                                     )
                             })
                             .count(),
@@ -2244,6 +2624,9 @@ fn resolve_ref(
                     ObjectProperty::Power => record.power,
                     ObjectProperty::Toughness => record.toughness,
                     ObjectProperty::ManaValue => Some(u32_to_i32_saturating(record.mana_value)),
+                    // Damage records do not retain the source's individual mana
+                    // symbols; symbol-count aggregation is not defined over them.
+                    ObjectProperty::ManaSymbolCount(_) => None,
                 });
             match function {
                 AggregateFunction::Max => vals.max().unwrap_or(0),
@@ -2261,6 +2644,7 @@ fn resolve_ref(
             aggregate,
             group_by,
             damage_kind,
+            excess_only,
         } => resolve_damage_dealt_this_turn(
             state,
             controller,
@@ -2272,6 +2656,7 @@ fn resolve_ref(
             *aggregate,
             *group_by,
             *damage_kind,
+            *excess_only,
         ),
         // CR 500: Cumulative turns taken by this player.
         QuantityRef::TurnsTaken => player.map_or(0, |p| u32_to_i32_saturating(p.turns_taken)),
@@ -2545,6 +2930,18 @@ fn resolve_ref(
                         Some(ControllerRef::TriggeringPlayer) => {
                             triggering_event_player(state).is_some_and(|pid| pid == snap.controller)
                         }
+                        // CR 303.4b: Resolve enchanted player for quantity counting.
+                        Some(ControllerRef::EnchantedPlayer) => {
+                            crate::game::filter::controller_ref_player(
+                                state,
+                                ctx.source,
+                                Some(controller),
+                                ability,
+                                // CR 303.4b: Resolve enchanted player for quantity counting.
+                                &ControllerRef::EnchantedPlayer,
+                            )
+                            .is_some_and(|pid| pid == snap.controller)
+                        }
                     })
                     .count(),
             )
@@ -2606,6 +3003,16 @@ fn damage_source_controller_matches(
         ControllerRef::TriggeringPlayer => {
             triggering_event_player(state).is_some_and(|player| actual == player)
         }
+        // CR 303.4b: Resolve enchanted player for quantity counting.
+        ControllerRef::EnchantedPlayer => crate::game::filter::controller_ref_player(
+            state,
+            ctx.source,
+            Some(controller),
+            ability,
+            // CR 303.4b: Resolve enchanted player for quantity counting.
+            &ControllerRef::EnchantedPlayer,
+        )
+        .is_some_and(|player| actual == player),
     }
 }
 
@@ -2748,6 +3155,10 @@ fn resolve_damage_dealt_this_turn(
     aggregate: AggregateFunction,
     group_by: Option<crate::types::ability::DamageGroupKey>,
     damage_kind: crate::types::ability::DamageKindFilter,
+    // CR 120.10: When true, only count records where excess > 0 — i.e. overkill
+    // damage beyond lethal/loyalty/defense. Used by the "was dealt excess damage
+    // this turn" intervening-if condition class (Maarika, Rith, etc.).
+    excess_only: bool,
 ) -> i32 {
     use crate::types::ability::DamageGroupKey;
 
@@ -2763,7 +3174,11 @@ fn resolve_damage_dealt_this_turn(
         |record: &DamageRecord| damage_record_source_matches(state, record, source, filter_ctx);
 
     let matching = state.damage_dealt_this_turn.iter().filter(|record| {
-        damage_record_matches_kind(record, damage_kind)
+        // CR 120.10: excess_only gates on the per-record excess amount captured at
+        // damage time, so a "was dealt excess damage" query never double-counts
+        // separate non-overkill hits to the same target.
+        (!excess_only || record.excess > 0)
+            && damage_record_matches_kind(record, damage_kind)
             && source_matches(record)
             && damage_record_target_matches(
                 state, record, controller, ctx, ability, target, filter_ctx,
@@ -3251,7 +3666,7 @@ fn resolve_mana_symbols_in_mana_cost(
                     .filter(|shard| shard.contributes_to(color))
                     .count(),
             ),
-            ManaCost::NoCost | ManaCost::SelfManaCost => 0,
+            ManaCost::NoCost | ManaCost::SelfManaCost | ManaCost::SelfManaValue => 0,
         })
         .unwrap_or(0)
 }
@@ -3815,6 +4230,52 @@ fn defending_player_from_event(
             }
         })
         .or(Some(*defending_player))
+}
+
+/// CR 810.9a + CR 810.9d: Resolve an aggregate (multi-player) `LifeTotal`
+/// scope by folding over each DISTINCT team's shared life total. Mirrors the
+/// population semantics of the aggregate arms in `resolve_per_player_scalar`
+/// (Opponent / AllPlayers); single-player scopes never reach here (they are
+/// handled by the `Some(pid)` branch of the LifeTotal arm). A non-aggregate
+/// scope that failed to resolve a single player returns 0, preserving the
+/// pre-fix `map_or(0)` fallback.
+fn resolve_per_team_life(
+    state: &GameState,
+    scope: &PlayerScope,
+    controller: PlayerId,
+    ctx: QuantityContext,
+    targets: &[TargetRef],
+    ability: Option<&ResolvedAbility>,
+) -> i32 {
+    match scope {
+        // CR 102.2: aggregate over all opponents' teams.
+        PlayerScope::Opponent { aggregate } => crate::game::players::aggregate_over_teams(
+            state,
+            state
+                .players
+                .iter()
+                .filter(|p| p.id != controller)
+                .map(|p| p.id),
+            *aggregate,
+        ),
+        // CR 102.1: aggregate over all players' teams, optionally excluding
+        // the `exclude` anchor ("each OTHER player").
+        PlayerScope::AllPlayers { aggregate, exclude } => {
+            let excluded_id = exclude.as_deref().and_then(|ex| {
+                resolve_single_player_scope(state, ex, controller, ctx, targets, ability)
+            });
+            crate::game::players::aggregate_over_teams(
+                state,
+                state
+                    .players
+                    .iter()
+                    .filter(|p| Some(p.id) != excluded_id)
+                    .map(|p| p.id),
+                *aggregate,
+            )
+        }
+        _ => 0,
+    }
 }
 
 /// CR 107.3e: Reduce a player iterator to a single i32 by aggregate function.
@@ -4568,6 +5029,147 @@ mod tests {
         assert_eq!(resolve_quantity(&state, &qty, PlayerId(1), creature), 0);
     }
 
+    /// CR 107.4a + CR 202.1: graveyard-scope chroma (Umbra Stalker) resolves
+    /// through the zone-general `Aggregate` / `ObjectProperty::ManaSymbolCount`
+    /// building block — `Sum` of black mana symbols over cards in YOUR
+    /// graveyard. Verifies zone scoping (battlefield excluded), owner scoping
+    /// (opponent's graveyard excluded), and controller-relative `You` binding.
+    #[test]
+    fn resolve_aggregate_mana_symbol_count_over_graveyard() {
+        use crate::types::ability::{AggregateFunction, ControllerRef, FilterProp, ObjectProperty};
+        use crate::types::mana::{ManaColor, ManaCost, ManaCostShard};
+        let mut state = GameState::new_two_player(42);
+        // P0 graveyard: {B}{B} and {B}{U} → 3 black symbols total.
+        for (cid, shards) in [
+            (CardId(1), vec![ManaCostShard::Black, ManaCostShard::Black]),
+            (CardId(2), vec![ManaCostShard::Black, ManaCostShard::Blue]),
+        ] {
+            let id = create_object(
+                &mut state,
+                cid,
+                PlayerId(0),
+                "Gy".to_string(),
+                Zone::Graveyard,
+            );
+            state.objects.get_mut(&id).unwrap().mana_cost = ManaCost::Cost { shards, generic: 0 };
+        }
+        // P0 battlefield {B} — wrong zone, must not count.
+        let bf = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Bf".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&bf).unwrap().mana_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::Black],
+            generic: 0,
+        };
+        // Opponent (P1) graveyard {B}{B} — wrong owner relative to P0.
+        let opp = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(1),
+            "Opp".to_string(),
+            Zone::Graveyard,
+        );
+        state.objects.get_mut(&opp).unwrap().mana_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::Black, ManaCostShard::Black],
+            generic: 0,
+        };
+
+        let qty = QuantityExpr::Ref {
+            qty: QuantityRef::Aggregate {
+                function: AggregateFunction::Sum,
+                property: ObjectProperty::ManaSymbolCount(ManaColor::Black),
+                filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
+                    FilterProp::Owned {
+                        controller: ControllerRef::You,
+                    },
+                    FilterProp::InZone {
+                        zone: Zone::Graveyard,
+                    },
+                ])),
+            },
+        };
+
+        // P0 sees 3 black symbols in their own graveyard (battlefield + P1's
+        // graveyard excluded); P1 sees only their own 2.
+        assert_eq!(resolve_quantity(&state, &qty, PlayerId(0), bf), 3);
+        assert_eq!(resolve_quantity(&state, &qty, PlayerId(1), opp), 2);
+    }
+
+    /// CR 404.2 + CR 109.4: graveyard-scope chroma must scope its population by
+    /// OWNER, not by the at-departure (LKI) controller. A card in YOUR graveyard
+    /// is one you own; the controller it had before leaving the battlefield is
+    /// irrelevant. Regression for the review on #4075: the prior `controller(You)`
+    /// filter read `effective_controller`, which falls back to the at-departure
+    /// controller for off-battlefield objects, so a card you own but an opponent
+    /// last controlled would be miscounted (dropped for the owner, double-counted
+    /// for the opponent). `Owned { You }` reads ownership and is LKI-independent.
+    #[test]
+    fn resolve_aggregate_mana_symbol_count_scopes_by_owner_not_lki_controller() {
+        use crate::types::ability::{AggregateFunction, ControllerRef, FilterProp, ObjectProperty};
+        use crate::types::mana::{ManaColor, ManaCost, ManaCostShard};
+        let mut state = GameState::new_two_player(42);
+        // A {B}{B} card in P0's graveyard that P0 OWNS but whose last controller
+        // was the opponent P1 (e.g. it died after being stolen, or was milled
+        // from P0's library while under P1's control). Off the battlefield it has
+        // no live controller; the at-departure controller is what an LKI-reading
+        // filter would see — here, P1.
+        let stolen = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Reclaimed".to_string(),
+            Zone::Graveyard,
+        );
+        {
+            let obj = state.objects.get_mut(&stolen).unwrap();
+            obj.mana_cost = ManaCost::Cost {
+                shards: vec![ManaCostShard::Black, ManaCostShard::Black],
+                generic: 0,
+            };
+            // Diverge the controller from the owner: P1 last controlled it.
+            obj.controller = PlayerId(1);
+        }
+        // A reference object on the battlefield to anchor each player's resolve.
+        let p0_ref = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Ref0".to_string(),
+            Zone::Battlefield,
+        );
+        let p1_ref = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Ref1".to_string(),
+            Zone::Battlefield,
+        );
+
+        let qty = QuantityExpr::Ref {
+            qty: QuantityRef::Aggregate {
+                function: AggregateFunction::Sum,
+                property: ObjectProperty::ManaSymbolCount(ManaColor::Black),
+                filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
+                    FilterProp::Owned {
+                        controller: ControllerRef::You,
+                    },
+                    FilterProp::InZone {
+                        zone: Zone::Graveyard,
+                    },
+                ])),
+            },
+        };
+
+        // The card is counted for its OWNER (P0), not for the player who last
+        // controlled it (P1) — owner scoping is independent of LKI controller.
+        assert_eq!(resolve_quantity(&state, &qty, PlayerId(0), p0_ref), 2);
+        assert_eq!(resolve_quantity(&state, &qty, PlayerId(1), p1_ref), 0);
+    }
+
     /// CR 202.2 + CR 601.2h: GitHub #307 — Painful Truths bug regression.
     /// `ManaSpentToCast { metric: DistinctColors }` reads
     /// `GameObject::colors_spent_to_cast.distinct_colors()`, which is the
@@ -4979,6 +5581,115 @@ mod tests {
         assert_eq!(
             resolve_quantity(&state, &all_expr, PlayerId(0), ObjectId(0)),
             8
+        );
+    }
+
+    /// CR 119 + CR 810.9a + CR 810.9d: in a 2HG game, `LifeTotal { Opponent }`
+    /// (Malignus "highest life total among your opponents") folds over each
+    /// DISTINCT team's shared total exactly once, rather than over individual
+    /// `Player::life` values. The `Opponent` population is `p.id != controller`
+    /// (mirroring the pre-fix aggregate arm — see NOTE below on teammate
+    /// inclusion), so it spans the controller's teammate AND the opposing team;
+    /// the team dedup collapses each to its shared total.
+    ///
+    /// Setup: controller P0 on team A {0,1} at 2 + 3 = 5; opposing team B {2,3}
+    /// at 9 + 5 = 14. The deduped team totals are {A=5, B=14}. Max = 14
+    /// post-fix (pre-fix individual Max{P1=3, P2=9, P3=5} = 9); Min = 5 post-fix
+    /// (pre-fix individual Min{P1=3, P2=9, P3=5} = 3). Both assertions flip if
+    /// Site 1 is reverted to a per-individual fold.
+    ///
+    /// NOTE: `PlayerScope::Opponent` here still includes the controller's
+    /// 2HG teammate (population `p.id != controller`), a PRE-EXISTING population
+    /// quirk this change deliberately preserves (the plan mirrors the existing
+    /// aggregate semantics; CR 102.2 teammate-exclusion is out of scope). With
+    /// team A (5) below team B (14), Max coincides with the opposing-team total,
+    /// which is the Malignus-intended read.
+    #[test]
+    fn life_total_opponent_max_reads_team_total_in_2hg() {
+        use crate::types::format::FormatConfig;
+        let mut state = GameState::new(FormatConfig::two_headed_giant(), 4, 0);
+        state.players[0].life = 2;
+        state.players[1].life = 3; // team A total 5
+        state.players[2].life = 9;
+        state.players[3].life = 5; // team B total 14
+
+        let max_expr = QuantityExpr::Ref {
+            qty: QuantityRef::LifeTotal {
+                player: PlayerScope::Opponent {
+                    aggregate: AggregateFunction::Max,
+                },
+            },
+        };
+        assert_eq!(
+            resolve_quantity(&state, &max_expr, PlayerId(0), ObjectId(0)),
+            14,
+            "deduped team fold Max{{A=5, B=14}} = 14, not the individual max (9)"
+        );
+
+        // Sibling: Min over the deduped team totals {A=5, B=14} = 5, not the
+        // individual minimum (3).
+        let min_expr = QuantityExpr::Ref {
+            qty: QuantityRef::LifeTotal {
+                player: PlayerScope::Opponent {
+                    aggregate: AggregateFunction::Min,
+                },
+            },
+        };
+        assert_eq!(
+            resolve_quantity(&state, &min_expr, PlayerId(0), ObjectId(0)),
+            5,
+            "deduped team fold Min{{A=5, B=14}} = 5, not the individual min (3)"
+        );
+
+        // Negative: an unresolved single-player Target scope (no player target)
+        // returns 0, preserving the pre-fix map_or(0) fallback.
+        let target_expr = QuantityExpr::Ref {
+            qty: QuantityRef::LifeTotal {
+                player: PlayerScope::Target,
+            },
+        };
+        assert_eq!(
+            resolve_quantity(&state, &target_expr, PlayerId(0), ObjectId(0)),
+            0
+        );
+    }
+
+    /// Off-team degeneracy sibling for Site 1: in a 1v1 (non-team) game the
+    /// single opponent's life reads through unchanged (no team fold).
+    #[test]
+    fn life_total_opponent_max_off_team_is_individual_life() {
+        let mut state = GameState::new_two_player(0);
+        state.players[1].life = 7;
+        let max_expr = QuantityExpr::Ref {
+            qty: QuantityRef::LifeTotal {
+                player: PlayerScope::Opponent {
+                    aggregate: AggregateFunction::Max,
+                },
+            },
+        };
+        assert_eq!(
+            resolve_quantity(&state, &max_expr, PlayerId(0), ObjectId(0)),
+            7
+        );
+    }
+
+    /// CR 810.9a + CR 810.4: `LifeAboveStarting` reads the controller's TEAM
+    /// total minus the (team-correct) starting life (30 in 2HG). Team at 55 →
+    /// 25 above starting. Reverting Site 7 to `p.life` reads only the
+    /// controller's individual share.
+    #[test]
+    fn life_above_starting_reads_team_total_in_2hg() {
+        use crate::types::format::FormatConfig;
+        let mut state = GameState::new(FormatConfig::two_headed_giant(), 4, 0);
+        state.players[0].life = 30;
+        state.players[1].life = 25;
+        let expr = QuantityExpr::Ref {
+            qty: QuantityRef::LifeAboveStarting,
+        };
+        assert_eq!(
+            resolve_quantity(&state, &expr, PlayerId(0), ObjectId(0)),
+            25,
+            "team total (55) minus starting life (30) = 25"
         );
     }
 
@@ -5917,6 +6628,8 @@ mod tests {
                 aggregate: AggregateFunction::Max,
                 group_by: Some(crate::types::ability::DamageGroupKey::SourceId),
                 damage_kind: DamageKindFilter::Any,
+
+                excess_only: false,
             },
         };
         assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), source), 5);
@@ -5970,6 +6683,8 @@ mod tests {
                 aggregate: AggregateFunction::Sum,
                 group_by: None,
                 damage_kind: DamageKindFilter::Any,
+
+                excess_only: false,
             },
         };
         assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), source), 1);
@@ -6010,6 +6725,8 @@ mod tests {
                 aggregate: AggregateFunction::Sum,
                 group_by: None,
                 damage_kind: DamageKindFilter::Any,
+
+                excess_only: false,
             },
         };
         assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), source), 1);
@@ -6102,6 +6819,8 @@ mod tests {
                 aggregate: AggregateFunction::Max,
                 group_by: Some(DamageGroupKey::SourceId),
                 damage_kind: DamageKindFilter::Any,
+
+                excess_only: false,
             },
         };
         // P0's single largest source contribution is 5 (Lightning Rig: 3+2),
@@ -6162,6 +6881,8 @@ mod tests {
                 aggregate: AggregateFunction::Max,
                 group_by: Some(DamageGroupKey::SourceId),
                 damage_kind: DamageKindFilter::Any,
+
+                excess_only: false,
             },
         };
         // P0 still sees their 4 damage even though the live source is now P1's.
@@ -6214,6 +6935,8 @@ mod tests {
                 aggregate: AggregateFunction::Sum,
                 group_by: None,
                 damage_kind: DamageKindFilter::Any,
+
+                excess_only: false,
             },
         };
 
@@ -6274,6 +6997,8 @@ mod tests {
                 aggregate: AggregateFunction::Sum,
                 group_by: None,
                 damage_kind: DamageKindFilter::NoncombatOnly,
+
+                excess_only: false,
             },
         };
         assert_eq!(
@@ -6304,12 +7029,17 @@ mod tests {
                 aggregate,
                 group_by,
                 damage_kind,
+                excess_only,
             } => {
                 assert_eq!(*source, TargetFilter::Any);
                 assert_eq!(*target, TargetFilter::SelfRef);
                 assert_eq!(aggregate, AggregateFunction::Sum);
                 assert_eq!(group_by, None);
                 assert_eq!(damage_kind, crate::types::ability::DamageKindFilter::Any);
+                assert!(
+                    !excess_only,
+                    "legacy JSON should default excess_only to false"
+                );
                 // Sanity: an explicit Max+SourceId still round-trips.
                 let new_form = QuantityRef::DamageDealtThisTurn {
                     source: Box::new(TargetFilter::Any),
@@ -6317,6 +7047,8 @@ mod tests {
                     aggregate: AggregateFunction::Max,
                     group_by: Some(DamageGroupKey::SourceId),
                     damage_kind: DamageKindFilter::Any,
+
+                    excess_only: false,
                 };
                 let round_trip: QuantityRef =
                     serde_json::from_str(&serde_json::to_string(&new_form).unwrap()).unwrap();
@@ -7477,6 +8209,8 @@ mod tests {
                         aggregate: AggregateFunction::Sum,
                         group_by: None,
                         damage_kind: DamageKindFilter::Any,
+
+                        excess_only: false,
                     },
                 },
                 PlayerId(0),
@@ -8422,6 +9156,79 @@ mod tests {
         };
 
         assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), ObjectId(1)), 1);
+    }
+
+    /// Storm Entity's "for each other spell cast this turn": `CountScope::All`
+    /// plus offset −1 must count opponent spells while excluding the resolving
+    /// spell.
+    #[test]
+    fn resolve_quantity_other_spells_cast_this_turn_counts_opponent_spells() {
+        fn other_spell_cast_this_turn_expr() -> QuantityExpr {
+            QuantityExpr::ClampMin {
+                inner: Box::new(QuantityExpr::Offset {
+                    inner: Box::new(QuantityExpr::Ref {
+                        qty: QuantityRef::SpellsCastThisTurn {
+                            scope: CountScope::All,
+                            filter: None,
+                        },
+                    }),
+                    offset: -1,
+                }),
+                minimum: 0,
+            }
+        }
+
+        fn dummy_spell() -> SpellCastRecord {
+            SpellCastRecord {
+                name: String::new(),
+                core_types: vec![CoreType::Instant],
+                supertypes: vec![],
+                subtypes: vec![],
+                keywords: vec![],
+                colors: vec![ManaColor::Red],
+                mana_value: 1,
+                has_x_in_cost: false,
+                from_zone: Zone::Hand,
+                cast_variant: crate::types::game_state::CastingVariant::Normal,
+                was_kicked: false,
+            }
+        }
+
+        let mut state = GameState::new_two_player(42);
+        // Opponent cast a spell earlier this turn.
+        state
+            .spells_cast_this_turn_by_player
+            .insert(PlayerId(1), crate::im::Vector::from(vec![dummy_spell()]));
+        // Controller cast only Storm Entity (the resolving spell).
+        state
+            .spells_cast_this_turn_by_player
+            .insert(PlayerId(0), crate::im::Vector::from(vec![dummy_spell()]));
+
+        let expr = other_spell_cast_this_turn_expr();
+        assert_eq!(
+            resolve_quantity(&state, &expr, PlayerId(0), ObjectId(1)),
+            1,
+            "opponent's spell must count; resolving Storm Entity excluded by -1"
+        );
+
+        // Controller-only scope would incorrectly yield 0 here (1 own spell − 1).
+        let controller_only = QuantityExpr::ClampMin {
+            inner: Box::new(QuantityExpr::Offset {
+                inner: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::SpellsCastThisTurn {
+                        scope: CountScope::Controller,
+                        filter: None,
+                    },
+                }),
+                offset: -1,
+            }),
+            minimum: 0,
+        };
+        assert_eq!(
+            resolve_quantity(&state, &controller_only, PlayerId(0), ObjectId(1)),
+            0,
+            "Controller scope must not count opponent spells"
+        );
     }
 
     #[test]

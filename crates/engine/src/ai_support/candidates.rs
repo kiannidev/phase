@@ -953,19 +953,20 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
             cards,
             count,
             up_to,
+            allows_partial_find,
             constraint,
             ..
         } => {
-            // CR 701.23b/d: constrained (stated-quality) searches enumerate 0..=count
-            // so the legal-action set always contains the empty fail-to-find plus
-            // valid partials; pure-quantity exact-count searches enumerate only
-            // `count`. `combinations(_, 0)` returns `vec![vec![]]`, so the empty
-            // decline survives the constraint filter below.
-            let sizes: Vec<usize> = if *up_to || constraint.permits_partial_find() {
-                (0..=*count).collect()
-            } else {
-                vec![*count]
-            };
+            // CR 701.23b/d: "up to N", hidden-zone stated-quality searches, or
+            // explicit stated-quality selection constraints enumerate 0..=count
+            // so the legal-action set contains fail-to-find plus valid partials.
+            // Pure-quantity exact-count searches enumerate only `count`.
+            let sizes: Vec<usize> =
+                if *up_to || *allows_partial_find || constraint.permits_partial_find() {
+                    (0..=*count).collect()
+                } else {
+                    vec![*count]
+                };
             // Engine-side beam cap. Required (not optional) because every candidate
             // returned here flows into `PlannerServices::validate_candidates`, which
             // clones state + applies the action per candidate. Without a cap, a
@@ -1597,6 +1598,30 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
             min_count,
             ..
         } => bounded_select_card_candidates(*player, choices, *min_count..=*count),
+        // CR 601.2f + CR 208.1: The aggregate Crew/Saddle/Teamwork tap cost is
+        // paid by ANY creature subset whose summed current power satisfies the
+        // advertised comparator — not a fixed cardinality. Enumerate minimal-cover
+        // subsets (mirroring crew/saddle) so the AI/MP legal-action set offers
+        // them; measure each creature via the same current-power authority, and
+        // evaluate acceptance through the same `satisfied_by` the payment
+        // validator uses, so all three seams agree. The `aggregate: None`
+        // (fixed-count) form falls through to the exact-`count` selection below.
+        WaitingFor::PayCost {
+            player,
+            kind:
+                PayCostKind::TapCreatures {
+                    aggregate: Some(aggregate),
+                },
+            choices,
+            ..
+        } => minimal_power_subset_candidates(
+            state,
+            *player,
+            choices,
+            |total| aggregate.satisfied_by(total),
+            crate::game::casting_costs::tap_creature_power_contribution,
+            |cards| GameAction::SelectCards { cards },
+        ),
         WaitingFor::PayCost {
             player,
             choices,
@@ -2006,6 +2031,27 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
             .map(|&target| {
                 candidate(
                     GameAction::ChooseRingBearer { target },
+                    TacticalClass::Selection,
+                    Some(*player),
+                )
+            })
+            .collect(),
+        // CR 709.5f-g: Choose which door (half) of the targeted Room to
+        // lock/unlock — one candidate per offered (operation, door) pair so AI
+        // games never soft-lock on the door-choice prompt.
+        WaitingFor::ChooseRoomDoor {
+            player,
+            object_id,
+            options,
+        } => options
+            .iter()
+            .map(|&(op, door)| {
+                candidate(
+                    GameAction::ChooseRoomDoor {
+                        object_id: *object_id,
+                        op,
+                        door,
+                    },
                     TacticalClass::Selection,
                     Some(*player),
                 )
@@ -4004,8 +4050,14 @@ fn crew_vehicle_candidates(
         state,
         player,
         eligible_creatures,
-        crew_power as i32,
-        crate::types::statics::CrewAction::Crew,
+        |total| total >= crew_power as i32,
+        |state, id| {
+            crate::game::static_abilities::object_crew_power_contribution(
+                state,
+                id,
+                crate::types::statics::CrewAction::Crew,
+            )
+        },
         |creature_ids| GameAction::CrewVehicle {
             vehicle_id,
             creature_ids,
@@ -4027,8 +4079,14 @@ fn saddle_mount_candidates(
         state,
         player,
         eligible_creatures,
-        saddle_power as i32,
-        crate::types::statics::CrewAction::Saddle,
+        |total| total >= saddle_power as i32,
+        |state, id| {
+            crate::game::static_abilities::object_crew_power_contribution(
+                state,
+                id,
+                crate::types::statics::CrewAction::Saddle,
+            )
+        },
         |creature_ids| GameAction::SaddleMount {
             mount_id,
             creature_ids,
@@ -4036,43 +4094,46 @@ fn saddle_mount_candidates(
     )
 }
 
-/// Shared engine policy for power-threshold subset selection (Crew/Saddle).
-/// Enumerates only the **minimal-size** valid covers, with creatures explored
-/// in ascending-power order so the lowest-power valid cover is yielded first.
-/// Capped at 20 candidates within the minimal size for search bounding.
-fn minimal_power_subset_candidates<F>(
+/// Shared engine policy for power-threshold subset selection (Crew/Saddle/
+/// Teamwork). Enumerates only the **minimal-size** valid covers, with creatures
+/// explored in ascending-power order so the lowest-power valid cover is yielded
+/// first. Capped at 20 candidates within the minimal size for search bounding.
+///
+/// `power_of` is the per-creature power accessor: each cost family measures
+/// contribution through its own authority (Crew/Saddle via
+/// `object_crew_power_contribution`, which honors "as though its power were N
+/// greater"/"uses its toughness"; Teamwork via the plain current-power sum). The
+/// candidate enumerator MUST use the same authority as that family's activation
+/// gate and announcement validator — measuring power any other way yields zero
+/// valid covers and hangs the controller with an empty legal-action set.
+///
+/// `satisfies` evaluates a candidate subset's summed power against the cost's
+/// constraint (Crew/Saddle: `>= N`; Teamwork: the advertised comparator via
+/// `TapCreaturesAggregate::satisfied_by`). The minimal-cover early-break assumes
+/// the constraint is monotone non-decreasing in the total (the only shapes
+/// produced today — `>=`/`>`); a future non-monotone comparator would need a
+/// different enumeration policy, but the payment validator remains the exact
+/// authority regardless.
+fn minimal_power_subset_candidates<S, P, F>(
     state: &GameState,
     player: PlayerId,
     eligible_creatures: &[crate::types::identifiers::ObjectId],
-    threshold: i32,
-    action: crate::types::statics::CrewAction,
+    satisfies: S,
+    power_of: P,
     wrap: F,
 ) -> Vec<CandidateAction>
 where
+    S: Fn(i32) -> bool,
+    P: Fn(&GameState, crate::types::identifiers::ObjectId) -> i32,
     F: Fn(Vec<crate::types::identifiers::ObjectId>) -> GameAction,
 {
     const MAX_CANDIDATES: usize = 20;
 
-    // CR 702.122c / 702.171a: a creature's contribution toward the crew/saddle
-    // threshold may be modified ("as though its power were N greater" / "using
-    // its toughness rather than its power"). The activation gate and the
-    // announcement validator both measure power via `object_crew_power_contribution`,
-    // so the candidate enumerator must use the same authority — measuring raw
-    // `power` here disagrees with those seams and yields zero valid covers for
-    // Pilot-style creatures (e.g. Deathless Pilot, "crews as though its power
-    // were 2 greater"), hanging the controller with an empty legal-action set.
     let mut creatures_with_power: Vec<(crate::types::identifiers::ObjectId, i32)> =
         eligible_creatures
             .iter()
             .filter(|&&id| state.objects.contains_key(&id))
-            .map(|&id| {
-                (
-                    id,
-                    crate::game::static_abilities::object_crew_power_contribution(
-                        state, id, action,
-                    ),
-                )
-            })
+            .map(|&id| (id, power_of(state, id)))
             .collect();
     // Ascending-power sort with id tie-break makes enumeration deterministic
     // and surfaces low-power covers first within each subset size.
@@ -4093,7 +4154,7 @@ where
                         .map(|(_, p)| *p)
                 })
                 .sum();
-            if total >= threshold {
+            if satisfies(total) {
                 actions.push(candidate(wrap(combo), TacticalClass::Utility, Some(player)));
                 if actions.len() >= MAX_CANDIDATES {
                     return actions;
@@ -4690,6 +4751,9 @@ mod tests {
 
         state.waiting_for = WaitingFor::TriggerTargetSelection {
             player: p0,
+            trigger_controller: None,
+            trigger_event: None,
+            trigger_events: Vec::new(),
             target_slots: vec![TargetSelectionSlot {
                 legal_targets: vec![TargetRef::Object(target_a), TargetRef::Object(target_b)],
                 optional: false,
@@ -4968,6 +5032,7 @@ mod tests {
             track_exiled_by_source: false,
             face_down_profile: None,
             count_param: 0,
+            library_position: None,
             is_cost_payment: false,
         };
 
@@ -5296,6 +5361,57 @@ mod tests {
                 GameAction::TapLandForMana { object_id } if object_id == blank_land
             )
         }));
+    }
+
+    #[test]
+    fn ai_does_not_pin_pool_mana_during_mana_payment() {
+        // CR 118.3a: pinning a pool unit is a human-only manual-payment affordance.
+        // The AI candidate generator must never emit SpendPoolMana/UnspendPoolMana
+        // (they are excluded by the `!is_mana_ability` flat-list filter / by
+        // `mana_payment_actions` not generating them).
+        let mut state = GameState::new_two_player(42);
+        state.waiting_for = WaitingFor::ManaPayment {
+            player: PlayerId(0),
+            convoke_mode: None,
+        };
+        let spell = create_object(
+            &mut state,
+            CardId(500),
+            PlayerId(0),
+            "Some Spell".to_string(),
+            Zone::Stack,
+        );
+        state.pending_cast = Some(Box::new(crate::types::game_state::PendingCast::new(
+            spell,
+            CardId(500),
+            crate::types::ability::ResolvedAbility::new(
+                Effect::Unimplemented {
+                    name: "test".to_string(),
+                    description: None,
+                },
+                Vec::new(),
+                spell,
+                PlayerId(0),
+            ),
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Red],
+                generic: 1,
+            },
+        )));
+        // Floated mana that a pin could target — must still not surface a pin action.
+        state.add_mana_to_pool(
+            PlayerId(0),
+            crate::types::mana::ManaUnit::new(ManaType::Red, ObjectId(0), false, Vec::new()),
+        );
+
+        let actions = candidate_actions(&state);
+        assert!(
+            !actions.iter().any(|c| matches!(
+                c.action,
+                GameAction::SpendPoolMana { .. } | GameAction::UnspendPoolMana { .. }
+            )),
+            "AI candidate generation must never offer pool-mana pinning"
+        );
     }
 
     #[test]
@@ -5676,6 +5792,7 @@ mod tests {
             count: 2,
             reveal: false,
             up_to: false,
+            allows_partial_find: false,
             constraint: SearchSelectionConstraint::None,
             split: None,
         };
@@ -5697,6 +5814,7 @@ mod tests {
             count: 2,
             reveal: false,
             up_to: false,
+            allows_partial_find: false,
             constraint: SearchSelectionConstraint::DistinctQualities {
                 qualities: vec![SharedQuality::Name],
             },
@@ -5757,6 +5875,7 @@ mod tests {
             count: 4,
             reveal: false,
             up_to: true,
+            allows_partial_find: false,
             constraint: SearchSelectionConstraint::DistinctQualities {
                 qualities: vec![SharedQuality::Name],
             },
@@ -5871,6 +5990,7 @@ mod tests {
         state.players[0].mana_pool.add(ManaUnit {
             color: ManaType::Blue,
             source_id: ObjectId(0),
+            pip_id: crate::types::mana::ManaPipId(0),
             supertype: None,
             source_could_produce_two_or_more_colors: false,
             restrictions: Vec::new(),
@@ -6012,6 +6132,7 @@ mod tests {
         state.players[player].mana_pool.add(ManaUnit {
             color,
             source_id: ObjectId(0),
+            pip_id: crate::types::mana::ManaPipId(0),
             supertype: None,
             source_could_produce_two_or_more_colors: false,
             restrictions: Vec::new(),

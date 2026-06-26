@@ -3,7 +3,7 @@ use rand::Rng;
 use crate::game::zones;
 use crate::types::ability::{
     ControllerRef, Duration, Effect, EffectError, EffectKind, FilterProp, LibraryPosition,
-    ResolvedAbility, TargetChoiceTiming, TargetFilter, TargetSelectionMode, TypedFilter,
+    ResolvedAbility, TargetChoiceTiming, TargetFilter, TargetRef, TargetSelectionMode, TypedFilter,
 };
 #[cfg(test)]
 use crate::types::ability::{EffectScope, TapStateChange};
@@ -212,19 +212,49 @@ pub fn resolve(
 
     let mut origin = origin;
 
+    let parsed_target = match &ability.effect {
+        Effect::ChangeZone { target, .. } => target.clone(),
+        _ => TargetFilter::Any,
+    };
     // CR 603.7: Resolve the `TrackedSetId(0)` sentinel emitted by the parser
     // for "from among the milled cards" / "X cards revealed this way"
     // continuations to the most recent non-empty tracked set. Done up front so
     // every downstream path (interactive scan, `matches_target_filter`,
     // `tracked_set_member_zones`) sees the bound id — `matches_target_filter`
     // looks the set up by exact id and would otherwise miss the sentinel.
-    let target_filter: TargetFilter = match &ability.effect {
-        Effect::ChangeZone { target, .. } => {
-            crate::game::targeting::resolve_tracked_set_sentinel(state, target.clone())
+    let mut effective_target_filter =
+        crate::game::targeting::resolve_tracked_set_sentinel(state, parsed_target);
+    // CR 608.2c: After a dig that already routed ParentTarget to hand, a chained
+    // "exile one of them" must pick from the remaining looked-at cards in the
+    // tracked set — not re-exile the card already in hand (Expressive Iteration).
+    let mut exile_tracked_set_library_only = false;
+    if let Effect::ChangeZone {
+        destination: Zone::Exile,
+        ..
+    } = &ability.effect
+    {
+        if matches!(effective_target_filter, TargetFilter::ParentTarget) {
+            if let Some(parent) = ability.targets.iter().find_map(|t| match t {
+                TargetRef::Object(id) => Some(*id),
+                _ => None,
+            }) {
+                if state
+                    .objects
+                    .get(&parent)
+                    .is_some_and(|obj| obj.zone == Zone::Hand)
+                {
+                    exile_tracked_set_library_only = true;
+                    effective_target_filter = crate::game::targeting::resolve_tracked_set_sentinel(
+                        state,
+                        TargetFilter::TrackedSet {
+                            id: crate::types::identifiers::TrackedSetId(0),
+                        },
+                    );
+                }
+            }
         }
-        _ => TargetFilter::Any,
-    };
-    let target_filter = &target_filter;
+    }
+    let target_filter = &effective_target_filter;
     if origin.is_none() && matches!(target_filter, TargetFilter::TriggeringSource) {
         origin = state
             .current_trigger_event
@@ -256,6 +286,19 @@ pub fn resolve(
         targeted_objects,
         target_filter,
     );
+    let targeted_objects: Vec<ObjectId> = if exile_tracked_set_library_only {
+        targeted_objects
+            .into_iter()
+            .filter(|id| {
+                state
+                    .objects
+                    .get(id)
+                    .is_some_and(|obj| obj.zone == Zone::Library)
+            })
+            .collect()
+    } else {
+        targeted_objects
+    };
 
     if targeted_objects.is_empty() {
         // CR 115.6: "Up to one target" — if the player chose zero targets during
@@ -338,19 +381,23 @@ pub fn resolve(
         // there is no fixed `InZone` constraint to extract — so derive the scan
         // zone from the members' actual zone rather than defaulting to the
         // battlefield.
-        let scan_zone = origin
-            .or_else(|| target_filter.extract_in_zone())
-            .or_else(|| {
-                tracked_set_member_zones(state, target_filter)
-                    .and_then(|zones| zones.into_iter().next())
-            })
-            .unwrap_or(Zone::Battlefield);
+        let scan_zone = if exile_tracked_set_library_only {
+            Zone::Library
+        } else {
+            origin
+                .or_else(|| target_filter.extract_in_zone())
+                .or_else(|| {
+                    tracked_set_member_zones(state, target_filter)
+                        .and_then(|zones| zones.into_iter().next())
+                })
+                .unwrap_or(Zone::Battlefield)
+        };
         // Filter-controller override is primary here: when a filter like
         // "creature you control" needs "you" to resolve to the *target* player
-        // (not the caster), we pass `filter_controller` explicitly. Use
-        // `from_source_with_controller` to honor this remapping.
-        let ctx = crate::game::filter::FilterContext::from_source_with_controller(
-            ability.source_id,
+        // (not the caster), we pass `filter_controller` explicitly. Include the
+        // resolving ability so `Owned { ScopedPlayer }` reads `scoped_player`.
+        let ctx = crate::game::filter::FilterContext::from_ability_with_controller(
+            ability,
             filter_controller,
         );
         let eligible: Vec<ObjectId> = state
@@ -555,6 +602,7 @@ pub fn resolve(
             // resolves the choice.
             face_down_profile: face_down_profile.clone(),
             count_param: 0,
+            library_position: None,
             is_cost_payment: false,
         };
         // EffectResolved is emitted by the EffectZoneChoice handler after the player chooses
@@ -859,9 +907,9 @@ pub fn resolve_all(
     // in a mass zone-change reference a *player*, not a set of objects. Such
     // filters arise from phrases like "shuffle your hand into your library"
     // (Controller) or "that/target player puts all cards from their graveyard
-    // into their library" (Player / ParentTarget). Translate them here to "all
-    // cards owned by that player in the origin zone" — the object-level matcher
-    // would otherwise reject them outright.
+    // into their library" (Player / ParentTarget / ParentTargetController).
+    // Translate them here to "all cards owned by that player in the origin zone"
+    // — the object-level matcher would otherwise reject them outright.
     let player_scope: Option<crate::types::player::PlayerId> = match &target_filter {
         TargetFilter::Controller => Some(ability.controller),
         TargetFilter::Player => ability
@@ -876,6 +924,21 @@ pub fn resolve_all(
             crate::types::ability::TargetRef::Player(p) => Some(*p),
             _ => None,
         }),
+        // CR 608.2c + CR 109.4: "that player shuffles their hand into their
+        // library" (Jace, the Mind Sculptor −12) binds the mass move to the
+        // parent instruction's chosen player via `ParentTargetController`.
+        TargetFilter::ParentTargetController => crate::game::targeting::resolve_effect_player_ref(
+            state,
+            ability,
+            &TargetFilter::ParentTargetController,
+        ),
+        // CR 108.3 + CR 608.2c: "its owner shuffles their graveyard into their
+        // library" mass moves key off owner, not controller.
+        TargetFilter::ParentTargetOwner => crate::game::targeting::resolve_effect_player_ref(
+            state,
+            ability,
+            &TargetFilter::ParentTargetOwner,
+        ),
         _ => None,
     };
 
@@ -5107,6 +5170,88 @@ mod tests {
         assert_eq!(state.last_effect_count, Some(4));
     }
 
+    /// CR 400.7 + CR 701.23 + CR 108.3: Surgical Extraction-class search uses
+    /// `ParentTargetOwner` (owner axis) rather than controller axis.
+    #[test]
+    fn change_zone_all_multi_zone_same_name_parent_target_owner_exiles() {
+        use crate::types::ability::FilterProp;
+        let mut state = GameState::new_two_player(42);
+
+        let seed = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Lightning Bolt".to_string(),
+            Zone::Graveyard,
+        );
+
+        let bolt_gy = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Lightning Bolt".to_string(),
+            Zone::Graveyard,
+        );
+        let bolt_hand = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Lightning Bolt".to_string(),
+            Zone::Hand,
+        );
+        let bolt_lib = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(1),
+            "Lightning Bolt".to_string(),
+            Zone::Library,
+        );
+        let other_gy = create_object(
+            &mut state,
+            CardId(5),
+            PlayerId(1),
+            "Counterspell".to_string(),
+            Zone::Graveyard,
+        );
+
+        let ability = ResolvedAbility::new(
+            Effect::ChangeZoneAll {
+                origin: None,
+                destination: Zone::Exile,
+                target: TargetFilter::Typed(
+                    crate::types::ability::TypedFilter::default()
+                        .controller(ControllerRef::ParentTargetOwner)
+                        .properties(vec![
+                            FilterProp::InAnyZone {
+                                zones: vec![Zone::Graveyard, Zone::Hand, Zone::Library],
+                            },
+                            FilterProp::SameNameAsParentTarget,
+                        ]),
+                ),
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enter_with_counters: vec![],
+                face_down_profile: None,
+                library_position: None,
+                random_order: false,
+            },
+            vec![TargetRef::Object(seed)],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve_all(&mut state, &ability, &mut events).unwrap();
+
+        for &id in &[seed, bolt_gy, bolt_hand, bolt_lib] {
+            assert_eq!(
+                state.objects[&id].zone,
+                Zone::Exile,
+                "matching Lightning Bolt {id:?} must be exiled"
+            );
+        }
+        assert_eq!(state.objects[&other_gy].zone, Zone::Graveyard);
+    }
+
     /// CR 701.59c + CR 601.2f: End-to-end cascade for Deadly Cover-Up with
     /// evidence paid. Chains DestroyAll → (conditional on AdditionalCostPaid)
     /// exile seed from opponent's graveyard → multi-zone same-name exile →
@@ -6522,6 +6667,7 @@ mod tests {
             track_exiled_by_source: false,
             face_down_profile: None,
             count_param: 0,
+            library_position: None,
             is_cost_payment: false,
         };
 

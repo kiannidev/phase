@@ -1510,6 +1510,12 @@ pub(crate) fn rebind_source_object_quantity_expr_to_recipient(expr: QuantityExpr
             left: Box::new(rebind_source_object_quantity_expr_to_recipient(*left)),
             right: Box::new(rebind_source_object_quantity_expr_to_recipient(*right)),
         },
+        QuantityExpr::Max { exprs } => QuantityExpr::Max {
+            exprs: exprs
+                .into_iter()
+                .map(rebind_source_object_quantity_expr_to_recipient)
+                .collect(),
+        },
         other => other,
     }
 }
@@ -1603,7 +1609,8 @@ pub(crate) enum CombatTaxSubject {
 pub(crate) fn parse_for_each_cost_quantity(input: &str) -> OracleResult<'_, QuantityRef> {
     let (input, _) = tag_no_case::<_, _, OracleError<'_>>(" for each ").parse(input)?;
     let lowered = input.trim_end_matches('.').to_lowercase();
-    let quantity = parse_for_each_clause(&lowered).ok_or_else(|| {
+    let (_, quantity) = super::oracle_nom::quantity::parse_for_each_clause_ref_complete(&lowered)
+        .map_err(|_| {
         nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Fail))
     })?;
     Ok(("", quantity))
@@ -1744,6 +1751,38 @@ pub(crate) fn find_continuous_predicate_start(lower: &str) -> Option<usize> {
     .into_iter()
     .filter_map(|marker| lower.find(marker))
     .min()
+}
+
+/// CR 108.3 + CR 109.4: Strip a leading negated-ownership qualifier ("but don't
+/// own", "but do not own") from a "<subject> you control" predicate tail.
+///
+/// The "<X> you control" dispatch arms (`creatures you control `, `other
+/// creatures you control `) consume the `you control` controller anchor before
+/// the predicate, so a trailing "but don't own" qualifier would otherwise be
+/// silently dropped from the affected filter. Returns the
+/// `FilterProp::Owned { Opponent }` property ("controller doesn't own it") and
+/// the remaining predicate text when the qualifier is present. The companion
+/// "but don't own" handling in `parse_type_phrase` covers the full-subject path
+/// (Laughing Jasper Flint's "Creatures you control but don't own are
+/// Mercenaries …"); this is the controller-prefix-consumed sibling.
+pub(crate) fn strip_negated_ownership_qualifier(after_prefix: &str) -> Option<(FilterProp, &str)> {
+    type VE<'a> = OracleError<'a>;
+    for qualifier in [
+        "but don't own ",
+        "but do not own ",
+        "but doesn't own ",
+        "but does not own ",
+    ] {
+        if let Ok((rest, _)) = tag::<_, _, VE>(qualifier).parse(after_prefix) {
+            return Some((
+                FilterProp::Owned {
+                    controller: ControllerRef::Opponent,
+                },
+                rest,
+            ));
+        }
+    }
+    None
 }
 
 pub(crate) fn parse_qualified_creatures_you_control_suffix<'a>(
@@ -2390,23 +2429,68 @@ pub(crate) fn descriptor_is_supertype(descriptor: &str) -> bool {
     is_supertype
 }
 
+/// Nom-backed helper: split a subject string into (descriptor_core, controller)
+/// by trying to parse a trailing controller suffix. Only accepts the controller
+/// scopes that this static subject seam can actually resolve:
+///
+/// - `ControllerRef::You` — "you control"
+/// - `ControllerRef::Opponent` — "your opponents control" / "you don't control"
+/// - `ControllerRef::EnchantedPlayer` — "enchanted player controls" (CR 303.4b)
+///
+/// `TargetPlayer` and `DefendingPlayer` are deliberately excluded because this
+/// call site builds a continuous static `TargetFilter` with no companion
+/// target-player authority or combat context.
+///
+/// Uses nom `alt`/`tag`/`value` combinators so the phrase set is maintained
+/// alongside the shared grammar rather than as raw suffix literals.
+fn parse_static_controller_suffix(input: &str) -> OracleResult<'_, ControllerRef> {
+    alt((
+        value(ControllerRef::You, tag("you control")),
+        value(ControllerRef::Opponent, tag("your opponents control")),
+        value(ControllerRef::Opponent, tag("you don't control")),
+        // CR 303.4b + CR 702.5a: "enchanted player controls" — the controller
+        // scope is the player the source Aura is attached to.
+        value(
+            ControllerRef::EnchantedPlayer,
+            tag("enchanted player controls"),
+        ),
+    ))
+    .parse(input)
+}
+
+/// Strip a trailing controller suffix from a subject string using the
+/// restricted nom grammar above. Returns (descriptor_core, Some(controller))
+/// on match, or (original, None) if no valid suffix is found.
+fn strip_subject_controller_suffix<'a>(
+    original: &'a str,
+    lower: &str,
+) -> (&'a str, Option<ControllerRef>) {
+    // Try each space-delimited split point (left to right) and check if the
+    // remainder is a complete controller suffix.
+    let mut start = 0;
+    while let Some(pos) = lower[start..].find(' ') {
+        let abs_pos = start + pos;
+        let suffix_lower = &lower[abs_pos + 1..];
+        if let Ok((rest, ctrl)) = parse_static_controller_suffix(suffix_lower) {
+            if rest.is_empty() {
+                return (original[..abs_pos].trim(), Some(ctrl));
+            }
+        }
+        start = abs_pos + 1;
+    }
+    (original, None)
+}
+
 pub(crate) fn parse_creature_subject_filter(subject: &str) -> Option<TargetFilter> {
     let trimmed = subject.trim();
     let lower = trimmed.to_lowercase();
     let tp = TextPair::new(trimmed, &lower);
 
-    // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-    let (subject_core, controller) = if let Some(prefix) = tp.original.strip_suffix(" you control")
-    // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-    {
-        (prefix.trim(), Some(ControllerRef::You))
-    // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-    } else if let Some(prefix) = tp.original.strip_suffix(" your opponents control") {
-        // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-        (prefix.trim(), Some(ControllerRef::Opponent))
-    } else {
-        (tp.original, None)
-    };
+    // CR 109.5 + CR 303.4b: Split the subject into a descriptor core and an
+    // optional controller suffix. Uses `parse_static_controller_suffix`, a
+    // restricted nom grammar that only accepts the controller scopes this
+    // static seam can resolve (You, Opponent, EnchantedPlayer).
+    let (subject_core, controller) = strip_subject_controller_suffix(tp.original, &lower);
 
     let subject_core_lower = subject_core.to_lowercase();
     let subject_core_tp = TextPair::new(subject_core, &subject_core_lower);
@@ -2849,6 +2933,15 @@ pub(crate) fn parse_rule_static_predicate_nom(
             RuleStaticPredicate::CantBeSacrificed,
             tag("can't be sacrificed"),
         ),
+        // NOTE: "can't become untapped" / "can't be untapped" (CR 701.26b) is the
+        // BROAD untap prohibition and is NOT a rule-static predicate. It would
+        // conflate with `StaticMode::CantUntap`, which is the untap-step-only
+        // class (CR 502.3, "doesn't untap during its untap step") enforced only by
+        // the untap-step turn-based-action loop — a spell/ability untap would
+        // bypass it. The broad form is parsed as an unconditional
+        // `ProposedEvent::Untap` prevention by
+        // `oracle_replacement::parse_cant_become_untapped_replacement` (mirroring
+        // CR 122.1d stun counters), so every untap path consults it.
         value(
             RuleStaticPredicate::LoseAllAbilities,
             alt((tag("loses all abilities"), tag("lose all abilities"))),
@@ -2990,7 +3083,14 @@ pub(crate) fn parse_cant_attack_defended_scope_nom(
     input: &str,
 ) -> OracleResult<'_, Option<crate::types::triggers::AttackTargetFilter>> {
     use crate::types::triggers::AttackTargetFilter;
+    // CR 508.1c + CR 310.5: " you or permanents you control" defends battles too,
+    // so it is a distinct filter from " you or planeswalkers you control". Both
+    // longer phrases precede the bare " you" (nom `alt` is leftmost-match).
     opt(alt((
+        value(
+            AttackTargetFilter::PlayerOrPermanents,
+            tag(" you or permanents you control"),
+        ),
         value(
             AttackTargetFilter::PlayerOrPlaneswalker,
             tag(" you or planeswalkers you control"),

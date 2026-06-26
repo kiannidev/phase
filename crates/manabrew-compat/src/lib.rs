@@ -722,7 +722,7 @@ pub fn build_prompt(
             match choice_type {
                 ChoiceType::Color { .. } => "chooseColor",
                 ChoiceType::CreatureType
-                | ChoiceType::CardType
+                | ChoiceType::CardType { .. }
                 | ChoiceType::LandType
                 | ChoiceType::BasicLandType => "chooseType",
                 ChoiceType::CardName => "chooseCardName",
@@ -1442,6 +1442,7 @@ fn mana_cost_string(cost: &ManaCost) -> String {
     match cost {
         ManaCost::NoCost => String::new(),
         ManaCost::SelfManaCost => "its mana cost".to_string(),
+        ManaCost::SelfManaValue => "its mana value".to_string(),
         ManaCost::Cost { shards, generic } => {
             let mut out = String::new();
             if *generic > 0 {
@@ -1704,6 +1705,8 @@ mod tests {
             chosen_discards: Vec::new(),
             chosen_mana_payment: None,
             chosen_counter_count: None,
+            chosen_x: None,
+            collected_evidence: Vec::new(),
             chosen_exiled: Vec::new(),
             chosen_sacrificed_battlefield: Vec::new(),
             cost_paid_object: None,
@@ -2001,7 +2004,7 @@ mod tests {
             choosable_objects(
                 &WaitingFor::PayCost {
                     player: PlayerId(0),
-                    kind: PayCostKind::TapCreatures,
+                    kind: PayCostKind::TapCreatures { aggregate: None },
                     choices: vec![ObjectId(30)],
                     count: 1,
                     min_count: 0,
@@ -2160,6 +2163,9 @@ mod tests {
                 "chooseTargetCard",
                 WaitingFor::TriggerTargetSelection {
                     player: PlayerId(0),
+                    trigger_controller: None,
+                    trigger_event: None,
+                    trigger_events: Vec::new(),
                     target_slots: vec![TargetSelectionSlot {
                         legal_targets: vec![TargetRef::Object(ObjectId(1))],
                         optional: false,

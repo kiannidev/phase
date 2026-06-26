@@ -390,6 +390,10 @@ pub(crate) fn apply_zone_exit_cleanup(
         if !preserve_counters {
             obj_mut.counters.clear();
         }
+        if !crate::game::stickers::zone_retains_stickers(to) && !obj_mut.stickers.is_empty() {
+            obj_mut.stickers.clear();
+            obj_mut.revert_layered_characteristics_to_base();
+        }
     }
 
     if from == Zone::Battlefield {
@@ -411,12 +415,21 @@ pub(crate) fn apply_zone_exit_cleanup(
         state.objects_that_dealt_damage.remove(&object_id);
         super::layers::prune_host_left_effects(state, object_id);
         super::layers::prune_affected_object_left_effects(state, object_id);
+        // CR 611.2b + CR 400.7: the captured source leaving play, OR the host
+        // leaving and re-entering as a new object (same storage ObjectId), ends
+        // the "can't become untapped for as long as you control [source]"
+        // continuous effect permanently — drop the gated def from base+live so
+        // it cannot revive on a same-ObjectId re-entry.
+        super::layers::prune_controller_controls_source_on_leave(state, object_id);
         // CR 613.1 + CR 400.7: Copy effects are pruned above, but layer-derived
         // characteristics (name, types, abilities) persist on the object until
         // explicitly reset. Revert to printed baseline so graveyard/exile objects
         // do not retain copied identity (Vesuva legend-rule sacrifice).
         if let Some(obj) = state.objects.get_mut(&object_id) {
             obj.revert_layered_characteristics_to_base();
+            if crate::game::stickers::zone_retains_stickers(to) && !obj.stickers.is_empty() {
+                crate::game::stickers::rebuild_public_zone_stickers(obj);
+            }
         }
         for tapped in state.lands_tapped_for_mana.values_mut() {
             tapped.retain(|&id| id != object_id);
@@ -661,6 +674,11 @@ pub fn move_to_zone(
 
     if to == Zone::Battlefield {
         obj_mut.reset_for_battlefield_entry(state.turn_number);
+        // CR 400.7: capture the entrant's incarnation AFTER the battlefield-entry
+        // bump so a later leave + re-entry (same ObjectId, higher incarnation) is
+        // distinguishable from the original entrant when an ETB intervening-if is
+        // rechecked at resolution (CR 603.4 + CR 608.2h).
+        zone_change_record.entered_incarnation = Some(obj_mut.incarnation);
     }
 
     // CR 700.11: a permanent card was put into its owner's graveyard.
@@ -668,11 +686,9 @@ pub fn move_to_zone(
         record_descend_on_graveyard_arrival(state, object_id, owner);
     }
 
-    // Mark layers dirty when objects enter the battlefield, or the hand (so
-    // Lorehold-style hand-zone grants re-apply to newly-drawn cards).
-    // Exit-side dirty marking is handled by apply_zone_exit_cleanup.
-    // CR 702.94a + CR 400.3: hand-zone continuous effects require re-evaluation
-    // when a hand object appears or departs.
+    // CR 611.3a + CR 400.3: Hand size affects continuous effects gated on the
+    // controller's hand (Carnage Interpreter, issue #3991) and hand-zone
+    // effects (Miracle in hand). Re-evaluate layers on any hand entry/exit.
     if to == Zone::Battlefield || to == Zone::Hand || from == Zone::Hand {
         crate::game::layers::mark_layers_full(state);
     }
@@ -715,7 +731,9 @@ pub fn move_to_zone(
         super::trigger_index::reindex_object_triggers(state, object_id);
     }
 
-    super::restrictions::record_zone_change(state, zone_change_record.clone());
+    let turn_zone_change_index =
+        super::restrictions::record_zone_change(state, zone_change_record.clone());
+    zone_change_record.turn_zone_change_index = turn_zone_change_index;
 
     if let Some(old_target) = unattached_from {
         events.push(GameEvent::Unattached {
@@ -979,7 +997,9 @@ pub fn move_to_library_at_index(
         obj_mut.zone = Zone::Library;
     }
 
-    super::restrictions::record_zone_change(state, zone_change_record.clone());
+    let turn_zone_change_index =
+        super::restrictions::record_zone_change(state, zone_change_record.clone());
+    zone_change_record.turn_zone_change_index = turn_zone_change_index;
 
     if let Some(old_target) = unattached_from {
         events.push(GameEvent::Unattached {
@@ -1031,6 +1051,18 @@ pub fn remove_from_zone(state: &mut GameState, object_id: ObjectId, zone: Zone, 
                     .expect("owner exists")
                     .attraction_deck
                     .retain(|id| *id != object_id);
+            } else if state
+                .objects
+                .get(&object_id)
+                .is_some_and(|obj| obj.in_contraption_deck)
+            {
+                state
+                    .players
+                    .iter_mut()
+                    .find(|p| p.id == owner)
+                    .expect("owner exists")
+                    .contraption_deck
+                    .retain(|id| *id != object_id);
             } else {
                 state.command_zone.retain(|id| *id != object_id);
             }
@@ -1070,6 +1102,18 @@ pub fn add_to_zone(state: &mut GameState, object_id: ObjectId, zone: Zone, owner
                     .find(|p| p.id == owner)
                     .expect("owner exists")
                     .attraction_deck
+                    .push_back(object_id);
+            } else if state
+                .objects
+                .get(&object_id)
+                .is_some_and(|obj| obj.in_contraption_deck)
+            {
+                state
+                    .players
+                    .iter_mut()
+                    .find(|p| p.id == owner)
+                    .expect("owner exists")
+                    .contraption_deck
                     .push_back(object_id);
             } else {
                 state.command_zone.push_back(object_id);
@@ -1154,8 +1198,16 @@ fn is_blocked_from_entering_battlefield(state: &GameState, obj: &GameObject) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::types::ability::{
+        ContinuousModification, ControllerRef, FilterProp, StaticDefinition, TargetFilter,
+        TypeFilter, TypedFilter,
+    };
     use crate::types::game_state::GameState;
+    use crate::types::keywords::Keyword;
+    use crate::types::mana::ManaCost;
 
     fn setup() -> GameState {
         GameState::new_two_player(42)
@@ -1189,6 +1241,77 @@ mod tests {
             Zone::Hand,
         );
         assert!(state.players[0].hand.contains(&id));
+    }
+
+    #[test]
+    fn hand_to_stack_marks_layers_dirty_for_hand_size_statics() {
+        let mut state = setup();
+        let id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Spell".to_string(),
+            Zone::Hand,
+        );
+        state.layers_dirty = crate::types::game_state::LayersDirty::Clean;
+
+        let mut events = Vec::new();
+        move_to_zone(&mut state, id, Zone::Stack, &mut events);
+
+        assert_eq!(state.objects[&id].zone, Zone::Stack);
+        assert!(
+            matches!(
+                state.layers_dirty,
+                crate::types::game_state::LayersDirty::Full
+            ),
+            "hand-to-stack movement must mark layers dirty so hand-size-gated statics re-evaluate"
+        );
+    }
+
+    #[test]
+    fn hand_to_stack_with_hand_zone_static_dirties_layers() {
+        let mut state = setup();
+        let grant_static = StaticDefinition::new(StaticMode::Continuous)
+            .affected(TargetFilter::Typed(
+                TypedFilter::new(TypeFilter::Instant)
+                    .controller(ControllerRef::You)
+                    .properties(vec![FilterProp::InZone { zone: Zone::Hand }]),
+            ))
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Miracle(ManaCost::Cost {
+                    shards: vec![],
+                    generic: 2,
+                }),
+            }]);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "HandGrantSource".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let src = state.objects.get_mut(&source).unwrap();
+            src.static_definitions.push(grant_static.clone());
+            src.base_static_definitions = Arc::new(vec![grant_static]);
+        }
+        let id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Spell".to_string(),
+            Zone::Hand,
+        );
+        state.layers_dirty = crate::types::game_state::LayersDirty::Clean;
+
+        let mut events = Vec::new();
+        move_to_zone(&mut state, id, Zone::Stack, &mut events);
+
+        assert_eq!(state.objects[&id].zone, Zone::Stack);
+        assert!(
+            state.layers_dirty.is_dirty(),
+            "hand-zone continuous effects must re-evaluate when a hand card departs"
+        );
     }
 
     #[test]

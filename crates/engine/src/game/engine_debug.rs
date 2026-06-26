@@ -112,13 +112,29 @@ pub fn apply_debug_action(
             // CR 614.6 + CR 614.11 + CR 704.3: route through the single-authority
             // helper so post-replacement continuations (Jace WinTheGame,
             // Abundance reveal-until) drain in the same step as the draw.
-            let _ = super::effects::draw::draw_through_replacement(
+            let event_start = events.len();
+            let result = super::effects::draw::draw_through_replacement(
                 state,
                 player_id,
                 count,
                 events,
                 super::effects::draw::apply_draw_after_replacement,
             );
+            // CR 603.2: Mirror the normal draw pipeline — `PassPriority` /
+            // `run_post_action_pipeline` scans CardDrawn events after the draw
+            // step's turn-based action. Debug draw previously returned without
+            // that scan, so draw triggers (Sheoldred, Rhystic Study, etc.) never
+            // fired unless a replacement-choice round-trip happened to run the
+            // pipeline. Defer trigger/SBA processing while a replacement choice
+            // is open; the choice handler owns the post-draw scan.
+            if !matches!(
+                result,
+                super::replacement::ReplacementResult::NeedsChoice(_)
+            ) {
+                let draw_events: Vec<_> = events[event_start..].to_vec();
+                super::triggers::process_triggers(state, &draw_events);
+                super::sba::check_state_based_actions(state, events);
+            }
         }
 
         DebugAction::Mill { player_id, count } => {
@@ -371,15 +387,16 @@ pub fn apply_debug_action(
 
         DebugAction::AddMana { player_id, mana } => {
             validate_player(state, player_id)?;
-            if let Some(player) = state.players.iter_mut().find(|p| p.id == player_id) {
-                for mana_type in mana {
-                    player.mana_pool.add(crate::types::mana::ManaUnit::new(
-                        mana_type,
-                        ObjectId(0),
-                        false,
-                        vec![],
-                    ));
-                }
+            for mana_type in mana {
+                // CR 118.3a: route through the stamping authority so each
+                // debug-added unit gets a distinct `pip_id`, exactly like
+                // produced mana. A bare `mana_pool.add` leaves the unstamped
+                // sentinel (`ManaPipId(0)`) on every unit, which makes all of
+                // them pin/unpin together in the manual-payment UI.
+                state.add_mana_to_pool(
+                    player_id,
+                    crate::types::mana::ManaUnit::new(mana_type, ObjectId(0), false, vec![]),
+                );
             }
         }
 
@@ -741,6 +758,50 @@ mod tests {
         let mut state = GameState::new(FormatConfig::standard().with_sandbox(), 2, 42);
         state.debug_mode = true;
         state
+    }
+
+    /// CR 118.3a regression: debug-added mana must route through the stamping
+    /// authority so each unit gets a DISTINCT, nonzero `pip_id`. A bare
+    /// `mana_pool.add` leaves every unit at the unstamped sentinel (0), which
+    /// makes all same-color pips in the manual-payment UI pin/unpin together.
+    #[test]
+    fn debug_add_mana_stamps_distinct_pip_ids() {
+        let mut state = sandbox_state();
+        let mut events = Vec::new();
+        apply_debug_action(
+            &mut state,
+            PlayerId(0),
+            DebugAction::AddMana {
+                player_id: PlayerId(0),
+                mana: vec![
+                    crate::types::mana::ManaType::Green,
+                    crate::types::mana::ManaType::Green,
+                    crate::types::mana::ManaType::Green,
+                ],
+            },
+            &mut events,
+        )
+        .unwrap();
+
+        let ids: Vec<u64> = state.players[0]
+            .mana_pool
+            .mana
+            .iter()
+            .map(|u| u.pip_id.0)
+            .collect();
+        assert_eq!(ids.len(), 3, "three AddMana entries → three pool units");
+        assert!(
+            ids.iter().all(|&id| id != 0),
+            "debug-added units must be stamped (nonzero pip_id), got {ids:?}"
+        );
+        assert_eq!(
+            ids.iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            3,
+            "debug-added pip ids must be distinct, got {ids:?}"
+        );
     }
 
     fn zero_zero_creature() -> TokenCharacteristics {
@@ -1402,6 +1463,56 @@ mod tests {
         assert!(
             !state.objects.contains_key(&token_id),
             "0/0 token with no counters should be removed by SBA + CR 704.5d",
+        );
+    }
+
+    /// CR 603.2 + CR 121.1: Debug draw must scan CardDrawn events for triggers,
+    /// matching the post-priority pipeline that natural draw-step draws use.
+    #[test]
+    fn debug_draw_cards_processes_draw_triggers() {
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::types::phase::Phase;
+        use crate::types::triggers::TriggerMode;
+
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        scenario.with_library_top(P0, &["Lib A", "Lib B"]);
+        scenario.add_creature_from_oracle(
+            P0,
+            "Watcher",
+            2,
+            2,
+            "Whenever you draw a card, you gain 2 life.",
+        );
+        let mut runner = scenario.build();
+        runner.state_mut().debug_mode = true;
+
+        let life_before = runner.state().players[0].life;
+        runner
+            .act(GameAction::Debug(DebugAction::DrawCards {
+                player_id: P0,
+                count: 1,
+            }))
+            .expect("debug draw");
+        runner.advance_until_stack_empty();
+
+        assert_eq!(
+            runner.state().players[0].life,
+            life_before + 2,
+            "draw trigger must fire after DebugAction::DrawCards"
+        );
+        let watcher = runner
+            .state()
+            .battlefield
+            .iter()
+            .find_map(|id| runner.state().objects.get(id))
+            .expect("watcher on battlefield");
+        assert!(
+            watcher
+                .trigger_definitions
+                .iter_all()
+                .any(|t| t.mode == TriggerMode::Drawn),
+            "sanity: watcher carries a Drawn trigger"
         );
     }
 }

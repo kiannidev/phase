@@ -19,6 +19,7 @@ use crate::types::identifiers::{CardId, ObjectId};
 use crate::types::keywords::{Keyword, KeywordKind};
 use crate::types::mana::{ColoredManaCount, ManaColor, ManaCost, ManaPip};
 use crate::types::player::PlayerId;
+use crate::types::stickers::AppliedSticker;
 use crate::types::zones::Zone;
 
 /// Image-lookup routing hint for the display layer.
@@ -86,6 +87,7 @@ pub struct MutateFormState;
 pub enum MergeKind {
     Mutate,
     Meld,
+    Augment,
 }
 
 /// CR 702.160a: Prototype form marker — `Some(_)` means this object was cast
@@ -293,6 +295,19 @@ impl RoomUnlockState {
             fully_unlocked: !was_fully_unlocked && self.left_unlocked && self.right_unlocked,
         }
     }
+
+    /// CR 709.5g: To lock a half, remove its unlocked designation. Returns
+    /// whether the designation was actually removed (false if it was already
+    /// locked). Mirror of [`unlock`], but no fully-unlocked outcome exists —
+    /// locking only ever removes a designation.
+    pub fn lock(&mut self, door: RoomDoor) -> bool {
+        let was_unlocked = self.is_unlocked(door);
+        match door {
+            RoomDoor::Left => self.left_unlocked = false,
+            RoomDoor::Right => self.right_unlocked = false,
+        }
+        was_unlocked
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -381,6 +396,13 @@ pub struct GameObject {
     #[serde(default)]
     pub intensity: u32,
 
+    /// Alchemy "perpetually" modifications applied to this card (digital-only, no
+    /// CR entry). Like `intensity`, these persist across zone changes (the object
+    /// keeps its id) and serialization, so a perpetual edit follows the card
+    /// through hand/library/stack/battlefield for the rest of the game.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub perpetual_mods: Vec<crate::types::ability::PerpetualModification>,
+
     // Characteristics
     pub name: String,
     pub power: Option<i32>,
@@ -404,6 +426,17 @@ pub struct GameObject {
     /// tracked via `Player::attraction_deck` rather than `command_zone`.
     #[serde(default)]
     pub in_attraction_deck: bool,
+    /// Unstable Contraptions: object is in the supplementary Contraption deck
+    /// (command zone), tracked via `Player::contraption_deck`.
+    #[serde(default)]
+    pub in_contraption_deck: bool,
+    /// Unstable Contraptions: the sprocket this Contraption occupies on the
+    /// battlefield. `None` when it is not assembled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contraption_sprocket: Option<u8>,
+    /// CR 123.1 + CR 123.5: Stickers are object state, distinct from counters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stickers: Vec<AppliedSticker>,
     pub mana_cost: ManaCost,
     pub keywords: Vec<Keyword>,
     /// Live abilities after layer evaluation. Wrapped in `Arc<Vec<_>>` so
@@ -818,6 +851,14 @@ pub struct GameObject {
     #[serde(default)]
     pub monstrous: bool,
 
+    /// CR 701.64b: Harnessed designation. Once a permanent becomes harnessed it
+    /// stays harnessed until it leaves the battlefield. Like `monstrous`, this is
+    /// a pure marker — neither an ability nor part of copiable values. Only
+    /// permanents can be harnessed. Read by the ∞ (Infinity) static-ability gate
+    /// (CR 702.186b: "∞ — [Ability]" grants [Ability] as long as harnessed).
+    #[serde(default)]
+    pub harnessed: bool,
+
     /// CR 702.xxx: Prepared (Strixhaven) designation. Present only on a
     /// permanent whose printed-card layout is `CardLayout::Prepare(a, b)`.
     /// While prepared, the controller may activate a synthesized priority-time
@@ -978,6 +1019,27 @@ pub(crate) fn chosen_card_type_of(attrs: &[ChosenAttribute]) -> Option<CoreType>
 }
 
 impl GameObject {
+    /// Apply an Alchemy "perpetually" modification to this card: record it on the
+    /// object (so it persists across zones/serialization and can be re-applied
+    /// after a copy rebuilds base characteristics) and edit the corresponding
+    /// persistent characteristic. Increment 1: base power/toughness.
+    pub fn apply_perpetual_modification(
+        &mut self,
+        modification: &crate::types::ability::PerpetualModification,
+    ) {
+        use crate::types::ability::PerpetualModification;
+        match modification {
+            PerpetualModification::SetBasePowerToughness { power, toughness } => {
+                // The base_* fields are the persistent baseline the layer pass
+                // copies into live P/T each recalc, so editing them here makes the
+                // change permanent and zone-independent.
+                self.base_power = Some(*power);
+                self.base_toughness = Some(*toughness);
+            }
+        }
+        self.perpetual_mods.push(modification.clone());
+    }
+
     pub fn instance_payment_count(&self, origin: AdditionalCostOrigin) -> u32 {
         additional_cost_instance_payment_count(&self.additional_cost_payments, origin)
     }
@@ -1056,6 +1118,11 @@ impl GameObject {
             is_token: self.is_token,
             combat_status: Default::default(),
             co_departed: Vec::new(),
+            attached_to: self.attached_to,
+            // CR 400.7: filled in by `move_to_zone` from the live object AFTER the
+            // battlefield-entry incarnation bump; `None` here (pre-entry snapshot).
+            entered_incarnation: None,
+            turn_zone_change_index: 0,
         }
     }
 
@@ -1133,6 +1200,7 @@ impl GameObject {
             pair_controller: None,
             counters: HashMap::new(),
             intensity: 0,
+            perpetual_mods: Vec::new(),
             name: name.clone(),
             power: None,
             toughness: None,
@@ -1142,6 +1210,9 @@ impl GameObject {
             card_types: CardType::default(),
             attraction_lights: Vec::new(),
             in_attraction_deck: false,
+            in_contraption_deck: false,
+            contraption_sprocket: None,
+            stickers: Vec::new(),
             mana_cost: ManaCost::default(),
             keywords: Vec::new(),
             abilities: Arc::new(Vec::new()),
@@ -1223,6 +1294,7 @@ impl GameObject {
             detained_by: std::collections::HashSet::new(),
             is_suspected: false,
             monstrous: false,
+            harnessed: false,
             prepared: None,
             is_saddled: false,
             saddled_by: Vec::new(),
@@ -1320,6 +1392,8 @@ impl GameObject {
         self.is_suspected = false;
         self.is_renowned = false;
         self.monstrous = false;
+        // CR 701.64b: Harnessed clears when a permanent leaves the battlefield.
+        self.harnessed = false;
         self.foretold = false;
         // CR 702.xxx: Prepared (Strixhaven) is a new-object-on-entry reset, per
         // CR 400.7. A re-entering permanent has no memory of a prior prepared
@@ -1403,6 +1477,8 @@ impl GameObject {
         self.base_controller = Some(self.owner);
         // CR 701.37b: Monstrous designation clears when a permanent leaves the battlefield.
         self.monstrous = false;
+        // CR 701.64b: Harnessed designation clears when a permanent leaves the battlefield.
+        self.harnessed = false;
         // CR 701.15a / CR 701.35a: Goad and detain are battlefield-only designations.
         self.goaded_by.clear();
         self.detained_by.clear();

@@ -33,7 +33,7 @@ fn resolve_and_prune_stack_spell_legs(
 /// CR 614.1a: Resolve a damage source filter, replacing dynamic references
 /// (e.g., `IsChosenColor`, `ParentTargetSlot`) with concrete values from the
 /// source object's state and the ability's chosen targets.
-fn resolve_source_filter(
+pub(crate) fn resolve_source_filter(
     filter: &TargetFilter,
     state: &GameState,
     source_id: ObjectId,
@@ -54,13 +54,31 @@ fn resolve_source_filter(
         TargetFilter::ChosenDamageSource => state
             .last_chosen_damage_source
             .as_ref()
-            .map(|choice| TargetFilter::And {
-                filters: vec![
-                    TargetFilter::SpecificObject {
-                        id: choice.source_id,
+            .map(|choice| {
+                let constraint = match &choice.source_filter {
+                    TargetFilter::Any | TargetFilter::ChosenDamageSource => TargetFilter::Any,
+                    other => resolve_source_filter(
+                        other,
+                        state,
+                        source_id,
+                        ability_targets,
+                    ),
+                };
+                match &constraint {
+                    TargetFilter::Any | TargetFilter::ChosenDamageSource => {
+                        TargetFilter::SpecificObject {
+                            id: choice.source_id,
+                        }
+                    }
+                    _ => TargetFilter::And {
+                        filters: vec![
+                            TargetFilter::SpecificObject {
+                                id: choice.source_id,
+                            },
+                            constraint,
+                        ],
                     },
-                    resolve_source_filter(&choice.source_filter, state, source_id, ability_targets),
-                ],
+                }
             })
             .unwrap_or(TargetFilter::None),
         TargetFilter::Not { filter: inner } => TargetFilter::Not {

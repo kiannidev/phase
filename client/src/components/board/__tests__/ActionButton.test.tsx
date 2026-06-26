@@ -92,6 +92,7 @@ describe("ActionButton", () => {
       gameState: createGameState(waitingFor),
       waitingFor,
       legalActions: [],
+      isResolvingAll: false,
     });
     useUiStore.setState({
       combatMode: null,
@@ -111,5 +112,89 @@ describe("ActionButton", () => {
 
     expect(screen.getByRole("button", { name: "Block with None" })).toBeInTheDocument();
     expect(screen.queryByText("Auto-Passing to End Step...")).not.toBeInTheDocument();
+  });
+
+  it("shows resolve when turn decision controller differs from priority player (issue #1218)", () => {
+    useGameStore.setState({
+      gameMode: "online",
+      gameState: {
+        ...createGameState({
+          type: "Priority",
+          data: { player: 0 },
+        }),
+        turn_decision_controller: 1,
+        active_player: 0,
+        stack: [
+          {
+            id: 1,
+            source_id: 1,
+            controller: 0,
+            kind: { type: "Spell", data: { card_id: 1 } },
+          },
+        ],
+      },
+      waitingFor: { type: "Priority", data: { player: 0 } },
+      legalActions: [],
+    });
+    useMultiplayerStore.setState({ activePlayerId: 1, actionPending: false });
+
+    render(<ActionButton />);
+
+    expect(screen.getByRole("button", { name: /^Resolve Pass priority/ })).toBeInTheDocument();
+  });
+
+  it("disables resolve controls while Resolve All is draining", () => {
+    useGameStore.setState({
+      gameMode: "online",
+      gameState: {
+        ...createGameState({
+          type: "Priority",
+          data: { player: 0 },
+        }),
+        phase: "PostCombatMain",
+        auto_pass: {},
+        stack: [
+          {
+            id: 1,
+            source_id: 1,
+            controller: 0,
+            kind: { type: "Spell", data: { card_id: 1 } },
+          },
+        ],
+      },
+      waitingFor: { type: "Priority", data: { player: 0 } },
+      legalActions: [],
+      isResolvingAll: true,
+    });
+    useMultiplayerStore.setState({ activePlayerId: 0, actionPending: false });
+
+    render(<ActionButton />);
+
+    expect(screen.getByRole("button", { name: /^Resolve Pass priority/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /^Resolve All Keep passing priority/ })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /^Resolve All Keep passing priority/ })).toHaveAttribute("aria-busy", "true");
+  });
+
+  it("shows blocker controls when turn decision controller differs from blocking player (issue #1199)", () => {
+    useGameStore.setState({
+      gameMode: "online",
+      gameState: createGameState(blockerPrompt()),
+      waitingFor: blockerPrompt(),
+      legalActions: [],
+    });
+    useGameStore.setState((state) => ({
+      gameState: state.gameState
+        ? {
+            ...state.gameState,
+            turn_decision_controller: 1,
+            active_player: 0,
+          }
+        : state.gameState,
+    }));
+    useMultiplayerStore.setState({ activePlayerId: 1, actionPending: false });
+
+    render(<ActionButton />);
+
+    expect(screen.getByRole("button", { name: "Block with None" })).toBeInTheDocument();
   });
 });

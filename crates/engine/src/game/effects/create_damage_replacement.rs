@@ -78,9 +78,12 @@ pub fn resolve(
     let resolved_source_filter = match &source_filter {
         Some(TargetFilter::ChosenDamageSource) => {
             match state.last_chosen_damage_source.as_ref() {
-                Some(choice) => Some(TargetFilter::SpecificObject {
-                    id: choice.source_id,
-                }),
+                Some(_choice) => Some(crate::game::effects::prevent_damage::resolve_source_filter(
+                    &TargetFilter::ChosenDamageSource,
+                    state,
+                    ability.source_id,
+                    &ability.targets,
+                )),
                 None => {
                     // CR 609.7a: prompt the source choice; stash self so the
                     // shield is built on the second pass with the choice known.

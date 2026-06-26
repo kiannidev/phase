@@ -31,7 +31,7 @@ import { ensureCardDatabase } from "../services/cardData";
 import { loadDraftRun } from "../services/quickDraftPersistence";
 import { SPECTATOR_PLAYER_ID } from "../constants/game";
 import { clearWsSession, loadWsSession, saveWsSession } from "../services/multiplayerSession";
-import { TextPromptDialog } from "../components/ui/TextPromptDialog.tsx";
+import { TextPromptDialog } from "../components/ui/TextPromptDialog";
 import { detectServerUrl } from "../services/serverDetection";
 import {
   clearGame,

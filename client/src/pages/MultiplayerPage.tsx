@@ -15,7 +15,7 @@ import { LobbyView } from "../components/lobby/LobbyView";
 import { PlayerIdentityBanner } from "../components/lobby/PlayerIdentityBanner";
 import { ServerOfflinePrompt } from "../components/lobby/ServerOfflinePrompt";
 import { ConnectionToast } from "../components/multiplayer/ConnectionToast";
-import { TextPromptDialog } from "../components/ui/TextPromptDialog.tsx";
+import { TextPromptDialog } from "../components/ui/TextPromptDialog";
 import { MenuParticles } from "../components/menu/MenuParticles";
 import { MenuPanel, MenuShell } from "../components/menu/MenuShell";
 import { menuButtonClass } from "../components/menu/buttonStyles";

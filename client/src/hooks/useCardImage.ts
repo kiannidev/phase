@@ -105,6 +105,16 @@ registerStrategyCacheClearFn(() => {
   strategyNoWinnerCache.clear();
 });
 
+function oldestPrinting(printings: PrintingEntry[]): PrintingEntry {
+  return [...printings].sort((a, b) => {
+    const byDate = a.released_at.localeCompare(b.released_at);
+    if (byDate !== 0) return byDate;
+    return a.collector_number.localeCompare(b.collector_number, undefined, {
+      numeric: true,
+    });
+  })[0];
+}
+
 function applyChainEntry(
   entry: ArtChainEntry,
   printings: PrintingEntry[],
@@ -116,7 +126,7 @@ function applyChainEntry(
     case "newest":
       return printings[0];
     case "oldest":
-      return printings[printings.length - 1];
+      return oldestPrinting(printings);
     case "prefer_borderless":
       return printings.find((p) => p.border_color === "borderless") ?? null;
     case "prefer_extended":

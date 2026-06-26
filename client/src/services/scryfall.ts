@@ -38,6 +38,7 @@ export interface PrintingEntry {
   set: string;
   set_name: string;
   collector_number: string;
+  released_at: string;
   border_color: string;
   frame_effects: string[];
   full_art: boolean;

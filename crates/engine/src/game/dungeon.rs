@@ -150,10 +150,10 @@ pub fn dungeon_sentinel_id(player: PlayerId) -> crate::types::identifiers::Objec
 use crate::game::ability_utils::build_resolved_from_def;
 use crate::parser::oracle_effect::parse_effect_chain;
 use crate::types::ability::{
-    AbilityCondition, AbilityKind, CardPlayMode, CastFromZoneDriver, CastingPermission,
-    ContinuousModification, ControllerRef, Duration, Effect, FilterProp, PlayerFilter, PlayerScope,
-    PtValue, QuantityExpr, ResolvedAbility, SearchSelectionConstraint, StaticDefinition,
-    TargetFilter, TypeFilter, TypedFilter,
+    AbilityCondition, AbilityKind, AggregateFunction, CardPlayMode, CastFromZoneDriver,
+    CastingPermission, ContinuousModification, ControllerRef, Duration, Effect, FilterProp,
+    ObjectProperty, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef, ResolvedAbility,
+    SearchSelectionConstraint, StaticDefinition, TargetFilter, TypeFilter, TypedFilter,
 };
 use crate::types::card_type::Supertype;
 use crate::types::counter::CounterType;
@@ -199,10 +199,9 @@ pub fn room_effects(
             vec![],
         ),
         // 2: Mine Tunnels — "Create a Treasure token"
-        (DungeonId::LostMineOfPhandelver, 2) => (
-            simple(treasure_token(), source_id, controller),
-            vec![],
-        ),
+        (DungeonId::LostMineOfPhandelver, 2) => {
+            (simple(treasure_token(), source_id, controller), vec![])
+        }
         // 3: Storeroom — "Put a +1/+1 counter on target creature you control"
         (DungeonId::LostMineOfPhandelver, 3) => (
             simple(
@@ -221,7 +220,10 @@ pub fn room_effects(
         // 4: Dark Pool — "Each opponent loses 1 life. You gain 1 life."
         (DungeonId::LostMineOfPhandelver, 4) => {
             let mut lose = ResolvedAbility::new(
-                Effect::LoseLife { amount: fixed(1), target: None },
+                Effect::LoseLife {
+                    amount: fixed(1),
+                    target: None,
+                },
                 vec![],
                 source_id,
                 controller,
@@ -291,10 +293,9 @@ pub fn room_effects(
             vec![],
         ),
         // 2: Goblin Bazaar — "Create a Treasure token"
-        (DungeonId::DungeonOfTheMadMage, 2) => (
-            simple(treasure_token(), source_id, controller),
-            vec![],
-        ),
+        (DungeonId::DungeonOfTheMadMage, 2) => {
+            (simple(treasure_token(), source_id, controller), vec![])
+        }
         // 3: Twisted Caverns — "Target creature can't attack until your next turn"
         // CR 309.4c + CR 508.1c: Room ability applying a combat restriction.
         (DungeonId::DungeonOfTheMadMage, 3) => {
@@ -371,15 +372,7 @@ pub fn room_effects(
         // 6: Muiral's Graveyard — "Create two 1/1 black Skeleton creature tokens"
         (DungeonId::DungeonOfTheMadMage, 6) => (
             simple(
-                creature_token(
-                    "Skeleton",
-                    1,
-                    1,
-                    &["Skeleton"],
-                    &[ManaColor::Black],
-                    &[],
-                    2,
-                ),
+                creature_token("Skeleton", 1, 1, &["Skeleton"], &[ManaColor::Black], &[], 2),
                 source_id,
                 controller,
             ),
@@ -399,16 +392,16 @@ pub fn room_effects(
         ),
         // 8: Mad Wizard's Lair — "Draw three cards and reveal them. You may cast one of them
         //    without paying its mana cost."
-        (DungeonId::DungeonOfTheMadMage, 8) => (
-            mad_wizards_lair(source_id, controller),
-            vec![],
-        ),
+        (DungeonId::DungeonOfTheMadMage, 8) => (mad_wizards_lair(source_id, controller), vec![]),
 
         // ── Tomb of Annihilation ────────────────────────────────────────
         // 0: Trapped Entry — "Each player loses 1 life"
         (DungeonId::TombOfAnnihilation, 0) => {
             let mut ability = simple(
-                Effect::LoseLife { amount: fixed(1), target: None },
+                Effect::LoseLife {
+                    amount: fixed(1),
+                    target: None,
+                },
                 source_id,
                 controller,
             );
@@ -444,7 +437,10 @@ pub fn room_effects(
         // 3: Sandfall Cell — "You lose 2 life and create a 2/2 black Zombie creature token"
         (DungeonId::TombOfAnnihilation, 3) => {
             let mut lose = simple(
-                Effect::LoseLife { amount: fixed(2), target: None },
+                Effect::LoseLife {
+                    amount: fixed(2),
+                    target: None,
+                },
                 source_id,
                 controller,
             );
@@ -489,10 +485,7 @@ pub fn room_effects(
         // ── Undercity ───────────────────────────────────────────────────
         // 0: Secret Entrance — "Search your library for a basic land card, reveal it,
         //    put it into your hand, then shuffle."
-        (DungeonId::Undercity, 0) => (
-            search_basic_land(source_id, controller),
-            vec![],
-        ),
+        (DungeonId::Undercity, 0) => (search_basic_land(source_id, controller), vec![]),
         // 1: Forge — "Put two +1/+1 counters on target creature"
         (DungeonId::Undercity, 1) => (
             simple(
@@ -543,10 +536,7 @@ pub fn room_effects(
             vec![],
         ),
         // 5: Stash — "Create a Treasure token"
-        (DungeonId::Undercity, 5) => (
-            simple(treasure_token(), source_id, controller),
-            vec![],
-        ),
+        (DungeonId::Undercity, 5) => (simple(treasure_token(), source_id, controller), vec![]),
         // 6: Archives — "Draw a card"
         (DungeonId::Undercity, 6) => (
             simple(
@@ -577,23 +567,16 @@ pub fn room_effects(
             vec![],
         ),
         // 8: Throne of the Dead Three — reveal 10, put creature with counters, hexproof, shuffle
-        (DungeonId::Undercity, 8) => (
-            throne_of_dead_three(source_id, controller),
-            vec![],
-        ),
+        (DungeonId::Undercity, 8) => (throne_of_dead_three(source_id, controller), vec![]),
 
         // ── Baldur's Gate Wilderness ────────────────────────────────────
         // 0: Crash Landing — "Search your library for a basic land card, reveal it,
         //    put it into your hand, then shuffle."
-        (DungeonId::BaldursGateWilderness, 0) => (
-            search_basic_land(source_id, controller),
-            vec![],
-        ),
+        (DungeonId::BaldursGateWilderness, 0) => (search_basic_land(source_id, controller), vec![]),
         // 1: Goblin Camp — "Create a Treasure token"
-        (DungeonId::BaldursGateWilderness, 1) => (
-            simple(treasure_token(), source_id, controller),
-            vec![],
-        ),
+        (DungeonId::BaldursGateWilderness, 1) => {
+            (simple(treasure_token(), source_id, controller), vec![])
+        }
         // 2: Emerald Grove — "Create a 2/2 white Knight creature token"
         (DungeonId::BaldursGateWilderness, 2) => (
             simple(
@@ -682,36 +665,10 @@ pub fn room_effects(
             vec![],
         ),
         // 7: Grymforge — "For each opponent, goad up to one target creature that player controls."
-        (DungeonId::BaldursGateWilderness, 7) => (
-            simple(
-                Effect::Unimplemented {
-                    name: "Room: Grymforge".to_string(),
-                    description: Some(
-                        "For each opponent, goad up to one target creature that player controls."
-                            .to_string(),
-                    ),
-                },
-                source_id,
-                controller,
-            ),
-            vec![],
-        ),
+        (DungeonId::BaldursGateWilderness, 7) => (grymforge(source_id, controller), vec![]),
         // 8: Githyanki Crèche — "Distribute three +1/+1 counters among up to three target
         //    creatures you control."
-        (DungeonId::BaldursGateWilderness, 8) => (
-            simple(
-                Effect::Unimplemented {
-                    name: "Room: Githyanki Crèche".to_string(),
-                    description: Some(
-                        "Distribute three +1/+1 counters among up to three target creatures you control."
-                            .to_string(),
-                    ),
-                },
-                source_id,
-                controller,
-            ),
-            vec![],
-        ),
+        (DungeonId::BaldursGateWilderness, 8) => (githyanki_creche(source_id, controller), vec![]),
         // 9: Last Light Inn — "Draw two cards"
         (DungeonId::BaldursGateWilderness, 9) => (
             simple(
@@ -725,74 +682,33 @@ pub fn room_effects(
             vec![],
         ),
         // 10: Reithwin Tollhouse — "Roll 2d4 and create that many Treasure tokens."
-        (DungeonId::BaldursGateWilderness, 10) => (
-            simple(
-                Effect::Unimplemented {
-                    name: "Room: Reithwin Tollhouse".to_string(),
-                    description: Some(
-                        "Roll 2d4 and create that many Treasure tokens.".to_string(),
-                    ),
-                },
-                source_id,
-                controller,
-            ),
-            vec![],
-        ),
+        (DungeonId::BaldursGateWilderness, 10) => {
+            (reithwin_tollhouse(source_id, controller), vec![])
+        }
         // 11: Moonrise Towers — "Instant and sorcery spells you cast this turn cost {3} less
         //     to cast."
-        (DungeonId::BaldursGateWilderness, 11) => (
-            simple(
-                Effect::Unimplemented {
-                    name: "Room: Moonrise Towers".to_string(),
-                    description: Some(
-                        "Instant and sorcery spells you cast this turn cost {3} less to cast."
-                            .to_string(),
-                    ),
+        (DungeonId::BaldursGateWilderness, 11) => (moonrise_towers(source_id, controller), vec![]),
+        // 12: Gauntlet of Shar — "Each opponent loses 5 life"
+        (DungeonId::BaldursGateWilderness, 12) => {
+            let mut ability = simple(
+                Effect::LoseLife {
+                    amount: fixed(5),
+                    target: None,
                 },
                 source_id,
                 controller,
-            ),
-            vec![],
-        ),
-        // 12: Gauntlet of Shar — "Each opponent loses 5 life"
-        (DungeonId::BaldursGateWilderness, 12) => {
-            let mut ability =
-                simple(Effect::LoseLife { amount: fixed(5), target: None }, source_id, controller);
+            );
             ability.player_scope = Some(PlayerFilter::Opponent);
             (ability, vec![])
         }
         // 13: Balthazar's Lab — "Return up to two target creature cards from your graveyard
         //     to your hand."
-        (DungeonId::BaldursGateWilderness, 13) => (
-            simple(
-                Effect::Unimplemented {
-                    name: "Room: Balthazar's Lab".to_string(),
-                    description: Some(
-                        "Return up to two target creature cards from your graveyard to your hand."
-                            .to_string(),
-                    ),
-                },
-                source_id,
-                controller,
-            ),
-            vec![],
-        ),
+        (DungeonId::BaldursGateWilderness, 13) => (balthazars_lab(source_id, controller), vec![]),
         // 14: Circus of the Last Days — "Create a token that's a copy of one of your
         //     commanders, except it's not legendary."
-        (DungeonId::BaldursGateWilderness, 14) => (
-            simple(
-                Effect::Unimplemented {
-                    name: "Room: Circus of the Last Days".to_string(),
-                    description: Some(
-                        "Create a token that's a copy of one of your commanders, except it's not legendary."
-                            .to_string(),
-                    ),
-                },
-                source_id,
-                controller,
-            ),
-            vec![],
-        ),
+        (DungeonId::BaldursGateWilderness, 14) => {
+            (circus_of_the_last_days(source_id, controller), vec![])
+        }
         // 15: Undercity Ruins — "Create three 4/1 black Skeleton creature tokens with menace"
         (DungeonId::BaldursGateWilderness, 15) => (
             simple(
@@ -848,20 +764,7 @@ pub fn room_effects(
         // 17: Ansur's Sanctum — "Reveal the top four cards of your library. Put those cards
         //     into your hand. Each opponent loses life equal to the total mana value of
         //     those cards."
-        (DungeonId::BaldursGateWilderness, 17) => (
-            simple(
-                Effect::Unimplemented {
-                    name: "Room: Ansur's Sanctum".to_string(),
-                    description: Some(
-                        "Reveal the top four cards of your library. Put those cards into your hand. Each opponent loses life equal to the total mana value of those cards."
-                            .to_string(),
-                    ),
-                },
-                source_id,
-                controller,
-            ),
-            vec![],
-        ),
+        (DungeonId::BaldursGateWilderness, 17) => (ansurs_sanctum(source_id, controller), vec![]),
         // 18: Temple of Bhaal — "Creatures your opponents control get -5/-5 until end of turn"
         (DungeonId::BaldursGateWilderness, 18) => (
             ResolvedAbility::new(
@@ -1020,6 +923,152 @@ fn patch_throne_parsed_chain(mut root: ResolvedAbility) -> ResolvedAbility {
     }
     retarget_hexproof_to_parent(&mut root);
     root
+}
+
+/// BGW room 7 (Grymforge): for each opponent, goad up to one creature they control.
+fn grymforge(source_id: ObjectId, controller: PlayerId) -> ResolvedAbility {
+    const ORACLE: &str = "For each opponent, goad up to one target creature that player controls.";
+    let def = parse_effect_chain(ORACLE, AbilityKind::Spell);
+    build_resolved_from_def(&def, source_id, controller)
+}
+
+/// BGW room 8 (Githyanki Crèche): distribute three +1/+1 counters among up to
+/// three creatures you control.
+fn githyanki_creche(source_id: ObjectId, controller: PlayerId) -> ResolvedAbility {
+    const ORACLE: &str =
+        "Distribute three +1/+1 counters among up to three target creatures you control.";
+    let def = parse_effect_chain(ORACLE, AbilityKind::Spell);
+    build_resolved_from_def(&def, source_id, controller)
+}
+
+/// BGW room 10 (Reithwin Tollhouse): roll two d4s and create that many Treasures.
+fn reithwin_tollhouse(source_id: ObjectId, controller: PlayerId) -> ResolvedAbility {
+    const ORACLE: &str = "Roll 2d4 and create that many Treasure tokens.";
+    let def = parse_effect_chain(ORACLE, AbilityKind::Spell);
+    if matches!(*def.effect, Effect::RollDie { .. }) {
+        return build_resolved_from_def(&def, source_id, controller);
+    }
+
+    let mut roll = simple(
+        Effect::RollDie {
+            count: fixed(2),
+            sides: 4,
+            results: vec![],
+            modifier: None,
+        },
+        source_id,
+        controller,
+    );
+    let token = simple(
+        treasure_token_count(QuantityRef::EventContextAmount),
+        source_id,
+        controller,
+    );
+    roll.sub_ability = Some(Box::new(token));
+    roll
+}
+
+/// BGW room 11 (Moonrise Towers): instant and sorcery spells you cast this turn
+/// cost {3} less to cast.
+fn moonrise_towers(source_id: ObjectId, controller: PlayerId) -> ResolvedAbility {
+    const ORACLE: &str = "Instant and sorcery spells you cast this turn cost {3} less to cast.";
+    let def = parse_effect_chain(ORACLE, AbilityKind::Spell);
+    build_resolved_from_def(&def, source_id, controller)
+}
+
+/// BGW room 13 (Balthazar's Lab): return up to two creature cards from your
+/// graveyard to your hand.
+fn balthazars_lab(source_id: ObjectId, controller: PlayerId) -> ResolvedAbility {
+    const ORACLE: &str = "Return up to two target creature cards from your graveyard to your hand.";
+    let def = parse_effect_chain(ORACLE, AbilityKind::Spell);
+    build_resolved_from_def(&def, source_id, controller)
+}
+
+/// BGW room 14 (Circus of the Last Days): copy one of your commanders as a
+/// nonlegendary token.
+fn circus_of_the_last_days(source_id: ObjectId, controller: PlayerId) -> ResolvedAbility {
+    const ORACLE: &str =
+        "Create a token that's a copy of one of your commanders, except it's not legendary.";
+    let def = parse_effect_chain(ORACLE, AbilityKind::Spell);
+    patch_circus_commander_target(build_resolved_from_def(&def, source_id, controller))
+}
+
+fn patch_circus_commander_target(mut root: ResolvedAbility) -> ResolvedAbility {
+    fn walk(ability: &mut ResolvedAbility) {
+        if let Effect::CopyTokenOf { target, .. } = &mut ability.effect {
+            *target = TargetFilter::Typed(TypedFilter {
+                controller: None,
+                properties: vec![
+                    FilterProp::Owned {
+                        controller: ControllerRef::You,
+                    },
+                    FilterProp::IsCommander,
+                ],
+                ..Default::default()
+            });
+        }
+        if let Some(sub) = ability.sub_ability.as_mut() {
+            walk(sub);
+        }
+    }
+    walk(&mut root);
+    root
+}
+
+/// BGW room 17 (Ansur's Sanctum): reveal four, put them into hand, each opponent
+/// loses life equal to the total mana value of those cards.
+fn ansurs_sanctum(source_id: ObjectId, controller: PlayerId) -> ResolvedAbility {
+    const ORACLE: &str = "Reveal the top four cards of your library. Put those cards into your hand. Each opponent loses life equal to the total mana value of those cards.";
+    let def = parse_effect_chain(ORACLE, AbilityKind::Spell);
+    patch_ansurs_sanctum_chain(build_resolved_from_def(&def, source_id, controller))
+}
+
+/// The parser covers reveal + hand placement but may leave the per-opponent life
+/// tail as `Unimplemented`. Wire `TrackedSetAggregate(Sum, ManaValue)` over the
+/// revealed set (CR 609.3 / CR 700.4).
+fn patch_ansurs_sanctum_chain(mut root: ResolvedAbility) -> ResolvedAbility {
+    fn walk(ability: &mut ResolvedAbility) {
+        if matches!(
+            &ability.effect,
+            Effect::Unimplemented { name, .. } if name == "lose"
+        ) {
+            ability.effect = Effect::LoseLife {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::TrackedSetAggregate {
+                        function: AggregateFunction::Sum,
+                        property: ObjectProperty::ManaValue,
+                    },
+                },
+                target: None,
+            };
+            ability.player_scope = Some(PlayerFilter::Opponent);
+        }
+        if let Some(sub) = ability.sub_ability.as_mut() {
+            walk(sub);
+        }
+    }
+    walk(&mut root);
+    root
+}
+
+/// Build a Treasure token Effect with a dynamic count.
+fn treasure_token_count(count: QuantityRef) -> Effect {
+    Effect::Token {
+        name: "Treasure".to_string(),
+        power: PtValue::Fixed(0),
+        toughness: PtValue::Fixed(0),
+        types: vec!["Artifact".to_string(), "Treasure".to_string()],
+        colors: vec![],
+        keywords: vec![],
+        tapped: false,
+        count: QuantityExpr::Ref { qty: count },
+        owner: TargetFilter::Controller,
+        attach_to: None,
+        enters_attacking: false,
+        supertypes: vec![],
+        static_abilities: vec![],
+        enter_with_counters: vec![],
+    }
 }
 
 fn resolved_chain_contains(
@@ -1697,28 +1746,71 @@ mod tests {
 
     #[test]
     fn room_effects_bgw_implemented_rooms() {
-        let implemented = [0, 1, 2, 3, 4, 5, 6, 9, 12, 15, 16, 18];
+        let implemented = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18,
+        ];
         for room in implemented {
             let ability = bgw_effect(room);
-            assert!(
-                !matches!(ability.effect, Effect::Unimplemented { .. }),
-                "Room {room} ({}) should be implemented",
-                room_name(DungeonId::BaldursGateWilderness, room),
-            );
+            assert_no_unimplemented_resolved(&ability);
         }
     }
 
     #[test]
-    fn room_effects_bgw_deferred_rooms() {
-        let deferred = [7, 8, 10, 11, 13, 14, 17];
-        for room in deferred {
-            let ability = bgw_effect(room);
-            assert!(
-                matches!(ability.effect, Effect::Unimplemented { .. }),
-                "Room {room} ({}) should be Unimplemented",
-                room_name(DungeonId::BaldursGateWilderness, room),
-            );
-        }
+    fn room_effects_bgw_grymforge_goads_per_opponent() {
+        let ability = bgw_effect(7);
+        assert!(matches!(ability.effect, Effect::Goad { .. }));
+        assert!(ability.multi_target.is_some());
+    }
+
+    #[test]
+    fn room_effects_bgw_githyanki_creche_distributes_counters() {
+        let ability = bgw_effect(8);
+        assert!(matches!(
+            ability.effect,
+            Effect::PutCounter {
+                counter_type: CounterType::Plus1Plus1,
+                count: QuantityExpr::Fixed { value: 3 },
+                ..
+            }
+        ));
+        assert!(ability.multi_target.is_some());
+    }
+
+    #[test]
+    fn room_effects_bgw_reithwin_tollhouse_roll_and_treasure() {
+        let ability = bgw_effect(10);
+        assert!(matches!(
+            ability.effect,
+            Effect::RollDie {
+                count: QuantityExpr::Fixed { value: 2 },
+                sides: 4,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn room_effects_bgw_moonrise_towers_cost_reduction() {
+        assert_eq!(bgw_effect(11).duration, Some(Duration::UntilEndOfTurn));
+    }
+
+    #[test]
+    fn room_effects_bgw_balthazars_lab_returns_from_graveyard() {
+        assert!(matches!(bgw_effect(13).effect, Effect::Bounce { .. }));
+    }
+
+    #[test]
+    fn room_effects_bgw_circus_copies_commander_nonlegendary() {
+        assert!(matches!(bgw_effect(14).effect, Effect::CopyTokenOf { .. }));
+    }
+
+    #[test]
+    fn room_effects_bgw_ansurs_sanctum_reveal_hand_and_life_loss() {
+        let ability = bgw_effect(17);
+        assert!(matches!(
+            ability.effect,
+            Effect::RevealTop { .. } | Effect::Reveal { .. } | Effect::Dig { .. }
+        ));
     }
 
     #[test]

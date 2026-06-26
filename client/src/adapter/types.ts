@@ -349,6 +349,16 @@ export type ManaType = "White" | "Blue" | "Black" | "Red" | "Green" | "Colorless
 export type ConvokeMode = "Convoke" | "Waterbend" | "Improvise" | "Delve";
 export type RoomDoor = "Left" | "Right";
 
+// CR 709.5f-g: Operation a lock/unlock-door effect performs on a Room door
+// (half). Mirrors the engine `DoorLockOp` enum (`#[serde(tag = "type")]` —
+// internally tagged, so serializes as `{ "type": "Unlock" }`). `LockOrUnlock`
+// is the "lock or unlock a door" disjunction where the player chooses both the
+// operation and the half at resolution (Keys to the House, Marina Vendrell).
+export type DoorLockOp =
+  | { type: "Unlock" }
+  | { type: "Lock" }
+  | { type: "LockOrUnlock" };
+
 /**
  * Display-layer projection of the engine's `ManaProduction` enum. One variant
  * per producer shape so colorless and commander-identity producers reach the
@@ -411,6 +421,9 @@ export type ManaSpellGrant =
 export interface ManaUnit {
   color: ManaType;
   source_id: ObjectId;
+  // CR 118.3a: stable per-unit id used to pin which pool unit pays a cost.
+  // `0` is the unstamped sentinel (convoke markers / detached preview pools).
+  pip_id: number;
   snow: boolean;
   restrictions: ManaRestriction[];
   // `#[serde(default, skip_serializing_if = "Vec::is_empty")]` — absent when empty.
@@ -424,7 +437,8 @@ export interface ManaPool {
 export type ManaCost =
   | { type: "NoCost" }
   | { type: "Cost"; shards: string[]; generic: number }
-  | { type: "SelfManaCost" };
+  | { type: "SelfManaCost" }
+  | { type: "SelfManaValue" };
 
 export type CastFrequency =
   | "Unlimited"
@@ -1006,6 +1020,9 @@ export interface PendingCast {
   activation_cost?: SerializedAbilityCost;
   activation_ability_index?: number;
   target_constraints?: Array<{ type: string }>;
+  // CR 118.3a: pip ids the caster pinned to direct payment. `#[serde(default,
+  // skip_serializing_if = "Vec::is_empty")]` — absent when no pin is recorded.
+  pinned_pool_units?: number[];
 }
 
 export interface TargetSelectionSlot {
@@ -1076,6 +1093,12 @@ export interface ModalChoice {
    */
   mode_pawprints?: number[];
   constraints?: Array<{ type: string }>;
+  /**
+   * CR 700.2 + CR 107.3m: Engine-internal dynamic "choose up to X —" cap
+   * descriptor (a serialized QuantityExpr). Resolved live by the engine into
+   * `max_choices` before the choice is offered; the UI never reads this field.
+   */
+  dynamic_max_choices?: unknown;
 }
 
 // CR 603.3b: Display payload for one collected-but-not-yet-stacked trigger
@@ -1160,11 +1183,11 @@ export type WaitingFor =
   | { type: "DigChoice"; data: { player: PlayerId; cards: ObjectId[]; keep_count: number; up_to?: boolean; selectable_cards?: ObjectId[]; kept_destination?: Zone | null; rest_destination?: Zone | null } }
   | { type: "SurveilChoice"; data: { player: PlayerId; cards: ObjectId[] } }
   | { type: "RevealChoice"; data: { player: PlayerId; cards: ObjectId[]; filter: unknown; optional?: boolean } }
-  | { type: "SearchChoice"; data: { player: PlayerId; cards: ObjectId[]; count: number; reveal?: boolean; up_to?: boolean; constraint?: SearchSelectionConstraint; split?: SearchDestinationSplit | null } }
+  | { type: "SearchChoice"; data: { player: PlayerId; cards: ObjectId[]; count: number; reveal?: boolean; up_to?: boolean; allows_partial_find?: boolean; constraint?: SearchSelectionConstraint; split?: SearchDestinationSplit | null } }
   | { type: "SearchPartitionChoice"; data: { player: PlayerId; cards: ObjectId[]; primary_destination: Zone; primary_count: number; primary_enter_tapped: boolean; rest_destination: Zone; source_id: ObjectId } }
   | { type: "OutsideGameChoice"; data: { player: PlayerId; source_id: ObjectId; choices: OutsideGameChoiceEntry[]; count: number; reveal?: boolean; up_to?: boolean; destination: Zone } }
   | { type: "ChooseOneOfBranch"; data: { player: PlayerId; controller: PlayerId; source_id: ObjectId; branches: unknown[]; branch_descriptions?: string[]; parent_targets?: TargetRef[]; context?: unknown; remaining_players?: PlayerId[] } }
-  | { type: "TriggerTargetSelection"; data: { player: PlayerId; target_slots: TargetSelectionSlot[]; mode_labels?: (string | null)[]; target_constraints?: TargetSelectionConstraint[]; selection: TargetSelectionProgress; source_id?: ObjectId; description?: string } }
+  | { type: "TriggerTargetSelection"; data: { player: PlayerId; trigger_controller?: PlayerId; trigger_event?: GameEvent; trigger_events?: GameEvent[]; target_slots: TargetSelectionSlot[]; mode_labels?: (string | null)[]; target_constraints?: TargetSelectionConstraint[]; selection: TargetSelectionProgress; source_id?: ObjectId; description?: string } }
   | { type: "BetweenGamesSideboard"; data: { player: PlayerId; game_number: number; score: MatchScore } }
   | { type: "BetweenGamesChoosePlayDraw"; data: { player: PlayerId; game_number: number; score: MatchScore } }
   | { type: "NamedChoice"; data: { player: PlayerId; choice_type: string | Record<string, unknown>; options: string[]; source_id?: ObjectId } }
@@ -1181,7 +1204,7 @@ export type WaitingFor =
   // `keyword.type` mirrors engine `AlternativeCastKeyword` (game_state.rs) 1:1.
   // Keep this union exhaustive with the engine enum so the modal's keyword
   // switch is type-checked against every variant the engine can emit.
-  | { type: "AlternativeCastChoice"; data: { player: PlayerId; object_id: ObjectId; card_id: CardId; payment_mode?: CastPaymentMode; keyword: { type: "Warp" } | { type: "Evoke" } | { type: "Emerge" } | { type: "Dash" } | { type: "Blitz" } | { type: "Overload" } | { type: "Bestow" } | { type: "Awaken" } | { type: "Cleave" } | { type: "MoreThanMeetsTheEye" } | { type: "Impending" } | { type: "Prototype" } | { type: "Mutate" } | { type: "Spectacle" }; normal_cost: ManaCost; alternative_cost: ManaCost | null; alternative_additional_cost: SerializedAbilityCost | null } }
+  | { type: "AlternativeCastChoice"; data: { player: PlayerId; object_id: ObjectId; card_id: CardId; payment_mode?: CastPaymentMode; keyword: { type: "Warp" } | { type: "Evoke" } | { type: "Emerge" } | { type: "Dash" } | { type: "Blitz" } | { type: "Overload" } | { type: "Bestow" } | { type: "Awaken" } | { type: "Cleave" } | { type: "MoreThanMeetsTheEye" } | { type: "Impending" } | { type: "Prototype" } | { type: "Mutate" } | { type: "Spectacle" } | { type: "Prowl" }; normal_cost: ManaCost; alternative_cost: ManaCost | null; alternative_additional_cost: SerializedAbilityCost | null } }
   // CR 702.140c + CR 730.2a: mutating creature spell resolving with a legal
   // target — controller chooses to put it on top of or under the target creature.
   | { type: "MutateMergeChoice"; data: { player: PlayerId; merging_id: ObjectId; target_id: ObjectId } }
@@ -1317,6 +1340,13 @@ export type WaitingFor =
   | { type: "ChooseDungeon"; data: { player: PlayerId; options: DungeonId[] } }
   | { type: "ChooseDungeonRoom"; data: { player: PlayerId; dungeon: DungeonId; options: number[]; option_names: string[] } }
   | { type: "SpecializeColor"; data: { player: PlayerId; object_id: ObjectId; options: ManaColor[] } }
+  // CR 709.5f-g: Resolving lock/unlock-door effect needs the player to choose
+  // which door (half) of the targeted Room to act on. `options` is the engine's
+  // `Vec<(DoorLockOp, RoomDoor)>` — each tuple serializes as a JSON array
+  // `[op, door]`. A fixed-op effect (Unlock / Lock) lists one operation across
+  // eligible doors; a "lock or unlock" effect lists both. Answered with
+  // `GameAction::ChooseRoomDoor`.
+  | { type: "ChooseRoomDoor"; data: { player: PlayerId; object_id: ObjectId; options: [DoorLockOp, RoomDoor][] } }
   | { type: "CategoryChoice"; data: {
       player: PlayerId;
       target_player: PlayerId;
@@ -1534,6 +1564,9 @@ export type GameAction =
   | { type: "ReorderHand"; data: { order: ObjectId[] } }
   | { type: "TapLandForMana"; data: { object_id: ObjectId } }
   | { type: "UntapLandForMana"; data: { object_id: ObjectId } }
+  // CR 118.3a: pin / unpin a specific pool unit during manual mana payment.
+  | { type: "SpendPoolMana"; data: { pip_id: number } }
+  | { type: "UnspendPoolMana"; data: { pip_id: number } }
   | { type: "TapForConvoke"; data: { object_id: ObjectId; mana_type: ManaType } }
   | { type: "SelectCards"; data: { cards: ObjectId[] } }
   | { type: "SelectCoinFlips"; data: { keep_indices: number[] } }
@@ -1622,6 +1655,9 @@ export type GameAction =
   | { type: "ChooseDungeonRoom"; data: { room_index: number } }
   | { type: "ChooseSpecializeColor"; data: { color: ManaColor } }
   | { type: "UnlockRoomDoor"; data: { object_id: ObjectId; door: RoomDoor } }
+  // CR 709.5f-g: Answer to WaitingFor::ChooseRoomDoor — the chosen (op, door)
+  // pair, which must be one of the prompt's `options`.
+  | { type: "ChooseRoomDoor"; data: { object_id: ObjectId; op: DoorLockOp; door: RoomDoor } }
   | { type: "TapForConvoke"; data: { object_id: ObjectId; mana_type: ManaType } }
   | { type: "SelectCategoryPermanents"; data: { choices: (ObjectId | null)[] } }
   | { type: "ChooseX"; data: { value: number } }
@@ -1656,7 +1692,8 @@ export type ShardChoice =
 export type PayableResource =
   | { type: "Energy" }
   | { type: "ManaGeneric"; data: { per_x: number } }
-  | { type: "Counters" };
+  | { type: "Counters" }
+  | { type: "Speed" };
 
 export type ShardOptions =
   | { type: "ManaOrLife" }
@@ -1696,6 +1733,7 @@ export type GameEvent =
   | { type: "DamageCleared"; data: { object_id: ObjectId } }
   | { type: "GameOver"; data: { winner: PlayerId | null } }
   | { type: "DamageDealt"; data: { source_id: ObjectId; target: TargetRef; amount: number; is_combat: boolean; excess?: number } }
+  | { type: "DamagePrevented"; data: { source_id: ObjectId; target: TargetRef; amount: number } }
   | { type: "SpellCountered"; data: { object_id: ObjectId; countered_by: ObjectId } }
   | { type: "CounterAdded"; data: { object_id: ObjectId; counter_type: string; count: number } }
   | { type: "ObjectIntensified"; data: { object_id: ObjectId; amount: number } }
@@ -1713,6 +1751,10 @@ export type GameEvent =
   | { type: "TurnedFaceUp"; data: { object_id: ObjectId } }
   | { type: "CardsRevealed"; data: { player: PlayerId; card_ids?: ObjectId[]; card_names: string[] } }
   | { type: "Regenerated"; data: { object_id: ObjectId } }
+  | {
+      type: "CombatDamageDealtToPlayer";
+      data: { player_id: PlayerId; source_amounts?: [ObjectId, number][]; total_damage: number };
+    }
   | { type: "CreatureSuspected"; data: { object_id: ObjectId } }
   | { type: "Detained"; data: { object_id: ObjectId } }
   | { type: "CaseSolved"; data: { object_id: ObjectId } }
@@ -1836,6 +1878,16 @@ export interface DerivedViews {
    * `engine::game::derived_views::DerivedViews::player_status`.
    */
   player_status?: PlayerStatusView[];
+  /**
+   * CR 118.3a + CR 601.2g: during the viewing player's own manual mana payment
+   * for a spell, the portion of the locked cost still UNPAID by the pool units
+   * they have pinned (selected). The payment UI renders this as the cost shrinks
+   * while the player picks mana; an empty/`NoCost` value means their selection
+   * alone covers the whole cost. Omitted outside a non-convoke spell payment the
+   * viewer controls. Mirrors
+   * `engine::game::derived_views::DerivedViews::pending_payment_remaining`.
+   */
+  pending_payment_remaining?: ManaCost;
 }
 
 /** Mirrors `engine::types::game_state::NextSpellModifier` (serde tag="type"). */
@@ -2155,7 +2207,7 @@ export function isStateLostMessage(message: string): boolean {
 /**
  * Transport-agnostic interface for communicating with the game engine.
  * Phase 1: WasmAdapter (direct WASM calls)
- * Phase 7: TauriAdapter (IPC to native Rust process)
+ * Tauri desktop uses the same WasmAdapter path as browser local gameplay.
  */
 export interface SubmitResult {
   events: GameEvent[];
@@ -2223,6 +2275,16 @@ export interface BatchResolveResult {
    *  chunk's value as the "resolving X of Y" denominator. */
   total: number;
 }
+
+/**
+ * Engine-built game-scoped AI card-DB subset descriptor (the `build_ai_card_subset`
+ * WASM export, serialized as a tagged union). `full` means the game's card
+ * universe is not statically bounded (today: Momir) and AI workers must load the
+ * full database; `subset` carries the minimal card-data JSON for this game.
+ */
+export type AiCardSubsetResult =
+  | { kind: "full" }
+  | { kind: "subset"; json: string; count: number };
 
 export interface EngineAdapter {
   initialize(): Promise<void>;

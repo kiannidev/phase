@@ -69,17 +69,33 @@ fn build_face_from_oracle(
     // The parser's `extract_keyword_line` requires keyword name hints to identify
     // keyword-only lines (returns None when hints are empty). Pre-scan each line
     // through Keyword::from_str to detect bare keywords like "Flying", "Haste".
+    //
+    // A line contributes inferred hints ONLY when it is a genuine keyword line —
+    // every comma-separated part parses to a known keyword (e.g. "Flying,
+    // vigilance, trample"). A line with any prose fragment is an effect/ability
+    // line and contributes nothing, even if it lists keywords inside a sentence
+    // (e.g. Super-Adaptoid / Kathril's "Do the same for flying, first strike,
+    // …"): those keyword names are the OBJECT of an effect, not granted
+    // keywords, and must not be inferred as static abilities on the card.
     let inferred_kw_names: Vec<String>;
     let effective_kw_names = if keyword_names.is_empty() {
         inferred_kw_names = oracle_text
             .lines()
             .flat_map(|line| {
-                line.split(',')
+                let parts: Vec<String> = line
+                    .split(',')
                     .map(|part| part.trim().to_lowercase())
-                    .filter(|lower| {
+                    .collect();
+                let is_keyword_line = !parts.is_empty()
+                    && parts.iter().all(|lower| {
                         let kw: Keyword = lower.parse().unwrap_or(Keyword::Unknown(String::new()));
                         !matches!(kw, Keyword::Unknown(_))
-                    })
+                    });
+                if is_keyword_line {
+                    parts
+                } else {
+                    Vec::new()
+                }
             })
             .collect();
         &inferred_kw_names
@@ -271,9 +287,15 @@ impl GameScenario {
     }
 
     /// Replace a player's mana pool for deterministic payment tests.
+    ///
+    /// CR 118.3a: routes each unit through `add_mana_to_pool` so every seeded
+    /// unit receives a distinct `ManaPipId` (a direct `mana_pool.mana = mana`
+    /// would leave all units at the `ManaPipId(0)` sentinel, so pins would
+    /// collide). All callers seed a fresh pool exactly once per player, so
+    /// appending is equivalent to replacing.
     pub fn with_mana_pool(&mut self, player: PlayerId, mana: Vec<ManaUnit>) -> &mut Self {
-        if let Some(p) = self.state.players.iter_mut().find(|p| p.id == player) {
-            p.mana_pool.mana = mana;
+        for unit in mana {
+            self.state.add_mana_to_pool(player, unit);
         }
         self
     }
@@ -913,6 +935,21 @@ impl<'a> CardBuilder<'a> {
         self
     }
 
+    /// CR 305: Make this card a land. Strips the Creature core type pushed by
+    /// `add_creature_to_graveyard` and adds Land. Mirrors `as_artifact`/
+    /// `as_enchantment`; reusable for graveyard-return targeting tests.
+    pub fn as_land(&mut self) -> &mut Self {
+        let obj = self.obj();
+        obj.card_types
+            .core_types
+            .retain(|t| *t != CoreType::Creature);
+        if !obj.card_types.core_types.contains(&CoreType::Land) {
+            obj.card_types.core_types.push(CoreType::Land);
+        }
+        self.sync_base_card_types();
+        self
+    }
+
     /// CR 302: Make this card a creature. Strips the spell core types
     /// (Instant/Sorcery) pushed by `add_spell_to_library_top` and adds Creature.
     /// Mirrors `as_sorcery`/`as_instant`; reusable for search/tutor library tests.
@@ -1528,6 +1565,9 @@ impl GameRunner {
                 crate::types::game_state::AlternativeCastKeyword::Mutate => {
                     "AlternativeCastChoice(Mutate)"
                 }
+                crate::types::game_state::AlternativeCastKeyword::Prowl => {
+                    "AlternativeCastChoice(Prowl)"
+                }
             },
             WaitingFor::MutateMergeChoice { .. } => "MutateMergeChoice",
             WaitingFor::CipherEncodeChoice { .. } => "CipherEncodeChoice",
@@ -1543,6 +1583,7 @@ impl GameRunner {
             WaitingFor::UnlessPaymentChooseCost { .. } => "UnlessPaymentChooseCost",
             WaitingFor::CompanionReveal { .. } => "CompanionReveal",
             WaitingFor::ChooseRingBearer { .. } => "ChooseRingBearer",
+            WaitingFor::ChooseRoomDoor { .. } => "ChooseRoomDoor",
             WaitingFor::PayCost { .. } => "PayCost",
             WaitingFor::ChooseManaColor { .. } => "ChooseManaColor",
             WaitingFor::PayManaAbilityMana { .. } => "PayManaAbilityMana",
@@ -4070,6 +4111,108 @@ mod tests {
             outcome.state().objects[&victim].damage_marked,
             0,
             "CR 701.19a: regeneration removes all marked damage"
+        );
+    }
+
+    /// CR 613.1f + CR 613.4b + CR 205.1b: Curious Colossus end-to-end. Its ETB
+    /// targets an opponent; each creature that opponent controls "loses all
+    /// abilities, becomes a Coward in addition to its other types, and has base
+    /// power and toughness 1/1". After casting through the real pipeline and
+    /// evaluating layers, the affected creature must (a) have no abilities/
+    /// keywords (layer 6 RemoveAllAbilities), (b) gain the Coward subtype while
+    /// KEEPING its prior subtype (CR 205.1b additive), and (c) have effective
+    /// power/toughness 1/1 (layer 7b set). The comma-split guards are what keep
+    /// the trailing base-P/T conjunct in the GenericEffect; if reverted, the base
+    /// P/T conjunct orphans to Unimplemented and the creature stays 3/4.
+    #[test]
+    fn curious_colossus_etb_strips_abilities_adds_subtype_sets_base_pt() {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+
+        // The opponent's victim: a 3/4 Bird with flying.
+        let victim = scenario
+            .add_creature(P1, "Victim Bird", 3, 4)
+            .with_subtypes(vec!["Bird"])
+            .flying()
+            .id();
+
+        // Curious Colossus in P0's hand, parsed from its real Oracle text.
+        let colossus = scenario
+            .add_creature_to_hand_from_oracle(
+                P0,
+                "Curious Colossus",
+                7,
+                7,
+                "When this creature enters, each creature target opponent controls \
+                 loses all abilities, becomes a Coward in addition to its other types, \
+                 and has base power and toughness 1/1.",
+            )
+            .id();
+
+        // Fund {5}{W}{W} from the pool (2 White + 5 Colorless).
+        let mut mana = vec![ManaUnit::new(ManaType::White, ObjectId(9_999), false, vec![]); 2];
+        mana.extend(vec![
+            ManaUnit::new(
+                ManaType::Colorless,
+                ObjectId(9_999),
+                false,
+                vec![]
+            );
+            5
+        ]);
+        scenario.with_mana_pool(P0, mana);
+
+        let mut runner = scenario.build();
+
+        // Cast Curious Colossus; its ETB targets opponent P1.
+        let outcome = runner.cast(colossus).target_player(P1).resolve();
+
+        // Evaluate layers on the resolved state and inspect the affected creature.
+        let mut state = outcome.state().clone();
+        state.layers_dirty.mark_full();
+        crate::game::layers::evaluate_layers(&mut state);
+        let obj = state
+            .objects
+            .get(&victim)
+            .expect("victim still on battlefield");
+
+        // (a) CR 613.1f: all abilities/keywords removed.
+        assert!(
+            !crate::game::keywords::has_keyword(obj, &Keyword::Flying),
+            "RemoveAllAbilities must strip flying, keywords={:?}",
+            obj.keywords
+        );
+        assert!(
+            obj.abilities.is_empty(),
+            "RemoveAllAbilities must clear printed abilities, got {:?}",
+            obj.abilities
+        );
+
+        // (b) CR 205.1b: Coward added "in addition to its other types" — prior
+        // Bird subtype is KEPT.
+        assert!(
+            obj.card_types.subtypes.iter().any(|s| s == "Coward"),
+            "must gain the Coward subtype, subtypes={:?}",
+            obj.card_types.subtypes
+        );
+        assert!(
+            obj.card_types.subtypes.iter().any(|s| s == "Bird"),
+            "must KEEP the prior Bird subtype (additive), subtypes={:?}",
+            obj.card_types.subtypes
+        );
+
+        // (c) CR 613.4b: base power and toughness set to 1/1.
+        assert_eq!(
+            obj.power,
+            Some(1),
+            "effective power must be 1, got {:?}",
+            obj.power
+        );
+        assert_eq!(
+            obj.toughness,
+            Some(1),
+            "effective toughness must be 1, got {:?}",
+            obj.toughness
         );
     }
 }

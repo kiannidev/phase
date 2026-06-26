@@ -64,7 +64,26 @@ pub fn resolve(
     // `resolve_quantity_with_targets` threads `ability.chosen_x` through to the
     // `Variable { name: "X" }` branch of `resolve_ref`. Non-X mana production
     // (Fixed, ObjectCount, etc.) is unaffected.
-    let mana_types = resolve_mana_types_with_ability(produced, &*state, ability);
+    //
+    // CR 605.1b + CR 106.12a: For inline `TapsForMana` triggered mana abilities
+    // (Fertile Ground, Utopia Sprawl AnyOneColor), the auto-tap planner may have
+    // stored a `current_triggered_mana_override` so the resolver produces the
+    // planned color rather than defaulting to the first listed option.
+    let mana_types = if is_triggered_mana_inline {
+        match state.current_triggered_mana_override.clone() {
+            Some(crate::types::game_state::ProductionOverride::SingleColor(color)) => {
+                // Resolve the count from the production descriptor, then produce
+                // that many units of the override color — mirrors the behavior of
+                // `resolve_single_color_override` in `mana_abilities.rs`.
+                let count = resolve_mana_types_with_ability(produced, &*state, ability).len();
+                vec![color; count]
+            }
+            Some(crate::types::game_state::ProductionOverride::Combination(types)) => types,
+            None => resolve_mana_types_with_ability(produced, &*state, ability),
+        }
+    } else {
+        resolve_mana_types_with_ability(produced, &*state, ability)
+    };
     let source_could_produce_two_or_more_colors =
         mana_sources::mana_production_could_produce_two_or_more_colors(
             state,
@@ -280,6 +299,9 @@ pub(crate) fn resolve_restrictions(
                 ability: *ability,
             }),
             ManaSpendRestriction::ActivateOnly => Some(ManaRestriction::OnlyForActivation),
+            ManaSpendRestriction::ActivateTagged(tag) => {
+                Some(ManaRestriction::OnlyForTaggedActivation(*tag))
+            }
             ManaSpendRestriction::XCostOnly => Some(ManaRestriction::OnlyForXCosts),
             ManaSpendRestriction::SpellWithKeywordKind(kind) => {
                 Some(ManaRestriction::OnlyForSpellWithKeywordKind(*kind))
@@ -293,6 +315,16 @@ pub(crate) fn resolve_restrictions(
                     value: *value,
                 })
             }
+            // CR 106.6 + CR 107.3 + CR 202.3: Lower the disjunctive MV/X cost
+            // criteria (with optional type narrowing) into the runtime gate
+            // checked against `SpellMeta` by `allows_spell`.
+            ManaSpendRestriction::SpellMatchingCostCriteria {
+                spell_type,
+                criteria,
+            } => Some(ManaRestriction::OnlyForSpellMatchingCostCriteria {
+                spell_type: spell_type.clone(),
+                criteria: criteria.clone(),
+            }),
             // CR 105.2 + CR 106.6: Lower color-count spend restrictions into the
             // runtime gate checked against `SpellMeta.color_count`.
             ManaSpendRestriction::SpellWithColorCount { comparator, count } => {
@@ -301,8 +333,38 @@ pub(crate) fn resolve_restrictions(
                     count: *count,
                 })
             }
-            ManaSpendRestriction::SpellFromZone(zone) => {
-                Some(ManaRestriction::OnlyForSpellFromZone(*zone))
+            ManaSpendRestriction::SpellFromZone(zs) => {
+                Some(ManaRestriction::OnlyForSpellFromZone(*zs))
+            }
+            // CR 106.6 + CR 116.2m + CR 709.5e: Lower the door-unlock special-action
+            // leaf into the runtime gate checked by `allows_special_action` when a
+            // Room's unlock cost is paid through `PaymentContext::SpecialAction`.
+            ManaSpendRestriction::UnlockDoor => Some(ManaRestriction::OnlyForSpecialAction(
+                crate::types::mana::SpecialAction::UnlockDoor,
+            )),
+            // CR 106.6 + CR 708.4: Lower the face-down-cast leaf into the runtime
+            // gate checked against `SpellMeta.is_face_down` by `allows_spell`. The
+            // gate reads cast face-down intent (not `obj.face_down`), so it
+            // correctly rejects exile-concealment casts (foretell/hideaway, whose
+            // `obj.face_down = true` but which are cast face up, CR 702.143c). It is
+            // fail-closed: no production path casts a spell face down, so the gate
+            // never over-permits.
+            ManaSpendRestriction::FaceDownSpell => Some(ManaRestriction::OnlyForFaceDownSpell),
+            // CR 106.6 + CR 116.2b + CR 702.37e: Lower the turn-face-up
+            // special-action leaf into the runtime gate. No payment site emits
+            // `PaymentContext::SpecialAction(TurnFaceUp)` yet, so the gate is
+            // conservatively unsatisfiable — honest-deferred, never over-permitted.
+            ManaSpendRestriction::TurnPermanentFaceUp => {
+                Some(ManaRestriction::OnlyForSpecialAction(
+                    crate::types::mana::SpecialAction::TurnFaceUp,
+                ))
+            }
+            // CR 106.6: Disjunction — recursively lower each branch. If every branch
+            // dropped (e.g. an unresolvable `ChosenCreatureType` with no chosen type),
+            // the disjunction has no payable cases, so drop it too.
+            ManaSpendRestriction::Any(subs) => {
+                let inner = resolve_restrictions(subs, state, source_id);
+                (!inner.is_empty()).then_some(ManaRestriction::OnlyForAny(inner))
             }
         })
         .collect()

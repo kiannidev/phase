@@ -9,9 +9,9 @@ use nom::Parser;
 
 use crate::types::ability::{
     AggregateFunction, AttachmentKind, CombatRelation, CombatRelationSubject, Comparator,
-    ControllerRef, FilterProp, ObjectProperty, ObjectScope, PtStat, PtValueScope, QuantityExpr,
-    QuantityRef, SeatDirection, SharedQuality, SharedQualityRelation, TargetFilter,
-    TargetSelectionMode, TypeFilter, TypedFilter,
+    ControllerRef, CountScope, FilterProp, ObjectProperty, ObjectScope, ParitySource, PtStat,
+    PtValueScope, QuantityExpr, QuantityRef, SeatDirection, SharedQuality, SharedQualityRelation,
+    TargetFilter, TargetSelectionMode, TypeFilter, TypedFilter,
 };
 use crate::types::card_type::Supertype;
 use crate::types::counter::{CounterMatch, CounterType};
@@ -1720,6 +1720,51 @@ pub fn parse_type_phrase_with_ctx<'a>(
         break;
     }
 
+    // CR 205.4a: A supertype adjective can also appear AFTER a `non-`
+    // token-identity/type negation prefix (e.g. "nontoken legendary permanent"
+    // in Cadric, Soul Kindler / issue #3677 class). The pre-negation arm above
+    // only fires when the supertype word leads the phrase, so a leading
+    // "nontoken " left it unparsed, dropping the legendary restriction entirely.
+    // Mirrors the post-negation `historic` re-check directly below.
+    if let Ok((rest, supertype)) = nom_target::parse_supertype_prefix(&lower[pos..]) {
+        if !properties
+            .iter()
+            .any(|p| matches!(p, FilterProp::HasSupertype { .. }))
+        {
+            properties.push(FilterProp::HasSupertype { value: supertype });
+            pos += lower[pos..].len() - rest.len();
+        }
+    }
+
+    // CR 105.1 + CR 105.2: A color adjective can also appear AFTER a `non-`
+    // token-identity/type negation prefix (e.g. "nontoken blue creature",
+    // Flare of Denial / issue #3677). The pre-negation arm above only fires
+    // when the color word leads the phrase, so a leading "nontoken " left the
+    // color word — and therefore the entire creature-type filter behind it —
+    // unparsed, silently degrading the cost to "sacrifice a nontoken
+    // permanent" (which a land never is, so any permanent paid the alt cost).
+    // Mirrors the post-negation `historic` re-check directly below.
+    if color_prop.is_none() {
+        if let Some((prop, color_len)) =
+            parse_color_prefix(&lower[pos..]).or_else(|| parse_color_quality_prefix(&lower[pos..]))
+        {
+            properties.push(prop);
+            pos += color_len;
+        }
+    }
+
+    // CR 700.4 + CR 700.9: A "modified" adjective can also appear AFTER a
+    // `non-` token-identity/type negation prefix (e.g. "nontoken modified
+    // creature" in Akki Ember-Keeper / issue #3677 class). The pre-negation
+    // arm above only fires when "modified" leads the phrase. Mirrors the
+    // post-negation `historic` re-check directly below.
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("modified ").parse(&lower[pos..]) {
+        if starts_with_type_phrase_lead(rest) && !properties.contains(&FilterProp::Modified) {
+            properties.push(FilterProp::Modified);
+            pos += lower[pos..].len() - rest.len();
+        }
+    }
+
     let mut adjective_type_filters: Vec<TypeFilter> = Vec::new();
 
     // CR 700.6: "historic" adjective prefix can appear AFTER negation prefixes
@@ -1927,7 +1972,12 @@ pub fn parse_type_phrase_with_ctx<'a>(
     for separator in TYPE_SEPARATORS {
         if let Ok((after_sep, _)) = tag::<_, _, OracleError<'_>>(*separator).parse(rest_lower) {
             let after_trimmed = after_sep.trim_start();
-            if starts_with_type_word(after_trimmed) {
+            let can_recurse = if separator.starts_with(',') {
+                starts_with_or_article_type_segment(after_trimmed)
+            } else {
+                starts_with_type_word(after_trimmed)
+            };
+            if can_recurse {
                 let sep_text = &text[pos + rest_offset + separator.len()..];
                 let (other_filter, final_rest) = parse_type_phrase_with_ctx(sep_text, ctx);
                 // CR 205.2a: The left branch of a type disjunction must retain
@@ -2163,12 +2213,22 @@ pub fn parse_type_phrase_with_ctx<'a>(
         pos += consumed;
     }
 
-    // Check "of the chosen type" suffix (Cavern of Souls, Metallic Mimic, etc.)
+    // Check "of the chosen type" / "of that type" suffix (Cavern of Souls,
+    // Metallic Mimic; Selfless Safewright). CR 205.3m + CR 608.2c: "of that
+    // type" is the anaphor form of "of the chosen type" — same typed reference,
+    // same runtime resolution against the source's chosen creature type — so
+    // both surface forms route to one suffix arm. Mirrors the dual recognition
+    // in `parse_chosen_qualifier_subject` (oracle_static/keyword_grant.rs).
     let remaining = lower[pos..].trim_start();
     let remaining_offset = lower[pos..].len() - remaining.len();
-    if tag::<_, _, OracleError<'_>>("of the chosen type")
-        .parse(remaining)
-        .is_ok()
+    if let Ok((_, of_chosen_len)) = alt((
+        value(
+            "of the chosen type".len(),
+            tag::<_, _, OracleError<'_>>("of the chosen type"),
+        ),
+        value("of that type".len(), tag("of that type")),
+    ))
+    .parse(remaining)
     {
         // CR 205.2a: Disambiguate which "chosen type" axis this refers to by the
         // base type, mirroring the static cost-mod path in
@@ -2200,7 +2260,21 @@ pub fn parse_type_phrase_with_ctx<'a>(
             FilterProp::IsChosenCreatureType
         };
         properties.push(chosen_prop);
-        pos += remaining_offset + "of the chosen type".len();
+        pos += remaining_offset + of_chosen_len;
+    }
+
+    // CR 115.2: A spell or ability may target an object in a zone other than
+    // the battlefield only when it specifies that zone, so the trailing zone
+    // phrase must be parsed onto the target filter. Zone phrases may trail "of
+    // the chosen type" ("target creature card of the chosen type from your
+    // graveyard", From the Rubble). The primary `parse_zone_suffix` arm above
+    // runs before this suffix.
+    if let Some((zone_props, zone_ctrl, consumed)) = parse_zone_suffix(&lower[pos..]) {
+        properties.extend(zone_props);
+        pos += consumed;
+        if controller.is_none() {
+            controller = zone_ctrl;
+        }
     }
 
     let mut exclude_chosen_type = false;
@@ -2628,19 +2702,24 @@ pub(crate) fn starts_with_type_word(text: &str) -> bool {
         }
     }
     // CR 205.4b: Negated type prefix: "noncreature spell", "nonland permanent",
-    // "non-Saga token" (Good King Mog XII chapter II — issue #3294).
+    // "non-Saga token" (Good King Mog XII chapter II — issue #3294), and
+    // negated-adjective compounds like "nontoken modified creature" (Akki
+    // Ember-Keeper / issue #3677 class) or "nontoken legendary permanent"
+    // (Cadric, Soul Kindler). Recurses into `starts_with_type_phrase_lead`
+    // (rather than only `parse_core_type`/`parse_token_suffix`) so the article
+    // guard recognizes every adjective that can lead a type phrase after a
+    // `non-` prefix — color, supertype, "modified", "renowned", "historic" —
+    // not just bare core types and tokens.
     if let Ok((after_non, _)) = alt((tag::<_, _, OracleError<'_>>("non-"), tag("non"))).parse(text)
     {
-        // Consume the negated word up to whitespace, then check for a core type or
-        // standalone "token"/"tokens" after the negation.
+        // Consume the negated word up to whitespace, then check what follows.
         if let Ok((after_space, _)) = (
             take_till::<_, _, OracleError<'_>>(|c: char| c.is_whitespace()),
             tag::<_, _, OracleError<'_>>(" "),
         )
             .parse(after_non)
         {
-            if parse_core_type(after_space).0.is_some() || parse_token_suffix(after_space).is_some()
-            {
+            if starts_with_type_phrase_lead(after_space) {
                 return true;
             }
         }
@@ -2682,6 +2761,33 @@ fn starts_with_type_phrase_lead(text: &str) -> bool {
         // CR 208.1 (#2912): "1/1 creature" leads a type phrase (the P/T
         // designation is followed by a type word).
         || parse_leading_pt_designation(text).is_some()
+}
+
+/// Guard for comma/and/or type-list continuations where core-type segments may
+/// carry their own article — e.g. "an artifact, a creature, or a land" (Braids,
+/// Cabal Minion / issue #847).
+fn starts_with_or_article_type_segment(text: &str) -> bool {
+    let text = text.trim_start();
+    if let Ok((rest, _)) = alt((tag::<_, _, OracleError<'_>>("an "), tag("a "))).parse(text) {
+        return starts_with_article_core_type_segment(rest);
+    }
+    starts_with_type_phrase_lead(text)
+}
+
+fn starts_with_article_core_type_segment(text: &str) -> bool {
+    let text = text.trim_start();
+    if parse_core_type(text).0.is_some() {
+        return true;
+    }
+    if let Ok((rest, _)) = nom_primitives::parse_color(text) {
+        if let Ok((after_space, _)) = tag::<_, _, OracleError<'_>>(" ").parse(rest) {
+            return starts_with_article_core_type_segment(after_space);
+        }
+    }
+    if let Some((_prop, consumed)) = parse_color_quality_prefix(text) {
+        return starts_with_article_core_type_segment(&text[consumed..]);
+    }
+    false
 }
 
 fn target_filter_has_meaningful_content(filter: &TargetFilter) -> bool {
@@ -3360,8 +3466,23 @@ pub(crate) fn parse_combat_status_prefix(text: &str) -> Option<(FilterProp, usiz
 /// CR 508.1b: Postnominal "attacking you" / "attacking your opponents" on a
 /// typed phrase ("target creature attacking you"). The prefix form emits
 /// `Attacking { defender: None }`; this suffix scopes the defending player.
+///
+/// An optional "that's "/"that is "/"that are " relative-clause intro before
+/// "attacking" is consumed first (CR 608.2c). "Each creature that's attacking
+/// one of your opponents" (Oviya) is the relative-clause form of the bare
+/// postnominal "creature attacking your opponents"; both resolve to the same
+/// `Attacking { defender }` property, so the intro is stripped here rather than
+/// forking a second attacking grammar in the `that's`-clause path.
 fn parse_attacking_defender_suffix(text: &str) -> Option<(FilterProp, usize)> {
-    let trimmed = text.trim_start();
+    let trimmed_outer = text.trim_start();
+    let trimmed = opt(alt((
+        tag::<_, _, OracleError<'_>>("that's "),
+        tag("that is "),
+        tag("that are "),
+    )))
+    .parse(trimmed_outer)
+    .map(|(rest, _)| rest)
+    .unwrap_or(trimmed_outer);
     for (pattern, defender) in [
         (
             "attacking you or a planeswalker you control",
@@ -3377,6 +3498,13 @@ fn parse_attacking_defender_suffix(text: &str) -> Option<(FilterProp, usize)> {
             ControllerRef::Opponent,
         ),
         ("attacking your opponents", ControllerRef::Opponent),
+        // CR 508.1b: "attacking one of your opponents" — in a multiplayer
+        // attack-multiple-players game each attacker is assigned one defending
+        // player; "one of your opponents" scopes the defender to any of the
+        // controller's opponents (Oviya, Automech Artisan). Same defender scope
+        // as the plural "your opponents" form; the singular phrasing only
+        // changes the surface text, not the `ControllerRef::Opponent` mapping.
+        ("attacking one of your opponents", ControllerRef::Opponent),
     ] {
         if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(pattern).parse(trimmed) {
             let rest_trim = rest.trim_start();
@@ -3477,6 +3605,11 @@ fn superlative_property_filter_prop(
             comparator: Comparator::EQ,
             value,
         },
+        // ManaSymbolCount is a zone-aggregated chroma property (`QuantityRef::
+        // Aggregate`), never a per-object superlative comparison filter.
+        ObjectProperty::ManaSymbolCount(_) => unreachable!(
+            "ManaSymbolCount is aggregated via QuantityRef::Aggregate, not a superlative filter"
+        ),
     }
 }
 
@@ -3537,6 +3670,28 @@ pub(crate) fn parse_mana_value_suffix(
     }
     if let Some((prop, after)) = parse_relative_mana_value_suffix(trimmed) {
         return Some((prop, text.len() - after.len()));
+    }
+
+    if let Ok((after, _)) = (
+        alt((
+            tag::<_, _, OracleError<'_>>("with "),
+            tag::<_, _, OracleError<'_>>("that have "),
+            tag::<_, _, OracleError<'_>>("that each have "),
+        )),
+        tag::<_, _, OracleError<'_>>("mana value of "),
+        alt((
+            tag::<_, _, OracleError<'_>>("the chosen quality"),
+            tag::<_, _, OracleError<'_>>("that quality"),
+        )),
+    )
+        .parse(trimmed)
+    {
+        return Some((
+            FilterProp::ManaValueParity {
+                parity: ParitySource::LastNamedChoice,
+            },
+            text.len() - after.len(),
+        ));
     }
 
     let (rest, _) = alt((
@@ -4115,6 +4270,86 @@ fn parse_counter_spec_after_lead(
                 counters: CounterMatch::OfType(crate::types::counter::parse_counter_type(
                     counter_type,
                 )),
+                comparator,
+                count,
+            },
+            consumed,
+        ));
+    }
+
+    None
+}
+
+/// CR 122.1 + CR 122.6: Parse the relative-clause body AFTER "that " for the
+/// historical counter-placement predicate "[actor] put [count] [type] counters
+/// on this turn". `input` begins at the actor word. Returns
+/// `(FilterProp::CountersPutOnThisTurn, bytes consumed from `input`)`.
+///
+/// Axes (all parameterized — covers the class, not just Kid Loki):
+/// - actor: "you've"/"you have" → Controller; "an opponent has"/"an opponent's"
+///   → Opponents; "a player has"/"a player's" → All.
+/// - count: "one or more"/"a"/"an" → GE 1; "<N> or more" → GE N; "<N>" → EQ N.
+/// - counters: a typed "+1/+1"/"<name>" → OfType; bare "counters" → Any.
+fn parse_counters_put_this_turn_clause(input: &str) -> Option<(FilterProp, usize)> {
+    use nom::bytes::complete::take_until;
+    use nom::combinator::value;
+
+    type VE<'a> = OracleError<'a>;
+
+    // Actor scope (CR 122.6 + CR 109.5). Longest-match-first within each group.
+    let (rest, actor) = alt((
+        value(CountScope::Controller, tag::<_, _, VE>("you've put ")),
+        value(CountScope::Controller, tag("you have put ")),
+        value(CountScope::Opponents, tag("an opponent has put ")),
+        value(CountScope::Opponents, tag("an opponent's put ")),
+        value(CountScope::Opponents, tag("an opponent\u{2019}s put ")),
+        value(CountScope::All, tag("a player has put ")),
+        value(CountScope::All, tag("a player's put ")),
+        value(CountScope::All, tag("a player\u{2019}s put ")),
+    ))
+    .parse(input)
+    .ok()?;
+
+    // Count threshold (CR 122.6). "one or more"/"a"/"an" all mean GE 1.
+    let (rest, (comparator, count)) = alt((
+        value((Comparator::GE, 1u32), tag::<_, _, VE>("one or more ")),
+        value((Comparator::GE, 1u32), tag("a ")),
+        value((Comparator::GE, 1u32), tag("an ")),
+        |i| {
+            let (i, n) = nom_primitives::parse_number(i)?;
+            let (i, _) = tag::<_, _, VE>(" or more ").parse(i)?;
+            Ok((i, (Comparator::GE, n)))
+        },
+        |i| {
+            let (i, n) = nom_primitives::parse_number(i)?;
+            let (i, _) = tag::<_, _, VE>(" ").parse(i)?;
+            Ok((i, (Comparator::EQ, n)))
+        },
+    ))
+    .parse(rest)
+    .ok()?;
+
+    // Counter type, then the elided-recipient terminator "counter(s) on this
+    // turn". `take_until` grabs the (possibly empty) type text before the
+    // terminator; a blank type text means a bare untyped counter
+    // (CounterMatch::Any). The terminator carries no leading space so the bare
+    // "a counter on this turn" form (no type text) matches as well as the typed
+    // "+1/+1 counters on this turn" form (type text + trailing space).
+    for suffix in ["counters on this turn", "counter on this turn"] {
+        let Ok((after, counter_text)) = take_until::<_, _, VE>(suffix).parse(rest) else {
+            continue;
+        };
+        let counter_type = counter_text.trim();
+        let counters = if counter_type.is_empty() {
+            CounterMatch::Any
+        } else {
+            CounterMatch::OfType(crate::types::counter::parse_counter_type(counter_type))
+        };
+        let consumed = input.len() - after.len() + suffix.len();
+        return Some((
+            FilterProp::CountersPutOnThisTurn {
+                actor,
+                counters,
                 comparator,
                 count,
             },
@@ -4909,6 +5144,16 @@ pub(crate) fn parse_that_clause_suffix<'a>(
         }
     }
 
+    // CR 122.1 + CR 122.6: "that you've put one or more +1/+1 counters on this
+    // turn" — historical counter-placement relative clause (Kid Loki). The
+    // relative pronoun is the object of "on" (counters put on THAT creature this
+    // turn), so the surface form ends "...on this turn" with the recipient
+    // elided. Lowers to `FilterProp::CountersPutOnThisTurn`, distinct from the
+    // current-counter `FilterProp::Counters` ("that has a +1/+1 counter on it").
+    if let Some((prop, consumed)) = parse_counters_put_this_turn_clause(after_that) {
+        return Some((vec![prop], that_len + consumed));
+    }
+
     // CR 122.1 / CR 122.1a: "that has a/an <type> counter on it" / "that have …
     // on them" — relative-clause counter predicate; positive (GE). Reuses the
     // shared counter-spec combinator the with-form (parse_counter_suffix) uses,
@@ -4948,6 +5193,12 @@ pub(crate) fn parse_that_clause_suffix<'a>(
         ),
         ("attacked this turn", FilterProp::AttackedThisTurn),
         ("blocked this turn", FilterProp::BlockedThisTurn),
+        // CR 702.171c: "that saddled it [this turn]" — the creature was tapped to
+        // pay the source's saddle cost (recorded in the source's `saddled_by`,
+        // cleared at end of turn so "this turn" is implicit). "it" refers to the
+        // ability source. Calamity, Galloping Inferno. Longest match first.
+        ("saddled it this turn", FilterProp::SaddledSource),
+        ("saddled it", FilterProp::SaddledSource),
     ];
 
     for (phrase, prop) in VERB_PHRASES {
@@ -5132,8 +5383,14 @@ fn parse_color_disjunction(
 }
 
 fn preceded_color_separator(input: &str) -> super::oracle_nom::error::OracleResult<'_, ManaColor> {
+    // CR 105.2: "black and/or red", "white and/or blue" (Rowan/Will, Scion of …)
+    // join two colors disjunctively. The "and/or" forms are matched before the
+    // bare "or "/", " separators (longest-match-first) so "black and/or red"
+    // does not stop after parsing "black" and stranding " and/or red".
     let (rest, _) = alt((
-        tag::<_, _, OracleError<'_>>(", or "),
+        tag::<_, _, OracleError<'_>>(", and/or "),
+        tag(" and/or "),
+        tag(", or "),
         tag(", "),
         tag(" or "),
     ))
@@ -5956,6 +6213,57 @@ mod tests {
             TargetFilter::And { filters } => filters.iter().find_map(typed_leg),
             _ => None,
         }
+    }
+
+    /// Issue #3677 (Flare of Denial): "sacrifice a nontoken blue creature" must
+    /// capture the color AND the creature type, not just the NonToken negation.
+    /// Before the fix, the color-prefix scan ran only BEFORE the `non-` negation
+    /// loop, so a leading "nontoken " left "blue creature" unconsumed and the
+    /// resulting filter silently matched any nontoken permanent — including a
+    /// land, which is never a token, allowing the alt cost to be paid with a
+    /// colorless land instead of a blue creature.
+    #[test]
+    fn nontoken_color_creature_captures_color_and_type() {
+        let (filter, rest) = parse_type_phrase("nontoken blue creature");
+        assert_eq!(rest.trim(), "");
+        let tf = typed_leg(&filter).expect("expected typed filter");
+        assert!(tf.type_filters.contains(&TypeFilter::Creature));
+        assert!(tf.properties.contains(&FilterProp::NonToken));
+        assert!(tf.properties.contains(&FilterProp::HasColor {
+            color: ManaColor::Blue
+        }));
+    }
+
+    /// Issue #3677 class (Cadric, Soul Kindler): "another nontoken legendary
+    /// permanent you control" must capture the Legendary supertype, not just
+    /// the NonToken negation. Same root cause as the color case above — the
+    /// supertype-prefix scan only ran BEFORE the `non-` negation loop.
+    #[test]
+    fn nontoken_legendary_permanent_captures_supertype() {
+        let (filter, rest) = parse_type_phrase("another nontoken legendary permanent you control");
+        assert_eq!(rest.trim(), "");
+        let tf = typed_leg(&filter).expect("expected typed filter");
+        assert!(tf.type_filters.contains(&TypeFilter::Permanent));
+        assert!(tf.properties.contains(&FilterProp::NonToken));
+        assert!(tf.properties.contains(&FilterProp::HasSupertype {
+            value: Supertype::Legendary
+        }));
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+    }
+
+    /// Issue #3677 class (Akki Ember-Keeper): "a nontoken modified creature
+    /// you control" must capture the Modified property, not just the
+    /// NonToken negation. Same root cause as the color case above — the
+    /// "modified" adjective scan only ran BEFORE the `non-` negation loop.
+    #[test]
+    fn nontoken_modified_creature_captures_modified_property() {
+        let (filter, rest) = parse_type_phrase("a nontoken modified creature you control");
+        assert_eq!(rest.trim(), "");
+        let tf = typed_leg(&filter).expect("expected typed filter");
+        assert!(tf.type_filters.contains(&TypeFilter::Creature));
+        assert!(tf.properties.contains(&FilterProp::NonToken));
+        assert!(tf.properties.contains(&FilterProp::Modified));
+        assert_eq!(tf.controller, Some(ControllerRef::You));
     }
 
     /// CR 201.2 (issue #2016): the "named <CardName>" suffix must terminate the
@@ -7053,6 +7361,17 @@ mod tests {
                 }
             ]))
         );
+    }
+
+    #[test]
+    fn mana_value_chosen_quality_suffix_maps_to_parity_choice() {
+        let (filter, rest) = parse_target("creatures with mana value of the chosen quality");
+        assert!(rest.trim().is_empty(), "remainder: '{rest}'");
+        let typed = typed_leg(&filter).expect("expected typed creature filter");
+        assert!(typed.type_filters.contains(&TypeFilter::Creature));
+        assert!(typed.properties.contains(&FilterProp::ManaValueParity {
+            parity: ParitySource::LastNamedChoice,
+        }));
     }
 
     #[test]
@@ -9938,6 +10257,27 @@ mod tests {
                 );
                 assert_eq!(
                     filters[3],
+                    TargetFilter::Typed(TypedFilter::new(TypeFilter::Land))
+                );
+            }
+            other => panic!("Expected Or filter, got {:?}", other),
+        }
+        assert_eq!(rest.trim(), "");
+    }
+
+    #[test]
+    fn comma_list_per_item_articles() {
+        let (f, rest) = parse_type_phrase("an artifact, a creature, or a land");
+        match f {
+            TargetFilter::Or { ref filters } => {
+                assert_eq!(filters.len(), 3);
+                assert_eq!(
+                    filters[0],
+                    TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact))
+                );
+                assert_eq!(filters[1], TargetFilter::Typed(TypedFilter::creature()));
+                assert_eq!(
+                    filters[2],
                     TargetFilter::Typed(TypedFilter::new(TypeFilter::Land))
                 );
             }
@@ -12924,6 +13264,170 @@ mod tests {
         assert!(
             filters.iter().any(has_noncreature),
             "expected a noncreature branch in {filters:?}"
+        );
+    }
+
+    /// CR 122.1 + CR 122.6: the "that [actor] put [count] [type] counters on this
+    /// turn" relative clause lowers to `FilterProp::CountersPutOnThisTurn` with
+    /// the right actor/counter/comparator/count axes — across "you've put", the
+    /// "an opponent has put" actor scope, the "N or more" / "a" count forms, and
+    /// the bare untyped "counters" form.
+    #[test]
+    fn counters_put_this_turn_clause_kid_loki_form() {
+        // Kid Loki: "that you've put one or more +1/+1 counters on this turn".
+        let (prop, _) = parse_counters_put_this_turn_clause(
+            "you've put one or more +1/+1 counters on this turn",
+        )
+        .expect("clause parses");
+        assert_eq!(
+            prop,
+            FilterProp::CountersPutOnThisTurn {
+                actor: CountScope::Controller,
+                counters: CounterMatch::OfType(CounterType::Plus1Plus1),
+                comparator: Comparator::GE,
+                count: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn counters_put_this_turn_clause_opponent_and_numeric_count() {
+        // Opponent actor scope + explicit "two or more" threshold.
+        let (prop, _) = parse_counters_put_this_turn_clause(
+            "an opponent has put two or more +1/+1 counters on this turn",
+        )
+        .expect("clause parses");
+        assert_eq!(
+            prop,
+            FilterProp::CountersPutOnThisTurn {
+                actor: CountScope::Opponents,
+                counters: CounterMatch::OfType(CounterType::Plus1Plus1),
+                comparator: Comparator::GE,
+                count: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn counters_put_this_turn_clause_bare_untyped_singular() {
+        // Bare untyped "a counter ... on this turn" → CounterMatch::Any, GE 1.
+        let (prop, _) = parse_counters_put_this_turn_clause("you've put a counter on this turn")
+            .expect("clause parses");
+        assert_eq!(
+            prop,
+            FilterProp::CountersPutOnThisTurn {
+                actor: CountScope::Controller,
+                counters: CounterMatch::Any,
+                comparator: Comparator::GE,
+                count: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn counters_put_this_turn_clause_rejects_non_matching() {
+        // No actor/verb → not this clause.
+        assert!(parse_counters_put_this_turn_clause("attacked this turn").is_none());
+        // Missing the "on this turn" terminator → not this clause.
+        assert!(parse_counters_put_this_turn_clause("you've put a +1/+1 counter on it").is_none());
+    }
+
+    /// CR 508.1b (Oviya, Automech Artisan): the relative-clause attacking suffix
+    /// "that's attacking one of your opponents" must fully consume and emit
+    /// `Attacking { defender: Some(Opponent) }`.
+    #[test]
+    fn that_s_attacking_one_of_your_opponents_suffix() {
+        let (filter, rest) = parse_target("each creature that's attacking one of your opponents");
+        assert!(
+            rest.trim().is_empty(),
+            "suffix must be fully consumed: {rest:?}"
+        );
+        let tf = typed_leg(&filter).expect("typed filter");
+        assert!(
+            tf.properties.contains(&FilterProp::Attacking {
+                defender: Some(ControllerRef::Opponent),
+            }),
+            "must carry Attacking{{defender: Opponent}}, got {:?}",
+            tf.properties
+        );
+    }
+
+    /// CR 205.3m + CR 608.2c (Selfless Safewright): the anaphor suffix "of that
+    /// type" must be recognized identically to "of the chosen type" and emit
+    /// `IsChosenCreatureType` for a non-card-typed base.
+    #[test]
+    fn of_that_type_anaphor_suffix_equals_of_the_chosen_type() {
+        let (filter, rest) = parse_target("other permanents you control of that type");
+        assert!(
+            rest.trim().is_empty(),
+            "suffix must be fully consumed: {rest:?}"
+        );
+        let tf = typed_leg(&filter).expect("typed filter");
+        assert!(
+            tf.properties.contains(&FilterProp::IsChosenCreatureType),
+            "must carry IsChosenCreatureType, got {:?}",
+            tf.properties
+        );
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+        assert!(tf.properties.contains(&FilterProp::Another));
+    }
+
+    /// CR 205.3h: `parse_type_phrase` parses "a Plan" — "Plan" is an enchantment
+    /// subtype (Marvel's Spider-Man) — to `Typed{[Subtype("Plan")]}`, fully
+    /// consumed. The elided-verb "or" disjunction ("you control an artifact
+    /// creature or a Plan") is assembled one level up in `parse_you_control_a`,
+    /// so `parse_type_phrase` itself stops at the first segment and leaves the
+    /// connector as remainder (asserted below).
+    #[test]
+    fn parse_type_phrase_recognizes_plan() {
+        let (f, rest) = parse_type_phrase("a Plan");
+        assert!(rest.trim().is_empty(), "remainder must be empty: {rest:?}");
+        let TargetFilter::Typed(tf) = f else {
+            panic!("expected single Typed filter, got {f:?}");
+        };
+        assert_eq!(
+            tf.type_filters,
+            vec![TypeFilter::Subtype("Plan".to_string())]
+        );
+    }
+
+    /// `parse_type_phrase` does NOT swallow an article-led "or" RHS — it stops at
+    /// the first segment and leaves " or a Plan" as remainder. This is the
+    /// load-bearing precondition for the `parse_you_control_a` elided-verb loop:
+    /// the connector must survive so the condition layer can fold the disjuncts.
+    #[test]
+    fn parse_type_phrase_leaves_article_led_or_rhs_as_remainder() {
+        let (f, rest) = parse_type_phrase("an artifact creature or a Plan");
+        assert_eq!(rest, " or a Plan", "article-led or RHS must remain");
+        let TargetFilter::Typed(tf) = f else {
+            panic!("expected single Typed filter, got {f:?}");
+        };
+        assert!(tf.type_filters.contains(&TypeFilter::Artifact));
+        assert!(tf.type_filters.contains(&TypeFilter::Creature));
+    }
+
+    /// Regression: a single article-led conjunction with no connector still
+    /// parses to a single Typed filter (not an Or).
+    #[test]
+    fn single_artifact_creature_still_typed_not_or() {
+        let (f, rest) = parse_type_phrase("an artifact creature");
+        assert!(rest.trim().is_empty(), "remainder must be empty: {rest:?}");
+        let TargetFilter::Typed(tf) = f else {
+            panic!("expected single Typed filter, got {f:?}");
+        };
+        assert!(tf.type_filters.contains(&TypeFilter::Artifact));
+        assert!(tf.type_filters.contains(&TypeFilter::Creature));
+    }
+
+    /// Regression: a bare (no-article) connector RHS still parses to an Or via
+    /// the existing non-comma separator branch (unchanged by this work).
+    #[test]
+    fn bare_connector_rhs_still_or() {
+        let (f, rest) = parse_type_phrase("artifact creature or enchantment");
+        assert!(rest.trim().is_empty(), "remainder must be empty: {rest:?}");
+        assert!(
+            matches!(f, TargetFilter::Or { .. }),
+            "expected Or filter, got {f:?}"
         );
     }
 }

@@ -1,6 +1,7 @@
 pub mod ability_utils;
 pub mod arithmetic;
 pub mod attractions;
+pub mod augment;
 pub mod bending;
 pub mod blitz;
 // Tests for `blitz` live in a sibling file (declared here, not in `blitz.rs`,
@@ -9,6 +10,7 @@ pub mod blitz;
 #[path = "blitz_tests.rs"]
 mod blitz_tests;
 pub mod bracket_estimate;
+pub mod card_subset;
 pub mod casting;
 pub(crate) mod casting_costs;
 pub(crate) mod casting_targets;
@@ -23,6 +25,10 @@ pub mod combat_damage;
 pub mod commander;
 pub mod companion;
 pub(crate) mod conditions;
+pub mod contraptions;
+#[cfg(test)]
+#[path = "contraptions_tests.rs"]
+mod contraptions_tests;
 pub mod cost_payability;
 pub(crate) mod costs;
 pub mod coverage;
@@ -48,6 +54,7 @@ pub(crate) mod engine_payment_choices;
 pub(crate) mod engine_priority;
 pub(crate) mod engine_replacement;
 pub(crate) mod engine_resolution_choices;
+pub mod engine_resolve_batch;
 pub(crate) mod engine_stack;
 pub(crate) mod exile_links;
 pub mod filter;
@@ -97,6 +104,9 @@ pub mod perf_counters;
 #[cfg(test)]
 #[path = "archenemy_tests.rs"]
 mod archenemy_tests;
+#[cfg(test)]
+#[path = "augment_tests.rs"]
+mod augment_tests;
 pub mod phasing;
 pub mod planechase;
 // Tests for `planechase` live in a sibling file (declared here, not in
@@ -125,6 +135,10 @@ mod splice_tests;
 pub mod stack;
 pub mod static_abilities;
 pub mod static_source_index;
+pub mod stickers;
+#[cfg(test)]
+#[path = "stickers_tests.rs"]
+mod stickers_tests;
 pub mod targeting;
 pub mod token_presets;
 pub mod transform;
@@ -159,6 +173,9 @@ pub use engine::{
     start_game_with_starting_player, EngineError,
 };
 pub use engine_debug::route_debug_create_to_battlefield;
+pub use engine_resolve_batch::{
+    resolve_all_fast_forward, ResolveAllCallbackDecision, ResolveAllFastForwardResult,
+};
 pub use game_object::{BackFaceData, GameObject, PhaseOutCause, PhaseStatus};
 pub use keywords::parse_keywords;
 pub use mana_payment::{can_pay, pay_from_pool, produce_mana, PaymentError};

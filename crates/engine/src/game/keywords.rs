@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use crate::game::casting_costs::cost_has_x;
 use crate::game::combat::AttackTarget;
 use crate::game::game_object::GameObject;
 use crate::game::zone_pipeline::{self, ZoneMoveRequest};
@@ -8,11 +9,13 @@ use crate::types::ability::{AbilityCost, CastVariantPaid, NinjutsuVariant};
 use crate::types::events::GameEvent;
 use crate::types::game_state::{GameState, WaitingFor};
 use crate::types::identifiers::{CardId, ObjectId};
-use crate::types::keywords::{FlashbackCost, Keyword, KeywordKind, ProtectionTarget};
+use crate::types::keywords::{
+    EmbalmCost, EternalizeCost, FlashbackCost, Keyword, KeywordKind, ProtectionTarget,
+};
 use crate::types::mana::ManaCost;
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
-use crate::types::statics::StaticMode;
+use crate::types::statics::{CostModifyMode, StaticMode};
 use crate::types::zones::Zone;
 
 /// Check if a game object has a specific keyword, using discriminant-based matching
@@ -160,6 +163,22 @@ pub fn effective_mayhem_cost(state: &GameState, object_id: ObjectId) -> Option<M
     }
 }
 
+/// CR 702.180a: Effective Harmonize alt-cost for a card in the graveyard,
+/// honoring off-zone keyword grants (e.g. Songcrafter Mage's "target instant or
+/// sorcery card in your graveyard gains harmonize until end of turn. Its
+/// harmonize cost is equal to its mana cost.") in addition to a printed Harmonize
+/// keyword. Resolves `ManaCost::SelfManaCost` to the card's own mana cost via
+/// `resolve_keyword_mana_cost`, mirroring `effective_mayhem_cost`. The
+/// tap-a-creature cost reduction (CR 702.180a/b) is applied separately at
+/// payment time.
+pub fn effective_harmonize_cost(state: &GameState, object_id: ObjectId) -> Option<ManaCost> {
+    let keyword = effective_keyword_for_object(state, object_id, KeywordKind::Harmonize)?;
+    match keyword {
+        Keyword::Harmonize(cost) => Some(resolve_keyword_mana_cost(state, object_id, &cost)),
+        _ => None,
+    }
+}
+
 /// CR 702.190a: Effective Sneak alt-cost for an object, honoring off-zone characteristic
 /// grants (e.g., Ninja Teen's "creature cards in your graveyard have sneak {cost}").
 pub fn effective_sneak_cost(state: &GameState, object_id: ObjectId) -> Option<ManaCost> {
@@ -210,7 +229,111 @@ fn resolve_keyword_mana_cost(state: &GameState, object_id: ObjectId, cost: &Mana
             .get(&object_id)
             .map(|obj| obj.mana_cost.clone())
             .unwrap_or(ManaCost::NoCost),
+        // CR 202.3: Mana value is a single number; keyword costs bound to mana
+        // value resolve to that much generic mana, not the card's colored cost.
+        ManaCost::SelfManaValue => state
+            .objects
+            .get(&object_id)
+            .map(|obj| ManaCost::generic(obj.mana_cost.mana_value()))
+            .unwrap_or(ManaCost::NoCost),
         _ => cost.clone(),
+    }
+}
+
+/// CR 602.1a + CR 702.141a: Resolve `SelfManaCost` / `SelfManaValue` placeholders
+/// anywhere in an activated ability's cost tree before legality or payment.
+/// The mana payment path treats those placeholders as free, so every activation
+/// fetch must concretize them against the source object (Sliver Gravemother class).
+pub(crate) fn resolve_self_mana_in_ability_cost(
+    state: &GameState,
+    source_id: ObjectId,
+    cost: &AbilityCost,
+) -> AbilityCost {
+    match cost {
+        AbilityCost::Mana { cost: mana } => AbilityCost::Mana {
+            cost: resolve_keyword_mana_cost(state, source_id, mana),
+        },
+        AbilityCost::Composite { costs } => AbilityCost::Composite {
+            costs: costs
+                .iter()
+                .map(|sub| resolve_self_mana_in_ability_cost(state, source_id, sub))
+                .collect(),
+        },
+        AbilityCost::OneOf { costs } => AbilityCost::OneOf {
+            costs: costs
+                .iter()
+                .map(|sub| resolve_self_mana_in_ability_cost(state, source_id, sub))
+                .collect(),
+        },
+        AbilityCost::PerCounter {
+            counter,
+            target,
+            base,
+        } => AbilityCost::PerCounter {
+            counter: counter.clone(),
+            target: target.clone(),
+            base: Box::new(resolve_self_mana_in_ability_cost(state, source_id, base)),
+        },
+        other => other.clone(),
+    }
+}
+
+/// CR 702.141a + CR 202.3: Encore grants that bind X to the card's mana value
+/// (Sliver Gravemother) must not enter `ChooseXValue` with X choosable at 0.
+/// When the synthesized cost still carries a symbolic `{X}` shard, concretize it
+/// to the source object's mana value before activation proceeds.
+pub(crate) fn concretize_encore_mana_value_in_ability_cost(
+    state: &GameState,
+    source_id: ObjectId,
+    cost: &mut AbilityCost,
+) {
+    match cost {
+        AbilityCost::Mana { cost: mana } if cost_has_x(mana) => {
+            let mana_value = state
+                .objects
+                .get(&source_id)
+                .map(|obj| obj.mana_cost.mana_value())
+                .unwrap_or(0);
+            mana.concretize_x(mana_value);
+        }
+        AbilityCost::Composite { costs } | AbilityCost::OneOf { costs } => {
+            for sub in costs {
+                concretize_encore_mana_value_in_ability_cost(state, source_id, sub);
+            }
+        }
+        AbilityCost::PerCounter { base, .. } => {
+            concretize_encore_mana_value_in_ability_cost(state, source_id, base);
+        }
+        _ => {}
+    }
+}
+
+/// CR 702.97a / CR 702.128a / CR 702.129a / CR 702.141a + CR 602.1a: Resolve a
+/// `ManaCost::SelfManaCost` or `ManaCost::SelfManaValue` payload carried by a
+/// granted graveyard activated keyword to the recipient card's concrete mana
+/// sub-cost. Encore / Scavenge / Embalm / Eternalize are graveyard *activated*
+/// abilities whose mana sub-cost is paid through `AbilityCost::Mana`, and that
+/// payment path treats self-referential placeholders as free — so they must be
+/// concretized before the activated ability is synthesized. Non-self-referential
+/// keywords (printed Embalm `{3}{W}`, Encore `{5}`, or any other keyword) pass
+/// through unchanged.
+pub fn resolve_self_cost_graveyard_activated_keyword(
+    state: &GameState,
+    object_id: ObjectId,
+    keyword: &Keyword,
+) -> Keyword {
+    match keyword {
+        Keyword::Encore(cost) => Keyword::Encore(resolve_keyword_mana_cost(state, object_id, cost)),
+        Keyword::Scavenge(cost) => {
+            Keyword::Scavenge(resolve_keyword_mana_cost(state, object_id, cost))
+        }
+        Keyword::Embalm(EmbalmCost::Mana(cost)) => Keyword::Embalm(EmbalmCost::Mana(
+            resolve_keyword_mana_cost(state, object_id, cost),
+        )),
+        Keyword::Eternalize(EternalizeCost::Mana(cost)) => Keyword::Eternalize(
+            EternalizeCost::Mana(resolve_keyword_mana_cost(state, object_id, cost)),
+        ),
+        other => other.clone(),
     }
 }
 
@@ -753,12 +876,20 @@ fn apply_ability_cost_reduction(
             continue;
         }
         if let StaticMode::ReduceAbilityCost {
+            ref mode,
             ref keyword,
             amount,
             ref dynamic_count,
             ..
         } = static_def.mode
         {
+            // CR 118.7: This ninjutsu-cost path only subtracts. A directional
+            // static in the `Raise` direction keyed on the same keyword must not
+            // reach the subtraction below — skip it (cost increases on ninjutsu
+            // are not modeled here; this path is reduction-only by construction).
+            if !matches!(mode, CostModifyMode::Reduce) {
+                continue;
+            }
             if keyword == ability_keyword {
                 // CR 601.2f: When dynamic_count is present, the total reduction is
                 // amount * resolve_quantity(dynamic_count). E.g., "cost {1} less for each Dragon".
@@ -825,10 +956,12 @@ mod tests {
     use std::sync::Arc;
 
     use crate::ai_support::legal_actions;
+    use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityDefinition, AbilityKind, Effect, ManaContribution, ManaProduction,
+        AbilityDefinition, AbilityKind, Effect, ManaContribution, ManaProduction, TargetFilter,
     };
     use crate::types::actions::GameAction;
+    use crate::types::counter::CounterType;
     use crate::types::game_state::WaitingFor;
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
@@ -851,6 +984,98 @@ mod tests {
         obj.keywords.push(Keyword::Flying);
         assert!(has_keyword(&obj, &Keyword::Flying));
         assert!(!has_keyword(&obj, &Keyword::Haste));
+    }
+
+    #[test]
+    fn resolve_self_mana_in_ability_cost_descends_per_counter_base() {
+        let mut state = GameState::new_two_player(1);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Graveyard,
+        );
+        {
+            let obj = state.objects.get_mut(&source).unwrap();
+            obj.mana_cost = ManaCost::Cost {
+                generic: 0,
+                shards: vec![
+                    ManaCostShard::White,
+                    ManaCostShard::Blue,
+                    ManaCostShard::Black,
+                    ManaCostShard::Red,
+                    ManaCostShard::Green,
+                ],
+            };
+        }
+
+        let cost = AbilityCost::PerCounter {
+            counter: CounterType::Generic("charge".to_string()),
+            target: TargetFilter::SelfRef,
+            base: Box::new(AbilityCost::Mana {
+                cost: ManaCost::SelfManaValue,
+            }),
+        };
+
+        let resolved = resolve_self_mana_in_ability_cost(&state, source, &cost);
+        let AbilityCost::PerCounter { base, .. } = resolved else {
+            panic!("expected PerCounter wrapper preserved");
+        };
+        assert_eq!(
+            *base,
+            AbilityCost::Mana {
+                cost: ManaCost::generic(5),
+            }
+        );
+    }
+
+    #[test]
+    fn concretize_encore_mana_value_descends_per_counter_base() {
+        let mut state = GameState::new_two_player(1);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Graveyard,
+        );
+        {
+            let obj = state.objects.get_mut(&source).unwrap();
+            obj.mana_cost = ManaCost::Cost {
+                generic: 0,
+                shards: vec![
+                    ManaCostShard::White,
+                    ManaCostShard::Blue,
+                    ManaCostShard::Black,
+                    ManaCostShard::Red,
+                    ManaCostShard::Green,
+                ],
+            };
+        }
+
+        let mut cost = AbilityCost::PerCounter {
+            counter: CounterType::Generic("charge".to_string()),
+            target: TargetFilter::SelfRef,
+            base: Box::new(AbilityCost::Mana {
+                cost: ManaCost::Cost {
+                    generic: 0,
+                    shards: vec![ManaCostShard::X],
+                },
+            }),
+        };
+
+        concretize_encore_mana_value_in_ability_cost(&state, source, &mut cost);
+
+        let AbilityCost::PerCounter { base, .. } = cost else {
+            panic!("expected PerCounter wrapper preserved");
+        };
+        assert_eq!(
+            *base,
+            AbilityCost::Mana {
+                cost: ManaCost::generic(5),
+            }
+        );
     }
 
     /// CR 702.164b: a creature's total toxic value is the sum of N over ALL its
@@ -957,6 +1182,114 @@ mod tests {
         assert_eq!(
             toxic_count, 2,
             "both printed and granted Toxic instances must remain on the keyword list"
+        );
+    }
+
+    /// CR 702.138a (#3281): card-data export encodes compound escape as
+    /// `EscapeCost::NonMana`; hydrating a face from that export shape must
+    /// resolve `effective_escape_data`, not collapse to the bare MTGJSON placeholder.
+    #[test]
+    fn compound_escape_export_hydrates_effective_escape_data() {
+        use crate::game::deck_loading::create_object_from_card_face;
+        use crate::types::card::CardFace;
+        use crate::types::card_type::{CardType, CoreType, Supertype};
+        use crate::types::keywords::{EscapeCost, KeywordKind};
+        use crate::types::PtValue;
+
+        // Byte-shaped like Uro's `keywords[0]` entry in card-data export.
+        let escape_kw: Keyword = serde_json::from_value(serde_json::json!({
+            "Escape": {
+                "type": "NonMana",
+                "data": {
+                    "type": "Composite",
+                    "costs": [
+                        {
+                            "type": "Mana",
+                            "cost": {
+                                "type": "Cost",
+                                "shards": ["Green", "Green", "Blue", "Blue"],
+                                "generic": 0
+                            }
+                        },
+                        {
+                            "type": "Exile",
+                            "count": 5,
+                            "zone": "Graveyard",
+                            "filter": {
+                                "type": "Typed",
+                                "type_filters": ["Card"],
+                                "controller": "You",
+                                "properties": [
+                                    {"type": "Another"},
+                                    {"type": "InZone", "zone": "Graveyard"}
+                                ]
+                            }
+                        }
+                    ]
+                }
+            }
+        }))
+        .expect("card-data export escape keyword shape");
+
+        assert!(
+            matches!(escape_kw, Keyword::Escape(EscapeCost::NonMana(_))),
+            "export escape must deserialize as compound NonMana"
+        );
+
+        let face = CardFace {
+            name: "Uro, Titan of Nature's Wrath".to_string(),
+            mana_cost: ManaCost::Cost {
+                generic: 2,
+                shards: vec![ManaCostShard::Green, ManaCostShard::Blue],
+            },
+            card_type: CardType {
+                supertypes: vec![Supertype::Legendary],
+                core_types: vec![CoreType::Creature],
+                subtypes: vec!["Elder".to_string(), "Giant".to_string()],
+            },
+            power: Some(PtValue::Fixed(6)),
+            toughness: Some(PtValue::Fixed(6)),
+            loyalty: None,
+            defense: None,
+            oracle_text: None,
+            non_ability_text: None,
+            flavor_name: None,
+            keywords: vec![escape_kw],
+            abilities: vec![],
+            triggers: vec![],
+            static_abilities: vec![],
+            replacements: vec![],
+            cleave_variant: None,
+            color_override: None,
+            color_identity: vec![],
+            scryfall_oracle_id: None,
+            modal: None,
+            additional_cost: None,
+            strive_cost: None,
+            casting_restrictions: vec![],
+            casting_options: vec![],
+            solve_condition: None,
+            parse_warnings: vec![],
+            brawl_commander: false,
+            is_commander: false,
+            is_oathbreaker: false,
+            deck_copy_limit: None,
+            metadata: Default::default(),
+            rarities: Default::default(),
+            attraction_lights: vec![],
+        };
+
+        let mut state = GameState::new_two_player(1);
+        let id = create_object_from_card_face(&mut state, &face, PlayerId(0));
+        crate::game::zones::move_to_zone(&mut state, id, Zone::Graveyard, &mut Vec::new());
+
+        assert!(
+            object_has_effective_keyword_kind(&state, id, KeywordKind::Escape),
+            "graveyard object must have effective Escape"
+        );
+        assert!(
+            effective_escape_data(&state, id).is_some(),
+            "effective_escape_data must resolve compound export escape"
         );
     }
 
@@ -1411,7 +1744,6 @@ mod tests {
     }
 
     use crate::game::combat::{AttackerInfo, CombatState};
-    use crate::game::zones::create_object;
     use crate::types::events::GameEvent;
     use crate::types::game_state::GameState;
 
@@ -1504,6 +1836,7 @@ mod tests {
             state.players[0].mana_pool.add(ManaUnit {
                 color,
                 source_id: ObjectId(0),
+                pip_id: crate::types::mana::ManaPipId(0),
                 supertype: None,
                 source_could_produce_two_or_more_colors: false,
                 restrictions: Vec::new(),
@@ -1624,7 +1957,6 @@ mod tests {
     #[test]
     fn ninjutsu_enter_as_copy_defers_combat_placement_until_copy_resolves() {
         use crate::game::engine::apply_as_current;
-        use crate::game::zones::create_object;
         use crate::types::ability::{
             AbilityDefinition, AbilityKind, ContinuousModification, Effect, ReplacementDefinition,
             ReplacementMode, TargetFilter, TargetRef, TypeFilter, TypedFilter,
@@ -1931,6 +2263,28 @@ mod tests {
             state.players[0].mana_pool.total(),
             0,
             "Mana pool should be empty after ninjutsu payment"
+        );
+    }
+
+    #[test]
+    fn ninjutsu_legal_with_mana_already_in_pool() {
+        let (mut state, attacker_id, ninja_id) = setup_ninjutsu_scenario();
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+
+        let actions = legal_actions(&state);
+
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                GameAction::ActivateNinjutsu {
+                    ninjutsu_object_id,
+                    creature_to_return,
+                } if *ninjutsu_object_id == ninja_id && *creature_to_return == attacker_id
+            )),
+            "Ninjutsu must be legal when the activation cost is already in the mana pool"
         );
     }
 

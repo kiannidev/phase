@@ -371,6 +371,8 @@ pub fn guard_game_action_payload(action: &GameAction) -> Result<(), String> {
         | GameAction::MulliganDecision { .. }
         | GameAction::TapLandForMana { .. }
         | GameAction::UntapLandForMana { .. }
+        | GameAction::SpendPoolMana { .. }
+        | GameAction::UnspendPoolMana { .. }
         | GameAction::ChooseTarget { .. }
         | GameAction::ChooseReplacement { .. }
         | GameAction::CancelCast
@@ -408,6 +410,7 @@ pub fn guard_game_action_payload(action: &GameAction) -> Result<(), String> {
         | GameAction::ChooseDungeon { .. }
         | GameAction::ChooseDungeonRoom { .. }
         | GameAction::UnlockRoomDoor { .. }
+        | GameAction::ChooseRoomDoor { .. }
         | GameAction::TapForConvoke { .. }
         | GameAction::HarmonizeTap { .. }
         | GameAction::DeclareCompanion { .. }

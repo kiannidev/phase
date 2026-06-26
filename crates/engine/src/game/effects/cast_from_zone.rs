@@ -63,6 +63,7 @@ fn open_private_zone_cast_selection(
         // CR 708.2a: cast-from-zone selection is not a face-down entry.
         face_down_profile: None,
         count_param: 0,
+        library_position: None,
         is_cost_payment: false,
     };
     Ok(())
@@ -90,7 +91,7 @@ pub fn resolve(
         cast_transformed,
         alt_ability_cost,
         constraint,
-        _duration,
+        duration,
         driver,
     ) = match &ability.effect {
         Effect::CastFromZone {
@@ -127,6 +128,14 @@ pub fn resolve(
         })
         .collect();
 
+    // CR 701.20e + CR 608.2c: Look-then-cast chains (Kiora) inject the legal
+    // looked-at library cards as targets at the chain seam
+    // (`inject_last_revealed_targets`), already filtered through this cast
+    // filter's `ExiledBySource`→`LastRevealed` remap. Explicitly-supplied
+    // targets from ordinary CastFromZone paths (graveyard/exile free-cast,
+    // Bring to Light, Urza) must NOT be re-filtered through that remap, which
+    // would drop every target not in `last_revealed_ids`. The remap therefore
+    // only applies on the empty-target fallback below.
     if target_ids.is_empty() && target_filter.references_exiled_by_source() {
         let ctx = crate::game::filter::FilterContext::from_ability(ability);
         target_ids = crate::game::players::linked_exile_cards_for_source(state, ability.source_id)
@@ -140,6 +149,14 @@ pub fn resolve(
                     && crate::game::filter::matches_target_filter(state, *id, target_filter, &ctx)
             })
             .collect();
+        // CR 701.20e + CR 608.2c: Look-then-cast chains (Kiora, Sovereign of
+        // the Deep) leave the looked-at cards in the library. `Dig { keep_count:
+        // 0 }` publishes them via `last_revealed_ids`, not exile links, but the
+        // parser still binds the cast step to `ExiledBySource`.
+        if target_ids.is_empty() && !state.last_revealed_ids.is_empty() {
+            target_ids =
+                crate::game::filter::last_revealed_library_ids_matching(state, target_filter, &ctx);
+        }
     }
 
     // CR 310.11b + CR 608.2c: "exile it, then you may cast it transformed" —
@@ -166,6 +183,26 @@ pub fn resolve(
                     events,
                 );
             }
+        }
+        // CR 701.20a + CR 608.2c: "Draw three cards and reveal them. You may cast
+        // one of them" (Mad Wizard's Lair) leaves the revealed cards in hand;
+        // `LastRevealed` must open a hand selection among them, not resolve to
+        // `.first()` or filter them out via the library-only reveal injector.
+        if matches!(target_filter, TargetFilter::LastRevealed)
+            && state.last_revealed_ids.iter().any(|id| {
+                state
+                    .objects
+                    .get(id)
+                    .is_some_and(|obj| obj.zone == Zone::Hand)
+            })
+        {
+            return open_private_zone_cast_selection(
+                state,
+                ability,
+                target_filter,
+                Zone::Hand,
+                events,
+            );
         }
         // No targets resolved — nothing to cast.
         events.push(GameEvent::EffectResolved {
@@ -234,25 +271,27 @@ pub fn resolve(
         && alt_ability_cost.is_none()
         && target_ids.len() == 1;
 
-    // CR 608.2g: A targeted free-cast of a card the controller could never
-    // surface a *later* cast for must also be driven DURING resolution. Memory
-    // Plunder's "you may cast target instant or sorcery card from an opponent's
-    // graveyard without paying its mana cost" leaves the card in the OPPONENT's
-    // graveyard; a lingering `ExileWithAltCost` grant is inert there because the
-    // graveyard cast surface (`graveyard_spell_objects_available_to_cast`) only
-    // offers cards in the *controller's own* graveyard (`obj.owner == player`),
-    // so the granted player can never act on the permission (issue #2884:
-    // accepting the "you may cast" prompt did nothing). When the single resolved
-    // target is a card in a graveyard owned by another player, the only
-    // rules-correct casting mechanism is CR 608.2g — cast it as this effect
-    // resolves. The Suspend/Rebound self-cast (`driver` + `target == source`) is
-    // the other during-resolution case; both share the same casting authority.
-    let foreign_graveyard_free_cast = without_paying
+    // CR 608.2g: A targeted immediate free-cast of a card in a graveyard must
+    // be driven DURING resolution — the controller chooses whether to cast as
+    // this effect resolves (Torrential Gearhulk / Memory Plunder / Toshiro
+    // class). A lingering `ExileWithAltCost` grant is wrong here:
+    //   - opponent-graveyard targets are inert on the graveyard cast surface
+    //     (issue #2884 — accepting did nothing);
+    //   - own-graveyard targets defer the cast to a later priority window,
+    //     which violates CR 608.2g for resolution-time "you may cast" with no
+    //     standing duration (issue #852).
+    // Timed grants (`duration: Some(_)`) and paid casts stay on the lingering
+    // permission path (Emry, Urza-class deferred play).
+    let immediate_graveyard_free_cast = without_paying
         && alt_ability_cost.is_none()
+        && duration.is_none()
         && target_ids.len() == 1
-        && target_is_in_other_players_graveyard(state, target_ids[0], ability.controller);
+        && state
+            .objects
+            .get(&target_ids[0])
+            .is_some_and(|obj| obj.zone == Zone::Graveyard);
 
-    if driver_free_cast || foreign_graveyard_free_cast {
+    if driver_free_cast || immediate_graveyard_free_cast {
         return cast_single_target_during_resolution(
             state,
             ability,
@@ -271,22 +310,6 @@ pub fn resolve(
     });
 
     Ok(())
-}
-
-/// CR 608.2g: True when `card` currently sits in a graveyard owned by a player
-/// other than `controller`. Such a card can never be cast via a lingering
-/// `ExileWithAltCost` grant — the graveyard cast surface only offers cards in
-/// the controller's own graveyard — so a targeted free-cast of it must happen
-/// during resolution (Memory Plunder, issue #2884).
-fn target_is_in_other_players_graveyard(
-    state: &GameState,
-    card: ObjectId,
-    controller: crate::types::player::PlayerId,
-) -> bool {
-    state
-        .objects
-        .get(&card)
-        .is_some_and(|obj| obj.zone == Zone::Graveyard && obj.owner != controller)
 }
 
 /// CR 608.2g + CR 601.2a: After a resolution-time hand pick for a free
@@ -395,13 +418,17 @@ fn cast_single_target_during_resolution(
         reject_action: crate::types::ability::ResolutionMvRejectAction::RemainExiled,
         success_action: crate::types::ability::ResolutionCastSuccessAction::BottomMisses,
     };
+    let exile_instead_of_graveyard_on_resolve = cast_from_zone_has_graveyard_exile_rider(ability);
     state.waiting_for = crate::game::casting::initiate_cast_during_resolution(
         state,
         ability.controller,
         card,
-        constraint,
-        cast_transformed,
-        cleanup,
+        crate::game::casting::ResolutionCastRequest {
+            constraint,
+            cast_transformed,
+            cleanup,
+            exile_instead_of_graveyard_on_resolve,
+        },
         events,
     )
     .map_err(|e| EffectError::InvalidParam(e.to_string()))?;
@@ -428,6 +455,34 @@ fn cast_from_zone_has_graveyard_exile_rider(ability: &ResolvedAbility) -> bool {
         .sub_ability
         .as_deref()
         .is_some_and(is_graveyard_exile_rider_subability)
+}
+
+/// CR 614.1c + CR 122.1: Osteomancer Adept / The Tomb of Aclazotz class — the
+/// parser represents "the creature cast this way enters with a [counter] counter
+/// on it" as a sequential `AddPendingETBCounters` rider on `CastFromZone`. The
+/// rider's target is the *future* spell cast via the granted permission, not the
+/// current trigger event, so it is consumed as permission metadata rather than
+/// resolved in place (a standalone `AddPendingETBCounters` reads a `SpellCast`
+/// event that does not exist when the permission-granting ability resolves).
+pub(crate) fn is_enters_with_counter_rider_subability(ability: &ResolvedAbility) -> bool {
+    matches!(&ability.effect, Effect::AddPendingETBCounters { .. })
+}
+
+/// Extract the counter the cast-this-way creature enters with, if the
+/// `CastFromZone` carries an enters-with-counter rider sub-ability. Returns the
+/// rider's counter type; the count is fixed at one per CR 122.1 (the printed
+/// rider is always "a [counter] counter").
+fn cast_from_zone_enters_with_counter(
+    ability: &ResolvedAbility,
+) -> Option<crate::types::counter::CounterType> {
+    let sub = ability.sub_ability.as_deref()?;
+    if !is_enters_with_counter_rider_subability(sub) {
+        return None;
+    }
+    match &sub.effect {
+        Effect::AddPendingETBCounters { counter_type, .. } => Some(counter_type.clone()),
+        _ => None,
+    }
 }
 
 /// CR 118.9: Stamp `ExileWithAltCost` / `ExileWithAltAbilityCost` on resolved
@@ -458,6 +513,11 @@ pub(crate) fn grant_lingering_permissions(
             _ => return Err(EffectError::MissingParam("CastFromZone".to_string())),
         };
     let exile_instead_of_graveyard_on_resolve = cast_from_zone_has_graveyard_exile_rider(ability);
+    // CR 614.1c + CR 122.1: "the creature cast this way enters with a [counter]
+    // counter on it" — recorded on the granted permission so the cast
+    // finalization (`casting_costs::finalize`) registers a pending ETB counter
+    // on the cast object (Osteomancer Adept, The Tomb of Aclazotz).
+    let enters_with_counter = cast_from_zone_enters_with_counter(ability);
 
     for &obj_id in target_ids {
         // CR 601.2a: Impulse-draw and similar grants move non-exile cards to
@@ -531,6 +591,7 @@ pub(crate) fn grant_lingering_permissions(
                             .then_some(Duration::UntilEndOfTurn)
                     }),
                     exile_instead_of_graveyard_on_resolve,
+                    enters_with_counter: enters_with_counter.clone(),
                 }
             };
             if !obj.casting_permissions.contains(&permission) {
@@ -650,18 +711,9 @@ mod tests {
         )));
     }
 
-    /// Issue #2884 — Memory Plunder: "you may cast target instant or sorcery card
-    /// from an opponent's graveyard without paying its mana cost". The target is
-    /// in the OPPONENT's graveyard, where a lingering `ExileWithAltCost` grant is
-    /// inert (the graveyard cast surface only offers cards in the controller's own
-    /// graveyard). The free cast must therefore be driven DURING resolution
-    /// (CR 608.2g): the card moves directly from that graveyard to the stack
-    /// under CR 601.2a, rather than staying in the graveyard with a dead
-    /// permission or detouring through exile.
-    ///
-    /// Discriminator vs. `graveyard_target_grant_stays_in_graveyard_with_timed_permission`:
-    /// the only difference is the target's owner — own-graveyard → lingering
-    /// permission (stays put); opponent-graveyard → cast during resolution.
+    /// Issue #2884 / #852 — Memory Plunder (opponent graveyard) and Torrential
+    /// Gearhulk (own graveyard): immediate "you may cast target … from a
+    /// graveyard without paying its mana cost" must cast during resolution.
     #[test]
     fn opponent_graveyard_free_cast_moves_directly_to_stack() {
         let mut state = make_test_state();
@@ -733,6 +785,47 @@ mod tests {
                 )
             }),
             "Memory Plunder must not fake an exile origin before casting"
+        );
+    }
+
+    #[test]
+    fn own_graveyard_immediate_free_cast_moves_directly_to_stack() {
+        let mut state = make_test_state();
+        let obj_id = {
+            let id = add_card_to_graveyard(&mut state, PlayerId(0), CardId(852));
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Instant);
+            id
+        };
+
+        let ability = ResolvedAbility::new(
+            Effect::CastFromZone {
+                target: TargetFilter::ParentTarget,
+                without_paying_mana_cost: true,
+                mode: CardPlayMode::Cast,
+                cast_transformed: false,
+                alt_ability_cost: None,
+                constraint: None,
+                duration: None,
+                driver: CastFromZoneDriver::LingeringPermission,
+            },
+            vec![TargetRef::Object(obj_id)],
+            ObjectId(999),
+            PlayerId(0),
+        );
+
+        let mut events = vec![];
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state.objects.get(&obj_id).map(|obj| obj.zone),
+            Some(Zone::Stack),
+            "Torrential Gearhulk class free casts must move from own graveyard to stack during resolution"
         );
     }
 
@@ -1082,6 +1175,72 @@ mod tests {
         );
     }
 
+    /// Issue #2019 — Kiora, Sovereign of the Deep: look-then-cast chains leave
+    /// cards in the library via `last_revealed_ids`, but the parser binds the
+    /// cast step to `ExiledBySource`. Without the library fallback the cast
+    /// sub-ability silently no-ops.
+    #[test]
+    fn look_peek_exiled_by_source_cast_uses_last_revealed_library_cards() {
+        let mut state = make_test_state();
+        let source = create_object(
+            &mut state,
+            CardId(999),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let instant = create_object(
+            &mut state,
+            CardId(301),
+            PlayerId(0),
+            "Looked Instant".to_string(),
+            Zone::Library,
+        );
+        state
+            .objects
+            .get_mut(&instant)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Instant);
+        state.objects.get_mut(&instant).unwrap().mana_cost = ManaCost::generic(3);
+        state.last_revealed_ids = vec![instant];
+
+        let ability = ResolvedAbility::new(
+            Effect::CastFromZone {
+                target: TargetFilter::And {
+                    filters: vec![
+                        TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant)),
+                        TargetFilter::ExiledBySource,
+                    ],
+                },
+                without_paying_mana_cost: true,
+                mode: CardPlayMode::Cast,
+                cast_transformed: false,
+                alt_ability_cost: None,
+                constraint: None,
+                duration: None,
+                driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+
+        let mut events = vec![];
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let obj = state.objects.get(&instant).expect("looked card");
+        assert_eq!(obj.zone, Zone::Exile, "library cast grant exiles the card");
+        assert!(
+            obj.casting_permissions.iter().any(|p| matches!(
+                p,
+                CastingPermission::ExileWithAltCost { cost, .. } if *cost == ManaCost::zero()
+            )),
+            "looked library card must receive a free cast permission"
+        );
+    }
+
     /// Issue #1313 — Electrodominance's "you may cast a spell with mana value X
     /// or less from your hand" must open a resolution-time hand pick, not
     /// silently no-op when `ability.targets` is empty.
@@ -1283,16 +1442,19 @@ mod tests {
         let mut events = vec![];
         resolve(&mut state, &ability, &mut events).unwrap();
 
-        assert!(state.objects[&instant]
-            .casting_permissions
-            .iter()
-            .any(|p| matches!(
-                p,
-                CastingPermission::ExileWithAltCost {
-                    exile_instead_of_graveyard_on_resolve: true,
-                    ..
-                }
-            )));
+        assert_eq!(state.objects[&instant].zone, Zone::Stack);
+        assert!(
+            state.objects[&instant].casting_permissions.iter().any(|p| {
+                matches!(
+                    p,
+                    CastingPermission::ExileWithAltCost {
+                        exile_instead_of_graveyard_on_resolve: true,
+                        ..
+                    }
+                )
+            }) || !state.objects[&instant].replacement_definitions.is_empty(),
+            "exile rider must stamp either the permission or a graveyard redirect"
+        );
     }
 
     #[test]

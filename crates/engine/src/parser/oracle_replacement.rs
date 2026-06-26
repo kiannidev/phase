@@ -4567,14 +4567,10 @@ fn parse_oneshot_source_filter(body: &str) -> Option<TargetFilter> {
     .parse(subject)
     {
         if rest.trim().is_empty() {
-            // TODO (known limitation, deferred): the candidate constraint on the
-            // chosen source is dropped. Desperate Gambit's separate "Choose a
-            // source you control" sentence parses as TargetOnly{Any}, and the
-            // inline source prompt enumerates with TargetFilter::Any — so a
-            // "you control" restriction (and any similar qualifier) is not yet
-            // enforced when the player picks the source. Closing this needs the
-            // pre-choice candidate filter threaded into ChosenDamageSource;
-            // out of scope for this change.
+            // CR 609.7a: "a source of your choice" with no qualifier. A separate
+            // "Choose a source you control" clause routes through
+            // `Effect::ChooseDamageSource` and threads the constraint into
+            // `ChosenDamageSource.source_filter` (issue #4350).
             return Some(TargetFilter::ChosenDamageSource);
         }
     }
@@ -4708,7 +4704,7 @@ fn parse_damage_source_subject_filter(subject: &str) -> Option<TargetFilter> {
 /// - "Giant source you control"
 /// - "Goblin sources you control"
 /// - "sources you control of the chosen type"
-fn parse_damage_source_subject(subject: &str) -> Option<TargetFilter> {
+pub(crate) fn parse_damage_source_subject(subject: &str) -> Option<TargetFilter> {
     let (qualifier, tail) = split_damage_source_noun(subject)?;
     if qualifier.trim().is_empty() && tail.trim().is_empty() {
         return None;

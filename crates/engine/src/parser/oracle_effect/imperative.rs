@@ -2950,6 +2950,21 @@ fn parse_hand_possessive_target(input: &str) -> nom::IResult<&str, TargetFilter,
     .parse(input)
 }
 
+/// CR 609.7a: "Choose a source you control" — interactive damage-source
+/// selection, not spell targeting (Desperate Gambit, issue #4350).
+fn try_parse_choose_damage_source(rest: &str) -> Option<TargetFilter> {
+    let clause = rest.split(" and ").next().unwrap_or(rest).trim();
+    let subject = clause
+        .strip_prefix("a ")
+        .or_else(|| clause.strip_prefix("an "))
+        .unwrap_or(clause)
+        .trim();
+    if !subject.starts_with("source") {
+        return None;
+    }
+    crate::parser::oracle_replacement::parse_damage_source_subject(subject)
+}
+
 pub(super) fn parse_choose_ast(
     text: &str,
     lower: &str,
@@ -2989,6 +3004,12 @@ pub(super) fn parse_choose_ast(
         // non-interactive TargetOnly path.
         if let Some(ast) = try_parse_choose_owned_by_voter(rest, rest_lower, ctx) {
             return Some(ast);
+        }
+
+        // CR 609.7a: "Choose a source you control" — damage-source selection,
+        // not spell targeting (Desperate Gambit, issue #4350).
+        if let Some(source_filter) = try_parse_choose_damage_source(rest) {
+            return Some(ChooseImperativeAst::ChooseDamageSource { source_filter });
         }
 
         if super::is_choose_as_targeting(rest_lower) {
@@ -3979,6 +4000,9 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
         // `lower_choose_ast` are restricted to single-effect contexts and do
         // not exercise this variant.
         ChooseImperativeAst::TwoTargets { target_a, .. } => Effect::TargetOnly { target: target_a },
+        ChooseImperativeAst::ChooseDamageSource { source_filter } => {
+            Effect::ChooseDamageSource { source_filter }
+        }
     }
 }
 
@@ -14053,6 +14077,23 @@ mod tests {
     /// CR 115.1c regression: single-target "choose target X" must keep
     /// emitting the existing `TargetOnly` AST — the two-target detector must
     /// not steal single-slot wordings.
+    #[test]
+    fn parse_choose_damage_source_you_control() {
+        let text = "choose a source you control";
+        let lower = text.to_lowercase();
+        let result = parse_choose_ast(text, &lower, &mut ParseContext::default());
+        let ast = result.expect("must parse choose damage source");
+        let effect = lower_choose_ast(ast);
+        match effect {
+            Effect::ChooseDamageSource {
+                source_filter: TargetFilter::Typed(tf),
+            } => {
+                assert_eq!(tf.controller, Some(ControllerRef::You));
+            }
+            other => panic!("expected ChooseDamageSource with you-control filter, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_choose_single_target_unchanged() {
         let text = "choose a creature they control";

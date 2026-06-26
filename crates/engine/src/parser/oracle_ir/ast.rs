@@ -1117,6 +1117,11 @@ pub(crate) enum ChooseImperativeAst {
         target_a: TargetFilter,
         target_b: TargetFilter,
     },
+    /// CR 609.7a: "Choose a source you control" — interactive damage-source
+    /// selection before a one-shot replacement (Desperate Gambit).
+    ChooseDamageSource {
+        source_filter: TargetFilter,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

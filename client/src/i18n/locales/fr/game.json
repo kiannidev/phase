@@ -508,6 +508,7 @@
     "controllerInitialOpp": "J{{seat}}",
     "targetingLabel": "Cible {{label}}",
     "titleTargets": "Cibles : {{targets}}",
+    "titleModes": "Mode : {{modes}}",
     "titlePaid": "Payé : {{paid}}",
     "titleContext": "Contexte : {{context}}",
     "paidXValue": "X={{value}}",

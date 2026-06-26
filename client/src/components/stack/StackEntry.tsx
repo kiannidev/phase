@@ -255,9 +255,9 @@ export function StackEntry({ entry, index, isTop, isPending, cardSize, style, on
 
       {(targetLabels.length > 0 || chosenModeLabels.length > 0 || paidLabels.length > 0 || contextLabels.length > 0) && (
         <div className="absolute left-1 right-1 top-5 flex flex-wrap gap-1">
-          {chosenModeLabels.slice(0, 2).map((label) => (
+          {chosenModeLabels.slice(0, 2).map((label, index) => (
             <span
-              key={`mode-${label}`}
+              key={`mode-${index}-${label}`}
               className="max-w-full rounded bg-indigo-950/90 px-1.5 py-0.5 text-[8px] font-semibold text-indigo-100 shadow line-clamp-2"
               title={label}
             >

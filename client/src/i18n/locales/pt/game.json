@@ -508,6 +508,7 @@
     "controllerInitialOpp": "J{{seat}}",
     "targetingLabel": "Mirando {{label}}",
     "titleTargets": "Alvos: {{targets}}",
+    "titleModes": "Modo: {{modes}}",
     "titlePaid": "Pago: {{paid}}",
     "titleContext": "Contexto: {{context}}",
     "paidXValue": "X={{value}}",

@@ -508,6 +508,7 @@
     "controllerInitialOpp": "G{{seat}}",
     "targetingLabel": "Obiera za cel {{label}}",
     "titleTargets": "Cele: {{targets}}",
+    "titleModes": "Tryb: {{modes}}",
     "titlePaid": "Zapłacono: {{paid}}",
     "titleContext": "Kontekst: {{context}}",
     "paidXValue": "X={{value}}",

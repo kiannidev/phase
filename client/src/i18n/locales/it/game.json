@@ -508,6 +508,7 @@
     "controllerInitialOpp": "G{{seat}}",
     "targetingLabel": "Bersaglia {{label}}",
     "titleTargets": "Bersagli: {{targets}}",
+    "titleModes": "Modalità: {{modes}}",
     "titlePaid": "Pagato: {{paid}}",
     "titleContext": "Contesto: {{context}}",
     "paidXValue": "X={{value}}",

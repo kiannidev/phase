@@ -5478,13 +5478,13 @@ pub(super) fn finalize_cast_with_phyrexian_choices(
         .unwrap_or_default();
     let convoked_creature_count = convoked_creatures.len();
     // CR 700.2: Modal mode choice is public information on the stack.
-    let chosen_mode_labels = state
+    let chosen_mode_indices = state
         .pending_cast
         .as_ref()
         .filter(|pending| pending.object_id == object_id)
         .map(|pending| pending.chosen_modes.as_slice())
         .unwrap_or(&[]);
-    let chosen_mode_labels: Vec<String> = if chosen_mode_labels.is_empty() {
+    let chosen_mode_labels: Vec<String> = if chosen_mode_indices.is_empty() {
         Vec::new()
     } else {
         state
@@ -5492,7 +5492,7 @@ pub(super) fn finalize_cast_with_phyrexian_choices(
             .get(&object_id)
             .and_then(|obj| obj.modal.as_ref())
             .map(|modal| {
-                chosen_mode_labels
+                chosen_mode_indices
                     .iter()
                     .filter_map(|&idx| modal.mode_descriptions.get(idx).cloned())
                     .collect()

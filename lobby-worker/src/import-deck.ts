@@ -176,11 +176,7 @@ interface MoxfieldDeck {
   sideboard?: Record<string, MoxfieldEntry>;
   commanders?: Record<string, MoxfieldEntry>;
   companions?: Record<string, MoxfieldEntry>;
-  maybeboard?: Record<string, MoxfieldEntry>;
 }
-
-/** Moxfield board ids that must never enter an imported deck (test hands / wishlists). */
-const MOXFIELD_EXCLUDED_BOARD_IDS = new Set(["maybeboard"]);
 
 // Resolve a board's entry map by key, accepting both the nested v2 shape
 // (`boards.<key>.cards`) and the flat top-level shape (`deck.<key>`).
@@ -225,7 +221,7 @@ function sectionsEmpty(sections: DeckSections): boolean {
 function projectMoxfield(deck: MoxfieldDeck): { text: string; empty: boolean } {
   // Only commander/main/sideboard/companion boards are imported. Moxfield's
   // `maybeboard` (and Archidekt's Maybeboard category) are test-deck slots —
-  // see MOXFIELD_EXCLUDED_BOARD_IDS and classifyArchidektCard.
+  // see classifyArchidektCard for Archidekt exclusion.
   const sections: DeckSections = {
     commander: moxfieldBoardToCards(moxfieldBoard(deck, "commanders")),
     main: moxfieldBoardToCards(moxfieldBoard(deck, "mainboard")),

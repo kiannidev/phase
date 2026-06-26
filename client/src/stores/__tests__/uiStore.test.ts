@@ -97,7 +97,10 @@ describe("uiStore", () => {
     expect(useUiStore.getState().autoPass).toBe(true);
   });
 
-  it("inspectObject deferred clear keeps preview when cursor remains on card-hover", async () => {
+  it("inspectObject deferred clear keeps preview when cursor remains on card-hover", () => {
+    vi.useFakeTimers();
+    useUiStore.getState().dismissPreview();
+
     const card = document.createElement("div");
     card.setAttribute("data-card-hover", "");
     document.body.appendChild(card);
@@ -106,10 +109,12 @@ describe("uiStore", () => {
     act(() => useUiStore.getState().inspectObject(99));
     act(() => useUiStore.getState().inspectObject(null));
 
-    await new Promise((r) => setTimeout(r, 60));
+    vi.advanceTimersByTime(50);
     expect(useUiStore.getState().inspectedObjectId).toBe(99);
 
     card.remove();
+    vi.clearAllTimers();
+    vi.useRealTimers();
     vi.restoreAllMocks();
   });
 });

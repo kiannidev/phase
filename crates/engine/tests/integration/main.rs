@@ -372,6 +372,7 @@ mod issue_4251_mad_wizards_lair;
 mod issue_4253_sanar_vivid;
 mod issue_4271_birthing_ritual_cmc_filter;
 mod issue_4272_birthing_ritual_etb_triggers;
+mod issue_4314_minsc_boo_hamster_draw;
 mod issue_536_six_grants_retrace;
 mod issue_541_endurance_graveyard_to_bottom;
 mod issue_544_krark_clan_ironworks_auto_pass;

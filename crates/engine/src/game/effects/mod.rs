@@ -1659,9 +1659,35 @@ fn apply_parent_chain_context(
     {
         child.set_chosen_players_recursive(&parent.chosen_players);
     }
-    if let Some(snapshot) = effect_context_object {
-        child.set_effect_context_object_recursive(snapshot.clone());
+    if let Some(snapshot) = propagated_effect_context(child, parent, effect_context_object) {
+        child.set_effect_context_object_recursive(snapshot);
     }
+}
+
+/// CR 608.2c + CR 608.2k: choose which referent snapshot to stamp on a chained
+/// sub-ability. `CostPaidObjectMatchesFilter` ("If the sacrificed creature …")
+/// must keep the parent's earlier sacrifice referent instead of a later
+/// demonstrative referent from the parent's own effect (Minsc & Boo Hamster draw
+/// after damage). Other subs prefer the freshest instruction referent.
+fn propagated_effect_context(
+    child: &ResolvedAbility,
+    parent: &ResolvedAbility,
+    from_parent_effect: Option<&CostPaidObjectSnapshot>,
+) -> Option<CostPaidObjectSnapshot> {
+    if child.condition.as_ref().is_some_and(|condition| {
+        matches!(
+            condition,
+            AbilityCondition::CostPaidObjectMatchesFilter { .. }
+        )
+    }) {
+        return parent
+            .effect_context_object
+            .clone()
+            .or_else(|| from_parent_effect.cloned());
+    }
+    from_parent_effect
+        .cloned()
+        .or_else(|| parent.effect_context_object.clone())
 }
 
 fn waits_for_resolution_choice(waiting_for: &WaitingFor) -> bool {
@@ -6261,7 +6287,15 @@ fn resolve_chain_body(
                 return Ok(());
             }
 
-            let condition_met = evaluate_condition(condition, state, ability);
+            let condition_met = {
+                let mut sub_for_condition = sub.as_ref().clone();
+                apply_parent_chain_context(
+                    &mut sub_for_condition,
+                    ability,
+                    effect_context_object.as_ref(),
+                );
+                evaluate_condition(condition, state, &sub_for_condition)
+            };
             if !condition_met {
                 // CR 608.2c: Execute else branch if present ("Otherwise, [effect]")
                 if let Some(ref else_branch) = sub.else_ability {
@@ -7267,6 +7301,14 @@ pub(crate) fn evaluate_condition(
         }
         AbilityCondition::CostPaidObjectMatchesFilter { filter } => {
             if let Some(snapshot) = &ability.cost_paid_object {
+                crate::game::filter::matches_target_filter_on_lki_snapshot(
+                    state,
+                    snapshot.object_id,
+                    &snapshot.lki,
+                    filter,
+                    &crate::game::filter::FilterContext::from_ability(ability),
+                )
+            } else if let Some(snapshot) = &ability.effect_context_object {
                 crate::game::filter::matches_target_filter_on_lki_snapshot(
                     state,
                     snapshot.object_id,

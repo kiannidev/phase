@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useLocation, useNavigate } from "react-router";
 
@@ -15,6 +15,7 @@ import { LobbyView } from "../components/lobby/LobbyView";
 import { PlayerIdentityBanner } from "../components/lobby/PlayerIdentityBanner";
 import { ServerOfflinePrompt } from "../components/lobby/ServerOfflinePrompt";
 import { ConnectionToast } from "../components/multiplayer/ConnectionToast";
+import { TextPromptDialog } from "../components/ui/TextPromptDialog.tsx";
 import { MenuParticles } from "../components/menu/MenuParticles";
 import { MenuPanel, MenuShell } from "../components/menu/MenuShell";
 import { menuButtonClass } from "../components/menu/buttonStyles";
@@ -119,6 +120,24 @@ export function MultiplayerPage() {
       primaryAction?: { label: string; onClick: () => void };
     } | null
   >(null);
+  const passwordPromptResolver = useRef<((value: string | null) => void) | null>(null);
+  const [passwordPromptOpen, setPasswordPromptOpen] = useState(false);
+  const requestRoomPassword = useCallback(() => {
+    return new Promise<string | null>((resolve) => {
+      passwordPromptResolver.current = resolve;
+      setPasswordPromptOpen(true);
+    });
+  }, []);
+  const confirmRoomPassword = useCallback((value: string) => {
+    setPasswordPromptOpen(false);
+    passwordPromptResolver.current?.(value);
+    passwordPromptResolver.current = null;
+  }, []);
+  const cancelRoomPassword = useCallback(() => {
+    setPasswordPromptOpen(false);
+    passwordPromptResolver.current?.(null);
+    passwordPromptResolver.current = null;
+  }, []);
   // Where to return when the user enters deck-select *without* a pending
   // host/join action (i.e. clicked the "Change" affordance on the active-
   // deck banner). Before this, back/confirm both assumed pendingAction
@@ -313,7 +332,7 @@ export function MultiplayerPage() {
           return true;
         }
         if (result.reason === "password_required") {
-          const entered = window.prompt(t("page.passwordPrompt"));
+          const entered = await requestRoomPassword();
           if (!entered) return false;
           password = entered;
           continue;
@@ -343,7 +362,7 @@ export function MultiplayerPage() {
         return false;
       }
     },
-    [navigate, resolveGuestFromStore, showToast, t],
+    [navigate, resolveGuestFromStore, showToast, t, requestRoomPassword],
   );
 
   // Execute a pending action (host or join) with the currently active deck.
@@ -625,7 +644,7 @@ export function MultiplayerPage() {
         resolvedIsP2P = result.info.is_p2p;
         reservationToken = result.info.reservation_token ?? null;
       } else if (result.reason === "password_required") {
-        const entered = window.prompt(t("page.passwordPrompt"));
+        const entered = await requestRoomPassword();
         if (!entered) return;
         resolvedPassword = entered;
         const retry = await lookupJoinTargetFromStore(code, resolvedPassword, reserveOptions);
@@ -653,7 +672,7 @@ export function MultiplayerPage() {
       setPendingAction(action);
       setView("deck-select");
     },
-    [lookupJoinTargetFromStore, handleJoinDraftFromLobby, showToast, t],
+    [lookupJoinTargetFromStore, handleJoinDraftFromLobby, showToast, requestRoomPassword],
   );
 
   const handleBack = () => {
@@ -950,6 +969,14 @@ export function MultiplayerPage() {
           onDismiss={() => setJoinErrorDialog(null)}
         />
       )}
+      <TextPromptDialog
+        open={passwordPromptOpen}
+        title={t("page.passwordPromptTitle")}
+        label={t("page.passwordPrompt")}
+        confirmLabel={t("page.passwordPromptConfirm")}
+        onConfirm={confirmRoomPassword}
+        onCancel={cancelRoomPassword}
+      />
     </div>
   );
 }

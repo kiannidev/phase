@@ -19,9 +19,7 @@ expression: "&ir"
                 {
                   "type": "AddKeyword",
                   "keyword": {
-                    "Protection": {
-                      "CardType": "the color of your choice"
-                    }
+                    "Protection": "ChosenColor"
                   }
                 }
               ],

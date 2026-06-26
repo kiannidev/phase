@@ -2423,7 +2423,8 @@ pub(crate) fn parse_protection_target(s: &str) -> ProtectionTarget {
         // change). Mirrors parse_hexproof_filter's monocolored→Quality handling.
         "monocolored" => ProtectionTarget::Quality("monocolored".into()),
         // CR 702.16: "the chosen color" resolves at runtime from chosen_attributes
-        "the chosen color" | "chosen color" => ProtectionTarget::ChosenColor,
+        "the chosen color" | "chosen color" | "the color of your choice"
+        | "color of your choice" => ProtectionTarget::ChosenColor,
         // CR 702.16 + CR 205.2: "the chosen card type" resolves at
         // runtime from the source permanent's chosen `CardType` attribute.
         "the chosen card type" | "chosen card type" => ProtectionTarget::ChosenCardType,
@@ -3463,6 +3464,14 @@ mod tests {
         );
         assert_eq!(
             parse_protection_target("the chosen color"),
+            ProtectionTarget::ChosenColor
+        );
+        assert_eq!(
+            parse_protection_target("the color of your choice"),
+            ProtectionTarget::ChosenColor
+        );
+        assert_eq!(
+            parse_protection_target("color of your choice"),
             ProtectionTarget::ChosenColor
         );
         assert_eq!(

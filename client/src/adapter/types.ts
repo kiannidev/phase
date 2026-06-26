@@ -993,7 +993,8 @@ export type StackPaidFactView =
   | { type: "Kicked"; data: { count: number } }
   | { type: "AdditionalCostPaid" }
   | { type: "CastVariant"; data: { variant: string } }
-  | { type: "Convoked"; data: { count: number } };
+  | { type: "Convoked"; data: { count: number } }
+  | { type: "ChosenModes"; data: { labels: string[] } };
 
 export interface TriggerContextDisplay {
   label: string;

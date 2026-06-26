@@ -537,6 +537,7 @@
     "controllerInitialOpp": "P{{seat}}",
     "targetingLabel": "Targeting {{label}}",
     "titleTargets": "Targets: {{targets}}",
+    "titleModes": "Mode: {{modes}}",
     "titlePaid": "Paid: {{paid}}",
     "titleContext": "Context: {{context}}",
     "paidXValue": "X={{value}}",

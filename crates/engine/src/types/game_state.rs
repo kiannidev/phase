@@ -5420,6 +5420,11 @@ pub struct StackPaidSnapshot {
     pub cast_transformed: bool,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub convoked_creatures: usize,
+    /// CR 700.2: Human-readable labels for the mode(s) chosen during the cast's
+    /// modal step. Persisted for stack display so opponents can see which mode
+    /// was selected (public information on the stack).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chosen_mode_labels: Vec<String>,
 }
 
 /// CR 603.2: Maintained index from `TriggerEventKey` to the candidate set of

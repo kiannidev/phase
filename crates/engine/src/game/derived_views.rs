@@ -58,6 +58,7 @@ pub enum StackPaidFactView {
     AdditionalCostPaid,
     CastVariant { variant: String },
     Convoked { count: usize },
+    ChosenModes { labels: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -702,6 +703,11 @@ fn stack_paid_facts(snapshot: Option<&StackPaidSnapshot>) -> Vec<StackPaidFactVi
             count: snapshot.convoked_creatures,
         });
     }
+    if !snapshot.chosen_mode_labels.is_empty() {
+        facts.push(StackPaidFactView::ChosenModes {
+            labels: snapshot.chosen_mode_labels.clone(),
+        });
+    }
     facts
 }
 
@@ -1208,6 +1214,65 @@ mod tests {
             .paid
             .iter()
             .any(|fact| matches!(fact, StackPaidFactView::ColorsSpent { distinct: 2 })));
+    }
+
+    #[test]
+    fn derive_views_surfaces_chosen_modal_modes_on_stack() {
+        let mut state = GameState::new_two_player(42);
+        let spell = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Brotherhood's End".to_string(),
+            Zone::Stack,
+        );
+        if let Some(obj) = state.objects.get_mut(&spell) {
+            obj.modal = Some(crate::types::ability::ModalChoice {
+                min_choices: 1,
+                max_choices: 1,
+                mode_count: 2,
+                mode_descriptions: vec![
+                    "Brotherhood's End deals 3 damage to each creature and each planeswalker."
+                        .to_string(),
+                    "Destroy all artifacts with mana value 3 or less.".to_string(),
+                ],
+                ..Default::default()
+            });
+        }
+        state.stack.push_back(StackEntry {
+            id: spell,
+            source_id: spell,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(1),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 3,
+            },
+        });
+        state.stack_paid_facts.insert(
+            spell,
+            StackPaidSnapshot {
+                actual_mana_spent: 3,
+                chosen_mode_labels: vec![
+                    "Destroy all artifacts with mana value 3 or less.".to_string()
+                ],
+                ..Default::default()
+            },
+        );
+
+        let views = derive_views(&state, None);
+        let details = views
+            .stack_entry_details
+            .get(&spell)
+            .expect("stack details include the spell");
+        assert!(details.paid.iter().any(|fact| {
+            matches!(
+                fact,
+                StackPaidFactView::ChosenModes { labels }
+                    if labels == &["Destroy all artifacts with mana value 3 or less."]
+            )
+        }));
     }
 
     #[test]

@@ -5477,6 +5477,28 @@ pub(super) fn finalize_cast_with_phyrexian_choices(
         .map(|pending| pending.convoked_creatures.clone())
         .unwrap_or_default();
     let convoked_creature_count = convoked_creatures.len();
+    // CR 700.2: Modal mode choice is public information on the stack.
+    let chosen_mode_labels = state
+        .pending_cast
+        .as_ref()
+        .filter(|pending| pending.object_id == object_id)
+        .map(|pending| pending.chosen_modes.as_slice())
+        .unwrap_or(&[]);
+    let chosen_mode_labels: Vec<String> = if chosen_mode_labels.is_empty() {
+        Vec::new()
+    } else {
+        state
+            .objects
+            .get(&object_id)
+            .and_then(|obj| obj.modal.as_ref())
+            .map(|modal| {
+                chosen_mode_labels
+                    .iter()
+                    .filter_map(|&idx| modal.mode_descriptions.get(idx).cloned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
 
     // Determine whether this spell has a meaningful on-resolve ability.
     // Permanent spells with no Spell-kind AbilityDefinition get a placeholder
@@ -5706,6 +5728,7 @@ pub(super) fn finalize_cast_with_phyrexian_choices(
             casting_variant,
             cast_transformed,
             convoked_creatures: convoked_creature_count,
+            chosen_mode_labels,
         },
     );
 

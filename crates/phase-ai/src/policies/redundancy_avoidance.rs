@@ -301,6 +301,8 @@ fn redundancy_delta(
             KIND_DEAL_DAMAGE_ZERO,
             /* delta= */ -3.0,
         ),
+        Effect::ApplyPostReplacementDamage { .. } => None,
+        Effect::CombineHost { .. } | Effect::ChooseAugmentAndCombineWithHost { .. } => None,
         Effect::Draw { count, .. } => zero_quantity_redundancy(
             state,
             source_id,
@@ -361,6 +363,7 @@ fn redundancy_delta(
         | Effect::ChangeSpeed { .. }
         | Effect::Destroy { .. }
         | Effect::Regenerate { .. }
+        | Effect::RemoveAllDamage { .. }
         | Effect::Counter { .. }
         | Effect::Token { .. }
         | Effect::LoseLife { .. }
@@ -391,11 +394,13 @@ fn redundancy_delta(
         | Effect::UnattachAll { .. }
         | Effect::Surveil { .. }
         | Effect::Fight { .. }
+        | Effect::EachDealsDamageEqualToPower { .. }
         | Effect::Explore
         | Effect::ExploreAll { .. }
         | Effect::Investigate
         | Effect::TimeTravel
         | Effect::BecomeMonarch
+        | Effect::NoOp
         | Effect::Proliferate
         | Effect::EndTheTurn
         | Effect::EndCombatPhase
@@ -433,6 +438,7 @@ fn redundancy_delta(
         | Effect::ExileResolvingSpellInsteadOfGraveyard
         | Effect::CopyTokenBlockingAttacker { .. }
         | Effect::BecomeCopy { .. }
+        | Effect::GainActivatedAbilitiesOfTarget { .. }
         | Effect::ChooseCard { .. }
         | Effect::PutCounterAll { .. }
         | Effect::MultiplyCounter { .. }
@@ -454,6 +460,7 @@ fn redundancy_delta(
         | Effect::Choose { .. }
         | Effect::ChooseDamageSource { .. }
         | Effect::Suspect { .. }
+        | Effect::Unsuspect { .. }
         | Effect::Connive { .. }
         | Effect::PhaseOut { .. }
         | Effect::PhaseIn { .. }
@@ -484,6 +491,7 @@ fn redundancy_delta(
         | Effect::Planeswalk
         | Effect::GrantCastingPermission { .. }
         | Effect::ChooseFromZone { .. }
+        | Effect::ForEachCategoryExile { .. }
         | Effect::ChooseObjectsIntoTrackedSet { .. }
         | Effect::ChooseAndSacrificeRest { .. }
         | Effect::Exploit { .. }
@@ -498,6 +506,7 @@ fn redundancy_delta(
         | Effect::Goad { .. }
         | Effect::GoadAll { .. }
         | Effect::Detain { .. }
+        | Effect::SetRoomDoorLock { .. }
         | Effect::ExchangeControl { .. }
         | Effect::ChangeTargets { .. }
         | Effect::Manifest { .. }
@@ -520,6 +529,7 @@ fn redundancy_delta(
         | Effect::Adapt { .. }
         | Effect::Learn
         | Effect::Forage
+        | Effect::Harness
         | Effect::CollectEvidence { .. }
         | Effect::Endure { .. }
         | Effect::BlightEffect { .. }
@@ -530,6 +540,7 @@ fn redundancy_delta(
         | Effect::RemoveFromCombat { .. }
         | Effect::Conjure { .. }
         | Effect::Intensify { .. }
+        | Effect::ApplyPerpetual { .. }
         | Effect::DraftFromSpellbook { .. }
         | Effect::Tribute { .. }
         | Effect::Unimplemented { .. }
@@ -542,6 +553,9 @@ fn redundancy_delta(
         // CR 702.xxx: Prepare (Strixhaven) — no redundancy detection.
         | Effect::BecomePrepared { .. }
         | Effect::BecomeUnprepared { .. }
+        // CR 702.171b: a permanent cannot become saddled if already saddled; no
+        // static redundancy signal — leave to the resolver.
+        | Effect::BecomeSaddled { .. }
         // CR 702.95c-d: PairWith mutates the source/target pair relationship;
         // redundancy depends on trigger timing and revalidation, so this policy
         // leaves it to the resolver.
@@ -587,11 +601,29 @@ fn redundancy_delta(
         // CR 701.51 + CR 701.52: Attraction open/visit — deck state dependent.
         | Effect::OpenAttractions { .. }
         | Effect::RollToVisitAttractions
+        // Unstable Contraptions: assembly/crank/reassembly value depends on deck
+        // contents, sprocket state, and board state; no static redundancy signal.
+        | Effect::AssembleContraptions { .. }
+        | Effect::AssembleContraptionsFromRollDifference
+        | Effect::CrankContraptions { .. }
+        | Effect::ReassembleContraption { .. }
+        | Effect::AssembleContraptionOnSprocket { .. }
+        | Effect::ReassembleContraptionOnSprocket { .. }
         // CR 701.34a + CR 122.1: targeted proliferate adds one counter of each
         // kind already present — adding counters is virtually always beneficial,
         // so there is no "does nothing" static-redundancy signal here.
         | Effect::ProliferateTarget { .. }
-        | Effect::ProcessRadCounters => None,
+        | Effect::ProcessRadCounters
+        // Heist (MTG Arena digital-only) draws random nonland cards from the
+        // opponent's library and exiles the controller's chosen one face down
+        // with a permanent any-color cast-from-exile permission. The randomness
+        // and the face-down / any-mana dimension make it state-dependent with
+        // no static redundancy signal; the AI scores Heist via the generic
+        // effect-rating path, not the redundancy-avoidance table.
+        | Effect::Heist { .. }
+        | Effect::PutSticker { .. }
+        | Effect::ApplySticker { .. }
+        | Effect::HeistExile => None,
     }
 }
 

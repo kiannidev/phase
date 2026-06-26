@@ -1,8 +1,8 @@
 use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::tag;
-use nom::combinator::verify;
-use nom::sequence::terminated;
+use nom::combinator::{opt, verify};
+use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
 use super::oracle_nom::primitives as nom_primitives;
@@ -198,12 +198,26 @@ fn is_spell_resolution_cast_from_hand_free(lower: &str) -> bool {
 }
 
 fn is_self_spell_cost_modification(lower: &str) -> bool {
+    if is_self_spell_cost_modification_body(lower) {
+        return true;
+    }
+    // CR 207.2c: an ability-word prefix ("Void — This spell costs {2} less to
+    // cast if …", Temporal Intervention) has no rules meaning — strip it so the
+    // self-cost-modification guard recognizes the body. Without this, the
+    // "this turn" inside the gating condition makes `should_defer_spell_to_effect`
+    // route the line to the effect parser, dropping the cost reduction.
+    super::oracle_modal::strip_ability_word(lower)
+        .as_deref()
+        .is_some_and(is_self_spell_cost_modification_body)
+}
+
+fn is_self_spell_cost_modification_body(body: &str) -> bool {
     let Ok((after_subject, _)) = alt((
         tag::<_, _, OracleError<'_>>("this spell costs "),
         tag("this card costs "),
         tag("~ costs "),
     ))
-    .parse(lower) else {
+    .parse(body) else {
         return false;
     };
     let Some((_, after_cost)) = parse_mana_symbols(after_subject) else {
@@ -241,6 +255,10 @@ const STATIC_CONTAINS_PATTERNS: &[&str] = &[
     "can't be copied",
     "can't be the target",
     "can't be sacrificed",
+    // CR 116.2b + CR 708.7: "Permanents your opponents control can't be turned
+    // face up during your turn" (Karlov Watchdog) — prohibition static. Routes
+    // to parse_static_line so it lowers to StaticMode::CantBeTurnedFaceUp.
+    "can't be turned face up",
     "doesn't untap",
     "don't untap",
     "attacks or blocks each combat if able",
@@ -276,8 +294,6 @@ const STATIC_CONTAINS_PATTERNS: &[&str] = &[
     // quote is required: scan_contains only matches at word starts, and "legend"
     // is glued to its opening quote ("legend) in the Oracle text.
     "\"legend rule\" doesn't apply",
-    "can block an additional",
-    "can block any number",
     "play an additional land",
     "play two additional lands",
     "triggers an additional time",
@@ -385,6 +401,10 @@ const STATIC_PREFIX_PATTERNS: &[&str] = &[
     "spells you cast ",
     "spells your opponents cast ",
     "you may look at the top card of your library",
+    // CR 708.5: "You may look at face-down creatures [you don't control | your
+    // opponents control] any time." (Found Footage) — top-level look-permission
+    // static. Routed to `parse_static_line` so it lowers to MayLookAtFaceDown.
+    "you may look at face-down creatures",
     "once during each of your turns, you may cast",
     // CR 601.3e: shorter sibling of "once during each of your turns, you may
     // cast" — Maralen, Fae Ascendant prints "Once each turn, you may cast a
@@ -419,6 +439,10 @@ pub(crate) fn is_static_pattern(lower: &str) -> bool {
     }
 
     if super::oracle_static::is_tiered_enters_with_additional_counters_static(lower) {
+        return true;
+    }
+
+    if super::oracle_static::is_extra_blockers_static_candidate(lower) {
         return true;
     }
 
@@ -464,10 +488,21 @@ fn is_static_compound_pattern(lower: &str) -> bool {
     {
         return false;
     }
-    if alt((
-        tag::<_, _, OracleError<'_>>("you may play"),
-        tag("you may cast"),
-    ))
+    // CR 604.2 + CR 601.2a: head-anchor the "you may play"/"you may cast"
+    // permission lead, allowing an optional leading once-per-turn frequency
+    // phrase ("Once during each of your turns, " / "Once each turn, ") to be
+    // stripped first. This classifies the disjunctive once-per-turn play/cast-
+    // from-zone permission (The Eighth Doctor, Serra Paragon) as static so it
+    // routes ahead of the Priority 8 "would" replacement fallback — the granted
+    // rider's "would leave the battlefield" text would otherwise misclassify the
+    // whole line as a replacement. Class-level anchor, not a per-card branch.
+    if preceded(
+        opt(alt((
+            tag::<_, _, OracleError<'_>>("once during each of your turns, "),
+            tag("once each turn, "),
+        ))),
+        alt((tag("you may play"), tag("you may cast"))),
+    )
     .parse(lower)
     .is_ok()
         && (scan_contains(lower, "from your graveyard")
@@ -498,6 +533,14 @@ fn is_static_compound_pattern(lower: &str) -> bool {
         lower,
         "play lands and cast spells from among cards exiled with",
     ) {
+        return true;
+    }
+    // CR 117.1c + CR 113.6b: Evendo-class compact persistent exile-play
+    // permission. Like the Matrix form above, this may be preceded by timing
+    // and condition qualifiers.
+    if scan_contains(lower, "you may play cards exiled with")
+        || scan_contains(lower, "you may play the cards exiled with")
+    {
         return true;
     }
     // CR 601.3f + CR 406.6: The "look-at" variant leads with "you may look at
@@ -614,6 +657,13 @@ pub(crate) fn is_replacement_pattern(lower: &str) -> bool {
         return true;
     }
 
+    // CR 614.1e + CR 708.11: "As ~ is turned face up, [effect]"
+    // is a replacement effect. The "When ~ is turned face up" form is a trigger
+    // and stays out of this path, so the lead is required to be "As".
+    if lower_starts_with(lower, "as ") && scan_contains(lower, "is turned face up") {
+        return true;
+    }
+
     is_replacement_compound_pattern(lower)
 }
 
@@ -621,7 +671,15 @@ fn is_replacement_compound_pattern(lower: &str) -> bool {
     if is_as_enters_choose_pattern(lower) {
         return true;
     }
-    if (scan_contains(lower, "enters") || scan_contains(lower, "escapes"))
+    // CR 614.1c: "enters with [counters]" replacement effects. The plural-subject
+    // forms ("Other creatures you control enter with …", "… creatures escape
+    // with …") use the bare-verb "enter"/"escape" rather than "enters"/"escapes",
+    // so accept both at word boundaries. Gated on "counter" so the bare verb
+    // alone never reclassifies a non-counter line.
+    if (scan_contains(lower, "enters")
+        || scan_contains(lower, "escapes")
+        || scan_contains(lower, "enter with")
+        || scan_contains(lower, "escape with"))
         && scan_contains(lower, "counter")
     {
         return true;
@@ -646,6 +704,29 @@ fn is_replacement_compound_pattern(lower: &str) -> bool {
         return true;
     }
     false
+}
+
+/// CR 614.1c + CR 614.12: Recognizer for the *dynamically scaled* distributive
+/// "[Other/each] [type] you control enter(s) with [an additional] [counter] …
+/// for each …" replacement lines (Gev, Scaled Scorch). Used by the Priority 7
+/// (static-pattern) dispatcher to route these counter replacements to the
+/// replacement parser before the static parser claims them — their
+/// "[type] you control …" subject also satisfies `is_static_pattern`.
+///
+/// The " for each " gate is load-bearing: the fixed-count and conditional-tier
+/// distributive forms ("Each other Vehicle … enters with an additional +1/+1
+/// counter on it if its mana value is 4 or less. Otherwise …" — Thunderous
+/// Velocipede) are owned by `StaticMode::EntersWithAdditionalCounters` (which
+/// carries a fixed `count`), so this recognizer must NOT intercept them. Only
+/// the per-each *scaled* count, which the static mode cannot represent, routes
+/// to the dynamic-capable replacement (`PutCounter { count: QuantityExpr }`).
+pub(crate) fn is_enters_with_counter_replacement_line(lower: &str) -> bool {
+    (scan_contains(lower, "enters")
+        || scan_contains(lower, "escapes")
+        || scan_contains(lower, "enter with")
+        || scan_contains(lower, "escape with"))
+        && scan_contains(lower, "counter")
+        && scan_contains(lower, "for each")
 }
 
 fn is_counter_prohibition_replacement_pattern(lower: &str) -> bool {

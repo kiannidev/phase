@@ -8,6 +8,7 @@ use super::identifiers::{CardId, ObjectId};
 use super::mana::ManaType;
 use super::phase::Phase;
 use super::player::{PlayerCounterKind, PlayerId};
+use super::stickers::StickerKind;
 use super::zones::Zone;
 
 /// CR 121.1: Default `nth_in_step` for `CardDrawn` events deserialized from
@@ -79,6 +80,8 @@ pub enum BendingType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PlayerActionKind {
+    /// A player accepted a resolution-time optional effect.
+    AcceptedOptionalEffect,
     SearchedLibrary,
     Scry,
     Surveil,
@@ -138,6 +141,19 @@ pub enum GameEvent {
     Mutated {
         merged_id: ObjectId,
         merging_id: ObjectId,
+        controller: PlayerId,
+    },
+    /// Unstable Host/Augment: a card with augment combined with a Host
+    /// creature, forming a merged permanent. Emitted by `augment.rs`.
+    /// `merged_id` is the surviving permanent's `ObjectId` (the Host
+    /// creature's continuity id); `augmenting_id` is the augment component that
+    /// merged onto it; `controller` is the player who performed the combine.
+    ///
+    /// Distinct from `Mutated`: Augment reuses merge-like bookkeeping but is a
+    /// separate mechanic and must not satisfy `TriggerMode::Mutates`.
+    Augmented {
+        merged_id: ObjectId,
+        augmenting_id: ObjectId,
         controller: PlayerId,
     },
     /// CR 707.10: A spell was copied onto the stack. A copy of a spell isn't
@@ -468,7 +484,7 @@ pub enum GameEvent {
         target: TargetRef,
         source_id: ObjectId,
     },
-    /// CR 702.122d: A Vehicle's crew ability resolved.
+    /// CR 702.122e: A Vehicle's crew ability resolved.
     /// Carries creature list for trigger conditions that reference "creatures that crewed it".
     VehicleCrewed {
         vehicle_id: ObjectId,
@@ -564,6 +580,12 @@ pub enum GameEvent {
     },
     /// CR 701.60a: A creature was suspected.
     CreatureSuspected {
+        object_id: ObjectId,
+    },
+    /// CR 701.60a: A creature is no longer suspected — the un-designation
+    /// transition. Emitted only when the toggle actually flips (idempotent
+    /// resolver). Mirrors `BecameUnprepared`.
+    CreatureNoLongerSuspected {
         object_id: ObjectId,
     },
     /// CR 701.35a: A permanent was detained — until the detaining player's next
@@ -694,6 +716,18 @@ pub enum GameEvent {
         player_id: PlayerId,
         object_id: ObjectId,
     },
+    /// Unstable Contraptions: a Contraption was assembled from a player's
+    /// supplementary Contraption deck onto a sprocket.
+    ContraptionAssembled {
+        player_id: PlayerId,
+        object_id: ObjectId,
+        sprocket: u8,
+    },
+    StickerPlaced {
+        player_id: PlayerId,
+        object_id: ObjectId,
+        kind: StickerKind,
+    },
     /// CR 701.52: The active player rolled to visit their Attractions.
     AttractionsRolledToVisit {
         player_id: PlayerId,
@@ -704,6 +738,13 @@ pub enum GameEvent {
         player_id: PlayerId,
         roll: u8,
         attraction_id: ObjectId,
+    },
+    /// Unstable Contraptions: a specific Contraption on a sprocket was
+    /// cranked. `TriggerMode::CrankContraption` listens to this event.
+    ContraptionCranked {
+        player_id: PlayerId,
+        sprocket: u8,
+        contraption_id: ObjectId,
     },
     /// Avatar crossover: A firebending ability resolved and produced mana.
     Firebend {

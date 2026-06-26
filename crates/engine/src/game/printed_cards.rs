@@ -2,8 +2,8 @@ use crate::database::synthesis::KeywordTriggerInstaller;
 use crate::database::CardDatabase;
 use crate::types::ability::{
     AbilityCost, AbilityDefinition, ConjureSource, ContinuousModification, CopiableValues,
-    CounterSourceRider, Effect, PtValue, QuantityExpr, ReplacementDefinition, ReplacementMode,
-    StaticDefinition, TargetFilter, TriggerDefinition,
+    CounterSourceRider, Effect, PtValue, QuantityExpr, ReplacementCondition, ReplacementDefinition,
+    ReplacementMode, StaticDefinition, TargetFilter, TriggerDefinition,
 };
 use crate::types::card::{CardFace, CardLayout, LayoutKind, PrintedCardRef};
 use crate::types::card_type::{CardType, CoreType};
@@ -456,9 +456,50 @@ pub fn intrinsic_copiable_values(obj: &GameObject) -> CopiableValues {
         // is both correct and zero-allocation.
         abilities: Arc::clone(&obj.base_abilities),
         trigger_definitions: Arc::clone(&obj.base_trigger_definitions),
-        replacement_definitions: Arc::clone(&obj.base_replacement_definitions),
+        replacement_definitions: copiable_replacement_definitions(obj),
         static_definitions: Arc::clone(&obj.base_static_definitions),
     }
+}
+
+/// CR 707.2 / CR 707.2b: copiable values are the object's printed/defining
+/// characteristics, NOT resolved continuous effects installed by other
+/// permanents (CR 611.2b "for as long as you control ~" locks). A
+/// `ControllerControlsSource`-gated replacement is a runtime continuous effect
+/// durably stored in `base_replacement_definitions` purely so it survives a
+/// layer reset (evaluate_layers rebuilds live defs from base — layers.rs); it is
+/// NOT a printed characteristic. Exclude it from copiable values so that a copy
+/// of the locked host (becomes-a-copy or a copy-token) does not inherit the lock.
+///
+/// Zero-alloc fast path: every printed card has no gated def, so the common case
+/// keeps sharing the source `Arc<Vec<_>>`. A filtered allocation is paid only
+/// when a runtime lock is actually present on the object.
+fn copiable_replacement_definitions(obj: &GameObject) -> Arc<Vec<ReplacementDefinition>> {
+    if !obj
+        .base_replacement_definitions
+        .iter()
+        .any(is_runtime_control_gated_replacement)
+    {
+        return Arc::clone(&obj.base_replacement_definitions);
+    }
+    Arc::new(
+        obj.base_replacement_definitions
+            .iter()
+            .filter(|def| !is_runtime_control_gated_replacement(def))
+            .cloned()
+            .collect(),
+    )
+}
+
+/// CR 707.2 / CR 611.2b: True for a replacement that is a runtime continuous
+/// effect installed by another permanent ("for as long as you control ~"),
+/// durably stored in base only for layer-reset survival. Such defs are NOT
+/// copiable values and must be excluded from any copiable-values surface
+/// (`intrinsic_copiable_values`, the merge/mutate `merged_copiable_values`).
+pub(crate) fn is_runtime_control_gated_replacement(def: &ReplacementDefinition) -> bool {
+    matches!(
+        def.condition,
+        Some(ReplacementCondition::ControllerControlsSource { .. })
+    )
 }
 
 /// CR 707.2 + CR 712.4b: Build the copiable values for a melded permanent
@@ -777,6 +818,10 @@ fn walk_cost(cost: &AbilityCost, out: &mut Vec<String>) {
 fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
     match effect {
         Effect::Intensify { .. } => {}
+        Effect::ApplyPerpetual { .. } => {}
+        // Heist exiles a card from an opponent's library at random; it does not
+        // name a conjure card, so there is no static face to preload.
+        Effect::Heist { .. } | Effect::HeistExile => {}
         Effect::Conjure { cards, .. } => {
             // Only named-conjure has a static card name to seed into the face
             // registry. Duplicate-conjure copies a card already in play (its face
@@ -888,11 +933,16 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         Effect::StartYourEngines { .. }
         | Effect::ChangeSpeed { .. }
         | Effect::DealDamage { .. }
+        | Effect::ApplyPostReplacementDamage { .. }
+        // CR 120.1: leaf effect — the source/recipient filters carry no nested
+        // ability or effect to walk.
+        | Effect::EachDealsDamageEqualToPower { .. }
         | Effect::Draw { .. }
         | Effect::Pump { .. }
         | Effect::PairWith { .. }
         | Effect::Destroy { .. }
         | Effect::Regenerate { .. }
+        | Effect::RemoveAllDamage { .. }
         | Effect::CounterAll { .. }
         | Effect::GainLife { .. }
         | Effect::LoseLife { .. }
@@ -927,6 +977,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::Tribute { .. }
         | Effect::TimeTravel
         | Effect::BecomeMonarch
+        | Effect::NoOp
         | Effect::Proliferate
         | Effect::ProliferateTarget { .. }
         | Effect::EndTheTurn
@@ -948,6 +999,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::HideawayConceal { .. }
         | Effect::CopyTokenBlockingAttacker { .. }
         | Effect::BecomeCopy { .. }
+        | Effect::GainActivatedAbilitiesOfTarget { .. }
         | Effect::ChooseCard { .. }
         | Effect::PutCounter { .. }
         | Effect::PutCounterAll { .. }
@@ -972,6 +1024,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::Choose { .. }
         | Effect::ChooseDamageSource { .. }
         | Effect::Suspect { .. }
+        | Effect::Unsuspect { .. }
         | Effect::Connive { .. }
         | Effect::PhaseOut { .. }
         | Effect::PhaseIn { .. }
@@ -980,6 +1033,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::SolveCase
         | Effect::BecomePrepared { .. }
         | Effect::BecomeUnprepared { .. }
+        | Effect::BecomeSaddled { .. }
         | Effect::SetClassLevel { .. }
         | Effect::AddRestriction { .. }
         | Effect::ReduceNextSpellCost { .. }
@@ -999,9 +1053,18 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::Planeswalk
         | Effect::OpenAttractions { .. }
         | Effect::RollToVisitAttractions
+        | Effect::AssembleContraptions { .. }
+        | Effect::AssembleContraptionsFromRollDifference
+        | Effect::CrankContraptions { .. }
+        | Effect::ReassembleContraption { .. }
+        | Effect::AssembleContraptionOnSprocket { .. }
+        | Effect::ReassembleContraptionOnSprocket { .. }
+        | Effect::PutSticker { .. }
+        | Effect::ApplySticker { .. }
         | Effect::ProcessRadCounters
         | Effect::GrantCastingPermission { .. }
         | Effect::ChooseFromZone { .. }
+        | Effect::ForEachCategoryExile { .. }
         | Effect::ChooseObjectsIntoTrackedSet { .. }
         | Effect::ChooseAndSacrificeRest { .. }
         | Effect::Exploit { .. }
@@ -1022,6 +1085,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::Goad { .. }
         | Effect::GoadAll { .. }
         | Effect::Detain { .. }
+        | Effect::SetRoomDoorLock { .. }
         | Effect::ExchangeControl { .. }
         | Effect::ChangeTargets { .. }
         | Effect::Manifest { .. }
@@ -1042,6 +1106,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::Adapt { .. }
         | Effect::Learn
         | Effect::Forage
+        | Effect::Harness
         | Effect::CollectEvidence { .. }
         | Effect::Endure { .. }
         | Effect::BlightEffect { .. }
@@ -1051,6 +1116,8 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::GiveControl { .. }
         | Effect::RemoveFromCombat { .. }
         | Effect::CreateDamageReplacement { .. }
+        | Effect::CombineHost { .. }
+        | Effect::ChooseAugmentAndCombineWithHost { .. }
         // CR 614.12 + CR 303.4: ReturnAsAura.grants carry typed
         // ContinuousModifications, never conjured card names.
         | Effect::ReturnAsAura { .. }
@@ -1102,7 +1169,7 @@ fn collect_seed_conjure_names(state: &GameState, db: &CardDatabase) -> Vec<Strin
 /// conjure names (a conjured card may itself conjure another) to a fixpoint.
 /// Returns the registry plus every conjure name encountered along the way (used
 /// by the debug-only walker-coverage safety net).
-fn build_conjure_registry(
+pub(crate) fn build_conjure_registry(
     state: &GameState,
     db: &CardDatabase,
 ) -> (HashMap<String, CardFace>, Vec<String>) {
@@ -1344,6 +1411,13 @@ fn reapply_printed_faces_from_card_db(state: &mut GameState, db: &CardDatabase) 
                 obj.base_printed_ref = obj.printed_ref.clone();
             } else {
                 apply_card_face_to_object(obj, &card_face);
+                // CR 702.103b: Rehydration re-stamps printed characteristics from
+                // card-data.json, which clobbers the synthesized Aura subtype while
+                // `bestow_form` remains set (issue #3253). Re-apply the bestow
+                // type-changing effect so WASM/client views see a legal Aura.
+                if obj.bestow_form.is_some() {
+                    crate::game::casting::apply_bestow_aura_form(obj);
+                }
             }
 
             if let Some(back_face) = obj.back_face.as_mut() {
@@ -1509,7 +1583,7 @@ fn shard_colors(shard: &ManaCostShard) -> Vec<ManaColor> {
 
 pub fn derive_colors_from_mana_cost(mana_cost: &ManaCost) -> Vec<ManaColor> {
     match mana_cost {
-        ManaCost::NoCost | ManaCost::SelfManaCost => vec![],
+        ManaCost::NoCost | ManaCost::SelfManaCost | ManaCost::SelfManaValue => vec![],
         ManaCost::Cost { shards, .. } => {
             let mut colors = Vec::new();
             for shard in shards {
@@ -2697,6 +2771,7 @@ mod tests {
             per_choice_effect: vec![Box::new(conjure_ability("vote", Zone::Hand))],
             starting_with: ControllerRef::You,
             voter_scope: VoterScope::AllPlayers,
+            tally_mode: crate::types::ability::VoteTally::PerVote,
         };
         walk_effect(&vote, &mut names);
 
@@ -2832,6 +2907,7 @@ mod tests {
             source_rider: Some(CounterSourceRider::LosesAbilities {
                 static_def: Box::new(counter_static),
             }),
+            countered_spell_zone: None,
         };
         walk_effect(&counter, &mut names);
 
@@ -3014,6 +3090,76 @@ mod tests {
         assert!(
             after.contains(&id),
             "rehydrate must rebuild the derived index before layer flush (issue #581)"
+        );
+    }
+
+    /// Issue #3253: card-data rehydration must not leave a bestowed permanent
+    /// without the synthesized Aura subtype while `bestow_form` remains set.
+    #[test]
+    fn rehydrate_resyncs_bestow_aura_subtype() {
+        use crate::game::game_object::{AttachTarget, BestowFormState};
+
+        let mut face = test_face(
+            "Springheart Nantuko",
+            "springheart-oracle",
+            vec![CoreType::Enchantment, CoreType::Creature],
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Green, ManaCostShard::Green],
+                generic: 1,
+            },
+        );
+        face.card_type.subtypes = vec!["Insect".into(), "Monk".into()];
+        let db = db_from_faces(&[face.clone()]);
+        let printed_ref = printed_ref_from_face(&face).unwrap();
+
+        let mut state = GameState::new_two_player(3253);
+        let host_id = create_object(
+            &mut state,
+            CardId(3253),
+            PlayerId(0),
+            "Host".into(),
+            Zone::Battlefield,
+        );
+        let aura_id = create_object(
+            &mut state,
+            CardId(3254),
+            PlayerId(0),
+            "Springheart Nantuko".into(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&aura_id).unwrap();
+            obj.card_types = face.card_type.clone();
+            obj.base_card_types = face.card_type.clone();
+            obj.printed_ref = Some(printed_ref.clone());
+            obj.base_printed_ref = Some(printed_ref);
+            obj.base_characteristics_initialized = true;
+        }
+
+        crate::game::casting::apply_bestow_aura_form(state.objects.get_mut(&aura_id).unwrap());
+        {
+            let obj = state.objects.get_mut(&aura_id).unwrap();
+            obj.attached_to = Some(AttachTarget::Object(host_id));
+        }
+
+        rehydrate_game_from_card_db(&mut state, &db);
+
+        let obj = state.objects.get(&aura_id).unwrap();
+        assert_eq!(obj.zone, Zone::Battlefield);
+        assert_eq!(obj.bestow_form, Some(BestowFormState));
+        assert!(
+            obj.card_types.subtypes.iter().any(|s| s == "Aura"),
+            "live subtypes must include Aura after rehydrate, got {:?}",
+            obj.card_types.subtypes
+        );
+        assert!(
+            obj.base_card_types.subtypes.iter().any(|s| s == "Aura"),
+            "base subtypes must include Aura after rehydrate, got {:?}",
+            obj.base_card_types.subtypes
+        );
+        assert!(
+            !obj.card_types.core_types.contains(&CoreType::Creature),
+            "bestowed object must not keep Creature core type"
         );
     }
 }

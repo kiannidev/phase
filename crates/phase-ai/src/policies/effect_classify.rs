@@ -5,7 +5,7 @@ use engine::types::ability::{
     TargetFilter, TypeFilter,
 };
 use engine::types::counter::CounterType;
-use engine::types::game_state::GameState;
+use engine::types::game_state::{CastingVariant, GameState, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
 use engine::types::player::PlayerId;
@@ -112,6 +112,7 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
         Effect::DoublePTAll { .. } => EffectPolarity::Beneficial,
         Effect::SkipNextTurn { .. } | Effect::SkipNextStep { .. } => EffectPolarity::Contextual,
         Effect::Regenerate { .. }
+        | Effect::RemoveAllDamage { .. }
         | Effect::PreventDamage { .. }
         | Effect::Animate { .. }
         | Effect::DoublePT { .. } => EffectPolarity::Beneficial,
@@ -211,6 +212,7 @@ pub(crate) fn extract_target_filter(effect: &Effect) -> Option<&TargetFilter> {
         | Effect::DoublePT { target, .. }
         | Effect::DoublePTAll { target, .. }
         | Effect::Regenerate { target, .. }
+        | Effect::RemoveAllDamage { target, .. }
         | Effect::PreventDamage { target, .. }
         // Harmful effects
         | Effect::Destroy { target, .. }
@@ -225,7 +227,6 @@ pub(crate) fn extract_target_filter(effect: &Effect) -> Option<&TargetFilter> {
         | Effect::Goad { target }
         | Effect::ChangeZone { target, .. }
         | Effect::Connive { target, .. }
-        | Effect::Suspect { target, .. }
         | Effect::ForceBlock { target, .. }
         | Effect::Exploit { target, .. }
         | Effect::Attach { target, .. }
@@ -239,6 +240,20 @@ pub(crate) fn extract_target_filter(effect: &Effect) -> Option<&TargetFilter> {
         // not surfaced as a target (matching the legacy `TapAll`/`UntapAll`,
         // which fell through to `None`).
         Effect::SetTapState {
+            scope: EffectScope::Single,
+            target,
+            ..
+        } => Some(target),
+        // CR 701.60a: only single-permanent suspect/unsuspect exposes a
+        // selectable target. The mass (`All`) scope (e.g. Absolving Lammasu)
+        // is a non-targeting population effect — its filter is not surfaced as
+        // a target (mirrors `SetTapState`'s `Single`/`All` split).
+        Effect::Suspect {
+            scope: EffectScope::Single,
+            target,
+            ..
+        }
+        | Effect::Unsuspect {
             scope: EffectScope::Single,
             target,
             ..
@@ -379,6 +394,15 @@ pub(crate) fn targets_creatures(effect: &Effect) -> bool {
 /// Defaults to false (assume harmful) when uncertain — safe fallback since most
 /// targeted spells in MTG are removal/damage.
 pub(crate) fn is_spell_beneficial(ctx: &PolicyContext<'_>) -> bool {
+    // CR 702.140a: Mutate targets a non-Human creature with the same owner as
+    // the spell — treat it as beneficial so targeting prefers our creatures over
+    // opponents' creatures when evaluating candidate targets.
+    if let WaitingFor::TargetSelection { pending_cast, .. } = &ctx.decision.waiting_for {
+        if pending_cast.casting_variant == CastingVariant::Mutate {
+            return true;
+        }
+    }
+
     let player_impact = aggregate_player_impact(ctx);
     if player_impact > 0.25 {
         return true;
@@ -835,5 +859,56 @@ mod lethality_tests {
             cant_regenerate: false,
         };
         assert_eq!(lethal_to_creature(state, bear, &[&destroy]), None);
+    }
+}
+
+#[cfg(test)]
+mod suspect_scope_tests {
+    use super::*;
+
+    // CR 701.60a: mass un-designation ("all suspected creatures are no longer
+    // suspected", Absolving Lammasu) is a non-targeting population effect. The
+    // AI's target-filter extraction must mirror the engine's `target_filter()`,
+    // which surfaces a selectable target only for `EffectScope::Single`.
+    #[test]
+    fn extract_target_filter_only_for_single_scope_suspect() {
+        // Same non-None filter on both; only `scope` differs, so a pass proves
+        // the scope gate (not the filter) drives target-filter extraction.
+        let single_suspect = Effect::Suspect {
+            target: TargetFilter::Any,
+            scope: EffectScope::Single,
+        };
+        let all_suspect = Effect::Suspect {
+            target: TargetFilter::Any,
+            scope: EffectScope::All,
+        };
+        assert!(
+            extract_target_filter(&single_suspect).is_some(),
+            "single-scope Suspect must expose a selectable target"
+        );
+        assert!(
+            extract_target_filter(&all_suspect).is_none(),
+            "mass Suspect{{All}} is a population effect, not target-filtered"
+        );
+    }
+
+    #[test]
+    fn extract_target_filter_only_for_single_scope_unsuspect() {
+        let single_unsuspect = Effect::Unsuspect {
+            target: TargetFilter::Any,
+            scope: EffectScope::Single,
+        };
+        let all_unsuspect = Effect::Unsuspect {
+            target: TargetFilter::Any,
+            scope: EffectScope::All,
+        };
+        assert!(
+            extract_target_filter(&single_unsuspect).is_some(),
+            "single-scope Unsuspect must expose a selectable target"
+        );
+        assert!(
+            extract_target_filter(&all_unsuspect).is_none(),
+            "mass Unsuspect{{All}} (Absolving Lammasu) is a population effect, not target-filtered"
+        );
     }
 }

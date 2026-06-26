@@ -1,7 +1,8 @@
 use std::collections::HashSet;
 
+use crate::game::filter::{matches_target_filter_including_phased_out, FilterContext};
 use crate::game::replacement::{self, ReplacementResult};
-use crate::types::ability::{EffectKind, ReplacementDefinition, RestrictionExpiry};
+use crate::types::ability::{EffectKind, ReplacementDefinition, RestrictionExpiry, TargetFilter};
 use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
 use crate::types::format::GameFormat;
@@ -147,6 +148,13 @@ fn enter_phase(state: &mut GameState, next: Phase, events: &mut Vec<GameEvent>) 
     if next == Phase::BeginCombat {
         state.combat_phases_started_this_turn =
             state.combat_phases_started_this_turn.saturating_add(1);
+    }
+    // CR 500.8 + CR 513.1: track end-step occurrences for "first end step of the
+    // turn" gates (Y'shtola Rhul). Counts every End step begun this turn,
+    // including extra end steps scheduled via AdditionalPhase, so the gate only
+    // holds for the first.
+    if next == Phase::End {
+        state.end_steps_started_this_turn = state.end_steps_started_this_turn.saturating_add(1);
     }
 
     // CR 500.5: Mana pools empty between phases/steps.
@@ -432,6 +440,14 @@ fn finish_enter_phase(state: &mut GameState, next: Phase, events: &mut Vec<GameE
 
 /// Begin the next player's turn (CR 500.1 / CR 101.4 seat order).
 pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    // CR 805.4b: defensively drop any stale draw-step queue entries. The
+    // queue is normally drained to empty before a turn ends, but a turn
+    // ended early (e.g. `Effect::EndTheTurn` — Time Stop, Obeka) could in
+    // principle leave it non-empty; without this it would be wrongly
+    // resumed at the START of the next turn's Draw step instead of being
+    // re-seeded for the new active player.
+    state.pending_team_draw_step.clear();
+
     let completed_player = state.active_player;
     if state.turn_decision_controller.is_some() {
         let mut grant_extra_turn_after = false;
@@ -570,6 +586,9 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // open-ended "cards exiled with ~" filter for sources without a per-turn
     // cap.
     state.exile_cast_permissions_used.clear();
+    // CR 601.2a + CR 401.5: Reset per-turn TopOfLibraryCastPermission
+    // once-per-turn tracking (Assemble the Players, Johann, Apprentice Sorcerer).
+    state.top_of_library_cast_permissions_used.clear();
     state.cards_exiled_with_source_this_turn.clear();
     // CR 702.94a: Reset per-player first-card-drawn-this-turn tracking for miracle.
     state.first_card_drawn_this_turn.clear();
@@ -589,18 +608,35 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
     state.attacked_defenders_this_turn.clear();
     state.creature_attacked_defenders_this_turn.clear();
     state.combat_phases_started_this_turn = 0;
+    state.end_steps_started_this_turn = 0;
     state.creatures_attacked_this_turn.clear();
     state.attacker_declarations_this_turn.clear();
     state.creatures_blocked_this_turn.clear();
     state.players_who_created_token_this_turn.clear();
     state.created_tokens_this_turn.clear();
+    // CR 122.6 + CR 514.2: The `counter_added_this_turn` ledger backs the
+    // turn-scoped `CountersPutOnThisTurn` filter predicate (CR 122.6 look-back),
+    // which feeds continuous statics such as Kid Loki's hexproof grant. Those
+    // "this turn" effects end at cleanup (CR 514.2), so clearing the ledger
+    // changes layer-relevant state. Route the expiry through the layer
+    // invalidation authority — mirroring the turn-boundary continuous-effect
+    // prunes (`prune_until_next_turn_effects`) — guarded on a non-empty ledger so
+    // we only invalidate when something actually depended on it; otherwise a
+    // static that gained a keyword from a counter placed last turn stays cached.
+    if !state.counter_added_this_turn.is_empty() {
+        state.layers_dirty.mark_full();
+    }
     state.counter_added_this_turn.clear();
     state.players_who_discarded_card_this_turn.clear();
     state.cards_discarded_this_turn_by_player.clear();
     state.players_who_sacrificed_artifact_this_turn.clear();
     state.sacrificed_permanents_this_turn.clear();
     state.zone_changes_this_turn.clear();
+    state.batched_zone_change_trigger_fired.clear();
     state.battlefield_entries_this_turn.clear();
+    // CR 701.26 + CR 603.4: reset per-object tap counts so "first time it became
+    // tapped this turn" intervening-ifs start fresh each turn.
+    state.object_tap_count_this_turn.clear();
     state.damage_dealt_this_turn.clear();
     // CR 702.173a + CR 514: Clear the Freerunning eligibility ledger at
     // cleanup. CR 702.173a's "was dealt combat damage this turn" predicate
@@ -733,6 +769,25 @@ pub fn execute_untap_with_choices(
     state.pending_damage_replacements.retain(|r| {
         !matches!(r.expiry, Some(RestrictionExpiry::UntilPlayerNextTurn { player }) if player == active)
     });
+    // CR 514.2 + CR 500.7: Arm "until the end of the player's next turn"
+    // restrictions (Kang's power-up prohibition) when that player's next turn
+    // begins — convert to `EndOfTurn` so the cleanup-step prune (`execute_cleanup`)
+    // ends them at THIS turn's cleanup, persisting through the whole turn.
+    // Mirrors `prune_until_next_turn_effects` (layers.rs). NOTE: if the granted
+    // turn is SKIPPED/PREVENTED before its untap step, this conversion never runs
+    // and the restriction is never armed/pruned — a documented narrow edge shared
+    // with the analogous `Duration::UntilEndOfNextTurnOf` arming.
+    {
+        use crate::types::ability::GameRestriction;
+        for restriction in state.restrictions.iter_mut() {
+            if let GameRestriction::ProhibitActivity { expiry, .. } = restriction {
+                if matches!(expiry, RestrictionExpiry::UntilEndOfNextTurnOf { player } if *player == active)
+                {
+                    *expiry = RestrictionExpiry::EndOfTurn;
+                }
+            }
+        }
+    }
     state.restrictions.retain(|restriction| {
         use crate::types::ability::GameRestriction;
 
@@ -1184,9 +1239,60 @@ fn execute_seedborn_statics(state: &mut GameState, events: &mut Vec<GameEvent>, 
 /// CR 504.1: During the draw step, the active player draws a card.
 /// CR 614.1a: Routes through the replacement pipeline so effects like Dredge apply.
 /// Returns `Some(WaitingFor)` if a replacement effect needs player interaction.
+/// CR 504.1: The active player's mandatory draw-step draw. CR 805.4b: under
+/// the shared team turns option, every player on the active team draws
+/// during the team's draw step — so the active player's teammate(s) also
+/// draw here.
+///
+/// Seeds `state.pending_team_draw_step` with the players who owe a draw
+/// THIS step (skipped if the queue is already non-empty — that means a
+/// caller is resuming a step that paused mid-draw, and re-seeding would
+/// redraw an already-completed player) and delegates to
+/// `drain_pending_team_draw_step`, the single authority for actually
+/// performing the queued draws. That function is also called directly by
+/// `handle_replacement_choice`'s resume epilogue, so a draw that pauses on a
+/// CR 616.1 competing-replacement choice still reaches every queued
+/// teammate once the choice resolves — this function only needs to run once
+/// per step, at first entry.
 pub fn execute_draw(state: &mut GameState, events: &mut Vec<GameEvent>) -> Option<WaitingFor> {
-    let active = state.active_player;
+    if state.pending_team_draw_step.is_empty() {
+        state.pending_team_draw_step.push(state.active_player);
+        if state.format_config.team_based {
+            state
+                .pending_team_draw_step
+                .extend(super::players::teammates(state, state.active_player));
+        }
+    }
+    drain_pending_team_draw_step(state, events)
+}
 
+/// CR 504.1 + CR 805.4b: Drain `state.pending_team_draw_step` front-to-back,
+/// performing each queued player's turn-based draw-step draw exactly once.
+///
+/// A draw that pauses on a CR 616.1 competing-replacement choice (`Some`
+/// returned) leaves its player at the FRONT of the queue — NOT popped — so
+/// the next call (from `handle_replacement_choice`'s epilogue, once the
+/// choice resolves) retries exactly that player's draw rather than skipping
+/// it or re-drawing a player who already completed. Only a fully completed
+/// draw (`None` from `execute_draw_for`) advances the queue.
+pub(crate) fn drain_pending_team_draw_step(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> Option<WaitingFor> {
+    while let Some(&player) = state.pending_team_draw_step.first() {
+        if let Some(wf) = execute_draw_for(state, player, events) {
+            return Some(wf);
+        }
+        state.pending_team_draw_step.remove(0);
+    }
+    None
+}
+
+fn execute_draw_for(
+    state: &mut GameState,
+    active: PlayerId,
+    events: &mut Vec<GameEvent>,
+) -> Option<WaitingFor> {
     // CR 121.1 + CR 614.1a + CR 614.6 + CR 704.3: Route through the
     // single-authority `draw_through_replacement` helper so post-replacement
     // continuations (Jace WinTheGame, Abundance reveal-until) drain in the
@@ -1266,6 +1372,69 @@ pub fn execute_draw(state: &mut GameState, events: &mut Vec<GameEvent>) -> Optio
     }
 
     None
+}
+
+/// CR 514.2: Remove marked damage from every battlefield permanent as the
+/// cleanup-step turn-based action, EXCEPT permanents matched by an active
+/// "Damage isn't removed from [filter] during cleanup steps" static (Ancient
+/// Adamantoise, Patient Zero, Uthgardt Fury, …), whose marked damage persists
+/// across turns. Shared by both cleanup exits — the direct `execute_cleanup`
+/// (no discard) and the deferred `finish_cleanup_discard` (after the active
+/// player discards to maximum hand size) — so the protection holds on either
+/// path.
+fn clear_cleanup_damage(state: &mut GameState, events: &mut Vec<GameEvent>) {
+    // CR 514.2: An active "Damage isn't removed from [filter] during cleanup
+    // steps" static suppresses removal for the permanents it matches; gather
+    // that protected set first.
+    let damage_persists: HashSet<ObjectId> = {
+        let sources: Vec<(ObjectId, PlayerId, TargetFilter)> =
+            super::functioning_abilities::battlefield_active_statics(state)
+                .filter(|(_, def)| matches!(def.mode, StaticMode::DamageNotRemovedDuringCleanup))
+                .filter_map(|(obj, def)| {
+                    def.affected
+                        .as_ref()
+                        .map(|f| (obj.id, obj.controller, f.clone()))
+                })
+                .collect();
+
+        // CR 514.2 + CR 702.26b: removing marked damage is a turn-based cleanup
+        // action over the whole battlefield, including phased-out permanents — it
+        // is not targeting — so the protected membership is evaluated with the
+        // phased-out-aware matcher to mirror the unconditional removal below.
+        let mut protected = std::collections::HashSet::new();
+        for (source_id, source_controller, filter) in sources {
+            let ctx = FilterContext::from_source_with_controller(source_id, source_controller);
+            for id in state.battlefield.iter().copied() {
+                if matches_target_filter_including_phased_out(state, id, &filter, &ctx) {
+                    protected.insert(id);
+                }
+            }
+        }
+        protected
+    };
+
+    // CR 514.2: Damage on creatures is removed at cleanup.
+    let to_clear: Vec<_> = state
+        .battlefield
+        .iter()
+        .copied()
+        .filter(|id| !damage_persists.contains(id))
+        .filter(|id| {
+            state
+                .objects
+                .get(id)
+                .map(|obj| obj.damage_marked > 0)
+                .unwrap_or(false)
+        })
+        .collect();
+
+    for id in to_clear {
+        if let Some(obj) = state.objects.get_mut(&id) {
+            obj.damage_marked = 0;
+            obj.dealt_deathtouch_damage = false;
+            events.push(GameEvent::DamageCleared { object_id: id });
+        }
+    }
 }
 
 /// Execute the cleanup step. Returns `Some(WaitingFor)` if the player must
@@ -1359,27 +1528,10 @@ pub fn execute_cleanup(state: &mut GameState, events: &mut Vec<GameEvent>) -> Op
         }
     }
 
-    // CR 514.2: Damage on creatures is removed at cleanup.
-    let to_clear: Vec<_> = state
-        .battlefield
-        .iter()
-        .copied()
-        .filter(|id| {
-            state
-                .objects
-                .get(id)
-                .map(|obj| obj.damage_marked > 0)
-                .unwrap_or(false)
-        })
-        .collect();
-
-    for id in to_clear {
-        if let Some(obj) = state.objects.get_mut(&id) {
-            obj.damage_marked = 0;
-            obj.dealt_deathtouch_damage = false;
-            events.push(GameEvent::DamageCleared { object_id: id });
-        }
-    }
+    // CR 514.2: Remove cleanup damage, preserving any permanent protected by a
+    // "Damage isn't removed during cleanup steps" static (shared with the
+    // deferred discard path so the protection holds regardless of discard).
+    clear_cleanup_damage(state, events);
 
     // CR 702.171b: "Once a permanent has become saddled, it stays saddled until
     // the end of the turn or it leaves the battlefield." Clear the designation
@@ -1486,27 +1638,11 @@ pub fn finish_cleanup_discard(
         }
     }
 
-    // Clear damage on all battlefield creatures (deferred from execute_cleanup)
-    let to_clear: Vec<_> = state
-        .battlefield
-        .iter()
-        .copied()
-        .filter(|id| {
-            state
-                .objects
-                .get(id)
-                .map(|obj| obj.damage_marked > 0)
-                .unwrap_or(false)
-        })
-        .collect();
-
-    for id in to_clear {
-        if let Some(obj) = state.objects.get_mut(&id) {
-            obj.damage_marked = 0;
-            obj.dealt_deathtouch_damage = false;
-            events.push(GameEvent::DamageCleared { object_id: id });
-        }
-    }
+    // CR 514.2: Clear cleanup damage deferred from execute_cleanup — through the
+    // same shared helper so a "Damage isn't removed during cleanup steps" static
+    // (Patient Zero, Ancient Adamantoise, …) still preserves protected marked
+    // damage even when the active player had to discard to maximum hand size.
+    clear_cleanup_damage(state, events);
     false
 }
 
@@ -1764,6 +1900,13 @@ pub fn auto_advance(state: &mut GameState, events: &mut Vec<GameEvent>) -> Waiti
                     && !matches!(state.waiting_for, WaitingFor::Priority { .. })
                 {
                     return state.waiting_for.clone();
+                }
+                if let Some(prompt) =
+                    crate::game::contraptions::perform_contraption_upkeep_turn_based_action(
+                        state, events,
+                    )
+                {
+                    return prompt;
                 }
                 // CR 503.1a: "At the beginning of [your] upkeep" triggers fire here.
                 // CR 603.3b: 2+ same-controller upkeep triggers (multiple suspended
@@ -2290,6 +2433,7 @@ mod tests {
         state.players[0].mana_pool.add(ManaUnit {
             color: ManaType::Green,
             source_id: ObjectId(1),
+            pip_id: crate::types::mana::ManaPipId(0),
             supertype: None,
             source_could_produce_two_or_more_colors: false,
             restrictions: Vec::new(),
@@ -3582,6 +3726,88 @@ mod tests {
         );
     }
 
+    /// CR 502.3 + CR 701.26b: Blossombind — "Enchanted creature can't become
+    /// untapped …" is an unconditional `ProposedEvent::Untap` PREVENTION
+    /// (CR 701.26b, the broad prohibition — NOT a `CantUntap` static, which is the
+    /// untap-step-only class). This drives the production untap step (`execute_untap`)
+    /// and asserts the host stays tapped; the EFFECT-driven untap path is covered
+    /// separately in `tap_untap.rs`. The replacement is parsed from the real
+    /// Oracle text via the cross-layer split and installed on the attached Aura.
+    /// Reverting the untap-prevention replacement (or its split routing) makes the
+    /// untap-step `replace_event` return `Execute`, the creature untaps, and this
+    /// assertion fails — so the test discriminates the change.
+    #[test]
+    fn execute_untap_honors_blossombind_cant_become_untapped() {
+        use crate::game::effects::attach::attach_to;
+        use crate::types::card_type::CoreType;
+        use crate::types::replacements::ReplacementEvent;
+
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        let host = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Bound Bear".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&host).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.tapped = true;
+        }
+
+        let aura = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Blossombind".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            // Parse the real compound line; pull the Untap-prevention replacement
+            // out of the cross-layer split and install it on the Aura. (The
+            // AddCounter-prevention conjunct is irrelevant to untap; the full split
+            // is exercised by the parser-layer test.)
+            let parsed = crate::parser::parse_oracle_text(
+                "Enchant creature\nEnchanted creature can't become untapped and can't have counters put on it.",
+                "Blossombind",
+                &[],
+                &["Enchantment".to_string()],
+                &["Aura".to_string()],
+            );
+            assert!(
+                parsed
+                    .replacements
+                    .iter()
+                    .any(|def| def.event == ReplacementEvent::Untap),
+                "Blossombind's untap prohibition must parse to an Untap-prevention replacement"
+            );
+            let obj = state.objects.get_mut(&aura).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.card_types.subtypes.push("Aura".to_string());
+            obj.base_card_types = obj.card_types.clone();
+            obj.replacement_definitions = parsed.replacements.into();
+        }
+        attach_to(&mut state, aura, host);
+
+        let mut events = Vec::new();
+        execute_untap(&mut state, &mut events);
+
+        assert!(
+            state.objects[&host].tapped,
+            "Blossombind's enchanted creature must stay tapped at the untap step"
+        );
+        assert!(
+            !events.iter().any(|event| {
+                matches!(event, GameEvent::PermanentUntapped { object_id } if *object_id == host)
+            }),
+            "skipped untap must not emit PermanentUntapped"
+        );
+    }
+
     #[test]
     fn execute_untap_honors_attached_subject_cant_untap_from_parser() {
         use crate::game::effects::attach::attach_to;
@@ -4352,6 +4578,89 @@ mod tests {
         assert!(state.players[0].has_drawn_this_turn);
     }
 
+    /// CR 805.4b: "Each player on a team draws a card during that team's
+    /// draw step." A single `execute_draw` call must seed the queue with
+    /// both active-team members and drain it to completion in the common
+    /// (no-pause) case.
+    #[test]
+    fn execute_draw_two_headed_giant_both_teammates_draw() {
+        let mut state = GameState::new(crate::types::FormatConfig::two_headed_giant(), 4, 0);
+        state.active_player = PlayerId(0);
+        let card0 = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Card0".to_string(),
+            Zone::Library,
+        );
+        let card1 = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Card1".to_string(),
+            Zone::Library,
+        );
+
+        let mut events = Vec::new();
+        let result = execute_draw(&mut state, &mut events);
+
+        assert!(result.is_none(), "no replacement pause expected here");
+        assert!(state.players[0].hand.contains(&card0));
+        assert!(state.players[1].hand.contains(&card1));
+        assert!(state.players[0].has_drawn_this_turn);
+        assert!(state.players[1].has_drawn_this_turn);
+        assert!(
+            state.pending_team_draw_step.is_empty(),
+            "the draw-step queue must be fully drained, not left with stale entries"
+        );
+    }
+
+    /// CR 805.4b + CR 616.1: regression for the resumption gap flagged in
+    /// review — if the active player's draw-step draw paused on a
+    /// competing-replacement choice and was then resumed (popping the active
+    /// player off the queue's front), the teammate left in the queue must
+    /// still be drawn for by a later `drain_pending_team_draw_step` call
+    /// (the exact call `handle_replacement_choice`'s resume epilogue makes),
+    /// not silently dropped.
+    #[test]
+    fn drain_pending_team_draw_step_resumes_remaining_queued_teammate() {
+        let mut state = GameState::new(crate::types::FormatConfig::two_headed_giant(), 4, 0);
+        state.active_player = PlayerId(0);
+        let card0 = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Card0".to_string(),
+            Zone::Library,
+        );
+        let card1 = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Card1".to_string(),
+            Zone::Library,
+        );
+
+        // Simulate "P0's draw already completed and was popped off the
+        // front; P1 is still owed their draw" — the exact state the queue
+        // is in immediately after a resumed P0 draw, before P1 has drawn.
+        state.pending_team_draw_step = vec![PlayerId(1)];
+
+        let mut events = Vec::new();
+        let result = drain_pending_team_draw_step(&mut state, &mut events);
+
+        assert!(result.is_none());
+        assert!(
+            state.players[0].hand.is_empty() && state.players[0].library.contains(&card0),
+            "P0 already drew in this scenario — this call must not draw for them again"
+        );
+        assert!(
+            state.players[1].hand.contains(&card1),
+            "P1's queued draw must still happen on resume"
+        );
+        assert!(state.pending_team_draw_step.is_empty());
+    }
+
     #[test]
     fn should_skip_draw_on_turn_1() {
         let mut state = setup();
@@ -4587,6 +4896,228 @@ mod tests {
         execute_cleanup(&mut state, &mut events);
 
         assert_eq!(state.objects[&id].damage_marked, 0);
+    }
+
+    #[test]
+    fn execute_cleanup_preserves_damage_under_damage_not_removed_static() {
+        use crate::types::card_type::CoreType;
+
+        let mut state = setup();
+
+        // Ancient-Adamantoise-style permanent: its own damage isn't removed at
+        // cleanup. CR 514.2 — the static suppresses the turn-based removal.
+        let protected = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Ancient Adamantoise".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let defs = crate::parser::oracle_static::parse_static_line_multi(
+                "Damage isn't removed from this creature during cleanup steps.",
+            );
+            assert!(
+                defs.iter()
+                    .any(|d| d.mode == StaticMode::DamageNotRemovedDuringCleanup),
+                "static must parse to DamageNotRemovedDuringCleanup, got {:?}",
+                defs.iter().map(|d| &d.mode).collect::<Vec<_>>()
+            );
+            let obj = state.objects.get_mut(&protected).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.damage_marked = 4;
+            for def in defs.iter().cloned() {
+                obj.static_definitions.push(def);
+            }
+            Arc::make_mut(&mut obj.base_static_definitions).extend(defs);
+        }
+
+        // A normal creature: its damage IS removed at cleanup (control).
+        let normal = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Grizzly Bears".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&normal).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.damage_marked = 3;
+        }
+
+        let mut events = Vec::new();
+        execute_cleanup(&mut state, &mut events);
+
+        assert_eq!(
+            state.objects[&protected].damage_marked, 4,
+            "damage must persist under DamageNotRemovedDuringCleanup"
+        );
+        assert_eq!(
+            state.objects[&normal].damage_marked, 0,
+            "a normal creature's damage is still removed at cleanup"
+        );
+    }
+
+    #[test]
+    fn finish_cleanup_discard_preserves_damage_under_damage_not_removed_static() {
+        use crate::types::card_type::CoreType;
+
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        // 9 cards in hand so cleanup must DEFER to a discard-to-hand-size choice,
+        // routing the damage clearing through `finish_cleanup_discard`.
+        let mut hand_ids = Vec::new();
+        for i in 0..9 {
+            let id = create_object(
+                &mut state,
+                CardId(100 + i),
+                PlayerId(0),
+                format!("Card {}", i),
+                Zone::Hand,
+            );
+            hand_ids.push(id);
+        }
+
+        // Ancient-Adamantoise-style protected permanent with marked damage.
+        let protected = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Ancient Adamantoise".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let defs = crate::parser::oracle_static::parse_static_line_multi(
+                "Damage isn't removed from this creature during cleanup steps.",
+            );
+            let obj = state.objects.get_mut(&protected).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.damage_marked = 4;
+            for def in defs.iter().cloned() {
+                obj.static_definitions.push(def);
+            }
+            Arc::make_mut(&mut obj.base_static_definitions).extend(defs);
+        }
+
+        // Normal creature with marked damage (control).
+        let normal = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Grizzly Bears".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&normal).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.damage_marked = 3;
+        }
+
+        // Cleanup defers: over hand size, the damage clearing is postponed to the
+        // discard finish, so both creatures still carry their damage here.
+        let mut events = Vec::new();
+        let waiting = execute_cleanup(&mut state, &mut events);
+        assert!(
+            matches!(waiting, Some(WaitingFor::DiscardToHandSize { .. })),
+            "expected a discard-to-hand-size choice, got {:?}",
+            waiting
+        );
+        assert_eq!(
+            state.objects[&protected].damage_marked, 4,
+            "damage clearing is deferred until the discard finishes"
+        );
+        assert_eq!(
+            state.objects[&normal].damage_marked, 3,
+            "damage clearing is deferred until the discard finishes"
+        );
+
+        // Finish the discard: the deferred cleanup damage clearing runs through
+        // the shared helper, so the protected creature KEEPS its damage while the
+        // normal creature's is removed.
+        finish_cleanup_discard(
+            &mut state,
+            PlayerId(0),
+            &[hand_ids[7], hand_ids[8]],
+            &mut events,
+        );
+
+        assert_eq!(
+            state.objects[&protected].damage_marked, 4,
+            "CR 514.2: protected damage must persist even through the discard path"
+        );
+        assert_eq!(
+            state.objects[&normal].damage_marked, 0,
+            "a normal creature's damage is removed when the discard finishes"
+        );
+    }
+
+    #[test]
+    fn execute_cleanup_preserves_phased_out_creature_damage_under_static() {
+        use crate::game::game_object::{PhaseOutCause, PhaseStatus};
+        use crate::types::card_type::CoreType;
+
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+
+        // Patient Zero: "Damage isn't removed from creatures your opponents
+        // control during cleanup steps." — the static source (controlled by P0).
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Patient Zero".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let defs = crate::parser::oracle_static::parse_static_line_multi(
+                "Damage isn't removed from creatures your opponents control during cleanup steps.",
+            );
+            assert!(defs
+                .iter()
+                .any(|d| d.mode == StaticMode::DamageNotRemovedDuringCleanup));
+            let obj = state.objects.get_mut(&source).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            for def in defs.iter().cloned() {
+                obj.static_definitions.push(def);
+            }
+            Arc::make_mut(&mut obj.base_static_definitions).extend(defs);
+        }
+
+        // A phased-out opponent creature with marked damage. CR 514.2 + CR
+        // 702.26b: damage removal at cleanup is a turn-based action over the
+        // whole battlefield (including phased-out permanents), so the static must
+        // preserve this creature's damage even while it is phased out.
+        let phased = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Grizzly Bears".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&phased).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj.damage_marked = 3;
+            obj.phase_status = PhaseStatus::PhasedOut {
+                cause: PhaseOutCause::Directly,
+            };
+        }
+
+        let mut events = Vec::new();
+        execute_cleanup(&mut state, &mut events);
+
+        assert_eq!(
+            state.objects[&phased].damage_marked, 3,
+            "a phased-out opponent creature's damage must persist under the static"
+        );
     }
 
     /// CR 117.1c + CR 503.2: After Untap (no priority), the engine must hand

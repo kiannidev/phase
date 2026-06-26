@@ -204,15 +204,18 @@ fn doubler_disjunct_connector(input: &str) -> OracleResult<'_, ()> {
 /// restrictive when it carries a concrete type/subtype restriction or any
 /// property (subtype designations, "another", "of the chosen type", etc.).
 fn doubler_source_is_restrictive(filter: &TargetFilter) -> bool {
-    let TargetFilter::Typed(tf) = filter else {
-        return false;
-    };
-    tf.type_filters.iter().any(|t| {
-        !matches!(
-            t,
-            TypeFilter::Permanent | TypeFilter::Card | TypeFilter::Any
-        )
-    }) || !tf.properties.is_empty()
+    match filter {
+        TargetFilter::Typed(tf) => {
+            tf.type_filters.iter().any(|t| {
+                !matches!(
+                    t,
+                    TypeFilter::Permanent | TypeFilter::Card | TypeFilter::Any
+                )
+            }) || !tf.properties.is_empty()
+        }
+        TargetFilter::Or { filters } => filters.iter().all(doubler_source_is_restrictive),
+        _ => false,
+    }
 }
 
 pub(crate) fn parse_max_combat_creatures_static(lower: &str) -> Option<StaticMode> {
@@ -223,9 +226,23 @@ pub(crate) fn parse_max_combat_creatures_static(lower: &str) -> Option<StaticMod
     let (rest, _) = tag::<_, _, OracleError<'_>>("creature").parse(rest).ok()?;
     let (rest, _) = opt(tag::<_, _, OracleError<'_>>("s")).parse(rest).ok()?;
     let (rest, mode) = alt((
+        // CR 508.5 + CR 802.1: "...can attack you each combat" is a
+        // defending-player-scoped cap (Judoon Enforcers) — only attacks
+        // declared against this static's controller are limited. Must precede
+        // the bare " can attack each combat" arm (longest match first).
         value(
-            StaticMode::MaxAttackersEachCombat { max },
-            tag::<_, _, OracleError<'_>>(" can attack each combat"),
+            StaticMode::MaxAttackersEachCombat {
+                max,
+                defender: Some(AttackDefenderScope::Controller),
+            },
+            tag::<_, _, OracleError<'_>>(" can attack you each combat"),
+        ),
+        value(
+            StaticMode::MaxAttackersEachCombat {
+                max,
+                defender: None,
+            },
+            tag(" can attack each combat"),
         ),
         value(
             StaticMode::MaxBlockersEachCombat { max },
@@ -388,6 +405,116 @@ pub(crate) fn parse_rule_static_separator_nom(input: &str) -> OracleResult<'_, (
         )),
     )
     .parse(input)
+}
+
+fn parse_extra_blockers_creature_noun(input: &str) -> OracleResult<'_, ()> {
+    value((), (tag(" creature"), opt(tag("s")))).parse(input)
+}
+
+pub(crate) fn parse_extra_blockers_count_phrase(input: &str) -> OracleResult<'_, Option<u32>> {
+    alt((
+        value(None, tag("any number of creatures")),
+        map(
+            preceded(
+                tag("an additional "),
+                terminated(
+                    nom_primitives::parse_number,
+                    parse_extra_blockers_creature_noun,
+                ),
+            ),
+            Some,
+        ),
+        value(
+            Some(1),
+            (
+                tag("additional creature"),
+                opt(tag::<_, _, OracleError<'_>>("s")),
+            ),
+        ),
+        map(
+            terminated(
+                nom_primitives::parse_number,
+                (
+                    tag(" additional creature"),
+                    opt(tag::<_, _, OracleError<'_>>("s")),
+                ),
+            ),
+            Some,
+        ),
+    ))
+    .parse(input)
+}
+
+fn parse_extra_blockers_tail(input: &str) -> OracleResult<'_, Option<u32>> {
+    let (input, count) = parse_extra_blockers_count_phrase(input)?;
+    let (input, _) = opt(alt((
+        tag::<_, _, OracleError<'_>>(" each combat"),
+        tag(" this combat"),
+        tag(" this turn"),
+    )))
+    .parse(input)?;
+    Ok((input, count))
+}
+
+fn parse_can_block_extra_blockers_predicate(input: &str) -> OracleResult<'_, Option<u32>> {
+    preceded(tag("can block "), parse_extra_blockers_tail).parse(input)
+}
+
+fn parse_and_can_block_extra_blockers_predicate(input: &str) -> OracleResult<'_, Option<u32>> {
+    preceded(tag("and "), parse_can_block_extra_blockers_predicate).parse(input)
+}
+
+fn extra_blockers_static_definition(
+    affected: TargetFilter,
+    mode: StaticMode,
+    text: &str,
+) -> StaticDefinition {
+    if matches!(affected, TargetFilter::SelfRef) {
+        StaticDefinition::new(mode)
+            .affected(affected)
+            .description(text.to_string())
+    } else {
+        StaticDefinition::continuous()
+            .affected(affected)
+            .modifications(vec![ContinuousModification::AddStaticMode { mode }])
+            .description(text.to_string())
+    }
+}
+
+fn parse_subject_trailing_conjunction(input: &str) -> OracleResult<'_, ()> {
+    value((), all_consuming((take_until(" and"), tag(" and")))).parse(input)
+}
+
+pub(crate) fn parse_extra_blockers_static(text: &str) -> Option<StaticDefinition> {
+    let lower = text.to_lowercase();
+    let (before, count, rest) =
+        nom_primitives::scan_preceded(&lower, parse_can_block_extra_blockers_predicate)?;
+    let (rest, _) = opt(tag::<_, _, OracleError<'_>>(".")).parse(rest).ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+
+    let subject_len = before
+        .trim_end_matches(|ch: char| ch == ',' || ch.is_whitespace())
+        .len();
+    let subject = text[..subject_len].trim();
+    if subject.is_empty() {
+        return None;
+    }
+    let subject_lower = lower[..subject_len].trim();
+    if parse_subject_trailing_conjunction(subject_lower).is_ok() {
+        return None;
+    }
+    let affected = parse_rule_static_subject_filter(subject).unwrap_or(TargetFilter::SelfRef);
+    Some(extra_blockers_static_definition(
+        affected,
+        StaticMode::ExtraBlockers { count },
+        text,
+    ))
+}
+
+pub(crate) fn is_extra_blockers_static_candidate(lower: &str) -> bool {
+    parse_extra_blockers_static(lower).is_some()
 }
 
 /// CR 702.3b + CR 611.3a + CR 613: Decompose `"<predicate_1> and can attack
@@ -553,35 +680,14 @@ pub(crate) fn try_split_and_must_attack_block(text: &str) -> Option<Vec<StaticDe
 /// the remainder for the first conjunct, then clone its `affected`/`condition`
 /// onto the companion `ExtraBlockers` definition.
 pub(crate) fn try_split_and_can_block_additional(text: &str) -> Option<Vec<StaticDefinition>> {
-    type VE<'a> = OracleError<'a>;
     let lower = text.to_lowercase();
 
-    let (before, count, _rest) = nom_primitives::scan_preceded(&lower, |i: &str| {
-        let (i, _) = tag::<_, _, VE>("and can block ").parse(i)?;
-        // CR 107.1c: "any number of creatures" → unbounded (None); otherwise a
-        // numeric count of additional creatures ("an"/"a" → 1, "two" → 2, …).
-        let (i, count): (&str, Option<u32>) = if let Ok((after, _)) = (
-            tag::<_, _, VE>("any"),
-            tag::<_, _, VE>(" number of creatures"),
-        )
-            .parse(i)
-        {
-            (after, None)
-        } else {
-            let (after_n, n) = nom_primitives::parse_number(i)?;
-            let (after_kw, _) = tag::<_, _, VE>(" additional creature").parse(after_n)?;
-            let (after_s, _) = opt(tag::<_, _, VE>("s")).parse(after_kw)?;
-            (after_s, Some(n))
-        };
-        // Optional trailing duration phrase ("each combat", "this combat", …).
-        let (i, _) = opt(alt((
-            tag::<_, _, VE>(" each combat"),
-            tag::<_, _, VE>(" this combat"),
-            tag::<_, _, VE>(" this turn"),
-        )))
-        .parse(i)?;
-        Ok((i, count))
-    })?;
+    let (before, count, rest) =
+        nom_primitives::scan_preceded(&lower, parse_and_can_block_extra_blockers_predicate)?;
+    let (rest, _) = opt(tag::<_, _, OracleError<'_>>(".")).parse(rest).ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
 
     let cut_end = before
         .trim_end_matches(|ch: char| ch == ',' || ch.is_whitespace())
@@ -597,9 +703,8 @@ pub(crate) fn try_split_and_can_block_additional(text: &str) -> Option<Vec<Stati
 
     let affected = defs[0].affected.clone()?;
     let condition = defs[0].condition.clone();
-    let mut companion = StaticDefinition::new(StaticMode::ExtraBlockers { count })
-        .affected(affected)
-        .description(text.to_string());
+    let mut companion =
+        extra_blockers_static_definition(affected, StaticMode::ExtraBlockers { count }, text);
     if let Some(condition) = condition {
         companion = companion.condition(condition);
     }
@@ -1517,6 +1622,32 @@ pub(crate) fn try_parse_compound_subtypes(
     Some(TargetFilter::Or { filters })
 }
 
+/// CR 510.1a + CR 613.11: The "assign[s] combat damage equal to <poss> toughness
+/// rather than <poss> power" predicate, in both the singular ("assigns … its …
+/// its") and plural ("assign … their … their") surface forms. CR 510.1a is the
+/// default ("assigns combat damage equal to its power"); this is a continuous
+/// rule-modification effect (CR 613.11) that substitutes toughness for power.
+///
+/// Both forms map to the same [`ContinuousModification::AssignDamageFromToughness`]
+/// rule — only the subject's grammatical number differs (singular "each creature
+/// … assigns" vs plural "creatures you control … assign"). Centralizing the
+/// phrase here keeps the static-line parser and the one-shot continuous-effect
+/// parser (`parse_continuous_modifications`) in lockstep so a new subject scope
+/// never silently drops the plural form. Returns the post-phrase remainder.
+pub(crate) fn parse_assigns_damage_from_toughness_predicate(input: &str) -> OracleResult<'_, ()> {
+    alt((
+        value(
+            (),
+            tag("assigns combat damage equal to its toughness rather than its power"),
+        ),
+        value(
+            (),
+            tag("assign combat damage equal to their toughness rather than their power"),
+        ),
+    ))
+    .parse(input)
+}
+
 /// CR 510.1c: Parse "each creature [you control] [with condition] assigns combat damage
 /// equal to its toughness rather than its power" patterns.
 ///
@@ -1657,8 +1788,21 @@ pub(crate) fn parse_attached_assigns_damage_from_toughness(
     )
 }
 
+/// Possessive pronoun for any character's combat damage ("its"/"his"/"her"/"their").
+/// Widens the neuter-only assumption so gendered-character cards (e.g. Wolverine)
+/// parse the same combat-damage-assignment static as neuter creatures.
+fn parse_possessive_pronoun(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("its"), tag("his"), tag("her"), tag("their"))).parse(input)
+}
+
+/// Nominative pronoun for any character ("it"/"he"/"she"/"they").
+fn parse_nominative_pronoun(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("it"), tag("he"), tag("she"), tag("they"))).parse(input)
+}
+
 /// CR 510.1c: Parse "you may have this creature assign its combat damage as though it
-/// weren't blocked" self-referential static.
+/// weren't blocked" self-referential static. Accepts gendered pronouns
+/// (his/her/he/she/they) so named characters parse the same as neuter creatures.
 pub(crate) fn parse_assign_damage_as_though_unblocked(
     lower: &str,
     text: &str,
@@ -1673,9 +1817,13 @@ pub(crate) fn parse_assign_damage_as_though_unblocked(
     .parse(clean)
     .ok()?;
     let (rest, _) = result;
-    let (rest, _) = tag::<_, _, VE<'_>>(" assign its combat damage as though it weren't blocked")
+    let (rest, _) = tag::<_, _, VE<'_>>(" assign ").parse(rest).ok()?;
+    let (rest, _) = parse_possessive_pronoun(rest).ok()?;
+    let (rest, _) = tag::<_, _, VE<'_>>(" combat damage as though ")
         .parse(rest)
         .ok()?;
+    let (rest, _) = parse_nominative_pronoun(rest).ok()?;
+    let (rest, _) = tag::<_, _, VE<'_>>(" weren't blocked").parse(rest).ok()?;
     if !rest.is_empty() {
         return None;
     }
@@ -1714,11 +1862,17 @@ pub(crate) fn parse_attached_creature_assign_damage_as_though_unblocked(
         )
     };
 
-    let (_, _) = tag::<_, _, VE<'_>>(
-        "'s controller may have it assign its combat damage as though it weren't blocked",
-    )
-    .parse(rest.lower)
-    .ok()?;
+    let (after, _) = tag::<_, _, VE<'_>>("'s controller may have ")
+        .parse(rest.lower)
+        .ok()?;
+    let (after, _) = parse_nominative_pronoun(after).ok()?;
+    let (after, _) = tag::<_, _, VE<'_>>(" assign ").parse(after).ok()?;
+    let (after, _) = parse_possessive_pronoun(after).ok()?;
+    let (after, _) = tag::<_, _, VE<'_>>(" combat damage as though ")
+        .parse(after)
+        .ok()?;
+    let (after, _) = parse_nominative_pronoun(after).ok()?;
+    let (_, _) = tag::<_, _, VE<'_>>(" weren't blocked").parse(after).ok()?;
 
     Some(
         StaticDefinition::continuous()
@@ -1923,7 +2077,7 @@ pub(crate) fn parse_subject_combat_rule_static(text: &str) -> Option<StaticDefin
     None
 }
 
-/// CR 702.122c / 702.171a / 702.184a: nom parser for the crew/saddle/station
+/// CR 702.122a / 702.171a / 702.184c: nom parser for the crew/saddle/station
 /// power-contribution modifier predicate. Composes the named action-list prefix
 /// (which records the affected keyword actions) with the modifier tail.
 fn parse_crew_contribution_predicate_nom(
@@ -1939,6 +2093,10 @@ fn parse_crew_contribution_predicate_nom(
             tag("crews vehicles and stations permanents"),
         ),
         value(vec![CrewAction::Crew], tag("crews vehicles")),
+        // CR 702.184a: bare "stations permanents" — station-only contribution
+        // modifier (Tapestry Warden: "… stations permanents using its toughness
+        // rather than its power").
+        value(vec![CrewAction::Station], tag("stations permanents")),
     ))
     .parse(input)?;
     let (input, _) = space1.parse(input)?;
@@ -1960,7 +2118,7 @@ fn parse_crew_contribution_predicate_nom(
     Ok((input, (kind, actions)))
 }
 
-/// CR 702.122c / 702.171a / 702.184a: "<subject> crews Vehicles [/ saddles
+/// CR 702.122a / 702.171a / 702.184c: "<subject> crews Vehicles [/ saddles
 /// Mounts / stations permanents] as though its power were N greater" or "…
 /// using its toughness rather than its power" — a continuous static that
 /// modifies the creature's contributed power when paying a crew/saddle/station
@@ -2085,6 +2243,12 @@ pub(crate) fn parse_combat_tax_body(input: &str) -> OracleResult<'_, CombatTaxPa
     // so the longer phrase wins (nom `alt` is leftmost-match).
     use crate::types::triggers::AttackTargetFilter;
     let (input, defended) = opt(alt((
+        // CR 508.1c + CR 310.5: " you or permanents you control" also defends
+        // battles — a distinct filter from the planeswalker-only phrase.
+        value(
+            AttackTargetFilter::PlayerOrPermanents,
+            tag_no_case::<_, _, OracleError<'_>>(" you or permanents you control"),
+        ),
         value(
             AttackTargetFilter::PlayerOrPlaneswalker,
             tag_no_case::<_, _, OracleError<'_>>(" you or planeswalkers you control"),
@@ -2649,4 +2813,51 @@ pub(crate) fn try_split_and_foreign_keyword_grant(text: &str) -> Option<Vec<Stat
     }
 
     None
+}
+
+#[cfg(test)]
+mod assign_damage_pronoun_tests {
+    use super::*;
+
+    fn assert_unblocked_self(lower: &str) {
+        let def = parse_assign_damage_as_though_unblocked(lower, lower)
+            .unwrap_or_else(|| panic!("expected Some for {lower:?}"));
+        assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+        assert_eq!(
+            def.modifications,
+            vec![ContinuousModification::AssignDamageAsThoughUnblocked]
+        );
+    }
+
+    #[test]
+    fn parses_neuter_pronouns() {
+        // Regression: neuter "its"/"it" must still parse (Thorn Elemental class).
+        assert_unblocked_self(
+            "you may have ~ assign its combat damage as though it weren't blocked",
+        );
+    }
+
+    #[test]
+    fn parses_masculine_pronouns() {
+        // Wolverine, Claws Out: "his"/"he".
+        assert_unblocked_self(
+            "you may have ~ assign his combat damage as though he weren't blocked",
+        );
+    }
+
+    #[test]
+    fn parses_feminine_pronouns() {
+        assert_unblocked_self(
+            "you may have ~ assign her combat damage as though she weren't blocked",
+        );
+    }
+
+    #[test]
+    fn rejects_non_matching() {
+        assert!(parse_assign_damage_as_though_unblocked(
+            "you may have ~ assign its combat damage to any target",
+            "you may have ~ assign its combat damage to any target",
+        )
+        .is_none());
+    }
 }

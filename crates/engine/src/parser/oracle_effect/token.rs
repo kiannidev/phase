@@ -36,7 +36,7 @@ where
     Some((result, &text[consumed..]))
 }
 
-pub(super) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) -> Option<Effect> {
+pub(crate) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) -> Option<Effect> {
     let text = strip_reminder_text(text);
     let lower = text.to_lowercase();
 
@@ -610,16 +610,29 @@ fn parse_token_count_prefix(text: &str) -> Option<(QuantityExpr, &str)> {
 }
 
 fn parse_named_token_preamble(text: &str) -> Option<(String, &str)> {
-    let comma = text.find(',')?;
-    let name = text[..comma].trim().trim_matches('"');
-    if name.is_empty() {
-        return None;
+    // CR 111.4: A named-token preamble is "<Name>, a/an <characteristics> token".
+    // The token name may itself contain a comma ("Primo, the Indivisible";
+    // "Tibalt, the Fiend-Blooded"), so the FIRST comma is not necessarily the
+    // name/body boundary. The boundary is the comma immediately followed by the
+    // article that introduces the token's characteristics (", a "/", an "). Scan
+    // every comma and pick the one whose remainder begins with an article, so
+    // the full epithet stays in the name. Mirrors the article guard already used
+    // for the single-comma case.
+    for (idx, _) in text.match_indices(',') {
+        let after_comma = text[idx + 1..].trim_start();
+        let after_lower = after_comma.to_lowercase();
+        let Some((_, rest)) =
+            nom_on_lower(after_comma, &after_lower, nom_primitives::parse_article)
+        else {
+            continue;
+        };
+        let name = text[..idx].trim().trim_matches('"');
+        if name.is_empty() {
+            continue;
+        }
+        return Some((name.to_string(), rest));
     }
-
-    let after_comma = text[comma + 1..].trim_start();
-    let after_lower = after_comma.to_lowercase();
-    let (_, rest) = nom_on_lower(after_comma, &after_lower, nom_primitives::parse_article)?;
-    Some((name.to_string(), rest))
+    None
 }
 
 /// CR 205.4a: Strip leading supertype words from the token description and
@@ -958,6 +971,12 @@ pub(super) fn scope_token_for_each_to_iterating_player(expr: QuantityExpr) -> Qu
             },
         },
         QuantityExpr::Sum { exprs } => QuantityExpr::Sum {
+            exprs: exprs
+                .into_iter()
+                .map(scope_token_for_each_to_iterating_player)
+                .collect(),
+        },
+        QuantityExpr::Max { exprs } => QuantityExpr::Max {
             exprs: exprs
                 .into_iter()
                 .map(scope_token_for_each_to_iterating_player)
@@ -2358,6 +2377,105 @@ mod tests {
             assert_eq!(name, descriptor);
             assert_eq!(types, expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod kazar_token_landfall_tests {
+    use super::*;
+    use crate::types::ability::ContinuousModification;
+
+    /// Ka-Zar of the Savage Land's Zabu token: the granted ability text carries
+    /// an italicized "Landfall —" ability-word prefix (CR 207.2c) before the
+    /// trigger keyword. The token-ability classifier must strip the ability word
+    /// and recognize the inner trigger (CR 603.1 / CR 603.6a) as a `GrantTrigger`
+    /// static modification — not the `GrantAbility(Unimplemented[landfall])`
+    /// catch-all produced before the fix.
+    #[test]
+    fn zabu_token_landfall_trigger_parses_as_grant_trigger() {
+        let txt = "Create Zabu, a legendary 2/2 green Cat creature token with \"Landfall — Whenever a land you control enters, put a +1/+1 counter on Zabu.\"";
+        let effect = try_parse_token(&txt.to_lowercase(), txt, &mut ParseContext::default())
+            .expect("Zabu token line must parse");
+        let Effect::Token {
+            name,
+            supertypes,
+            static_abilities,
+            ..
+        } = effect
+        else {
+            panic!("expected Effect::Token, got {effect:?}");
+        };
+        assert_eq!(name, "Zabu");
+        assert!(
+            supertypes.contains(&Supertype::Legendary),
+            "Zabu must be legendary, got {supertypes:?}"
+        );
+        let grant_trigger = static_abilities
+            .iter()
+            .flat_map(|def| def.modifications.iter())
+            .find_map(|m| match m {
+                ContinuousModification::GrantTrigger { trigger } => Some(trigger),
+                _ => None,
+            });
+        let trigger = grant_trigger.unwrap_or_else(|| {
+            panic!("landfall trigger must classify as GrantTrigger, got {static_abilities:#?}")
+        });
+        // CR 603.6a: the inner trigger is a zone-change (ETB) trigger.
+        assert_eq!(
+            trigger.mode,
+            crate::types::triggers::TriggerMode::ChangesZone
+        );
+        // No residual Unimplemented landfall effect anywhere in the parsed token.
+        assert!(
+            // allow-noncombinator: test assertion scanning debug output, not parsing dispatch.
+            !format!("{static_abilities:?}").contains("Unimplemented"),
+            "token ability must have no residual Unimplemented effect"
+        );
+    }
+
+    /// The catalog-token path (`inject_catalog_token_abilities`) re-parses the
+    /// preset `rules_text` through `classify_quoted_inner`. The Zabu preset's
+    /// rules_text begins with the "Landfall —" ability word; the same strip must
+    /// apply so the runtime injection yields a `GrantTrigger`, not a
+    /// `GrantAbility(Unimplemented)`.
+    #[test]
+    fn catalog_landfall_rules_text_classifies_as_grant_trigger() {
+        let rules_text =
+            "Landfall — Whenever a land you control enters, put a +1/+1 counter on Zabu.";
+        let mods = crate::parser::oracle_static::classify_quoted_inner(rules_text);
+        assert!(
+            mods.iter()
+                .any(|m| matches!(m, ContinuousModification::GrantTrigger { .. })),
+            "catalog rules_text must classify as GrantTrigger, got {mods:?}"
+        );
+        assert!(
+            // allow-noncombinator: test assertion scanning debug output, not parsing dispatch.
+            !format!("{mods:?}").contains("Unimplemented"),
+            "catalog classification must have no residual Unimplemented effect"
+        );
+    }
+
+    /// Full-card parse: Ka-Zar's three lines (look at top, play lands from top,
+    /// ETB token with landfall) must produce zero residual `Unimplemented`
+    /// effects after the ability-word strip fix.
+    #[test]
+    fn kazar_full_card_no_residual_unimplemented() {
+        let oracle = "You may look at the top card of your library any time.\n\
+            You may play lands from the top of your library.\n\
+            When Ka-Zar of the Savage Land enters, create Zabu, a legendary 2/2 green Cat creature token with \"Landfall — Whenever a land you control enters, put a +1/+1 counter on Zabu.\"";
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            oracle,
+            "Ka-Zar of the Savage Land",
+            &[],
+            &["Legendary".to_string(), "Creature".to_string()],
+            &["Human".to_string(), "Warrior".to_string()],
+        );
+        let debug = format!("{parsed:?}");
+        assert!(
+            // allow-noncombinator: test assertion scanning debug output, not parsing dispatch.
+            !debug.contains("Unimplemented"),
+            "Ka-Zar must parse to zero residual Unimplemented, got: {debug}"
+        );
     }
 }
 

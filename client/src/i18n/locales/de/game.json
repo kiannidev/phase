@@ -1,6 +1,8 @@
 {
   "resolutionProgress": {
-    "label": "Auflösen {{resolved}} / {{total}}"
+    "label": "Auflösen {{resolved}} / {{total}}",
+    "collapse": "Auflösungsfortschritt einklappen",
+    "expand": "Auflösungsfortschritt ausklappen"
   },
   "card": {
     "faceDownName": "Verdeckte Karte",
@@ -171,6 +173,8 @@
     "copyTooltip": "Spielstein-Kopie einer echten Karte",
     "ringBearer": "Ring",
     "ringBearerTooltip": "Ringträger",
+    "hiddenAttachments": "+{{count}} more attached",
+    "hiddenExileCards": "+{{count}} more exiled",
     "sacrifice": "Sacrifice",
     "boardChoiceBadges": {
       "sacrifice": "Sac",
@@ -208,6 +212,7 @@
     "allTo": "Alle → <name>{{label}}</name>",
     "creatureFallback": "Kreatur #{{id}}",
     "planeswalkerFallback": "Planeswalker #{{id}}",
+    "objectFallback": "Object #{{id}}",
     "you": "Du",
     "ally": "Verbündeter",
     "restoreDialog": "Dialog wiederherstellen",
@@ -354,7 +359,8 @@
     "onlyForActivation": "Nur zum Aktivieren von Fähigkeiten ausgeben",
     "onlyForXCosts": "Nur für Kosten ausgeben, die {X} enthalten",
     "convokePayment": "Beschwörbeitrag-Bezahlung",
-    "grantsProperty": "Verleiht dem Zauberspruch eine Eigenschaft"
+    "grantsProperty": "Verleiht dem Zauberspruch eine Eigenschaft",
+    "grantCantBeCountered": "Für diesen Zauberspruch ausgeben, damit er nicht neutralisiert werden kann"
   },
   "zone": {
     "commandZone": "Kommandozone",
@@ -411,13 +417,22 @@
     "paymentPending": "Die Bezahlung steht noch aus. Tappe bleibende Karten oder brich diese Aktion ab.",
     "poolLabel": "Vorrat:",
     "poolEmpty": "Leer",
+    "pinUnit": "Dieses Mana zum Bezahlen vormerken",
+    "unpinUnit": "Mana-Vormerkung aufheben",
     "pay": "Bezahlen",
     "chooseAmountTitle": "Wähle die zu zahlende Menge",
     "chooseAmountAria": "Wähle die zu zahlende Menge",
     "payAmount": "{{value}} {{resource}} bezahlen",
     "resourceEnergy": "Energie",
     "resourceMana": "Mana",
-    "resourceCounters": "Marken"
+    "resourceCounters": "Marken",
+    "resourceSpeed": "Tempo",
+    "manualMana": "Manuell",
+    "manualManaTooltip": "Manuelles Mana — nur für dieses Spiel. Tippe deine eigenen Länder und dein Mana an, um zu bezahlen.",
+    "spendHint": "Klicke auf dein Mana, um es für diese Kosten einzusetzen",
+    "covered": "✓ Gedeckt",
+    "spending": "Wird ausgegeben",
+    "fillHint": "(Umschalt+Klick fügt alle einer Quelle hinzu)"
   },
   "hand": {
     "viewFullHand_one": "Volle Hand ansehen ({{count}} Karte)",
@@ -516,6 +531,7 @@
     "tapUntappedCreatures_other": "Tappe {{count}} ungetappte Kreaturen",
     "chooseTargetOf": "Wähle Ziel {{current}} von {{total}}",
     "chooseTarget": "Wähle ein Ziel",
+    "triggerDamageAmount": "This trigger: {{amount}} damage",
     "noLegalTargets": "Keine legalen Ziele verfügbar",
     "modeContext": "{{mode}} — {{prompt}}",
     "upToOne": "bis zu eine {{target}}",
@@ -1211,6 +1227,22 @@
       "title": "Beweise sammeln",
       "subtitle": "Schicke Karten aus deinem Friedhof mit einem Gesamtmanawert von {{minimum}} oder mehr ins Exil"
     },
+    "bulk": {
+      "selectAll": "Alle auswählen",
+      "invert": "Umkehren",
+      "clear": "Leeren",
+      "sortLabel": "Sortieren",
+      "groupLabel": "Gruppieren",
+      "optNone": "Keine",
+      "optName": "Name",
+      "optCmc": "Manawert",
+      "optType": "Typ",
+      "optColor": "Farbe",
+      "counterDiscard": "{{selected}} von {{cap}} abwerfen",
+      "counterKeep": "{{selected}} von {{cap}} behalten",
+      "keepInstead": "Stattdessen behalten",
+      "discardInstead": "Stattdessen abwerfen"
+    },
     "discard": {
       "title": "Abwerfen",
       "titleAdditionalCost": "Als zusätzliche Kosten abwerfen",
@@ -1225,7 +1257,9 @@
       "subtitleUpTo_other": "Wähle bis zu {{count}} Karten zum Abwerfen",
       "subtitleUnless": "Wähle {{count}} Karten oder 1 passende Karte zum Abwerfen",
       "subtitleExact_one": "Wähle {{count}} Karte zum Abwerfen",
-      "subtitleExact_other": "Wähle {{count}} Karten zum Abwerfen"
+      "subtitleExact_other": "Wähle {{count}} Karten zum Abwerfen",
+      "subtitleKeep_one": "Wähle 1 Karte zum Behalten — der Rest wird abgeworfen",
+      "subtitleKeep_other": "Wähle {{count}} Karten zum Behalten — der Rest wird abgeworfen"
     },
     "harmonize": {
       "title": "Harmonisieren",
@@ -1296,6 +1330,17 @@
     "red": "Rot",
     "green": "Grün"
   },
+  "roomDoor": {
+    "title": "Wähle eine Tür",
+    "subtitle": "Wähle, auf welche Tür des Raums du einwirkst",
+    "confirm": "Bestätigen",
+    "option": "{{op}} {{door}}",
+    "unlock": "Aufschließen",
+    "lock": "Abschließen",
+    "lockOrUnlock": "Auf- oder abschließen",
+    "left": "linke Tür",
+    "right": "rechte Tür"
+  },
   "dialogShell": {
     "eyebrow": "Spielentscheidung",
     "restoreDialog": "Dialog wiederherstellen",
@@ -1360,6 +1405,10 @@
     "spectacleNormalLabel": "Normal wirken",
     "spectacleAltLabel": "Mit Spektakel wirken",
     "spectacleSubtitle": "Wirke {{name}} normal oder zahle seine Spektakel-Kosten (verfügbar, weil ein Gegner in diesem Zug Lebenspunkte verloren hat).",
+    "prowlEyebrow": "Prowl",
+    "prowlNormalLabel": "Normal wirken",
+    "prowlAltLabel": "Mit Prowl wirken",
+    "prowlSubtitle": "Wirke {{name}} normal oder zahle seine Prowl-Kosten (verfügbar, weil eine passende Kreatur einem Spieler in diesem Zug Kampfschaden zugefügt hat).",
     "overloadEyebrow": "Überladen",
     "overloadNormalLabel": "Normal wirken",
     "overloadAltLabel": "Mit Überladen wirken",
@@ -1513,6 +1562,9 @@
     "connectionBody": "phase.rs hat die Verbindung zur Spiel-Engine verloren — meist durch ein Hintergrund-Update verursacht, das mitten im Spiel aktiviert wurde. Dein zuletzt gespeicherter Zug bleibt erhalten; lade neu, um das Spiel wiederherzustellen.",
     "diagnostic": "Diagnose: {{reason}}",
     "showDetails": "Details anzeigen",
+    "exportGameState": "Spielzustand exportieren",
+    "exported": "Exportiert",
+    "exportFailed": "Export fehlgeschlagen",
     "copyDiagnostic": "Diagnose kopieren",
     "copied": "Kopiert!",
     "reportOnGithub": "Auf GitHub melden",

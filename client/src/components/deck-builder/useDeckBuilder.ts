@@ -17,6 +17,7 @@ import {
   setDeckFolder,
   stampDeckMeta,
 } from "../../constants/storage";
+import { BASIC_LAND_NAMES } from "../../constants/game";
 import { loadPreconDeckMap } from "../../hooks/useDecks";
 import { preconDeckEntryToParsedDeck } from "../../services/preconDecks";
 import { useDeckCardData } from "../../hooks/useDeckCardData";
@@ -31,6 +32,7 @@ import { getSharedAdapter } from "../../adapter/wasm-adapter";
 import { useBracketEstimate } from "../../hooks/useBracketEstimate";
 import {
   commanderPartnerCandidates,
+  deckCopyLimit,
   isCardCommanderEligibleForFormat,
 } from "../../services/engineRuntime";
 
@@ -91,6 +93,10 @@ export function useDeckBuilder({
 
   const [compatibility, setCompatibility] = useState<DeckCompatibilityResult | null>(null);
   const [commanderEligibleNames, setCommanderEligibleNames] = useState<Set<string>>(new Set());
+  // CR 100.2a / CR 903.5b: per-card deck-construction copy-limit overrides, keyed
+  // by card name. `Infinity` = "any number"; a finite cap = "up to N" / singleton.
+  // Populated from the engine — never inferred from Oracle text client-side.
+  const [deckCopyLimits, setDeckCopyLimits] = useState<Map<string, number>>(new Map());
 
   const artOverrides = usePreferencesStore((s) => s.artOverrides);
   const clearArtOverride = usePreferencesStore((s) => s.clearArtOverride);
@@ -167,6 +173,7 @@ export function useDeckBuilder({
   const formatConfig = formatMetadata(format)?.default_config;
   const isCommander = formatConfig?.command_zone ?? false;
   const expectedDeckSize = formatConfig?.deck_size ?? 60;
+  const maxCopies = formatConfig?.singleton ? 1 : 4;
 
   useEffect(() => {
     if (!isCommander) {
@@ -196,6 +203,101 @@ export function useDeckBuilder({
       cancelled = true;
     };
   }, [deck.main, format, isCommander]);
+
+  // Names whose copy-limit override has already been requested (in flight or
+  // resolved). A card's copy limit is static per name, so once queried it never
+  // needs re-querying — this keeps deck edits and repeated searches from
+  // re-issuing WASM calls for every card in the deck.
+  const queriedCopyLimitNamesRef = useRef<Set<string>>(new Set());
+
+  const prefetchDeckCopyLimits = useCallback((names: string[]) => {
+    const unique = Array.from(new Set(names)).filter(
+      (name) => !queriedCopyLimitNamesRef.current.has(name),
+    );
+    if (unique.length === 0) return;
+    for (const name of unique) {
+      queriedCopyLimitNamesRef.current.add(name);
+    }
+    Promise.all(
+      unique.map(async (name) => [name, await deckCopyLimit(name)] as const),
+    )
+      .then((results) => {
+        // No cancellation guard: limits are static per name, so a resolved
+        // batch is never stale — merging is always safe.
+        setDeckCopyLimits((prev) => {
+          const next = new Map(prev);
+          for (const [name, limit] of results) {
+            if (!limit) continue;
+            next.set(name, limit.type === "Unlimited" ? Infinity : limit.data);
+          }
+          return next;
+        });
+      })
+      .catch(() => {
+        // Retain previously resolved overrides and allow this batch to be
+        // retried after a transient WASM failure.
+        for (const name of unique) {
+          queriedCopyLimitNamesRef.current.delete(name);
+        }
+      });
+  }, []);
+
+  // CR 100.2a / CR 903.5b: resolve per-card copy-limit overrides for every card
+  // referenced anywhere in the deck. The engine is the single authority — the
+  // frontend never re-parses Oracle text. Limits are static per card name, so
+  // the resolved map is a monotonic cache: merged into, never cleared.
+  useEffect(() => {
+    prefetchDeckCopyLimits([
+      ...deck.main.map((e) => e.name),
+      ...deck.sideboard.map((e) => e.name),
+      ...(deck.planar_deck ?? []),
+      ...(deck.scheme_deck ?? []),
+      ...commanders,
+    ]);
+  }, [deck.main, deck.sideboard, deck.planar_deck, deck.scheme_deck, commanders, prefetchDeckCopyLimits]);
+
+  const maxCopiesRef = useRef(maxCopies);
+  useEffect(() => {
+    maxCopiesRef.current = maxCopies;
+  }, [maxCopies]);
+
+  const deckCopyLimitsRef = useRef(deckCopyLimits);
+  useEffect(() => {
+    deckCopyLimitsRef.current = deckCopyLimits;
+  }, [deckCopyLimits]);
+
+  const noOverrideCardsRef = useRef<Set<string>>(new Set());
+
+  const cacheDeckCopyLimit = useCallback((name: string, limit: Awaited<ReturnType<typeof deckCopyLimit>>) => {
+    if (!limit) {
+      noOverrideCardsRef.current.add(name);
+      return;
+    }
+    setDeckCopyLimits((prev) => {
+      const next = new Map(prev);
+      next.set(name, limit.type === "Unlimited" ? Infinity : limit.data);
+      return next;
+    });
+  }, []);
+
+  // Issue #1136: resolve the engine copy-limit override before enforcing the cap
+  // so cards like Hare Apparent are not stuck at the format default while the
+  // async prefetch batch is still in flight.
+  const resolveEffectiveCap = useCallback(
+    async (name: string): Promise<number> => {
+      const cached = deckCopyLimitsRef.current.get(name);
+      if (cached !== undefined) return cached;
+      if (noOverrideCardsRef.current.has(name)) return maxCopiesRef.current;
+      const limit = await deckCopyLimit(name);
+      if (limit) {
+        cacheDeckCopyLimit(name, limit);
+        return limit.type === "Unlimited" ? Infinity : limit.data;
+      }
+      noOverrideCardsRef.current.add(name);
+      return maxCopiesRef.current;
+    },
+    [cacheDeckCopyLimit],
+  );
 
   const { estimate, unsupported: bracketUnsupported } = useBracketEstimate({
     deck,
@@ -239,8 +341,9 @@ export function useDeckBuilder({
       }
       setSearchResults(cards);
       cacheCards(cards);
+      prefetchDeckCopyLimits(cards.map((card) => card.name));
     },
-    [cacheCards, initialDeckName, searchFilters],
+    [cacheCards, initialDeckName, prefetchDeckCopyLimits, searchFilters],
   );
 
   const handleSearchTrigger = useCallback(() => {
@@ -251,22 +354,28 @@ export function useDeckBuilder({
     cacheCards([card]);
     setDirty(true);
 
-    setDeck((prev) => {
-      const existing = prev.main.find((e) => e.name === card.name);
-      if (existing) {
+    void resolveEffectiveCap(card.name).then((cap) => {
+      setDeck((prev) => {
+        const existing = prev.main.find((e) => e.name === card.name);
+        if (existing && existing.count >= cap && !BASIC_LAND_NAMES.has(card.name)) {
+          return prev;
+        }
+
+        if (existing) {
+          return {
+            ...prev,
+            main: prev.main.map((e) =>
+              e.name === card.name ? { ...e, count: e.count + 1 } : e,
+            ),
+          };
+        }
         return {
           ...prev,
-          main: prev.main.map((e) =>
-            e.name === card.name ? { ...e, count: e.count + 1 } : e,
-          ),
+          main: [...prev.main, { count: 1, name: card.name }],
         };
-      }
-      return {
-        ...prev,
-        main: [...prev.main, { count: 1, name: card.name }],
-      };
+      });
     });
-  }, [cacheCards]);
+  }, [cacheCards, resolveEffectiveCap]);
 
   const handleAddCardByName = useCallback((name: string) => {
     const card = cardDataCache.get(name);
@@ -303,35 +412,45 @@ export function useDeckBuilder({
     (name: string, from: "main" | "sideboard") => {
       const to: "main" | "sideboard" = from === "main" ? "sideboard" : "main";
       setDirty(true);
-      setDeck((prev) => {
-        const source = prev[from];
-        const target = prev[to];
-        const sourceEntry = source.find((e) => e.name === name);
-        if (!sourceEntry) return prev;
+      void resolveEffectiveCap(name).then((cap) => {
+        setDeck((prev) => {
+          const source = prev[from];
+          const target = prev[to];
+          const sourceEntry = source.find((e) => e.name === name);
+          if (!sourceEntry) return prev;
 
-        const targetEntry = target.find((e) => e.name === name);
+          const targetEntry = target.find((e) => e.name === name);
+          if (
+            to === "main" &&
+            targetEntry &&
+            targetEntry.count >= cap &&
+            !BASIC_LAND_NAMES.has(name)
+          ) {
+            return prev;
+          }
 
-        const nextSource =
-          sourceEntry.count <= 1
-            ? source.filter((e) => e.name !== name)
-            : source.map((e) =>
-                e.name === name ? { ...e, count: e.count - 1 } : e,
-              );
+          const nextSource =
+            sourceEntry.count <= 1
+              ? source.filter((e) => e.name !== name)
+              : source.map((e) =>
+                  e.name === name ? { ...e, count: e.count - 1 } : e,
+                );
 
-        const nextTarget = targetEntry
-          ? target.map((e) =>
-              e.name === name ? { ...e, count: e.count + 1 } : e,
-            )
-          : [...target, { count: 1, name }];
+          const nextTarget = targetEntry
+            ? target.map((e) =>
+                e.name === name ? { ...e, count: e.count + 1 } : e,
+              )
+            : [...target, { count: 1, name }];
 
-        return {
-          ...prev,
-          [from]: nextSource,
-          [to]: nextTarget,
-        };
+          return {
+            ...prev,
+            [from]: nextSource,
+            [to]: nextTarget,
+          };
+        });
       });
     },
-    [],
+    [resolveEffectiveCap],
   );
 
   const applyDeckToEditor = useCallback((next: ParsedDeck) => {

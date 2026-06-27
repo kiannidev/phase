@@ -5460,6 +5460,69 @@ mod tests {
     }
 
     #[test]
+    fn commander_accepts_ten_hare_apparent_copies() {
+        // Issue #1136: "A deck can have any number of cards named Hare Apparent"
+        // must override the Commander singleton default.
+        let db_json = serde_json::json!({
+            "hare apparent": {
+                "name": "Hare Apparent",
+                "mana_cost": { "type": "Cost", "shards": ["White"], "generic": 1 },
+                "card_type": { "supertypes": [], "core_types": ["Creature"], "subtypes": ["Rabbit", "Noble"] },
+                "power": { "type": "Fixed", "value": 2 }, "toughness": { "type": "Fixed", "value": 2 },
+                "loyalty": null, "defense": null,
+                "oracle_text": "When this creature enters, create a number of 1/1 white Rabbit creature tokens equal to the number of other creatures you control named Hare Apparent.\nA deck can have any number of cards named Hare Apparent.",
+                "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": ["White"], "scryfall_oracle_id": null,
+                "deck_copy_limit": { "type": "Unlimited" },
+                "legalities": { "commander": "legal" }
+            },
+            "legal commander": {
+                "name": "Legal Commander",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": ["Legendary"], "core_types": ["Creature"], "subtypes": [] },
+                "power": null, "toughness": null, "loyalty": null, "defense": null,
+                "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": ["White"], "scryfall_oracle_id": null,
+                "legalities": { "commander": "legal" }
+            },
+            "plains": {
+                "name": "Plains",
+                "mana_cost": { "type": "NoCost" },
+                "card_type": { "supertypes": ["Basic"], "core_types": ["Land"], "subtypes": ["Plains"] },
+                "power": null, "toughness": null, "loyalty": null, "defense": null,
+                "oracle_text": null, "non_ability_text": null, "flavor_name": null,
+                "keywords": [], "abilities": [], "triggers": [], "static_abilities": [], "replacements": [],
+                "color_override": null, "scryfall_oracle_id": null,
+                "legalities": { "commander": "legal" }
+            }
+        })
+        .to_string();
+        let db = CardDatabase::from_json_str(&db_json).unwrap();
+        let mut main = expand("Hare Apparent", 10);
+        main.extend(expand("Plains", 89));
+        let request = DeckCompatibilityRequest {
+            main_deck: main,
+            sideboard: Vec::new(),
+            commander: vec!["Legal Commander".to_string()],
+            planar_deck: Vec::new(),
+            scheme_deck: Vec::new(),
+            signature_spell: Vec::new(),
+            selected_format: Some(GameFormat::Commander),
+            selected_match_type: None,
+            player_count: 2,
+            summary_only: false,
+        };
+        let result = evaluate_deck_compatibility(&db, &request);
+        assert!(
+            result.commander.compatible,
+            "expected compatible, got reasons: {:?}",
+            result.commander.reasons
+        );
+    }
+
+    #[test]
     fn commander_sideboard_policy_accepts_maybeboard_entries() {
         // CR 903.5e: Phase's deck builder reuses the sideboard slot as a
         // builder-only "Maybeboard" for Commander-style formats. The

@@ -3570,7 +3570,7 @@ pub(super) fn strip_temporal_suffix(text: &str) -> (&str, Option<DelayedTriggerC
                 player: crate::types::player::PlayerId(0),
             },
         ),
-        // CR 514.1 + CR 603.7a: "at the beginning of the next cleanup step"
+        // CR 514.3a + CR 603.7a: "at the beginning of the next cleanup step"
         // (Bounty of the Hunt and the class of temporary-counter effects).
         (
             " at the beginning of the next cleanup step",
@@ -3680,6 +3680,7 @@ pub(super) fn strip_temporal_prefix(text: &str) -> (&str, Option<DelayedTriggerC
                 },
                 tag("at end of combat, "),
             ),
+            // CR 514.3a + CR 603.7a: "at the beginning of the next cleanup step, "
             value(
                 DelayedTriggerCondition::AtNextPhase {
                     phase: Phase::Cleanup,

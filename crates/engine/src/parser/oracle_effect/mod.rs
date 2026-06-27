@@ -36155,9 +36155,7 @@ mod tests {
             .expect("cleanup removal sub-ability");
         match &*sub.effect {
             Effect::CreateDelayedTrigger {
-                condition,
-                effect,
-                ..
+                condition, effect, ..
             } => {
                 assert_eq!(
                     *condition,

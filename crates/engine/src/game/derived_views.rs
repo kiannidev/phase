@@ -18,9 +18,11 @@ use crate::game::ability_utils::flatten_targets_in_chain;
 use crate::game::game_object::AttachTarget;
 use crate::game::stack::{stack_display_groups, StackDisplayGroup};
 use crate::types::ability::{
-    GameRestriction, KeywordAction, ProhibitedActivity, RestrictionPlayerScope, TargetRef,
+    GameRestriction, KeywordAction, ProhibitedActivity, RestrictionExpiry, RestrictionPlayerScope,
+    TargetRef,
 };
 use crate::types::events::GameEvent;
+use crate::types::format::GameFormat;
 use crate::types::game_state::{
     CastingVariant, GameState, StackEntry, StackEntryKind, StackPaidSnapshot,
 };
@@ -57,6 +59,7 @@ pub enum StackPaidFactView {
     AdditionalCostPaid,
     CastVariant { variant: String },
     Convoked { count: usize },
+    ChosenModes { labels: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +133,27 @@ pub struct PlayerStatusView {
     pub source: Option<ObjectId>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanechaseView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_plane: Option<ObjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planar_controller: Option<PlayerId>,
+    pub planar_deck_count: usize,
+    pub current_roll_cost: ManaCost,
+    pub can_roll: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchenemyView {
+    pub archenemy: PlayerId,
+    pub scheme_deck_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_scheme_ids: Vec<ObjectId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hero_player_ids: Vec<PlayerId>,
+}
+
 /// Engine-authored projections used by the display layer. Keep this struct
 /// small — every field becomes mandatory payload on every state snapshot
 /// the client receives. Add a new field only when the frontend would
@@ -186,6 +210,28 @@ pub struct DerivedViews {
     /// Empty (and omitted) in the dominant case where no player is afflicted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub player_status: Vec<PlayerStatusView>,
+
+    /// CR 118.3a + CR 601.2g: during the viewer's own manual mana payment for a
+    /// spell, the portion of the locked cost still UNPAID by the pool units they
+    /// have pinned (selected) so far — the cost reduced against a pool of ONLY
+    /// those pinned units. Lets the payment UI show the cost shrinking as the
+    /// player picks mana, and "covered" (`NoCost`) when their selection alone
+    /// pays the whole cost. `None` outside a non-convoke spell `ManaPayment` the
+    /// viewer controls. Viewer-scoped — one caster's private in-progress choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_payment_remaining: Option<ManaCost>,
+
+    /// CR 901: Engine-authored Planechase presentation state. The frontend
+    /// renders this directly instead of deriving the active plane from command
+    /// zone objects or recomputing planar-die legality.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planechase: Option<PlanechaseView>,
+
+    /// CR 904: Engine-authored Archenemy presentation state. The frontend
+    /// renders this directly instead of deriving active schemes from command
+    /// zone objects or recomputing side membership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archenemy: Option<ArchenemyView>,
 }
 
 /// Serialize-only wrapper: the WASM getter passes `&GameState` by reference
@@ -230,6 +276,70 @@ pub struct ClientGameState {
 /// unconditionally for every Commander-format game regardless of who is
 /// viewing. Partner commanders under the same controller each get their
 /// own `CommanderDamageView` entry, not a summed total.
+/// CR 118.3a + CR 601.2g: the cost still unpaid by `viewer`'s pinned pool units
+/// during their own manual mana payment for a spell. Reduces the locked spell
+/// cost against a pool containing ONLY the pinned units (so the residual is
+/// exactly what the player has chosen to spend), under the same spend-restriction
+/// context (`PaymentContext::Spell`) the finalize spend uses. Returns `None`
+/// unless the viewer is mid (non-convoke) spell `ManaPayment` with a pending
+/// cast — activated-ability mana payment keeps its full-cost display, and
+/// convoke/improvise/delve pay via board taps tracked by their own staged UI.
+///
+/// KNOWN LIMITATION: reduces with `any_color = false` and no life-for-color
+/// permissions, so under an any-color spend permission (Chromatic Orrery) or a
+/// K'rrik-style life-as-colored-mana grant the displayed residual can over-state
+/// the cost (a colorless unit pinned toward `{R}` reads as not covering it).
+/// This is deliberately consistent with the pin-eligibility gate
+/// (`mana_unit_eligible_for_cost`), which is also `any_color`-blind and would
+/// reject such a pin — both layers agree on the stricter behavior, and the
+/// common cases (generic + plain colored costs) are exact. Threading the real
+/// permission bundle through both sites is the follow-up to lift this.
+fn pending_payment_remaining(state: &GameState, viewer: PlayerId) -> Option<ManaCost> {
+    use crate::types::game_state::WaitingFor;
+    use crate::types::mana::{ManaPool, PaymentContext};
+
+    let WaitingFor::ManaPayment {
+        player,
+        convoke_mode,
+    } = &state.waiting_for
+    else {
+        return None;
+    };
+    if *player != viewer || convoke_mode.is_some() {
+        return None;
+    }
+
+    let pending = state.pending_cast.as_ref()?;
+    // The mana portion the spend funnel reduces is `pending.cost` for both spells
+    // and activations; live-shrink is scoped to spell casts, where that cost is
+    // exactly what the payment panel displays (no activated-ability cost mismatch).
+    if pending.activation_ability_index.is_some() {
+        return None;
+    }
+    let cost = pending.cost.clone();
+
+    // Scratch pool of ONLY the pinned units = the player's current selection.
+    let player_obj = state.players.iter().find(|p| p.id == viewer)?;
+    let mut selected = ManaPool::default();
+    for unit in &player_obj.mana_pool.mana {
+        if pending.pinned_pool_units.contains(&unit.pip_id) {
+            selected.add(unit.clone());
+        }
+    }
+
+    // CR 106.6: reduce under the SAME spend-restriction context the finalize
+    // spend uses, so restricted mana the spell can't accept stays in the residual.
+    let spell_meta = crate::game::casting::build_spell_meta(state, viewer, pending.object_id);
+    let ctx = spell_meta.as_ref().map(PaymentContext::Spell);
+    Some(crate::game::mana_payment::reduce_cost_by_pool(
+        &selected,
+        &cost,
+        ctx.as_ref(),
+        false,
+        None,
+    ))
+}
+
 pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews {
     let mut views = DerivedViews::default();
 
@@ -285,6 +395,45 @@ pub fn derive_views(state: &GameState, viewer: Option<PlayerId>) -> DerivedViews
                     }
                 }
             }
+        }
+    }
+
+    // CR 118.3a + CR 601.2g: viewer-scoped remaining cost after the caster's
+    // pinned (selected) pool mana — drives the payment UI's live-shrinking cost.
+    if let Some(viewer) = viewer {
+        views.pending_payment_remaining = pending_payment_remaining(state, viewer);
+    }
+
+    if state.format_config.format == GameFormat::Planechase {
+        let roll_player = crate::game::turn_control::priority_seat(state);
+        let can_viewer_roll = viewer.is_some_and(|viewer| {
+            crate::game::turn_control::authorized_submitter_for_player(state, roll_player) == viewer
+                && crate::game::planechase::can_roll_planar_die(state, roll_player)
+        });
+        views.planechase = Some(PlanechaseView {
+            active_plane: crate::game::planechase::active_plane(state),
+            planar_controller: state.planar_controller,
+            planar_deck_count: state.planar_deck.len(),
+            current_roll_cost: crate::game::planechase::planar_die_roll_cost(state, roll_player),
+            can_roll: can_viewer_roll,
+        });
+    }
+
+    if state.format_config.format == GameFormat::Archenemy {
+        if let Some(archenemy) = crate::game::topology::archenemy(state) {
+            let hero_player_ids = state
+                .seat_order
+                .iter()
+                .copied()
+                .find(|&player| player != archenemy)
+                .map(|hero| crate::game::topology::team_members(state, hero))
+                .unwrap_or_default();
+            views.archenemy = Some(ArchenemyView {
+                archenemy,
+                scheme_deck_count: state.scheme_deck.len(),
+                active_scheme_ids: crate::game::archenemy::active_schemes(state),
+                hero_player_ids,
+            });
         }
     }
 
@@ -381,12 +530,22 @@ fn player_status_views(state: &GameState) -> Vec<PlayerStatusView> {
             source,
             affected_players,
             activity,
-            ..
+            expiry,
         } = restriction
         else {
             // DamagePreventionDisabled has no per-player axis — see fn docs.
             continue;
         };
+        // CR 514.2 + CR 500.7: a `UntilEndOfNextTurnOf` prohibition (Kang's "during
+        // that [extra] turn, power-up abilities can't be activated") is created
+        // pre-armed and only takes force during the granted turn, after the untap
+        // step converts it to `EndOfTurn` (turns.rs). Suppress the HUD status badge
+        // while it is still dormant so this display seam agrees with the activation
+        // gate (`is_blocked_by_cant_activate_abilities`) — they share the expiry
+        // variant as the single source of truth.
+        if matches!(expiry, RestrictionExpiry::UntilEndOfNextTurnOf { .. }) {
+            continue;
+        }
         let kind = match activity {
             ProhibitedActivity::CastSpells { .. } => PlayerConditionKind::CantCastSpells,
             ProhibitedActivity::ActivateAbilities { .. } => {
@@ -397,6 +556,10 @@ fn player_status_views(state: &GameState) -> Vec<PlayerStatusView> {
                     allowed_zones: allowed_zones.clone(),
                 }
             }
+            // CR 508.1c: a "can't attack" prohibition is enforced only at the
+            // declare-attackers gate; it has no cast/activate HUD badge, so no
+            // player-status row is produced for it.
+            ProhibitedActivity::Attack { .. } => continue,
         };
         for pid in restriction_affected_players(state, affected_players, *source) {
             views.push(PlayerStatusView {
@@ -443,9 +606,16 @@ fn restriction_affected_players(
                 None => Vec::new(),
             }
         }
-        RestrictionPlayerScope::TargetedPlayer | RestrictionPlayerScope::ParentTargetedPlayer => {
-            Vec::new()
-        }
+        // CR 109.5: `add_restriction` resolves the scoped player to
+        // `SpecificPlayer` when the restriction is created, so a stored
+        // restriction never carries an unresolved placeholder scope here.
+        RestrictionPlayerScope::TargetedPlayer
+        | RestrictionPlayerScope::ParentTargetedPlayer
+        | RestrictionPlayerScope::ScopedPlayer => Vec::new(),
+        // CR 508.5a: `add_restriction` resolves the defending player to
+        // `SpecificPlayer` when the restriction is created, so a stored
+        // restriction never carries an unresolved `DefendingPlayer` scope here.
+        RestrictionPlayerScope::DefendingPlayer => Vec::new(),
     }
 }
 
@@ -600,6 +770,11 @@ fn stack_paid_facts(snapshot: Option<&StackPaidSnapshot>) -> Vec<StackPaidFactVi
             count: snapshot.convoked_creatures,
         });
     }
+    if !snapshot.chosen_mode_labels.is_empty() {
+        facts.push(StackPaidFactView::ChosenModes {
+            labels: snapshot.chosen_mode_labels.clone(),
+        });
+    }
     facts
 }
 
@@ -749,11 +924,15 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::ability::{Effect, ResolvedAbility, RestrictionExpiry, TargetRef};
+    use crate::types::card_type::CoreType;
     use crate::types::format::FormatConfig;
     use crate::types::game_state::{
-        CommanderDamageEntry, StackEntry, StackEntryKind, StackPaidSnapshot, ZoneChangeRecord,
+        CommanderDamageEntry, StackEntry, StackEntryKind, StackPaidSnapshot, WaitingFor,
+        ZoneChangeRecord,
     };
     use crate::types::identifiers::CardId;
+    use crate::types::mana::ManaCost;
+    use crate::types::phase::Phase;
     use crate::types::statics::ActivationExemption;
     use crate::types::zones::Zone;
 
@@ -843,6 +1022,57 @@ mod tests {
         assert_eq!(from_p1[0].commander, cmd_p1);
         assert_eq!(from_p2.len(), 1);
         assert_eq!(from_p2[0].damage, 11);
+    }
+
+    #[test]
+    fn planechase_can_roll_view_uses_controlled_priority_seat() {
+        let controller = PlayerId(0);
+        let controlled = PlayerId(1);
+        let mut state = GameState::new(FormatConfig::planechase(), 2, 7);
+        state.active_player = controlled;
+        state.priority_player = controller;
+        state.turn_decision_controller = Some(controller);
+        state.waiting_for = WaitingFor::Priority { player: controlled };
+        state.phase = Phase::PreCombatMain;
+        state.planar_controller = Some(controlled);
+        state.planar_die_actions_this_turn.insert(controller, 2);
+
+        let plane = create_object(
+            &mut state,
+            CardId(9000),
+            controlled,
+            "Controlled Turn Plane".to_string(),
+            Zone::Command,
+        );
+        state
+            .objects
+            .get_mut(&plane)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Plane);
+        state.command_zone.push_back(plane);
+
+        let controller_view = derive_views(&state, Some(controller))
+            .planechase
+            .expect("Planechase view should be present");
+        assert_eq!(
+            controller_view.current_roll_cost,
+            ManaCost::generic(0),
+            "roll cost must be derived from the controlled active seat, not the submitter"
+        );
+        assert!(
+            controller_view.can_roll,
+            "authorized turn controller should see the planar-die action"
+        );
+
+        let controlled_view = derive_views(&state, Some(controlled))
+            .planechase
+            .expect("Planechase view should be present");
+        assert!(
+            !controlled_view.can_roll,
+            "controlled seat is not the authorized human submitter during turn control"
+        );
     }
 
     /// Partner commanders (two commanders under the same controller) must
@@ -956,6 +1186,93 @@ mod tests {
         );
     }
 
+    /// SHAPE test (constructs `pending_cast`/pool directly, not via the cast
+    /// pipeline): `pending_payment_remaining` is the locked cost reduced by ONLY
+    /// the units the caster has pinned, so the payment UI's cost visibly shrinks
+    /// as mana is selected and reads covered (`NoCost`) once the selection alone
+    /// pays the whole cost. Also pins the viewer-scoping: an opponent never sees
+    /// the caster's in-progress private selection.
+    #[test]
+    fn pending_payment_remaining_reflects_pinned_selection() {
+        use crate::types::ability::{Effect, ResolvedAbility};
+        use crate::types::game_state::{PendingCast, WaitingFor};
+        use crate::types::mana::{ManaCost, ManaType, ManaUnit};
+
+        let mut state = GameState::new_two_player(42);
+        let p0 = PlayerId(0);
+        let spell = create_object(&mut state, CardId(1), p0, "Test Spell".into(), Zone::Stack);
+
+        // Three colorless pool units, each stamped with a distinct pip id.
+        for _ in 0..3 {
+            state.add_mana_to_pool(
+                p0,
+                ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]),
+            );
+        }
+        let pip_ids: Vec<_> = state.players[0]
+            .mana_pool
+            .mana
+            .iter()
+            .map(|u| u.pip_id)
+            .collect();
+
+        let ability = ResolvedAbility::new(
+            Effect::Unimplemented {
+                name: "test".into(),
+                description: None,
+            },
+            vec![],
+            spell,
+            p0,
+        );
+        state.pending_cast = Some(Box::new(PendingCast::new(
+            spell,
+            CardId(1),
+            ability,
+            ManaCost::generic(2),
+        )));
+        state.waiting_for = WaitingFor::ManaPayment {
+            player: p0,
+            convoke_mode: None,
+        };
+
+        // No selection → the whole {2} still has to be paid.
+        assert_eq!(
+            derive_views(&state, Some(p0)).pending_payment_remaining,
+            Some(ManaCost::generic(2)),
+        );
+
+        // Pin one unit → {1} remains.
+        state
+            .pending_cast
+            .as_mut()
+            .unwrap()
+            .pinned_pool_units
+            .push(pip_ids[0]);
+        assert_eq!(
+            derive_views(&state, Some(p0)).pending_payment_remaining,
+            Some(ManaCost::generic(1)),
+        );
+
+        // Pin a second → the selection alone covers the cost (NoCost).
+        state
+            .pending_cast
+            .as_mut()
+            .unwrap()
+            .pinned_pool_units
+            .push(pip_ids[1]);
+        assert_eq!(
+            derive_views(&state, Some(p0)).pending_payment_remaining,
+            Some(ManaCost::NoCost),
+        );
+
+        // Viewer scoping: the opponent never sees the caster's private selection.
+        assert_eq!(
+            derive_views(&state, Some(PlayerId(1))).pending_payment_remaining,
+            None,
+        );
+    }
+
     #[test]
     fn derive_views_wires_stack_entry_details() {
         let mut state = GameState::new_two_player(42);
@@ -1022,6 +1339,65 @@ mod tests {
     }
 
     #[test]
+    fn derive_views_surfaces_chosen_modal_modes_on_stack() {
+        let mut state = GameState::new_two_player(42);
+        let spell = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Brotherhood's End".to_string(),
+            Zone::Stack,
+        );
+        if let Some(obj) = state.objects.get_mut(&spell) {
+            obj.modal = Some(crate::types::ability::ModalChoice {
+                min_choices: 1,
+                max_choices: 1,
+                mode_count: 2,
+                mode_descriptions: vec![
+                    "Brotherhood's End deals 3 damage to each creature and each planeswalker."
+                        .to_string(),
+                    "Destroy all artifacts with mana value 3 or less.".to_string(),
+                ],
+                ..Default::default()
+            });
+        }
+        state.stack.push_back(StackEntry {
+            id: spell,
+            source_id: spell,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(1),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 3,
+            },
+        });
+        state.stack_paid_facts.insert(
+            spell,
+            StackPaidSnapshot {
+                actual_mana_spent: 3,
+                chosen_mode_labels: vec![
+                    "Destroy all artifacts with mana value 3 or less.".to_string()
+                ],
+                ..Default::default()
+            },
+        );
+
+        let views = derive_views(&state, None);
+        let details = views
+            .stack_entry_details
+            .get(&spell)
+            .expect("stack details include the spell");
+        assert!(details.paid.iter().any(|fact| {
+            matches!(
+                fact,
+                StackPaidFactView::ChosenModes { labels }
+                    if labels == &["Destroy all artifacts with mana value 3 or less."]
+            )
+        }));
+    }
+
+    #[test]
     fn derive_views_uses_filtered_names_for_trigger_context() {
         let mut state = GameState::new_two_player(42);
         let trigger_source = create_object(
@@ -1067,6 +1443,9 @@ mod tests {
                 is_token: false,
                 combat_status: Default::default(),
                 co_departed: Vec::new(),
+                attached_to: None,
+                entered_incarnation: None,
+                turn_zone_change_index: 0,
             }),
         };
         let ability = ResolvedAbility::new(
@@ -1250,6 +1629,7 @@ mod tests {
             expiry: RestrictionExpiry::EndOfTurn,
             activity: ProhibitedActivity::ActivateAbilities {
                 exemption: ActivationExemption::ManaAbilities,
+                only_tag: None,
             },
         });
         // CR 614.16: no per-player axis — must NOT produce a status row.

@@ -1,11 +1,10 @@
 import { memo, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import type { ObjectId, WaitingFor } from "../../adapter/types.ts";
+import type { GameObject, ObjectId, WaitingFor } from "../../adapter/types.ts";
 import { dispatchAction } from "../../game/dispatch.ts";
 import { usePlayerId } from "../../hooks/usePlayerId.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
-import type { GameObject } from "../../adapter/types.ts";
 import type { GroupedPermanent as GroupedPermanentType } from "../../viewmodel/battlefieldProps";
 import {
   boardChoiceMaxSelection,
@@ -84,6 +83,7 @@ export const GroupedPermanentDisplay = memo(function GroupedPermanentDisplay({
   const selectedCardIds = useUiStore((s) => s.selectedCardIds);
   const setGroupSelectedCards = useUiStore((s) => s.setGroupSelectedCards);
   const waitingFor = useGameStore((s) => s.waitingFor);
+  const gameObjects = useGameStore((s) => s.gameState?.objects);
   const {
     boardChoiceObjectIds,
     committedAttackerIds,
@@ -104,7 +104,7 @@ export const GroupedPermanentDisplay = memo(function GroupedPermanentDisplay({
     if (renderMode !== "collapsed") return null;
     if (waitingForPlayer(waitingFor) !== playerId) return null;
 
-    const boardChoice = getBoardChoiceView(waitingFor);
+    const boardChoice = getBoardChoiceView(waitingFor, gameObjects);
     if (boardChoice) {
       const eligibleIds = group.ids.filter((id) => boardChoiceObjectIds.has(id));
       return eligibleIds.length > 0
@@ -155,6 +155,7 @@ export const GroupedPermanentDisplay = memo(function GroupedPermanentDisplay({
     boardChoiceObjectIds,
     combatClickHandler,
     combatMode,
+    gameObjects,
     group.ids,
     playerId,
     renderMode,
@@ -508,27 +509,49 @@ function BoardChoiceGroupControls({
   const selectedInGroup = eligibleIds.filter((id) => selectedCardIds.includes(id));
   const maxSelection = boardChoiceMaxSelection(choice);
 
-  const toggleId = (id: ObjectId) => {
-    const selected = new Set(selectedInGroup);
-    if (selected.has(id)) {
-      selected.delete(id);
-    } else if (maxSelection == null || selectedForChoice.length < maxSelection) {
-      selected.add(id);
-    }
-    setGroupSelectedCards(groupIds, eligibleIds.filter((eligibleId) => selected.has(eligibleId)));
-  };
+  // Every eligible id in a collapsed group is visually identical to the others
+  // (same name, P/T, counters, keywords, tap/flip state — that's why they're
+  // stacked). Distinguishing them with a #1..#N list (the old UI) forced the
+  // player to pick among indistinguishable tokens, e.g. choosing which of five
+  // Food tokens to sacrifice. Resolve by quantity instead.
 
+  // Immediate single pick: nothing to distinguish — resolve with one click on a
+  // labelled action button using the first eligible id.
   if (isBoardChoiceImmediate(choice)) {
+    // Guard against an empty eligible list: the picker only opens when there is
+    // at least one eligible id, but defending here avoids ever dispatching an
+    // action with an undefined id payload.
+    const firstId = eligibleIds[0];
+    if (firstId === undefined) return null;
     return (
-      <ObjectChoiceList
-        eligibleIds={eligibleIds}
-        onChoose={(id) => {
-          dispatchAction(buildBoardChoiceAction(choice, [id]));
+      <button
+        type="button"
+        className="w-full rounded bg-sky-700 px-2 py-1.5 font-bold text-white hover:bg-sky-600"
+        onClick={() => {
+          dispatchAction(buildBoardChoiceAction(choice, [firstId]));
           onClose();
         }}
-      />
+      >
+        {t(`boardChoice.actions.${choice.intent}`)}
+      </button>
     );
   }
+
+  // Multi-select: a quantity stepper that maps to the first N eligible ids.
+  // The cap accounts for selections already made in other groups so the
+  // choice-wide count limit can't be exceeded.
+  const selectedOutsideGroup = Math.max(
+    0,
+    selectedForChoice.length - selectedInGroup.length,
+  );
+  const groupCeiling =
+    maxSelection == null ? eligibleIds.length : Math.max(0, maxSelection - selectedOutsideGroup);
+  const effectiveMax = Math.min(eligibleIds.length, groupCeiling);
+
+  const setCount = (n: number) => {
+    const clamped = Math.max(0, Math.min(n, effectiveMax));
+    setGroupSelectedCards(groupIds, eligibleIds.slice(0, clamped));
+  };
 
   const canConfirm = canConfirmBoardChoice(choice, selectedForChoice, objects);
   const requiredPower =
@@ -540,12 +563,10 @@ function BoardChoiceGroupControls({
 
   return (
     <div className="space-y-2">
-      <ObjectToggleList
-        eligibleIds={eligibleIds}
-        objects={objects}
-        selectedIds={selectedInGroup}
-        showPower={choice.selection.type === "totalPowerAtLeast"}
-        onToggle={toggleId}
+      <CountPickerControls
+        count={selectedInGroup.length}
+        max={effectiveMax}
+        onChange={setCount}
       />
       <div className="text-center text-[11px] text-slate-300">
         {power == null
@@ -640,46 +661,6 @@ function ObjectChoiceList({ eligibleIds, onChoose }: ObjectChoiceListProps) {
           #{index + 1}
         </button>
       ))}
-    </div>
-  );
-}
-
-interface ObjectToggleListProps {
-  eligibleIds: ObjectId[];
-  objects: Record<ObjectId, GameObject> | undefined;
-  selectedIds: ObjectId[];
-  showPower: boolean;
-  onToggle: (id: ObjectId) => void;
-}
-
-function ObjectToggleList({
-  eligibleIds,
-  objects,
-  selectedIds,
-  showPower,
-  onToggle,
-}: ObjectToggleListProps) {
-  return (
-    <div className="grid max-h-48 grid-cols-2 gap-1 overflow-auto">
-      {eligibleIds.map((id, index) => {
-        const selected = selectedIds.includes(id);
-        const power = Math.max(objects?.[id]?.power ?? 0, 0);
-        return (
-          <button
-            key={id}
-            type="button"
-            className={`rounded px-2 py-1 font-semibold ${
-              selected
-                ? "bg-sky-500 text-sky-950"
-                : "bg-slate-800 hover:bg-slate-700"
-            }`}
-            onClick={() => onToggle(id)}
-          >
-            #{index + 1}
-            {showPower ? ` (${power})` : ""}
-          </button>
-        );
-      })}
     </div>
   );
 }

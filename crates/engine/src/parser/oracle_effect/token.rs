@@ -36,7 +36,7 @@ where
     Some((result, &text[consumed..]))
 }
 
-pub(super) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) -> Option<Effect> {
+pub(crate) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) -> Option<Effect> {
     let text = strip_reminder_text(text);
     let lower = text.to_lowercase();
 
@@ -231,30 +231,89 @@ fn split_token_except_clause<'a>(
     ctx: &ParseContext,
 ) -> (&'a str, Vec<Keyword>, Vec<ContinuousModification>) {
     let lower = text.to_lowercase();
-    let Ok((except_input, head_lower)) = parse_token_except_boundary(&lower) else {
+    let Ok((_, head_lower)) = parse_token_except_boundary(&lower) else {
         return (text, Vec::new(), Vec::new());
     };
     let head = &text[..head_lower.len()];
+    // CR 707.9b + CR 707.2: a token-copy exception can rename the copy with a
+    // literal name ("…named Mishra's Warform…", Mishra, Eminent One). Unlike the
+    // self-name "its name is ~" arm — which keys off the copying card's own name
+    // and so cannot apply to a token copy (`card_name` empty below) — a literal
+    // override carries the name in the text itself, so peel it off here (original
+    // case preserved) and strip the "named <X>" span before the body reaches the
+    // shared except parser. Without this the name words leak into the copied
+    // creature's subtype list AND the override is dropped, so a token copying a
+    // legendary permanent keeps the source's name and wrongly collides with it
+    // under the legend rule (CR 704.5j). The original-case except body is
+    // byte-aligned to its lowercase form (mirrors the `head` slice above).
+    let except_original = &text[head_lower.len()..];
+    let (name_override, except_body) = strip_copy_except_named_override(except_original);
+    let except_lower = except_body.to_lowercase();
+
     // Pass the lowercase suffix starting at `[, ]except ` to the shared
     // building block. The except parser is the single authority for the
     // grammar (CR 707.9 + CR 707.2): keyword lists, supertype additions /
     // removals, conditional counter placement, etc.
     let card_name = ""; // SetName cannot apply to token-copy (source unknown at parse time).
-    let (_, modifications) =
-        match super::become_copy_except::parse_except_clause(except_input, card_name, ctx) {
-            Some(parts) => parts,
-            None => return (head, Vec::new(), Vec::new()),
-        };
-
     let mut extra_keywords = Vec::new();
     let mut additional_modifications = Vec::new();
-    for modification in modifications {
-        match modification {
-            ContinuousModification::AddKeyword { keyword } => extra_keywords.push(keyword),
-            other => additional_modifications.push(other),
+    match super::become_copy_except::parse_except_clause(&except_lower, card_name, ctx) {
+        Some((_, modifications)) => {
+            for modification in modifications {
+                match modification {
+                    ContinuousModification::AddKeyword { keyword } => extra_keywords.push(keyword),
+                    other => additional_modifications.push(other),
+                }
+            }
         }
+        // A clause that is *only* a literal name override (no other recognised
+        // body) still yields the rename — don't discard it.
+        None if name_override.is_none() => return (head, Vec::new(), Vec::new()),
+        None => {}
+    }
+
+    if let Some(name) = name_override {
+        additional_modifications.push(ContinuousModification::SetName { name });
     }
     (head, extra_keywords, additional_modifications)
+}
+
+/// CR 707.9b + CR 707.2: peel a literal `"named <X>"` rename off a token-copy
+/// `, except <body>` clause, returning the original-case name and the body with
+/// the `"named <X>"` span removed. Mishra, Eminent One: "…except it's a 4/4
+/// Construct artifact creature named Mishra's Warform in addition to its other
+/// types." — the name must not be ingested as creature subtypes, and must
+/// override the copied name so the legend rule (CR 704.5j) sees the distinct
+/// token name.
+///
+/// Quoted-ability exceptions ("…except it has \"…\"") are left untouched: any
+/// `named` inside a granted ability is part of that ability's own text, not a
+/// rename of the copy, so the strip is skipped when the body carries a `"`.
+fn strip_copy_except_named_override(body: &str) -> (Option<String>, String) {
+    if body.contains('"') {
+        return (None, body.to_string());
+    }
+    let lower = body.to_lowercase();
+    let tp = TextPair::new(body, &lower);
+    let Some((before, after)) = tp.split_around(" named ") else {
+        return (None, body.to_string());
+    };
+    // The literal name runs to the next copy-exception boundary: the additive
+    // type carve-out, a further `and`-joined body, or sentence punctuation.
+    let mut end = after.original.len();
+    for needle in [" in addition to", " and ", " with ", " that ", ",", "."] {
+        if let Some(pos) = after.find(needle) {
+            end = end.min(pos);
+        }
+    }
+    let name = after.original[..end].trim().trim_matches('"');
+    if name.is_empty() {
+        return (None, body.to_string());
+    }
+    // Reassemble the body without the " named <X>" span so the type list parses
+    // cleanly ("…artifact creature in addition to its other types").
+    let stripped = format!("{}{}", before.original, &after.original[end..]);
+    (Some(name.to_string()), stripped)
 }
 
 fn parse_token_except_boundary(input: &str) -> OracleResult<'_, &str> {
@@ -610,16 +669,29 @@ fn parse_token_count_prefix(text: &str) -> Option<(QuantityExpr, &str)> {
 }
 
 fn parse_named_token_preamble(text: &str) -> Option<(String, &str)> {
-    let comma = text.find(',')?;
-    let name = text[..comma].trim().trim_matches('"');
-    if name.is_empty() {
-        return None;
+    // CR 111.4: A named-token preamble is "<Name>, a/an <characteristics> token".
+    // The token name may itself contain a comma ("Primo, the Indivisible";
+    // "Tibalt, the Fiend-Blooded"), so the FIRST comma is not necessarily the
+    // name/body boundary. The boundary is the comma immediately followed by the
+    // article that introduces the token's characteristics (", a "/", an "). Scan
+    // every comma and pick the one whose remainder begins with an article, so
+    // the full epithet stays in the name. Mirrors the article guard already used
+    // for the single-comma case.
+    for (idx, _) in text.match_indices(',') {
+        let after_comma = text[idx + 1..].trim_start();
+        let after_lower = after_comma.to_lowercase();
+        let Some((_, rest)) =
+            nom_on_lower(after_comma, &after_lower, nom_primitives::parse_article)
+        else {
+            continue;
+        };
+        let name = text[..idx].trim().trim_matches('"');
+        if name.is_empty() {
+            continue;
+        }
+        return Some((name.to_string(), rest));
     }
-
-    let after_comma = text[comma + 1..].trim_start();
-    let after_lower = after_comma.to_lowercase();
-    let (_, rest) = nom_on_lower(after_comma, &after_lower, nom_primitives::parse_article)?;
-    Some((name.to_string(), rest))
+    None
 }
 
 /// CR 205.4a: Strip leading supertype words from the token description and
@@ -958,6 +1030,12 @@ pub(super) fn scope_token_for_each_to_iterating_player(expr: QuantityExpr) -> Qu
             },
         },
         QuantityExpr::Sum { exprs } => QuantityExpr::Sum {
+            exprs: exprs
+                .into_iter()
+                .map(scope_token_for_each_to_iterating_player)
+                .collect(),
+        },
+        QuantityExpr::Max { exprs } => QuantityExpr::Max {
             exprs: exprs
                 .into_iter()
                 .map(scope_token_for_each_to_iterating_player)
@@ -1316,6 +1394,55 @@ mod tests {
         };
         assert_eq!(target, TargetFilter::CostPaidObject);
         assert_eq!(count, QuantityExpr::Fixed { value: 2 });
+    }
+
+    #[test]
+    fn copy_token_with_literal_named_override_emits_set_name() {
+        // CR 707.9b + CR 704.5j (issue #4444): Mishra, Eminent One creates a
+        // token copy renamed by a literal "named <X>" exception. The override
+        // must reach `additional_modifications` as a `SetName` (so the copy of a
+        // legendary permanent does not collide with its source under the legend
+        // rule), and the name words must NOT leak into the copied subtype list.
+        let txt = "create a token that's a copy of target artifact you control, except it's a 4/4 Construct artifact creature named Mishra's Warform in addition to its other types";
+        let effect = try_parse_token(&txt.to_lowercase(), txt, &mut ParseContext::default())
+            .expect("expected CopyTokenOf");
+        let Effect::CopyTokenOf {
+            additional_modifications,
+            ..
+        } = effect
+        else {
+            panic!("expected CopyTokenOf, got {effect:?}");
+        };
+        assert!(
+            additional_modifications.iter().any(|m| matches!(
+                m,
+                ContinuousModification::SetName { name } if name == "Mishra's Warform"
+            )),
+            "literal name override must emit SetName with original casing, got {additional_modifications:?}"
+        );
+        // The name words must not be misclassified as creature subtypes.
+        assert!(
+            !additional_modifications.iter().any(|m| matches!(
+                m,
+                ContinuousModification::AddSubtype { subtype }
+                    if matches!(subtype.as_str(), "Named" | "Mishra's" | "Warform")
+            )),
+            "name words must not leak into the subtype list, got {additional_modifications:?}"
+        );
+        // The genuine copy exceptions still flow through.
+        assert!(additional_modifications
+            .iter()
+            .any(|m| matches!(m, ContinuousModification::SetPower { value: 4 })));
+        assert!(additional_modifications.iter().any(|m| matches!(
+            m,
+            ContinuousModification::AddType {
+                core_type: CoreType::Artifact
+            }
+        )));
+        assert!(additional_modifications.iter().any(|m| matches!(
+            m,
+            ContinuousModification::AddSubtype { subtype } if subtype == "Construct"
+        )));
     }
 
     #[test]
@@ -2358,6 +2485,105 @@ mod tests {
             assert_eq!(name, descriptor);
             assert_eq!(types, expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod kazar_token_landfall_tests {
+    use super::*;
+    use crate::types::ability::ContinuousModification;
+
+    /// Ka-Zar of the Savage Land's Zabu token: the granted ability text carries
+    /// an italicized "Landfall —" ability-word prefix (CR 207.2c) before the
+    /// trigger keyword. The token-ability classifier must strip the ability word
+    /// and recognize the inner trigger (CR 603.1 / CR 603.6a) as a `GrantTrigger`
+    /// static modification — not the `GrantAbility(Unimplemented[landfall])`
+    /// catch-all produced before the fix.
+    #[test]
+    fn zabu_token_landfall_trigger_parses_as_grant_trigger() {
+        let txt = "Create Zabu, a legendary 2/2 green Cat creature token with \"Landfall — Whenever a land you control enters, put a +1/+1 counter on Zabu.\"";
+        let effect = try_parse_token(&txt.to_lowercase(), txt, &mut ParseContext::default())
+            .expect("Zabu token line must parse");
+        let Effect::Token {
+            name,
+            supertypes,
+            static_abilities,
+            ..
+        } = effect
+        else {
+            panic!("expected Effect::Token, got {effect:?}");
+        };
+        assert_eq!(name, "Zabu");
+        assert!(
+            supertypes.contains(&Supertype::Legendary),
+            "Zabu must be legendary, got {supertypes:?}"
+        );
+        let grant_trigger = static_abilities
+            .iter()
+            .flat_map(|def| def.modifications.iter())
+            .find_map(|m| match m {
+                ContinuousModification::GrantTrigger { trigger } => Some(trigger),
+                _ => None,
+            });
+        let trigger = grant_trigger.unwrap_or_else(|| {
+            panic!("landfall trigger must classify as GrantTrigger, got {static_abilities:#?}")
+        });
+        // CR 603.6a: the inner trigger is a zone-change (ETB) trigger.
+        assert_eq!(
+            trigger.mode,
+            crate::types::triggers::TriggerMode::ChangesZone
+        );
+        // No residual Unimplemented landfall effect anywhere in the parsed token.
+        assert!(
+            // allow-noncombinator: test assertion scanning debug output, not parsing dispatch.
+            !format!("{static_abilities:?}").contains("Unimplemented"),
+            "token ability must have no residual Unimplemented effect"
+        );
+    }
+
+    /// The catalog-token path (`inject_catalog_token_abilities`) re-parses the
+    /// preset `rules_text` through `classify_quoted_inner`. The Zabu preset's
+    /// rules_text begins with the "Landfall —" ability word; the same strip must
+    /// apply so the runtime injection yields a `GrantTrigger`, not a
+    /// `GrantAbility(Unimplemented)`.
+    #[test]
+    fn catalog_landfall_rules_text_classifies_as_grant_trigger() {
+        let rules_text =
+            "Landfall — Whenever a land you control enters, put a +1/+1 counter on Zabu.";
+        let mods = crate::parser::oracle_static::classify_quoted_inner(rules_text);
+        assert!(
+            mods.iter()
+                .any(|m| matches!(m, ContinuousModification::GrantTrigger { .. })),
+            "catalog rules_text must classify as GrantTrigger, got {mods:?}"
+        );
+        assert!(
+            // allow-noncombinator: test assertion scanning debug output, not parsing dispatch.
+            !format!("{mods:?}").contains("Unimplemented"),
+            "catalog classification must have no residual Unimplemented effect"
+        );
+    }
+
+    /// Full-card parse: Ka-Zar's three lines (look at top, play lands from top,
+    /// ETB token with landfall) must produce zero residual `Unimplemented`
+    /// effects after the ability-word strip fix.
+    #[test]
+    fn kazar_full_card_no_residual_unimplemented() {
+        let oracle = "You may look at the top card of your library any time.\n\
+            You may play lands from the top of your library.\n\
+            When Ka-Zar of the Savage Land enters, create Zabu, a legendary 2/2 green Cat creature token with \"Landfall — Whenever a land you control enters, put a +1/+1 counter on Zabu.\"";
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            oracle,
+            "Ka-Zar of the Savage Land",
+            &[],
+            &["Legendary".to_string(), "Creature".to_string()],
+            &["Human".to_string(), "Warrior".to_string()],
+        );
+        let debug = format!("{parsed:?}");
+        assert!(
+            // allow-noncombinator: test assertion scanning debug output, not parsing dispatch.
+            !debug.contains("Unimplemented"),
+            "Ka-Zar must parse to zero residual Unimplemented, got: {debug}"
+        );
     }
 }
 

@@ -1,6 +1,8 @@
 {
   "resolutionProgress": {
-    "label": "Risoluzione {{resolved}} / {{total}}"
+    "label": "Risoluzione {{resolved}} / {{total}}",
+    "collapse": "Comprimi avanzamento risoluzione",
+    "expand": "Espandi avanzamento risoluzione"
   },
   "card": {
     "faceDownName": "Carta coperta",
@@ -171,6 +173,8 @@
     "copyTooltip": "Copia pedina di una carta reale",
     "ringBearer": "Anello",
     "ringBearerTooltip": "Portatore dell'Anello",
+    "hiddenAttachments": "+{{count}} more attached",
+    "hiddenExileCards": "+{{count}} more exiled",
     "sacrifice": "Sacrifice",
     "boardChoiceBadges": {
       "sacrifice": "Sac",
@@ -208,6 +212,7 @@
     "allTo": "Tutti → <name>{{label}}</name>",
     "creatureFallback": "Creatura #{{id}}",
     "planeswalkerFallback": "Planeswalker #{{id}}",
+    "objectFallback": "Object #{{id}}",
     "you": "Tu",
     "ally": "Alleato",
     "restoreDialog": "Ripristina finestra",
@@ -354,7 +359,8 @@
     "onlyForActivation": "Spendi solo per attivare abilità",
     "onlyForXCosts": "Spendi solo su costi che includono {X}",
     "convokePayment": "Pagamento di Convocare",
-    "grantsProperty": "Concede una proprietà alla magia"
+    "grantsProperty": "Concede una proprietà alla magia",
+    "grantCantBeCountered": "Spendi per questa magia per renderla impossibile da neutralizzare"
   },
   "zone": {
     "commandZone": "Zona di comando",
@@ -411,13 +417,22 @@
     "paymentPending": "Il pagamento è ancora in sospeso. TAPpa i permanenti o annulla questa azione.",
     "poolLabel": "Riserva:",
     "poolEmpty": "Vuota",
+    "pinUnit": "Fissa questo mana per pagare per primo",
+    "unpinUnit": "Rimuovi fissaggio di questo mana",
     "pay": "Paga",
     "chooseAmountTitle": "Scegli quanto pagare",
     "chooseAmountAria": "Scegli quanto pagare",
     "payAmount": "Paga {{value}} {{resource}}",
     "resourceEnergy": "energia",
     "resourceMana": "mana",
-    "resourceCounters": "segnalini"
+    "resourceCounters": "segnalini",
+    "resourceSpeed": "velocità",
+    "manualMana": "Manuale",
+    "manualManaTooltip": "Mana manuale — solo questa partita. TAPpa le tue terre e il tuo mana per pagare.",
+    "spendHint": "Clicca sul tuo mana per spenderlo per questo costo",
+    "covered": "✓ Coperto",
+    "spending": "In spesa",
+    "fillHint": "(maiusc+clic per aggiungere tutti di una fonte)"
   },
   "hand": {
     "viewFullHand_one": "Vedi la mano completa ({{count}} carta)",
@@ -493,6 +508,7 @@
     "controllerInitialOpp": "G{{seat}}",
     "targetingLabel": "Bersaglia {{label}}",
     "titleTargets": "Bersagli: {{targets}}",
+    "titleModes": "Modalità: {{modes}}",
     "titlePaid": "Pagato: {{paid}}",
     "titleContext": "Contesto: {{context}}",
     "paidXValue": "X={{value}}",
@@ -516,6 +532,7 @@
     "tapUntappedCreatures_other": "TAPpa {{count}} creature STAPpate",
     "chooseTargetOf": "Scegli il bersaglio {{current}} di {{total}}",
     "chooseTarget": "Scegli un bersaglio",
+    "triggerDamageAmount": "This trigger: {{amount}} damage",
     "noLegalTargets": "Nessun bersaglio legale disponibile",
     "modeContext": "{{mode}} — {{prompt}}",
     "upToOne": "fino a un {{target}}",
@@ -883,6 +900,7 @@
     "startMatch": "Avvia partita",
     "startMatchWithOpponents": "Avvia partita ({{count}} avv.)",
     "deckNotLegal": "Il mazzo non è legale in {{format}}.",
+    "aiUnsupportedFormat": "{{format}} è disponibile per ospitare partite multigiocatore, ma le partite contro l'IA non sono ancora supportate.",
     "cedhWarning": "Il tuo mazzo è di bracket {{bracket}} contro un'IA cEDH: preparati a perdere in fretta.",
     "cedhWarningUntagged": "non assegnato",
     "bracketViolation": {
@@ -1211,6 +1229,22 @@
       "title": "Raccogli prove",
       "subtitle": "Esilia carte dal tuo cimitero con valore di mana totale {{minimum}} o superiore"
     },
+    "bulk": {
+      "selectAll": "Tutti",
+      "invert": "Inverti",
+      "clear": "Cancella",
+      "sortLabel": "Ordina",
+      "groupLabel": "Raggruppa",
+      "optNone": "Nessuno",
+      "optName": "Nome",
+      "optCmc": "Valore di mana",
+      "optType": "Tipo",
+      "optColor": "Colore",
+      "counterDiscard": "Scarta {{selected}} di {{cap}}",
+      "counterKeep": "Tieni {{selected}} di {{cap}}",
+      "keepInstead": "Tieni invece",
+      "discardInstead": "Scarta invece"
+    },
     "discard": {
       "title": "Scarta",
       "titleAdditionalCost": "Scarta come costo aggiuntivo",
@@ -1225,7 +1259,9 @@
       "subtitleUpTo_other": "Scegli fino a {{count}} carte da scartare",
       "subtitleUnless": "Scegli {{count}} carte o 1 carta corrispondente da scartare",
       "subtitleExact_one": "Scegli {{count}} carta da scartare",
-      "subtitleExact_other": "Scegli {{count}} carte da scartare"
+      "subtitleExact_other": "Scegli {{count}} carte da scartare",
+      "subtitleKeep_one": "Scegli 1 carta da tenere — il resto viene scartato",
+      "subtitleKeep_other": "Scegli {{count}} carte da tenere — il resto viene scartato"
     },
     "harmonize": {
       "title": "Armonizzare",
@@ -1296,6 +1332,17 @@
     "red": "Rosso",
     "green": "Verde"
   },
+  "roomDoor": {
+    "title": "Scegli una porta",
+    "subtitle": "Scegli su quale porta della Stanza agire",
+    "confirm": "Conferma",
+    "option": "{{op}} {{door}}",
+    "unlock": "Sblocca",
+    "lock": "Blocca",
+    "lockOrUnlock": "Blocca o sblocca",
+    "left": "porta sinistra",
+    "right": "porta destra"
+  },
   "dialogShell": {
     "eyebrow": "Scelta di gioco",
     "restoreDialog": "Ripristina finestra",
@@ -1360,6 +1407,10 @@
     "spectacleNormalLabel": "Lancia normalmente",
     "spectacleAltLabel": "Lancia con Spettacolo",
     "spectacleSubtitle": "Lancia {{name}} normalmente, o paga il suo costo di Spettacolo (disponibile perché un avversario ha perso punti vita in questo turno).",
+    "prowlEyebrow": "Prowl",
+    "prowlNormalLabel": "Lancia normalmente",
+    "prowlAltLabel": "Lancia con Prowl",
+    "prowlSubtitle": "Lancia {{name}} normalmente, o paga il suo costo di Prowl (disponibile perché una creatura corrispondente ha inflitto danno da combattimento a un giocatore in questo turno).",
     "overloadEyebrow": "Sovraccarico",
     "overloadNormalLabel": "Lancia normalmente",
     "overloadAltLabel": "Lancia con Sovraccarico",
@@ -1513,6 +1564,9 @@
     "connectionBody": "phase.rs ha perso il collegamento con il motore di gioco — più spesso causato da un aggiornamento in background attivatosi a metà partita. Il tuo ultimo turno salvato è preservato; ricarica per ripristinare la partita.",
     "diagnostic": "diagnostica: {{reason}}",
     "showDetails": "Mostra dettagli",
+    "exportGameState": "Esporta stato partita",
+    "exported": "Esportato",
+    "exportFailed": "Esportazione non riuscita",
     "copyDiagnostic": "Copia diagnostica",
     "copied": "Copiato!",
     "reportOnGithub": "Segnala su GitHub",
@@ -1790,5 +1844,20 @@
     "skip": "Skip",
     "groupCount": "{{selected}} / {{count}} selected",
     "groupPower": "Power {{selected}} / {{required}}"
+  },
+  "planechase": {
+    "active": "Active plane",
+    "none": "None",
+    "noPlane": "No plane",
+    "deckCount": "{{count}} in deck",
+    "cost": "Cost",
+    "roll": "Roll planar die"
+  },
+  "archenemy": {
+    "active": "Active scheme",
+    "none": "None",
+    "noScheme": "No scheme",
+    "deckCount": "{{count}} in deck",
+    "heroCount": "{{count}} heroes"
   }
 }

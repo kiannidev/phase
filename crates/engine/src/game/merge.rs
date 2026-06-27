@@ -233,7 +233,19 @@ fn merged_copiable_values(
         abilities.extend(abil.iter().cloned());
         triggers.extend(trig.iter().cloned());
         statics.extend(stat.iter().cloned());
-        replacements.extend(repl.iter().cloned());
+        // CR 707.2 / CR 611.2b: merged copiable values are printed/defining
+        // characteristics, not the runtime "for as long as you control ~" locks
+        // another permanent installed on a component. Those gated defs live in
+        // base only for layer-reset survival; exclude them from this
+        // copiable-values surface (mirrors `intrinsic_copiable_values`) so a
+        // merged permanent does not inherit a component host's runtime lock.
+        replacements.extend(
+            repl.iter()
+                .filter(|def| {
+                    !crate::game::printed_cards::is_runtime_control_gated_replacement(def)
+                })
+                .cloned(),
+        );
         for kw in kws {
             if !keywords.contains(&kw) {
                 keywords.push(kw);
@@ -249,7 +261,7 @@ fn merged_copiable_values(
     Some((values, display_source, printed_ref, token_image_ref))
 }
 
-fn remove_merge_layer_effect(state: &mut GameState, target_id: ObjectId) {
+pub(crate) fn remove_merge_layer_effect(state: &mut GameState, target_id: ObjectId) {
     let effect_id = state
         .objects
         .get(&target_id)
@@ -551,7 +563,7 @@ fn put_component_into_zone(
     // (mirrors `move_to_zone`, which snapshots before exit cleanup). Origin is
     // `None`: the component enters `dest` as a new object, not as a departure
     // from the battlefield.
-    let Some((owner, record)) = state.objects.get(&component_id).map(|obj| {
+    let Some((owner, mut record)) = state.objects.get(&component_id).map(|obj| {
         (
             obj.owner,
             obj.snapshot_for_zone_change(component_id, None, dest),
@@ -583,7 +595,9 @@ fn put_component_into_zone(
         crate::game::zones::record_descend_on_graveyard_arrival(state, component_id, owner);
     }
 
-    crate::game::restrictions::record_zone_change(state, record.clone());
+    let turn_zone_change_index =
+        crate::game::restrictions::record_zone_change(state, record.clone());
+    record.turn_zone_change_index = turn_zone_change_index;
     events.push(GameEvent::ZoneChanged {
         object_id: component_id,
         from: None,

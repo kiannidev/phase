@@ -3,11 +3,14 @@ use crate::types::ability::{
     TargetRef, TargetSelectionMode,
 };
 use crate::types::events::GameEvent;
-use crate::types::game_state::{GameState, PendingCast, StackEntry, StackEntryKind, WaitingFor};
+use crate::types::game_state::{
+    CostResume, GameState, PayCostKind, PendingCast, StackEntry, StackEntryKind, WaitingFor,
+};
 use crate::types::identifiers::ObjectId;
 use crate::types::keywords::Keyword;
 use crate::types::mana::ManaCost;
 use crate::types::player::PlayerId;
+use crate::types::zones::ExileCostSourceZone;
 
 use super::ability_utils::{
     ability_target_legality_needs_chosen_x, assign_selected_slots_in_chain,
@@ -22,6 +25,7 @@ use super::casting_costs::{
     finish_pending_cast_cost_or_pay,
 };
 use super::engine::EngineError;
+use super::priority;
 use super::restrictions;
 use super::stack;
 
@@ -336,8 +340,7 @@ pub(crate) fn handle_select_targets(
             player,
             events,
         );
-        state.priority_passes.clear();
-        state.priority_pass_count = 0;
+        priority::clear_priority_passes(state);
         return Ok(WaitingFor::Priority { player });
     }
 
@@ -445,8 +448,7 @@ pub(crate) fn handle_choose_target(
                     player,
                     events,
                 );
-                state.priority_passes.clear();
-                state.priority_pass_count = 0;
+                priority::clear_priority_passes(state);
                 return Ok(drain_deferred_triggers_after_stack_object_announcement(
                     state,
                     events,
@@ -481,12 +483,44 @@ fn pay_activation_costs_after_target_selection(
             player,
             pending.object_id,
             &pending.cost,
+            super::casting::activation_ability_tag(state, pending.object_id, ability_index),
             events,
             &excluded_sources,
+            // Top-level ability activation: no outer cost on the stack.
+            None,
         )?;
     }
 
     if let Some(ref activation_cost) = pending.activation_cost {
+        if let Some((count, zone, filter)) = super::casting::find_non_self_exile(activation_cost) {
+            let narrow_zone = ExileCostSourceZone::try_from_zone(zone)
+                .expect("find_non_self_exile restricts zone to Hand or Graveyard");
+            let eligible = super::casting::find_eligible_exile_for_cost_targets(
+                state,
+                player,
+                pending.object_id,
+                narrow_zone,
+                filter,
+            );
+            if eligible.len() < count as usize {
+                return Err(EngineError::ActionNotAllowed(
+                    "Not enough eligible cards to exile".into(),
+                ));
+            }
+            let mut pending = pending.clone();
+            pending.ability = assigned_ability;
+            return Ok(Some(WaitingFor::PayCost {
+                player,
+                kind: PayCostKind::ExileFromZone { zone: narrow_zone },
+                choices: eligible,
+                count: count as usize,
+                min_count: 0,
+                resume: CostResume::Spell {
+                    spell: Box::new(pending),
+                },
+            }));
+        }
+
         let should_record_loyalty = crate::types::ability::is_loyalty_ability_cost(activation_cost)
             && super::planeswalker::can_activate_loyalty_ability(
                 state,
@@ -506,6 +540,7 @@ fn pay_activation_costs_after_target_selection(
                 player,
                 pending.object_id,
                 activation_cost,
+                super::casting::activation_ability_tag(state, pending.object_id, ability_index),
                 events,
             )?
         {

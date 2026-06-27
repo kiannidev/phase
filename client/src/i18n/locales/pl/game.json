@@ -1,6 +1,8 @@
 {
   "resolutionProgress": {
-    "label": "Rozwiązywanie {{resolved}} / {{total}}"
+    "label": "Rozwiązywanie {{resolved}} / {{total}}",
+    "collapse": "Zwiń postęp rozwiązywania",
+    "expand": "Rozwiń postęp rozwiązywania"
   },
   "card": {
     "faceDownName": "Karta zakryta",
@@ -171,6 +173,8 @@
     "copyTooltip": "Kopia tokenowa prawdziwej karty",
     "ringBearer": "Pierścień",
     "ringBearerTooltip": "Powiernik Pierścienia",
+    "hiddenAttachments": "+{{count}} more attached",
+    "hiddenExileCards": "+{{count}} more exiled",
     "sacrifice": "Sacrifice",
     "boardChoiceBadges": {
       "sacrifice": "Sac",
@@ -208,6 +212,7 @@
     "allTo": "Wszyscy → <name>{{label}}</name>",
     "creatureFallback": "Stwór #{{id}}",
     "planeswalkerFallback": "Wędrowiec #{{id}}",
+    "objectFallback": "Object #{{id}}",
     "you": "Ty",
     "ally": "Sojusznik",
     "restoreDialog": "Przywróć okno dialogowe",
@@ -354,7 +359,8 @@
     "onlyForActivation": "Wydaj tylko na aktywowanie zdolności",
     "onlyForXCosts": "Wydaj tylko na koszty zawierające {X}",
     "convokePayment": "Płatność Convoke",
-    "grantsProperty": "Nadaje czarowi właściwość"
+    "grantsProperty": "Nadaje czarowi właściwość",
+    "grantCantBeCountered": "Wydaj na ten czar, aby nie można było go skontrować"
   },
   "zone": {
     "commandZone": "Strefa dowodzenia",
@@ -411,13 +417,22 @@
     "paymentPending": "Płatność wciąż oczekuje. Obróć trwałe lub anuluj tę akcję.",
     "poolLabel": "Pula:",
     "poolEmpty": "Pusta",
+    "pinUnit": "Przypnij tę manę, aby zapłacić najpierw",
+    "unpinUnit": "Odepnij tę manę",
     "pay": "Zapłać",
     "chooseAmountTitle": "Wybierz kwotę do zapłaty",
     "chooseAmountAria": "Wybierz kwotę do zapłaty",
     "payAmount": "Zapłać {{value}} {{resource}}",
     "resourceEnergy": "energii",
     "resourceMana": "many",
-    "resourceCounters": "znaczników"
+    "resourceCounters": "znaczników",
+    "resourceSpeed": "prędkości",
+    "manualMana": "Ręcznie",
+    "manualManaTooltip": "Ręczna mana — tylko ta gra. Stuknij własne ziemie i manę, aby zapłacić.",
+    "spendHint": "Kliknij swoją manę, aby wydać ją na ten koszt",
+    "covered": "✓ Pokryte",
+    "spending": "Wydawane",
+    "fillHint": "(shift+klik dodaje wszystkie z jednego źródła)"
   },
   "hand": {
     "viewFullHand_one": "Zobacz całą rękę ({{count}} karta)",
@@ -493,6 +508,7 @@
     "controllerInitialOpp": "G{{seat}}",
     "targetingLabel": "Obiera za cel {{label}}",
     "titleTargets": "Cele: {{targets}}",
+    "titleModes": "Tryb: {{modes}}",
     "titlePaid": "Zapłacono: {{paid}}",
     "titleContext": "Kontekst: {{context}}",
     "paidXValue": "X={{value}}",
@@ -518,6 +534,7 @@
     "tapUntappedCreatures_other": "Obróć {{count}} nieobróconych stworów",
     "chooseTargetOf": "Wybierz cel {{current}} z {{total}}",
     "chooseTarget": "Wybierz cel",
+    "triggerDamageAmount": "This trigger: {{amount}} damage",
     "noLegalTargets": "Brak dostępnych dozwolonych celów",
     "modeContext": "{{mode}} — {{prompt}}",
     "upToOne": "do jednego {{target}}",
@@ -883,6 +900,7 @@
     "startMatch": "Rozpocznij mecz",
     "startMatchWithOpponents": "Rozpocznij mecz ({{count}} przec.)",
     "deckNotLegal": "Talia nie jest dozwolona w formacie {{format}}.",
+    "aiUnsupportedFormat": "{{format}} jest dostępny do hostowania gier wieloosobowych, ale mecze z AI nie są jeszcze obsługiwane.",
     "cedhWarning": "Twoja talia to bracket {{bracket}} przeciwko SI cEDH — spodziewaj się szybkiej porażki.",
     "cedhWarningUntagged": "bez bracketu",
     "bracketViolation": {
@@ -1211,6 +1229,22 @@
       "title": "Zbierz dowody",
       "subtitle": "Wygnaj karty ze swojego cmentarza o łącznej wartości many {{minimum}} lub większej"
     },
+    "bulk": {
+      "selectAll": "Zaznacz wszystko",
+      "invert": "Odwróć",
+      "clear": "Wyczyść",
+      "sortLabel": "Sortuj",
+      "groupLabel": "Grupuj",
+      "optNone": "Brak",
+      "optName": "Nazwa",
+      "optCmc": "Wartość many",
+      "optType": "Typ",
+      "optColor": "Kolor",
+      "counterDiscard": "Odrzuć {{selected}} z {{cap}}",
+      "counterKeep": "Zatrzymaj {{selected}} z {{cap}}",
+      "keepInstead": "Zatrzymaj zamiast tego",
+      "discardInstead": "Odrzuć zamiast tego"
+    },
     "discard": {
       "title": "Odrzuć",
       "titleAdditionalCost": "Odrzuć jako koszt dodatkowy",
@@ -1225,7 +1259,9 @@
       "subtitleUpTo_other": "Wybierz do {{count}} kart do odrzucenia",
       "subtitleUnless": "Wybierz {{count}} kart lub 1 pasującą kartę do odrzucenia",
       "subtitleExact_one": "Wybierz {{count}} kartę do odrzucenia",
-      "subtitleExact_other": "Wybierz {{count}} kart do odrzucenia"
+      "subtitleExact_other": "Wybierz {{count}} kart do odrzucenia",
+      "subtitleKeep_one": "Wybierz 1 kartę do zatrzymania — reszta zostaje odrzucona",
+      "subtitleKeep_other": "Wybierz {{count}} kart do zatrzymania — reszta zostaje odrzucona"
     },
     "harmonize": {
       "title": "Harmonize",
@@ -1296,6 +1332,17 @@
     "red": "Czerwony",
     "green": "Zielony"
   },
+  "roomDoor": {
+    "title": "Wybierz drzwi",
+    "subtitle": "Wybierz, na które drzwi Pokoju zadziałać",
+    "confirm": "Potwierdź",
+    "option": "{{op}} {{door}}",
+    "unlock": "Odblokuj",
+    "lock": "Zablokuj",
+    "lockOrUnlock": "Zablokuj lub odblokuj",
+    "left": "lewe drzwi",
+    "right": "prawe drzwi"
+  },
   "dialogShell": {
     "eyebrow": "Wybór w grze",
     "restoreDialog": "Przywróć okno dialogowe",
@@ -1360,6 +1407,10 @@
     "spectacleNormalLabel": "Rzuć normalnie",
     "spectacleAltLabel": "Rzuć z Spectacle",
     "spectacleSubtitle": "Rzuć {{name}} normalnie lub zapłać jego koszt Spectacle (dostępny, ponieważ przeciwnik stracił życie w tej turze).",
+    "prowlEyebrow": "Prowl",
+    "prowlNormalLabel": "Rzuć normalnie",
+    "prowlAltLabel": "Rzuć z Prowl",
+    "prowlSubtitle": "Rzuć {{name}} normalnie lub zapłać jego koszt Prowl (dostępny, ponieważ pasujący stwór zadał graczowi obrażenia bojowe w tej turze).",
     "overloadEyebrow": "Overload",
     "overloadNormalLabel": "Rzuć normalnie",
     "overloadAltLabel": "Rzuć z Overload",
@@ -1513,6 +1564,9 @@
     "connectionBody": "phase.rs utracił połączenie z silnikiem gry — najczęściej spowodowane aktualizacją w tle aktywowaną w trakcie gry. Twoja ostatnia zapisana tura jest zachowana; odśwież, aby przywrócić grę.",
     "diagnostic": "diagnostyka: {{reason}}",
     "showDetails": "Pokaż szczegóły",
+    "exportGameState": "Eksportuj stan gry",
+    "exported": "Wyeksportowano",
+    "exportFailed": "Eksport nie powiódł się",
     "copyDiagnostic": "Kopiuj diagnostykę",
     "copied": "Skopiowano!",
     "reportOnGithub": "Zgłoś na GitHub",
@@ -1790,5 +1844,20 @@
     "skip": "Skip",
     "groupCount": "{{selected}} / {{count}} selected",
     "groupPower": "Power {{selected}} / {{required}}"
+  },
+  "planechase": {
+    "active": "Active plane",
+    "none": "None",
+    "noPlane": "No plane",
+    "deckCount": "{{count}} in deck",
+    "cost": "Cost",
+    "roll": "Roll planar die"
+  },
+  "archenemy": {
+    "active": "Active scheme",
+    "none": "None",
+    "noScheme": "No scheme",
+    "deckCount": "{{count}} in deck",
+    "heroCount": "{{count}} heroes"
   }
 }

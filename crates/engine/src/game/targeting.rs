@@ -183,6 +183,8 @@ fn find_legal_targets_with_context(
                     // CR 603.2 + CR 109.4: The triggering player is fixed by
                     // the event, not enumerated as a target candidate. Fail closed.
                     Some(ControllerRef::TriggeringPlayer) => false,
+                    // CR 303.4b: Enchanted-player scope is not enumerated as a target candidate. Fail closed.
+                    Some(ControllerRef::EnchantedPlayer) => false,
                     None => true,
                 };
                 if include {
@@ -534,6 +536,9 @@ pub fn resolved_targets(
             .collect();
     }
     if matches!(target_filter, TargetFilter::ParentTarget) && ability.targets.is_empty() {
+        if let Some(targets) = parent_target_refs_from_attack_trigger_context(state) {
+            return targets;
+        }
         if let Some(target) = resolve_event_context_target(state, target_filter, ability.source_id)
         {
             return vec![target];
@@ -607,6 +612,7 @@ fn is_pure_event_context_filter(target_filter: &TargetFilter) -> bool {
             | TargetFilter::TriggeringSpellOwner
             | TargetFilter::TriggeringPlayer
             | TargetFilter::TriggeringSource
+            | TargetFilter::EventTarget
             | TargetFilter::DefendingPlayer
             | TargetFilter::AttachedTo
             | TargetFilter::ParentTargetController
@@ -687,7 +693,7 @@ pub(crate) fn resolved_object_ids_for_filter(
             .collect(),
         TargetFilter::LastCreated => state.last_created_token_ids.clone(),
         TargetFilter::LastRevealed => state.last_revealed_ids.clone(),
-        TargetFilter::TriggeringSource | TargetFilter::AttachedTo => {
+        TargetFilter::TriggeringSource | TargetFilter::EventTarget | TargetFilter::AttachedTo => {
             resolve_event_context_target(state, filter, ability.source_id)
                 .and_then(|target| target_ref_object(&target))
                 .into_iter()
@@ -767,6 +773,37 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
             let obj_id = extract_source_from_event(event)?;
             Some(TargetRef::Object(obj_id))
         }
+        // CR 603.2 + CR 120.1: "that creature" / "that permanent" — the object
+        // that *received* the triggering event's damage (recipient counterpart
+        // of `TriggeringSource`). Resolves via the same authority
+        // `ObjectScope::EventTarget` uses so the antecedent is the specific
+        // damaged object, never a generic type filter.
+        TargetFilter::EventTarget => {
+            let event = event?;
+            let obj_id = extract_target_object_from_event(event)?;
+            Some(TargetRef::Object(obj_id))
+        }
+        // CR 603.7c + CR 109.4 + CR 110.2: "the attacking player" / "its
+        // controller" — the controller of the triggering event's source object
+        // (the player-level counterpart of `TriggeringSource`, mirroring
+        // `TriggeringSpellController`). Contested Game Ball's DamageReceived
+        // trigger needs the controller of the creature that dealt combat
+        // damage, not the damaged player.
+        TargetFilter::TriggeringSourceController => {
+            let event = event?;
+            let source_obj_id = extract_source_from_event(event)?;
+            let controller = state
+                .objects
+                .get(&source_obj_id)
+                .map(|obj| obj.controller)
+                .or_else(|| {
+                    state
+                        .lki_cache
+                        .get(&source_obj_id)
+                        .map(|lki| lki.controller)
+                })?;
+            Some(TargetRef::Player(controller))
+        }
         TargetFilter::ParentTarget => {
             let event = event?;
             blocked_attacker_from_event(event, source_id).map(TargetRef::Object)
@@ -839,6 +876,29 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
         TargetFilter::PostReplacementDamageTarget => state.post_replacement_event_target.clone(),
         _ => None,
     }
+}
+
+/// CR 603.2c + CR 608.2c: For batched attack triggers, "those creatures"
+/// anaphorically refers to every attacker that satisfied the trigger subject
+/// in the contextual `AttackersDeclared` event (Champions from Beyond Full Party).
+fn parent_target_refs_from_attack_trigger_context(state: &GameState) -> Option<Vec<TargetRef>> {
+    let events: Vec<&GameEvent> = if state.current_trigger_events.is_empty() {
+        state.current_trigger_event.iter().collect()
+    } else {
+        state.current_trigger_events.iter().collect()
+    };
+    let mut seen = HashSet::new();
+    let targets: Vec<TargetRef> = events
+        .iter()
+        .filter_map(|event| match event {
+            GameEvent::AttackersDeclared { attacker_ids, .. } => Some(attacker_ids.as_slice()),
+            _ => None,
+        })
+        .flat_map(|attacker_ids| attacker_ids.iter())
+        .filter(|id| seen.insert(**id))
+        .map(|id| TargetRef::Object(*id))
+        .collect();
+    (!targets.is_empty()).then_some(targets)
 }
 
 fn blocked_attacker_from_event(
@@ -966,6 +1026,7 @@ pub(crate) fn extract_source_from_event(
         GameEvent::TurnedFaceUp { object_id } => Some(*object_id),
         GameEvent::Cycled { object_id, .. } => Some(*object_id),
         GameEvent::CreatureSuspected { object_id } => Some(*object_id),
+        GameEvent::CreatureNoLongerSuspected { object_id } => Some(*object_id),
         GameEvent::Detained { object_id } => Some(*object_id),
         GameEvent::CaseSolved { object_id } => Some(*object_id),
         GameEvent::AttackersDeclared { attacker_ids, .. } if attacker_ids.len() == 1 => {
@@ -3667,6 +3728,69 @@ mod tests {
         );
     }
 
+    /// Issue #4268 + CR 508.5: An Equipment/Aura attack trigger ("Whenever
+    /// equipped creature attacks, ... tap up to one target creature defending
+    /// player controls" — Greatsword of Tyr) has the EQUIPMENT as its ability
+    /// source. The equipped creature, not the Equipment, is the attacker in
+    /// `state.combat.attackers`, so keying `DefendingPlayer` resolution on the
+    /// source id alone finds no attacker and matches no object. Target-legality
+    /// (`matches_target_filter` → `filter_inner_for_object`) must fall back to
+    /// the attacker carried by `current_trigger_event` (CR 508.5a: the defending
+    /// player is determined for that attacking creature), so the defending
+    /// player's creature satisfies the `DefendingPlayer`-controlled filter while
+    /// the attacking player's own creature does not.
+    #[test]
+    fn defending_player_filter_resolves_from_attacker_when_source_is_equipment() {
+        use crate::game::combat::{AttackTarget, AttackerInfo};
+        use crate::game::filter::{matches_target_filter, FilterContext};
+        use crate::types::ability::{ControllerRef, TypedFilter};
+
+        // c0 = P0's creature (the defending player's creature); `attacker` = P1's
+        // equipped creature.
+        let (mut state, c0, attacker) = setup_with_creatures();
+
+        // P1 controls a separate Equipment object — the ability source. It is
+        // NOT an attacker and never appears in `combat.attackers`.
+        let equipment = create_object(
+            &mut state,
+            CardId(99),
+            PlayerId(1),
+            "Greatsword of Tyr".to_string(),
+            Zone::Battlefield,
+        );
+
+        // The equipped creature attacks P0.
+        let combat = state.combat.get_or_insert_with(Default::default);
+        combat.attackers.push(AttackerInfo::new(
+            attacker,
+            AttackTarget::Player(PlayerId(0)),
+            PlayerId(0),
+        ));
+
+        // The attack trigger fired for the single equipped attacker.
+        state.current_trigger_event = Some(crate::types::events::GameEvent::AttackersDeclared {
+            attacker_ids: vec![attacker],
+            defending_player: PlayerId(0),
+            attacks: vec![(attacker, AttackTarget::Player(PlayerId(0)))],
+        });
+
+        let filter =
+            TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::DefendingPlayer));
+        // Filter is evaluated with the Equipment as source — NOT the attacker.
+        let ctx = FilterContext::from_source(&state, equipment);
+
+        assert!(
+            matches_target_filter(&state, c0, &filter, &ctx),
+            "the defending player's creature must be a legal target even though the \
+             ability source (the Equipment) is not itself the attacker"
+        );
+        assert!(
+            !matches_target_filter(&state, attacker, &filter, &ctx),
+            "the attacking player's own creature is not controlled by the defending \
+             player and must not match"
+        );
+    }
+
     /// CR 608.2c (issue #323): `SelfRef` always resolves to the source object,
     /// even when `ability.targets` is non-empty. The chained "Exile ~"
     /// sub-ability of cards like Treasured Find / Arc Blade gets its
@@ -3706,6 +3830,40 @@ mod tests {
         let result = resolved_targets(&ability, &TargetFilter::ParentTarget, &state);
 
         assert_eq!(result, vec![TargetRef::Object(attacker)]);
+    }
+
+    /// CR 603.2c + CR 608.2c: batched attack triggers pump every attacker that
+    /// satisfied the subject ("those creatures get +4/+4").
+    #[test]
+    fn resolved_targets_parent_target_for_attack_event_returns_all_attackers() {
+        let (mut state, _, _) = setup_with_creatures();
+        let a1 = create_object(
+            &mut state,
+            CardId(10),
+            PlayerId(0),
+            "Attacker 1".to_string(),
+            Zone::Battlefield,
+        );
+        let a2 = create_object(
+            &mut state,
+            CardId(11),
+            PlayerId(0),
+            "Attacker 2".to_string(),
+            Zone::Battlefield,
+        );
+        state.current_trigger_event = Some(crate::types::events::GameEvent::AttackersDeclared {
+            attacker_ids: vec![a1, a2],
+            defending_player: PlayerId(1),
+            attacks: vec![
+                (a1, crate::game::combat::AttackTarget::Player(PlayerId(1))),
+                (a2, crate::game::combat::AttackTarget::Player(PlayerId(1))),
+            ],
+        });
+        let ability = make_resolved_with_targets(vec![], a1);
+
+        let result = resolved_targets(&ability, &TargetFilter::ParentTarget, &state);
+
+        assert_eq!(result, vec![TargetRef::Object(a1), TargetRef::Object(a2)]);
     }
 
     /// CR 601.2c (issue #2351): player-chosen stack targets must not be replaced

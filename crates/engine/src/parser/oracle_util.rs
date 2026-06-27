@@ -440,9 +440,9 @@ pub fn parse_count_expr(text: &str) -> Option<(QuantityExpr, &str)> {
             ));
         }
     }
-    // CR 107.1b: "equal to <quantity ref>" — composes the existing
-    // QuantityRef parser into the count-position. Strips the prefix, hands
-    // the trimmed tail to the shared `parse_quantity_ref` building block.
+    // CR 107.1b: "equal to <quantity expr>" — delegate to the shared
+    // `parse_cda_quantity` grammar so composed forms (twice/half/offset/sum/
+    // difference/max/aggregate) parse in count positions, not just bare refs.
     if let Some(((), rest_lower)) = super::oracle_nom::bridge::nom_on_lower(text, &lower, |i| {
         nom::combinator::value(
             (),
@@ -451,8 +451,8 @@ pub fn parse_count_expr(text: &str) -> Option<(QuantityExpr, &str)> {
         .parse(i)
     }) {
         let trimmed = rest_lower.trim_end_matches('.').trim_end();
-        if let Some(qty) = super::oracle_quantity::parse_quantity_ref(trimmed) {
-            return Some((QuantityExpr::Ref { qty }, ""));
+        if let Some(expr) = parse_cda_quantity(trimmed) {
+            return Some((expr, ""));
         }
     }
 
@@ -924,451 +924,18 @@ const SUBTYPE_PLURALS: &[(&str, &str)] = &[
 /// recognizes the "outlaw[s]" head noun.
 pub const OUTLAW_SUBTYPES: [&str; 5] = ["Assassin", "Mercenary", "Pirate", "Rogue", "Warlock"];
 
-/// Comprehensive list of MTG subtypes (creature types, land types, spell types, etc.).
-/// Case-insensitive matching is done by lowercasing the input.
-/// This covers the standard MTGJSON subtype list plus common Oracle text usage.
-const SUBTYPES: &[&str] = &[
-    // ── Creature types (alphabetical) ──
-    "Advisor",
-    "Aetherborn",
-    "Alien",
-    "Ally",
-    "Angel",
-    "Antelope",
-    "Ape",
-    "Archer",
-    "Archon",
-    "Armadillo",
-    "Army",
-    "Artificer",
-    "Assassin",
-    "Assembly-Worker",
-    "Astartes",
-    "Atog",
-    "Aurochs",
-    "Autobot",
-    "Avatar",
-    "Azra",
-    "Badger",
-    "Balloon",
-    "Barbarian",
-    "Bard",
-    "Basilisk",
-    "Bat",
-    "Bear",
-    "Beast",
-    "Beeble",
-    "Beholder",
-    "Berserker",
-    "Bird",
-    "Blinkmoth",
-    "Boar",
-    "Brainiac",
-    "Bringer",
-    "Brushwagg",
-    "Bureaucrat",
-    "Camarid",
-    "Camel",
-    "Capybara",
-    "Caribou",
-    "Carrier",
-    "Cat",
-    "Centaur",
-    "Cephalid",
-    "Chimera",
-    "Citizen",
-    "Cleric",
-    "Clown",
-    "Cockatrice",
-    "Construct",
-    "Coward",
-    "Crab",
-    "Crocodile",
-    "Ctan",
-    "Custodes",
-    "Cyberman",
-    "Cyborg",
-    "Cyclops",
-    "Dalek",
-    "Dauthi",
-    "Demigod",
-    "Demon",
-    "Deserter",
-    "Detective",
-    "Devil",
-    "Dinosaur",
-    "Djinn",
-    "Doctor",
-    "Dog",
-    "Dragon",
-    "Drake",
-    "Dreadnought",
-    "Drone",
-    "Druid",
-    "Dryad",
-    "Dwarf",
-    "Efreet",
-    "Egg",
-    "Elder",
-    "Eldrazi",
-    "Elemental",
-    "Elephant",
-    "Elf",
-    "Elk",
-    "Employee",
-    "Eye",
-    "Faerie",
-    "Ferret",
-    "Fish",
-    "Flagbearer",
-    "Fox",
-    "Fractal",
-    "Frog",
-    "Fungus",
-    "Gamer",
-    "Gamma",
-    "Gargoyle",
-    "Germ",
-    "Giant",
-    "Gith",
-    "Glimmer",
-    "Gnoll",
-    "Gnome",
-    "Goat",
-    "Goblin",
-    "God",
-    "Golem",
-    "Gorgon",
-    "Graveborn",
-    "Gremlin",
-    "Griffin",
-    "Guest",
-    "Hag",
-    "Halfling",
-    "Hamster",
-    "Harpy",
-    "Head",
-    "Hellion",
-    "Hero",
-    "Hippo",
-    "Hippogriff",
-    "Homarid",
-    "Homunculus",
-    "Horror",
-    "Horse",
-    "Human",
-    "Hydra",
-    "Hyena",
-    "Illusion",
-    "Imp",
-    "Incarnation",
-    "Inhuman",
-    "Inkling",
-    "Inquisitor",
-    "Insect",
-    "Jackal",
-    "Jellyfish",
-    "Juggernaut",
-    "Kavu",
-    "Kirin",
-    "Kithkin",
-    "Knight",
-    "Kobold",
-    "Kor",
-    "Kraken",
-    "Kree",
-    "Lamia",
-    "Lammasu",
-    "Leech",
-    "Leviathan",
-    "Lhurgoyf",
-    "Licid",
-    "Lizard",
-    "Llama",
-    "Locus",
-    "Mammoth",
-    "Manticore",
-    "Masticore",
-    "Mercenary",
-    "Merfolk",
-    "Metathran",
-    "Minion",
-    "Minotaur",
-    "Mite",
-    "Mole",
-    "Monger",
-    "Mongoose",
-    "Monk",
-    "Monkey",
-    "Moogle",
-    "Moonfolk",
-    "Mount",
-    "Mouse",
-    "Mutant",
-    "Myr",
-    "Mystic",
-    "Naga",
-    "Nautilus",
-    "Necron",
-    "Nephilim",
-    "Nightmare",
-    "Nightstalker",
-    "Ninja",
-    "Noble",
-    "Noggle",
-    "Nomad",
-    "Nymph",
-    "Octopus",
-    "Ogre",
-    "Ooze",
-    "Orb",
-    "Orc",
-    "Orgg",
-    "Otter",
-    "Ouphe",
-    "Ox",
-    "Oyster",
-    "Pangolin",
-    "Peasant",
-    "Pegasus",
-    "Pentavite",
-    "Performer",
-    "Pest",
-    "Phelddagrif",
-    "Phoenix",
-    "Phyrexian",
-    "Pilot",
-    "Pincher",
-    "Pirate",
-    "Plant",
-    "Pony",
-    "Praetor",
-    "Primarch",
-    "Prism",
-    "Processor",
-    "Rabbit",
-    "Raccoon",
-    "Ranger",
-    "Rat",
-    "Rebel",
-    "Reflection",
-    "Rhino",
-    "Rigger",
-    "Robot",
-    "Rogue",
-    "Sable",
-    "Salamander",
-    "Samurai",
-    "Sand",
-    "Saproling",
-    "Satyr",
-    "Scarecrow",
-    "Scientist",
-    "Scion",
-    "Scorpion",
-    "Scout",
-    "Sculpture",
-    "Serf",
-    "Serpent",
-    "Servo",
-    "Shade",
-    "Shaman",
-    "Shapeshifter",
-    "Shark",
-    "Sheep",
-    "Siren",
-    "Skeleton",
-    "Skrull",
-    "Slith",
-    "Sliver",
-    "Slug",
-    "Snail",
-    "Snake",
-    "Soldier",
-    "Soltari",
-    "Sorcerer",
-    "Spawn",
-    "Specter",
-    "Spellshaper",
-    "Sphinx",
-    "Spider",
-    "Spike",
-    "Spirit",
-    "Splinter",
-    "Sponge",
-    "Spy",
-    "Squid",
-    "Squirrel",
-    "Starfish",
-    "Surrakar",
-    "Survivor",
-    "Suspect",
-    "Symbiote",
-    "Synth",
-    "Tentacle",
-    "Tetravite",
-    "Thalakos",
-    "Thopter",
-    "Thrull",
-    "Tiefling",
-    // CR 205.3m: "Time Lord" is the only two-word creature type. Multi-word
-    // matching is handled by `parse_subtype_entry`/`starts_with_word_ci`
-    // (full-entry match + word boundary); no SUBTYPE_PLURALS entry is needed
-    // because the regular plural "Time Lords" is covered by the +"s" branch.
-    "Time Lord",
-    "Treefolk",
-    "Trilobite",
-    "Troll",
-    "Turtle",
-    "Tyranid",
-    "Unicorn",
-    "Vampire",
-    "Vedalken",
-    "Viashino",
-    "Villain",
-    "Volver",
-    "Wall",
-    "Walrus",
-    "Warlock",
-    "Warrior",
-    "Weasel",
-    "Weird",
-    "Werewolf",
-    "Whale",
-    "Wizard",
-    "Wolf",
-    "Wolverine",
-    "Wombat",
-    "Worm",
-    "Wraith",
-    "Wurm",
-    "Yeti",
-    "Zombie",
-    "Zubera",
-    // ── Land subtypes ──
-    "Cave",
-    "Desert",
-    "Forest",
-    "Gate",
-    "Island",
-    "Lair",
-    "Mine",
-    "Mountain",
-    "Plains",
-    "Power-Plant",
-    "Swamp",
-    "Tower",
-    "Urza's",
-    // ── Artifact subtypes ──
-    "Blood",
-    "Clue",
-    "Contraption",
-    "Equipment",
-    "Food",
-    "Fortification",
-    "Gold",
-    "Incubator",
-    "Junk",
-    "Map",
-    "Powerstone",
-    "Spacecraft", // CR 205.3g: Spacecraft is an artifact subtype.
-    "Treasure",
-    "Vehicle",
-    // ── Enchantment subtypes ──
-    "Aura",
-    "Background",
-    "Cartouche",
-    "Case",
-    "Class",
-    "Curse",
-    "Role",
-    "Room",
-    "Rune",
-    "Saga",
-    "Shard",
-    "Shrine",
-    // ── Spell subtypes ──
-    "Adventure",
-    "Arcane",
-    "Lesson",
-    "Trap",
-    // ── Planeswalker subtypes ──
-    "Ajani",
-    "Aminatou",
-    "Angrath",
-    "Arlinn",
-    "Ashiok",
-    "Basri",
-    "Bolas",
-    "Calix",
-    "Chandra",
-    "Comet",
-    "Dack",
-    "Dakkon",
-    "Daretti",
-    "Davriel",
-    "Dihada",
-    "Domri",
-    "Dovin",
-    "Ellywick",
-    "Elspeth",
-    "Estrid",
-    "Freyalise",
-    "Garruk",
-    "Gideon",
-    "Grist",
-    "Guff",
-    "Huatli",
-    "Jace",
-    "Jared",
-    "Jaya",
-    "Jeska",
-    "Kaito",
-    "Karn",
-    "Kasmina",
-    "Kaya",
-    "Kiora",
-    "Koth",
-    "Liliana",
-    "Lolth",
-    "Lukka",
-    "Minsc",
-    "Mordenkainen",
-    "Nahiri",
-    "Narset",
-    "Niko",
-    "Nissa",
-    "Nixilis",
-    "Oko",
-    "Quintorius",
-    "Ral",
-    "Rowan",
-    "Saheeli",
-    "Samut",
-    "Sarkhan",
-    "Serra",
-    "Sivitri",
-    "Sorin",
-    "Szat",
-    "Tamiyo",
-    "Teferi",
-    "Teyo",
-    "Tezzeret",
-    "Tibalt",
-    "Tyvar",
-    "Ugin",
-    "Urza",
-    "Venser",
-    "Vivien",
-    "Vraska",
-    "Will",
-    "Windgrace",
-    "Wrenn",
-    "Xenagos",
-    "Yanggu",
-    "Yanling",
-    "Zariel",
-];
+/// MTGJSON CardTypes-derived **creature** subtype vocabulary (`oracle-subtypes.json`),
+/// merged at load with canonical noncreature tables from `card_type.rs`.
+static ORACLE_SUBTYPES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    let creature: Vec<String> =
+        serde_json::from_str(include_str!("../../data/oracle-subtypes.json"))
+            .expect("oracle-subtypes.json well-formed");
+    crate::database::subtype_vocab::build_parser_subtype_vocabulary(&creature)
+});
+
+fn oracle_subtypes() -> &'static [String] {
+    &ORACLE_SUBTYPES
+}
 
 /// Test whether a lowercased candidate word names an MTG core type.
 /// CR 205.2: Core types are artifact, battle, creature, enchantment, instant,
@@ -1415,7 +982,7 @@ pub(crate) fn is_non_subtype_subject_name(text: &str) -> bool {
 /// subtype word in their own Oracle text).
 pub(crate) fn is_subtype_word(candidate_lower: &str) -> bool {
     fixed_noncreature_subtypes().any(|s| s.eq_ignore_ascii_case(candidate_lower))
-        || SUBTYPES
+        || oracle_subtypes()
             .iter()
             .any(|s| s.eq_ignore_ascii_case(candidate_lower))
 }
@@ -1466,8 +1033,8 @@ pub fn parse_subtype(text: &str) -> Option<(String, usize)> {
     }
 
     // Check each subtype (singular and regular plural)
-    for &subtype in SUBTYPES {
-        if let Some(parsed) = parse_subtype_entry(text, subtype) {
+    for subtype in oracle_subtypes() {
+        if let Some(parsed) = parse_subtype_entry(text, subtype.as_str()) {
             return Some(parsed);
         }
     }
@@ -1513,7 +1080,46 @@ fn parse_subtype_entry(text: &str, subtype: &str) -> Option<(String, usize)> {
         }
     }
 
+    // Try regular "-ies" plural: subtypes ending in consonant + "y" pluralize by
+    // replacing "y" with "ies" (e.g. "Mercenary" → "Mercenaries", "Berserker"
+    // is unaffected). Words ending in vowel + "y" take a plain "-s" ("Monkey" →
+    // "Monkeys") and are covered by the "-s" rule above. Matching the plural
+    // surface form requires stripping the trailing "y" from the subtype stem and
+    // matching "ies" at the boundary; only the canonical singular is returned.
+    if takes_ies_plural(subtype) {
+        let stem_len = subtype.len() - 1; // drop trailing "y"
+        let ies_plural_len = stem_len + 3; // stem + "ies"
+        if text.len() >= ies_plural_len
+            && text.is_char_boundary(stem_len)
+            && text[..stem_len].eq_ignore_ascii_case(&subtype[..stem_len])
+            && text[stem_len..ies_plural_len].eq_ignore_ascii_case("ies")
+        {
+            let after = &text[ies_plural_len..];
+            if after.is_empty() || after.starts_with(|c: char| !c.is_alphanumeric()) {
+                return Some((subtype.to_string(), ies_plural_len));
+            }
+        }
+    }
+
     None
+}
+
+/// Whether an English noun pluralizes by replacing a trailing "-y" with "-ies":
+/// nouns ending in consonant + "y" (e.g. "Mercenary" → "Mercenaries"). Nouns
+/// ending in vowel + "y" take a plain "-s" ("Monkey" → "Monkeys") and are
+/// excluded so the regular "-s" rule handles them.
+fn takes_ies_plural(word: &str) -> bool {
+    let bytes = word.as_bytes();
+    // A one-letter "y" has no preceding consonant, so the "-ies" rule cannot
+    // apply; the `len() < 2` guard also makes the penultimate index safe without
+    // `saturating_sub`/`get`.
+    if bytes.len() < 2 || !matches!(bytes.last(), Some(b'y' | b'Y')) {
+        return false;
+    }
+    !matches!(
+        bytes[bytes.len() - 2].to_ascii_lowercase(),
+        b'a' | b'e' | b'i' | b'o' | b'u'
+    )
 }
 
 /// Whether an English noun forms its plural by appending "-es" rather than
@@ -1748,8 +1354,85 @@ fn unmask_ring_tempts_you_phrase(text: String) -> String {
     text.replace(RING_TEMPTS_YOU_PLACEHOLDER, "the ring tempts you")
 }
 
+const KEYWORD_ACTION_PLACEHOLDER: &str = "\u{E0001}";
+
+/// CR 701.40a / CR 701.58a / CR 701.62a: A handful of cards are *named* after a
+/// keyword action ("Manifest Dread" → "Manifest dread.", "Cloak" → "Cloak …").
+/// Multi-word self-reference normalization is case-insensitive, so it would
+/// rewrite the card's own primary keyword-action verb to `~`, producing the
+/// nonsensical body "~." and a parse gap. Mask the keyword-action phrase the
+/// same way the Ring temptation phrase is protected, but ONLY when the card
+/// name *is* that keyword action — a keyword phrase that merely appears in the
+/// body of an unrelated card never collides with `~` normalization, so the
+/// narrow guard avoids touching every other card. The phrase is restored after
+/// normalization so the dispatcher sees the real keyword-action text.
+fn mask_card_name_keyword_action(text: &str, card_name: &str) -> Option<(String, Vec<String>)> {
+    // CR 701.40a / CR 701.58a / CR 701.62a: keyword actions whose phrasing can
+    // be an entire card name. These are full keyword-action verb phrases, not
+    // bare nouns, so an exact (case-insensitive) card-name match is unambiguous.
+    const KEYWORD_ACTIONS: &[&str] = &["manifest dread", "cloak", "manifest"];
+    let name_lower = card_name.trim().to_ascii_lowercase();
+    // allow-noncombinator: Iterator::find over the keyword-action table (slice
+    // selection), not string-dispatch parsing.
+    let &phrase = KEYWORD_ACTIONS.iter().find(|kw| name_lower == **kw)?;
+
+    let lower = text.to_ascii_lowercase();
+    let mut masked = String::with_capacity(text.len());
+    // Original-cased slices captured per masked occurrence, restored in order so
+    // the dispatcher sees the printed casing ("Manifest dread.").
+    let mut originals: Vec<String> = Vec::new();
+    let mut rest = text;
+    let mut lower_rest = lower.as_str();
+    // allow-noncombinator: structural occurrence-masking before `~` normalization
+    // (mirrors `mask_ring_tempts_you_phrase`), not parsing dispatch.
+    while let Some(idx) = lower_rest.find(phrase) {
+        // CR 201.5 boundary: only mask a free-standing occurrence of the
+        // keyword phrase (the body verb), never a substring inside a longer
+        // word (so "manifested"/"cloaked" are left intact).
+        let before_ok = idx == 0
+            || !rest[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_alphanumeric());
+        let after = idx + phrase.len();
+        let after_ok = after >= rest.len()
+            || !rest[after..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphanumeric());
+        if before_ok && after_ok {
+            masked.push_str(&rest[..idx]);
+            masked.push_str(KEYWORD_ACTION_PLACEHOLDER);
+            originals.push(rest[idx..after].to_string());
+        } else {
+            masked.push_str(&rest[..after]);
+        }
+        rest = &rest[after..];
+        lower_rest = &lower_rest[after..];
+    }
+    masked.push_str(rest);
+    Some((masked, originals))
+}
+
+/// Restore the original-cased keyword-action occurrences masked by
+/// [`mask_card_name_keyword_action`], in the order they were captured.
+fn unmask_card_name_keyword_action(text: String, originals: &[String]) -> String {
+    let mut result = text;
+    for original in originals {
+        result = result.replacen(KEYWORD_ACTION_PLACEHOLDER, original, 1);
+    }
+    result
+}
+
 pub fn normalize_card_name_refs(text: &str, card_name: &str) -> String {
-    let text = mask_ring_tempts_you_phrase(text);
+    let pre = mask_ring_tempts_you_phrase(text);
+    // CR 701.40a/701.58a/701.62a: protect the keyword-action body verb on cards
+    // named after a keyword action ("Manifest Dread", "Cloak") so it survives
+    // self-reference `~` normalization. The original casing is restored at the end.
+    let (text, kw_action_originals) = match mask_card_name_keyword_action(&pre, card_name) {
+        Some((masked, originals)) => (masked, originals),
+        None => (pre, Vec::new()),
+    };
     // Strip A- prefix (Alchemy rebalanced cards in MTGJSON)
     let effective_name = card_name.strip_prefix("A-").unwrap_or(card_name);
 
@@ -1939,6 +1622,17 @@ pub fn normalize_card_name_refs(text: &str, card_name: &str) -> String {
                         // E.g. "Merfolk Mistbinder" → "Other Merfolk you control get +1/+1."
                         // would become "Other ~ you control..." without this guard.
                         || replaced.contains("~ you control")
+                        // CR 111.10 + CR 303.7: Named token guard. A card-name first word
+                        // immediately followed by a token-subtype noun ("Role"/"Aura") is the
+                        // *token's* name, not a self-reference — the named-Role/Aura-token class
+                        // is "<Name> Role token attached to ..." (Royal Treatment's "Royal Role",
+                        // Cursed/Monster/Wicked/Sorcerer/Virtuous Roles). Replacing the first
+                        // word there ("Royal" → "~") destroys the token name and the token
+                        // parser can no longer recognize it.
+                        // allow-noncombinator: structural guard on already-normalized output (mirrors the "~ creatures"/"~ you control" guards above), not parsing dispatch
+                        || replaced.contains("~ Role")
+                        // allow-noncombinator: structural guard on already-normalized output, not parsing dispatch
+                        || replaced.contains("~ Aura")
                     {
                         continue;
                     }
@@ -1954,6 +1648,7 @@ pub fn normalize_card_name_refs(text: &str, card_name: &str) -> String {
     let effective_name_str = effective_name;
     result = result.replace("named ~", &format!("named {effective_name_str}"));
 
+    result = unmask_card_name_keyword_action(result, &kw_action_originals);
     unmask_ring_tempts_you_phrase(result)
 }
 
@@ -2070,6 +1765,33 @@ mod tests {
         assert_eq!(
             normalize_card_name_refs("Whenever the Ring tempts you, draw a card.", "Ring Watcher"),
             "Whenever the ring tempts you, draw a card."
+        );
+    }
+
+    #[test]
+    fn normalize_card_named_after_keyword_action_preserves_keyword_phrase() {
+        // CR 701.62a: The card "Manifest Dread" has the keyword-action body
+        // "Manifest dread." Self-reference normalization is case-insensitive for
+        // multi-word names, so without the keyword-action mask the body would be
+        // rewritten to "~." (a parse gap). The keyword phrase must survive.
+        assert_eq!(
+            normalize_card_name_refs("Manifest dread.", "Manifest Dread"),
+            "Manifest dread."
+        );
+        // CR 701.40a / CR 701.58a: same class for single-word keyword-action
+        // names — "Cloak"/"Manifest" body verbs must not normalize to `~`.
+        assert_eq!(
+            normalize_card_name_refs("Cloak the top card of your library.", "Cloak"),
+            "Cloak the top card of your library."
+        );
+        // The mask is word-boundary-aware: it must not touch a longer word that
+        // merely starts with the keyword phrase ("manifested").
+        assert_eq!(
+            normalize_card_name_refs(
+                "Manifest dread. A manifested permanent you control gets +1/+1.",
+                "Manifest Dread"
+            ),
+            "Manifest dread. A manifested permanent you control gets +1/+1."
         );
     }
 
@@ -2400,17 +2122,64 @@ mod tests {
 
     #[test]
     fn is_subtype_word_recognizes_registered_subtypes() {
-        // Subtypes from the SUBTYPES registry — used by strategy-5 to guard
-        // cards whose first name-word is a subtype (e.g. "Cleric Class",
-        // "Druid Arcanist", "Coward").
+        // Valid creature + noncreature subtypes from the validated vocabulary.
         assert!(is_subtype_word("cleric"));
         assert!(is_subtype_word("druid"));
         assert!(is_subtype_word("coward"));
         assert!(is_subtype_word("sliver"));
         assert!(is_subtype_word("merfolk"));
+        assert!(is_subtype_word("jace"));
+        assert!(is_subtype_word("nahiri"));
+        assert!(is_subtype_word("plains"));
+        assert!(is_subtype_word("equipment"));
         // Not a subtype.
         assert!(!is_subtype_word("sharuum"));
         assert!(!is_subtype_word("flying")); // that's a keyword, not a subtype
+    }
+
+    #[test]
+    fn is_subtype_word_recognizes_token_only_creature_subtypes() {
+        for (lower, canonical) in [
+            ("army", "Army"),
+            ("germ", "Germ"),
+            ("servo", "Servo"),
+            ("tentacle", "Tentacle"),
+            ("camarid", "Camarid"),
+            ("tetravite", "Tetravite"),
+        ] {
+            assert!(
+                is_subtype_word(lower),
+                "{lower} must be parser-authoritative"
+            );
+            assert_eq!(
+                parse_subtype(lower),
+                Some((canonical.to_string(), lower.len())),
+                "{lower} must parse as a subtype head"
+            );
+        }
+    }
+
+    #[test]
+    fn is_subtype_word_rejects_plane_and_spell_subtypes_from_noncreature_faces() {
+        // Plane — Time and Elemental Instant — Fire must not register as parser
+        // subtypes; otherwise "time travel" lowers incorrectly and split-card
+        // half-names like "Fire // Ice" fail to normalize to ~.
+        for non_creature in ["time", "fire"] {
+            assert!(
+                !is_subtype_word(non_creature),
+                "{non_creature} must not be a parser subtype"
+            );
+        }
+    }
+
+    #[test]
+    fn is_subtype_word_rejects_oracle_function_words_and_mtgjson_garbage() {
+        for garbage in ["the", "you", "and/or", "of", "elemental?", "baddest,"] {
+            assert!(
+                !is_subtype_word(garbage),
+                "{garbage} must not register as a subtype"
+            );
+        }
     }
 
     #[test]
@@ -2432,8 +2201,8 @@ mod tests {
             parse_subtype("Time Lords"),
             Some(("Time Lord".to_string(), 10))
         );
-        // Negative: a bare single word must NOT match the two-word subtype.
-        assert_eq!(parse_subtype("time you control"), None);
+        // Negative: trailing fragment of a two-word subtype must not match.
+        assert_eq!(parse_subtype("lord creature"), None);
     }
 
     #[test]
@@ -2737,6 +2506,33 @@ mod tests {
             other => panic!("expected Multiply, got {other:?}"),
         }
         assert_eq!(rest, "stun counters");
+    }
+
+    /// CR 107.1b: "equal to" in count positions must compose full quantity
+    /// expressions, not just bare `QuantityRef` leaves (Tormented Thoughts /
+    /// Ulamog enter-with-counters class).
+    #[test]
+    fn parse_count_expr_equal_to_composed_quantity() {
+        use crate::types::ability::{AggregateFunction, ObjectProperty};
+
+        let (qty, rest) =
+            parse_count_expr("equal to twice the number of creatures you control").unwrap();
+        assert!(matches!(qty, QuantityExpr::Multiply { factor: 2, .. }));
+        assert!(rest.is_empty());
+
+        let (qty, rest) =
+            parse_count_expr("equal to the greatest mana value among cards in exile").unwrap();
+        assert!(matches!(
+            qty,
+            QuantityExpr::Ref {
+                qty: QuantityRef::Aggregate {
+                    function: AggregateFunction::Max,
+                    property: ObjectProperty::ManaValue,
+                    ..
+                }
+            }
+        ));
+        assert!(rest.is_empty());
     }
 
     #[test]

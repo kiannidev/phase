@@ -1409,6 +1409,11 @@ pub(crate) fn parse_static_condition(text: &str) -> Option<StaticCondition> {
         return Some(condition);
     }
 
+    // "[N] or more [type] are on the battlefield" (Limited Resources)
+    if let Some(condition) = parse_count_on_battlefield_condition(tp.lower) {
+        return Some(condition);
+    }
+
     // "the chosen color is [color]"
     if let Some(color_name) = nom_tag_lower(tp.lower, tp.lower, "the chosen color is ") {
         let trimmed = color_name.trim().trim_end_matches('.');
@@ -1424,6 +1429,88 @@ pub(crate) fn parse_static_condition(text: &str) -> Option<StaticCondition> {
 
 pub(crate) fn parse_attached_static_condition(text: &str) -> Option<StaticCondition> {
     parse_static_condition(text).map(rebind_source_object_quantities_to_recipient)
+}
+
+/// CR 611.3a + CR 702.16: Parse a multi-clause conditional protection grant —
+/// "protection from `<quality>` if `<condition>`, from `<quality>` if
+/// `<condition>`, ..., and from `<quality>` if `<condition>`" (Dominaria's
+/// Judgment: "gain protection from white if you control a Plains, from blue if
+/// you control an Island, ..., and from green if you control a Forest").
+///
+/// Returns one `(ProtectionTarget, StaticCondition)` per clause so each color's
+/// protection is gated on its OWN condition. The prior generic grant path
+/// emitted a single static carrying every protection modification but only the
+/// FINAL clause's condition — silently dropping the gating for every other
+/// color (and leaving their qualities as raw `ProtectionTarget::CardType`
+/// strings like `"white if you control a plains"`).
+///
+/// The trailing-condition stripper one layer up peels the FINAL clause's "if
+/// `<condition>`" and re-applies it afterward, so the last clause may arrive as a
+/// bare quality (`None` condition); only that final clause may omit its `if`.
+/// Returns `None` for a single-clause grant or any unrecognized shape, so those
+/// fall through to the existing path untouched.
+pub(crate) fn parse_conditional_protection_grant_list(
+    predicate: &str,
+) -> Option<
+    Vec<(
+        crate::types::keywords::ProtectionTarget,
+        Option<StaticCondition>,
+    )>,
+> {
+    let (rest, grants) = conditional_protection_grant_list(predicate.trim()).ok()?;
+    // Require full consumption and a genuine multi-clause list; a single clause
+    // is parsed correctly by the generic suffix-condition path.
+    (rest.trim().is_empty() && grants.len() >= 2).then_some(grants)
+}
+
+/// nom body for [`parse_conditional_protection_grant_list`]: lead-in followed by
+/// one or more "from `<quality>` if `<condition>`" clauses (the leading clause's
+/// "from" is consumed by the lead-in; the final one is Oxford-prefixed "and").
+type ConditionalProtectionGrant = (
+    crate::types::keywords::ProtectionTarget,
+    Option<StaticCondition>,
+);
+
+fn conditional_protection_grant_list(
+    input: &str,
+) -> OracleResult<'_, Vec<ConditionalProtectionGrant>> {
+    let (input, _) = alt((
+        tag("gain protection from "),
+        tag("gains protection from "),
+        tag("have protection from "),
+        tag("has protection from "),
+    ))
+    .parse(input)?;
+    let (input, first) = conditional_protection_clause(input)?;
+    let (input, rest) = many0(preceded(
+        // Oxford-comma tolerant: longest separator first.
+        alt((tag(", and from "), tag(", from "), tag(" and from "))),
+        conditional_protection_clause,
+    ))
+    .parse(input)?;
+    let grants = std::iter::once(first).chain(rest).collect();
+    Ok((input, grants))
+}
+
+/// Parse one "`<protection quality>` if `<condition>`" clause, delegating the
+/// quality to [`parse_protection_target`](crate::types::keywords::parse_protection_target)
+/// and the condition run to [`parse_attached_condition_run`]. A bare trailing
+/// quality (its `if <condition>` already peeled upstream) yields a `None`
+/// condition for the caller to fill.
+fn conditional_protection_clause(input: &str) -> OracleResult<'_, ConditionalProtectionGrant> {
+    let (input, qualified) = opt((take_until(" if "), tag(" if "))).parse(input)?;
+    match qualified {
+        Some((quality, _)) => {
+            let (input, condition) = parse_attached_condition_run(input)?;
+            let target = crate::types::keywords::parse_protection_target(quality.trim());
+            Ok((input, (target, Some(condition))))
+        }
+        None => {
+            let (input, quality) = rest.parse(input)?;
+            let target = crate::types::keywords::parse_protection_target(quality.trim());
+            Ok((input, (target, None)))
+        }
+    }
 }
 
 pub(crate) fn rebind_source_object_quantities_to_recipient(
@@ -1509,6 +1596,12 @@ pub(crate) fn rebind_source_object_quantity_expr_to_recipient(expr: QuantityExpr
         QuantityExpr::Difference { left, right } => QuantityExpr::Difference {
             left: Box::new(rebind_source_object_quantity_expr_to_recipient(*left)),
             right: Box::new(rebind_source_object_quantity_expr_to_recipient(*right)),
+        },
+        QuantityExpr::Max { exprs } => QuantityExpr::Max {
+            exprs: exprs
+                .into_iter()
+                .map(rebind_source_object_quantity_expr_to_recipient)
+                .collect(),
         },
         other => other,
     }
@@ -1603,7 +1696,8 @@ pub(crate) enum CombatTaxSubject {
 pub(crate) fn parse_for_each_cost_quantity(input: &str) -> OracleResult<'_, QuantityRef> {
     let (input, _) = tag_no_case::<_, _, OracleError<'_>>(" for each ").parse(input)?;
     let lowered = input.trim_end_matches('.').to_lowercase();
-    let quantity = parse_for_each_clause(&lowered).ok_or_else(|| {
+    let (_, quantity) = super::oracle_nom::quantity::parse_for_each_clause_ref_complete(&lowered)
+        .map_err(|_| {
         nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Fail))
     })?;
     Ok(("", quantity))
@@ -1723,6 +1817,40 @@ pub(crate) fn parse_color_list(text: &str) -> Option<Vec<crate::types::mana::Man
     None
 }
 
+/// CR 611.3a: "[N] or more [type] are on the battlefield" → a count
+/// `QuantityComparison` (Limited Resources: "ten or more lands are on the
+/// battlefield"). Modeled as `ObjectCount(type) >= N`; the gate is then attached
+/// by the shared "as long as <condition>" machinery to the host static.
+pub(crate) fn parse_count_on_battlefield_condition(lower: &str) -> Option<StaticCondition> {
+    count_on_battlefield_condition(lower)
+        .ok()
+        .and_then(|(rest, cond)| rest.trim().is_empty().then_some(cond))
+}
+
+fn count_on_battlefield_condition(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (input, n) = nom_primitives::parse_number(input)?;
+    let (input, _) = tag(" or more ").parse(input)?;
+    let (input, type_text) = take_until(" are on the battlefield").parse(input)?;
+    let (input, _) = tag(" are on the battlefield").parse(input)?;
+    let (filter, remainder) = parse_type_phrase(type_text.trim());
+    if matches!(filter, TargetFilter::Any) || !remainder.trim().is_empty() {
+        return Err(nom::Err::Error(OracleError::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    }
+    Ok((
+        input,
+        StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount { filter },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: n as i32 },
+        },
+    ))
+}
+
 /// Parse "the number of [quantity] is [comparator] [quantity]" into a QuantityComparison.
 pub(crate) fn parse_quantity_comparison(lower: &str) -> Option<StaticCondition> {
     let rest = nom_tag_lower(lower, lower, "the number of ")?;
@@ -1744,6 +1872,38 @@ pub(crate) fn find_continuous_predicate_start(lower: &str) -> Option<usize> {
     .into_iter()
     .filter_map(|marker| lower.find(marker))
     .min()
+}
+
+/// CR 108.3 + CR 109.4: Strip a leading negated-ownership qualifier ("but don't
+/// own", "but do not own") from a "<subject> you control" predicate tail.
+///
+/// The "<X> you control" dispatch arms (`creatures you control `, `other
+/// creatures you control `) consume the `you control` controller anchor before
+/// the predicate, so a trailing "but don't own" qualifier would otherwise be
+/// silently dropped from the affected filter. Returns the
+/// `FilterProp::Owned { Opponent }` property ("controller doesn't own it") and
+/// the remaining predicate text when the qualifier is present. The companion
+/// "but don't own" handling in `parse_type_phrase` covers the full-subject path
+/// (Laughing Jasper Flint's "Creatures you control but don't own are
+/// Mercenaries …"); this is the controller-prefix-consumed sibling.
+pub(crate) fn strip_negated_ownership_qualifier(after_prefix: &str) -> Option<(FilterProp, &str)> {
+    type VE<'a> = OracleError<'a>;
+    for qualifier in [
+        "but don't own ",
+        "but do not own ",
+        "but doesn't own ",
+        "but does not own ",
+    ] {
+        if let Ok((rest, _)) = tag::<_, _, VE>(qualifier).parse(after_prefix) {
+            return Some((
+                FilterProp::Owned {
+                    controller: ControllerRef::Opponent,
+                },
+                rest,
+            ));
+        }
+    }
+    None
 }
 
 pub(crate) fn parse_qualified_creatures_you_control_suffix<'a>(
@@ -2390,23 +2550,68 @@ pub(crate) fn descriptor_is_supertype(descriptor: &str) -> bool {
     is_supertype
 }
 
+/// Nom-backed helper: split a subject string into (descriptor_core, controller)
+/// by trying to parse a trailing controller suffix. Only accepts the controller
+/// scopes that this static subject seam can actually resolve:
+///
+/// - `ControllerRef::You` — "you control"
+/// - `ControllerRef::Opponent` — "your opponents control" / "you don't control"
+/// - `ControllerRef::EnchantedPlayer` — "enchanted player controls" (CR 303.4b)
+///
+/// `TargetPlayer` and `DefendingPlayer` are deliberately excluded because this
+/// call site builds a continuous static `TargetFilter` with no companion
+/// target-player authority or combat context.
+///
+/// Uses nom `alt`/`tag`/`value` combinators so the phrase set is maintained
+/// alongside the shared grammar rather than as raw suffix literals.
+fn parse_static_controller_suffix(input: &str) -> OracleResult<'_, ControllerRef> {
+    alt((
+        value(ControllerRef::You, tag("you control")),
+        value(ControllerRef::Opponent, tag("your opponents control")),
+        value(ControllerRef::Opponent, tag("you don't control")),
+        // CR 303.4b + CR 702.5a: "enchanted player controls" — the controller
+        // scope is the player the source Aura is attached to.
+        value(
+            ControllerRef::EnchantedPlayer,
+            tag("enchanted player controls"),
+        ),
+    ))
+    .parse(input)
+}
+
+/// Strip a trailing controller suffix from a subject string using the
+/// restricted nom grammar above. Returns (descriptor_core, Some(controller))
+/// on match, or (original, None) if no valid suffix is found.
+fn strip_subject_controller_suffix<'a>(
+    original: &'a str,
+    lower: &str,
+) -> (&'a str, Option<ControllerRef>) {
+    // Try each space-delimited split point (left to right) and check if the
+    // remainder is a complete controller suffix.
+    let mut start = 0;
+    while let Some(pos) = lower[start..].find(' ') {
+        let abs_pos = start + pos;
+        let suffix_lower = &lower[abs_pos + 1..];
+        if let Ok((rest, ctrl)) = parse_static_controller_suffix(suffix_lower) {
+            if rest.is_empty() {
+                return (original[..abs_pos].trim(), Some(ctrl));
+            }
+        }
+        start = abs_pos + 1;
+    }
+    (original, None)
+}
+
 pub(crate) fn parse_creature_subject_filter(subject: &str) -> Option<TargetFilter> {
     let trimmed = subject.trim();
     let lower = trimmed.to_lowercase();
     let tp = TextPair::new(trimmed, &lower);
 
-    // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-    let (subject_core, controller) = if let Some(prefix) = tp.original.strip_suffix(" you control")
-    // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-    {
-        (prefix.trim(), Some(ControllerRef::You))
-    // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-    } else if let Some(prefix) = tp.original.strip_suffix(" your opponents control") {
-        // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-        (prefix.trim(), Some(ControllerRef::Opponent))
-    } else {
-        (tp.original, None)
-    };
+    // CR 109.5 + CR 303.4b: Split the subject into a descriptor core and an
+    // optional controller suffix. Uses `parse_static_controller_suffix`, a
+    // restricted nom grammar that only accepts the controller scopes this
+    // static seam can resolve (You, Opponent, EnchantedPlayer).
+    let (subject_core, controller) = strip_subject_controller_suffix(tp.original, &lower);
 
     let subject_core_lower = subject_core.to_lowercase();
     let subject_core_tp = TextPair::new(subject_core, &subject_core_lower);
@@ -2849,6 +3054,15 @@ pub(crate) fn parse_rule_static_predicate_nom(
             RuleStaticPredicate::CantBeSacrificed,
             tag("can't be sacrificed"),
         ),
+        // NOTE: "can't become untapped" / "can't be untapped" (CR 701.26b) is the
+        // BROAD untap prohibition and is NOT a rule-static predicate. It would
+        // conflate with `StaticMode::CantUntap`, which is the untap-step-only
+        // class (CR 502.3, "doesn't untap during its untap step") enforced only by
+        // the untap-step turn-based-action loop — a spell/ability untap would
+        // bypass it. The broad form is parsed as an unconditional
+        // `ProposedEvent::Untap` prevention by
+        // `oracle_replacement::parse_cant_become_untapped_replacement` (mirroring
+        // CR 122.1d stun counters), so every untap path consults it.
         value(
             RuleStaticPredicate::LoseAllAbilities,
             alt((tag("loses all abilities"), tag("lose all abilities"))),
@@ -2990,7 +3204,14 @@ pub(crate) fn parse_cant_attack_defended_scope_nom(
     input: &str,
 ) -> OracleResult<'_, Option<crate::types::triggers::AttackTargetFilter>> {
     use crate::types::triggers::AttackTargetFilter;
+    // CR 508.1c + CR 310.5: " you or permanents you control" defends battles too,
+    // so it is a distinct filter from " you or planeswalkers you control". Both
+    // longer phrases precede the bare " you" (nom `alt` is leftmost-match).
     opt(alt((
+        value(
+            AttackTargetFilter::PlayerOrPermanents,
+            tag(" you or permanents you control"),
+        ),
         value(
             AttackTargetFilter::PlayerOrPlaneswalker,
             tag(" you or planeswalkers you control"),

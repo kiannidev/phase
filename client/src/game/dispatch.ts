@@ -14,21 +14,22 @@ import { isMultiplayerMode, useGameStore, legalResultState, saveGame, saveCheckp
 import { getOpponentDisplayName } from "../stores/multiplayerStore";
 import { usePreferencesStore } from "../stores/preferencesStore";
 import { useUiStore } from "../stores/uiStore";
-import { stackPressureFromLength, STACK_PRESSURE_ELEVATED } from "../utils/stackPressure";
+import { pressureMultiplier, stackPressureFromLength, STACK_PRESSURE_ELEVATED } from "../utils/stackPressure";
+import { effectiveStackPressure, recordStackResolutions } from "../utils/stackThroughput";
 import { applySpellPaymentPreference } from "./castPaymentMode";
 
 /**
  * Event types whose SFX is deferred to the card slam onImpact callback
  * in AnimationOverlay, so sound aligns with the visual impact moment.
  */
-const SLAM_DEFERRED_SFX = new Set(["DamageDealt"]);
+const SLAM_DEFERRED_SFX = new Set(["DamageDealt", "GroupedDamageFlurry"]);
 
 /** Schedule SFX for each animation step, offset to sync with visual timing. */
 function scheduleSfxForSteps(steps: AnimationStep[], multiplier: number): void {
   let offset = 0;
   for (const step of steps) {
     // Filter out slam-deferred events — their SFX fires at impact time instead
-    const immediate = step.effects.filter((e) => !SLAM_DEFERRED_SFX.has(e.event.type));
+    const immediate = step.effects.filter((e) => !e.displayOnly && !SLAM_DEFERRED_SFX.has(e.event.type));
     if (immediate.length > 0) {
       if (offset === 0) {
         audioManager.playSfxForStep(immediate);
@@ -209,6 +210,20 @@ async function processAction(action: GameAction, actor: number): Promise<void> {
   const { gameId } = useGameStore.getState();
   if (gameId) saveGame(gameId, newState);
 
+  // 3c. Feed the throughput tracker: count stack entries that left the stack
+  //     this action (resolved, countered, or otherwise removed), id-diffed so a
+  //     resolution that spawns replacement triggers still counts even when net
+  //     stack length is unchanged. Drives rate-based pacing for the
+  //     low-depth-high-churn loops the depth signal can't see (Exquisite Blood +
+  //     Sanguine Bond and friends). Single-dispatch resolves one item per pass;
+  //     the batch path feeds its own gross count below.
+  const nextStackIds = new Set(newState.stack.map((e) => e.id));
+  const resolvedCount = gameState.stack.reduce(
+    (n, e) => (nextStackIds.has(e.id) ? n : n + 1),
+    0,
+  );
+  if (resolvedCount > 0) recordStackResolutions(resolvedCount);
+
   // 4. Checkpoint: save pre-action state on turn boundaries for debug restore
   const turnEvent = events.find((e) => e.type === "TurnStarted");
   if (turnEvent) {
@@ -244,8 +259,13 @@ async function processAction(action: GameAction, actor: number): Promise<void> {
   const pacingMultipliers = usePreferencesStore.getState().pacingMultipliers;
   const steps = normalizeEvents(events, { pacingMultipliers });
 
-  // 7. Play animations (unless instant — multiplier === 0)
-  const multiplier = usePreferencesStore.getState().animationSpeedMultiplier;
+  // 7. Play animations (unless instant — multiplier === 0). Fold in stack
+  //    pressure so per-resolution timing collapses under depth OR recent churn —
+  //    without this the single-dispatch path animated every oscillation cycle at
+  //    full speed (it previously read only the user speed preference).
+  const multiplier =
+    usePreferencesStore.getState().animationSpeedMultiplier *
+    pressureMultiplier(effectiveStackPressure(newState.stack.length));
 
   if (steps.length > 0 && multiplier > 0) {
     useAnimationStore.getState().setAnimationNewState(newState);
@@ -607,18 +627,13 @@ export async function restoreGameState(
 
 const BATCH_CHUNK_SIZE = 5;
 // Under "Instant" stack pressure (a multi-hundred/thousand identical-trigger
-// storm, e.g. Scute Swarm) the 5-at-a-time animated countdown is wasted: the
-// dominant cost becomes the per-chunk full-state `getState` (~12MB serialize)
-// + `getLegalActions` + the inter-chunk delay, repeated once per 5 items. We
-// drain in large chunks instead — the engine can resolve unboundedly in one
-// call, but a bounded chunk keeps each WASM call short enough that the main
-// thread yields between chunks (no "page unresponsive" freeze) while still
-// collapsing ~580 round-trips into a few dozen. The value is an empirical
-// tradeoff: smaller chunks give visibly-advancing "resolving X of Y" progress
-// (the bar updates once per chunk) at the cost of more per-chunk `getState`
-// serialization; the rAF yield below — not this size — is what guarantees the
-// overlay repaints between chunks.
-const BATCH_CHUNK_INSTANT = 50;
+// storm, e.g. Scute Swarm) the 5-at-a-time animated countdown is wasted. Keep
+// large storms in engine-owned fast-forward batches so partial stacks collapse
+// before the frontend pays the per-chunk `getState` + `getLegalActions` cost.
+// The value is intentionally large: the worker boundary already keeps the main
+// thread responsive, while this still lets the overlay update during truly
+// pathological stacks.
+const BATCH_CHUNK_INSTANT = 5_000;
 const BATCH_CHUNK_BASE_DELAY_MS = 150;
 let batchResolveInProgress = false;
 
@@ -635,7 +650,8 @@ export async function dispatchResolveAll(
 
   batchResolveInProgress = true;
   const multiplier = usePreferencesStore.getState().animationSpeedMultiplier;
-  const { setResolutionProgress } = useGameStore.getState();
+  const { setIsResolvingAll, setResolutionProgress } = useGameStore.getState();
+  setIsResolvingAll(true);
   // Storm-origin denominator: latched from the FIRST chunk's `total` because
   // the engine reports the *remaining* stack per chunk (shrinks as it drains),
   // so only the first chunk carries the true origin count.
@@ -657,6 +673,12 @@ export async function dispatchResolveAll(
 
       if (latchedTotal === 0) latchedTotal = batchResult.total;
       resolvedSoFar += batchResult.itemsResolved;
+      // Keep the throughput tracker warm so a storm draining below Instant keeps
+      // its animated tail fast instead of snapping back to full pacing.
+      // `itemsResolved` is a net-shrink count (can lag the true gross when a
+      // resolution spawns triggers) — an acceptable under-count here since the
+      // batch path is already depth-gated, where the depth axis dominates pacing.
+      if (batchResult.itemsResolved > 0) recordStackResolutions(batchResult.itemsResolved);
       // Surface progress only for a genuine storm (trivial multi-item resolves
       // drain too fast to render). Clamp to the latched total: `itemsResolved`
       // is a net-shrink count that can lag the true gross when a resolution
@@ -707,6 +729,7 @@ export async function dispatchResolveAll(
     if (gameId && newState) saveGame(gameId, newState);
   } finally {
     batchResolveInProgress = false;
+    setIsResolvingAll(false);
     setResolutionProgress(null);
   }
 }

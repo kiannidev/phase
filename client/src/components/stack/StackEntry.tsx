@@ -104,8 +104,12 @@ export function StackEntry({ entry, index, isTop, isPending, cardSize, style, on
   // capped paid-chip row so it isn't shown twice.
   const xValueFact = details?.paid?.find((fact) => fact.type === "XValue");
   const xValue = xValueFact?.type === "XValue" ? xValueFact.data.value : undefined;
+  const chosenModeLabels =
+    details?.paid
+      ?.filter((fact): fact is Extract<StackPaidFactView, { type: "ChosenModes" }> => fact.type === "ChosenModes")
+      .flatMap((fact) => fact.data.labels) ?? [];
   const paidLabels =
-    details?.paid?.filter((fact) => fact.type !== "XValue").map((fact) => formatPaidFact(fact, t)) ??
+    details?.paid?.filter((fact) => fact.type !== "XValue" && fact.type !== "ChosenModes").map((fact) => formatPaidFact(fact, t)) ??
     [];
   const contextLabels = details?.trigger_context?.map((context) => context.label) ?? [];
   const controllerLabel = entry.controller === playerId ? t("stack.controllerYou") : t("stack.controllerOpp");
@@ -123,7 +127,7 @@ export function StackEntry({ entry, index, isTop, isPending, cardSize, style, on
     && waitingFor.data.player === playerId
     && waitingFor.data.scope.type === "Single";
   const currentTargetRefs = isHumanTargetSelection
-    ? waitingFor.data.selection.current_legal_targets
+    ? (waitingFor.data.selection?.current_legal_targets ?? [])
     : isRetargetChoice
       ? waitingFor.data.legal_new_targets
       : [];
@@ -232,7 +236,7 @@ export function StackEntry({ entry, index, isTop, isPending, cardSize, style, on
       {!isSpell && (
         <div
           className="absolute inset-x-0 bottom-0 rounded-b-lg border-t border-white/10 bg-gray-900/95 px-1.5 py-1 backdrop-blur-sm"
-          title={stackEntryTitle(abilityLabel, triggerDescription, targetLabels, paidLabels, contextLabels, t)}
+          title={stackEntryTitle(abilityLabel, triggerDescription, targetLabels, chosenModeLabels, paidLabels, contextLabels, t)}
         >
           <RichLabel
             text={abilityLabel}
@@ -249,8 +253,17 @@ export function StackEntry({ entry, index, isTop, isPending, cardSize, style, on
         </div>
       )}
 
-      {(targetLabels.length > 0 || paidLabels.length > 0 || contextLabels.length > 0) && (
+      {(targetLabels.length > 0 || chosenModeLabels.length > 0 || paidLabels.length > 0 || contextLabels.length > 0) && (
         <div className="absolute left-1 right-1 top-5 flex flex-wrap gap-1">
+          {chosenModeLabels.slice(0, 2).map((label, index) => (
+            <span
+              key={`mode-${index}-${label}`}
+              className="max-w-full rounded bg-indigo-950/90 px-1.5 py-0.5 text-[8px] font-semibold text-indigo-100 shadow line-clamp-2"
+              title={label}
+            >
+              {label}
+            </span>
+          ))}
           {targetLabels.slice(0, 2).map((label) => (
             <span
               key={`target-${label}`}
@@ -321,12 +334,14 @@ function stackEntryTitle(
   label: string,
   description: string | undefined,
   targets: string[],
+  modes: string[],
   paid: string[],
   context: string[],
   t: TFunction<"game">,
 ): string {
   return [
     description ? `${label}: ${description}` : label,
+    modes.length > 0 ? t("stack.titleModes", { modes: modes.join("; ") }) : "",
     targets.length > 0 ? t("stack.titleTargets", { targets: targets.join(", ") }) : "",
     paid.length > 0 ? t("stack.titlePaid", { paid: paid.join(", ") }) : "",
     context.length > 0 ? t("stack.titleContext", { context: context.join(", ") }) : "",

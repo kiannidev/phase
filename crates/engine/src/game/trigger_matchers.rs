@@ -44,6 +44,7 @@ pub fn trigger_matcher(mode: TriggerMode) -> Option<TriggerMatcher> {
         TriggerMode::Enlisted => match_enlisted,
         TriggerMode::Discover => match_discover,
         TriggerMode::Adapt => match_adapt,
+        TriggerMode::Connives => match_connives,
         TriggerMode::Foretell => match_foretell,
         TriggerMode::DamagePreventedOnce => match_unimplemented,
         TriggerMode::AttackersDeclared | TriggerMode::AttackersDeclaredOneTarget => {
@@ -175,7 +176,6 @@ pub fn trigger_matcher(mode: TriggerMode) -> Option<TriggerMatcher> {
         | TriggerMode::Copied
         | TriggerMode::ConjureAll
         | TriggerMode::ClaimPrize
-        | TriggerMode::CrankContraption
         | TriggerMode::Devoured
         | TriggerMode::Forage
         | TriggerMode::GiveGift
@@ -184,6 +184,7 @@ pub fn trigger_matcher(mode: TriggerMode) -> Option<TriggerMatcher> {
         | TriggerMode::SeekAll
         | TriggerMode::Trains
         | TriggerMode::VisitAttraction => match_visit_attraction,
+        TriggerMode::CrankContraption => match_crank_contraption,
         TriggerMode::Specializes => match_specializes,
         // CR 702.140c-d: "Whenever this creature mutates" fires on `Mutated`.
         TriggerMode::Mutates => match_mutates,
@@ -373,6 +374,9 @@ pub fn build_trigger_registry() -> HashMap<TriggerMode, TriggerMatcher> {
 
     // CR 701.52a + CR 702.159a: Attraction visit triggers
     r.insert(TriggerMode::VisitAttraction, match_visit_attraction);
+    // Unstable Contraptions: "Whenever you crank this Contraption" listens for
+    // `GameEvent::ContraptionCranked`.
+    r.insert(TriggerMode::CrankContraption, match_crank_contraption);
     r.insert(TriggerMode::Specializes, match_specializes);
 
     // CR 702.140c-d: "Whenever this creature mutates" fires on `Mutated`.
@@ -419,6 +423,7 @@ pub fn build_trigger_registry() -> HashMap<TriggerMode, TriggerMatcher> {
 
     r.insert(TriggerMode::Discover, match_discover);
     r.insert(TriggerMode::Adapt, match_adapt);
+    r.insert(TriggerMode::Connives, match_connives);
     r.insert(TriggerMode::Foretell, match_foretell);
     r.insert(TriggerMode::Enlisted, match_enlisted);
     // CR 702.26b: Phasing triggers fire when a permanent phases out.
@@ -462,7 +467,6 @@ pub fn build_trigger_registry() -> HashMap<TriggerMode, TriggerMatcher> {
         TriggerMode::ConjureAll,
         // TriggerMode::Abandoned — moved to real matcher above
         TriggerMode::ClaimPrize,
-        TriggerMode::CrankContraption,
         TriggerMode::Devoured,
         TriggerMode::Forage,
         TriggerMode::GiveGift,
@@ -493,7 +497,7 @@ pub fn build_trigger_registry() -> HashMap<TriggerMode, TriggerMatcher> {
     // evolve ability's resolution actually put one or more +1/+1 counters on it.
     r.insert(TriggerMode::Evolved, match_evolved);
 
-    // CR 702.122d: Crew trigger matchers
+    // CR 702.122e: Crew trigger matchers
     r.insert(TriggerMode::Crewed, match_vehicle_crewed);
     r.insert(TriggerMode::BecomesCrewed, match_vehicle_crewed);
 
@@ -731,8 +735,10 @@ pub(super) fn target_filter_matches_object(
         TargetFilter::Neighbor { .. } => false,
         TargetFilter::TriggeringSpellController
         | TargetFilter::TriggeringSpellOwner
+        | TargetFilter::TriggeringSourceController
         | TargetFilter::TriggeringPlayer
         | TargetFilter::TriggeringSource
+        | TargetFilter::EventTarget
         | TargetFilter::DefendingPlayer
         | TargetFilter::ExiledCardByIndex { .. }
         | TargetFilter::ParentTarget
@@ -824,9 +830,15 @@ fn count_matching_trigger_event_subjects(
         | GameEvent::PermanentSacrificed { object_id, .. }
         | GameEvent::ControllerChanged { object_id, .. }
         | GameEvent::PermanentTapped { object_id, .. }
-        | GameEvent::PermanentUntapped { object_id } => count_one(*object_id),
+        | GameEvent::PermanentUntapped { object_id }
+        | GameEvent::StickerPlaced { object_id, .. } => count_one(*object_id),
         // CR 702.140c + CR 730.2c: the merged (surviving) permanent is the subject.
         GameEvent::Mutated { merged_id, .. } => count_one(*merged_id),
+        // Unstable Host/Augment combine also makes the surviving Host permanent
+        // the observable subject for generic object-scoped event helpers.
+        GameEvent::Augmented { merged_id, .. } => count_one(*merged_id),
+        GameEvent::ContraptionAssembled { object_id, .. } => count_one(*object_id),
+        GameEvent::ContraptionCranked { contraption_id, .. } => count_one(*contraption_id),
         // Object target events yield the affected object as subject. Player
         // target events carry no object subject; player scoping lives on
         // `valid_target`.
@@ -890,6 +902,7 @@ fn count_matching_trigger_event_subjects(
         | GameEvent::PlayerPerformedAction { .. }
         | GameEvent::Regenerated { .. }
         | GameEvent::CreatureSuspected { .. }
+        | GameEvent::CreatureNoLongerSuspected { .. }
         | GameEvent::Detained { .. }
         | GameEvent::BecamePrepared { .. }
         | GameEvent::BecameUnprepared { .. }
@@ -1589,10 +1602,25 @@ pub(super) fn matching_attack_events(
                 valid_card_matches(trigger, state, *id, source_id)
             } else if trigger.valid_source.is_some() {
                 valid_source_matches(trigger, state, *id, source_id)
+            } else if trigger.valid_target.is_some() {
+                // CR 508.3b: "Whenever [player] is attacked" — no attacker
+                // filter, any creature attacking that player satisfies the
+                // trigger. The defending-player restriction is enforced by
+                // `attack_target_matches` below.
+                true
             } else {
                 *id == source_id
             }
         };
+
+        // CR 508.3b: "Whenever [player] is attacked" triggers once per
+        // attacked player, not once per attacking creature. Deduplicate when
+        // the trigger has valid_target set but no valid_card/valid_source
+        // (the player-is-attacked pattern).
+        let dedup_by_player = trigger.valid_target.is_some()
+            && trigger.valid_card.is_none()
+            && trigger.valid_source.is_none();
+        let mut seen_defending_players: Vec<PlayerId> = Vec::new();
 
         attacker_ids
             .iter()
@@ -1607,13 +1635,17 @@ pub(super) fn matching_attack_events(
                 if !attack_target_matches(trigger, state, target, *defending_player, source_id) {
                     return None;
                 }
+                let event_defending_player =
+                    attack_target_defending_player(state, target, *defending_player);
+                if dedup_by_player {
+                    if seen_defending_players.contains(&event_defending_player) {
+                        return None;
+                    }
+                    seen_defending_players.push(event_defending_player);
+                }
                 Some(GameEvent::AttackersDeclared {
                     attacker_ids: vec![*id],
-                    defending_player: attack_target_defending_player(
-                        state,
-                        target,
-                        *defending_player,
-                    ),
+                    defending_player: event_defending_player,
                     attacks: vec![(*id, target)],
                 })
             })
@@ -2402,8 +2434,21 @@ pub(super) fn match_play_card(
     source_id: ObjectId,
     state: &GameState,
 ) -> bool {
-    match_spell_cast(event, trigger, source_id, state)
-        || match_land_played(event, trigger, source_id, state)
+    if match_spell_cast(event, trigger, source_id, state) {
+        return true;
+    }
+    // CR 601.1a + CR 305.1: the land-play half honors the same play-origin
+    // constraint the cast half routes through `spell_cast_origin`. The shared
+    // `PlayCard` def can't carry the origin on `valid_card` (the cast half's
+    // spell is on the stack at fire time, not its play origin), so the land
+    // half consults `spell_cast_origin` directly here. `Any` → matches every
+    // origin → plain "play a land" triggers are unaffected.
+    if let GameEvent::LandPlayed { from_zone, .. } = event {
+        if !trigger.spell_cast_origin.matches_from(&Some(*from_zone)) {
+            return false;
+        }
+    }
+    match_land_played(event, trigger, source_id, state)
 }
 
 pub(super) fn match_mana_added(
@@ -2900,6 +2945,30 @@ pub(super) fn match_adapt(
         valid_card_matches(trigger, state, *adapted_id, source_id)
     } else {
         *adapted_id == source_id
+    }
+}
+
+/// CR 701.50f: Connives — fires when a permanent connives.
+/// `valid_card` scopes the CONNIVER (the permanent that connived). With no
+/// filter, this is "this creature connives" — match the source by identity
+/// (Ultron's self-connive).
+pub(super) fn match_connives(
+    event: &GameEvent,
+    trigger: &TriggerDefinition,
+    source_id: ObjectId,
+    state: &GameState,
+) -> bool {
+    let GameEvent::EffectResolved {
+        kind: EffectKind::Connive,
+        source_id: conniver_id,
+    } = event
+    else {
+        return false;
+    };
+    if trigger.valid_card.is_some() {
+        valid_card_matches(trigger, state, *conniver_id, source_id)
+    } else {
+        *conniver_id == source_id
     }
 }
 
@@ -3692,6 +3761,24 @@ pub(super) fn match_visit_attraction(
     }
 }
 
+pub(super) fn match_crank_contraption(
+    event: &GameEvent,
+    trigger: &TriggerDefinition,
+    source_id: ObjectId,
+    state: &GameState,
+) -> bool {
+    if let GameEvent::ContraptionCranked {
+        player_id,
+        contraption_id,
+        ..
+    } = event
+    {
+        *contraption_id == source_id && valid_player_matches(trigger, state, *player_id, source_id)
+    } else {
+        false
+    }
+}
+
 /// CR 309.7: Match dungeon completion events.
 pub(super) fn match_dungeon_completed(
     event: &GameEvent,
@@ -4018,10 +4105,10 @@ pub(super) fn match_unimplemented(
 }
 
 // ---------------------------------------------------------------------------
-// CR 702.122d: Crew trigger matchers
+// CR 702.122e: Crew trigger matchers
 // ---------------------------------------------------------------------------
 
-/// CR 702.122d: Matches when a Vehicle's crew ability resolves.
+/// CR 702.122e: Matches when a Vehicle's crew ability resolves.
 /// Both `Crewed` and `BecomesCrewed` are semantically identical — different Oracle text
 /// phrasings for the same trigger condition.
 pub(super) fn match_vehicle_crewed(
@@ -4362,6 +4449,12 @@ mod tests {
                 "missing direct matcher for {mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn trigger_registry_includes_crank_contraption() {
+        let registry = build_trigger_registry();
+        assert!(registry.contains_key(&TriggerMode::CrankContraption));
     }
 
     /// Helper to create a minimal TriggerDefinition with typed fields.
@@ -5636,6 +5729,130 @@ mod tests {
             )],
         };
         assert!(!match_attacks(&other_player_event, &trigger, curse, &state));
+    }
+
+    /// CR 508.3b: "Whenever [player] is attacked" with no attacker filter.
+    /// Regression test for the fix where `attacker_matches` returned false when
+    /// `valid_card` and `valid_source` are both None but `valid_target` is set.
+    #[test]
+    fn attacks_trigger_matches_any_attacker_when_only_valid_target_set() {
+        let mut state = setup();
+        let curse = create_object(
+            &mut state,
+            CardId(13),
+            PlayerId(0),
+            "Curse of Vitality".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&curse).unwrap().attached_to =
+            Some(AttachTarget::Player(PlayerId(1)));
+
+        let attacker = create_object(
+            &mut state,
+            CardId(14),
+            PlayerId(0),
+            "Attacker".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&attacker)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+
+        // No valid_card, no valid_source — only valid_target = AttachedTo.
+        // CR 508.3b: attack_target_filter restricts to player-only attacks.
+        let mut trigger = make_trigger(TriggerMode::Attacks);
+        trigger.valid_target = Some(TargetFilter::AttachedTo);
+        trigger.attack_target_filter = Some(crate::types::triggers::AttackTargetFilter::Player);
+
+        // Positive: attacker attacks the enchanted player (P1).
+        let enchanted_player_event = GameEvent::AttackersDeclared {
+            attacker_ids: vec![attacker],
+            defending_player: PlayerId(1),
+            attacks: vec![(
+                attacker,
+                crate::game::combat::AttackTarget::Player(PlayerId(1)),
+            )],
+        };
+        assert!(match_attacks(
+            &enchanted_player_event,
+            &trigger,
+            curse,
+            &state
+        ));
+
+        // Negative: attacker attacks a different player (P0).
+        let other_player_event = GameEvent::AttackersDeclared {
+            attacker_ids: vec![attacker],
+            defending_player: PlayerId(0),
+            attacks: vec![(
+                attacker,
+                crate::game::combat::AttackTarget::Player(PlayerId(0)),
+            )],
+        };
+        assert!(!match_attacks(&other_player_event, &trigger, curse, &state));
+
+        // Deduplication: two creatures attack the same enchanted player —
+        // CR 508.3b says the trigger fires only once.
+        let attacker2 = create_object(
+            &mut state,
+            CardId(15),
+            PlayerId(0),
+            "Attacker2".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&attacker2)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        let two_attackers_event = GameEvent::AttackersDeclared {
+            attacker_ids: vec![attacker, attacker2],
+            defending_player: PlayerId(1),
+            attacks: vec![
+                (
+                    attacker,
+                    crate::game::combat::AttackTarget::Player(PlayerId(1)),
+                ),
+                (
+                    attacker2,
+                    crate::game::combat::AttackTarget::Player(PlayerId(1)),
+                ),
+            ],
+        };
+        let events = matching_attack_events(&two_attackers_event, &trigger, curse, &state);
+        assert_eq!(
+            events.len(),
+            1,
+            "CR 508.3b: 'whenever [player] is attacked' triggers once, not per creature"
+        );
+
+        // Negative: attacking a planeswalker controlled by the enchanted player
+        // should NOT fire the trigger (attack_target_filter = Player).
+        let pw = create_object(
+            &mut state,
+            CardId(16),
+            PlayerId(1),
+            "Planeswalker".to_string(),
+            Zone::Battlefield,
+        );
+        let pw_attack_event = GameEvent::AttackersDeclared {
+            attacker_ids: vec![attacker],
+            defending_player: PlayerId(1),
+            attacks: vec![(
+                attacker,
+                crate::game::combat::AttackTarget::Planeswalker(pw),
+            )],
+        };
+        assert!(
+            !match_attacks(&pw_attack_event, &trigger, curse, &state),
+            "attacking a planeswalker should not fire 'enchanted player is attacked'"
+        );
     }
 
     #[test]
@@ -7175,6 +7392,103 @@ mod tests {
             excess: 0,
         };
         assert!(!match_damage_done(&to_player, &trigger, source, &state));
+    }
+
+    /// CR 120.3 + CR 102.2: A "deals damage to a player or battle" trigger uses
+    /// `TargetFilter::Or { filters: [Player, Typed(Battle)] }` as emitted by
+    /// `parse_damage_to_qualifier`. The `TargetRef::Object` arm of
+    /// `match_damage_done` must NOT treat the disjunction as a player-scope filter
+    /// (it's an `Or`, not a controller-only `Typed`), and must delegate to
+    /// `target_filter_matches_object` so the `Typed(Battle)` leg resolves.
+    ///
+    /// Regression: fires for a battle object recipient, does NOT fire for a
+    /// non-battle object recipient, and still fires for a player recipient.
+    #[test]
+    fn battle_object_recipient_fires_for_player_or_battle_trigger() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Trigger Source".to_string(),
+            Zone::Battlefield,
+        );
+        let battle = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Invaded Farmland".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&battle)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Battle);
+        let creature = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Noncombatant Creature".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&creature)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+
+        // Exact shape `parse_damage_to_qualifier` emits for "a player or battle".
+        let mut trigger = make_trigger(TriggerMode::DamageDone);
+        trigger.valid_target = Some(TargetFilter::Or {
+            filters: vec![
+                TargetFilter::Player,
+                TargetFilter::Typed(TypedFilter::new(TypeFilter::Battle)),
+            ],
+        });
+
+        // Damage to a battle object fires (TargetRef::Object arm, Or's Battle leg).
+        let to_battle = GameEvent::DamageDealt {
+            source_id: source,
+            target: TargetRef::Object(battle),
+            amount: 2,
+            is_combat: true,
+            excess: 0,
+        };
+        assert!(
+            match_damage_done(&to_battle, &trigger, source, &state),
+            "battle object recipient must fire a 'player or battle' trigger"
+        );
+
+        // Damage to a non-battle object must NOT fire (creature matches neither leg).
+        let to_creature = GameEvent::DamageDealt {
+            source_id: source,
+            target: TargetRef::Object(creature),
+            amount: 2,
+            is_combat: true,
+            excess: 0,
+        };
+        assert!(
+            !match_damage_done(&to_creature, &trigger, source, &state),
+            "non-battle object recipient must not fire a 'player or battle' trigger"
+        );
+
+        // Damage to a player still fires via the Or's Player leg.
+        let to_player = GameEvent::DamageDealt {
+            source_id: source,
+            target: TargetRef::Player(PlayerId(1)),
+            amount: 2,
+            is_combat: true,
+            excess: 0,
+        };
+        assert!(
+            match_damage_done(&to_player, &trigger, source, &state),
+            "player recipient must fire a 'player or battle' trigger via its Player leg"
+        );
     }
 
     /// CR 120.3 + CR 102.2: Step 0a must NOT over-reject the legitimate

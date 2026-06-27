@@ -9,6 +9,7 @@ import {
   getCardPrintings,
   isCardImageFlipLayoutSync,
   isCardImageRotatedSync,
+  pickOldestPrinting,
   resolveFaceIndexSync,
   resolveOracleIdSync,
   resolvePrintingImageUrl,
@@ -105,16 +106,6 @@ registerStrategyCacheClearFn(() => {
   strategyNoWinnerCache.clear();
 });
 
-function oldestPrinting(printings: PrintingEntry[]): PrintingEntry {
-  return [...printings].sort((a, b) => {
-    const byDate = a.released_at.localeCompare(b.released_at);
-    if (byDate !== 0) return byDate;
-    return a.collector_number.localeCompare(b.collector_number, undefined, {
-      numeric: true,
-    });
-  })[0];
-}
-
 function applyChainEntry(
   entry: ArtChainEntry,
   printings: PrintingEntry[],
@@ -126,7 +117,7 @@ function applyChainEntry(
     case "newest":
       return printings[0];
     case "oldest":
-      return oldestPrinting(printings);
+      return pickOldestPrinting(printings);
     case "prefer_borderless":
       return printings.find((p) => p.border_color === "borderless") ?? null;
     case "prefer_extended":

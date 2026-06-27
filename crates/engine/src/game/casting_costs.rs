@@ -8033,6 +8033,9 @@ pub fn finalize_mana_payment_with_phyrexian_choices(
     match finalize_result {
         Ok(waiting_for) => Ok(waiting_for),
         Err(err) => {
+            // CR 601.2h: A failed Pay attempt must not consume the pending cast —
+            // the caster remains in the mana-payment window and may tap more
+            // convoke sources or CancelCast (issue #4379).
             state.pending_cast = Some(pending_for_restore);
             Err(err)
         }

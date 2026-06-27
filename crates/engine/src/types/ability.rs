@@ -5705,6 +5705,13 @@ pub enum StaticCondition {
     /// Hamlet Glutton's "This spell costs {2} less to cast if it's bargained." Evaluated
     /// against the in-flight cast's `additional_cost_paid` flag (`state.pending_cast`).
     AdditionalCostPaid,
+    /// CR 702.34a + CR 601.2f: True when the spell is being cast via the named
+    /// alternative-cast variant (e.g. flashback "cast this way" cost reduction on
+    /// Visions of Ruin). Evaluated only during self-spell `ModifyCost` collection,
+    /// not in the layer pipeline.
+    CastingAsVariant {
+        variant: crate::types::game_state::CastingVariant,
+    },
     None,
 }
 
@@ -6031,6 +6038,11 @@ pub enum CastVariantPaid {
     /// "if its prowl cost was paid" intervening-if (Latchkey Faerie, Oona's
     /// Blackguard-style prowl payoffs).
     Prowl,
+    /// CR 702.119a-c: Emerge alternative cast cost was paid (a creature was
+    /// sacrificed and the reduced emerge mana cost paid). Read by the "if its
+    /// emerge cost was paid, instead …" intervening-if / instead clauses
+    /// (Adipose Offspring).
+    Emerge,
 }
 
 /// CR 601.3b + CR 702.8a: A timing permission actually used to cast a spell.
@@ -6643,6 +6655,56 @@ pub enum CostCategory {
 }
 
 impl AbilityCost {
+    /// CR 605.3a + CR 106.12 + CR 107.6: True iff every component of this cost is
+    /// conclusively decided by the non-simulating mana-ability cheap gate
+    /// (`mana_ability_ready_without_simulation`) — i.e. the cost is built solely
+    /// from the tap ({T}) and untap ({Q}) symbols. For such costs the production +
+    /// payment path in `resolve_mana_ability_with_selected_choices` is infallible,
+    /// so the legality clone in `can_activate_mana_ability_now` can be skipped.
+    ///
+    /// `Mana`/`ManaDynamic` are deliberately NOT covered: their payability is decided
+    /// by an auto-tap affordability witness with a known remove-then-tap soundness
+    /// gap (CR 601.2g), so they must still simulate. No wildcard arm — a future
+    /// variant must be classified explicitly.
+    pub fn all_components_cheap_gate_covered(&self) -> bool {
+        match self {
+            AbilityCost::Tap | AbilityCost::Untap => true,
+            AbilityCost::Composite { costs } => costs
+                .iter()
+                .all(AbilityCost::all_components_cheap_gate_covered),
+            // Every other variant is decided by a path the cheap gate does NOT
+            // conclusively settle (mana affordability witness, interactive object
+            // selection, life/resource availability, effect resolution, etc.), so
+            // it must still simulate.
+            AbilityCost::Mana { .. }
+            | AbilityCost::ManaDynamic { .. }
+            | AbilityCost::Loyalty { .. }
+            | AbilityCost::Sacrifice(_)
+            | AbilityCost::PayLife { .. }
+            | AbilityCost::Discard { .. }
+            | AbilityCost::Exile { .. }
+            | AbilityCost::ExileMaterials { .. }
+            | AbilityCost::CollectEvidence { .. }
+            | AbilityCost::TapCreatures { .. }
+            | AbilityCost::RemoveCounter { .. }
+            | AbilityCost::PayEnergy { .. }
+            | AbilityCost::PaySpeed { .. }
+            | AbilityCost::ReturnToHand { .. }
+            | AbilityCost::Unattach
+            | AbilityCost::Mill { .. }
+            | AbilityCost::Exert
+            | AbilityCost::Blight { .. }
+            | AbilityCost::Reveal { .. }
+            | AbilityCost::Behold { .. }
+            | AbilityCost::OneOf { .. }
+            | AbilityCost::Waterbend { .. }
+            | AbilityCost::NinjutsuFamily { .. }
+            | AbilityCost::EffectCost { .. }
+            | AbilityCost::PerCounter { .. }
+            | AbilityCost::Unimplemented { .. } => false,
+        }
+    }
+
     /// CR 702.24a + CR 118.12: True iff this cost can be used as the base
     /// cost for a cumulative-upkeep trigger and then paid by the current
     /// unless-payment pipeline after `PerCounter` expansion.
@@ -7511,6 +7573,31 @@ impl StepSkipTarget {
             ],
         }
     }
+}
+
+/// CR 614.10 + CR 614.10a: How long a skip effect persists.
+///
+/// CR 614.10: "Skip [something]" is a replacement effect equivalent to
+/// "instead of doing [something], do nothing." A skip can be scoped to either a
+/// single next occurrence of a step (`NextOccurrence`) or to *every* occurrence
+/// within the player's next non-skipped turn (`AllOfNextTurn`, e.g. False Peace
+/// / Empty City Ruse: "skips all combat phases of their next turn"). Per
+/// CR 614.10a, an "all of next turn" skip lands on the first turn that isn't
+/// itself skipped (it waits past skipped turns), and — unlike a finite-count
+/// skip — it suppresses *every* combat phase that turn, including extra combat
+/// phases created that turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipScope {
+    /// CR 614.10a: skip the single next occurrence of the named step; satisfied
+    /// once that occurrence is skipped. This is the only scope that interacts
+    /// with a finite `count`.
+    #[default]
+    NextOccurrence,
+    /// CR 614.10 + CR 614.10a: skip every occurrence of the named phase across
+    /// the player's entire next non-skipped turn. Turn-binding subsumes
+    /// counting, so this scope ignores any finite `count`.
+    AllOfNextTurn,
 }
 
 /// CR 115.1: Whether the `Bounce` effect selects its affected object at
@@ -10120,6 +10207,15 @@ pub enum Effect {
         step: StepSkipTarget,
         #[serde(default = "default_quantity_one")]
         count: QuantityExpr,
+        /// CR 614.10 + CR 614.10a: scope of the skip. `NextOccurrence` (default)
+        /// uses the finite `count` and consumes the per-player step counter at the
+        /// relevant turn-flow boundary. `AllOfNextTurn` binds the skip to the
+        /// player's entire next non-skipped turn via the turn-scoped combat-skip
+        /// state machine and is **mutually exclusive** with a finite `count` —
+        /// turn-binding subsumes counting, so `count` is ignored when
+        /// `scope == AllOfNextTurn`.
+        #[serde(default)]
+        scope: SkipScope,
     },
     /// CR 500.8: Add an additional step or phase after the specified anchor phase.
     /// Uses a LIFO stack on GameState.extra_phases. `followed_by` entries are pushed
@@ -10958,6 +11054,27 @@ impl TargetFilter {
                 .iter()
                 .all(TargetFilter::references_exiled_by_source),
             TargetFilter::TrackedSetFiltered { filter, .. } => filter.references_exiled_by_source(),
+            _ => false,
+        }
+    }
+
+    /// CR 400.7d + CR 608.2k: True when this filter tree references the
+    /// cost-paid object (`TargetFilter::CostPaidObject`) at any structural
+    /// position — directly, or nested inside `And`/`Or`/`Not`/
+    /// `TrackedSetFiltered` composition. Mirrors `references_exiled_by_source`,
+    /// but uses `any` for `Or` because the consumer (the emerge cost-paid-object
+    /// propagation gate in `game::triggers`) needs to detect *any* reference to
+    /// the cost-paid object so the `cast_cost_paid_object` snapshot is propagated
+    /// whenever it could be read at resolution — not whether the filter as a
+    /// whole is a context-ref for target-slot purposes.
+    pub fn references_cost_paid_object(&self) -> bool {
+        match self {
+            TargetFilter::CostPaidObject => true,
+            TargetFilter::And { filters } | TargetFilter::Or { filters } => filters
+                .iter()
+                .any(TargetFilter::references_cost_paid_object),
+            TargetFilter::Not { filter } => filter.references_cost_paid_object(),
+            TargetFilter::TrackedSetFiltered { filter, .. } => filter.references_cost_paid_object(),
             _ => false,
         }
     }
@@ -15779,8 +15896,12 @@ pub enum DamageModification {
     Double,
     /// amount * 3 (e.g. Fiery Emancipation)
     Triple,
-    /// amount + value (e.g. Torbran, +2)
-    Plus { value: u32 },
+    /// CR 614.1a + CR 120: amount + value, where the added magnitude is a
+    /// `QuantityExpr` resolved against the replacement source at application
+    /// time. `Fixed { value }` covers static offsets (Torbran +2, Artist's
+    /// Talent +2); a `Ref` carries a live game quantity ("...plus X, where X is
+    /// ~'s power" — Hawkeye, Young Avenger).
+    Plus { value: QuantityExpr },
     /// amount.saturating_sub(value) (e.g. Benevolent Unicorn, -1).
     /// CR 615.1 + CR 614.1a: Continuous prevention statics ("prevent that damage")
     /// emit `Minus { value: u32::MAX }` — saturating-subtraction yields 0 for any

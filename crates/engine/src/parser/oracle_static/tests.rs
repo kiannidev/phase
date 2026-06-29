@@ -6585,6 +6585,17 @@ fn static_each_player_may_play_an_additional_land() {
 }
 
 #[test]
+fn static_anchor_choice_land_drop_stays_unsupported_until_choice_filter_exists() {
+    assert!(
+        parse_static_line(
+            "Each player who last chose green anchor may play an additional land during each of their turns.",
+        )
+        .is_none(),
+        "chosen-word player subjects must not be widened to all players"
+    );
+}
+
+#[test]
 fn static_you_may_choose_not_to_untap_self() {
     let def =
         parse_static_line("You may choose not to untap this creature during your untap step.")
@@ -7588,6 +7599,52 @@ fn static_play_two_additional_lands() {
     let def =
         parse_static_line("You may play two additional lands on each of your turns.").unwrap();
     assert_eq!(def.mode, StaticMode::AdditionalLandDrop { count: 2 });
+    match &def.affected {
+        Some(TargetFilter::Typed(tf)) => assert_eq!(tf.controller, Some(ControllerRef::You)),
+        other => panic!("two-additional land static must affect controller only, got {other:?}"),
+    }
+}
+
+#[test]
+fn static_play_any_number_of_lands() {
+    let def = parse_static_line("You may play any number of lands on each of your turns.").unwrap();
+    assert_eq!(def.mode, StaticMode::AdditionalLandDrop { count: u8::MAX });
+    match &def.affected {
+        Some(TargetFilter::Typed(tf)) => assert_eq!(tf.controller, Some(ControllerRef::You)),
+        other => panic!("any-number land static must affect controller only, got {other:?}"),
+    }
+}
+
+#[test]
+fn fastbond_first_line_is_static_not_targeted_play_effect() {
+    let parsed = crate::parser::oracle::parse_oracle_text(
+        "You may play any number of lands on each of your turns.\nWhenever you play a land, if it wasn't the first land you played this turn, this enchantment deals 1 damage to you.",
+        "Fastbond",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    );
+
+    assert!(
+        parsed.statics.iter().any(|def| {
+            def.mode == (StaticMode::AdditionalLandDrop { count: u8::MAX })
+                && matches!(
+                    &def.affected,
+                    Some(TargetFilter::Typed(tf))
+                        if tf.controller == Some(ControllerRef::You)
+                )
+        }),
+        "Fastbond must parse its land-play permission as a static ability, got {:?}",
+        parsed.statics
+    );
+    assert!(
+        !parsed
+            .abilities
+            .iter()
+            .any(|ability| matches!(*ability.effect, Effect::CastFromZone { .. })),
+        "Fastbond must not ask for a target by lowering the static land-play permission to CastFromZone, got {:?}",
+        parsed.abilities
+    );
 }
 
 #[test]

@@ -536,6 +536,7 @@ fn parse_begin_game_clause(line: &str, lower: &str) -> Option<AbilityDefinition>
             up_to: false,
             // CR 122.1: entry counters parsed from "with [N] [type] counter(s) on it".
             enter_with_counters,
+            conditional_enter_with_counters: vec![],
             face_down_profile: None,
         },
     )

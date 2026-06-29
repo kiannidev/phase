@@ -109,19 +109,34 @@ fn winter_soldier_attack_trigger_parses_reanimation_and_hero_counter_rider() {
         execute.forward_result,
         "ChangeZone must forward the returned card"
     );
-    let sub = execute.sub_ability.as_ref().expect("Hero counter rider");
-    assert!(matches!(sub.effect.as_ref(), Effect::PutCounter { .. }));
-    let Some(engine::types::ability::AbilityCondition::ZoneChangedThisWay { filter }) =
-        sub.condition.as_ref()
+    let Effect::ChangeZone {
+        conditional_enter_with_counters,
+        ..
+    } = execute.effect.as_ref()
     else {
-        panic!("expected ZoneChangedThisWay gate, got {:?}", sub.condition);
+        panic!("expected ChangeZone head");
     };
+    assert_eq!(
+        conditional_enter_with_counters.len(),
+        1,
+        "Hero counter rider must fold into conditional_enter_with_counters"
+    );
+    let (filter, counter_type, count) = &conditional_enter_with_counters[0];
+    assert_eq!(*counter_type, CounterType::Plus1Plus1);
+    assert!(
+        matches!(count, engine::types::ability::QuantityExpr::Fixed { value: 1 }),
+        "expected one additional +1/+1 counter, got {count:?}"
+    );
     let TargetFilter::Typed(typed) = filter else {
         panic!("expected Hero filter, got {filter:?}");
     };
     assert!(typed
         .type_filters
         .contains(&TypeFilter::Subtype("Hero".into())));
+    assert!(
+        execute.sub_ability.is_none(),
+        "counter rider must not remain as a PutCounter sub-ability"
+    );
 }
 
 #[test]

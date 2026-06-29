@@ -3,7 +3,8 @@ use rand::Rng;
 use crate::game::zones;
 use crate::types::ability::{
     ControllerRef, Duration, Effect, EffectError, EffectKind, FilterProp, LibraryPosition,
-    ResolvedAbility, TargetChoiceTiming, TargetFilter, TargetRef, TargetSelectionMode, TypedFilter,
+    QuantityExpr, ResolvedAbility, TargetChoiceTiming, TargetFilter, TargetRef,
+    TargetSelectionMode, TypedFilter,
 };
 #[cfg(test)]
 use crate::types::ability::{EffectScope, TapStateChange};
@@ -155,6 +156,7 @@ pub fn resolve(
         effect_enters_attacking,
         up_to,
         effect_enter_with_counters,
+        effect_conditional_enter_with_counters,
         face_down_profile,
     ) = match &ability.effect {
         Effect::ChangeZone {
@@ -167,6 +169,7 @@ pub fn resolve(
             enters_attacking,
             up_to,
             enter_with_counters,
+            conditional_enter_with_counters,
             face_down_profile,
             ..
         } => {
@@ -204,6 +207,7 @@ pub fn resolve(
                 *enters_attacking,
                 *up_to,
                 resolved_counters,
+                conditional_enter_with_counters.clone(),
                 face_down_profile.clone(),
             )
         }
@@ -619,7 +623,7 @@ pub fn resolve(
         enter_tapped: effect_enter_tapped,
         enters_under_player,
         enters_attacking: effect_enters_attacking,
-        enter_with_counters: effect_enter_with_counters,
+        enter_with_counters: effect_enter_with_counters.clone(),
         duration: ability.duration.clone(),
         track_exiled_by_source,
         face_down_profile: face_down_profile.clone(),
@@ -657,7 +661,17 @@ pub fn resolve(
             }
         }
 
-        match process_one_zone_move(state, &ctx, *obj_id, events) {
+        let per_obj_ctx = ChangeZoneIterationCtx {
+            enter_with_counters: enter_with_counters_for_object(
+                state,
+                ability,
+                *obj_id,
+                &effect_enter_with_counters,
+                &effect_conditional_enter_with_counters,
+            ),
+            ..ctx.clone()
+        };
+        match process_one_zone_move(state, &per_obj_ctx, *obj_id, events) {
             ZoneMoveResult::Done => {}
             ZoneMoveResult::NeedsAuraAttachmentChoice => {
                 state.pending_change_zone_iteration =
@@ -671,7 +685,7 @@ pub fn resolve(
                         enter_tapped: ctx.enter_tapped,
                         enters_under_player: ctx.enters_under_player,
                         enters_attacking: ctx.enters_attacking,
-                        enter_with_counters: ctx.enter_with_counters.clone(),
+                        enter_with_counters: per_obj_ctx.enter_with_counters.clone(),
                         duration: ctx.duration.clone(),
                         track_exiled_by_source: ctx.track_exiled_by_source,
                         moved_count: None,
@@ -734,11 +748,36 @@ pub fn resolve(
     Ok(())
 }
 
+/// CR 122.1 + CR 614.1c: Merge unconditional and conditional entry-time counters
+/// for one object about to enter via `ChangeZone`.
+fn enter_with_counters_for_object(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    obj_id: ObjectId,
+    base: &[(CounterType, u32)],
+    conditional: &[(TargetFilter, CounterType, QuantityExpr)],
+) -> Vec<(CounterType, u32)> {
+    let mut counters = base.to_vec();
+    if conditional.is_empty() {
+        return counters;
+    }
+    let ctx = crate::game::filter::FilterContext::from_ability(ability);
+    for (filter, counter_type, count) in conditional {
+        if crate::game::filter::matches_target_filter(state, obj_id, filter, &ctx) {
+            let n = crate::game::quantity::resolve_quantity_with_targets(state, count, ability)
+                .max(0) as u32;
+            counters.push((counter_type.clone(), n));
+        }
+    }
+    counters
+}
+
 /// Per-iteration context for the multi-target `ChangeZone` loop. Captured once
 /// per `resolve` call (and once per `EffectZoneChoice` resolution) so that the
 /// loop body and the post-pause drain share one parameter bundle. Mirrors
 /// the captured fields on [`crate::types::game_state::PendingChangeZoneIteration`]
 /// minus the resume-only fields (`remaining`, `effect_kind`).
+#[derive(Clone)]
 pub(crate) struct ChangeZoneIterationCtx {
     pub source_id: ObjectId,
     pub controller: PlayerId,

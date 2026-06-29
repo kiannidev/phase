@@ -5506,6 +5506,46 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
         assert!(!has_swallowed_detector(&parsed, "Duration_UntilEndOfTurn"));
     }
 
+    fn def_tree_has_create_damage_replacement(def: &AbilityDefinition) -> bool {
+        if matches!(def.effect.as_ref(), Effect::CreateDamageReplacement { .. }) {
+            return true;
+        }
+        match def.effect.as_ref() {
+            Effect::FlipCoin {
+                win_effect,
+                lose_effect,
+                ..
+            }
+            | Effect::FlipCoins {
+                win_effect,
+                lose_effect,
+                ..
+            } => {
+                if win_effect
+                    .as_deref()
+                    .is_some_and(def_tree_has_create_damage_replacement)
+                    || lose_effect
+                        .as_deref()
+                        .is_some_and(def_tree_has_create_damage_replacement)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        def.sub_ability
+            .as_deref()
+            .is_some_and(def_tree_has_create_damage_replacement)
+            || def
+                .else_ability
+                .as_deref()
+                .is_some_and(def_tree_has_create_damage_replacement)
+            || def
+                .mode_abilities
+                .iter()
+                .any(def_tree_has_create_damage_replacement)
+    }
+
     /// CR 614.9 + CR 705: Desperate Gambit — flip-coin win/lose branches carry
     /// one-shot damage replacements; the Replacement_Instead detector must walk
     /// `FlipCoin` payloads (issue #2236).
@@ -5516,6 +5556,18 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
             "Desperate Gambit",
             &["Instant"],
         );
+        assert!(
+            !parsed.abilities.iter().any(def_tree_has_unimplemented),
+            "Desperate Gambit must parse without Unimplemented"
+        );
+        assert!(
+            parsed
+                .abilities
+                .iter()
+                .any(def_tree_has_create_damage_replacement),
+            "expected CreateDamageReplacement in flip-coin branches, got {:#?}",
+            parsed.abilities
+        );
         assert!(!has_swallowed_detector(&parsed, "Replacement_Instead"));
     }
 
@@ -5523,18 +5575,44 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
     /// replacement choice must not trip Replacement_Instead (issue #2236).
     #[test]
     fn replacement_instead_accepts_untap_and_token_choice_replacements() {
+        use crate::types::ability::ReplacementCondition;
+        use crate::types::replacements::ReplacementEvent;
+
         let edge = parse_named(
             "If a creature you control would untap during your untap step, put two +1/+1 counters on it instead.",
             "Edge of Malacol",
             &["Enchantment"],
         );
+        assert!(
+            !edge
+                .replacements
+                .iter()
+                .any(|r| { r.execute.as_deref().is_some_and(def_tree_has_unimplemented) }),
+            "Edge of Malacol replacement must parse without Unimplemented"
+        );
+        assert!(
+            edge.replacements.iter().any(|r| {
+                r.event == ReplacementEvent::Untap
+                    && r.condition == Some(ReplacementCondition::DuringUntapStep)
+                    && r.execute.is_some()
+            }),
+            "expected untap-step replacement AST, got {:#?}",
+            edge.replacements
+        );
         assert!(!has_swallowed_detector(&edge, "Replacement_Instead"));
 
-        let jinnie = parse_named(
-            "If you would create one or more tokens, you may instead create that many 2/2 green Cat creature tokens with haste or that many 3/1 green Dog creature tokens with vigilance.",
-            "Jinnie Fay, Jetmir's Second",
-            &["Legendary", "Creature"],
+        let doubling = parse_named(
+            "If an effect would create one or more tokens under your control, it creates twice that many of those tokens instead.",
+            "Doubling Season",
+            &["Enchantment"],
         );
-        assert!(!has_swallowed_detector(&jinnie, "Replacement_Instead"));
+        assert!(
+            doubling.replacements.iter().any(|r| {
+                r.event == ReplacementEvent::CreateToken && r.quantity_modification.is_some()
+            }),
+            "expected CreateToken quantity-modifier replacement AST, got {:#?}",
+            doubling.replacements
+        );
+        assert!(!has_swallowed_detector(&doubling, "Replacement_Instead"));
     }
 }

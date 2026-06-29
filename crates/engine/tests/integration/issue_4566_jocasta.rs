@@ -36,9 +36,7 @@ fn accept_optional_return_and_resolve(runner: &mut GameRunner) {
                     );
                     return;
                 }
-                runner
-                    .act(GameAction::PassPriority)
-                    .expect("pass priority");
+                runner.act(GameAction::PassPriority).expect("pass priority");
             }
             other => panic!("unexpected waiting state during Jocasta resolution: {other:?}"),
         }
@@ -59,9 +57,9 @@ fn jocasta_returns_tapped_and_attacking_from_graveyard_on_commander_attack() {
         .triggers
         .iter()
         .find(|t| {
-            t.execute.as_ref().is_some_and(|a| {
-                matches!(a.effect.as_ref(), Effect::ChangeZone { .. })
-            })
+            t.execute
+                .as_ref()
+                .is_some_and(|a| matches!(a.effect.as_ref(), Effect::ChangeZone { .. }))
         })
         .expect("parsed return trigger");
     match return_trigger.execute.as_ref().unwrap().effect.as_ref() {
@@ -75,7 +73,10 @@ fn jocasta_returns_tapped_and_attacking_from_graveyard_on_commander_attack() {
             assert_eq!(*origin, Some(Zone::Graveyard));
             assert!(enter_tapped.is_tapped());
             assert!(enters_attacking);
-            assert!(matches!(target, engine::types::ability::TargetFilter::SelfRef));
+            assert!(matches!(
+                target,
+                engine::types::ability::TargetFilter::SelfRef
+            ));
         }
         other => panic!("expected ChangeZone, got {other:?}"),
     }

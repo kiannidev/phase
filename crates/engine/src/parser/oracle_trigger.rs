@@ -363,15 +363,16 @@ fn stamp_self_return_origin_in_effect(effect: &mut Effect, origin: Zone) {
             ..
         } if matches!(
             target,
-            TargetFilter::SelfRef
-                | TargetFilter::TriggeringSource
-                | TargetFilter::ParentTarget
+            TargetFilter::SelfRef | TargetFilter::TriggeringSource | TargetFilter::ParentTarget
         ) && matches!(destination, Zone::Battlefield | Zone::Hand) =>
         {
             if o.is_none() {
                 *o = Some(origin);
             }
-            if matches!(target, TargetFilter::ParentTarget | TargetFilter::TriggeringSource) {
+            if matches!(
+                target,
+                TargetFilter::ParentTarget | TargetFilter::TriggeringSource
+            ) {
                 *target = TargetFilter::SelfRef;
             }
         }
@@ -16645,24 +16646,27 @@ mod tests {
             .triggers
             .iter()
             .find(|t| {
-                t.execute.as_ref().is_some_and(|a| {
-                    matches!(a.effect.as_ref(), Effect::ChangeZone { .. })
-                })
+                t.execute
+                    .as_ref()
+                    .is_some_and(|a| matches!(a.effect.as_ref(), Effect::ChangeZone { .. }))
             })
             .expect("graveyard return trigger must exist in full pipeline");
         assert!(
-            graveyard_return
-                .trigger_zones
-                .contains(&Zone::Graveyard),
+            graveyard_return.trigger_zones.contains(&Zone::Graveyard),
             "graveyard intervening-if must set trigger_zones, got {:?}",
             graveyard_return.trigger_zones
         );
         assert_eq!(graveyard_return.mode, TriggerMode::YouAttack);
         match &graveyard_return.valid_card {
             Some(TargetFilter::Typed(tf)) => {
-                assert!(tf.properties.iter().any(|p| matches!(p, FilterProp::IsCommander)));
+                assert!(tf
+                    .properties
+                    .iter()
+                    .any(|p| matches!(p, FilterProp::IsCommander)));
             }
-            other => panic!("YouAttack with your commander must set IsCommander valid_card, got {other:?}"),
+            other => panic!(
+                "YouAttack with your commander must set IsCommander valid_card, got {other:?}"
+            ),
         }
         let execute = graveyard_return
             .execute

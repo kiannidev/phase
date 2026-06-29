@@ -829,9 +829,12 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
                     Some(TargetRef::Object(*mount_id))
                 }
                 // CR 603.2 + CR 608.2c: "that [creature/permanent]" on a zone-change
-                // trigger (Captain America, Team Leader's "that Hero") is the object
-                // that caused the trigger — the entering/moved object_id.
-                crate::types::events::GameEvent::ZoneChanged { object_id, .. } => {
+                // trigger (Captain America, Team Leader's "that Hero") is the entering
+                // object when it is not the trigger source itself (Abigale's "that
+                // creature" anaphor must still inherit the chosen target).
+                crate::types::events::GameEvent::ZoneChanged { object_id, .. }
+                    if *object_id != source_id =>
+                {
                     Some(TargetRef::Object(*object_id))
                 }
                 _ => None,

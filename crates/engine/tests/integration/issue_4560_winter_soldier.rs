@@ -1,0 +1,169 @@
+//! Regression for issue #4560: Winter Soldier, Reborn Avenger attack trigger must
+//! reanimate a legal graveyard creature and grant Heroes an extra +1/+1 counter.
+
+use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::parser::oracle::parse_oracle_text;
+use engine::types::ability::{Effect, TargetFilter, TypeFilter};
+use engine::types::actions::GameAction;
+use engine::types::counter::CounterType;
+use engine::types::game_state::WaitingFor;
+use engine::types::identifiers::ObjectId;
+use engine::types::mana::{ManaCost, ManaCostShard};
+use engine::types::phase::Phase;
+use engine::types::triggers::TriggerMode;
+use engine::types::zones::Zone;
+
+use super::rules::AttackTarget;
+
+const WINTER_SOLDIER_ORACLE: &str = "Whenever Winter Soldier attacks, return target creature card with mana value less than or equal to Winter Soldier's power from your graveyard to the battlefield. If a Hero enters this way, it enters with an additional +1/+1 counter on it.";
+
+fn p1p1_count(runner: &GameRunner, id: ObjectId) -> u32 {
+    runner
+        .state()
+        .objects
+        .get(&id)
+        .map(|obj| {
+            obj.counters
+                .get(&CounterType::Plus1Plus1)
+                .copied()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
+fn drive_attack_resolution(runner: &mut GameRunner, graveyard_target: ObjectId) {
+    for _ in 0..80 {
+        match runner.state().waiting_for.clone() {
+            WaitingFor::Priority { .. } => {
+                if runner.state().stack.is_empty() {
+                    return;
+                }
+                runner.act(GameAction::PassPriority).expect("pass priority");
+            }
+            WaitingFor::OrderTriggers { triggers, .. } => {
+                let count = triggers.len();
+                runner
+                    .act(GameAction::OrderTriggers {
+                        order: (0..count).collect(),
+                    })
+                    .expect("order triggers");
+            }
+            WaitingFor::TriggerTargetSelection {
+                target_slots,
+                selection,
+                ..
+            }
+            | WaitingFor::TargetSelection {
+                target_slots,
+                selection,
+                ..
+            } => {
+                let slot = &target_slots[selection.current_slot];
+                let target = slot
+                    .legal_targets
+                    .iter()
+                    .find(|t| {
+                        matches!(t, engine::types::ability::TargetRef::Object(id) if *id == graveyard_target)
+                    })
+                    .or_else(|| slot.legal_targets.first())
+                    .cloned();
+                runner
+                    .act(GameAction::ChooseTarget { target })
+                    .expect("choose graveyard target");
+            }
+            WaitingFor::OptionalEffectChoice { .. } => {
+                runner
+                    .act(GameAction::DecideOptionalEffect { accept: true })
+                    .expect("accept optional effect");
+            }
+            other if runner.state().stack.is_empty() => {
+                panic!("unexpected waiting state during attack resolution: {other:?}");
+            }
+            _ => {}
+        }
+    }
+    panic!("attack trigger did not finish resolving");
+}
+
+#[test]
+fn winter_soldier_attack_trigger_parses_reanimation_and_hero_counter_rider() {
+    let parsed = parse_oracle_text(
+        WINTER_SOLDIER_ORACLE,
+        "Winter Soldier, Reborn Avenger",
+        &[],
+        &["Creature".to_string()],
+        &["Human".to_string(), "Hero".to_string()],
+    );
+    let trigger = parsed
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::Attacks)
+        .expect("attacks trigger");
+    let execute = trigger.execute.as_ref().expect("execute");
+    assert!(
+        matches!(execute.effect.as_ref(), Effect::ChangeZone { .. }),
+        "head must reanimate from graveyard, got {:?}",
+        execute.effect
+    );
+    assert!(execute.forward_result, "ChangeZone must forward the returned card");
+    let sub = execute.sub_ability.as_ref().expect("Hero counter rider");
+    assert!(matches!(sub.effect.as_ref(), Effect::PutCounter { .. }));
+    let Some(engine::types::ability::AbilityCondition::ZoneChangedThisWay { filter }) =
+        sub.condition.as_ref()
+    else {
+        panic!("expected ZoneChangedThisWay gate, got {:?}", sub.condition);
+    };
+    let TargetFilter::Typed(typed) = filter else {
+        panic!("expected Hero filter, got {filter:?}");
+    };
+    assert!(typed.type_filters.contains(&TypeFilter::Subtype("Hero".into())));
+}
+
+#[test]
+fn winter_soldier_reanimates_hero_with_extra_counter() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let soldier = scenario
+        .add_creature_from_oracle(
+            P0,
+            "Winter Soldier, Reborn Avenger",
+            3,
+            3,
+            WINTER_SOLDIER_ORACLE,
+        )
+        .id();
+
+    let hero = scenario
+        .add_creature_to_graveyard(P0, "Fallen Hero", 2, 2)
+        .with_subtypes(vec!["Hero"])
+        .with_mana_cost(ManaCost::Cost {
+            generic: 2,
+            shards: vec![ManaCostShard::White],
+        })
+        .id();
+
+    let mut runner = scenario.build();
+    assert!(
+        !runner.state().objects[&soldier]
+            .trigger_definitions
+            .is_empty(),
+        "Winter Soldier must register its attack trigger from oracle text"
+    );
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(soldier, AttackTarget::Player(P1))])
+        .expect("attack with Winter Soldier");
+
+    drive_attack_resolution(&mut runner, hero);
+
+    assert_eq!(
+        runner.state().objects[&hero].zone,
+        Zone::Battlefield,
+        "Hero must return from graveyard"
+    );
+    assert!(
+        p1p1_count(&runner, hero) >= 1,
+        "Hero reanimated this way must enter with an additional +1/+1 counter"
+    );
+}

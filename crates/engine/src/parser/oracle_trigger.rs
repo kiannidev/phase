@@ -14279,6 +14279,29 @@ mod tests {
     }
 
     #[test]
+    fn winter_soldier_reborn_avenger_attack_reanimation_trigger() {
+        use crate::types::ability::{AbilityCondition, Effect};
+        let def = parse_trigger_line(
+            "Whenever Winter Soldier attacks, return target creature card with mana value less than or equal to Winter Soldier's power from your graveyard to the battlefield. If a Hero enters this way, it enters with an additional +1/+1 counter on it.",
+            "Winter Soldier, Reborn Avenger",
+        );
+        assert_eq!(def.mode, TriggerMode::Attacks);
+        let execute = def.execute.expect("execute");
+        assert!(
+            matches!(execute.effect.as_ref(), Effect::ChangeZone { .. }),
+            "expected ChangeZone reanimation, got {:?}",
+            execute.effect
+        );
+        assert!(execute.forward_result);
+        let sub = execute.sub_ability.expect("Hero counter rider");
+        assert!(matches!(sub.effect.as_ref(), Effect::PutCounter { .. }));
+        assert!(matches!(
+            sub.condition,
+            Some(AbilityCondition::ZoneChangedThisWay { .. })
+        ));
+    }
+
+    #[test]
     fn parses_phases_in_trigger_as_phase_in_mode() {
         let def = parse_trigger_line(
             "Whenever Warping Wurm phases in, put a +1/+1 counter on it.",

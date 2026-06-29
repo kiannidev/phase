@@ -5,6 +5,83 @@ use super::prelude::*;
 #[allow(unused_imports)]
 use super::support::*;
 
+/// CR 702.11b + CR 702.21a: Parse the "[subject] can be the targets of spells
+/// and abilities as though they didn't have hexproof[. Ward abilities of those
+/// creatures don't trigger]" static pair (Nowhere to Run).
+///
+/// Sentence 1 → `StaticMode::IgnoreHexproof` scoped to `<subject>` via the
+/// definition's `affected` filter (CR 702.11b — the bypass lets the matched
+/// permanents be targeted as though they had no hexproof). Optional sentence 2
+/// → `StaticMode::SuppressTriggers { source_filter: <same subject>, events:
+/// [BecomesTargeted] }` (CR 702.21a — "those creatures" anaphors sentence 1's
+/// subject, so the parsed filter is reused rather than re-derived).
+///
+/// Parsed as one unit (before generic sentence splitting) so the anaphoric
+/// "those creatures" keeps its antecedent. When the ward sentence is present but
+/// unrecognized trailing prose follows, the whole line is deferred (`None`)
+/// rather than silently dropping a clause.
+pub(crate) fn parse_ignore_hexproof_static(
+    tp: &TextPair<'_>,
+    text: &str,
+) -> Option<Vec<StaticDefinition>> {
+    // Sentence 1: subject up to the hexproof-bypass clause.
+    let (after_subject, subject) = take_until::<_, _, OracleError<'_>>(" can be the target")
+        .parse(tp.lower)
+        .ok()?;
+    let bypass: OracleResult<'_, ()> = (|| {
+        let (i, _) = tag::<_, _, OracleError<'_>>(" can be the target").parse(after_subject)?;
+        let (i, _) = opt(tag::<_, _, OracleError<'_>>("s")).parse(i)?;
+        let (i, _) =
+            tag::<_, _, OracleError<'_>>(" of spells and abilities as though ").parse(i)?;
+        // CR 702.11b: plural ("they") or singular ("it") subject pronoun.
+        let (i, _) = alt((
+            tag::<_, _, OracleError<'_>>("they didn't"),
+            tag::<_, _, OracleError<'_>>("it didn't"),
+        ))
+        .parse(i)?;
+        let (i, _) = tag::<_, _, OracleError<'_>>(" have hexproof").parse(i)?;
+        Ok((i, ()))
+    })();
+    let (rest, ()) = bypass.ok()?;
+
+    // Map the subject phrase to a typed filter; require it to fully consume so a
+    // partial parse never silently scopes the bypass wider than written.
+    let (filter, filter_remainder) = parse_type_phrase(subject.trim());
+    if !filter_remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
+        return None;
+    }
+
+    let mut defs = vec![StaticDefinition::new(StaticMode::IgnoreHexproof)
+        .affected(filter.clone())
+        .description(text.to_string())];
+
+    // Optional sentence 2: ward suppression for the same subject.
+    let after_bypass = rest.trim_start_matches('.').trim_start();
+    if !after_bypass.is_empty() {
+        let ward: OracleResult<'_, ()> = (|| {
+            let (i, _) =
+                tag::<_, _, OracleError<'_>>("ward abilities of those creatures don't trigger")
+                    .parse(after_bypass)?;
+            let (i, _) = opt(tag::<_, _, OracleError<'_>>(".")).parse(i.trim())?;
+            Ok((i, ()))
+        })();
+        let (ward_rest, ()) = ward.ok()?;
+        // Any unconsumed prose means this isn't a clean hexproof+ward line.
+        if !ward_rest.trim().is_empty() {
+            return None;
+        }
+        defs.push(
+            StaticDefinition::new(StaticMode::SuppressTriggers {
+                source_filter: filter,
+                events: vec![SuppressedTriggerEvent::BecomesTargeted],
+            })
+            .description(text.to_string()),
+        );
+    }
+
+    Some(defs)
+}
+
 /// CR 109.5 vs CR 102.1 + structural distributive: the pronoun-binding axis
 /// of an "only during X turn(s)" prohibition.
 ///
@@ -667,6 +744,15 @@ fn parse_multi_sentence_statics(text: &str) -> Option<Vec<StaticDefinition>> {
     for segment in &segments {
         let segment_defs = parse_static_line_multi_inner(segment);
         if segment_defs.is_empty() {
+            // CR 602.5b + CR 602.5c: An "activate ... only once each turn" rider
+            // carries no standalone static — it folds a once-per-turn use-restriction
+            // cap into the immediately-preceding `GrantAllActivatedAbilitiesOf`
+            // (Locus of Enlightenment, and any future "<grant abilities>. activate
+            // those only once each turn." card). This is the shared grant-rider
+            // primitive, composed with the standard grant parse — not a card hook.
+            if fold_grant_cap_rider(segment, &mut defs) {
+                continue;
+            }
             // A non-static sentence (or one the static pipeline can't classify)
             // means this isn't a pure sibling-static line — defer the whole
             // line to the single-sentence fallback rather than emitting a
@@ -890,6 +976,16 @@ pub(crate) fn parse_static_line_multi_inner(text: &str) -> Vec<StaticDefinition>
         return defs;
     }
 
+    // CR 702.11b + CR 702.21a: "Creatures your opponents control can be the
+    // targets of spells and abilities as though they didn't have hexproof. Ward
+    // abilities of those creatures don't trigger." (Nowhere to Run). The ward
+    // sentence's "those creatures" anaphors the first sentence's subject, so the
+    // pair is parsed as one unit before generic sentence splitting would treat
+    // them as independent statics (which would strand the anaphor).
+    if let Some(defs) = parse_ignore_hexproof_static(&tp, &stripped) {
+        return defs;
+    }
+
     // CR 611.3 + CR 613.1: A static ability whose Oracle text is several
     // independent sentences (each a self-contained continuous effect) defines
     // each sentence as its own continuous effect with its own affected set.
@@ -1016,6 +1112,14 @@ pub(crate) fn parse_static_line_multi_inner(text: &str) -> Vec<StaticDefinition>
         && (nom_primitives::scan_contains(&lower, "can't attack")
             || nom_primitives::scan_contains(&lower, "can't block"))
     {
+        let tp = TextPair::new(&stripped, &lower);
+        // Faith's Fetters / Arrest-class Aura lines lead with "enchanted
+        // permanent/creature …"; the combat lock and activation prohibition apply
+        // to the host, not the Aura source.
+        let affected = attached_subject_filter(&tp)
+            .map(|(filter, _)| filter)
+            .unwrap_or(TargetFilter::SelfRef);
+        let source_filter = affected.clone();
         let mut defs = Vec::new();
         let combat_mode = if nom_primitives::scan_contains(&lower, "can't attack or block") {
             StaticMode::CantAttackOrBlock
@@ -1026,18 +1130,16 @@ pub(crate) fn parse_static_line_multi_inner(text: &str) -> Vec<StaticDefinition>
         };
         defs.push(
             StaticDefinition::new(combat_mode)
-                .affected(TargetFilter::SelfRef)
+                .affected(affected.clone())
                 .description(stripped.to_string()),
         );
         defs.push(
-            // CR 602.5 + CR 603.2a: Self-reference case — the affected permanent's
-            // own activated abilities can't be activated by anyone.
             StaticDefinition::new(StaticMode::CantBeActivated {
                 who: ProhibitionScope::AllPlayers,
-                source_filter: TargetFilter::SelfRef,
+                source_filter,
                 exemption: parse_cant_be_activated_exemption_in_text(&lower),
             })
-            .affected(TargetFilter::SelfRef)
+            .affected(affected)
             .description(stripped.to_string()),
         );
         return defs;
@@ -1414,6 +1516,12 @@ pub(crate) fn parse_static_condition(text: &str) -> Option<StaticCondition> {
         return Some(condition);
     }
 
+    // "it shares a color with the most common color among all permanents
+    // [or a color tied for most common]" (Heroic Defiance)
+    if let Some(condition) = parse_shares_most_common_color_condition(tp.lower) {
+        return Some(condition);
+    }
+
     // "the chosen color is [color]"
     if let Some(color_name) = nom_tag_lower(tp.lower, tp.lower, "the chosen color is ") {
         let trimmed = color_name.trim().trim_end_matches('.');
@@ -1639,6 +1747,15 @@ pub(crate) fn parse_unless_static_condition(tp: &TextPair<'_>) -> Option<StaticC
     if let Ok((_, condition)) = nom_condition::parse_unless_condition(&lower) {
         return Some(condition);
     }
+    // CR 611.3a: "gets +X/+X unless <condition>" applies the grant precisely when
+    // <condition> is false — fall back to the shared static-condition parser and
+    // negate, so a recognized inner condition (e.g. Heroic Defiance's most-common-
+    // color check) gates the grant instead of being swallowed as Unrecognized.
+    if let Some(condition) = parse_static_condition(original) {
+        return Some(StaticCondition::Not {
+            condition: Box::new(condition),
+        });
+    }
     // Preserve the Oracle unless rider in the AST so swallow/coverage see a
     // `condition` slot even when the inner clause is not yet decomposed.
     Some(StaticCondition::Not {
@@ -1815,6 +1932,28 @@ pub(crate) fn parse_color_list(text: &str) -> Option<Vec<crate::types::mana::Man
     }
 
     None
+}
+
+/// CR 105.2 + CR 611.3a: "it shares a color with the most common color among all
+/// permanents[ or a color tied for most common]" (Heroic Defiance) →
+/// `SharesColorWithMostCommonColorAmongPermanents`. The optional "or a color tied
+/// for most common" tail is redundant — the runtime predicate already treats
+/// every color at the maximum count as most-common — so both phrasings map to the
+/// same condition.
+pub(crate) fn parse_shares_most_common_color_condition(lower: &str) -> Option<StaticCondition> {
+    let (rest, _) = tag::<_, _, OracleError<'_>>(
+        "it shares a color with the most common color among all permanents",
+    )
+    .parse(lower)
+    .ok()?;
+    let (rest, _) = opt(tag::<_, _, OracleError<'_>>(
+        " or a color tied for most common",
+    ))
+    .parse(rest)
+    .ok()?;
+    rest.trim()
+        .is_empty()
+        .then_some(StaticCondition::SharesColorWithMostCommonColorAmongPermanents)
 }
 
 /// CR 611.3a: "[N] or more [type] are on the battlefield" → a count

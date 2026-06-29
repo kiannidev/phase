@@ -1622,6 +1622,43 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
             crate::game::casting_costs::tap_creature_power_contribution,
             |cards| GameAction::SelectCards { cards },
         ),
+        // CR 117.1 + CR 601.2b: Aggregate-threshold "exile any number" cost
+        // (Baron Helmut Zemo's Boast). The threshold is satisfied by ANY chosen
+        // subset whose summed `property` meets the comparator, so enumerate
+        // minimal-cover subsets (mirroring the Crew/Saddle aggregate-tap path)
+        // rather than a fixed-cardinality selection. `minimal_power_subset_candidates`
+        // is sum-based, so this arm handles the `Sum` aggregate (the only shape in
+        // the corpus); other aggregate functions fall through to the generic arm.
+        WaitingFor::PayCost {
+            player,
+            kind:
+                PayCostKind::ExileAggregate {
+                    function: crate::types::ability::AggregateFunction::Sum,
+                    property,
+                    comparator,
+                    value,
+                    ..
+                },
+            choices,
+            ..
+        } => {
+            let property = *property;
+            minimal_power_subset_candidates(
+                state,
+                *player,
+                choices,
+                |total| comparator.evaluate(total, *value),
+                move |state, id| {
+                    crate::game::quantity::aggregate_property_over(
+                        state,
+                        &[id],
+                        crate::types::ability::AggregateFunction::Sum,
+                        property,
+                    )
+                },
+                |cards| GameAction::SelectCards { cards },
+            )
+        }
         WaitingFor::PayCost {
             player,
             choices,
@@ -3099,6 +3136,35 @@ fn priority_actions(state: &GameState, player: PlayerId) -> Vec<CandidateAction>
         }
     }
 
+    // CR 702.170f + CR 116.2k: Plot the top card of the library as a special
+    // action (Fblthp, Lost on the Range). Surfaced as the runtime-granted
+    // activated plot ability that lives only on the authorized top card, offered
+    // via the existing `GameAction::ActivateAbility` — a top-card-only query,
+    // never a generic library loop (no non-top library card carries the ability).
+    // `can_activate_ability_now` independently enforces the CR 702.170a sorcery-
+    // speed timing (main phase + empty stack + active player); the `is_active`
+    // + `stack_empty` guard just short-circuits the battlefield scan off-turn.
+    if is_active && stack_empty {
+        if let Some((top_id, _src_id)) = casting::top_of_library_plot_source(state, player) {
+            for (i, ability_def) in casting::activated_ability_definitions(state, top_id) {
+                if ability_def.kind == crate::types::ability::AbilityKind::Activated
+                    && ability_def.activation_zone == Some(crate::types::zones::Zone::Library)
+                    && !crate::game::mana_abilities::is_mana_ability(&ability_def)
+                    && casting::can_activate_ability_now(state, player, top_id, i)
+                {
+                    actions.push(candidate(
+                        GameAction::ActivateAbility {
+                            source_id: top_id,
+                            ability_index: i,
+                        },
+                        TacticalClass::Ability,
+                        Some(player),
+                    ));
+                }
+            }
+        }
+    }
+
     // CR 702.61a: Crew/Saddle/Station are activated abilities — blocked by split second.
     if !split_second_active {
         // Loop-invariant hoist: the set of this player's untapped creatures (and
@@ -3993,13 +4059,21 @@ fn mana_payment_actions(
                 }
             }
         } else {
-            for (obj_id, obj) in &state.objects {
+            // Non-Delve convoke/improvise/waterbend taps come from the
+            // battlefield only; the eligibility helpers all require
+            // `zone == Battlefield`, so iterating `state.battlefield` (rather
+            // than every object in the game) is behavior-preserving and avoids
+            // scanning hand/library/graveyard objects on go-wide token boards.
+            for &obj_id in &state.battlefield {
+                let Some(obj) = state.objects.get(&obj_id) else {
+                    continue;
+                };
                 match mode {
                     ConvokeMode::Waterbend if obj.is_waterbend_eligible(player) => {
                         // Waterbend: always colorless
                         actions.push(candidate(
                             GameAction::TapForConvoke {
-                                object_id: *obj_id,
+                                object_id: obj_id,
                                 mana_type: crate::types::mana::ManaType::Colorless,
                             },
                             TacticalClass::Mana,
@@ -4010,7 +4084,7 @@ fn mana_payment_actions(
                         // CR 702.126a: Improvise pays generic mana — always colorless.
                         actions.push(candidate(
                             GameAction::TapForConvoke {
-                                object_id: *obj_id,
+                                object_id: obj_id,
                                 mana_type: crate::types::mana::ManaType::Colorless,
                             },
                             TacticalClass::Mana,
@@ -4021,7 +4095,7 @@ fn mana_payment_actions(
                         // CR 702.51a: Colorless (for generic) always available
                         actions.push(candidate(
                             GameAction::TapForConvoke {
-                                object_id: *obj_id,
+                                object_id: obj_id,
                                 mana_type: crate::types::mana::ManaType::Colorless,
                             },
                             TacticalClass::Mana,
@@ -4040,7 +4114,7 @@ fn mana_payment_actions(
                             }
                             actions.push(candidate(
                                 GameAction::TapForConvoke {
-                                    object_id: *obj_id,
+                                    object_id: obj_id,
                                     mana_type: mana_sources::mana_color_to_type(color),
                                 },
                                 TacticalClass::Mana,

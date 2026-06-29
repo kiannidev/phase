@@ -325,6 +325,68 @@ fn collect_trigger_condition_source_zones(condition: &TriggerCondition, out: &mu
     }
 }
 
+/// CR 113.6b + CR 400.7: When a trigger's intervening-if pins the source to a
+/// single zone ("if this card is in your graveyard") and the effect is an
+/// implicit self-return ("return it to the battlefield …") with no "from …"
+/// phrase, stamp that zone as `ChangeZone.origin` so the runtime can locate
+/// the object (Jocasta, Automaton Avenger — issue #4566).
+fn stamp_self_return_origin_from_trigger_condition(def: &mut TriggerDefinition) {
+    let zones = def
+        .condition
+        .as_ref()
+        .map(trigger_condition_source_zones)
+        .unwrap_or_default();
+    let Some(origin) = (zones.len() == 1).then(|| zones[0]) else {
+        return;
+    };
+    if let Some(execute) = def.execute.as_deref_mut() {
+        stamp_self_return_origin_in_ability(execute, origin);
+    }
+}
+
+fn stamp_self_return_origin_in_ability(ability: &mut AbilityDefinition, origin: Zone) {
+    stamp_self_return_origin_in_effect(&mut ability.effect, origin);
+    if let Some(sub) = ability.sub_ability.as_deref_mut() {
+        stamp_self_return_origin_in_ability(sub, origin);
+    }
+    if let Some(else_ab) = ability.else_ability.as_deref_mut() {
+        stamp_self_return_origin_in_ability(else_ab, origin);
+    }
+}
+
+fn stamp_self_return_origin_in_effect(effect: &mut Effect, origin: Zone) {
+    match effect {
+        Effect::ChangeZone {
+            origin: o,
+            destination,
+            target,
+            ..
+        } if matches!(
+            target,
+            TargetFilter::SelfRef
+                | TargetFilter::TriggeringSource
+                | TargetFilter::ParentTarget
+        ) && matches!(destination, Zone::Battlefield | Zone::Hand) =>
+        {
+            if o.is_none() {
+                *o = Some(origin);
+            }
+            if matches!(target, TargetFilter::ParentTarget | TargetFilter::TriggeringSource) {
+                *target = TargetFilter::SelfRef;
+            }
+        }
+        Effect::CreateDelayedTrigger { effect: inner, .. } => {
+            stamp_self_return_origin_in_ability(inner, origin);
+        }
+        Effect::ChooseOneOf { branches, .. } => {
+            for branch in branches.iter_mut() {
+                stamp_self_return_origin_in_effect(&mut branch.effect, origin);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// CR 107.3a + CR 107.3i + CR 601.2f + CR 603.2: In an ETB trigger on a spell
 /// cast for `{X}`, bare "X" in the trigger body refers to the value paid for
 /// `{X}` during the cast. At runtime the `QuantityRef::Variable{name:"X"}`
@@ -1315,6 +1377,8 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     {
         def.trigger_zones = vec![zone];
     }
+
+    stamp_self_return_origin_from_trigger_condition(&mut def);
 
     // CR 107.3a + CR 107.3i + CR 601.2f: Rewrite X in ETB-self triggers.
     if trigger_should_rewrite_cost_x(&def) {
@@ -9463,6 +9527,10 @@ fn try_parse_special_trigger_pattern(lower: &str) -> Option<(TriggerMode, Trigge
         return Some(result);
     }
 
+    if let Some(result) = try_parse_you_attack_with_commander(lower) {
+        return Some(result);
+    }
+
     if let Some(result) = try_parse_n_or_more_attacks(lower) {
         return Some(result);
     }
@@ -9851,6 +9919,35 @@ fn apply_attachment_prop(filter: TargetFilter, prop: Option<FilterProp>) -> Targ
         }
         (other, _) => other,
     }
+}
+
+/// CR 903.3 + CR 508.1: "whenever you attack with [your] commander" — fires when
+/// the scoped player declares a commander as an attacker (Jocasta, Automaton Avenger).
+fn try_parse_you_attack_with_commander(lower: &str) -> Option<(TriggerMode, TriggerDefinition)> {
+    let (after_prefix, ()) = alt((
+        value((), tag::<_, _, OracleError<'_>>("whenever ")),
+        value((), tag("when ")),
+    ))
+    .parse(lower)
+    .ok()?;
+
+    let (after_actor, ()) = value((), tag::<_, _, OracleError<'_>>("you attack with "))
+        .parse(after_prefix)
+        .ok()?;
+
+    let (filter, rest) = parse_commander_subject_filter_prefix(after_actor)?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+
+    let mut def = make_base();
+    def.mode = TriggerMode::YouAttack;
+    def.valid_target = Some(TargetFilter::Typed(
+        TypedFilter::default().controller(ControllerRef::You),
+    ));
+    def.valid_card = Some(filter);
+    def.batched = true;
+    Some((TriggerMode::YouAttack, def))
 }
 
 /// Parse "whenever N or more creatures [you control] attack [a player]" patterns.
@@ -16527,6 +16624,74 @@ mod tests {
                 amount: QuantityExpr::Fixed { value: 1 }
             }
         );
+    }
+
+    #[test]
+    fn trigger_jocasta_commander_attack_return_tapped_and_attacking() {
+        use crate::parser::oracle::parse_oracle_text;
+
+        let oracle = "Flying\n\
+            Whenever your commander deals combat damage to a player, put a +1/+1 counter on Jocasta.\n\
+            Whenever you attack with your commander, if this card is in your graveyard, you may return it to the battlefield tapped and attacking.";
+
+        let parsed = parse_oracle_text(
+            oracle,
+            "Jocasta, Automaton Avenger",
+            &[],
+            &["Artifact".to_string(), "Creature".to_string()],
+            &["Robot".to_string(), "Hero".to_string()],
+        );
+        let graveyard_return = parsed
+            .triggers
+            .iter()
+            .find(|t| {
+                t.execute.as_ref().is_some_and(|a| {
+                    matches!(a.effect.as_ref(), Effect::ChangeZone { .. })
+                })
+            })
+            .expect("graveyard return trigger must exist in full pipeline");
+        assert!(
+            graveyard_return
+                .trigger_zones
+                .contains(&Zone::Graveyard),
+            "graveyard intervening-if must set trigger_zones, got {:?}",
+            graveyard_return.trigger_zones
+        );
+        assert_eq!(graveyard_return.mode, TriggerMode::YouAttack);
+        match &graveyard_return.valid_card {
+            Some(TargetFilter::Typed(tf)) => {
+                assert!(tf.properties.iter().any(|p| matches!(p, FilterProp::IsCommander)));
+            }
+            other => panic!("YouAttack with your commander must set IsCommander valid_card, got {other:?}"),
+        }
+        let execute = graveyard_return
+            .execute
+            .as_ref()
+            .expect("trigger should have execute ability");
+        match execute.effect.as_ref() {
+            Effect::ChangeZone {
+                origin,
+                destination,
+                enter_tapped,
+                enters_attacking,
+                target,
+                ..
+            } => {
+                assert_eq!(*destination, Zone::Battlefield);
+                assert_eq!(
+                    origin,
+                    &Some(Zone::Graveyard),
+                    "graveyard intervening-if must stamp ChangeZone origin"
+                );
+                assert!(
+                    enter_tapped.is_tapped(),
+                    "enter_tapped must be set, got {enter_tapped:?}"
+                );
+                assert!(enters_attacking, "enters_attacking must be true");
+                assert!(matches!(target, TargetFilter::SelfRef));
+            }
+            other => panic!("expected Effect::ChangeZone, got {other:?}"),
+        }
     }
 
     #[test]

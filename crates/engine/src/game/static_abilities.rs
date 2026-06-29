@@ -1668,8 +1668,9 @@ fn transient_additional_land_drops(state: &GameState, player: PlayerId) -> u8 {
 mod tests {
     use super::*;
     use crate::game::zones::create_object;
+    use crate::parser::oracle_static::parse_static_line;
     use crate::types::ability::StaticCondition;
-    use crate::types::ability::{ControllerRef, StaticDefinition, TargetFilter};
+    use crate::types::ability::{ControllerRef, StaticDefinition, TargetFilter, TypedFilter};
     use crate::types::card_type::CoreType;
     use crate::types::identifiers::CardId;
     use crate::types::statics::StaticMode;
@@ -2047,10 +2048,14 @@ mod tests {
             .static_definitions
             .push(
                 StaticDefinition::new(StaticMode::AdditionalLandDrop { count: 2 })
+                    .affected(TargetFilter::Typed(
+                        TypedFilter::default().controller(ControllerRef::You),
+                    ))
                     .description("You may play two additional lands on each of your turns.".into()),
             );
 
         assert_eq!(additional_land_drops(&state, PlayerId(0)), 2);
+        assert_eq!(additional_land_drops(&state, PlayerId(1)), 0);
     }
 
     #[test]
@@ -2084,6 +2089,96 @@ mod tests {
 
         // CR 305.2: Two Explorations = +2 additional land drops
         assert_eq!(additional_land_drops(&state, PlayerId(0)), 2);
+    }
+
+    #[test]
+    fn test_additional_land_drops_saturates_any_number() {
+        let mut state = setup();
+
+        let fastbond = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Fastbond".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&fastbond)
+            .unwrap()
+            .static_definitions
+            .push(
+                StaticDefinition::new(StaticMode::AdditionalLandDrop { count: u8::MAX })
+                    .affected(TargetFilter::Typed(
+                        TypedFilter::default().controller(ControllerRef::You),
+                    ))
+                    .description("You may play any number of lands on each of your turns.".into()),
+            );
+
+        let exploration = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Exploration".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&exploration)
+            .unwrap()
+            .static_definitions
+            .push(
+                StaticDefinition::new(StaticMode::MayPlayAdditionalLand)
+                    .affected(TargetFilter::Typed(
+                        TypedFilter::default().controller(ControllerRef::You),
+                    ))
+                    .description("You may play an additional land on each of your turns.".into()),
+            );
+
+        assert_eq!(additional_land_drops(&state, PlayerId(0)), u8::MAX);
+        assert_eq!(additional_land_drops(&state, PlayerId(1)), 0);
+    }
+
+    #[test]
+    fn test_parsed_controller_scoped_additional_land_drops_do_not_affect_opponent() {
+        let mut state = setup();
+
+        let fastbond = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Fastbond".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&fastbond)
+            .unwrap()
+            .static_definitions
+            .push(
+                parse_static_line("You may play any number of lands on each of your turns.")
+                    .expect("Fastbond land permission must parse"),
+            );
+
+        let azusa = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Azusa, Lost but Seeking".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&azusa)
+            .unwrap()
+            .static_definitions
+            .push(
+                parse_static_line("You may play two additional lands on each of your turns.")
+                    .expect("Azusa land permission must parse"),
+            );
+
+        assert_eq!(additional_land_drops(&state, PlayerId(0)), u8::MAX);
+        assert_eq!(additional_land_drops(&state, PlayerId(1)), 0);
     }
 
     /// Issue #2879 + CR 305.2 + CR 611.2c: a turn-scoped transient grant (Escape

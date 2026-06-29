@@ -36,7 +36,11 @@ fn captain_america_team_leader_puts_counters_on_both_heroes() {
         "Captain America, Team Leader",
         &[],
         &["Creature".to_string()],
-        &["Human".to_string(), "Soldier".to_string(), "Hero".to_string()],
+        &[
+            "Human".to_string(),
+            "Soldier".to_string(),
+            "Hero".to_string(),
+        ],
     );
     let trigger = parsed
         .triggers

@@ -3658,12 +3658,10 @@ mod tests {
             "Vivien, Arkbow Ranger",
             &["Planeswalker"],
         );
-        assert!(
-            vivien
-                .abilities
-                .iter()
-                .any(|a| matches!(a.effect.as_ref(), Effect::SearchOutsideGame { .. }))
-        );
+        assert!(vivien
+            .abilities
+            .iter()
+            .any(|a| matches!(a.effect.as_ref(), Effect::SearchOutsideGame { .. })));
         assert!(!has_swallowed_detector(&vivien, "Optional_YouMay"));
     }
 

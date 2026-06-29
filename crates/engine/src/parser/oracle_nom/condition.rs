@@ -6583,11 +6583,8 @@ pub fn parse_zone_changed_this_way_clause(input: &str) -> OracleResult<'_, (Targ
     // Two surface forms:
     //   * auxiliary + past participle / multi-word verb ("is put onto the battlefield this way")
     //   * present-tense third-person singular without auxiliary ("enters this way" — Winter Soldier)
-    if let Ok((rest, _)) = alt((
-        tag::<_, _, OracleError<'_>>("enters"),
-        tag("enter"),
-    ))
-    .parse(after_filter)
+    if let Ok((rest, _)) =
+        alt((tag::<_, _, OracleError<'_>>("enters"), tag("enter"))).parse(after_filter)
     {
         let (rest, _) = tag(" this way").parse(rest)?;
         return Ok((rest, (filter, false)));

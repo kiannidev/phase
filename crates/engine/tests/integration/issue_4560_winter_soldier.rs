@@ -105,7 +105,10 @@ fn winter_soldier_attack_trigger_parses_reanimation_and_hero_counter_rider() {
         "head must reanimate from graveyard, got {:?}",
         execute.effect
     );
-    assert!(execute.forward_result, "ChangeZone must forward the returned card");
+    assert!(
+        execute.forward_result,
+        "ChangeZone must forward the returned card"
+    );
     let sub = execute.sub_ability.as_ref().expect("Hero counter rider");
     assert!(matches!(sub.effect.as_ref(), Effect::PutCounter { .. }));
     let Some(engine::types::ability::AbilityCondition::ZoneChangedThisWay { filter }) =
@@ -116,7 +119,9 @@ fn winter_soldier_attack_trigger_parses_reanimation_and_hero_counter_rider() {
     let TargetFilter::Typed(typed) = filter else {
         panic!("expected Hero filter, got {filter:?}");
     };
-    assert!(typed.type_filters.contains(&TypeFilter::Subtype("Hero".into())));
+    assert!(typed
+        .type_filters
+        .contains(&TypeFilter::Subtype("Hero".into())));
 }
 
 #[test]

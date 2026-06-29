@@ -830,8 +830,11 @@ pub(crate) fn resolve_event_context_target_for_event_or_state(
                 }
                 // CR 603.2 + CR 608.2c: "that [creature/permanent]" on a zone-change
                 // trigger (Captain America, Team Leader's "that Hero") is the object
-                // that caused the trigger — the same referent as `TriggeringSource`.
-                _ => extract_source_from_event(event).map(TargetRef::Object),
+                // that caused the trigger — the entering/moved object_id.
+                crate::types::events::GameEvent::ZoneChanged { object_id, .. } => {
+                    Some(TargetRef::Object(*object_id))
+                }
+                _ => None,
             }
         }
         TargetFilter::StackSpell => {

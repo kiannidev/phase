@@ -3211,6 +3211,13 @@ mod tests {
             &["Artifact", "Creature"],
         );
         assert!(
+            !bronze
+                .replacements
+                .iter()
+                .any(|r| r.execute.as_deref().is_some_and(def_tree_has_unimplemented)),
+            "Bronze Horse replacement must parse without Unimplemented"
+        );
+        assert!(
             bronze.replacements.iter().any(|r| {
                 r.event == ReplacementEvent::DamageDone
                     && r.valid_card == Some(TargetFilter::SelfRef)
@@ -3228,6 +3235,14 @@ mod tests {
             "Equipped creature gets +2/+2.\nAs long as equipped creature is legendary, it has hexproof. (It can't be the target of spells or abilities your opponents control.)\nEquip {1}",
             "Champion's Helm",
             &["Artifact", "Equipment"],
+        );
+        assert!(
+            !helm.abilities.iter().any(def_tree_has_unimplemented)
+                && !helm
+                    .triggers
+                    .iter()
+                    .any(|t| t.execute.as_deref().is_some_and(def_tree_has_unimplemented)),
+            "Champion's Helm must parse without Unimplemented"
         );
         assert!(
             helm.statics.iter().any(|s| {

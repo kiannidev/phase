@@ -6006,10 +6006,12 @@ fn parse_optional_token_substitution_choice(
     if !lower.contains(" or that many ") {
         return None;
     }
-    let (_, effect_lower) =
-        split_once_on_lower(original_text, lower, ", you may instead ")?;
+    let (_, effect_lower) = split_once_on_lower(original_text, lower, ", you may instead ")?;
     let effect_lower = effect_lower.to_lowercase();
-    let effect_lower = effect_lower.strip_prefix("create ")?.trim_end_matches('.').trim();
+    let effect_lower = effect_lower
+        .strip_prefix("create ")?
+        .trim_end_matches('.')
+        .trim();
     let segments: Vec<&str> = effect_lower.split(" or that many ").collect();
     if segments.len() < 2 {
         return None;

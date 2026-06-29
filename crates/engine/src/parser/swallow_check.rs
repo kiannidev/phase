@@ -5684,20 +5684,21 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
         );
         fn def_tree_has_create_token_choice(def: &AbilityDefinition) -> bool {
             match &*def.effect {
-                Effect::ChooseOneOf { branches, .. } => branches.iter().any(|branch| {
-                    matches!(&*branch.effect, Effect::Token { .. })
-                }),
+                Effect::ChooseOneOf { branches, .. } => branches
+                    .iter()
+                    .any(|branch| matches!(&*branch.effect, Effect::Token { .. })),
                 Effect::CreateDelayedTrigger { effect, .. } => {
                     def_tree_has_create_token_choice(effect)
                 }
-                _ => def
-                    .sub_ability
-                    .as_deref()
-                    .is_some_and(def_tree_has_create_token_choice)
-                    || def
-                        .else_ability
+                _ => {
+                    def.sub_ability
                         .as_deref()
-                        .is_some_and(def_tree_has_create_token_choice),
+                        .is_some_and(def_tree_has_create_token_choice)
+                        || def
+                            .else_ability
+                            .as_deref()
+                            .is_some_and(def_tree_has_create_token_choice)
+                }
             }
         }
         assert!(

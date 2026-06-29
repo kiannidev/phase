@@ -3649,6 +3649,10 @@ mod tests {
             "Living Wish",
             &["Sorcery"],
         );
+        assert!(
+            !living_wish.abilities.iter().any(def_tree_has_unimplemented),
+            "Living Wish must parse without Unimplemented"
+        );
         let living = living_wish
             .abilities
             .iter()
@@ -3661,6 +3665,10 @@ mod tests {
             "[−2]: You may reveal an artifact card you own from outside the game or choose a face-up artifact card you own in exile. Put that card into your hand.",
             "Karn, the Great Creator",
             &["Planeswalker"],
+        );
+        assert!(
+            !karn.abilities.iter().any(def_tree_has_unimplemented),
+            "Karn -2 must parse without Unimplemented"
         );
         let karn_search = karn
             .abilities
@@ -3680,6 +3688,10 @@ mod tests {
             "[−5]: You may reveal a creature card you own from outside the game and put it into your hand.",
             "Vivien, Arkbow Ranger",
             &["Planeswalker"],
+        );
+        assert!(
+            !vivien.abilities.iter().any(def_tree_has_unimplemented),
+            "Vivien -5 must parse without Unimplemented"
         );
         assert!(vivien
             .abilities

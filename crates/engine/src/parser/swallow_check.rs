@@ -3644,10 +3644,43 @@ mod tests {
     /// on a layer effect; must not trip Duration_NextTurn swallow warnings (issue #2239).
     #[test]
     fn duration_next_turn_accepts_amplifire_upkeep_pt_set() {
+        use crate::types::ability::{Duration, PlayerScope};
+
         let parsed = parse_named(
             "At the beginning of your upkeep, reveal cards from the top of your library until you reveal a creature card. Until your next turn, this creature's base power becomes twice that card's power and its base toughness becomes twice that card's toughness. Put the revealed cards on the bottom of your library in a random order.",
             "Amplifire",
             &["Creature"],
+        );
+        let execute = parsed.triggers[0]
+            .execute
+            .as_ref()
+            .expect("Amplifire upkeep trigger");
+        assert!(
+            matches!(execute.effect.as_ref(), Effect::RevealUntil { .. }),
+            "Amplifire head must be RevealUntil, got {:?}",
+            execute.effect
+        );
+        fn def_tree_has_until_your_next_turn_duration(def: &AbilityDefinition) -> bool {
+            if matches!(
+                def.duration,
+                Some(Duration::UntilNextTurnOf {
+                    player: PlayerScope::Controller
+                })
+            ) {
+                return true;
+            }
+            def.sub_ability
+                .as_deref()
+                .is_some_and(def_tree_has_until_your_next_turn_duration)
+                || def
+                    .else_ability
+                    .as_deref()
+                    .is_some_and(def_tree_has_until_your_next_turn_duration)
+        }
+        assert!(
+            def_tree_has_until_your_next_turn_duration(execute),
+            "expected until-your-next-turn duration on the P/T clause, got {:#?}",
+            execute
         );
         assert!(!has_swallowed_detector(&parsed, "Duration_NextTurn"));
     }

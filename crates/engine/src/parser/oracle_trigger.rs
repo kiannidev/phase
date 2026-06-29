@@ -340,17 +340,7 @@ fn stamp_self_return_origin_from_trigger_condition(def: &mut TriggerDefinition) 
         return;
     };
     if let Some(execute) = def.execute.as_deref_mut() {
-        stamp_self_return_origin_in_ability(execute, origin);
-    }
-}
-
-fn stamp_self_return_origin_in_ability(ability: &mut AbilityDefinition, origin: Zone) {
-    stamp_self_return_origin_in_effect(&mut ability.effect, origin);
-    if let Some(sub) = ability.sub_ability.as_deref_mut() {
-        stamp_self_return_origin_in_ability(sub, origin);
-    }
-    if let Some(else_ab) = ability.else_ability.as_deref_mut() {
-        stamp_self_return_origin_in_ability(else_ab, origin);
+        stamp_self_return_origin_in_effect(&mut execute.effect, origin);
     }
 }
 
@@ -363,21 +353,18 @@ fn stamp_self_return_origin_in_effect(effect: &mut Effect, origin: Zone) {
             ..
         } if matches!(
             target,
-            TargetFilter::SelfRef | TargetFilter::TriggeringSource | TargetFilter::ParentTarget
+            TargetFilter::SelfRef | TargetFilter::TriggeringSource
         ) && matches!(destination, Zone::Battlefield | Zone::Hand) =>
         {
             if o.is_none() {
                 *o = Some(origin);
             }
-            if matches!(
-                target,
-                TargetFilter::ParentTarget | TargetFilter::TriggeringSource
-            ) {
+            if matches!(target, TargetFilter::TriggeringSource) {
                 *target = TargetFilter::SelfRef;
             }
         }
         Effect::CreateDelayedTrigger { effect: inner, .. } => {
-            stamp_self_return_origin_in_ability(inner, origin);
+            stamp_self_return_origin_in_effect(&mut inner.effect, origin);
         }
         Effect::ChooseOneOf { branches, .. } => {
             for branch in branches.iter_mut() {
@@ -16695,6 +16682,69 @@ mod tests {
                 assert!(matches!(target, TargetFilter::SelfRef));
             }
             other => panic!("expected Effect::ChangeZone, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stamp_self_return_origin_skips_nested_parent_target_return() {
+        use crate::types::ability::{AbilityDefinition, AbilityKind};
+        use crate::types::zones::EtbTapState;
+
+        let mut trigger = TriggerDefinition::new(TriggerMode::YouAttack);
+        trigger.condition = Some(TriggerCondition::SourceInZone {
+            zone: Zone::Graveyard,
+        });
+        let mut head = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChangeZone {
+                origin: None,
+                destination: Zone::Battlefield,
+                target: TargetFilter::SelfRef,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: EtbTapState::Tapped,
+                enters_attacking: true,
+                up_to: false,
+                enter_with_counters: vec![],
+                face_down_profile: None,
+            },
+        );
+        head.sub_ability = Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChangeZone {
+                origin: None,
+                destination: Zone::Hand,
+                target: TargetFilter::ParentTarget,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                face_down_profile: None,
+            },
+        )));
+        trigger.execute = Some(Box::new(head));
+
+        stamp_self_return_origin_from_trigger_condition(&mut trigger);
+
+        let execute = trigger.execute.as_ref().expect("execute");
+        match execute.effect.as_ref() {
+            Effect::ChangeZone { origin, target, .. } => {
+                assert_eq!(origin, &Some(Zone::Graveyard));
+                assert_eq!(*target, TargetFilter::SelfRef);
+            }
+            other => panic!("expected head ChangeZone, got {other:?}"),
+        }
+        let sub = execute.sub_ability.as_ref().expect("nested return");
+        match sub.effect.as_ref() {
+            Effect::ChangeZone { origin, target, .. } => {
+                assert_eq!(origin, &None);
+                assert_eq!(*target, TargetFilter::ParentTarget);
+            }
+            other => panic!("expected nested ParentTarget ChangeZone, got {other:?}"),
         }
     }
 

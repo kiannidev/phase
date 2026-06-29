@@ -5506,11 +5506,21 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
         assert!(!has_swallowed_detector(&parsed, "Duration_UntilEndOfTurn"));
     }
 
+    fn flip_branch_has_create_damage_replacement(
+        win_effect: &Option<Box<AbilityDefinition>>,
+        lose_effect: &Option<Box<AbilityDefinition>>,
+    ) -> bool {
+        win_effect
+            .as_deref()
+            .is_some_and(def_tree_has_create_damage_replacement)
+            || lose_effect
+                .as_deref()
+                .is_some_and(def_tree_has_create_damage_replacement)
+    }
+
     fn def_tree_has_create_damage_replacement(def: &AbilityDefinition) -> bool {
-        if matches!(def.effect.as_ref(), Effect::CreateDamageReplacement { .. }) {
-            return true;
-        }
         match def.effect.as_ref() {
+            Effect::CreateDamageReplacement { .. } => return true,
             Effect::FlipCoin {
                 win_effect,
                 lose_effect,
@@ -5520,17 +5530,7 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
                 win_effect,
                 lose_effect,
                 ..
-            } => {
-                if win_effect
-                    .as_deref()
-                    .is_some_and(def_tree_has_create_damage_replacement)
-                    || lose_effect
-                        .as_deref()
-                        .is_some_and(def_tree_has_create_damage_replacement)
-                {
-                    return true;
-                }
-            }
+            } if flip_branch_has_create_damage_replacement(win_effect, lose_effect) => return true,
             _ => {}
         }
         def.sub_ability

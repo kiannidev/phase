@@ -551,7 +551,9 @@ fn effect_has_internal_optionality(effect: &Effect) -> bool {
 /// (Desperate Gambit) nest these under `Effect::FlipCoin`, so recurse there too.
 fn def_tree_has_target_replacement(def: &AbilityDefinition) -> bool {
     match def.effect.as_ref() {
-        Effect::AddTargetReplacement { .. } | Effect::CreateDamageReplacement { .. } => return true,
+        Effect::AddTargetReplacement { .. } | Effect::CreateDamageReplacement { .. } => {
+            return true
+        }
         Effect::FlipCoin {
             win_effect,
             lose_effect,

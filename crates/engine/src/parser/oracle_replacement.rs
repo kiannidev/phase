@@ -599,6 +599,9 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
         || nom_primitives::scan_contains(&lower, "would create one or more tokens")
         || nom_primitives::scan_contains(&lower, "would create a token")
     {
+        if let Some(def) = parse_optional_token_substitution_choice(&lower, &text) {
+            return Some(def);
+        }
         if let Some(def) = parse_token_replacement(&lower, &text) {
             return Some(def);
         }
@@ -5987,6 +5990,57 @@ fn parse_copy_count_replacement(lower: &str, original_text: &str) -> Option<Repl
     Some(
         ReplacementDefinition::new(ReplacementEvent::CopySpell)
             .quantity_modification(QuantityModification::Plus { value: additional })
+            .description(original_text.to_string()),
+    )
+}
+
+/// CR 614.1a + CR 608.2d: "If you would create one or more tokens, you may
+/// instead create that many <token A> or that many <token B>" (Jinnie Fay).
+fn parse_optional_token_substitution_choice(
+    lower: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    if !nom_primitives::scan_contains(lower, "you may instead create that many ") {
+        return None;
+    }
+    if !lower.contains(" or that many ") {
+        return None;
+    }
+    let (_, effect_lower) =
+        split_once_on_lower(original_text, lower, ", you may instead ")?;
+    let effect_lower = effect_lower.to_lowercase();
+    let effect_lower = effect_lower.strip_prefix("create ")?.trim_end_matches('.').trim();
+    let segments: Vec<&str> = effect_lower.split(" or that many ").collect();
+    if segments.len() < 2 {
+        return None;
+    }
+
+    let mut branches = Vec::with_capacity(segments.len());
+    for (index, segment) in segments.iter().enumerate() {
+        let token_phrase = if index == 0 {
+            segment.trim().to_string()
+        } else {
+            format!("that many {}", segment.trim())
+        };
+        let token_lower = token_phrase.to_lowercase();
+        let mut ctx = ParseContext::default();
+        let effect = super::oracle_effect::try_parse_token(&token_lower, &token_phrase, &mut ctx)?;
+        if !matches!(effect, Effect::Token { .. }) {
+            return None;
+        }
+        branches.push(AbilityDefinition::new(AbilityKind::Spell, effect));
+    }
+
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::CreateToken)
+            .mode(ReplacementMode::Optional { decline: None })
+            .execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::ChooseOneOf {
+                    chooser: PlayerFilter::Controller,
+                    branches,
+                },
+            ))
             .description(original_text.to_string()),
     )
 }

@@ -549,6 +549,19 @@ fn effect_has_internal_optionality(effect: &Effect) -> bool {
 /// Condition_If, and Duration_ThisTurn detectors when the original text matches
 /// the "die this turn, exile instead" rider grammar. Flip-coin branches
 /// (Desperate Gambit) nest these under `Effect::FlipCoin`, so recurse there too.
+/// Flip-coin branch payloads may carry one-shot damage replacements.
+fn flip_branch_has_target_replacement(
+    win_effect: &Option<Box<AbilityDefinition>>,
+    lose_effect: &Option<Box<AbilityDefinition>>,
+) -> bool {
+    win_effect
+        .as_deref()
+        .is_some_and(def_tree_has_target_replacement)
+        || lose_effect
+            .as_deref()
+            .is_some_and(def_tree_has_target_replacement)
+}
+
 fn def_tree_has_target_replacement(def: &AbilityDefinition) -> bool {
     match def.effect.as_ref() {
         Effect::AddTargetReplacement { .. } | Effect::CreateDamageReplacement { .. } => {
@@ -558,32 +571,12 @@ fn def_tree_has_target_replacement(def: &AbilityDefinition) -> bool {
             win_effect,
             lose_effect,
             ..
-        } => {
-            if win_effect
-                .as_deref()
-                .is_some_and(def_tree_has_target_replacement)
-                || lose_effect
-                    .as_deref()
-                    .is_some_and(def_tree_has_target_replacement)
-            {
-                return true;
-            }
         }
-        Effect::FlipCoins {
+        | Effect::FlipCoins {
             win_effect,
             lose_effect,
             ..
-        } => {
-            if win_effect
-                .as_deref()
-                .is_some_and(def_tree_has_target_replacement)
-                || lose_effect
-                    .as_deref()
-                    .is_some_and(def_tree_has_target_replacement)
-            {
-                return true;
-            }
-        }
+        } if flip_branch_has_target_replacement(win_effect, lose_effect) => return true,
         _ => {}
     }
     if let Some(ref sub) = def.sub_ability {

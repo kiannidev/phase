@@ -124,7 +124,10 @@ fn winter_soldier_attack_trigger_parses_reanimation_and_hero_counter_rider() {
     let (filter, counter_type, count) = &conditional_enter_with_counters[0];
     assert_eq!(*counter_type, CounterType::Plus1Plus1);
     assert!(
-        matches!(count, engine::types::ability::QuantityExpr::Fixed { value: 1 }),
+        matches!(
+            count,
+            engine::types::ability::QuantityExpr::Fixed { value: 1 }
+        ),
         "expected one additional +1/+1 counter, got {count:?}"
     );
     let TargetFilter::Typed(typed) = filter else {

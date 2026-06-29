@@ -3666,27 +3666,27 @@ mod tests {
             "Amplifire head must be RevealUntil, got {:?}",
             execute.effect
         );
-        fn def_tree_has_until_your_next_turn_duration(def: &AbilityDefinition) -> bool {
+        fn find_until_your_next_turn_sub(def: &AbilityDefinition) -> Option<&AbilityDefinition> {
             if matches!(
                 def.duration,
                 Some(Duration::UntilNextTurnOf {
                     player: PlayerScope::Controller
                 })
             ) {
-                return true;
+                return Some(def);
             }
             def.sub_ability
                 .as_deref()
-                .is_some_and(def_tree_has_until_your_next_turn_duration)
-                || def
-                    .else_ability
-                    .as_deref()
-                    .is_some_and(def_tree_has_until_your_next_turn_duration)
+                .and_then(find_until_your_next_turn_sub)
+                .or_else(|| {
+                    def.else_ability
+                        .as_deref()
+                        .and_then(find_until_your_next_turn_sub)
+                })
         }
         assert!(
-            def_tree_has_until_your_next_turn_duration(execute),
-            "expected until-your-next-turn duration on the P/T clause, got {:#?}",
-            execute
+            find_until_your_next_turn_sub(execute).is_some(),
+            "expected until-your-next-turn duration on the P/T clause, got {execute:#?}",
         );
         assert!(!has_swallowed_detector(&parsed, "Duration_NextTurn"));
     }

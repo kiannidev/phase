@@ -19310,6 +19310,7 @@ mod tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
                 face_down_profile: None,
             },
             vec![TargetRef::Object(ObjectId(10))],
@@ -19392,6 +19393,7 @@ mod tests {
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
             face_down_profile: None,
         };
         let json = serde_json::to_string(&effect).unwrap();
@@ -19535,6 +19537,7 @@ mod tests {
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
             face_down_profile: None,
         }
     }

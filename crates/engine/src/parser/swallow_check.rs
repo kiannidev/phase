@@ -3224,7 +3224,7 @@ mod tests {
                     && matches!(r.shield_kind, ShieldKind::Prevention { .. })
                     && r.description
                         .as_deref()
-                        .is_some_and(|d| d.to_ascii_lowercase().contains("as long as"))
+                        .is_some_and(|d| d.to_ascii_lowercase().contains("as long as")) // allow-noncombinator: test assertion on parsed replacement description
                 // allow-noncombinator: test assertion on parsed replacement description
             }),
             "expected gated damage-prevention replacement, got {:#?}",

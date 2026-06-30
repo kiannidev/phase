@@ -3,7 +3,8 @@
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::parser::oracle::parse_oracle_text;
-use engine::types::ability::{Effect, TargetFilter, TypeFilter};
+use engine::types::ability::{Effect, EffectKind, TargetFilter, TypeFilter};
+use engine::types::events::GameEvent;
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::game_state::WaitingFor;
@@ -31,22 +32,34 @@ fn p1p1_count(runner: &GameRunner, id: ObjectId) -> u32 {
         .unwrap_or(0)
 }
 
-fn drive_attack_resolution(runner: &mut GameRunner, graveyard_target: ObjectId) {
+fn drive_attack_resolution_collecting_events(
+    runner: &mut GameRunner,
+    graveyard_target: ObjectId,
+) -> Vec<GameEvent> {
+    let mut events = Vec::new();
     for _ in 0..80 {
         match runner.state().waiting_for.clone() {
             WaitingFor::Priority { .. } => {
                 if runner.state().stack.is_empty() {
-                    return;
+                    return events;
                 }
-                runner.act(GameAction::PassPriority).expect("pass priority");
+                events.extend(
+                    runner
+                        .act(GameAction::PassPriority)
+                        .expect("pass priority")
+                        .events,
+                );
             }
             WaitingFor::OrderTriggers { triggers, .. } => {
                 let count = triggers.len();
-                runner
-                    .act(GameAction::OrderTriggers {
-                        order: (0..count).collect(),
-                    })
-                    .expect("order triggers");
+                events.extend(
+                    runner
+                        .act(GameAction::OrderTriggers {
+                            order: (0..count).collect(),
+                        })
+                        .expect("order triggers")
+                        .events,
+                );
             }
             WaitingFor::TriggerTargetSelection {
                 target_slots,
@@ -67,14 +80,20 @@ fn drive_attack_resolution(runner: &mut GameRunner, graveyard_target: ObjectId) 
                     })
                     .or_else(|| slot.legal_targets.first())
                     .cloned();
-                runner
-                    .act(GameAction::ChooseTarget { target })
-                    .expect("choose graveyard target");
+                events.extend(
+                    runner
+                        .act(GameAction::ChooseTarget { target })
+                        .expect("choose graveyard target")
+                        .events,
+                );
             }
             WaitingFor::OptionalEffectChoice { .. } => {
-                runner
-                    .act(GameAction::DecideOptionalEffect { accept: true })
-                    .expect("accept optional effect");
+                events.extend(
+                    runner
+                        .act(GameAction::DecideOptionalEffect { accept: true })
+                        .expect("accept optional effect")
+                        .events,
+                );
             }
             other if runner.state().stack.is_empty() => {
                 panic!("unexpected waiting state during attack resolution: {other:?}");
@@ -83,6 +102,10 @@ fn drive_attack_resolution(runner: &mut GameRunner, graveyard_target: ObjectId) 
         }
     }
     panic!("attack trigger did not finish resolving");
+}
+
+fn drive_attack_resolution(runner: &mut GameRunner, graveyard_target: ObjectId) {
+    let _ = drive_attack_resolution_collecting_events(runner, graveyard_target);
 }
 
 #[test]
@@ -188,5 +211,61 @@ fn winter_soldier_reanimates_hero_with_extra_counter() {
     assert!(
         p1p1_count(&runner, hero) >= 1,
         "Hero reanimated this way must enter with an additional +1/+1 counter"
+    );
+}
+
+/// CR 122.1 + CR 614.1c: The Hero counter must ride the battlefield-entry
+/// pipeline, not a separate post-move `PutCounter` effect. A folded
+/// `conditional_enter_with_counters` rider must not also resolve a
+/// `PutCounter` sub-ability after the zone move.
+#[test]
+fn winter_soldier_hero_counter_is_entry_time_not_post_move_put_counter() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+
+    let soldier = scenario
+        .add_creature_from_oracle(
+            P0,
+            "Winter Soldier, Reborn Avenger",
+            3,
+            3,
+            WINTER_SOLDIER_ORACLE,
+        )
+        .id();
+
+    let hero = scenario
+        .add_creature_to_graveyard(P0, "Fallen Hero", 2, 2)
+        .with_subtypes(vec!["Hero"])
+        .with_mana_cost(ManaCost::Cost {
+            generic: 2,
+            shards: vec![ManaCostShard::White],
+        })
+        .id();
+
+    let mut runner = scenario.build();
+    runner.advance_to_combat();
+    runner
+        .declare_attackers(&[(soldier, AttackTarget::Player(P1))])
+        .expect("attack with Winter Soldier");
+
+    let events = drive_attack_resolution_collecting_events(&mut runner, hero);
+
+    assert_eq!(runner.state().objects[&hero].zone, Zone::Battlefield);
+    assert!(
+        p1p1_count(&runner, hero) >= 1,
+        "Hero must still receive the +1/+1 counter"
+    );
+    assert!(
+        !events.iter().any(|ev| {
+            matches!(
+                ev,
+                GameEvent::EffectResolved {
+                    kind: EffectKind::PutCounter,
+                    source_id,
+                } if *source_id == soldier
+            )
+        }),
+        "Hero rider must fold into ChangeZone entry counters, not resolve a \
+         separate PutCounter effect afterward (events: {events:#?})"
     );
 }

@@ -700,7 +700,9 @@ fn pay_ability_cost_inner(
                     owner_library: false,
                     track_exiled_by_source: true,
                     face_down_profile: None,
-                    count_param: 0,
+                    enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
+            count_param: 0,
                     library_position: None,
                     is_cost_payment: true,
                 };

@@ -2662,6 +2662,8 @@ pub(super) fn handle_resolution_choice(
                 owner_library: _,
                 track_exiled_by_source,
                 face_down_profile,
+                enter_with_counters,
+                conditional_enter_with_counters,
                 count_param,
                 library_position,
                 is_cost_payment,
@@ -2792,30 +2794,51 @@ pub(super) fn handle_resolution_choice(
                             "EffectZoneChoice missing destination for zone move".to_string(),
                         )
                     })?;
-                    let ctx = effects::change_zone::ChangeZoneIterationCtx {
-                        source_id,
-                        controller: player,
-                        origin: Some(zone),
-                        destination: dest_zone,
-                        enter_transformed,
-                        enter_tapped,
-                        enters_under_player,
-                        enters_attacking,
-                        enter_with_counters: vec![],
-                        conditional_enter_with_counters: vec![],
-                        duration: None,
-                        track_exiled_by_source,
-                        // CR 708.2a + CR 708.3: thread the face-down profile that
-                        // was carried across the `EffectZoneChoice` round-trip into
-                        // the move ctx, so a selected face-down `ChangeZone` card
-                        // (Yedora-style return paused for selection) enters FACE
-                        // DOWN with the specified characteristics instead of
-                        // resuming face up and exposing the real object.
-                        face_down_profile: face_down_profile.clone(),
-                        library_placement: None,
-                    };
+                    let stack_ability = state
+                        .stack
+                        .iter()
+                        .find(|entry| entry.source_id == source_id)
+                        .and_then(|entry| entry.ability())
+                        .cloned();
                     let chosen_ids: Vec<_> = chosen.to_vec();
                     for (i, card_id) in chosen_ids.iter().enumerate() {
+                        let per_obj_enter_counters = if enter_with_counters.is_empty()
+                            && conditional_enter_with_counters.is_empty()
+                        {
+                            vec![]
+                        } else if let Some(ability) = stack_ability.as_ref() {
+                            effects::change_zone::enter_with_counters_for_object(
+                                state,
+                                ability,
+                                *card_id,
+                                &enter_with_counters,
+                                &conditional_enter_with_counters,
+                            )
+                        } else {
+                            enter_with_counters.clone()
+                        };
+                        let ctx = effects::change_zone::ChangeZoneIterationCtx {
+                            source_id,
+                            controller: player,
+                            origin: Some(zone),
+                            destination: dest_zone,
+                            enter_transformed,
+                            enter_tapped,
+                            enters_under_player,
+                            enters_attacking,
+                            enter_with_counters: per_obj_enter_counters,
+                            conditional_enter_with_counters: vec![],
+                            duration: None,
+                            track_exiled_by_source,
+                            // CR 708.2a + CR 708.3: thread the face-down profile that
+                            // was carried across the `EffectZoneChoice` round-trip into
+                            // the move ctx, so a selected face-down `ChangeZone` card
+                            // (Yedora-style return paused for selection) enters FACE
+                            // DOWN with the specified characteristics instead of
+                            // resuming face up and exposing the real object.
+                            face_down_profile: face_down_profile.clone(),
+                            library_placement: None,
+                        };
                         match effects::change_zone::process_one_zone_move(
                             state, &ctx, *card_id, events,
                         ) {

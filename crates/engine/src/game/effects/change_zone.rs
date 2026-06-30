@@ -605,6 +605,8 @@ pub fn resolve(
             // down" selection resumes face down (not face up) when the player
             // resolves the choice.
             face_down_profile: face_down_profile.clone(),
+            enter_with_counters: effect_enter_with_counters.clone(),
+            conditional_enter_with_counters: effect_conditional_enter_with_counters.clone(),
             count_param: 0,
             library_position: None,
             is_cost_payment: false,
@@ -751,7 +753,7 @@ pub fn resolve(
 
 /// CR 122.1 + CR 614.1c: Merge unconditional and conditional entry-time counters
 /// for one object about to enter via `ChangeZone`.
-fn enter_with_counters_for_object(
+pub(crate) fn enter_with_counters_for_object(
     state: &GameState,
     ability: &ResolvedAbility,
     obj_id: ObjectId,
@@ -6778,6 +6780,8 @@ mod tests {
             owner_library: false,
             track_exiled_by_source: false,
             face_down_profile: None,
+            enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
             count_param: 0,
             library_position: None,
             is_cost_payment: false,

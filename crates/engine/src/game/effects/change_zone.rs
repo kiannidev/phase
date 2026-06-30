@@ -4379,6 +4379,134 @@ mod tests {
         assert_eq!(state.objects.get(&p1_a).unwrap().owner, PlayerId(1));
     }
 
+    /// `EffectZoneChoice` must carry and apply `conditional_enter_with_counters`
+    /// when the player selects cards via `SelectCards` — the resolution-choice
+    /// path that previously dropped the Winter Soldier Hero counter rider.
+    #[test]
+    fn effect_zone_choice_applies_conditional_enter_with_counters_per_selected_card() {
+        let mut state = GameState::new_two_player(42);
+        let hero = creature_in_graveyard(&mut state, 1, PlayerId(0));
+        state
+            .objects
+            .get_mut(&hero)
+            .unwrap()
+            .card_types
+            .subtypes
+            .push("Hero".to_string());
+        let soldier = creature_in_graveyard(&mut state, 2, PlayerId(0));
+
+        let hero_filter = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Subtype("Hero".into())],
+            controller: None,
+            properties: vec![],
+        });
+        let conditional = vec![(
+            hero_filter,
+            CounterType::Plus1Plus1,
+            QuantityExpr::Fixed { value: 1 },
+        )];
+
+        let mut ability = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Battlefield,
+                target: TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Creature],
+                    controller: Some(ControllerRef::You),
+                    properties: vec![FilterProp::InZone {
+                        zone: Zone::Graveyard,
+                    }],
+                }),
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: true,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: conditional,
+                face_down_profile: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        ability.multi_target = Some(MultiTargetSpec::unlimited(0));
+        ability.target_choice_timing = TargetChoiceTiming::Resolution;
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        match &state.waiting_for {
+            WaitingFor::EffectZoneChoice {
+                conditional_enter_with_counters: carried,
+                cards,
+                ..
+            } => {
+                assert_eq!(
+                    carried.len(),
+                    1,
+                    "conditional rider must survive the EffectZoneChoice round-trip"
+                );
+                assert!(cards.contains(&hero));
+                assert!(cards.contains(&soldier));
+            }
+            other => panic!("expected EffectZoneChoice, got {other:?}"),
+        }
+
+        // Per-object conditional evaluation looks up the stack ability by source_id.
+        state.stack.push_back(StackEntry {
+            id: ObjectId(101),
+            controller: PlayerId(0),
+            source_id: ObjectId(100),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id: ObjectId(100),
+                ability: Box::new(ability.clone()),
+                condition: None,
+                trigger_event: None,
+                description: None,
+                source_name: String::new(),
+                subject_match_count: None,
+                die_result: None,
+            },
+        });
+
+        apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![hero, soldier],
+            },
+        )
+        .unwrap();
+
+        assert_eq!(state.objects[&hero].zone, Zone::Battlefield);
+        assert_eq!(state.objects[&soldier].zone, Zone::Battlefield);
+        assert_eq!(
+            state
+                .objects
+                .get(&hero)
+                .unwrap()
+                .counters
+                .get(&CounterType::Plus1Plus1)
+                .copied()
+                .unwrap_or(0),
+            1,
+            "Hero must enter with the conditional +1/+1 counter"
+        );
+        assert_eq!(
+            state
+                .objects
+                .get(&soldier)
+                .unwrap()
+                .counters
+                .get(&CounterType::Plus1Plus1)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "non-Hero must not receive the conditional counter"
+        );
+    }
+
     /// Issue #488 — MANDATORY 3-player coverage. A 2-player test can mask
     /// owner-vs-controller confusion (the wrong fallback might still resolve to
     /// a single default). With three players, each iterated player's

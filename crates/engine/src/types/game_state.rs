@@ -3378,8 +3378,7 @@ pub enum WaitingFor {
         /// across the `EffectZoneChoice` round-trip (e.g. "If a Hero enters
         /// this way, it enters with an additional +1/+1 counter on it").
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        conditional_enter_with_counters:
-            Vec<(TargetFilter, CounterType, QuantityExpr)>,
+        conditional_enter_with_counters: Vec<(TargetFilter, CounterType, QuantityExpr)>,
         /// CR 701.68a: N for Blight N — number of -1/-1 counters to place.
         /// Zero for all non-blight EffectZoneChoice uses.
         #[serde(default)]

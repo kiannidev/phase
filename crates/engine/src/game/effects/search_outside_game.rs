@@ -171,6 +171,7 @@ pub(crate) fn put_face_up_exile_into(
         enters_under_player: None,
         enters_attacking: false,
         enter_with_counters: Vec::new(),
+        conditional_enter_with_counters: vec![],
         duration: None,
         track_exiled_by_source: false,
         // Search-from-outside brings cards in face up.

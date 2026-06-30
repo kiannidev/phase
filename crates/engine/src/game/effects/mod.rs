@@ -725,6 +725,7 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
             enters_under_player,
             enters_attacking,
             enter_with_counters,
+            conditional_enter_with_counters: vec![],
             duration,
             track_exiled_by_source,
             // CR 708.2a + CR 708.3: thread the preserved face-down profile back

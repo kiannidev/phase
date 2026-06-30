@@ -2802,6 +2802,7 @@ pub(super) fn handle_resolution_choice(
                         enters_under_player,
                         enters_attacking,
                         enter_with_counters: vec![],
+                        conditional_enter_with_counters: vec![],
                         duration: None,
                         track_exiled_by_source,
                         // CR 708.2a + CR 708.3: thread the face-down profile that
@@ -3076,6 +3077,7 @@ pub(super) fn handle_resolution_choice(
                         enters_under_player,
                         enters_attacking,
                         enter_with_counters: vec![],
+                        conditional_enter_with_counters: vec![],
                         duration: None,
                         track_exiled_by_source,
                         face_down_profile: face_down_profile.clone(),

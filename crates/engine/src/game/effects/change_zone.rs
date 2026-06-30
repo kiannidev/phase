@@ -688,7 +688,10 @@ pub fn resolve(
                         enter_tapped: ctx.enter_tapped,
                         enters_under_player: ctx.enters_under_player,
                         enters_attacking: ctx.enters_attacking,
-                        enter_with_counters: per_obj_ctx.enter_with_counters.clone(),
+                        enter_with_counters: ctx.enter_with_counters.clone(),
+                        conditional_enter_with_counters: ctx
+                            .conditional_enter_with_counters
+                            .clone(),
                         duration: ctx.duration.clone(),
                         track_exiled_by_source: ctx.track_exiled_by_source,
                         moved_count: None,
@@ -719,6 +722,9 @@ pub fn resolve(
                         enters_under_player: ctx.enters_under_player,
                         enters_attacking: ctx.enters_attacking,
                         enter_with_counters: ctx.enter_with_counters.clone(),
+                        conditional_enter_with_counters: ctx
+                            .conditional_enter_with_counters
+                            .clone(),
                         duration: ctx.duration.clone(),
                         track_exiled_by_source: ctx.track_exiled_by_source,
                         moved_count: None,
@@ -773,6 +779,46 @@ pub(crate) fn enter_with_counters_for_object(
         }
     }
     counters
+}
+
+/// Resolve the ability currently driving a `ChangeZone` pause/resume for
+/// `source_id`, preferring the popped `resolving_stack_entry` over the live stack.
+pub(crate) fn resolving_stack_ability_for_source(
+    state: &GameState,
+    source_id: ObjectId,
+) -> Option<ResolvedAbility> {
+    state
+        .resolving_stack_entry
+        .as_ref()
+        .filter(|entry| entry.id == source_id || entry.source_id == source_id)
+        .and_then(|entry| entry.ability())
+        .or_else(|| {
+            state
+                .stack
+                .iter()
+                .find(|entry| entry.id == source_id || entry.source_id == source_id)
+                .and_then(|entry| entry.ability())
+        })
+        .cloned()
+}
+
+/// Merge unconditional and conditional entry counters for one object during a
+/// paused multi-object `ChangeZone` resume.
+pub(crate) fn enter_with_counters_for_pending_object(
+    state: &GameState,
+    source_id: ObjectId,
+    obj_id: ObjectId,
+    base: &[(CounterType, u32)],
+    conditional: &[(TargetFilter, CounterType, QuantityExpr)],
+) -> Vec<(CounterType, u32)> {
+    if base.is_empty() && conditional.is_empty() {
+        return vec![];
+    }
+    if let Some(ability) = resolving_stack_ability_for_source(state, source_id) {
+        enter_with_counters_for_object(state, &ability, obj_id, base, conditional)
+    } else {
+        base.to_vec()
+    }
 }
 
 /// Per-iteration context for the multi-target `ChangeZone` loop. Captured once
@@ -1260,6 +1306,7 @@ pub fn resolve_all(
                         // CR 122.1h: resumed members of a paused mass return still
                         // receive their counters (Shilgengar's finality counter).
                         enter_with_counters: enter_with_counters.clone(),
+                        conditional_enter_with_counters: vec![],
                         duration: ability.duration.clone(),
                         track_exiled_by_source,
                         moved_count: Some(moved_count),
@@ -1298,6 +1345,7 @@ pub fn resolve_all(
                         // CR 122.1h: resumed members of a paused mass return still
                         // receive their counters (Shilgengar's finality counter).
                         enter_with_counters: enter_with_counters.clone(),
+                        conditional_enter_with_counters: vec![],
                         duration: ability.duration.clone(),
                         track_exiled_by_source,
                         moved_count: Some(moved_count + 1),
@@ -4506,6 +4554,122 @@ mod tests {
                 .unwrap_or(0),
             0,
             "non-Hero must not receive the conditional counter"
+        );
+    }
+
+    /// `drain_pending_change_zone_iteration` must re-evaluate conditional entry
+    /// counters per remaining object — not reuse one object's resolved vector.
+    #[test]
+    fn pending_change_zone_drain_recomputes_conditional_entry_counters_per_object() {
+        let mut state = GameState::new_two_player(42);
+        let hero = creature_in_graveyard(&mut state, 1, PlayerId(0));
+        state
+            .objects
+            .get_mut(&hero)
+            .unwrap()
+            .card_types
+            .subtypes
+            .push("Hero".to_string());
+        let soldier = creature_in_graveyard(&mut state, 2, PlayerId(0));
+
+        let hero_filter = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Subtype("Hero".into())],
+            controller: None,
+            properties: vec![],
+        });
+        let conditional = vec![(
+            hero_filter,
+            CounterType::Plus1Plus1,
+            QuantityExpr::Fixed { value: 1 },
+        )];
+
+        let ability = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Battlefield,
+                target: TargetFilter::Any,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: conditional.clone(),
+                face_down_profile: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+
+        state.pending_change_zone_iteration =
+            Some(crate::types::game_state::PendingChangeZoneIteration {
+                remaining: vec![hero, soldier],
+                source_id: ObjectId(100),
+                controller: PlayerId(0),
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Battlefield,
+                enter_transformed: false,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enters_under_player: None,
+                enters_attacking: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: conditional,
+                duration: None,
+                track_exiled_by_source: false,
+                moved_count: None,
+                face_down_profile: None,
+                library_placement: None,
+                effect_kind: EffectKind::ChangeZone,
+            });
+        state.resolving_stack_entry = Some(StackEntry {
+            id: ObjectId(101),
+            controller: PlayerId(0),
+            source_id: ObjectId(100),
+            kind: StackEntryKind::TriggeredAbility {
+                source_id: ObjectId(100),
+                ability: Box::new(ability),
+                condition: None,
+                trigger_event: None,
+                description: None,
+                source_name: String::new(),
+                subject_match_count: None,
+                die_result: None,
+            },
+        });
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+
+        let mut events = Vec::new();
+        crate::game::effects::drain_pending_continuation(&mut state, &mut events);
+
+        assert_eq!(state.objects[&hero].zone, Zone::Battlefield);
+        assert_eq!(state.objects[&soldier].zone, Zone::Battlefield);
+        assert_eq!(
+            state
+                .objects
+                .get(&hero)
+                .unwrap()
+                .counters
+                .get(&CounterType::Plus1Plus1)
+                .copied()
+                .unwrap_or(0),
+            1,
+            "Hero must receive the conditional counter on drain"
+        );
+        assert_eq!(
+            state
+                .objects
+                .get(&soldier)
+                .unwrap()
+                .counters
+                .get(&CounterType::Plus1Plus1)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "non-Hero must not inherit another object's resolved counter vector"
         );
     }
 

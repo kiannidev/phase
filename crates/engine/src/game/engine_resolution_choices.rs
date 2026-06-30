@@ -2794,36 +2794,16 @@ pub(super) fn handle_resolution_choice(
                             "EffectZoneChoice missing destination for zone move".to_string(),
                         )
                     })?;
-                    let stack_ability = state
-                        .resolving_stack_entry
-                        .as_ref()
-                        .filter(|entry| entry.id == source_id || entry.source_id == source_id)
-                        .and_then(|entry| entry.ability())
-                        .or_else(|| {
-                            state
-                                .stack
-                                .iter()
-                                .find(|entry| entry.id == source_id || entry.source_id == source_id)
-                                .and_then(|entry| entry.ability())
-                        })
-                        .cloned();
                     let chosen_ids: Vec<_> = chosen.to_vec();
                     for (i, card_id) in chosen_ids.iter().enumerate() {
-                        let per_obj_enter_counters = if enter_with_counters.is_empty()
-                            && conditional_enter_with_counters.is_empty()
-                        {
-                            vec![]
-                        } else if let Some(ability) = stack_ability.as_ref() {
-                            effects::change_zone::enter_with_counters_for_object(
+                        let per_obj_enter_counters =
+                            effects::change_zone::enter_with_counters_for_pending_object(
                                 state,
-                                ability,
+                                source_id,
                                 *card_id,
                                 &enter_with_counters,
                                 &conditional_enter_with_counters,
-                            )
-                        } else {
-                            enter_with_counters.clone()
-                        };
+                            );
                         let ctx = effects::change_zone::ChangeZoneIterationCtx {
                             source_id,
                             controller: player,
@@ -2871,7 +2851,9 @@ pub(super) fn handle_resolution_choice(
                                         enter_tapped: ctx.enter_tapped,
                                         enters_under_player: ctx.enters_under_player,
                                         enters_attacking: ctx.enters_attacking,
-                                        enter_with_counters: ctx.enter_with_counters.clone(),
+                                        enter_with_counters: enter_with_counters.clone(),
+                                        conditional_enter_with_counters:
+                                            conditional_enter_with_counters.clone(),
                                         duration: ctx.duration.clone(),
                                         track_exiled_by_source: ctx.track_exiled_by_source,
                                         moved_count: None,
@@ -2903,7 +2885,9 @@ pub(super) fn handle_resolution_choice(
                                         enter_tapped: ctx.enter_tapped,
                                         enters_under_player: ctx.enters_under_player,
                                         enters_attacking: ctx.enters_attacking,
-                                        enter_with_counters: ctx.enter_with_counters.clone(),
+                                        enter_with_counters: enter_with_counters.clone(),
+                                        conditional_enter_with_counters:
+                                            conditional_enter_with_counters.clone(),
                                         duration: ctx.duration.clone(),
                                         track_exiled_by_source: ctx.track_exiled_by_source,
                                         moved_count: None,
@@ -3139,7 +3123,9 @@ pub(super) fn handle_resolution_choice(
                                         enter_tapped: ctx.enter_tapped,
                                         enters_under_player: ctx.enters_under_player,
                                         enters_attacking: ctx.enters_attacking,
-                                        enter_with_counters: ctx.enter_with_counters.clone(),
+                                        enter_with_counters: enter_with_counters.clone(),
+                                        conditional_enter_with_counters:
+                                            conditional_enter_with_counters.clone(),
                                         duration: ctx.duration.clone(),
                                         track_exiled_by_source: ctx.track_exiled_by_source,
                                         moved_count: None,
@@ -3168,7 +3154,9 @@ pub(super) fn handle_resolution_choice(
                                         enter_tapped: ctx.enter_tapped,
                                         enters_under_player: ctx.enters_under_player,
                                         enters_attacking: ctx.enters_attacking,
-                                        enter_with_counters: ctx.enter_with_counters.clone(),
+                                        enter_with_counters: enter_with_counters.clone(),
+                                        conditional_enter_with_counters:
+                                            conditional_enter_with_counters.clone(),
                                         duration: ctx.duration.clone(),
                                         track_exiled_by_source: ctx.track_exiled_by_source,
                                         moved_count: None,

@@ -1096,6 +1096,15 @@ pub struct PendingChangeZoneIteration {
     pub enters_attacking: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enter_with_counters: Vec<(crate::types::counter::CounterType, u32)>,
+    /// Conditional entry-counter specs carried across a pause so each remaining
+    /// object can be re-evaluated per-object on resume (Winter Soldier Hero
+    /// rider through `EffectZoneChoice`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditional_enter_with_counters: Vec<(
+        crate::types::ability::TargetFilter,
+        crate::types::counter::CounterType,
+        crate::types::ability::QuantityExpr,
+    )>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration: Option<crate::types::ability::Duration>,
     pub track_exiled_by_source: bool,
@@ -9525,6 +9534,7 @@ mod tests {
             enters_under_player: Some(PlayerId(1)),
             enters_attacking: false,
             enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
             duration: None,
             track_exiled_by_source: false,
             moved_count: None,

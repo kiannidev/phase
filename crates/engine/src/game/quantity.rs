@@ -459,6 +459,7 @@ pub(crate) fn continuous_modification_dynamic_quantity(
         | ContinuousModification::RemoveKeyword { .. }
         | ContinuousModification::GrantAbility { .. }
         | ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
+        | ContinuousModification::GrantAllTriggeredAbilitiesOf { .. }
         | ContinuousModification::GrantTrigger { .. }
         | ContinuousModification::RemoveAllAbilities
         | ContinuousModification::AddType { .. }
@@ -510,6 +511,7 @@ pub(crate) fn static_condition_uses_unspent_mana(condition: &StaticCondition) ->
         }
         StaticCondition::Not { condition } => static_condition_uses_unspent_mana(condition),
         StaticCondition::DevotionGE { .. }
+        | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
         | StaticCondition::IsPresent { .. }
         | StaticCondition::ChosenColorIs { .. }
         | StaticCondition::ChosenLabelIs { .. }

@@ -6000,46 +6000,53 @@ fn parse_optional_token_substitution_choice(
     lower: &str,
     original_text: &str,
 ) -> Option<ReplacementDefinition> {
-    if !nom_primitives::scan_contains(lower, "you may instead create that many ") {
-        return None;
-    }
-    if !nom_primitives::scan_contains(lower, "or that many ") {
-        return None;
-    }
-    let (_, effect_lower) = split_once_on_lower(original_text, lower, ", you may instead ")?;
-    let effect_lower = effect_lower.to_lowercase();
-    let (_, (_, effect_body)) = nom_primitives::split_once_on(&effect_lower, "create ").ok()?;
-    let effect_body = effect_body.trim_end_matches('.').trim();
+    use nom::combinator::{map, peek, success};
+    use nom::multi::separated_list1;
+    use nom::sequence::preceded;
 
-    const DELIM: &str = " or that many ";
-    let mut segments: Vec<&str> = Vec::new();
-    let mut rest_text = effect_body;
-    loop {
-        match nom_primitives::split_once_on(rest_text, DELIM) {
-            Ok((_, (before, after))) => {
-                segments.push(before);
-                rest_text = after;
-            }
-            Err(_) => {
-                if !rest_text.is_empty() {
-                    segments.push(rest_text);
-                }
-                break;
-            }
-        }
+    fn parse_jinnie_token_branch_segment(input: &str) -> OracleResult<'_, &str> {
+        alt((
+            terminated(take_until(" or that many "), peek(tag(" or that many "))),
+            map(terminated(rest, opt(char('.'))), |segment: &str| segment),
+        ))
+        .map(str::trim)
+        .parse(input)
     }
+
+    let (segments, remainder) = nom_on_lower(original_text, lower, |input| {
+        let (input, ()) = preceded(
+            tag("if you would create one or more tokens, "),
+            preceded(tag("you may instead "), success(())),
+        )
+        .parse(input)?;
+        let (input, _) = tag("create ").parse(input)?;
+        let (input, segments) =
+            separated_list1(tag(" or that many "), parse_jinnie_token_branch_segment)
+                .parse(input)?;
+        Ok((
+            input,
+            segments
+                .into_iter()
+                .map(|segment| segment.to_string())
+                .collect::<Vec<_>>(),
+        ))
+    })?;
+
     if segments.len() < 2 {
+        return None;
+    }
+    if !remainder.trim().trim_matches('.').is_empty() {
         return None;
     }
 
     let mut branches = Vec::with_capacity(segments.len());
     for (index, segment) in segments.iter().enumerate() {
         let token_phrase = if index == 0 {
-            segment.trim().to_string()
+            segment.clone()
         } else {
-            format!("that many {}", segment.trim())
+            format!("that many {segment}")
         };
-        let token_lower = token_phrase.to_lowercase();
+        let token_lower = token_phrase.to_ascii_lowercase();
         let mut ctx = ParseContext::default();
         let effect = super::oracle_effect::try_parse_token(&token_lower, &token_phrase, &mut ctx)?;
         if !matches!(effect, Effect::Token { .. }) {

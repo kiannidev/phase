@@ -6003,16 +6003,33 @@ fn parse_optional_token_substitution_choice(
     if !nom_primitives::scan_contains(lower, "you may instead create that many ") {
         return None;
     }
-    if !lower.contains(" or that many ") {
+    if !nom_primitives::scan_contains(lower, " or that many ") {
         return None;
     }
     let (_, effect_lower) = split_once_on_lower(original_text, lower, ", you may instead ")?;
     let effect_lower = effect_lower.to_lowercase();
-    let effect_lower = effect_lower
-        .strip_prefix("create ")?
-        .trim_end_matches('.')
-        .trim();
-    let segments: Vec<&str> = effect_lower.split(" or that many ").collect();
+    let (_, effect_body) = preceded(tag("create "), rest)
+        .parse(effect_lower.as_str())
+        .ok()?;
+    let effect_body = effect_body.trim_end_matches('.').trim();
+
+    const DELIM: &str = " or that many ";
+    let mut segments: Vec<&str> = Vec::new();
+    let mut rest_text = effect_body;
+    loop {
+        match nom_primitives::split_once_on(rest_text, DELIM) {
+            Ok((_, (before, after))) => {
+                segments.push(before);
+                rest_text = after;
+            }
+            Err(_) => {
+                if !rest_text.is_empty() {
+                    segments.push(rest_text);
+                }
+                break;
+            }
+        }
+    }
     if segments.len() < 2 {
         return None;
     }

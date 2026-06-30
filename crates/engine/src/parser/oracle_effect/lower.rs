@@ -2108,11 +2108,7 @@ fn fold_enters_this_way_counter_rider(def: &mut AbilityDefinition) {
             ..
         } = &mut *def.effect
         {
-            conditional_enter_with_counters.push((
-                filter,
-                counter_type.clone(),
-                count.clone(),
-            ));
+            conditional_enter_with_counters.push((filter, counter_type.clone(), count.clone()));
             def.sub_ability = sub.sub_ability.take();
             if let Some(nested) = def.sub_ability.as_mut() {
                 fold_enters_this_way_counter_rider(nested);

@@ -3217,6 +3217,7 @@ mod tests {
                 .any(|r| r.execute.as_deref().is_some_and(def_tree_has_unimplemented)),
             "Bronze Horse replacement must parse without Unimplemented"
         );
+        let as_long_as = "as long as";
         assert!(
             bronze.replacements.iter().any(|r| {
                 r.event == ReplacementEvent::DamageDone
@@ -3224,8 +3225,7 @@ mod tests {
                     && matches!(r.shield_kind, ShieldKind::Prevention { .. })
                     && r.description
                         .as_deref()
-                        .is_some_and(|d| d.to_ascii_lowercase().contains("as long as")) // allow-noncombinator: test assertion on parsed replacement description
-                // allow-noncombinator: test assertion on parsed replacement description
+                        .is_some_and(|d| d.to_ascii_lowercase().contains(as_long_as))
             }),
             "expected gated damage-prevention replacement, got {:#?}",
             bronze.replacements

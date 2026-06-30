@@ -6003,14 +6003,12 @@ fn parse_optional_token_substitution_choice(
     if !nom_primitives::scan_contains(lower, "you may instead create that many ") {
         return None;
     }
-    if !nom_primitives::scan_contains(lower, " or that many ") {
+    if !nom_primitives::scan_contains(lower, "or that many ") {
         return None;
     }
     let (_, effect_lower) = split_once_on_lower(original_text, lower, ", you may instead ")?;
     let effect_lower = effect_lower.to_lowercase();
-    let (_, effect_body) = preceded(tag("create "), rest)
-        .parse(effect_lower.as_str())
-        .ok()?;
+    let (_, (_, effect_body)) = nom_primitives::split_once_on(&effect_lower, "create ").ok()?;
     let effect_body = effect_body.trim_end_matches('.').trim();
 
     const DELIM: &str = " or that many ";

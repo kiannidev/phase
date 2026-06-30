@@ -455,6 +455,13 @@ pub fn resolve(
         {
             let index = state.rng.random_range(0..eligible.len());
             let chosen = eligible[index];
+            let per_obj_enter_counters = enter_with_counters_for_object(
+                state,
+                ability,
+                chosen,
+                &effect_enter_with_counters,
+                &effect_conditional_enter_with_counters,
+            );
             // CR 110.2a: `enters_under_player` was resolved once at resolver
             // entry — pass it straight through (no per-branch re-resolution).
             match execute_zone_move(
@@ -467,7 +474,7 @@ pub fn resolve(
                 effect_enter_transformed,
                 effect_enter_tapped,
                 enters_under_player,
-                &effect_enter_with_counters,
+                &per_obj_enter_counters,
                 face_down_profile.as_ref(),
                 track_exiled_by_source,
                 None,
@@ -520,11 +527,19 @@ pub fn resolve(
         }
 
         if eligible.len() == 1 && !choice_up_to && choice_count == 1 {
+            let chosen = eligible[0];
+            let per_obj_enter_counters = enter_with_counters_for_object(
+                state,
+                ability,
+                chosen,
+                &effect_enter_with_counters,
+                &effect_conditional_enter_with_counters,
+            );
             // CR 110.2a: pre-resolved controller override (single-eligible
             // branch). No per-branch re-resolution.
             match execute_zone_move(
                 state,
-                eligible[0],
+                chosen,
                 scan_zone,
                 dest_zone,
                 ability.source_id,
@@ -532,7 +547,7 @@ pub fn resolve(
                 effect_enter_transformed,
                 effect_enter_tapped,
                 enters_under_player,
-                &effect_enter_with_counters,
+                &per_obj_enter_counters,
                 face_down_profile.as_ref(),
                 track_exiled_by_source,
                 None,
@@ -543,12 +558,12 @@ pub fn resolve(
                     if effect_enters_attacking && dest_zone == Zone::Battlefield {
                         let controller = state
                             .objects
-                            .get(&eligible[0])
+                            .get(&chosen)
                             .map(|obj| obj.controller)
                             .unwrap_or(ability.controller);
                         crate::game::combat::enter_attacking(
                             state,
-                            eligible[0],
+                            chosen,
                             ability.source_id,
                             controller,
                         );
@@ -6394,6 +6409,79 @@ mod tests {
         let mut events = Vec::new();
         // Empty set → no panic, no moves.
         resolve_all(&mut state, &ability, &mut events).unwrap();
+    }
+
+    /// CR 122.1: the single-eligible fast path must evaluate conditional
+    /// `enter_with_counters` riders, not only the unconditional base vector.
+    #[test]
+    fn change_zone_single_eligible_applies_conditional_enter_with_counters() {
+        let mut state = GameState::new_two_player(42);
+        let hero = creature_in_graveyard(&mut state, 1, PlayerId(0));
+        state
+            .objects
+            .get_mut(&hero)
+            .unwrap()
+            .card_types
+            .subtypes
+            .push("Hero".to_string());
+
+        let hero_filter = TargetFilter::Typed(TypedFilter {
+            type_filters: vec![TypeFilter::Subtype("Hero".into())],
+            controller: None,
+            properties: vec![],
+        });
+        let conditional = vec![(
+            hero_filter,
+            CounterType::Plus1Plus1,
+            QuantityExpr::Fixed { value: 1 },
+        )];
+
+        let ability = ResolvedAbility::new(
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Battlefield,
+                target: TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![TypeFilter::Creature],
+                    controller: Some(ControllerRef::You),
+                    properties: vec![FilterProp::InZone {
+                        zone: Zone::Graveyard,
+                    }],
+                }),
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: conditional,
+                face_down_profile: None,
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }),
+            "single eligible card must auto-resolve without EffectZoneChoice"
+        );
+        assert_eq!(state.objects[&hero].zone, Zone::Battlefield);
+        assert_eq!(
+            state
+                .objects
+                .get(&hero)
+                .unwrap()
+                .counters
+                .get(&CounterType::Plus1Plus1)
+                .copied()
+                .unwrap_or(0),
+            1,
+            "Hero must enter with the conditional +1/+1 counter on the single-eligible path"
+        );
     }
 
     /// CR 708.2a / CR 708.3: the singular `ChangeZone` path also consumes

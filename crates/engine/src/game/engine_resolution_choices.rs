@@ -2795,10 +2795,17 @@ pub(super) fn handle_resolution_choice(
                         )
                     })?;
                     let stack_ability = state
-                        .stack
-                        .iter()
-                        .find(|entry| entry.source_id == source_id)
+                        .resolving_stack_entry
+                        .as_ref()
+                        .filter(|entry| entry.id == source_id || entry.source_id == source_id)
                         .and_then(|entry| entry.ability())
+                        .or_else(|| {
+                            state
+                                .stack
+                                .iter()
+                                .find(|entry| entry.id == source_id || entry.source_id == source_id)
+                                .and_then(|entry| entry.ability())
+                        })
                         .cloned();
                     let chosen_ids: Vec<_> = chosen.to_vec();
                     for (i, card_id) in chosen_ids.iter().enumerate() {

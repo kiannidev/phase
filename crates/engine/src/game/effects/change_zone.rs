@@ -4454,8 +4454,10 @@ mod tests {
             other => panic!("expected EffectZoneChoice, got {other:?}"),
         }
 
-        // Per-object conditional evaluation looks up the stack ability by source_id.
-        state.stack.push_back(StackEntry {
+        // Production resolution pops the stack entry into resolving_stack_entry
+        // before EffectZoneChoice pauses; conditional counter evaluation must
+        // read the ability from there, not the live stack.
+        state.resolving_stack_entry = Some(StackEntry {
             id: ObjectId(101),
             controller: PlayerId(0),
             source_id: ObjectId(100),

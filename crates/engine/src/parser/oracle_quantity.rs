@@ -2355,14 +2355,43 @@ fn parse_optional_offer_accepted_clause(
     Ok((input, (relation, PlayerActionKind::AcceptedOptionalEffect)))
 }
 
+/// CR 702.62b: A suspended card is a card in the exile zone that has suspend and
+/// has a time counter on it. This building block composes those observable axes
+/// (`InZone{Exile}` + `HasKeywordKind{Suspend}` + `Counters{Time ≥ 1}`) with an
+/// optional ownership qualifier into a typed card filter — the canonical filter for
+/// both the `for each suspended card you own` count clause (`parse_suspended_card_clause`)
+/// and the "choose a suspended card you own" interactive selection (Amy Pond's
+/// combat-damage trigger). When `owner` is `None` the filter covers any player's
+/// suspended cards (no ownership restriction). Never a one-off `Suspended` tag or a
+/// verbatim string match.
+pub(crate) fn suspended_card_filter(owner: Option<ControllerRef>) -> TargetFilter {
+    use crate::types::counter::{CounterMatch, CounterType};
+    let mut properties = vec![
+        // CR 400.1: in the exile zone.
+        FilterProp::InZone { zone: Zone::Exile },
+        // CR 702.62b: has suspend.
+        FilterProp::HasKeywordKind {
+            value: KeywordKind::Suspend,
+        },
+        // CR 702.62b: bears at least one time counter.
+        FilterProp::Counters {
+            counters: CounterMatch::OfType(CounterType::Time),
+            comparator: Comparator::GE,
+            count: QuantityExpr::Fixed { value: 1 },
+        },
+    ];
+    if let Some(o) = owner {
+        // CR 108.3: owned by the given player reference.
+        properties.push(FilterProp::Owned { controller: o });
+    }
+    TargetFilter::Typed(TypedFilter::card().properties(properties))
+}
+
 /// Parse the clause after "for each" into a QuantityRef.
 /// CR 702.62b: A suspended card is a card in the exile zone with the suspend
 /// keyword and a time counter on it. Counting clauses (`for each suspended card
-/// you own`) compose those observable axes with the ownership qualifier.
-///
-/// Composes existing `FilterProp`s (`InZone`/`HasKeywordKind`/`Owned`/`Counters`)
-/// into a typed card filter — never a one-off `Suspended` tag or a verbatim
-/// string match.
+/// you own`) compose those observable axes with the ownership qualifier via the
+/// shared `suspended_card_filter` building block.
 fn parse_suspended_card_clause(clause: &str) -> Option<QuantityRef> {
     let (rest, _) = tag::<_, _, OracleError<'_>>("suspended ")
         .parse(clause)
@@ -2382,26 +2411,8 @@ fn parse_suspended_card_clause(clause: &str) -> Option<QuantityRef> {
         return None;
     }
 
-    use crate::types::counter::{CounterMatch, CounterType};
     Some(QuantityRef::ObjectCount {
-        filter: TargetFilter::Typed(TypedFilter::card().properties(vec![
-            // CR 400.1: in the exile zone.
-            FilterProp::InZone { zone: Zone::Exile },
-            // CR 702.62b: has suspend.
-            FilterProp::HasKeywordKind {
-                value: KeywordKind::Suspend,
-            },
-            // CR 108.3: owned by the ability's controller.
-            FilterProp::Owned {
-                controller: ControllerRef::You,
-            },
-            // CR 702.62b: bears at least one time counter.
-            FilterProp::Counters {
-                counters: CounterMatch::OfType(CounterType::Time),
-                comparator: Comparator::GE,
-                count: QuantityExpr::Fixed { value: 1 },
-            },
-        ])),
+        filter: suspended_card_filter(Some(ControllerRef::You)),
     })
 }
 
@@ -2516,6 +2527,50 @@ fn parse_spell_history_clause(
     None
 }
 
+/// CR 608.2c + CR 400.7: "<TYPE> card <verb> this way" → count only the
+/// tracked-set members matching <TYPE> (`FilteredTrackedSetSize`), so
+/// "for each creature card put into a graveyard this way" makes a token per
+/// creature milled, not per card (Dread Summons, #4678-adjacent #4697). A bare
+/// "card" (`TypeFilter::Card`) or a typeless clause is the unfiltered count and
+/// returns `None`, so the caller keeps `TrackedSetSize`. Building block for the
+/// whole "for each <filter> card <verb> this way" class (creature / land /
+/// artifact / … milled / exiled / destroyed / put into a graveyard).
+/// `caused_by: None` counts every filtered member of the most recent tracked set
+/// (the cards moved "this way").
+fn parse_filtered_tracked_set_this_way(clause: &str) -> Option<QuantityRef> {
+    let (filter, rest) = parse_type_phrase(clause);
+    let TargetFilter::Typed(ref typed) = filter else {
+        return None;
+    };
+    // Only a SPECIFIC card type filters the set; a typeless clause or the generic
+    // "card" (`TypeFilter::Card`) is the unfiltered `TrackedSetSize` count.
+    if typed.type_filters.is_empty()
+        || typed
+            .type_filters
+            .iter()
+            .all(|t| matches!(t, TypeFilter::Card))
+    {
+        return None;
+    }
+    // The remainder must be a "<zone-move verb> this way" tracked-set phrase
+    // (e.g. "put into a graveyard this way", "milled this way", "exiled this
+    // way"): nom `take_until("this way") + tag`, with nothing after it.
+    let terminates_this_way = (
+        take_until::<_, _, OracleError<'_>>("this way"),
+        tag::<_, _, OracleError<'_>>("this way"),
+    )
+        .parse(rest.trim())
+        .map(|(after, _)| after.trim().is_empty())
+        .unwrap_or(false);
+    if !terminates_this_way {
+        return None;
+    }
+    Some(QuantityRef::FilteredTrackedSetSize {
+        filter: Box::new(filter),
+        caused_by: None,
+    })
+}
+
 pub(crate) fn parse_for_each_clause(clause: &str) -> Option<QuantityRef> {
     parse_for_each_clause_with_they_controller(
         clause,
@@ -2552,6 +2607,18 @@ fn parse_for_each_clause_with_they_controller(
         if rest.is_empty() {
             return Some(qty);
         }
+    }
+
+    // CR 608.2c + CR 122.1: bare "counter[s] removed" (Blademane Baku) — an
+    // activated ability whose cost removed counters scales the effect without
+    // an explicit "this way". Dispatches to `PreviousEffectAmount`, same runtime
+    // channel as "counter removed this way" (Coalition Relic class).
+    let lower = clause.to_ascii_lowercase();
+    if all_consuming(parse_counters_removed_phrase)
+        .parse(lower.as_str())
+        .is_ok()
+    {
+        return Some(QuantityRef::PreviousEffectAmount);
     }
 
     // CR 406.6 + CR 607.1 + CR 614.1c: "[type phrase] card(s) exiled with it/~"
@@ -2673,6 +2740,14 @@ fn parse_for_each_clause_with_they_controller(
         if let Ok(("", qty)) =
             crate::parser::oracle_nom::quantity::parse_distinct_card_types_among_tracked_set(&lower)
         {
+            return Some(qty);
+        }
+        // CR 608.2c + CR 400.7: "<TYPE> card <verb> this way" for the remaining
+        // zone-move verbs (put into a graveyard / milled / exiled …) — count only
+        // the members of that card type (Dread Summons #4697). Mirrors the
+        // revealed/destroyed helpers above; a bare "card" returns `None` and keeps
+        // the unfiltered `TrackedSetSize` fallback below.
+        if let Some(qty) = parse_filtered_tracked_set_this_way(&lower) {
             return Some(qty);
         }
         return Some(QuantityRef::TrackedSetSize);
@@ -3459,6 +3534,14 @@ mod tests {
         // Storage Counter cycle (Saprazzan Cove etc.) — same shape, different
         // counter type. Must produce the same dispatch.
         let qty = parse_for_each_clause("storage counter removed this way").unwrap();
+        assert_eq!(qty, QuantityRef::PreviousEffectAmount);
+    }
+
+    #[test]
+    fn for_each_bare_counter_removed_is_previous_effect_amount() {
+        // Blademane Baku: "For each counter removed, this creature gets +2/+0
+        // until end of turn" — no "this way" suffix on the activated tail.
+        let qty = parse_for_each_clause("counter removed").unwrap();
         assert_eq!(qty, QuantityRef::PreviousEffectAmount);
     }
 
@@ -6548,6 +6631,15 @@ mod tests {
         }
     }
 
+    /// CR 608.2c + CR 609.3: Read the Runes — "for each card drawn this way"
+    /// binds repeat count to the parent draw via `EventContextAmount`.
+    #[test]
+    fn card_drawn_this_way_uses_event_context_amount() {
+        let (rest, qty) = nom_quantity::parse_for_each_clause_ref("card drawn this way").unwrap();
+        assert!(rest.is_empty());
+        assert_eq!(qty, QuantityRef::EventContextAmount);
+    }
+
     /// CR 608.2c + CR 701.9a: "nonland card discarded this way" (Seasoned
     /// Pyromancer) must emit `FilteredTrackedSetSize` with a `[Card, NonLand]`
     /// filter, not the plain `TrackedSetSize` fallback. The filter must include
@@ -6585,6 +6677,37 @@ mod tests {
             }
             other => panic!("expected FilteredTrackedSetSize, got {other:?}"),
         }
+    }
+
+    /// CR 608.2c + CR 400.7 (#4697): "for each CREATURE card put into a graveyard
+    /// this way" (Dread Summons) counts only the creature cards milled, not every
+    /// card. The generic ref parser dropped the "creature" type and yielded the
+    /// unfiltered `TrackedSetSize`; it must now be `FilteredTrackedSetSize`.
+    #[test]
+    fn creature_card_put_into_graveyard_this_way_uses_filtered_tracked_set() {
+        let qty = parse_for_each_clause("creature card put into a graveyard this way")
+            .expect("must parse");
+        match qty {
+            QuantityRef::FilteredTrackedSetSize { filter, .. } => match *filter {
+                TargetFilter::Typed(ref tf) => assert!(
+                    tf.type_filters.contains(&TypeFilter::Creature),
+                    "filter must be Creature; got {tf:?}"
+                ),
+                other => panic!("expected Typed(Creature), got {other:?}"),
+            },
+            other => panic!("expected FilteredTrackedSetSize, got {other:?}"),
+        }
+    }
+
+    /// Regression: a bare "card put into a graveyard this way" (no card type)
+    /// counts EVERY tracked-set member and must keep the unfiltered
+    /// `TrackedSetSize`.
+    #[test]
+    fn bare_card_put_into_graveyard_this_way_keeps_tracked_set_size() {
+        assert_eq!(
+            parse_for_each_clause("card put into a graveyard this way"),
+            Some(QuantityRef::TrackedSetSize),
+        );
     }
 
     /// CR 406.6 + CR 614.1c: "for each instant and sorcery card exiled with it"
@@ -6792,6 +6915,63 @@ mod tests {
             }),
             "must require at least one time counter (CR 702.62b)"
         );
+    }
+
+    // CR 702.62b: the shared `suspended_card_filter` building block is owner-
+    // parameterized — `Some(You)` for "a suspended card you own" (Amy Pond),
+    // `Some(Opponent)` for other ownership scopes, and `None` for "any player's
+    // suspended card" (no ownership restriction).
+    #[test]
+    fn suspended_card_filter_is_owner_parameterized() {
+        use crate::types::counter::{CounterMatch, CounterType};
+        for owner in [
+            Some(ControllerRef::You),
+            Some(ControllerRef::Opponent),
+            None,
+        ] {
+            let TargetFilter::Typed(tf) = suspended_card_filter(owner.clone()) else {
+                panic!("expected a Typed filter for owner {owner:?}");
+            };
+            assert!(
+                tf.properties
+                    .contains(&FilterProp::InZone { zone: Zone::Exile }),
+                "owner {owner:?}: must require exile zone"
+            );
+            assert!(
+                tf.properties.contains(&FilterProp::HasKeywordKind {
+                    value: KeywordKind::Suspend,
+                }),
+                "owner {owner:?}: must require Suspend keyword"
+            );
+            // Check the counter requirement BEFORE the ownership match so that
+            // `owner` is not moved before this final assert.
+            assert!(
+                tf.properties.contains(&FilterProp::Counters {
+                    counters: CounterMatch::OfType(CounterType::Time),
+                    comparator: Comparator::GE,
+                    count: QuantityExpr::Fixed { value: 1 },
+                }),
+                "owner {owner:?}: must require at least one time counter (CR 702.62b)"
+            );
+            // Ownership check: `if let` moves `owner`, so it must come last.
+            // Clone `o` into the `contains` argument so the format string can
+            // still borrow it for the failure message.
+            if let Some(o) = owner {
+                assert!(
+                    tf.properties.contains(&FilterProp::Owned {
+                        controller: o.clone()
+                    }),
+                    "owner {o:?}: must require ownership by that player"
+                );
+            } else {
+                assert!(
+                    !tf.properties
+                        .iter()
+                        .any(|p| matches!(p, FilterProp::Owned { .. })),
+                    "owner None: must NOT restrict by ownership"
+                );
+            }
+        }
     }
 
     // Rose Tyler's compound: "suspended card you own and each other permanent you

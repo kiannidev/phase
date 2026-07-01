@@ -500,6 +500,9 @@ pub enum GameAction {
         object_id: ObjectId,
         door: crate::game::game_object::RoomDoor,
     },
+    /// CR 901.9 / CR 116.2i: Active-player special action to roll the planar
+    /// die during a main phase while the stack is empty.
+    RollPlanarDie,
     /// CR 709.5f-g: Response to `WaitingFor::ChooseRoomDoor` — the player picked
     /// which door (half) of the targeted Room to act on, and the operation to
     /// apply to it. The `(op, door)` pair must be one of the prompt's `options`.
@@ -528,6 +531,13 @@ pub enum GameAction {
     CompanionToHand,
     /// CR 701.57a: Choose to cast discovered card or put it to hand.
     DiscoverChoice {
+        choice: CastChoice,
+    },
+    /// CR 608.2g + CR 609.4b: Accept/decline a during-resolution PAID cast of a
+    /// graveyard card (Quistis Trepe, Tinybones the Pickpocket). On accept the
+    /// caster pays the card's real printed cost with any-type mana; on decline
+    /// the card stays in the graveyard.
+    GraveyardPaidCastChoice {
         choice: CastChoice,
     },
     /// CR 702.85a: Choose to cast the cascaded card without paying its mana cost.
@@ -636,6 +646,13 @@ pub enum GameAction {
     /// `WaitingFor::CategoryChoice::categories`. `None` = no permanent of that type.
     SelectCategoryPermanents {
         choices: Vec<Option<ObjectId>>,
+    },
+    /// CR 107.1c + CR 701.21a: Answer to `WaitingFor::KeepWithinTotalPowerChoice`
+    /// (Slaughter the Strong) — the subset of eligible creatures to keep. Every id
+    /// must be in the prompt's `eligible` set and their combined power must not
+    /// exceed `cap`; the rest are sacrificed.
+    ChooseKeptCreatures {
+        kept: Vec<ObjectId>,
     },
     /// CR 107.1b + CR 601.2f: Choose the value of X for a spell or activated
     /// ability whose cost contains X. Chosen as part of determining total cost,
@@ -1314,11 +1331,13 @@ impl GameAction {
             | GameAction::PayCombatTax { .. }
             | GameAction::ChooseDungeon { .. }
             | GameAction::ChooseDungeonRoom { .. }
+            | GameAction::RollPlanarDie
             | GameAction::ChooseSpecializeColor { .. }
             | GameAction::HarmonizeTap { .. }
             | GameAction::DeclareCompanion { .. }
             | GameAction::CompanionToHand
             | GameAction::DiscoverChoice { .. }
+            | GameAction::GraveyardPaidCastChoice { .. }
             | GameAction::CascadeChoice { .. }
             | GameAction::RippleChoice { .. }
             | GameAction::FreeCastWindowChoice { .. }
@@ -1340,6 +1359,7 @@ impl GameAction {
             | GameAction::RetargetSpell { .. }
             | GameAction::LearnDecision { .. }
             | GameAction::SelectCategoryPermanents { .. }
+            | GameAction::ChooseKeptCreatures { .. }
             | GameAction::ChooseX { .. }
             | GameAction::SubmitPhyrexianChoices { .. }
             | GameAction::ChooseManaColor { .. }

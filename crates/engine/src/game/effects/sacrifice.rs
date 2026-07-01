@@ -71,7 +71,7 @@ fn resolve_sacrifice_scope(
             .unwrap_or_default()
         }
         Some(ControllerRef::DefendingPlayer) => {
-            crate::game::combat::defending_player_for_attacker(state, ability.source_id)
+            crate::game::combat::resolve_defending_player(state, ability.source_id)
                 .map(|pid| vec![pid])
                 .unwrap_or_default()
         }
@@ -321,9 +321,12 @@ pub fn resolve(
             track_exiled_by_source: false,
             // CR 708.2a: sacrifice selection is not a face-down entry.
             face_down_profile: None,
+            enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
             count_param: 0,
             library_position: None,
             is_cost_payment: false,
+            enters_modified_if: None,
         };
 
         // EffectResolved is emitted by the EffectZoneChoice handler after the player chooses

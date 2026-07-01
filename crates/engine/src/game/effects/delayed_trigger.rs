@@ -249,6 +249,7 @@ fn bind_contextual_filter_to_condition(
         DelayedTriggerCondition::WhenNextEvent {
             trigger,
             or_trigger,
+            ..
         } => {
             for filter in [
                 &mut trigger.valid_card,
@@ -370,6 +371,7 @@ fn snapshot_parent_dependent_quantities(
                 ManaProduction::Colorless { count }
                 | ManaProduction::AnyOneColor { count, .. }
                 | ManaProduction::AnyCombination { count, .. }
+                | ManaProduction::AnyCombinationOfObjectColors { count, .. }
                 | ManaProduction::ChosenColor { count, .. },
             ..
         } => {
@@ -763,7 +765,9 @@ mod tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
                 face_down_profile: None,
+                enters_modified_if: None,
             },
         );
         let ability = ResolvedAbility::new(
@@ -821,7 +825,9 @@ mod tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
                 face_down_profile: None,
+                enters_modified_if: None,
             },
         );
         let ability = ResolvedAbility::new(
@@ -878,7 +884,9 @@ mod tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
                 face_down_profile: None,
+                enters_modified_if: None,
             },
         );
         let ability = ResolvedAbility::new(
@@ -940,7 +948,9 @@ mod tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
                 face_down_profile: None,
+                enters_modified_if: None,
             },
         )));
         let ability = ResolvedAbility::new(
@@ -995,7 +1005,9 @@ mod tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
                 face_down_profile: None,
+                enters_modified_if: None,
             },
         );
         let ability = ResolvedAbility::new(
@@ -1152,7 +1164,9 @@ mod tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
                 face_down_profile: None,
+                enters_modified_if: None,
             },
         )));
         let ability = ResolvedAbility::new(
@@ -1212,7 +1226,9 @@ mod tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
                 face_down_profile: None,
+                enters_modified_if: None,
             },
         );
         let ability = ResolvedAbility::new(
@@ -1915,6 +1931,7 @@ mod tests {
                 colors: vec![],
                 chosen_attributes: Vec::new(),
                 counters: lki_counters,
+                tapped: false,
             },
         );
 
@@ -1959,7 +1976,9 @@ mod tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![(revival_type.clone(), counter_qty)],
+                conditional_enter_with_counters: vec![],
                 face_down_profile: None,
+                enters_modified_if: None,
             },
         );
 

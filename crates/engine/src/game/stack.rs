@@ -315,6 +315,21 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
         }
     }
 
+    // CR 608.2c: Re-stamp ParentTarget anaphora from the stack entry's trigger
+    // event at resolution time (Stationed/VehicleCrewed/Saddled/attack batches).
+    // Push-time seeding in `push_pending_trigger_to_stack_with_event_batch` can
+    // be skipped on alternate dispatch paths; this guarantees the referent is
+    // bound before `execute_effect` when `trigger_event` is present on the entry.
+    if let (Some(ability), StackEntryKind::TriggeredAbility { trigger_event, .. }) =
+        (ability.as_mut(), &entry.kind)
+    {
+        let event_ref = trigger_event
+            .as_ref()
+            .or(state.current_trigger_event.as_ref());
+        super::triggers::seed_batched_attack_parent_targets(ability, event_ref);
+        super::triggers::seed_event_context_parent_targets(ability, event_ref);
+    }
+
     if ability
         .as_ref()
         .is_some_and(|ability| has_missing_required_stack_targets(state, ability))
@@ -820,6 +835,13 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                     obj.additional_cost_payment_count =
                         ability.context.additional_cost_payment_count;
                     obj.additional_cost_payments = ability.context.additional_cost_payments.clone();
+                    // CR 400.7d: carry the object paid as a cost to cast this
+                    // spell (e.g. the emerge-sacrificed creature) onto the stack
+                    // object so the `CastLinkSnapshot` restores it onto the
+                    // resulting permanent (Adipose Offspring). `cost_paid_object`
+                    // is a field on the resolving `ResolvedAbility` itself, not
+                    // on its `context`.
+                    obj.cast_cost_paid_object = ability.cost_paid_object.clone();
                     if let Some(cast_from_zone) = ability.context.cast_from_zone {
                         obj.cast_from_zone = Some(cast_from_zone);
                     }
@@ -1253,6 +1275,21 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                 if has_warp {
                     create_warp_delayed_trigger(state, entry.id, entry.controller);
                 }
+                // CR 702.185a + CR 400.7: stamp the per-object warp marker after
+                // `reset_for_battlefield_entry` cleared it, mirroring the Evoke /
+                // Impending / Suspend stamps below. Read by the target-scoped
+                // "if that creature was cast for its warp cost" rider (Full Bore)
+                // via `AbilityCondition::CastVariantPaid { subject: Target }`. The
+                // marker rides this incarnation only — a zone change makes a new
+                // object (CR 400.7) and re-casts from exile use
+                // `CastingVariant::Normal`, so the warp tag never persists past
+                // the cast turn's end-step exile.
+                if let Some(obj) = state.objects.get_mut(&entry.id) {
+                    obj.cast_variant_paid = Some((
+                        crate::types::ability::CastVariantPaid::Warp,
+                        state.turn_number,
+                    ));
+                }
             }
 
             // CR 702.190b: Sneak-cast permanent enters tapped (already seeded on
@@ -1432,6 +1469,20 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                         }],
                         None,
                     );
+                }
+            }
+
+            // CR 702.119a-c: Emerge-cast permanent is tagged so "if its emerge
+            // cost was paid" ETB instead-clauses (Adipose Offspring) can
+            // distinguish an emerge cast from a hard-cast. CR 603.4 re-checks at
+            // resolution; the marker is read by
+            // `AbilityCondition::CastVariantPaid` / `CastVariantPaidInstead`.
+            if casting_variant == CastingVariant::Emerge {
+                if let Some(obj) = state.objects.get_mut(&entry.id) {
+                    obj.cast_variant_paid = Some((
+                        crate::types::ability::CastVariantPaid::Emerge,
+                        state.turn_number,
+                    ));
                 }
             }
 
@@ -2491,7 +2542,9 @@ pub(crate) fn create_warp_delayed_trigger(
             enters_attacking: false,
             up_to: false,
             enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
             face_down_profile: None,
+            enters_modified_if: None,
         },
     )
     .sub_ability(AbilityDefinition::new(
@@ -3624,6 +3677,195 @@ mod tests {
     }
 
     #[test]
+    fn warp_cast_stamps_cast_variant_paid_warp_marker() {
+        // CR 702.185a + CR 400.7: a permanent cast for its warp cost must carry
+        // the per-object `cast_variant_paid` marker keyed on the cast turn, so the
+        // target-scoped "if that creature was cast for its warp cost" rider
+        // (Full Bore) can read it. Reverting the stack stamp leaves the marker
+        // `None` and this assertion fails.
+        let mut state = setup();
+        state.turn_number = 5;
+        state.active_player = PlayerId(0);
+        let obj_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Quantum Riddler".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&obj_id).unwrap();
+            obj.keywords.push(Keyword::Warp(ManaCost::generic(3)));
+            obj.mana_cost = ManaCost::generic(4);
+            obj.card_types.core_types.push(CoreType::Creature);
+        }
+        state.stack.push_back(StackEntry {
+            id: obj_id,
+            source_id: obj_id,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(1),
+                ability: None,
+                casting_variant: CastingVariant::Warp,
+                actual_mana_spent: 0,
+            },
+        });
+        resolve_top(&mut state, &mut Vec::new());
+        assert_eq!(
+            state.objects[&obj_id].cast_variant_paid,
+            Some((crate::types::ability::CastVariantPaid::Warp, 5)),
+            "a warp cast must stamp the per-object Warp marker keyed on the cast turn"
+        );
+    }
+
+    #[test]
+    fn full_bore_grants_trample_haste_only_to_warp_cast_target() {
+        // CR 115.1 + CR 608.2c + CR 702.185a: end-to-end production-path test for
+        // the whole feature. Warp-cast a creature through the real stack pipeline
+        // (stamping its per-object marker), then resolve Full Bore (Pump +
+        // target-scoped conditional grant) against it via the real ability
+        // resolver. The grant fires because the TARGET was warp-cast even though
+        // Full Bore's own source spell was NOT warp-cast — so reverting the
+        // evaluator's Target branch to read the source makes the warp-cast
+        // creature miss the grant (the source spell has no marker) and the
+        // positive assertion fails. The hard-cast creature (no marker) gets the
+        // +3/+2 only, proving the condition is load-bearing.
+        use crate::game::ability_utils::build_resolved_from_def_with_targets;
+        use crate::game::effects::resolve_ability_chain;
+        use crate::game::layers::evaluate_layers;
+        use crate::parser::oracle_effect::parse_effect_chain;
+        use crate::types::ability::AbilityKind;
+
+        fn make_creature(state: &mut GameState, id: u64, name: &str) -> ObjectId {
+            let obj_id = create_object(
+                state,
+                CardId(id),
+                PlayerId(0),
+                name.to_string(),
+                Zone::Battlefield,
+            );
+            let obj = state.objects.get_mut(&obj_id).unwrap();
+            obj.keywords.push(Keyword::Warp(ManaCost::generic(3)));
+            obj.mana_cost = ManaCost::generic(4);
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.base_card_types = obj.card_types.clone();
+            obj_id
+        }
+
+        let mut state = setup();
+        state.turn_number = 6;
+        state.active_player = PlayerId(0);
+
+        // Creature A: warp-cast through the production pipeline → marker stamped.
+        let warp_creature = make_creature(&mut state, 1, "Warp Brute");
+        state.stack.push_back(StackEntry {
+            id: warp_creature,
+            source_id: warp_creature,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(1),
+                ability: None,
+                casting_variant: CastingVariant::Warp,
+                actual_mana_spent: 0,
+            },
+        });
+        resolve_top(&mut state, &mut Vec::new());
+        assert_eq!(
+            state.objects[&warp_creature].cast_variant_paid,
+            Some((crate::types::ability::CastVariantPaid::Warp, 6)),
+            "precondition: warp cast stamped the per-object marker"
+        );
+
+        // Creature B: hard-cast (never warp-cast) → no marker.
+        let hard_creature = make_creature(&mut state, 2, "Hard Brute");
+        assert_eq!(state.objects[&hard_creature].cast_variant_paid, None);
+
+        // Full Bore source spell — itself NOT warp-cast (no marker).
+        let full_bore = create_object(
+            &mut state,
+            CardId(9),
+            PlayerId(0),
+            "Full Bore".to_string(),
+            Zone::Stack,
+        );
+
+        let def = parse_effect_chain(
+            "Target creature you control gets +3/+2 until end of turn. If that creature was cast for its warp cost, it also gains trample and haste until end of turn.",
+            AbilityKind::Spell,
+        );
+
+        // Full Bore on the warp-cast creature → +3/+2 AND trample + haste.
+        let resolved_a = build_resolved_from_def_with_targets(
+            &def,
+            full_bore,
+            PlayerId(0),
+            vec![TargetRef::Object(warp_creature)],
+        );
+        resolve_ability_chain(&mut state, &resolved_a, &mut Vec::new(), 0).unwrap();
+        evaluate_layers(&mut state);
+        assert!(
+            state.objects[&warp_creature].has_keyword(&Keyword::Trample)
+                && state.objects[&warp_creature].has_keyword(&Keyword::Haste),
+            "warp-cast target must gain trample AND haste from the target-scoped rider \
+             even though the Full Bore source spell was not warp-cast"
+        );
+
+        // Full Bore on the hard-cast creature → +3/+2 only, NO trample/haste.
+        let resolved_b = build_resolved_from_def_with_targets(
+            &def,
+            full_bore,
+            PlayerId(0),
+            vec![TargetRef::Object(hard_creature)],
+        );
+        resolve_ability_chain(&mut state, &resolved_b, &mut Vec::new(), 0).unwrap();
+        evaluate_layers(&mut state);
+        assert!(
+            !state.objects[&hard_creature].has_keyword(&Keyword::Trample)
+                && !state.objects[&hard_creature].has_keyword(&Keyword::Haste),
+            "hard-cast target must NOT gain trample/haste — the warp condition is load-bearing"
+        );
+    }
+
+    #[test]
+    fn normal_cast_does_not_stamp_warp_marker() {
+        // CR 702.185a: re-casting an exiled warp card (or any non-warp cast) uses
+        // `CastingVariant::Normal` and carries NO warp marker, so the warp-scoped
+        // rider must NOT fire for it.
+        let mut state = setup();
+        state.turn_number = 5;
+        state.active_player = PlayerId(0);
+        let obj_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Quantum Riddler".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&obj_id).unwrap();
+            obj.keywords.push(Keyword::Warp(ManaCost::generic(3)));
+            obj.mana_cost = ManaCost::generic(4);
+            obj.card_types.core_types.push(CoreType::Creature);
+        }
+        state.stack.push_back(StackEntry {
+            id: obj_id,
+            source_id: obj_id,
+            controller: PlayerId(0),
+            kind: StackEntryKind::Spell {
+                card_id: CardId(1),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 4,
+            },
+        });
+        resolve_top(&mut state, &mut Vec::new());
+        assert_eq!(
+            state.objects[&obj_id].cast_variant_paid, None,
+            "a normal (non-warp) cast must not stamp the warp marker"
+        );
+    }
+
+    #[test]
     fn exile_with_alt_cost_still_works() {
         // Regression: ExileWithAltCost (Airbending, etc.) should still be immediately castable.
         use crate::game::casting::spell_objects_available_to_cast;
@@ -3651,8 +3893,9 @@ mod tests {
                     resolution_cleanup: None,
                     duration: None,
 
-                    exile_instead_of_graveyard_on_resolve: false,
+                    graveyard_replacement: None,
                     enters_with_counter: None,
+                    mana_spend_permission: None,
                 });
         }
 
@@ -4298,7 +4541,9 @@ mod tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
                 face_down_profile: None,
+                enters_modified_if: None,
             },
             vec![],
             spell_id,
@@ -4346,7 +4591,9 @@ mod tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
                 face_down_profile: None,
+                enters_modified_if: None,
             },
             vec![TargetRef::Object(target_id)],
             spell_id,
@@ -7974,7 +8221,9 @@ mod tests {
                     enters_attacking: false,
                     up_to: false,
                     enter_with_counters: vec![],
+                    conditional_enter_with_counters: vec![],
                     face_down_profile: None,
+                    enters_modified_if: None,
                 },
             ));
         state

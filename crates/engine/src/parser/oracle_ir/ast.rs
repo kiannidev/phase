@@ -3,10 +3,10 @@ use serde::Serialize;
 use crate::types::ability::MultiTargetSpec;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, ActivationRestriction, BounceSelection,
-    CastingPermission, ControllerRef, CopyRetargetPermission, CounterSourceRider,
-    CounteredSpellDestination, DoorLockOp, Duration, Effect, FaceDownProfile, LibraryPosition,
-    ManaProduction, ManaSpendRestriction, ModalSelectionConstraint, OutsideGameSourcePool,
-    PlayerFilter, PtStat, PtValue, QuantityExpr, SearchDestinationSplit, SearchSelectionConstraint,
+    CastingPermission, ControllerRef, CopyRetargetPermission, CounterSourceRider, DoorLockOp,
+    Duration, Effect, FaceDownProfile, LibraryPosition, ManaProduction, ManaSpendRestriction,
+    ModalSelectionConstraint, OutsideGameSourcePool, PlayerFilter, PtStat, PtValue, QuantityExpr,
+    SearchDestinationSplit, SearchSelectionConstraint, SpellStackToGraveyardReplacement,
     StaticCondition, StaticDefinition, TargetFilter,
 };
 use crate::types::card_type::Supertype;
@@ -188,6 +188,12 @@ pub(crate) enum PredicateAst {
     Restriction {
         effect: Effect,
         duration: Option<Duration>,
+        /// CR 509.1b + CR 611.2c: A conjoined-subject evasion grant ("<source>
+        /// and up to N other target creature(s) can't be blocked this turn",
+        /// Martha Jones) carries the SECOND conjunct's grant as a sub_ability
+        /// continuation, mirroring `Become`/`Continuous`. `None` for the common
+        /// single-subject restriction.
+        sub_ability: Option<Box<AbilityDefinition>>,
     },
     ImperativeFallback {
         text: String,
@@ -200,6 +206,8 @@ pub(crate) enum ContinuationAst {
         destination: Zone,
         /// CR 701.23a: When true, the searched card enters the battlefield tapped.
         enter_tapped: bool,
+        /// CR 110.2a: Some(You) when the card enters "under your control"; None keeps the ChangeZone default (owner's control).
+        enters_under: Option<ControllerRef>,
         /// CR 701.23a: When true, the searched card is revealed before it moves.
         reveal: bool,
         /// When true, the found card enters "attached to" the search source.
@@ -231,7 +239,7 @@ pub(crate) enum ContinuationAst {
     /// `countered_spell_zone = Some(destination)` on the preceding
     /// `Effect::Counter` (Memory Lapse, Remand, Spell Crumple).
     CounterSpellZoneRedirect {
-        destination: CounteredSpellDestination,
+        destination: SpellStackToGraveyardReplacement,
     },
     /// CR 707.10c: "You may choose new targets for the copy/copies." after a
     /// CopySpell (possibly wrapped in a CreateDelayedTrigger) — patches
@@ -281,6 +289,8 @@ pub(crate) enum ContinuationAst {
     PutChosenCardsAtLibraryPosition { position: LibraryPosition },
     /// CR 702.170c-d: "It/that card/they become plotted" after an exile effect.
     BecomesPlotted,
+    /// CR 702.143d: "It/that card/they become foretold" after an exile effect.
+    BecomesForetold,
     /// "Put the rest on the bottom/into your graveyard" after Dig/RevealTop —
     /// sets `rest_destination` on the preceding Dig effect. The destination is
     /// parsed from the text (bottom of library, graveyard, hand, etc.).
@@ -335,7 +345,15 @@ pub(crate) enum ContinuationAst {
     /// CR 508.4 / CR 614.1: "It/The token enters tapped and attacking [that player]"
     /// Absorbs into preceding CopyTokenOf, Token, or ChangeZone by setting
     /// enters_attacking and tapped/enter_tapped flags.
-    EntersTappedAttacking,
+    ///
+    /// CR 614.12: `moved_filter` carries an optional leading moved-object
+    /// type condition ("If that card is an enchantment card, it enters
+    /// tapped and attacking" — Summoner's Grimoire). When `Some`, the
+    /// absorbed ChangeZone gates the riders on the moved object via
+    /// `Effect::ChangeZone.enters_modified_if`. `None` = unconditional
+    /// (Stangg / Shark Shredder). Only ChangeZone honors the gate;
+    /// CopyTokenOf / Token always enter unconditionally.
+    EntersTappedAttacking { moved_filter: Option<TargetFilter> },
     /// CR 122.6a: "The token enters with X +1/+1 counters on it, where X is ..."
     /// Absorbs into the preceding Token effect by populating `enter_with_counters`.
     TokenEntersWithCounters {
@@ -509,6 +527,23 @@ pub(crate) enum ImperativeFamilyAst {
     /// the card(s) the source exiled.
     TurnFaceUp {
         target: TargetFilter,
+    },
+    /// CR 708.2a: "Turn target [permanent] face down" — turns the targeted
+    /// face-up permanent(s) face down via a resolving effect (Cyber Conversion).
+    /// `profile` is seeded with `Some(vanilla_2_2())` at the verb arm so a
+    /// trailing "It's a 2/2 Cyberman artifact creature." `FaceDownProfileSpec`
+    /// continuation can refine the face-down body (CR 205.1a).
+    ///
+    /// CR 115.1d: `multi_target` carries the target-count quantifier when the
+    /// subject is plural ("turn any number of target tapped nontoken creatures
+    /// face down" — Illithid Harvester; "turn N target … face down"). It is
+    /// stamped onto the lowered `ParsedEffectClause` so the cast surfaces the
+    /// correct number of target slots rather than collapsing to one. `None` for
+    /// the single-subject form (Cyber Conversion, Backslide).
+    TurnFaceDown {
+        target: TargetFilter,
+        profile: Option<FaceDownProfile>,
+        multi_target: Option<MultiTargetSpec>,
     },
     BecomeMonarch,
     /// CR 701.49: "venture into the dungeon"
@@ -742,9 +777,18 @@ impl TargetedImperativeAst {
 pub(crate) enum TargetedImperativeAst {
     Tap {
         target: TargetFilter,
+        /// CR 115.1d + CR 701.26a: Variable target count for "tap up to N target
+        /// creatures" (Nyssa of Traken's "tap up to that many target creatures",
+        /// N = `EventContextAmount`). `None` for the common single-target
+        /// "tap target creature". Carried onto `ParsedEffectClause.multi_target`
+        /// at lowering so the targeting system surfaces the right number of slots.
+        multi_target: Option<MultiTargetSpec>,
     },
     Untap {
         target: TargetFilter,
+        /// CR 115.1d + CR 701.26b: Variable target count for "untap up to N target
+        /// creatures", mirroring [`TargetedImperativeAst::Tap`].
+        multi_target: Option<MultiTargetSpec>,
     },
     TapAll {
         target: TargetFilter,
@@ -1021,6 +1065,10 @@ pub(crate) enum UtilityImperativeAst {
     Attach {
         attachment: TargetFilter,
         target: TargetFilter,
+        /// CR 115.1d: "attach up to N target ..." / "attach any number of
+        /// target ..." cardinality belongs to the ability's target selection,
+        /// not the `Effect::Attach` payload.
+        multi_target: Option<MultiTargetSpec>,
     },
     UnattachAll {
         attachment: TargetFilter,
@@ -1062,6 +1110,11 @@ pub(crate) enum HandRevealImperativeAst {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) enum ChooseImperativeAst {
+    /// CR 609.7a: "choose a source [you control|...]" — interactive damage-source
+    /// selection, distinct from permanent targeting (`TargetOnly`).
+    DamageSource {
+        source_filter: TargetFilter,
+    },
     TargetOnly {
         target: TargetFilter,
     },
@@ -1105,6 +1158,9 @@ pub(crate) enum ChooseImperativeAst {
         chooser_scope: crate::types::ability::CategoryChooserScope,
         choose_filter: crate::types::ability::TargetFilter,
         sacrifice_filter: crate::types::ability::TargetFilter,
+        /// Slaughter the Strong: keep ANY number of `choose_filter` permanents
+        /// whose combined power is at most this cap, instead of one per category.
+        total_power_cap: Option<crate::types::ability::QuantityExpr>,
     },
     /// CR 115.1c + CR 601.2c: "choose target X and target Y" — two independent
     /// target slots declared in a single targeting clause (Goblin Welder shape).

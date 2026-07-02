@@ -8089,11 +8089,11 @@ pub fn handle_cast_spell_as_miracle_with_payment_mode(
     }
     // CR 702.94a: The keyword must still be present — it can have been removed
     // by layers / replacement effects between offer time and accept time.
-    let has_miracle = obj
-        .keywords
-        .iter()
-        .any(|k| matches!(k, crate::types::keywords::Keyword::Miracle(_)));
-    if !has_miracle {
+    if !super::keywords::object_has_effective_keyword_kind(
+        state,
+        object_id,
+        crate::types::keywords::KeywordKind::Miracle,
+    ) {
         return Err(EngineError::ActionNotAllowed(
             "Card no longer has miracle".to_string(),
         ));

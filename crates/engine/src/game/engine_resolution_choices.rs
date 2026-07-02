@@ -2908,6 +2908,7 @@ pub(super) fn handle_resolution_choice(
                             // across the `EffectZoneChoice` round-trip against each
                             // chosen object (Summoner's Grimoire).
                             enters_modified_if: enters_modified_if.clone(),
+                            enter_attached_to: None,
                         };
                         match effects::change_zone::process_one_zone_move(
                             state, &ctx, *card_id, events,
@@ -3188,6 +3189,7 @@ pub(super) fn handle_resolution_choice(
                         // CR 614.12: cost-payment exile carries no enter-modifier
                         // gate; thread the (None) round-trip value for consistency.
                         enters_modified_if: enters_modified_if.clone(),
+                        enter_attached_to: None,
                     };
                     let events_before_effect = events.len();
                     let chosen_ids: Vec<_> = chosen.to_vec();

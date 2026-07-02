@@ -31,6 +31,32 @@ use crate::types::mana::ManaCost;
 use crate::types::statics::StaticMode;
 use crate::types::zones::Zone;
 
+/// CR 303.4f: Parse the host of "put it onto the battlefield attached to X"
+/// inside a library-search compound.
+fn parse_search_attach_host(text: &str) -> Option<TargetFilter> {
+    let lower = text.to_ascii_lowercase();
+    let start = lower.find("attached to")? + "attached to".len();
+    let rest = lower[start..].trim();
+    let boundary = rest
+        .find(',')
+        .or_else(|| rest.find(" then "))
+        .unwrap_or(rest.len());
+    let phrase = rest[..boundary].trim().trim_end_matches('.');
+    match phrase {
+        "~" => Some(TargetFilter::SelfRef),
+        "that player" | "enchanted player" => Some(TargetFilter::ParentTarget),
+        _ if phrase.starts_with("target ") => {
+            let (filter, remainder) = parse_target(phrase);
+            if remainder.trim().is_empty() {
+                Some(filter)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// CR 608.2c + CR 701.23i: Strip a leading player-subject from a search-result
 /// continuation chunk so the absorption matcher sees the bare verb form. Used
 /// by the SearchDestination follow-up absorber to handle iterated-search
@@ -2845,7 +2871,7 @@ pub(super) fn apply_clause_continuation(
             enter_tapped,
             enters_under,
             reveal,
-            attach_to_source,
+            attach_host,
         } => {
             // CR 701.23a: A multi-zone tutor ("graveyard, hand, and/or library")
             // finds the card in any searched zone, so the put-step must move it
@@ -2893,14 +2919,13 @@ pub(super) fn apply_clause_continuation(
                     enters_modified_if: None,
                 },
             );
-            // CR 303.4f: "attached to [source]" — forward the moved card to an Attach sub_ability
-            if attach_to_source {
+            if let Some(host) = attach_host {
                 change_zone.forward_result = true;
                 change_zone.sub_ability = Some(Box::new(AbilityDefinition::new(
                     kind,
                     Effect::Attach {
                         attachment: TargetFilter::SelfRef,
-                        target: TargetFilter::Any,
+                        target: host,
                     },
                 )));
             }
@@ -4043,8 +4068,13 @@ pub(super) fn parse_intrinsic_continuation_ast(
                 return None;
             }
             let lower = text.to_lowercase();
-            let attach_to_source = nom_primitives::scan_contains(&full_lower, "attached to")
-                || nom_primitives::scan_contains(&lower, "attached to");
+            let attach_host = if nom_primitives::scan_contains(&full_lower, "attached to")
+                || nom_primitives::scan_contains(&lower, "attached to")
+            {
+                parse_search_attach_host(&full_lower).or(Some(TargetFilter::SelfRef))
+            } else {
+                None
+            };
             // CR 701.23a + CR 701.18a: Scan "onto the battlefield tapped" across
             // the whole sentence (full_lower) so the destination compound's
             // "enters tapped" modifier is detected even when the put-step is
@@ -4090,7 +4120,7 @@ pub(super) fn parse_intrinsic_continuation_ast(
                 enters_under: nom_primitives::scan_contains(&full_lower, "under your control")
                     .then_some(ControllerRef::You),
                 reveal,
-                attach_to_source,
+                attach_host,
             })
         }
         _ => None,

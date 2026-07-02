@@ -856,6 +856,7 @@ fn drain_pending_change_zone_iteration(state: &mut GameState, events: &mut Vec<G
                 // resume ctx so a resumed member is still gated on its type
                 // (Summoner's Grimoire), matching the synchronous move path.
                 enters_modified_if: enters_modified_if.clone(),
+                enter_attached_to: None,
             };
             let before_zone = state.objects.get(obj_id).map(|object| object.zone);
             match crate::game::effects::change_zone::process_one_zone_move(

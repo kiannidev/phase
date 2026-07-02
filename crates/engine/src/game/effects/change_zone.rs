@@ -1,5 +1,6 @@
 use rand::Rng;
 
+use crate::game::game_object::AttachTarget;
 use crate::game::zones;
 use crate::types::ability::{
     ControllerRef, Duration, Effect, EffectError, EffectKind, FilterProp, LibraryPosition,
@@ -14,6 +15,47 @@ use crate::types::game_state::{GameState, PendingCounterPostAction, WaitingFor};
 use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
 use crate::types::zones::{EtbTapState, Zone};
+
+/// CR 301.5b + CR 303.4f: Search effects that put an Aura onto the battlefield
+/// "attached to ~" (Light-Paws) or "attached to that/enchanted player" (Curse
+/// tutors) carry a `forward_result` Attach sub. Pre-resolve the host so the
+/// zone pipeline attaches on entry instead of surfacing a host-choice prompt.
+fn forward_result_search_attach_host(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> Option<AttachTarget> {
+    if !ability.forward_result {
+        return None;
+    }
+    let sub = ability.sub_ability.as_ref()?;
+    let Effect::Attach { attachment, target } = &sub.effect else {
+        return None;
+    };
+    if !matches!(attachment, TargetFilter::SelfRef) {
+        return None;
+    }
+    match target {
+        TargetFilter::SelfRef => Some(AttachTarget::Object(ability.source_id)),
+        TargetFilter::ParentTarget => ability.targets.first().and_then(|target| match target {
+            TargetRef::Object(id) => Some(AttachTarget::Object(*id)),
+            TargetRef::Player(id) => Some(AttachTarget::Player(*id)),
+        }),
+        TargetFilter::Any => {
+            let source = state.objects.get(&ability.source_id)?;
+            if source
+                .card_types
+                .subtypes
+                .iter()
+                .any(|subtype| subtype == "Aura")
+            {
+                source.attached_to.clone()
+            } else {
+                Some(AttachTarget::Object(ability.source_id))
+            }
+        }
+        _ => None,
+    }
+}
 
 /// CR 701.24a: Shuffle a player's library using the game's seeded RNG.
 /// Reusable helper for auto-shuffle after zone moves to Library.
@@ -503,6 +545,7 @@ pub fn resolve(
                 face_down_profile.as_ref(),
                 track_exiled_by_source,
                 None,
+                None,
                 events,
             ) {
                 ZoneMoveResult::Done => {
@@ -584,6 +627,7 @@ pub fn resolve(
                 &per_obj_enter_counters,
                 face_down_profile.as_ref(),
                 track_exiled_by_source,
+                None,
                 None,
                 events,
             ) {
@@ -685,6 +729,7 @@ pub fn resolve(
         face_down_profile: face_down_profile.clone(),
         library_placement: None,
         enters_modified_if: effect_enters_modified_if,
+        enter_attached_to: forward_result_search_attach_host(state, ability),
     };
     let _ = owner_library; // routing handled by move_to_zone (CR 400.7)
 
@@ -965,6 +1010,8 @@ pub(crate) struct ChangeZoneIterationCtx {
     /// unconditionally. Carried so the gate survives the `EffectZoneChoice`
     /// pick pause and is evaluated per chosen object in `process_one_zone_move`.
     pub enters_modified_if: Option<TargetFilter>,
+    /// CR 303.4f: Pre-resolved Aura host for search/tutor "enters attached" wiring.
+    pub enter_attached_to: Option<AttachTarget>,
 }
 
 /// CR 614.12 + CR 614.12a: Resolve the effective enter-modifiers for one moved
@@ -1074,6 +1121,7 @@ pub(crate) fn process_one_zone_move(
         ctx.face_down_profile.as_ref(),
         ctx.track_exiled_by_source,
         ctx.library_placement.clone(),
+        ctx.enter_attached_to.clone(),
         events,
     );
 
@@ -1399,6 +1447,7 @@ pub fn resolve_all(
             face_down_profile.as_ref(),
             track_exiled_by_source,
             effect_library_position.clone(),
+            None,
             events,
         ) {
             ZoneMoveResult::Done => {
@@ -3234,6 +3283,7 @@ mod tests {
             &[],
             None,
             false,
+            None,
             None,
             &mut events,
         );

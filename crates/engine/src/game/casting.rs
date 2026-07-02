@@ -1,11 +1,11 @@
 use crate::types::ability::{
     is_variable_remove_counter_cost_count, AbilityCondition, AbilityCost, AbilityDefinition,
-    AbilityKind, AdditionalCost, CardPlayMode, CastTimingPermission, CastingPermission, ChoiceType,
-    ContinuousModification, CostObjectCount, CostPaidObjectSnapshot, CounterCostSelection,
-    Duration, Effect, FilterProp, GameRestriction, ModalSelectionCondition, ObjectScope,
-    PlayerFilter, PlayerScope, ProhibitedActivity, QuantityExpr, QuantityRef, ResolvedAbility,
-    RestrictionExpiry, RestrictionPlayerScope, StaticCondition, StaticDefinition, SubAbilityLink,
-    TapCreaturesRequirement, TargetFilter, TargetRef,
+    AbilityKind, AbilityTag, AdditionalCost, CardPlayMode, CastTimingPermission, CastingPermission,
+    ChoiceType, ContinuousModification, CostObjectCount, CostPaidObjectSnapshot,
+    CounterCostSelection, Duration, Effect, FilterProp, GameRestriction, ModalSelectionCondition,
+    ObjectScope, PlayerFilter, PlayerScope, ProhibitedActivity, QuantityExpr, QuantityRef,
+    ResolvedAbility, RestrictionExpiry, RestrictionPlayerScope, StaticCondition, StaticDefinition,
+    SubAbilityLink, TapCreaturesRequirement, TargetFilter, TargetRef,
 };
 use crate::types::actions::AlternativeCastDecision;
 use crate::types::card::LayoutKind;
@@ -12423,14 +12423,12 @@ fn effect_branch_as_activation_cost(effect: &Effect) -> Option<AbilityCost> {
             target: TargetFilter::Controller | TargetFilter::Player,
             selection,
             ..
-        } => {
-            Some(AbilityCost::Discard {
-                count: count.clone(),
-                filter: None,
-                selection: *selection,
-                self_scope: crate::types::ability::DiscardSelfScope::FromHand,
-            })
-        }
+        } => Some(AbilityCost::Discard {
+            count: count.clone(),
+            filter: None,
+            selection: *selection,
+            self_scope: crate::types::ability::DiscardSelfScope::FromHand,
+        }),
         _ => None,
     }
 }
@@ -13234,7 +13232,13 @@ pub fn handle_activate_ability(
 
     // CR 118.3: Pre-check for non-self sacrifice costs — must detour to WaitingFor
     // before any cost payment, regardless of whether targets were auto-selected.
-    let activation_cost = ability_def.cost.clone().map(normalize_activation_cost);
+    let activation_cost = ability_def.cost.clone().map(|cost| {
+        if ability_def.ability_tag == Some(AbilityTag::Equip) {
+            normalize_activation_cost(cost)
+        } else {
+            cost
+        }
+    });
     if let Some(ref cost) = activation_cost {
         // CR 606.3: `can_activate_ability_now` gates legal-action generation,
         // but direct `GameAction::ActivateAbility` submissions must be rejected

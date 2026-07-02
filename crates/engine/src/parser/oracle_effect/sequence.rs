@@ -37,14 +37,24 @@ fn parse_search_attach_host(text: &str) -> Option<TargetFilter> {
     let lower = text.to_ascii_lowercase();
     let start = lower.find("attached to")? + "attached to".len();
     let rest = lower[start..].trim();
-    let boundary = rest
-        .find(',')
-        .or_else(|| rest.find(" then "))
+    let boundary = [rest.find('.'), rest.find(" then "), rest.find(',')]
+        .into_iter()
+        .flatten()
+        .min()
         .unwrap_or(rest.len());
     let phrase = rest[..boundary].trim().trim_end_matches('.');
     match phrase {
-        "~" => Some(TargetFilter::SelfRef),
+        "~" | "this creature" | "this permanent" | "this artifact" => Some(TargetFilter::SelfRef),
         "that player" | "enchanted player" => Some(TargetFilter::ParentTarget),
+        "that creature"
+        | "that permanent"
+        | "that token"
+        | "that card"
+        | "that enchanted creature"
+        | "that enchanted permanent"
+        | "the creature"
+        | "the permanent"
+        | "the token" => Some(TargetFilter::ParentTarget),
         _ if phrase.starts_with("target ") => {
             let (filter, remainder) = parse_target(phrase);
             if remainder.trim().is_empty() {
@@ -4071,7 +4081,7 @@ pub(super) fn parse_intrinsic_continuation_ast(
             let attach_host = if nom_primitives::scan_contains(&full_lower, "attached to")
                 || nom_primitives::scan_contains(&lower, "attached to")
             {
-                parse_search_attach_host(&full_lower).or(Some(TargetFilter::SelfRef))
+                parse_search_attach_host(&full_lower).or(Some(TargetFilter::Any))
             } else {
                 None
             };
@@ -10346,6 +10356,29 @@ mod tests {
                 })
             ),
             "expected bare of-them DigFromAmong, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn search_attach_host_that_creature_is_parent_target() {
+        use crate::types::ability::TypedFilter;
+        assert_eq!(
+            super::parse_search_attach_host(
+                "put it onto the battlefield attached to that creature, then shuffle"
+            ),
+            Some(TargetFilter::ParentTarget)
+        );
+        assert_eq!(
+            super::parse_search_attach_host(
+                "put it onto the battlefield attached to target creature. if you search your library this way, shuffle"
+            ),
+            Some(TargetFilter::Typed(TypedFilter::creature()))
+        );
+        assert_eq!(
+            super::parse_search_attach_host(
+                "put that card onto the battlefield attached to ~, then shuffle"
+            ),
+            Some(TargetFilter::SelfRef)
         );
     }
 

@@ -36,9 +36,9 @@ fn forward_result_search_attach_host(
     }
     match target {
         TargetFilter::SelfRef => Some(AttachTarget::Object(ability.source_id)),
-        TargetFilter::ParentTarget => ability.targets.first().and_then(|target| match target {
-            TargetRef::Object(id) => Some(AttachTarget::Object(*id)),
-            TargetRef::Player(id) => Some(AttachTarget::Player(*id)),
+        TargetFilter::ParentTarget => ability.targets.first().map(|target| match target {
+            TargetRef::Object(id) => AttachTarget::Object(*id),
+            TargetRef::Player(id) => AttachTarget::Player(*id),
         }),
         TargetFilter::Any => {
             let source = state.objects.get(&ability.source_id)?;
@@ -48,7 +48,7 @@ fn forward_result_search_attach_host(
                 .iter()
                 .any(|subtype| subtype == "Aura")
             {
-                source.attached_to.clone()
+                source.attached_to
             } else {
                 Some(AttachTarget::Object(ability.source_id))
             }
@@ -1121,7 +1121,7 @@ pub(crate) fn process_one_zone_move(
         ctx.face_down_profile.as_ref(),
         ctx.track_exiled_by_source,
         ctx.library_placement.clone(),
-        ctx.enter_attached_to.clone(),
+        ctx.enter_attached_to,
         events,
     );
 

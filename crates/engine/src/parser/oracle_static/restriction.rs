@@ -1582,6 +1582,35 @@ pub(crate) fn try_parse_graveyard_cast_permission(
         );
     }
 
+    // CR 305.1 + CR 601.2a + CR 114.4: Unlimited combined permission —
+    // "You may play lands and cast permanent spells from your graveyard."
+    // (Wrenn and Realmbreaker emblem). Shared zone anchor at the tail; `Play`
+    // mode covers both branches.
+    if nom_tag_lower(
+        lower,
+        lower,
+        "you may play lands and cast permanent spells from your graveyard",
+    )
+    .is_some()
+    {
+        let affected = TargetFilter::Or {
+            filters: vec![
+                TargetFilter::Typed(TypedFilter::new(TypeFilter::Land)),
+                TargetFilter::Typed(TypedFilter::new(TypeFilter::Permanent)),
+            ],
+        };
+        return Some(
+            StaticDefinition::new(StaticMode::GraveyardCastPermission {
+                frequency: CastFrequency::Unlimited,
+                play_mode: CardPlayMode::Play,
+                graveyard_destination_replacement: None,
+                extra_cost: None,
+            })
+            .affected(affected)
+            .description(text.to_string()),
+        );
+    }
+
     // CR 305.1 + CR 601.2a + CR 700.6: Disjunctive once-per-turn permission —
     // "Once during each of your turns, you may play a <land-filter> or cast a
     // <spell-filter> from your graveyard." (The Eighth Doctor, Serra Paragon).

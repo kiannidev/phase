@@ -18,7 +18,9 @@ use super::oracle_modal::try_parse_inline_modal;
 use super::oracle_nom::condition::parse_inner_condition;
 use super::oracle_nom::condition::parse_source_has_counters;
 use super::oracle_nom::error::{oracle_err, OracleResult};
-use super::oracle_nom::filter::{parse_enters_origin_zone, parse_with_property};
+use super::oracle_nom::filter::{
+    parse_color_property, parse_enters_origin_zone, parse_with_property,
+};
 use super::oracle_nom::primitives::{
     self as nom_primitives, scan_contains, scan_preceded, scan_split_at_phrase,
 };
@@ -12530,14 +12532,14 @@ fn parse_spell_qualifier_payload(qualifier: &str) -> Option<TargetFilter> {
 /// Returns `None` if `parse_type_phrase` reports `TargetFilter::Any` or leaves
 /// residual text — both indicate the phrase was not a pure type qualifier.
 fn type_only_filter(qualifier: &str) -> Option<TargetFilter> {
-    // CR 105.2b: "multicolored" is a color-count property, not a type phrase.
-    if qualifier == "multicolored" {
-        return Some(TargetFilter::Typed(
-            TypedFilter::default().properties(vec![FilterProp::ColorCount {
-                comparator: Comparator::GE,
-                count: 2,
-            }]),
-        ));
+    // CR 105.2b: bare color-quality qualifiers ("multicolored", "monocolored",
+    // "colorless") are color-count properties, not type phrases.
+    if let Ok((remainder, prop)) = parse_color_property(qualifier) {
+        if remainder.trim().is_empty() {
+            return Some(TargetFilter::Typed(
+                TypedFilter::new(TypeFilter::Card).properties(vec![prop]),
+            ));
+        }
     }
     let (filter, remainder) = parse_type_phrase(qualifier);
     if remainder.trim().is_empty() && !matches!(filter, TargetFilter::Any) {

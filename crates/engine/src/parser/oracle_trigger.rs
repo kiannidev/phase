@@ -5971,6 +5971,7 @@ fn parse_bare_shared_event_verb(input: &str) -> OracleResult<'_, ()> {
         parse_event_word("play"),
         parse_event_word("casts"),
         parse_event_word("cast"),
+        // CR 121.2: Player draw events in disjunctive trigger lists.
         parse_event_phrase("draws "),
         parse_event_word("draws"),
         parse_event_phrase("draw "),
@@ -5993,6 +5994,7 @@ fn parse_shared_object_verb_head(input: &str) -> OracleResult<'_, ()> {
         parse_event_phrase("play "),
         parse_event_phrase("casts "),
         parse_event_phrase("cast "),
+        // CR 121.2: Player draw events in disjunctive trigger lists.
         parse_event_phrase("draws "),
         parse_event_phrase("draw "),
         // CR 702.29c: "cycle" as shared-object verb head.
@@ -10332,8 +10334,8 @@ fn try_parse_attack_with_n_creatures(lower: &str) -> Option<(TriggerMode, Trigge
     .ok()?;
     let (after_actor, actor): (&str, ControllerRef) = actor_parse;
 
-    // CR 508.3a: "attacks you with N or more creatures" — the attacked player is
-    // the defending controller (Trouble in Pairs).
+    // CR 508.3e: "attacks you with N or more creatures" — player-level attack
+    // trigger where the defending player is the controller (Trouble in Pairs).
     let (after_target, attacks_you) = if let Ok((rest, ())) =
         value((), tag::<_, _, OracleError<'_>>(" you")).parse(after_actor)
     {

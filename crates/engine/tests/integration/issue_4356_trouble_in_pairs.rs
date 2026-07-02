@@ -31,7 +31,7 @@ fn draw_for(runner: &mut GameRunner, player: engine::types::player::PlayerId) {
     let mut events = Vec::new();
     resolve_draw(runner.state_mut(), &ability, &mut events).expect("draw resolves");
     process_triggers(runner.state_mut(), &events);
-    while runner.state().stack.len() > 0 {
+    while !runner.state().stack.is_empty() {
         runner.advance_until_stack_empty();
     }
 }

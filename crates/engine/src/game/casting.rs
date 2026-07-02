@@ -12420,10 +12420,10 @@ fn effect_branch_as_activation_cost(effect: &Effect) -> Option<AbilityCost> {
         } => Some(cost.clone()),
         Effect::Discard {
             count,
-            target,
+            target: TargetFilter::Controller | TargetFilter::Player,
             selection,
             ..
-        } if matches!(target, TargetFilter::Controller | TargetFilter::Player) => {
+        } => {
             Some(AbilityCost::Discard {
                 count: count.clone(),
                 filter: None,

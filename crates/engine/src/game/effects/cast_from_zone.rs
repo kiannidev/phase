@@ -485,7 +485,7 @@ fn cast_stack_spell_copy_during_resolution(
         ability.controller,
         None,
     )
-    .map_err(|e| EffectError::InvalidParam(e))?
+    .map_err(EffectError::InvalidParam)?
     {
         return Ok(());
     }

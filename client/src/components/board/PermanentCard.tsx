@@ -19,6 +19,7 @@ import { useGameStore } from "../../stores/gameStore.ts";
 import { usePreferencesStore } from "../../stores/preferencesStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
 import { buildGrantedKeywordSources, buildPTSources } from "../../viewmodel/attribution.ts";
+import { isFaceDownExileCardVisibleToViewer } from "../../viewmodel/gameStateView.ts";
 import { COUNTER_COLORS, computePTDisplay, formatCounterTooltip, formatCounterType, toRoman } from "../../viewmodel/cardProps.ts";
 import { getCardDisplayColors } from "../card/cardFrame.ts";
 import { useBoardInteractionState } from "./BoardInteractionContext.tsx";
@@ -926,7 +927,9 @@ interface ExileGhostCardProps {
 }
 
 const ExileGhostCard = memo(function ExileGhostCard({ objectId, offset }: ExileGhostCardProps) {
-  const obj = useGameStore((s) => s.gameState?.objects[objectId]);
+  const gameState = useGameStore((s) => s.gameState);
+  const obj = gameState?.objects[objectId];
+  const viewerId = usePlayerId();
   const { handlers: hoverHandlers } = useCardHover(objectId);
   const battlefieldCardDisplay = usePreferencesStore((s) => s.battlefieldCardDisplay);
   const controllerIdentity = useGameStore(
@@ -934,6 +937,9 @@ const ExileGhostCard = memo(function ExileGhostCard({ objectId, offset }: ExileG
   );
 
   if (!obj) return null;
+
+  const hiddenFromViewer =
+    obj.face_down && !isFaceDownExileCardVisibleToViewer(gameState ?? null, obj, viewerId);
 
   const isLand = obj.card_types.core_types.includes("Land");
   const displayColors = getCardDisplayColors(
@@ -955,9 +961,13 @@ const ExileGhostCard = memo(function ExileGhostCard({ objectId, offset }: ExileG
       {/* Purple exile tint */}
       <div className="absolute inset-0 z-10 rounded-lg bg-purple-600/30 pointer-events-none" />
       {useArtCrop ? (
-        <ArtCropCard objectId={objectId} />
+        hiddenFromViewer ? (
+          <CardImage cardName={imgName} size="small" faceDown />
+        ) : (
+          <ArtCropCard objectId={objectId} />
+        )
       ) : (
-        <CardImage cardName={imgName} faceIndex={imgFace} oracleId={imgOracleId} faceName={imgFaceName} size="small" colors={displayColors} isToken={obj.display_source === "Token"} tokenFilters={obj.display_source === "Token" ? tokenFiltersForObject(obj) : undefined} tokenImageRef={obj.token_image_ref} oracleText={obj.display_source === "Token" ? obj.token_rules_text : undefined} faceDown={obj.face_down} />
+        <CardImage cardName={imgName} faceIndex={imgFace} oracleId={imgOracleId} faceName={imgFaceName} size="small" colors={displayColors} isToken={obj.display_source === "Token"} tokenFilters={obj.display_source === "Token" ? tokenFiltersForObject(obj) : undefined} tokenImageRef={obj.token_image_ref} oracleText={obj.display_source === "Token" ? obj.token_rules_text : undefined} faceDown={hiddenFromViewer} />
       )}
     </div>
   );

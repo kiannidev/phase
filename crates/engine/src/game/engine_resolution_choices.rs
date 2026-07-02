@@ -1950,7 +1950,13 @@ pub(super) fn handle_resolution_choice(
             }
 
             set_priority(state, player);
-            if let Some(cont) = state.pending_continuation.as_mut() {
+            if let Some(mut cont) = state.pending_continuation.take() {
+                cont.search_attach_host =
+                    effects::change_zone::resolve_search_continuation_attach_host(
+                        state,
+                        &cont.chain,
+                    );
+                state.search_continuation_attach_host = cont.search_attach_host;
                 let mut continuation_targets: Vec<_> =
                     chosen.iter().map(|&id| TargetRef::Object(id)).collect();
                 // CR 701.23a + CR 701.24a: When the searcher is not the caster
@@ -1964,6 +1970,7 @@ pub(super) fn handle_resolution_choice(
                 }
                 cont.chain.targets = continuation_targets.clone();
                 propagate_targets_through_search_shuffle(&mut cont.chain, &continuation_targets);
+                state.pending_continuation = Some(cont);
             }
             effects::drain_pending_continuation(state, events);
             ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
@@ -2948,6 +2955,7 @@ pub(super) fn handle_resolution_choice(
                                         // CR 614.12: preserve the moved-object type
                                         // gate across a further as-enters pause.
                                         enters_modified_if: ctx.enters_modified_if.clone(),
+                                        enter_attached_to: ctx.enter_attached_to,
                                         effect_kind,
                                     });
                                 return Ok(action_result_outcome(
@@ -2985,6 +2993,7 @@ pub(super) fn handle_resolution_choice(
                                         // CR 614.12: preserve the moved-object type
                                         // gate across a further as-enters pause.
                                         enters_modified_if: ctx.enters_modified_if.clone(),
+                                        enter_attached_to: ctx.enter_attached_to,
                                         effect_kind,
                                     });
                                 state.waiting_for =
@@ -3228,6 +3237,7 @@ pub(super) fn handle_resolution_choice(
                                         // CR 614.12: preserve the moved-object type
                                         // gate across a further as-enters pause.
                                         enters_modified_if: ctx.enters_modified_if.clone(),
+                                        enter_attached_to: ctx.enter_attached_to,
                                         effect_kind,
                                     });
                                 state.waiting_for =
@@ -3262,6 +3272,7 @@ pub(super) fn handle_resolution_choice(
                                         // CR 614.12: preserve the moved-object type
                                         // gate across a further as-enters pause.
                                         enters_modified_if: ctx.enters_modified_if.clone(),
+                                        enter_attached_to: ctx.enter_attached_to,
                                         effect_kind,
                                     });
                                 state.waiting_for =

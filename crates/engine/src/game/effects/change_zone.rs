@@ -24,6 +24,16 @@ fn forward_result_search_attach_host(
     state: &GameState,
     ability: &ResolvedAbility,
 ) -> Option<AttachTarget> {
+    if let Some(host) = state.search_continuation_attach_host {
+        return Some(host);
+    }
+    resolve_forward_result_search_attach_host(state, ability)
+}
+
+fn resolve_forward_result_search_attach_host(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> Option<AttachTarget> {
     if !ability.forward_result {
         return None;
     }
@@ -55,6 +65,22 @@ fn forward_result_search_attach_host(
         }
         _ => None,
     }
+}
+
+/// CR 303.4f: Resolve the attach host for a search continuation using the
+/// chain's current target provenance (before found-card ids replace them).
+pub(crate) fn resolve_search_continuation_attach_host(
+    state: &GameState,
+    chain: &ResolvedAbility,
+) -> Option<AttachTarget> {
+    let mut cursor = Some(chain);
+    while let Some(ability) = cursor {
+        if let Some(host) = resolve_forward_result_search_attach_host(state, ability) {
+            return Some(host);
+        }
+        cursor = ability.sub_ability.as_deref();
+    }
+    None
 }
 
 /// CR 701.24a: Shuffle a player's library using the game's seeded RNG.
@@ -831,6 +857,7 @@ pub fn resolve(
                         // CR 614.12: preserve the moved-object type gate across a
                         // further as-enters / replacement pause.
                         enters_modified_if: ctx.enters_modified_if.clone(),
+                        enter_attached_to: ctx.enter_attached_to,
                         effect_kind: EffectKind::from(&ability.effect),
                     });
                 return Ok(());
@@ -870,6 +897,7 @@ pub fn resolve(
                         // CR 614.12: preserve the moved-object type gate across a
                         // further as-enters / replacement pause.
                         enters_modified_if: ctx.enters_modified_if.clone(),
+                        enter_attached_to: ctx.enter_attached_to,
                         effect_kind: EffectKind::from(&ability.effect),
                     });
                 // CR 608.2c: this object is paused mid-move on a replacement choice
@@ -1514,6 +1542,7 @@ pub fn resolve_all(
                         library_placement: effect_library_position.clone(),
                         // CR 614.12: mass zone moves carry no moved-object type gate.
                         enters_modified_if: None,
+                        enter_attached_to: None,
                         effect_kind: EffectKind::from(&ability.effect),
                     });
                 // CR 608.2c: record the replacement-paused member as in-flight (with
@@ -1563,6 +1592,7 @@ pub fn resolve_all(
                         library_placement: effect_library_position.clone(),
                         // CR 614.12: mass zone moves carry no moved-object type gate.
                         enters_modified_if: None,
+                        enter_attached_to: None,
                         effect_kind: EffectKind::from(&ability.effect),
                     });
                 return Ok(());
@@ -5034,6 +5064,7 @@ mod tests {
                 face_down_profile: None,
                 library_placement: None,
                 enters_modified_if: None,
+                enter_attached_to: None,
                 effect_kind: EffectKind::ChangeZone,
             });
         state.resolving_stack_entry = Some(StackEntry {

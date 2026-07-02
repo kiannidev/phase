@@ -923,6 +923,9 @@ pub struct PendingContinuation {
     pub chain: Box<ResolvedAbility>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_kind: Option<EffectKind>,
+    /// CR 303.4f: Attach host captured before SearchChoice overwrites parent targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_attach_host: Option<AttachTarget>,
 }
 
 impl PendingContinuation {
@@ -933,6 +936,7 @@ impl PendingContinuation {
         Self {
             chain,
             parent_kind: None,
+            search_attach_host: None,
         }
     }
 
@@ -944,6 +948,7 @@ impl PendingContinuation {
         Self {
             chain,
             parent_kind: Some(parent_kind),
+            search_attach_host: None,
         }
     }
 }
@@ -1134,6 +1139,9 @@ pub struct PendingChangeZoneIteration {
     /// carry-through pattern on this same struct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enters_modified_if: Option<crate::types::ability::TargetFilter>,
+    /// CR 303.4f: Pre-resolved Aura host carried across a paused ChangeZone loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enter_attached_to: Option<AttachTarget>,
     pub effect_kind: crate::types::ability::EffectKind,
 }
 
@@ -6715,6 +6723,10 @@ pub struct GameState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_continuation: Option<PendingContinuation>,
 
+    /// CR 303.4f: Attach host captured before SearchChoice replaces parent targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_continuation_attach_host: Option<AttachTarget>,
+
     /// CR 609.3 + CR 109.5: Pending `repeat_for` iteration loop paused mid-flight
     /// because the inner effect entered an interactive `WaitingFor` state.
     /// Drained by `drain_pending_continuation` AFTER `pending_continuation`,
@@ -7960,6 +7972,7 @@ impl GameState {
             revealed_cards: HashSet::new(),
             public_revealed_cards: HashSet::new(),
             pending_continuation: None,
+            search_continuation_attach_host: None,
             pending_repeat_iteration: None,
             pending_repeated_optional_payment: None,
             pending_change_zone_iteration: None,
@@ -9691,6 +9704,7 @@ mod tests {
             library_placement: None,
             effect_kind: crate::types::ability::EffectKind::ChangeZone,
             enters_modified_if: None,
+            enter_attached_to: None,
         };
         let json = serde_json::to_string(&original).expect("serialize");
         // Modern shape must be emitted, NOT the legacy bool field.

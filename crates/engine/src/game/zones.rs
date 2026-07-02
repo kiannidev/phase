@@ -169,6 +169,11 @@ pub(crate) fn apply_zone_exit_cleanup(
                 chosen_attributes: obj.chosen_attributes.clone(),
                 // CR 400.7: Capture counters for "if it had counters on it" patterns.
                 counters: obj.counters.clone(),
+                // CR 110.5 + CR 110.5d: Capture tap status AT zone exit. Once the
+                // object leaves the battlefield it is neither tapped nor untapped,
+                // so a use_lki rider ("if it was tapped", Brackish Blunder) reads
+                // this captured value instead of the live (now-absent) object.
+                tapped: obj.tapped,
             };
             state.lki_cache.insert(object_id, lki);
         }
@@ -390,6 +395,10 @@ pub(crate) fn apply_zone_exit_cleanup(
         if !preserve_counters {
             obj_mut.counters.clear();
         }
+        if !crate::game::stickers::zone_retains_stickers(to) && !obj_mut.stickers.is_empty() {
+            obj_mut.stickers.clear();
+            obj_mut.revert_layered_characteristics_to_base();
+        }
     }
 
     if from == Zone::Battlefield {
@@ -401,6 +410,11 @@ pub(crate) fn apply_zone_exit_cleanup(
     // Prune host-bound transient effects and clean up mana-tap tracking
     // when a permanent leaves the battlefield.
     if from == Zone::Battlefield {
+        // CR 506.4: A permanent is removed from combat when it leaves the
+        // battlefield. Combat role is snapshotted into the zone-change record
+        // (capture_combat_status) before this cleanup runs so look-back
+        // triggers still read attacking/blocking status (CR 603.10a).
+        super::effects::remove_from_combat::remove_object_from_combat(state, object_id);
         super::pairing::break_pair(state, object_id);
         crate::game::layers::mark_layers_full(state);
         // CR 400.7 + CR 702.11b: The "has dealt damage since entering" sticky flag
@@ -411,12 +425,21 @@ pub(crate) fn apply_zone_exit_cleanup(
         state.objects_that_dealt_damage.remove(&object_id);
         super::layers::prune_host_left_effects(state, object_id);
         super::layers::prune_affected_object_left_effects(state, object_id);
+        // CR 611.2b + CR 400.7: the captured source leaving play, OR the host
+        // leaving and re-entering as a new object (same storage ObjectId), ends
+        // the "can't become untapped for as long as you control [source]"
+        // continuous effect permanently — drop the gated def from base+live so
+        // it cannot revive on a same-ObjectId re-entry.
+        super::layers::prune_controller_controls_source_on_leave(state, object_id);
         // CR 613.1 + CR 400.7: Copy effects are pruned above, but layer-derived
         // characteristics (name, types, abilities) persist on the object until
         // explicitly reset. Revert to printed baseline so graveyard/exile objects
         // do not retain copied identity (Vesuva legend-rule sacrifice).
         if let Some(obj) = state.objects.get_mut(&object_id) {
             obj.revert_layered_characteristics_to_base();
+            if crate::game::stickers::zone_retains_stickers(to) && !obj.stickers.is_empty() {
+                crate::game::stickers::rebuild_public_zone_stickers(obj);
+            }
         }
         for tapped in state.lands_tapped_for_mana.values_mut() {
             tapped.retain(|&id| id != object_id);
@@ -656,11 +679,26 @@ pub fn move_to_zone(
         state.trigger_index.remove(object_id);
     }
 
+    // CR 613.7d: an object receives a timestamp when it enters a zone. Stage 2
+    // stamps battlefield entries only, so only draw a timestamp on a battlefield
+    // entry — a graveyard/exile/hand/library move must not burn one. Computed
+    // before the `get_mut` borrow because `next_timestamp` takes `&mut self` over
+    // the whole GameState.
+    let entry_timestamp = (to == Zone::Battlefield).then(|| state.next_timestamp());
+
     let obj_mut = state.objects.get_mut(&object_id).unwrap();
     obj_mut.zone = to;
 
     if to == Zone::Battlefield {
-        obj_mut.reset_for_battlefield_entry(state.turn_number);
+        obj_mut.reset_for_battlefield_entry(
+            state.turn_number,
+            entry_timestamp.expect("battlefield entry draws a timestamp"),
+        );
+        // CR 400.7: capture the entrant's incarnation AFTER the battlefield-entry
+        // bump so a later leave + re-entry (same ObjectId, higher incarnation) is
+        // distinguishable from the original entrant when an ETB intervening-if is
+        // rechecked at resolution (CR 603.4 + CR 608.2h).
+        zone_change_record.entered_incarnation = Some(obj_mut.incarnation);
     }
 
     // CR 700.11: a permanent card was put into its owner's graveyard.
@@ -668,11 +706,9 @@ pub fn move_to_zone(
         record_descend_on_graveyard_arrival(state, object_id, owner);
     }
 
-    // Mark layers dirty when objects enter the battlefield, or the hand (so
-    // Lorehold-style hand-zone grants re-apply to newly-drawn cards).
-    // Exit-side dirty marking is handled by apply_zone_exit_cleanup.
-    // CR 702.94a + CR 400.3: hand-zone continuous effects require re-evaluation
-    // when a hand object appears or departs.
+    // CR 611.3a + CR 400.3: Hand size affects continuous effects gated on the
+    // controller's hand (Carnage Interpreter, issue #3991) and hand-zone
+    // effects (Miracle in hand). Re-evaluate layers on any hand entry/exit.
     if to == Zone::Battlefield || to == Zone::Hand || from == Zone::Hand {
         crate::game::layers::mark_layers_full(state);
     }
@@ -715,7 +751,9 @@ pub fn move_to_zone(
         super::trigger_index::reindex_object_triggers(state, object_id);
     }
 
-    super::restrictions::record_zone_change(state, zone_change_record.clone());
+    let turn_zone_change_index =
+        super::restrictions::record_zone_change(state, zone_change_record.clone());
+    zone_change_record.turn_zone_change_index = turn_zone_change_index;
 
     if let Some(old_target) = unattached_from {
         events.push(GameEvent::Unattached {
@@ -979,7 +1017,9 @@ pub fn move_to_library_at_index(
         obj_mut.zone = Zone::Library;
     }
 
-    super::restrictions::record_zone_change(state, zone_change_record.clone());
+    let turn_zone_change_index =
+        super::restrictions::record_zone_change(state, zone_change_record.clone());
+    zone_change_record.turn_zone_change_index = turn_zone_change_index;
 
     if let Some(old_target) = unattached_from {
         events.push(GameEvent::Unattached {
@@ -1031,6 +1071,18 @@ pub fn remove_from_zone(state: &mut GameState, object_id: ObjectId, zone: Zone, 
                     .expect("owner exists")
                     .attraction_deck
                     .retain(|id| *id != object_id);
+            } else if state
+                .objects
+                .get(&object_id)
+                .is_some_and(|obj| obj.in_contraption_deck)
+            {
+                state
+                    .players
+                    .iter_mut()
+                    .find(|p| p.id == owner)
+                    .expect("owner exists")
+                    .contraption_deck
+                    .retain(|id| *id != object_id);
             } else {
                 state.command_zone.retain(|id| *id != object_id);
             }
@@ -1070,6 +1122,18 @@ pub fn add_to_zone(state: &mut GameState, object_id: ObjectId, zone: Zone, owner
                     .find(|p| p.id == owner)
                     .expect("owner exists")
                     .attraction_deck
+                    .push_back(object_id);
+            } else if state
+                .objects
+                .get(&object_id)
+                .is_some_and(|obj| obj.in_contraption_deck)
+            {
+                state
+                    .players
+                    .iter_mut()
+                    .find(|p| p.id == owner)
+                    .expect("owner exists")
+                    .contraption_deck
                     .push_back(object_id);
             } else {
                 state.command_zone.push_back(object_id);
@@ -1154,8 +1218,16 @@ fn is_blocked_from_entering_battlefield(state: &GameState, obj: &GameObject) -> 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use crate::types::ability::{
+        ContinuousModification, ControllerRef, FilterProp, StaticDefinition, TargetFilter,
+        TypeFilter, TypedFilter,
+    };
     use crate::types::game_state::GameState;
+    use crate::types::keywords::Keyword;
+    use crate::types::mana::ManaCost;
 
     fn setup() -> GameState {
         GameState::new_two_player(42)
@@ -1189,6 +1261,77 @@ mod tests {
             Zone::Hand,
         );
         assert!(state.players[0].hand.contains(&id));
+    }
+
+    #[test]
+    fn hand_to_stack_marks_layers_dirty_for_hand_size_statics() {
+        let mut state = setup();
+        let id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Spell".to_string(),
+            Zone::Hand,
+        );
+        state.layers_dirty = crate::types::game_state::LayersDirty::Clean;
+
+        let mut events = Vec::new();
+        move_to_zone(&mut state, id, Zone::Stack, &mut events);
+
+        assert_eq!(state.objects[&id].zone, Zone::Stack);
+        assert!(
+            matches!(
+                state.layers_dirty,
+                crate::types::game_state::LayersDirty::Full
+            ),
+            "hand-to-stack movement must mark layers dirty so hand-size-gated statics re-evaluate"
+        );
+    }
+
+    #[test]
+    fn hand_to_stack_with_hand_zone_static_dirties_layers() {
+        let mut state = setup();
+        let grant_static = StaticDefinition::new(StaticMode::Continuous)
+            .affected(TargetFilter::Typed(
+                TypedFilter::new(TypeFilter::Instant)
+                    .controller(ControllerRef::You)
+                    .properties(vec![FilterProp::InZone { zone: Zone::Hand }]),
+            ))
+            .modifications(vec![ContinuousModification::AddKeyword {
+                keyword: Keyword::Miracle(ManaCost::Cost {
+                    shards: vec![],
+                    generic: 2,
+                }),
+            }]);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "HandGrantSource".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let src = state.objects.get_mut(&source).unwrap();
+            src.static_definitions.push(grant_static.clone());
+            src.base_static_definitions = Arc::new(vec![grant_static]);
+        }
+        let id = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Spell".to_string(),
+            Zone::Hand,
+        );
+        state.layers_dirty = crate::types::game_state::LayersDirty::Clean;
+
+        let mut events = Vec::new();
+        move_to_zone(&mut state, id, Zone::Stack, &mut events);
+
+        assert_eq!(state.objects[&id].zone, Zone::Stack);
+        assert!(
+            state.layers_dirty.is_dirty(),
+            "hand-zone continuous effects must re-evaluate when a hand card departs"
+        );
     }
 
     #[test]
@@ -1379,6 +1522,105 @@ mod tests {
     /// rules say cease to exist. This test drives `move_to_zone` directly
     /// (not a shape assertion on the HashMap) and would have caught a
     /// regression in `apply_zone_exit_cleanup`'s counter-clear branch.
+    #[test]
+    fn issue_4223_combat_role_cleared_on_battlefield_exit() {
+        use crate::game::combat::{AttackTarget, AttackerInfo, CombatState};
+
+        let mut state = setup();
+        let attacker = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Strangleroot Geist".to_string(),
+            Zone::Battlefield,
+        );
+        let blocker = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Blocker".to_string(),
+            Zone::Battlefield,
+        );
+
+        let mut combat = CombatState {
+            attackers: vec![AttackerInfo {
+                object_id: attacker,
+                defending_player: PlayerId(1),
+                attack_target: AttackTarget::Player(PlayerId(1)),
+                blocked: true,
+                band_id: None,
+            }],
+            ..Default::default()
+        };
+        combat.blocker_assignments.insert(attacker, vec![blocker]);
+        combat.blocker_to_attacker.insert(blocker, vec![attacker]);
+        state.combat = Some(combat);
+
+        let mut events = Vec::new();
+        // Blocker dies (e.g. combat damage) — must leave combat before Undying
+        // returns the same ObjectId to the battlefield.
+        move_to_zone(&mut state, blocker, Zone::Graveyard, &mut events);
+        let combat = state.combat.as_ref().unwrap();
+        assert!(
+            !combat.blocker_to_attacker.contains_key(&blocker),
+            "CR 506.4: blocker must be removed from combat when it leaves the battlefield"
+        );
+        assert!(
+            combat
+                .blocker_assignments
+                .get(&attacker)
+                .is_none_or(|blockers| !blockers.contains(&blocker)),
+            "dead blocker must not remain assigned to the attacker"
+        );
+
+        // Undying-style return: same ObjectId re-enters without combat role.
+        move_to_zone(&mut state, blocker, Zone::Battlefield, &mut events);
+        let combat = state.combat.as_ref().unwrap();
+        assert!(
+            !combat.blocker_to_attacker.contains_key(&blocker),
+            "returned creature must not inherit stale blocking status (issue #4223)"
+        );
+
+        // Attacker dies and returns — must not remain an attacker either.
+        move_to_zone(&mut state, attacker, Zone::Graveyard, &mut events);
+        let combat = state.combat.as_ref().unwrap();
+        assert!(
+            combat
+                .attackers
+                .iter()
+                .all(|info| info.object_id != attacker),
+            "CR 506.4: attacker must be removed from combat when it leaves the battlefield"
+        );
+        assert!(
+            !combat.blocker_assignments.contains_key(&attacker),
+            "CR 506.4: attacker-keyed block assignment must be removed on battlefield exit"
+        );
+        assert!(
+            combat
+                .blocker_to_attacker
+                .values()
+                .all(|attackers| !attackers.contains(&attacker)),
+            "CR 506.4: departed attacker must be pruned from every blocker's reverse lookup"
+        );
+        move_to_zone(&mut state, attacker, Zone::Battlefield, &mut events);
+        let combat = state.combat.as_ref().unwrap();
+        assert!(
+            combat
+                .attackers
+                .iter()
+                .all(|info| info.object_id != attacker),
+            "returned attacker must not inherit stale attacking status"
+        );
+        assert!(
+            !combat.blocker_assignments.contains_key(&attacker),
+            "returned attacker must not inherit stale attacker-keyed block assignment"
+        );
+        assert!(
+            !combat.blocker_to_attacker.contains_key(&attacker),
+            "returned attacker must not inherit stale blocking status via reverse lookup"
+        );
+    }
+
     #[test]
     fn counters_cease_to_exist_across_exile_and_return() {
         use crate::types::counter::CounterType;

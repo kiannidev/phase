@@ -59,6 +59,7 @@ mod tests {
             Effect::Counter {
                 target: TargetFilter::Any,
                 source_rider: None,
+                countered_spell_zone: None,
             },
         )]);
 
@@ -342,8 +343,12 @@ mod tests {
             owner_library: false,
             track_exiled_by_source: false,
             face_down_profile: None,
+            enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
             count_param: 0,
             is_cost_payment: false,
+            library_position: None,
+            enters_modified_if: None,
         };
 
         let filtered = filter_state_for_player(&state, PlayerId(1));
@@ -424,6 +429,7 @@ mod tests {
             Effect::Counter {
                 target: TargetFilter::Any,
                 source_rider: None,
+                countered_spell_zone: None,
             },
             Vec::new(),
             source_id,
@@ -441,6 +447,7 @@ mod tests {
             entwine_cost: None,
             chooser: PlayerFilter::Controller,
             selection: engine::types::ability::TargetSelectionMode::Chosen,
+            dynamic_max_choices: None,
         };
         let pending = PendingTrigger {
             source_id,
@@ -457,6 +464,7 @@ mod tests {
                 Effect::Counter {
                     target: TargetFilter::Any,
                     source_rider: None,
+                    countered_spell_zone: None,
                 },
             )],
             description: Some(description.to_string()),

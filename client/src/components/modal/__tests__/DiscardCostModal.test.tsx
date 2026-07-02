@@ -12,13 +12,13 @@ vi.mock("../../../hooks/useGameDispatch.ts", () => ({
   useGameDispatch: () => dispatchMock,
 }));
 
-function makeObject(id: number, name: string): GameObject {
+function makeObject(id: number, name: string, zone: GameObject["zone"] = "Hand"): GameObject {
   return {
     id,
     card_id: id,
     owner: 0,
     controller: 0,
-    zone: "Hand",
+    zone,
     tapped: false,
     face_down: false,
     flipped: false,
@@ -157,12 +157,13 @@ describe("Discard cost modal", () => {
         data: {
           player: 0,
           kind: { type: "Sacrifice" },
-          choices: [],
+          choices: [10],
           count: 1,
           min_count: 0,
           resume: { type: "Spell", Spell: {} },
         },
       },
+      { 10: makeObject(10, "Food Token", "Battlefield") },
     ],
     [
       "PayCost ReturnToHand",
@@ -171,12 +172,13 @@ describe("Discard cost modal", () => {
         data: {
           player: 0,
           kind: { type: "ReturnToHand" },
-          choices: [],
+          choices: [10],
           count: 1,
           min_count: 0,
           resume: { type: "Spell", Spell: {} },
         },
       },
+      { 10: makeObject(10, "Kor Skyfisher", "Battlefield") },
     ],
     [
       "BlightChoice",
@@ -189,6 +191,7 @@ describe("Discard cost modal", () => {
           pending_cast: {},
         },
       },
+      {},
     ],
     [
       "HarmonizeTapChoice",
@@ -200,9 +203,10 @@ describe("Discard cost modal", () => {
           pending_cast: {},
         },
       },
+      {},
     ],
-  ])("suppresses the modal for board-native %s", (_label, waitingFor) => {
-    setWaitingFor(waitingFor as unknown as WaitingFor);
+  ])("suppresses the modal for board-native %s", (_label, waitingFor, objects) => {
+    setWaitingFor(waitingFor as unknown as WaitingFor, objects);
 
     render(<CardChoiceModal />);
 
@@ -253,6 +257,41 @@ describe("Discard cost modal", () => {
     expect(screen.getByText("Untap")).toBeInTheDocument();
     expect(screen.getByText("Choose up to 5 permanents to untap")).toBeInTheDocument();
     expect(screen.queryByText(/sacrifice/i)).not.toBeInTheDocument();
+  });
+
+  it("describes optional attach selection without saying sacrifice and allows decline", () => {
+    setWaitingFor(
+      {
+        type: "EffectZoneChoice",
+        data: {
+          player: 0,
+          cards: [10, 11],
+          count: 2,
+          min_count: 0,
+          up_to: true,
+          source_id: 19,
+          effect_kind: "Attach",
+          zone: "Battlefield",
+        },
+      } as unknown as WaitingFor,
+      {
+        10: { ...makeObject(10, "S.H.I.E.L.D. Spy Kit"), zone: "Battlefield" },
+        11: { ...makeObject(11, "Vibranium Energy Daggers"), zone: "Battlefield" },
+      },
+    );
+
+    render(<CardChoiceModal />);
+
+    expect(screen.getByText("Attach")).toBeInTheDocument();
+    expect(screen.getByText("Choose up to 2 Equipment to attach")).toBeInTheDocument();
+    expect(screen.queryByText(/sacrifice/i)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Decline" }));
+
+    expect(dispatchMock).toHaveBeenCalledWith({
+      type: "SelectCards",
+      data: { cards: [] },
+    });
   });
 
   it("describes library placement without saying battlefield", () => {

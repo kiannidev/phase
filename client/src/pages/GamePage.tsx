@@ -88,11 +88,11 @@ import { StackDisplay } from "../components/stack/StackDisplay.tsx";
 import { TargetingOverlay } from "../components/targeting/TargetingOverlay.tsx";
 import { PlayerHud } from "../components/hud/PlayerHud.tsx";
 import { OpponentHud } from "../components/hud/OpponentHud.tsx";
+import { TurnStatusLine } from "../components/hud/TurnStatusLine.tsx";
 import { GraveyardPile } from "../components/zone/GraveyardPile.tsx";
 import { LibraryPile } from "../components/zone/LibraryPile.tsx";
 import { ExilePile } from "../components/zone/ExilePile.tsx";
 import { CompanionZone } from "../components/zone/CompanionZone.tsx";
-import { ZoneHand } from "../components/hand/ZoneHand.tsx";
 import { ZoneViewer } from "../components/zone/ZoneViewer.tsx";
 import {
   PreferencesModal,
@@ -129,6 +129,7 @@ import {
   useMultiplayerStore,
   type PlayerSlot,
 } from "../stores/multiplayerStore.ts";
+import { formatMetadata, isSetupFormat } from "../data/formatRegistry.ts";
 import { useMultiplayerDraftStore } from "../stores/multiplayerDraftStore.ts";
 import { SpectatorChrome } from "../components/spectator/SpectatorChrome.tsx";
 import { useSpectatorMode } from "../hooks/useSpectatorMode.ts";
@@ -150,6 +151,28 @@ type ZoneRailStyle = CSSProperties & {
 
 function castableZoneViewerAutoOpenKey(target: ZoneViewerTarget): string {
   return `${target.zone}:${target.playerId}:${target.objectIds.join(",")}`;
+}
+
+function isDirectSoloRouteMode(rawMode: string | null): boolean {
+  return ![
+    "p2p-host",
+    "p2p-join",
+    "draft-match",
+    "spectate",
+    "host",
+    "join",
+  ].includes(rawMode ?? "");
+}
+
+function isDirectSetupFormat(format: GameFormat): boolean {
+  const metadata = formatMetadata(format);
+  return Boolean(metadata && isSetupFormat(metadata));
+}
+
+function directSetupFormatConfig(format: GameFormat | null) {
+  if (!format) return undefined;
+  if (!isDirectSetupFormat(format)) return undefined;
+  return FORMAT_DEFAULTS[format];
 }
 
 /**
@@ -190,6 +213,7 @@ export function GamePage() {
   const formatParam = searchParams.get("format") as GameFormat | null;
   const playersParam = searchParams.get("players");
   const matchParam = searchParams.get("match");
+  const loopParam = searchParams.get("loop");
   const firstParam = searchParams.get("first");
   const roomNameParam = searchParams.get("roomName");
   const sourceParam = searchParams.get("source") ?? undefined;
@@ -210,17 +234,25 @@ export function GamePage() {
   // but TypeScript's narrowing produces a fresh binding that the linter
   // treats as new). The explicit memo makes the stability guarantee
   // self-documenting.
-  const formatConfig = useMemo(
-    () => savedFormatConfig ?? (formatParam ? FORMAT_DEFAULTS[formatParam] : undefined),
-    [formatParam, savedFormatConfig],
-  );
+  const formatConfig = useMemo(() => {
+    if (isDirectSoloRouteMode(rawMode)) {
+      if (savedFormatConfig && isDirectSetupFormat(savedFormatConfig.format)) {
+        return savedFormatConfig;
+      }
+      return directSetupFormatConfig(formatParam);
+    }
+    return savedFormatConfig ?? (formatParam ? FORMAT_DEFAULTS[formatParam] : undefined);
+  }, [formatParam, rawMode, savedFormatConfig]);
   // CR 103.1: 0 = play first, 1 = draw first, undefined = random
   const firstPlayer = firstParam === "play" ? 0 : firstParam === "draw" ? 1 : undefined;
   const matchConfig = useMemo<MatchConfig>(
     () => ({
       match_type: matchParam?.toLowerCase() === "bo3" ? "Bo3" : "Bo1",
+      // CR 732.2a: combo (infinite-loop) detector opt-in carried from the local
+      // game-setup screen; immutable once the game starts (engine default Off).
+      loop_detection: loopParam?.toLowerCase() === "on" ? { type: "On" } : { type: "Off" },
     }),
-    [matchParam],
+    [matchParam, loopParam],
   );
 
   // Map URL modes to GameProvider modes
@@ -812,8 +844,7 @@ function GamePageContent({
     return orderedPlayers.filter((id) => id !== perspectivePlayerId && !eliminated.has(id));
   }, [eliminatedPlayers, perspectivePlayerId, players, seatOrder]);
   const activeOpponentId =
-    resolveFocusedOpponent(focusedOpponent, opponents)
-    ?? (perspectivePlayerId === 0 ? 1 : 0);
+    resolveFocusedOpponent(focusedOpponent, opponents) ?? opponents[0] ?? null;
 
   // Memoize the HUD elements passed to GameBoard. GameBoard is wrapped in
   // React.memo, which shallow-compares props; without stable element
@@ -1201,23 +1232,27 @@ function GamePageContent({
             className="flex shrink-0 items-start gap-1.5 px-1 py-1"
             style={playerZoneRailStyle}
           >
-            <ExilePile
-              playerId={activeOpponentId}
-              size={pileSize}
-              onClick={() => setViewingZone({ zone: "exile", playerId: activeOpponentId })}
-            />
-            <LibraryPile
-              playerId={activeOpponentId}
-              size={pileSize}
-              onView={() => setViewingZone({ zone: "library", playerId: activeOpponentId })}
-            />
-            <GraveyardPile
-              playerId={activeOpponentId}
-              size={pileSize}
-              onClick={() =>
-                setViewingZone({ zone: "graveyard", playerId: activeOpponentId })
-              }
-            />
+            {activeOpponentId != null ? (
+              <>
+                <ExilePile
+                  playerId={activeOpponentId}
+                  size={pileSize}
+                  onClick={() => setViewingZone({ zone: "exile", playerId: activeOpponentId })}
+                />
+                <LibraryPile
+                  playerId={activeOpponentId}
+                  size={pileSize}
+                  onView={() => setViewingZone({ zone: "library", playerId: activeOpponentId })}
+                />
+                <GraveyardPile
+                  playerId={activeOpponentId}
+                  size={pileSize}
+                  onClick={() =>
+                    setViewingZone({ zone: "graveyard", playerId: activeOpponentId })
+                  }
+                />
+              </>
+            ) : null}
           </DraggableWidget>
         </div>
 
@@ -1243,10 +1278,12 @@ function GamePageContent({
           style={{ height: "min(calc(0.18 * (100dvh - var(--game-top-overlay-offset, 0px))), 150px)" }}
           data-flex-zone="player-row"
         >
-          <div className="flex items-end justify-center">
-            <ZoneHand zone="exile" />
+          <div className="flex items-end justify-center" data-flex-zone="playerHandRow">
+            {/* Castable graveyard/exile cards now render as colored wings inside
+                PlayerHand's own fan (see ZoneFanCard), so the row is just the hand.
+                The `playerHandRow` flex-zone hook drives the mobile hand-lift
+                transform in index.css. */}
             <PlayerHand />
-            <ZoneHand zone="graveyard" />
           </div>
           <DraggableWidget
             target={{ kind: "widget", key: "playerPiles" }}
@@ -1283,13 +1320,13 @@ function GamePageContent({
         </div>
       </div>
 
-      {/* Right-side fixed UI stack: combat phases → full control → action buttons → log */}
+      {/* Bottom UI: mobile splits hand/full-control (left) from phases + pass (right). */}
       <DraggableWidget
         target={{ kind: "widget", key: "actionRail" }}
         flexZone="actionRail"
         scaleKey="actionRail"
         resizeCorner="bl"
-        className="fixed z-30 flex flex-col items-end gap-1.5"
+        className="fixed z-30 flex flex-col items-end gap-1.5 max-lg:w-full max-lg:flex-row max-lg:items-end max-lg:justify-between max-lg:gap-2"
         style={{
           bottom: "calc(env(safe-area-inset-bottom) + var(--action-btn-bottom))",
           right: "calc(env(safe-area-inset-right) + var(--game-edge-right) + var(--game-right-rail-offset, 0px))",
@@ -1297,18 +1334,43 @@ function GamePageContent({
           transformOrigin: "bottom right",
         }}
       >
-        {showFlowHelpNudge && <FlowHelpNudge />}
-        {showSandboxToolsNudge && <SandboxToolsNudge />}
-        <CombatPhaseIndicator />
         {!isSpectatorMode && (
-          <>
-            <div className="flex items-center gap-1.5">
-              <HandBadge />
-              <FullControlToggle />
+          <div
+            data-mobile-action-left
+            className="flex flex-col gap-1 max-lg:min-w-0 lg:hidden"
+          >
+            <div className="flex flex-col gap-1 max-lg:gap-1">
+              <CombatPhaseIndicator />
+              <HandBadge className="w-full" />
             </div>
-            <ActionButton />
-          </>
+            <FullControlToggle className="w-full" />
+          </div>
         )}
+        <div
+          data-mobile-action-right
+          className="flex flex-col items-end gap-1.5 max-lg:min-w-0 max-lg:items-stretch lg:items-end"
+        >
+          {showFlowHelpNudge && <FlowHelpNudge />}
+          {showSandboxToolsNudge && <SandboxToolsNudge />}
+          <div className="hidden lg:block">
+            <CombatPhaseIndicator />
+          </div>
+          {isSpectatorMode ? (
+            <TurnStatusLine />
+          ) : (
+            <>
+              <div className="max-lg:w-full lg:hidden">
+                <TurnStatusLine />
+              </div>
+              <div className="hidden flex-row items-center gap-1.5 lg:flex">
+                <TurnStatusLine />
+                <HandBadge />
+                <FullControlToggle />
+              </div>
+              <ActionButton />
+            </>
+          )}
+        </div>
       </DraggableWidget>
 
       <GameLogPanel />
@@ -1508,7 +1570,7 @@ function GamePageContent({
           new WaitingFor so a fresh prompt is always visible. */}
       <DialogHost>
         {waitingFor != null &&
-          isClickThroughWaitingFor(waitingFor) &&
+          isClickThroughWaitingFor(waitingFor, objects) &&
           canActForWaitingState && <TargetingOverlay />}
         {waitingFor != null &&
           MANA_PAYMENT_WAITING_FOR_TYPES.has(waitingFor.type) &&

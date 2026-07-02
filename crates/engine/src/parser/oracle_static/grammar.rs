@@ -6,6 +6,9 @@ use super::prelude::*;
 #[allow(unused_imports)]
 use super::support::*;
 use crate::types::ability::PlayerFilter;
+use nom::character::complete::{digit1, one_of};
+use nom::combinator::{all_consuming, not, opt, peek, recognize};
+use nom::sequence::{delimited, pair};
 
 /// Lower a parsed rule-static predicate into the runtime static mode.
 pub(crate) fn lower_rule_static(
@@ -141,6 +144,12 @@ pub(crate) fn parse_player_scope_filter(tp: &TextPair<'_>) -> TargetFilter {
         || nom_tag_tp(tp, "opponents").is_some()
     {
         TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent))
+    } else if nom_tag_tp(tp, "enchanted player").is_some()
+        || nom_primitives::scan_contains(tp.lower, "enchanted player")
+    {
+        // CR 303.4e + CR 702.5d: Player Auras (Curse cycle) scope restrictions
+        // to the player this Aura enchants.
+        TargetFilter::AttachedTo
     } else if nom_tag_tp(tp, "you ").is_some()
         || nom_primitives::scan_contains(tp.lower, "you can't")
     {
@@ -605,6 +614,46 @@ pub(crate) fn parse_enchanted_equipped_predicate(
         }
     }
 
+    // CR 502.3: enchanted/equipped host untap restriction with optional trailing
+    // "if …" / "as long as …" (Venarian Gold, Winter's Rest canonical rewrite).
+    if nom_primitives::scan_contains(&pred_lower, "doesn't untap during")
+        || nom_primitives::scan_contains(&pred_lower, "don\u{2019}t untap during")
+    {
+        if let Some(predicate) = parse_rule_static_predicate(predicate) {
+            let mut def = lower_rule_static(predicate, affected.clone(), description);
+            if matches!(predicate, RuleStaticPredicate::CantUntap) {
+                if let Some((_, after_cond)) = pred_tp.split_around(" as long as ") {
+                    let condition_text = after_cond.original.trim().trim_end_matches('.');
+                    def.condition = Some(
+                        parse_static_condition(condition_text)
+                            .or_else(|| parse_attached_static_condition(condition_text))
+                            .unwrap_or(StaticCondition::Unrecognized {
+                                text: condition_text.to_string(),
+                            }),
+                    );
+                } else if let Some(condition) = extract_cant_untap_condition(&pred_lower) {
+                    def.condition = Some(condition);
+                }
+            }
+            return vec![def];
+        }
+    }
+
+    // CR 611.2 + CR 701.27: restriction-only enchanted/equipped predicates
+    // ("can't attack, block, or transform" — Bound by Moonsilver class). Must
+    // precede continuous-grant parsing, which would otherwise return an empty vec
+    // and let the line fall through to a SelfRef combat lock on the Aura source.
+    if let Some(modes) = parse_restriction_modes(pred_lower.trim().trim_end_matches('.')) {
+        return modes
+            .into_iter()
+            .map(|mode| {
+                StaticDefinition::new(mode)
+                    .affected(affected.clone())
+                    .description(description.to_string())
+            })
+            .collect();
+    }
+
     // --- Non-standard keyword phrasings (check before continuous grants) ---
 
     // CR 702.10: "can attack as though it had haste" → AddKeyword(Haste)
@@ -634,7 +683,17 @@ pub(crate) fn parse_enchanted_equipped_predicate(
     }
 
     // CR 509.1b: "can't be blocked" on enchanted/equipped creature
-    let (body_tp, suffix_condition) = if let Some((body_tp, _)) = pred_tp.split_around(" unless ") {
+    //
+    // Only peel a trailing static-grant " unless " rider (Heroic Defiance:
+    // "gets +3/+3 unless it shares a color…") when the split point sits OUTSIDE a
+    // quoted/granted ability. A granted ability's own inner "unless" (e.g. Sunken
+    // Field's "Counter target spell unless its controller pays {1}") must stay
+    // with the quoted text — the body has balanced double quotes iff the split is
+    // outside any "...".
+    let unless_split = pred_tp
+        .split_around(" unless ")
+        .filter(|(body, _)| body.original.chars().filter(|&c| c == '"').count() % 2 == 0);
+    let (body_tp, suffix_condition) = if let Some((body_tp, _)) = unless_split {
         (
             body_tp,
             super::shared::parse_unless_static_condition(&pred_tp),
@@ -738,7 +797,16 @@ pub(crate) fn parse_enchanted_equipped_predicate(
     // is NEVER split. ---
     {
         let mut defs = Vec::new();
-        if let Some(def) = parse_continuous_gets_has(predicate, affected.clone(), description) {
+        // CR 611.3a: parse the grant from the unless/as-long-as-stripped body and
+        // attach any trailing `suffix_condition` (Heroic Defiance: "gets +3/+3
+        // unless it shares a color with the most common color among all
+        // permanents"), rather than parsing the whole predicate and dropping it.
+        if let Some(mut def) =
+            parse_continuous_gets_has(body_tp.original, affected.clone(), description)
+        {
+            if let Some(condition) = &suffix_condition {
+                def.condition = Some(condition.clone());
+            }
             defs.push(def);
         }
         // CR 509.1c: "<grant> and must be blocked by <filter> if able"
@@ -892,13 +960,32 @@ pub(crate) fn parse_variable_pt_pattern(
 }
 
 pub(crate) fn parse_fixed_pt_in_text(lower: &str) -> Option<(i32, i32)> {
+    // CR 613.4c: Layer 7c additive P/T grant — "gets/has +N/+M". The copula
+    // ("has"/"have") is accepted alongside "gets"/"get" so equip/anthem lines
+    // that phrase the grant as "Equipped creature has +2/+2 and has …"
+    // (Tinfoil Helm) resolve to the same additive modification as "gets +2/+2".
     nom_primitives::scan_at_word_boundaries(lower, |input| {
         let (rest, _) = alt((
             tag::<_, _, OracleError<'_>>("gets "),
             tag::<_, _, OracleError<'_>>("get "),
+            tag::<_, _, OracleError<'_>>("has "),
+            tag::<_, _, OracleError<'_>>("have "),
         ))
         .parse(input)?;
+        // sign-required: "protection"/"flying"/etc. after "has " fail here.
         let (rest, pt) = nom_primitives::parse_pt_modifier.parse(rest)?;
+        // CR 122.1a + CR 613.4c: a "+N/+M counter" is a counter placement, NOT a
+        // static P/T grant — exclude it so counter-placement lines (e.g. Melira,
+        // Sylvok Outcast "can't have -1/-1 counters put on them") do not misfire
+        // into an anthem. This counter-suffix guard is the load-bearing exclusion:
+        // `scan_at_word_boundaries` retries at every word, so a front "can't have"
+        // lookahead would be positionally ineffective; the suffix guard here is
+        // what actually rejects the counter-placement class.
+        peek(not(preceded(
+            space0,
+            alt((tag("counters"), tag("counter"))),
+        )))
+        .parse(rest)?;
         Ok((rest, pt))
     })
 }
@@ -1004,10 +1091,12 @@ pub(crate) fn base_pt_side_to_expr(side: BasePtSide, x_ref: &QuantityRef) -> Qua
 /// Resolve the `QuantityRef` that X binds to for a dynamic base-P/T effect.
 /// Spell-cast contexts (Biomass Mutation) have no explicit "where X is" clause:
 /// X is the cost X paid when the spell was cast, so fall back to `CostXPaid`.
-/// When a "where X is …" expression is present, parse it via `parse_quantity_ref`.
+/// When a "where X is …" expression is present, parse it via the nom quantity grammar.
 pub(crate) fn resolve_base_pt_x_ref(where_x_expression: Option<&str>) -> Option<QuantityRef> {
     if let Some(expr) = where_x_expression {
-        return parse_quantity_ref(expr);
+        return super::oracle_nom::quantity::parse_quantity_ref_complete(expr)
+            .ok()
+            .map(|(_, qty)| qty);
     }
     // CR 107.3m: In a spell-cast context, X refers to the value paid for {X}.
     Some(QuantityRef::CostXPaid)
@@ -1160,7 +1249,17 @@ pub(crate) fn parse_quoted_ability(text: &str) -> AbilityDefinition {
         // instead of leaving it as an unparsed trailing sentence.
         let (effect_text, constraints) =
             crate::parser::oracle::strip_activated_constraints(effect_text);
-        let mut def = parse_effect_chain(&effect_text, AbilityKind::Activated);
+        // CR 116.2b + CR 708.7: flag the granted activated-ability body so a head
+        // clause of "turn this/~ creature face up" lowers to the printed
+        // `Effect::TurnFaceUp { SelfRef }` resolving effect (Etrata, Deadly
+        // Fugitive's "{2}{U}{B}: Turn this creature face up. ..."), rather than
+        // being rejected as the rule-based morph/disguise special action.
+        let mut ctx = ParseContext {
+            in_granted_activated_ability: true,
+            ..ParseContext::default()
+        };
+        let mut def =
+            parse_effect_chain_with_context(&effect_text, AbilityKind::Activated, &mut ctx);
         def.cost = Some(cost);
         def.activation_restrictions.extend(constraints.restrictions);
         def.description = Some(text.to_string());
@@ -1171,6 +1270,17 @@ pub(crate) fn parse_quoted_ability(text: &str) -> AbilityDefinition {
         def.description = Some(text.to_string());
         def
     }
+}
+
+/// True when `trimmed_prefix` is a bracketed planeswalker loyalty cost (`[+N]`,
+/// `[−N]`, `[0]`, `[-N]`) as printed in granted-ability text (Ichormoon Gauntlet).
+fn is_bracket_loyalty_cost_prefix(trimmed_prefix: &str) -> bool {
+    parse_bracket_loyalty_cost_prefix(trimmed_prefix).is_ok()
+}
+
+fn parse_bracket_loyalty_cost_prefix(input: &str) -> nom::IResult<&str, &str, OracleError<'_>> {
+    let loyalty_number = recognize(pair(opt(one_of("+−–-")), digit1));
+    all_consuming(delimited(tag("["), loyalty_number, tag("]"))).parse(input)
 }
 
 /// Find the position of the cost/effect separator colon in ability text.
@@ -1188,6 +1298,7 @@ pub(crate) fn find_cost_separator(text: &str) -> Option<usize> {
             let lower_prefix = trimmed_prefix.to_lowercase();
             let has_cost = prefix.contains('{')
                 || trimmed_prefix.parse::<i32>().is_ok()
+                || is_bracket_loyalty_cost_prefix(trimmed_prefix)
                 || trimmed_prefix.strip_prefix('+').is_some() // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
                 || trimmed_prefix.strip_prefix('\u{2212}').is_some() // minus sign for loyalty // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
                 // CR 118.12: Text-based costs — sacrifice, discard, pay life, tap/untap, exile, remove
@@ -1316,6 +1427,35 @@ pub(crate) fn parse_pt_mod(text: &str) -> Option<(i32, i32)> {
     Some((p, t))
 }
 
+/// CR 702.34a / CR 702.128a / CR 702.180a: Map a bare graveyard alt-cost keyword
+/// token (one whose cost, when granted with no explicit value, is the recipient
+/// card's own mana cost) to the `Keyword` carrying `ManaCost::SelfManaCost`.
+/// Parameterized over the keyword by a single `alt()` of token tags — adding a
+/// future self-cost keyword is one more `value(..)` arm, not a new sibling
+/// branch in `map_keyword`. Returns `None` for any other text so `map_keyword`
+/// continues its normal dispatch.
+fn map_self_cost_graveyard_keyword(word: &str) -> Option<Keyword> {
+    let lower = word.to_ascii_lowercase();
+    let (_, keyword) = all_consuming(alt((
+        value(
+            Keyword::Flashback(crate::types::keywords::FlashbackCost::Mana(
+                ManaCost::SelfManaCost,
+            )),
+            tag::<_, _, OracleError<'_>>("flashback"),
+        ),
+        value(
+            Keyword::Embalm(crate::types::keywords::EmbalmCost::Mana(
+                ManaCost::SelfManaCost,
+            )),
+            tag("embalm"),
+        ),
+        value(Keyword::Harmonize(ManaCost::SelfManaCost), tag("harmonize")),
+    )))
+    .parse(lower.as_str())
+    .ok()?;
+    Some(keyword)
+}
+
 /// Map a keyword text to a Keyword enum variant using the FromStr impl.
 /// Returns None only for `Keyword::Unknown`.
 pub(crate) fn map_keyword(text: &str) -> Option<Keyword> {
@@ -1323,10 +1463,18 @@ pub(crate) fn map_keyword(text: &str) -> Option<Keyword> {
     if word.is_empty() {
         return None;
     }
-    if word.eq_ignore_ascii_case("flashback") {
-        return Some(Keyword::Flashback(
-            crate::types::keywords::FlashbackCost::Mana(ManaCost::SelfManaCost),
-        ));
+    // CR 702.34a (Flashback) / CR 702.128a (Embalm) / CR 702.180a (Harmonize):
+    // a bare graveyard alt-cost keyword granted by an effect ("target ... gains
+    // flashback/embalm/harmonize until end of turn. The [keyword] cost is equal
+    // to its mana cost") carries no printed cost — its cost is the granted card's
+    // own mana cost. `ManaCost::SelfManaCost` is the single building block that
+    // resolves to the recipient's mana cost at cast time (see
+    // `game::keywords::resolve_keyword_mana_cost`), so the grant is parameterized
+    // by keyword over one self-cost representation rather than baking a concrete
+    // cost. The trailing "the [keyword] cost is equal to its mana cost" sentence
+    // is therefore redundant reminder text (dropped by the effect-chain parser).
+    if let Some(keyword) = map_self_cost_graveyard_keyword(word) {
+        return Some(keyword);
     }
     // CR 702.73a: "all creature types" is the Changeling CDA effect.
     // Granting Changeling keyword triggers layer system post-fixup to add all types.

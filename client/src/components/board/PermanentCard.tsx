@@ -39,6 +39,7 @@ import {
 interface PermanentCardProps {
   objectId: number;
   attachmentsLiftedByAncestor?: boolean;
+  attachmentRenderPath?: readonly number[];
   onPrimaryClickOverride?: () => void;
   /** When this card is the visible representative of a collapsed identical-permanent
    *  group (see GroupedPermanent collapsed mode), the full list of object ids it
@@ -114,22 +115,28 @@ function objectIdFromRelatedTarget(target: EventTarget | null): number | null {
   return Number.isFinite(objectId) ? objectId : null;
 }
 
+// Selected board-choice cards get a bright ring PLUS an inset fill so the whole
+// card reads as "lit up / chosen" — a clearly stronger signal than the outline-
+// only `availableBoardChoiceGlowClass` used for eligible-but-unselected cards.
+// The inset differentiates selection independently of card art (blank/tokened
+// cards otherwise looked identical selected vs. merely available).
 function selectedBoardChoiceGlowClass(intent: BoardChoiceIntent): string {
   switch (intent) {
     case "sacrifice":
-      return "ring-2 ring-red-400 shadow-[0_0_14px_4px_rgba(248,113,113,0.55)]";
+      return "ring-2 ring-red-400 shadow-[0_0_14px_4px_rgba(248,113,113,0.55),inset_0_0_18px_5px_rgba(248,113,113,0.3)]";
     case "tap":
-      return "ring-2 ring-emerald-400 shadow-[0_0_14px_4px_rgba(52,211,153,0.55)]";
+      return "ring-2 ring-emerald-400 shadow-[0_0_14px_4px_rgba(52,211,153,0.55),inset_0_0_18px_5px_rgba(52,211,153,0.3)]";
     case "blight":
-      return "ring-2 ring-purple-400 shadow-[0_0_14px_4px_rgba(192,132,252,0.55)]";
+      return "ring-2 ring-purple-400 shadow-[0_0_14px_4px_rgba(192,132,252,0.55),inset_0_0_18px_5px_rgba(192,132,252,0.3)]";
     case "ringBearer":
-      return "ring-2 ring-amber-300 shadow-[0_0_14px_4px_rgba(252,211,77,0.55)]";
+      return "ring-2 ring-amber-300 shadow-[0_0_14px_4px_rgba(252,211,77,0.55),inset_0_0_18px_5px_rgba(252,211,77,0.3)]";
     case "return":
     case "exile":
     case "crew":
     case "saddle":
     case "station":
-      return "ring-2 ring-sky-300 shadow-[0_0_14px_4px_rgba(125,211,252,0.55)]";
+    case "keep":
+      return "ring-2 ring-sky-300 shadow-[0_0_14px_4px_rgba(125,211,252,0.55),inset_0_0_18px_5px_rgba(125,211,252,0.3)]";
   }
 }
 
@@ -148,6 +155,7 @@ function availableBoardChoiceGlowClass(intent: BoardChoiceIntent): string {
     case "crew":
     case "saddle":
     case "station":
+    case "keep":
       return "ring-2 ring-sky-300/80 shadow-[0_0_10px_3px_rgba(125,211,252,0.35)]";
   }
 }
@@ -167,11 +175,18 @@ function boardChoiceBadgeClass(intent: BoardChoiceIntent): string {
     case "crew":
     case "saddle":
     case "station":
+    case "keep":
       return "bg-sky-400 text-sky-950";
   }
 }
 
-export const PermanentCard = memo(function PermanentCard({ objectId, attachmentsLiftedByAncestor = false, onPrimaryClickOverride, coveredIds }: PermanentCardProps) {
+export const PermanentCard = memo(function PermanentCard({
+  objectId,
+  attachmentsLiftedByAncestor = false,
+  attachmentRenderPath = [],
+  onPrimaryClickOverride,
+  coveredIds,
+}: PermanentCardProps) {
   const { t } = useTranslation("game");
   const isMobile = useIsMobile();
   const canHover = useCanHover();
@@ -222,6 +237,7 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
     incomingAttackerCounts,
     manaTappableObjectIds,
     selectableManaCostCreatureIds,
+    selectableSacrificeObjectIds,
     undoableTapObjectIds,
     validAttackerIds,
     validTargetObjectIds,
@@ -243,6 +259,7 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
   // any permanent re-renders only the card whose hovered/lifted state actually
   // flips — not every PermanentCard on the board. O(1) per hover, not O(N).
   const isHovered = useUiStore((s) => s.hoveredObjectId === objectId);
+  const isInspected = useUiStore((s) => s.inspectedObjectId === objectId);
   // Lifting a host's attachments only applies to cards that HAVE attachments;
   // for the common (unattached) card this selector is a constant `false`, so it
   // never re-renders on hover. Attached cards re-render only when their lifted
@@ -270,9 +287,9 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
   );
   const waitingFor = useGameStore((s) => s.waitingFor);
   const boardChoice = useMemo(() => {
-    const choice = getBoardChoiceView(waitingFor);
+    const choice = getBoardChoiceView(waitingFor, gameObjects);
     return choice?.player === playerId ? choice : null;
-  }, [playerId, waitingFor]);
+  }, [gameObjects, playerId, waitingFor]);
   const equipTargetChoice = useGameStore((s) =>
     s.waitingFor?.type === "EquipTarget" && s.waitingFor.data.player === playerId
       ? s.waitingFor.data
@@ -345,9 +362,42 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
 
   const ptDisplay = computePTDisplay(obj);
   const isSelected = selectedObjectId === objectId;
+  // CR 301.5 / CR 303.4: An attached Equipment/Aura is an independent permanent
+  // that can be a valid target, an activation source (re-equip), or a board
+  // choice in its own right. Collapsed behind its host it is unreachable —
+  // clicks land on the host instead, so a "put a counter on target nonland
+  // permanent you control" trigger lands on the creature rather than the chosen
+  // Equipment, and an attached Equipment can't be re-activated to move it. Open
+  // a host's attachments whenever any of them is actionable in the current
+  // waiting state so each is independently clickable without requiring a hover.
+  const attachmentsActionable =
+    obj.attachments.length > 0
+    && obj.attachments.some(
+      (id) =>
+        validTargetObjectIds.has(id)
+        || activatableObjectIds.has(id)
+        || manaTappableObjectIds.has(id)
+        || boardChoiceObjectIds.has(id)
+        || selectableSacrificeObjectIds.has(id)
+        || selectableManaCostCreatureIds.has(id)
+        // An attachment tapped for mana that can still be untapped (undo) is
+        // itself actionable — keep it expanded so the undo affordance stays
+        // clickable. `undoableTapObjectIds` is already gated upstream
+        // (GameBoard `undoLegal`) to the states whose engine match arms accept
+        // the untap, so no extra state check is needed here.
+        || undoableTapObjectIds.has(id),
+    );
   const attachmentsLifted =
     obj.attachments.length > 0
-    && (attachmentsLiftedByAncestor || isInHoveredAttachmentTree);
+    && (attachmentsLiftedByAncestor || isInHoveredAttachmentTree || isSelected || isInspected || attachmentsActionable);
+  const attachmentsExpanded = obj.attachments.length <= 1 || attachmentsLifted;
+  const visibleAttachmentIds = attachmentsExpanded ? obj.attachments : obj.attachments.slice(0, 1);
+  const attachmentPathIds = new Set([...attachmentRenderPath, objectId]);
+  const renderableAttachmentIds = visibleAttachmentIds.filter((id) => !attachmentPathIds.has(id));
+  const hiddenAttachmentCount = obj.attachments.length - visibleAttachmentIds.length;
+  const exileLinksExpanded = exileLinks.length <= 1 || isHovered || isSelected || isInspected;
+  const visibleExileLinks = exileLinksExpanded ? exileLinks : exileLinks.slice(0, 1);
+  const hiddenExileCount = exileLinks.length - visibleExileLinks.length;
 
   // Combat state — check both UI selection and committed combat state
   const isSelectingAttacker =
@@ -475,9 +525,9 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
       ) {
         toggleSelectedCard(objectId);
       }
-    } else if (combatMode === "attackers") {
+    } else if (combatMode === "attackers" && waitingFor?.type === "DeclareAttackers") {
       if (isValidAttacker) toggleAttacker(objectId);
-    } else if (combatMode === "blockers" && combatClickHandler) {
+    } else if (combatMode === "blockers" && waitingFor?.type === "DeclareBlockers" && combatClickHandler) {
       combatClickHandler(objectId);
     } else if (equipTargetChoice?.valid_targets.includes(objectId)) {
       dispatchAction({
@@ -569,8 +619,8 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
         transformOrigin: "center center",
         // Reserve space below for exile ghost cards
         marginBottom:
-          exileLinks.length > 0
-            ? `${exileLinks.length * EXILE_GHOST_OFFSET_PX}px`
+          visibleExileLinks.length > 0
+            ? `${visibleExileLinks.length * EXILE_GHOST_OFFSET_PX}px`
             : undefined,
       }}
       animate={{
@@ -597,7 +647,7 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
           face. While the host or one of its attachment descendants is
           hovered, lift only the outer permanent tree above sibling
           permanents; internal host/attachment ordering stays unchanged. */}
-      {obj.attachments.map((attachId, i) => {
+      {renderableAttachmentIds.map((attachId, i) => {
         const peekPx = ATTACHMENT_PEEK_PX + i * ATTACHMENT_STACK_STEP_PX;
         return (
           <div
@@ -609,20 +659,43 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
               zIndex: 5 - i,
             }}
           >
-            <PermanentCard objectId={attachId} attachmentsLiftedByAncestor={attachmentsLifted} />
+            <PermanentCard
+              objectId={attachId}
+              attachmentsLiftedByAncestor={attachmentsLifted}
+              attachmentRenderPath={[...attachmentRenderPath, objectId]}
+            />
             <AttachmentTypeBadge attachId={attachId} />
           </div>
         );
       })}
+      {hiddenAttachmentCount > 0 && (
+        <div
+          className="pointer-events-none absolute -right-3 top-6 z-30 flex h-6 min-w-6 items-center justify-center rounded-full bg-amber-300 px-1.5 text-[11px] font-black leading-none text-amber-950 ring-2 ring-amber-950/80 shadow"
+          title={t("permanent.hiddenAttachments", { count: hiddenAttachmentCount })}
+          aria-label={t("permanent.hiddenAttachments", { count: hiddenAttachmentCount })}
+        >
+          +{hiddenAttachmentCount}
+        </div>
+      )}
 
       {/* Exile ghosts — cards held in exile by this permanent, peeking from below */}
-      {exileLinks.map((link, i) => (
+      {visibleExileLinks.map((link, i) => (
         <ExileGhostCard
           key={link.exiled_id}
           objectId={link.exiled_id}
           offset={(i + 1) * EXILE_GHOST_OFFSET_PX}
         />
       ))}
+      {hiddenExileCount > 0 && (
+        <div
+          className="pointer-events-none absolute left-8 z-30 flex h-6 min-w-6 items-center justify-center rounded-full bg-purple-300 px-1.5 text-[11px] font-black leading-none text-purple-950 ring-2 ring-purple-950/80 shadow"
+          style={{ bottom: `-${(visibleExileLinks.length + 1) * EXILE_GHOST_OFFSET_PX}px` }}
+          title={t("permanent.hiddenExileCards", { count: hiddenExileCount })}
+          aria-label={t("permanent.hiddenExileCards", { count: hiddenExileCount })}
+        >
+          +{hiddenExileCount}
+        </div>
+      )}
 
       {/* Main card — art crop or full card based on preference */}
       {useArtCrop ? (
@@ -764,10 +837,13 @@ export const PermanentCard = memo(function PermanentCard({ objectId, attachments
       )}
 
       {isSelectableForBoardChoice && boardChoice && (
+        // Selected cards get a checkmark + solid, white-ringed badge; eligible-
+        // but-unselected cards get the same label dimmed, so the current
+        // selection is unambiguous and the badge reads as a toggle.
         <div
-          className={`pointer-events-none absolute ${isUnderAttack || isValidTarget ? "left-1 top-7" : "left-1 top-1"} z-40 rounded ${boardChoiceBadgeClass(boardChoice.intent)} px-1.5 py-0.5 text-[9px] font-black uppercase leading-none tracking-normal ring-1 ring-black/70 shadow-[0_1px_4px_rgba(0,0,0,0.75)]`}
+          className={`pointer-events-none absolute ${isUnderAttack || isValidTarget ? "left-1 top-7" : "left-1 top-1"} z-40 rounded ${boardChoiceBadgeClass(boardChoice.intent)} px-1.5 py-0.5 text-[9px] font-black uppercase leading-none tracking-normal shadow-[0_1px_4px_rgba(0,0,0,0.75)] ${isSelectedForBoardChoice ? "ring-1 ring-white/90" : "opacity-60 ring-1 ring-black/70"}`}
         >
-          {t(`permanent.boardChoiceBadges.${boardChoice.intent}`)}
+          {isSelectedForBoardChoice ? `✓ ${t(`permanent.boardChoiceBadges.${boardChoice.intent}`)}` : t(`permanent.boardChoiceBadges.${boardChoice.intent}`)}
         </div>
       )}
 

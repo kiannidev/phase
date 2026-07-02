@@ -281,7 +281,7 @@ fn score_pre_cast(ctx: &PolicyContext<'_>) -> f64 {
                             && o.name == source.name
                     }) && !engine::game::sba::legend_rule_exempt(ctx.state, id)
                 })
-                .then_some(-8.0)
+                .then_some(ctx.penalties().wasted_cast_penalty)
         })
         .unwrap_or(0.0);
 
@@ -320,7 +320,7 @@ fn score_pre_cast(ctx: &PolicyContext<'_>) -> f64 {
             && !facts.requires_targets_in_spell_text
             && !etb_trigger_has_valid_targets(ctx, &facts)
         {
-            -8.0
+            ctx.penalties().wasted_cast_penalty
         } else {
             0.0
         }
@@ -360,17 +360,17 @@ fn score_pre_cast(ctx: &PolicyContext<'_>) -> f64 {
 
     // Beneficial creature-targeting spell but no own creatures to buff.
     if has_beneficial_creature_target && !has_own_creature {
-        penalty -= 8.0;
+        penalty += ctx.penalties().wasted_cast_penalty;
     }
 
     // Harmful creature-only spell (e.g. Murder) but no targetable opponent creatures.
     if has_harmful_creature_only_target && !has_targetable_opponent_creature {
-        penalty -= 8.0;
+        penalty += ctx.penalties().wasted_cast_penalty;
     }
 
     // Harmful bounce with no opposing legal targets will force a self-bounce line.
     if has_harmful_bounce && !has_opponent_bounce_target(ctx, &effects) {
-        penalty -= 8.0;
+        penalty += ctx.penalties().wasted_cast_penalty;
     }
 
     penalty += etb_whiff_penalty;
@@ -696,12 +696,12 @@ fn score_target_object(ctx: &PolicyContext<'_>, object_id: ObjectId, beneficial:
     {
         if object.tapped {
             score += if object.controller == ctx.ai_player {
-                8.0
+                ctx.penalties().untap_own_tapped_bonus
             } else {
-                -20.0
+                ctx.penalties().untap_opponent_tapped_penalty
             };
         } else {
-            score -= 6.0;
+            score += ctx.penalties().untap_untapped_penalty;
         }
     }
 
@@ -828,7 +828,7 @@ fn score_target_object(ctx: &PolicyContext<'_>, object_id: ObjectId, beneficial:
                     .is_some_and(|(dmg, t)| dmg >= t - object.damage_marked as i32);
                 let is_destroy = effects.iter().any(|e| matches!(e, Effect::Destroy { .. }));
                 if !is_lethal_burn && !is_destroy {
-                    score -= 5.0;
+                    score += ctx.penalties().tapped_removal_no_urgency_penalty;
                 }
             }
         }
@@ -1045,7 +1045,9 @@ mod tests {
         ReplacementDefinition, ResolvedAbility, SacrificeCost, StaticDefinition, TargetFilter,
         TriggerDefinition, TypeFilter, TypedFilter,
     };
-    use engine::types::game_state::{GameState, PendingCast, TargetSelectionSlot, WaitingFor};
+    use engine::types::game_state::{
+        CastingVariant, GameState, PendingCast, TargetSelectionSlot, WaitingFor,
+    };
     use engine::types::identifiers::{CardId, ObjectId};
     use engine::types::keywords::Keyword;
     use engine::types::mana::ManaCost;
@@ -1129,6 +1131,25 @@ mod tests {
         (decision, candidate)
     }
 
+    fn make_mutate_target_selection_ctx(
+        state: &GameState,
+        legal_targets: Vec<TargetRef>,
+        candidate_target: Option<TargetRef>,
+    ) -> (AiDecisionContext, CandidateAction) {
+        let (mut decision, candidate) = make_target_selection_ctx(
+            state,
+            Effect::TargetOnly {
+                target: TargetFilter::Any,
+            },
+            legal_targets,
+            candidate_target,
+        );
+        if let WaitingFor::TargetSelection { pending_cast, .. } = &mut decision.waiting_for {
+            pending_cast.casting_variant = CastingVariant::Mutate;
+        }
+        (decision, candidate)
+    }
+
     fn graveyard_recursion_creature(state: &mut GameState) -> ObjectId {
         let id = create_object(
             state,
@@ -1163,7 +1184,9 @@ mod tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: Vec::new(),
+                conditional_enter_with_counters: vec![],
                 face_down_profile: None,
+                enters_modified_if: None,
             },
         )));
         state
@@ -1322,6 +1345,52 @@ mod tests {
         assert!(
             score_opp < 0.0,
             "Opponent creature score should be negative"
+        );
+    }
+
+    #[test]
+    fn mutate_target_prefers_own_creature() {
+        let mut state = make_state();
+        let own_id = add_creature(&mut state, PlayerId(0), "Bear", 2, 2);
+        let opp_id = add_creature(&mut state, PlayerId(1), "Goblin", 2, 2);
+        let config = AiConfig::default();
+        let context = crate::context::AiContext::empty(&config.weights);
+
+        let (decision, candidate) = make_mutate_target_selection_ctx(
+            &state,
+            vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
+            Some(TargetRef::Object(own_id)),
+        );
+        let ctx_own = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &context,
+            cast_facts: None,
+        };
+        let score_own = AntiSelfHarmPolicy.score(&ctx_own);
+
+        let (decision, candidate) = make_mutate_target_selection_ctx(
+            &state,
+            vec![TargetRef::Object(own_id), TargetRef::Object(opp_id)],
+            Some(TargetRef::Object(opp_id)),
+        );
+        let ctx_opp = PolicyContext {
+            state: &state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: PlayerId(0),
+            config: &config,
+            context: &context,
+            cast_facts: None,
+        };
+        let score_opp = AntiSelfHarmPolicy.score(&ctx_opp);
+
+        assert!(
+            score_own > score_opp,
+            "Mutate should prefer own creature: own={score_own}, opp={score_opp}"
         );
     }
 
@@ -2459,6 +2528,7 @@ mod tests {
             Effect::Counter {
                 target: TargetFilter::StackSpell,
                 source_rider: None,
+                countered_spell_zone: None,
             },
             Vec::new(),
             rewind_id,
@@ -3090,7 +3160,9 @@ mod tests {
                     enters_attacking: false,
                     up_to: false,
                     enter_with_counters: vec![],
+                    conditional_enter_with_counters: vec![],
                     face_down_profile: None,
+                    enters_modified_if: None,
                 },
                 Vec::new(),
                 ObjectId(200),
@@ -3113,6 +3185,9 @@ mod tests {
         let decision = AiDecisionContext {
             waiting_for: WaitingFor::TriggerTargetSelection {
                 player: PlayerId(0),
+                trigger_controller: None,
+                trigger_event: None,
+                trigger_events: Vec::new(),
                 target_slots: vec![TargetSelectionSlot {
                     legal_targets: legal_targets.clone(),
                     optional: false,
@@ -3199,7 +3274,9 @@ mod tests {
                     enters_attacking: false,
                     up_to: false,
                     enter_with_counters: vec![],
+                    conditional_enter_with_counters: vec![],
                     face_down_profile: None,
+                    enters_modified_if: None,
                 },
                 Vec::new(),
                 ObjectId(200),
@@ -3221,6 +3298,9 @@ mod tests {
         let decision = AiDecisionContext {
             waiting_for: WaitingFor::TriggerTargetSelection {
                 player: PlayerId(0),
+                trigger_controller: None,
+                trigger_event: None,
+                trigger_events: Vec::new(),
                 target_slots: vec![],
                 mode_labels: Vec::new(),
                 target_constraints: Vec::new(),
@@ -3807,7 +3887,9 @@ mod tests {
                 enters_attacking: false,
                 up_to: false,
                 enter_with_counters: Vec::new(),
+                conditional_enter_with_counters: vec![],
                 face_down_profile: None,
+                enters_modified_if: None,
             },
         );
         let mut land_filter = TypedFilter::new(TypeFilter::Land);

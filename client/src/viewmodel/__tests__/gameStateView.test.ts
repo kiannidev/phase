@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { GameAction, GameObject, GameState, PlayerId } from "../../adapter/types";
+import type { GameAction, GameObject, GameState, PlayerId, WaitingFor } from "../../adapter/types";
 import {
   boardChoiceSelectedPower,
   buildBoardChoiceAction,
@@ -187,25 +187,31 @@ describe("getBattlefieldSacrificeChoice", () => {
 
 describe("getBoardChoiceView", () => {
   it("maps PayCost ReturnToHand to a confirmed board choice", () => {
-    const choice = getBoardChoiceView({
-      type: "PayCost",
-      data: {
-        player: 0,
-        kind: { type: "ReturnToHand" },
-        choices: [4, 5],
-        count: 1,
-        min_count: 1,
-        resume: {
-          type: "Spell",
-          Spell: {
-            object_id: 99,
-            card_id: 990,
-            ability: { targets: [] },
-            cost: { type: "NoCost" },
+    const choice = getBoardChoiceView(
+      {
+        type: "PayCost",
+        data: {
+          player: 0,
+          kind: { type: "ReturnToHand" },
+          choices: [4, 5],
+          count: 1,
+          min_count: 1,
+          resume: {
+            type: "Spell",
+            Spell: {
+              object_id: 99,
+              card_id: 990,
+              ability: { targets: [] },
+              cost: { type: "NoCost" },
+            },
           },
         },
       },
-    });
+      {
+        4: { id: 4, zone: "Battlefield" },
+        5: { id: 5, zone: "Battlefield" },
+      } as unknown as Record<number, GameObject>,
+    );
 
     expect(choice).toMatchObject({
       player: 0,
@@ -242,6 +248,36 @@ describe("getBoardChoiceView", () => {
       type: "CrewVehicle",
       data: { vehicle_id: 30, creature_ids: [10, 11] },
     });
+  });
+
+  it("sums raw power for Slaughter keep sets so negative-power creatures lower the total", () => {
+    const choice = getBoardChoiceView({
+      type: "KeepWithinTotalPowerChoice",
+      data: {
+        player: 0,
+        target_player: 0,
+        eligible: [10, 11],
+        cap: 4,
+        source_id: 50,
+        remaining_players: [],
+        all_kept: [],
+        scoped_players: [0],
+      },
+    });
+    const objects = {
+      10: { id: 10, power: 5 },
+      11: { id: 11, power: -1 },
+    } as unknown as Record<number, GameObject>;
+
+    expect(choice).not.toBeNull();
+    if (!choice) return;
+    expect(choice.selection).toEqual({ type: "totalPowerAtMost", power: 4 });
+    // Raw sum mirrors the engine's CR 208.3 total: 5 + (-1) = 4, not a
+    // positive-clamped 6 that would wrongly disable confirm.
+    expect(boardChoiceSelectedPower(choice, [10, 11], objects)).toBe(4);
+    expect(canConfirmBoardChoice(choice, [10, 11], objects)).toBe(true);
+    // Keeping only the 5-power creature exceeds the cap of 4.
+    expect(canConfirmBoardChoice(choice, [10], objects)).toBe(false);
   });
 
   it("maps simple StationTarget and Ring-bearer choices to immediate single actions", () => {
@@ -290,6 +326,27 @@ describe("getBoardChoiceView", () => {
           resume: { type: "ManaAbility", ManaAbility: {} },
         },
       }),
+    ).toBeNull();
+  });
+
+  it("keeps PayCost choices modal-only unless every candidate is on the battlefield", () => {
+    const waitingFor = {
+      type: "PayCost",
+      data: {
+        player: 0,
+        kind: { type: "ExilePermanent", filter: null },
+        choices: [4, 5],
+        count: 1,
+        min_count: 1,
+        resume: { type: "ManaAbility", ManaAbility: {} },
+      },
+    } as unknown as WaitingFor;
+
+    expect(
+      getBoardChoiceView(waitingFor, {
+        4: { id: 4, zone: "Battlefield" },
+        5: { id: 5, zone: "Graveyard" },
+      } as unknown as Record<number, GameObject>),
     ).toBeNull();
   });
 });

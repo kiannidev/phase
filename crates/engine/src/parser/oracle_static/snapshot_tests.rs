@@ -31,6 +31,15 @@ fn static_granted_keyword() {
 }
 
 #[test]
+fn static_extra_blockers_group_grant() {
+    let def = parse_static_line(
+        "Each creature you control can block an additional creature each combat.",
+    )
+    .unwrap();
+    insta::assert_json_snapshot!("static_extra_blockers_group_grant", &def);
+}
+
+#[test]
 fn static_tiered_enters_with_additional_counters() {
     let defs = parse_static_line_multi(
         "Each other Vehicle and creature you control enters with an additional +1/+1 counter on it if its mana value is 4 or less. Otherwise, it enters with three additional +1/+1 counters on it.",
@@ -761,6 +770,18 @@ fn panharmonicon_doubler_has_no_source_filter() {
         "bare 'permanent you control' source must leave affected None, got {:?}",
         def.affected
     );
+}
+
+#[test]
+fn hama_pashar_room_ability_doubler_static() {
+    let def = parse_static_line("Room abilities of dungeons you own trigger an additional time.")
+        .expect("expected DoubleTriggers static for Hama Pashar");
+    assert!(matches!(
+        def.mode,
+        StaticMode::DoubleTriggers {
+            cause: TriggerCause::RoomEntered
+        }
+    ));
 }
 
 /// CR 603.2d: Echoes of Eternity — a second real disjunctive doubler beyond

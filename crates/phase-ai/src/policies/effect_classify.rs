@@ -5,7 +5,7 @@ use engine::types::ability::{
     TargetFilter, TypeFilter,
 };
 use engine::types::counter::CounterType;
-use engine::types::game_state::GameState;
+use engine::types::game_state::{CastingVariant, GameState, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
 use engine::types::player::PlayerId;
@@ -112,6 +112,7 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
         Effect::DoublePTAll { .. } => EffectPolarity::Beneficial,
         Effect::SkipNextTurn { .. } | Effect::SkipNextStep { .. } => EffectPolarity::Contextual,
         Effect::Regenerate { .. }
+        | Effect::RemoveAllDamage { .. }
         | Effect::PreventDamage { .. }
         | Effect::Animate { .. }
         | Effect::DoublePT { .. } => EffectPolarity::Beneficial,
@@ -195,7 +196,173 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
         | Effect::GivePlayerCounter { .. }
         | Effect::ExchangeControl { .. }
         | Effect::ExchangeLifeTotals { .. } => EffectPolarity::Contextual,
-        _ => EffectPolarity::Contextual,
+        // Remaining variants have no fixed polarity for target-selection purposes
+        // (their benefit/harm depends on usage context). Enumerated exhaustively
+        // rather than caught by `_` so a newly added `Effect` variant fails to
+        // compile here until its polarity is deliberately classified — the
+        // forcing function that prevents silent `Contextual` misclassification.
+        // `SetTapState { .. }` here catches only the non-Single scopes; the
+        // beneficial (Single+Untap) and harmful (Single+Tap) cases are handled
+        // by the guarded arms above.
+        Effect::Adapt { .. }
+        | Effect::AdditionalPhase { .. }
+        | Effect::AddPendingETBCounters { .. }
+        | Effect::AddRestriction { .. }
+        | Effect::AddTargetReplacement { .. }
+        | Effect::Amass { .. }
+        | Effect::ApplyPerpetual { .. }
+        | Effect::ApplyPostReplacementDamage { .. }
+        | Effect::ApplySticker { .. }
+        | Effect::AssembleContraptionOnSprocket { .. }
+        | Effect::AssembleContraptions { .. }
+        | Effect::AssembleContraptionsFromRollDifference
+        | Effect::Attach { .. }
+        | Effect::BecomeCopy { .. }
+        | Effect::BecomePrepared { .. }
+        | Effect::BecomeSaddled { .. }
+        | Effect::BecomeUnprepared { .. }
+        | Effect::BlightEffect { .. }
+        | Effect::Bolster { .. }
+        | Effect::Cascade
+        | Effect::CastCopyOfCard { .. }
+        | Effect::CastFromZone { .. }
+        | Effect::ChangeSpeed { .. }
+        | Effect::ChangeTargets { .. }
+        | Effect::ChangeZoneAll { .. }
+        | Effect::Choose { .. }
+        | Effect::ChooseAndSacrificeRest { .. }
+        | Effect::ChooseAugmentAndCombineWithHost { .. }
+        | Effect::ChooseCard { .. }
+        | Effect::ChooseDamageSource { .. }
+        | Effect::ChooseDrawnThisTurnPayOrTopdeck { .. }
+        | Effect::ChooseFromZone { .. }
+        | Effect::ChooseObjectsIntoTrackedSet { .. }
+        | Effect::ChooseOneOf { .. }
+        | Effect::Clash
+        | Effect::Cleanup { .. }
+        | Effect::Cloak { .. }
+        | Effect::CollectEvidence { .. }
+        | Effect::CombineHost { .. }
+        | Effect::Conjure { .. }
+        | Effect::ControlNextTurn { .. }
+        | Effect::CopySpell { .. }
+        | Effect::CopyTokenBlockingAttacker { .. }
+        | Effect::CopyTokenOf { .. }
+        | Effect::CounterAll { .. }
+        | Effect::CrankContraptions { .. }
+        | Effect::CreateDamageReplacement { .. }
+        | Effect::CreateDelayedTrigger { .. }
+        | Effect::CreateDrawReplacement { .. }
+        | Effect::CreateEmblem { .. }
+        | Effect::CreateTokenCopyFromPool { .. }
+        | Effect::DamageEachPlayer { .. }
+        | Effect::Detain { .. }
+        | Effect::Dig { .. }
+        | Effect::Discard { .. }
+        | Effect::Discover { .. }
+        | Effect::Double { .. }
+        | Effect::DraftFromSpellbook { .. }
+        | Effect::EachDealsDamageEqualToPower { .. }
+        | Effect::Encore
+        | Effect::EndCombatPhase
+        | Effect::EndTheTurn
+        | Effect::Endure { .. }
+        | Effect::EpicCopy { .. }
+        | Effect::ExchangeLifeWithStat { .. }
+        | Effect::ExileFromTopUntil { .. }
+        | Effect::ExileHaunting { .. }
+        | Effect::ExileResolvingSpellInsteadOfGraveyard
+        | Effect::ExileTop { .. }
+        | Effect::Exploit { .. }
+        | Effect::ExploreAll { .. }
+        | Effect::FlipCoin { .. }
+        | Effect::FlipCoins { .. }
+        | Effect::FlipCoinUntilLose { .. }
+        | Effect::Forage
+        | Effect::ForceAttack { .. }
+        | Effect::ForEachCategoryExile { .. }
+        | Effect::FreeCastFromZones { .. }
+        | Effect::GainActivatedAbilitiesOfTarget { .. }
+        | Effect::GainControlAll { .. }
+        | Effect::GainEnergy { .. }
+        | Effect::GiveControl { .. }
+        | Effect::GoadAll { .. }
+        | Effect::GrantCastingPermission { .. }
+        | Effect::GrantExtraLoyaltyActivations { .. }
+        | Effect::GrantNextSpellAbility { .. }
+        | Effect::Harness
+        | Effect::Heist { .. }
+        | Effect::HeistExile
+        | Effect::HideawayConceal { .. }
+        | Effect::Incubate { .. }
+        | Effect::Intensify { .. }
+        | Effect::Learn
+        | Effect::LoseAllPlayerCounters { .. }
+        | Effect::MadnessCast { .. }
+        | Effect::Manifest { .. }
+        | Effect::ManifestDread
+        | Effect::Meld { .. }
+        | Effect::MiracleCast { .. }
+        | Effect::Monstrosity { .. }
+        | Effect::Myriad
+        | Effect::NoOp
+        | Effect::OpenAttractions { .. }
+        | Effect::PairWith { .. }
+        | Effect::PayCost { .. }
+        | Effect::PhaseIn { .. }
+        | Effect::Planeswalk
+        | Effect::Populate
+        | Effect::ProcessRadCounters
+        | Effect::ProliferateTarget { .. }
+        | Effect::PumpAll { .. }
+        | Effect::PutAtLibraryPosition { .. }
+        | Effect::PutOnTopOrBottom { .. }
+        | Effect::PutSticker { .. }
+        | Effect::ReassembleContraption { .. }
+        | Effect::ReassembleContraptionOnSprocket { .. }
+        | Effect::ReduceNextSpellCost { .. }
+        | Effect::RegisterBending { .. }
+        | Effect::RememberCard { .. }
+        | Effect::RemoveFromCombat { .. }
+        | Effect::Renown { .. }
+        | Effect::ReturnAsAura { .. }
+        | Effect::Reveal { .. }
+        | Effect::RevealFromHand { .. }
+        | Effect::RevealHand { .. }
+        | Effect::RevealTop { .. }
+        | Effect::RevealUntil { .. }
+        | Effect::RingTemptsYou
+        | Effect::Ripple { .. }
+        | Effect::RollDie { .. }
+        | Effect::RollToVisitAttractions
+        | Effect::RuntimeHandled { .. }
+        | Effect::SearchOutsideGame { .. }
+        | Effect::Seek { .. }
+        | Effect::SeparateIntoPiles { .. }
+        | Effect::SetClassLevel { .. }
+        | Effect::SetDayNight { .. }
+        | Effect::SetLifeTotal { .. }
+        | Effect::SetRoomDoorLock { .. }
+        | Effect::SetTapState { .. }
+        | Effect::Shuffle { .. }
+        | Effect::SolveCase
+        | Effect::Specialize
+        | Effect::StartYourEngines { .. }
+        | Effect::SwitchPT { .. }
+        | Effect::TakeTheInitiative
+        | Effect::TargetOnly { .. }
+        | Effect::TimeTravel
+        | Effect::Transform { .. }
+        | Effect::Tribute { .. }
+        | Effect::TurnFaceDown { .. }
+        | Effect::TurnFaceUp { .. }
+        | Effect::UnattachAll { .. }
+        | Effect::Unimplemented { .. }
+        | Effect::Unsuspect { .. }
+        | Effect::VentureInto { .. }
+        | Effect::VentureIntoDungeon
+        | Effect::Vote { .. }
+        | Effect::WinTheGame { .. } => EffectPolarity::Contextual,
     }
 }
 
@@ -211,6 +378,7 @@ pub(crate) fn extract_target_filter(effect: &Effect) -> Option<&TargetFilter> {
         | Effect::DoublePT { target, .. }
         | Effect::DoublePTAll { target, .. }
         | Effect::Regenerate { target, .. }
+        | Effect::RemoveAllDamage { target, .. }
         | Effect::PreventDamage { target, .. }
         // Harmful effects
         | Effect::Destroy { target, .. }
@@ -225,7 +393,6 @@ pub(crate) fn extract_target_filter(effect: &Effect) -> Option<&TargetFilter> {
         | Effect::Goad { target }
         | Effect::ChangeZone { target, .. }
         | Effect::Connive { target, .. }
-        | Effect::Suspect { target, .. }
         | Effect::ForceBlock { target, .. }
         | Effect::Exploit { target, .. }
         | Effect::Attach { target, .. }
@@ -239,6 +406,20 @@ pub(crate) fn extract_target_filter(effect: &Effect) -> Option<&TargetFilter> {
         // not surfaced as a target (matching the legacy `TapAll`/`UntapAll`,
         // which fell through to `None`).
         Effect::SetTapState {
+            scope: EffectScope::Single,
+            target,
+            ..
+        } => Some(target),
+        // CR 701.60a: only single-permanent suspect/unsuspect exposes a
+        // selectable target. The mass (`All`) scope (e.g. Absolving Lammasu)
+        // is a non-targeting population effect — its filter is not surfaced as
+        // a target (mirrors `SetTapState`'s `Single`/`All` split).
+        Effect::Suspect {
+            scope: EffectScope::Single,
+            target,
+            ..
+        }
+        | Effect::Unsuspect {
             scope: EffectScope::Single,
             target,
             ..
@@ -379,6 +560,15 @@ pub(crate) fn targets_creatures(effect: &Effect) -> bool {
 /// Defaults to false (assume harmful) when uncertain — safe fallback since most
 /// targeted spells in MTG are removal/damage.
 pub(crate) fn is_spell_beneficial(ctx: &PolicyContext<'_>) -> bool {
+    // CR 702.140a: Mutate targets a non-Human creature with the same owner as
+    // the spell — treat it as beneficial so targeting prefers our creatures over
+    // opponents' creatures when evaluating candidate targets.
+    if let WaitingFor::TargetSelection { pending_cast, .. } = &ctx.decision.waiting_for {
+        if pending_cast.casting_variant == CastingVariant::Mutate {
+            return true;
+        }
+    }
+
     let player_impact = aggregate_player_impact(ctx);
     if player_impact > 0.25 {
         return true;
@@ -835,5 +1025,56 @@ mod lethality_tests {
             cant_regenerate: false,
         };
         assert_eq!(lethal_to_creature(state, bear, &[&destroy]), None);
+    }
+}
+
+#[cfg(test)]
+mod suspect_scope_tests {
+    use super::*;
+
+    // CR 701.60a: mass un-designation ("all suspected creatures are no longer
+    // suspected", Absolving Lammasu) is a non-targeting population effect. The
+    // AI's target-filter extraction must mirror the engine's `target_filter()`,
+    // which surfaces a selectable target only for `EffectScope::Single`.
+    #[test]
+    fn extract_target_filter_only_for_single_scope_suspect() {
+        // Same non-None filter on both; only `scope` differs, so a pass proves
+        // the scope gate (not the filter) drives target-filter extraction.
+        let single_suspect = Effect::Suspect {
+            target: TargetFilter::Any,
+            scope: EffectScope::Single,
+        };
+        let all_suspect = Effect::Suspect {
+            target: TargetFilter::Any,
+            scope: EffectScope::All,
+        };
+        assert!(
+            extract_target_filter(&single_suspect).is_some(),
+            "single-scope Suspect must expose a selectable target"
+        );
+        assert!(
+            extract_target_filter(&all_suspect).is_none(),
+            "mass Suspect{{All}} is a population effect, not target-filtered"
+        );
+    }
+
+    #[test]
+    fn extract_target_filter_only_for_single_scope_unsuspect() {
+        let single_unsuspect = Effect::Unsuspect {
+            target: TargetFilter::Any,
+            scope: EffectScope::Single,
+        };
+        let all_unsuspect = Effect::Unsuspect {
+            target: TargetFilter::Any,
+            scope: EffectScope::All,
+        };
+        assert!(
+            extract_target_filter(&single_unsuspect).is_some(),
+            "single-scope Unsuspect must expose a selectable target"
+        );
+        assert!(
+            extract_target_filter(&all_unsuspect).is_none(),
+            "mass Unsuspect{{All}} (Absolving Lammasu) is a population effect, not target-filtered"
+        );
     }
 }

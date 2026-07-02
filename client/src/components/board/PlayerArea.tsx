@@ -279,8 +279,8 @@ export function PlayerArea({
             zone="lands"
             side="left"
             className="justify-start px-0"
+            showCollapseControl={isOwnArea}
           />
-          {landColumnExtra}
         </>
       ),
     },
@@ -302,6 +302,7 @@ export function PlayerArea({
           side="right"
           dividerBeforeIndex={supportDividerIndex}
           className="justify-end px-0"
+          showCollapseControl={isOwnArea}
         />
       ),
     },
@@ -399,6 +400,7 @@ export function PlayerArea({
     <div
       className={`absolute left-1/2 z-20 -translate-x-1/2 ${isMirrored ? "bottom-[130%] translate-y-full" : "top-[165%] -translate-y-full"}`}
       data-debug-label="HUD"
+      {...(mode === "full" ? { "data-player-hud-anchor": "" } : {})}
     >
       {/* Inner node owns the drag offset so the outer `-translate-x-1/2`
           centering transform is never clobbered. */}
@@ -408,6 +410,21 @@ export function PlayerArea({
       >
         {hud}
       </DraggableWidget>
+    </div>
+  ) : null;
+
+  const landColumnExtraOverlay = landColumnExtra ? (
+    // The stack anchors at the middle-row bottom and grows upward, so at bottom-0
+    // it rides up over the lowest lands / the collapsed land tile. Drop it into
+    // the outer column's reserved `pb-8` gutter (full, non-compact only — compact
+    // height has no bottom padding to borrow) so it clears the land row.
+    <div
+      className={`pointer-events-none absolute bottom-0 left-2 z-30 ${
+        isCompactHeight ? "" : "translate-y-8"
+      }`}
+      data-testid="land-column-extra"
+    >
+      <div className="pointer-events-auto">{landColumnExtra}</div>
     </div>
   ) : null;
 
@@ -434,6 +451,7 @@ export function PlayerArea({
             <div className={`relative ${isCompactHeight ? "min-h-0 max-h-[40%]" : "shrink-0"}`}>
               {middleRow}
               {hudBand}
+              {landColumnExtraOverlay}
             </div>
             <div className="flex min-h-0 flex-1 items-end px-2" data-debug-label="Opp Creatures">
               <BattlefieldZoneOverflow
@@ -456,6 +474,7 @@ export function PlayerArea({
             <div className={`relative ${isCompactHeight ? "min-h-0 max-h-[40%]" : "shrink-0"}`}>
               {middleRow}
               {hudBand}
+              {landColumnExtraOverlay}
             </div>
             <BattlefieldRow groups={partitioned?.other ?? []} rowType="other" />
           </>

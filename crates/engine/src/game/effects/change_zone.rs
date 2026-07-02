@@ -63,7 +63,19 @@ fn resolve_forward_result_search_attach_host(
                 Some(AttachTarget::Object(ability.source_id))
             }
         }
-        _ => None,
+        TargetFilter::TriggeringSource | TargetFilter::AttachedTo => {
+            crate::game::targeting::resolve_event_context_target(state, target, ability.source_id)
+                .map(|target| match target {
+                    TargetRef::Object(id) => AttachTarget::Object(id),
+                    TargetRef::Player(id) => AttachTarget::Player(id),
+                })
+        }
+        // Typed "target creature/player" hosts (Arachnus Spinner, Curse tutors)
+        // resolve from the ability's chosen targets carried through search.
+        _ => ability.targets.iter().find_map(|target| match target {
+            TargetRef::Object(id) => Some(AttachTarget::Object(*id)),
+            TargetRef::Player(id) => Some(AttachTarget::Player(*id)),
+        }),
     }
 }
 

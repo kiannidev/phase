@@ -13979,6 +13979,15 @@ pub fn handle_cancel_cast(
                 && !(unit.is_convoke_payment() && delved_cards.contains(&unit.source_id))
         });
     }
+    for object_id in &pending.cost_paid_sacrifices {
+        if state
+            .objects
+            .get(object_id)
+            .is_some_and(|obj| obj.zone == Zone::Graveyard)
+        {
+            super::zones::move_to_zone(state, *object_id, Zone::Battlefield, _events);
+        }
+    }
     if let Some(obj) = state.objects.get_mut(&pending.object_id) {
         obj.convoked_creatures.clear();
     }

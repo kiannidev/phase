@@ -1409,7 +1409,7 @@ fn parse_player_population(input: &str) -> OracleResult<'_, PlayerRelation> {
 /// `parse_player_counter_kind` grammar so poison / rad / experience / ticket are
 /// all covered.
 fn parse_player_counter_attr_clause(input: &str) -> OracleResult<'_, (QuantityRef, i32)> {
-    let (input, _) = tag("who have ").parse(input)?;
+    let (input, _) = alt((tag("who have "), tag("who has "))).parse(input)?;
     let (input, n) = nom_primitives::parse_number(input)?;
     let (input, _) = tag(" or more ").parse(input)?;
     let (input, kind) = nom_quantity::parse_player_counter_kind(input)?;

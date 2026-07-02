@@ -4581,14 +4581,17 @@ fn prepare_spell_cast_with_variant_override_inner(
     let exile_alt_cost_free = alt_cost_from_exile
         .as_ref()
         .is_some_and(ManaCost::is_without_paying_mana);
-    // CR 702.94a: Miracle alternative cost — pulled from `Keyword::Miracle(cost)`
-    // on the hand object. Only honored when the caller explicitly opted into the
+    // CR 702.94a: Miracle alternative cost — consult `effective_spell_keywords`
+    // so hand-granted miracle (Molecule Man) is honored at cast time, not only
+    // at offer enqueue. Only honored when the caller explicitly opted into the
     // Miracle variant via the reveal prompt.
     let miracle_cost = if casting_variant == CastingVariant::Miracle {
-        obj.keywords.iter().find_map(|k| match k {
-            crate::types::keywords::Keyword::Miracle(cost) => Some(cost.clone()),
-            _ => None,
-        })
+        effective_spell_keywords(state, player, object_id)
+            .iter()
+            .find_map(|k| match k {
+                crate::types::keywords::Keyword::Miracle(cost) => Some(cost.clone()),
+                _ => None,
+            })
     } else {
         None
     };

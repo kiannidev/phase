@@ -35,8 +35,10 @@ use crate::types::zones::Zone;
 /// inside a library-search compound.
 fn parse_search_attach_host(text: &str) -> Option<TargetFilter> {
     let lower = text.to_ascii_lowercase();
+    // allow-noncombinator: locate the attach-host phrase tail inside a pre-lowercased search-continuation substring.
     let start = lower.find("attached to")? + "attached to".len();
     let rest = lower[start..].trim();
+    // allow-noncombinator: choose the earliest clause boundary among period / then / comma on the attach-host tail.
     let boundary = [rest.find('.'), rest.find(" then "), rest.find(',')]
         .into_iter()
         .flatten()
@@ -55,6 +57,7 @@ fn parse_search_attach_host(text: &str) -> Option<TargetFilter> {
         | "the creature"
         | "the permanent"
         | "the token" => Some(TargetFilter::ParentTarget),
+        // allow-noncombinator: dispatch only the extracted attach-host noun phrase to parse_target.
         _ if phrase.starts_with("target ") => {
             let (filter, remainder) = parse_target(phrase);
             if remainder.trim().is_empty() {

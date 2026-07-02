@@ -36,7 +36,7 @@ function makeObject(overrides: Partial<GameObject> = {}): GameObject {
     toughness: null,
     loyalty: null,
     card_types: { supertypes: [], core_types: ["Land"], subtypes: [] },
-    mana_cost: { type: "NoCost", shards: [], generic: 0 },
+    mana_cost: { type: "NoCost" },
     keywords: [],
     abilities: [],
     trigger_definitions: [],

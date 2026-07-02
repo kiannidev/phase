@@ -3,6 +3,7 @@
 use engine::game::scenario::{GameRunner, GameScenario, P0};
 use engine::types::ability::TargetRef;
 use engine::types::actions::GameAction;
+use engine::types::card_type::CoreType;
 use engine::types::game_state::{CastPaymentMode, WaitingFor};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaColor, ManaType, ManaUnit};
@@ -98,19 +99,48 @@ fn orvar_copies_targeted_land_not_itself() {
     drive_cast_target(&mut runner, TargetRef::Object(land));
     runner.advance_until_stack_empty();
 
-    let permanents_after = runner
+    let battlefield: Vec<_> = runner
         .state()
         .objects
         .values()
         .filter(|o| o.zone == Zone::Battlefield && o.controller == P0)
-        .count();
+        .collect();
 
-    assert!(
-        permanents_after > permanents_before,
-        "Orvar must create a token copy of the targeted land (had {permanents_before}, now {permanents_after})"
+    assert_eq!(
+        battlefield.len(),
+        permanents_before + 1,
+        "Orvar must create exactly one token copy of the targeted land"
     );
     assert!(
         runner.state().objects.contains_key(&orvar),
         "Orvar itself must remain on the battlefield"
+    );
+    assert!(
+        runner.state().objects[&land].zone == Zone::Battlefield,
+        "the targeted land must remain on the battlefield"
+    );
+
+    let orvar_permanents = battlefield
+        .iter()
+        .filter(|o| o.name == "Orvar, the All-Form" && !o.is_token)
+        .count();
+    assert_eq!(
+        orvar_permanents, 1,
+        "must not create a second Orvar permanent"
+    );
+
+    let orvar_tokens = battlefield
+        .iter()
+        .filter(|o| o.is_token && o.name.contains("Orvar"))
+        .count();
+    assert_eq!(orvar_tokens, 0, "must not create a token copy of Orvar");
+
+    let land_token_copies = battlefield
+        .iter()
+        .filter(|o| o.is_token && o.id != land && o.card_types.core_types.contains(&CoreType::Land))
+        .count();
+    assert_eq!(
+        land_token_copies, 1,
+        "exactly one land token copy must be created"
     );
 }

@@ -1063,7 +1063,6 @@ fn parent_target_refs_from_attack_trigger_context(state: &GameState) -> Option<V
 /// (Orvar, the All-Form) inherits the triggering spell's committed object
 /// targets while the `SpellCast` event is still in scope.
 fn parent_target_refs_from_spell_cast_event(state: &GameState) -> Option<Vec<TargetRef>> {
-    use crate::types::events::GameEvent;
     let spell_id = match state.current_trigger_event.as_ref()? {
         GameEvent::SpellCast { object_id, .. } => *object_id,
         _ => return None,

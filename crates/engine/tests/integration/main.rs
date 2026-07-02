@@ -404,6 +404,7 @@ mod issue_4829_zenith_chronicler;
 mod issue_4830_orvar_land_copy;
 mod issue_4835_intimidation_tactics;
 mod issue_4836_mindskinner;
+mod issue_493_ulalek_hybrid_mana_cost;
 mod issue_536_six_grants_retrace;
 mod issue_541_endurance_graveyard_to_bottom;
 mod issue_544_krark_clan_ironworks_auto_pass;

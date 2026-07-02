@@ -24,14 +24,20 @@ fn reveal_hand_filter(def: &engine::types::ability::AbilityDefinition) -> Option
     }
 }
 
-fn hand_size(runner: &engine::game::scenario::GameRunner, player: engine::types::PlayerId) -> usize {
+fn hand_size(
+    runner: &engine::game::scenario::GameRunner,
+    player: engine::types::PlayerId,
+) -> usize {
     runner.state().players[player.0 as usize].hand.len()
 }
 
 #[test]
 fn intimidation_tactics_parses_exile_continuation() {
     let def = parse_effect_chain(INTIMIDATION_TACTICS, AbilityKind::Spell);
-    let sub = def.sub_ability.as_ref().expect("exile sub after RevealHand");
+    let sub = def
+        .sub_ability
+        .as_ref()
+        .expect("exile sub after RevealHand");
     assert!(
         matches!(
             sub.effect.as_ref(),
@@ -72,20 +78,18 @@ fn intimidation_tactics_parses_artifact_or_creature_reveal_filter() {
 fn intimidation_tactics_exiles_chosen_artifact_or_creature() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    scenario.with_mana_pool(P0, vec![engine::types::mana::ManaUnit::new(
-        engine::types::mana::ManaType::Black,
-        engine::types::identifiers::ObjectId(0),
-        false,
-        vec![],
-    )]);
+    scenario.with_mana_pool(
+        P0,
+        vec![engine::types::mana::ManaUnit::new(
+            engine::types::mana::ManaType::Black,
+            engine::types::identifiers::ObjectId(0),
+            false,
+            vec![],
+        )],
+    );
 
     let spell = scenario
-        .add_spell_to_hand_from_oracle(
-            P0,
-            "Intimidation Tactics",
-            false,
-            INTIMIDATION_TACTICS_FULL,
-        )
+        .add_spell_to_hand_from_oracle(P0, "Intimidation Tactics", false, INTIMIDATION_TACTICS_FULL)
         .id();
 
     let creature_id = scenario.add_creature_to_hand(P1, "Opp Creature", 2, 2).id();

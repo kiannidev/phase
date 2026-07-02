@@ -250,13 +250,12 @@ pub fn resolve(
                     .get(&parent)
                     .is_some_and(|obj| obj.zone == Zone::Hand)
                 {
-                    let tracked_filter =
-                        crate::game::targeting::resolve_tracked_set_sentinel(
-                            state,
-                            TargetFilter::TrackedSet {
-                                id: crate::types::identifiers::TrackedSetId(0),
-                            },
-                        );
+                    let tracked_filter = crate::game::targeting::resolve_tracked_set_sentinel(
+                        state,
+                        TargetFilter::TrackedSet {
+                            id: crate::types::identifiers::TrackedSetId(0),
+                        },
+                    );
                     // Dig tails (Expressive Iteration) keep looked-at cards in a
                     // tracked set with library members — "exile one of them" must
                     // not re-exile the card already put in hand. RevealHand ->

@@ -441,6 +441,7 @@ fn complete_loyalty_activation(
     record_loyalty_activation(state, pw_id, player);
 
     let assigned_targets = flatten_targets_in_chain(&resolved);
+    let crime_candidate = super::casting::targets_commit_crime(state, &assigned_targets, player);
     emit_targeting_events(state, &assigned_targets, pw_id, player, events);
 
     let entry_id = ObjectId(state.next_object_id);
@@ -461,6 +462,7 @@ fn complete_loyalty_activation(
         },
         events,
     );
+    super::casting::commit_crime_after_stack_placement(state, crime_candidate, player, events);
 
     super::restrictions::record_ability_activation(state, pw_id, ability_index);
     // CR 117.1b: Priority permits unbounded activation. `pending_activations`
@@ -832,6 +834,10 @@ mod tests {
         // turn for every planeswalker regardless of controller. The reset is
         // global, so it fires on the very first `start_next_turn` (which makes
         // PlayerId(1) the active player) — not two turns later.
+        state.stack.clear();
+        state.waiting_for = WaitingFor::Priority {
+            player: state.priority_player,
+        };
         crate::game::turns::start_next_turn(&mut state, &mut events);
         assert_eq!(state.objects[&pw].loyalty_activations_this_turn, 0);
     }

@@ -1,18 +1,18 @@
 use std::borrow::Cow;
 
-use crate::parser::oracle_nom::error::OracleError;
+use crate::parser::oracle_nom::error::{OracleError, OracleResult};
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
-use nom::character::complete::{alpha1, space0, space1};
+use nom::character::complete::{alpha1, alphanumeric1, space0, space1};
 use nom::combinator::{all_consuming, eof, not, opt, peek, value};
-use nom::sequence::preceded;
+use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
 use super::oracle_cost::parse_oracle_cost;
 use super::oracle_nom::primitives as nom_primitives;
 use super::oracle_nom::primitives::{scan_at_word_boundaries, scan_contains, split_once_on};
 use super::oracle_quantity::parse_cda_quantity;
-use super::oracle_target::parse_type_phrase;
+use super::oracle_target::parse_type_phrase_folding;
 use super::oracle_util::{strip_reminder_text, strip_where_x_is_clause};
 use crate::types::ability::{
     AbilityCost, ActivationRestriction, AdditionalCost, ControllerRef, CostObjectCount,
@@ -21,7 +21,7 @@ use crate::types::ability::{
 };
 use crate::types::keywords::{
     normalize_bands_with_other_quality, BloodthirstValue, BuybackCost, CyclingCost, DisguiseCost,
-    EmbalmCost, EscapeCost, EternalizeCost, FlashbackCost, Keyword, WardCost,
+    EmbalmCost, EmergeCost, EscapeCost, EternalizeCost, FlashbackCost, Keyword, WardCost,
 };
 use crate::types::mana::{ManaCost, ManaCostShard};
 use crate::types::zones::Zone;
@@ -700,6 +700,34 @@ fn parse_ward_cost(cost_text: &str) -> Option<Keyword> {
     Some(Keyword::Ward(cost))
 }
 
+/// CR 702.21a + CR 122.1 + CR 104.3d: "get N <kind> counter(s)" / "get a/an
+/// <kind> counter" — the single grammatical authority for this ward-cost
+/// family. Composes the count/article, kind, and singular/plural axes as
+/// independent nom combinators (this repo's mandated style) rather than
+/// enumerating their product as ad-hoc string dispatch.
+fn parse_get_player_counters_ward_cost(input: &str) -> OracleResult<'_, WardCost> {
+    all_consuming(|i| {
+        let (rest, _) = tag::<_, _, OracleError<'_>>("get ").parse(i)?;
+        let (rest, count) = alt((
+            nom_primitives::parse_number,
+            value(1u32, nom_primitives::parse_article),
+        ))
+        .parse(rest)?;
+        let (rest, _) = space0.parse(rest)?;
+        let (rest, counter_kind) = nom_primitives::parse_player_counter_kind.parse(rest)?;
+        let (rest, _) = tag(" counter").parse(rest)?;
+        let (rest, _) = opt(tag("s")).parse(rest)?;
+        Ok((
+            rest,
+            WardCost::GetPlayerCounters {
+                counter_kind,
+                count,
+            },
+        ))
+    })
+    .parse(input)
+}
+
 /// Parse a single ward cost component (not compound).
 fn parse_ward_cost_single(lower: &str) -> Option<WardCost> {
     // CR 702.21a + CR 608.2h + CR 113.7a: Ward's life cost reads the source's
@@ -740,7 +768,7 @@ fn parse_ward_cost_single(lower: &str) -> Option<WardCost> {
                     .or(rest.strip_prefix("an "))
                     .unwrap_or(rest),
             ));
-        let (filter, _) = parse_type_phrase(after_count);
+        let (filter, _) = parse_type_phrase_folding(after_count);
         return Some(WardCost::Sacrifice { count, filter });
     }
 
@@ -748,6 +776,30 @@ fn parse_ward_cost_single(lower: &str) -> Option<WardCost> {
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("waterbend").parse(lower) {
         let cost = crate::database::mtgjson::parse_mtgjson_mana_cost(rest.trim());
         return Some(WardCost::Waterbend(cost));
+    }
+
+    // CR 702.21a + CR 122.1 + CR 104.3d: "get N <kind> counter(s)" — a
+    // player-counter ward cost (The Serpent Society: "Ward—Get five poison
+    // counters."). MUST run before the mana-cost fallback below, which
+    // otherwise silently parses unrecognized cost text with no mana
+    // symbols/braces as a free, always-paid Ward (phase-rs/phase#6640).
+    //
+    // One grammatical authority over the count/article, kind, and
+    // singular/plural axes — composed nom combinators, not string-suffix
+    // dispatch — so this parser family has a single production to extend
+    // rather than ad-hoc per-branch string handling.
+    if tag::<_, _, OracleError<'_>>("get ").parse(lower).is_ok() {
+        return match parse_get_player_counters_ward_cost(lower) {
+            Ok((_, cost)) => Some(cost),
+            // CR 702.21a: recognized as counter-shaped ("get ...") but the
+            // count, kind, or "counter(s)" tail didn't parse in full — fail
+            // closed rather than falling through to the mana-cost fallback
+            // below, which would otherwise silently produce a free,
+            // always-paid Ward for unsupported/malformed counter text
+            // (phase-rs/phase#6640's exact bug class, for different
+            // malformed input).
+            Err(_) => None,
+        };
     }
 
     // Fall back to mana cost parsing
@@ -1135,7 +1187,7 @@ fn parse_craft_materials(input: &str) -> Option<(&str, (TargetFilter, CostObject
     {
         return None;
     } else {
-        let (filter, rest) = parse_type_phrase(materials_text);
+        let (filter, rest) = parse_type_phrase_folding(materials_text);
         if !rest.trim().is_empty() {
             return None;
         }
@@ -1370,6 +1422,15 @@ pub(crate) fn parse_keyword_line_core(text: &str) -> Option<(Keyword, &str)> {
     // which would capture only N and silently drop the quality (the reported bug).
     if let Some(result) = parse_devour_keyword_line(text) {
         return Some(result);
+    }
+
+    // CR 702.119b: "Emerge from [quality] {cost}" replaces ordinary Emerge's
+    // creature sacrifice with a permanent matching the parsed quality.
+    if tag::<_, _, OracleError<'_>>("emerge from ")
+        .parse(text)
+        .is_ok()
+    {
+        return parse_emerge_from_quality_keyword_line(text);
     }
 
     if let Some(kw) = parse_firebending_keyword_line(text) {
@@ -1619,7 +1680,7 @@ pub(crate) fn parse_keyword_line_core(text: &str) -> Option<(Keyword, &str)> {
         }
     }
 
-    // CR 702.74a: "hideaway N" — parameterized keyword.
+    // CR 702.75a: "hideaway N" — parameterized keyword.
     // Delegates to nom combinator for number parsing.
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("hideaway ").parse(text) {
         if let Ok((rem, n)) = nom_primitives::parse_number.parse(rest.trim()) {
@@ -1675,6 +1736,30 @@ pub(crate) fn parse_keyword_line_core(text: &str) -> Option<(Keyword, &str)> {
             if rem.is_empty() {
                 return Some((Keyword::Discover(n), ""));
             }
+        }
+    }
+
+    // CR 702.174g: "Gift an extra turn". The article is part of the printed form
+    // and this kind takes "an", so the "gift a " scan below never saw it: the
+    // outer keyword scan then fell back to the bare `Gift` form, which defaults
+    // to `Card`, and Perch Protection promised a card draw instead of a turn
+    // (#7286).
+    //
+    // A separate scan rather than an `alt` over both articles, because an
+    // unknown "gift an [something]" must keep falling THROUGH to the outer scan
+    // exactly as it does today. CR 702.174i's Octopus is the live case
+    // (Octomancer, #5975) and has no `GiftKind` yet; folding it into the block
+    // below would turn its silent-`Card` parse into no keyword at all, which is
+    // a different wrong answer, in a card this change has no business touching.
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("gift an ").parse(text) {
+        use crate::types::keywords::GiftKind;
+        if let Ok((remainder, _)) = terminated(
+            tag::<_, _, OracleError<'_>>("extra turn"),
+            not(alphanumeric1),
+        )
+        .parse(rest)
+        {
+            return Some((Keyword::Gift(GiftKind::ExtraTurn), remainder));
         }
     }
 
@@ -1896,6 +1981,27 @@ pub(crate) fn parse_keyword_line_core(text: &str) -> Option<(Keyword, &str)> {
         return None;
     }
     Some((parsed, unconsumed))
+}
+
+/// CR 702.119b: Parse "emerge from [quality] {cost}" without swallowing a
+/// missing mana cost or semantic suffix. The type parser owns the quality grammar
+/// and the mana combinator leaves any trailing text for the strict router.
+fn parse_emerge_from_quality_keyword_line(text: &str) -> Option<(Keyword, &str)> {
+    let (after_prefix, _) = tag::<_, _, OracleError<'_>>("emerge from ")
+        .parse(text)
+        .ok()?;
+    let (sacrifice_filter, after_quality) = parse_type_phrase_folding(after_prefix);
+    if after_quality.len() == after_prefix.len() {
+        return None;
+    }
+    let (after_cost, _) = space1::<_, OracleError<'_>>.parse(after_quality).ok()?;
+    let upper_cost = after_cost.to_ascii_uppercase();
+    let (upper_remainder, mana_cost) = nom_primitives::parse_mana_cost(&upper_cost).ok()?;
+    let remainder = &after_cost[after_cost.len() - upper_remainder.len()..];
+    Some((
+        Keyword::Emerge(EmergeCost::from_quality(mana_cost, sacrifice_filter)),
+        remainder,
+    ))
 }
 
 /// Permissive, grant-context keyword parser. Returns the typed leading keyword
@@ -2366,6 +2472,7 @@ pub fn keyword_display_name(keyword: &Keyword) -> String {
         Keyword::Exploit => "exploit".to_string(),
         Keyword::Explore => "explore".to_string(),
         Keyword::Ascend => "ascend".to_string(),
+        Keyword::Storied => "storied".to_string(),
         Keyword::StartYourEngines => "start your engines!".to_string(),
         Keyword::Soulbond => "soulbond".to_string(),
         Keyword::Banding => "banding".to_string(),
@@ -2406,6 +2513,7 @@ pub fn keyword_display_name(keyword: &Keyword) -> String {
         Keyword::Gift(_) => "gift".to_string(),
         Keyword::Discover(n) => format!("discover {n}"),
         Keyword::Spree => "spree".to_string(),
+        Keyword::Tiered => "tiered".to_string(),
         Keyword::Ravenous => "ravenous".to_string(),
         Keyword::Daybound => "daybound".to_string(),
         Keyword::Nightbound => "nightbound".to_string(),
@@ -2709,7 +2817,7 @@ fn type_filter_subject_name(tf: &TypeFilter) -> String {
 /// exactly how a candidate recognizer starts silently swallowing card text.
 ///
 /// CR 702.29e adds the one NON-fixed rule (typecycling), handled separately below.
-pub(crate) const KEYWORD_COST_PREFIXES: [&str; 95] = [
+pub(crate) const KEYWORD_COST_PREFIXES: [&str; 97] = [
     "cycling",
     "basic landcycling",
     "flashback",
@@ -2799,8 +2907,10 @@ pub(crate) const KEYWORD_COST_PREFIXES: [&str; 95] = [
     "modular",
     "partner",
     "spree",
+    "tiered",
     "casualty",
     "bargain",
+    "storied",
     "demonstrate",
     "strive",
     "exploit",
@@ -2829,6 +2939,122 @@ mod tests {
     use super::*;
     use crate::types::ability::{AbilityCost, SacrificeCost};
     use crate::types::mana::ManaCost;
+    use crate::types::player::PlayerCounterKind;
+
+    #[test]
+    fn parse_keyword_line_core_emerge_from_artifact_preserves_quality() {
+        let (keyword, remainder) = parse_keyword_line_core("emerge from artifact {5}{b}{b}")
+            .expect("artifact-qualified Emerge must parse");
+        assert!(remainder.is_empty());
+        match keyword {
+            Keyword::Emerge(EmergeCost {
+                mana_cost,
+                sacrifice_filter: TargetFilter::Typed(filter),
+            }) => {
+                assert_eq!(
+                    mana_cost,
+                    ManaCost::Cost {
+                        shards: vec![ManaCostShard::Black, ManaCostShard::Black],
+                        generic: 5,
+                    }
+                );
+                assert_eq!(filter.type_filters, vec![TypeFilter::Artifact]);
+            }
+            other => panic!("expected artifact-qualified Emerge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_keyword_line_core_emerge_from_creature_preserves_quality() {
+        let (keyword, remainder) = parse_keyword_line_core("emerge from creature {3}{u}")
+            .expect("creature-qualified Emerge must parse");
+        assert!(remainder.is_empty());
+        match keyword {
+            Keyword::Emerge(EmergeCost {
+                mana_cost,
+                sacrifice_filter: TargetFilter::Typed(filter),
+            }) => {
+                assert_eq!(
+                    mana_cost,
+                    ManaCost::Cost {
+                        shards: vec![ManaCostShard::Blue],
+                        generic: 3,
+                    }
+                );
+                assert_eq!(filter.type_filters, vec![TypeFilter::Creature]);
+            }
+            other => panic!("expected creature-qualified Emerge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_keyword_line_core_emerge_from_quality_requires_mana_cost() {
+        assert!(parse_keyword_line_core("emerge from artifact").is_none());
+    }
+
+    #[test]
+    fn parse_router_keyword_line_emerge_from_quality_rejects_semantic_suffix() {
+        assert!(
+            parse_router_keyword_line("Emerge from artifact {5} if you control an Island")
+                .is_none(),
+            "a semantic suffix must remain unconsumed so the strict router declines the line"
+        );
+    }
+
+    #[test]
+    fn ward_get_poison_counters_parses_as_player_counter_cost() {
+        // Issue #6640 (The Serpent Society): "Ward—Get five poison counters."
+        // must not silently fall through to the mana-cost fallback.
+        let result = parse_ward_cost("Get five poison counters.");
+        assert_eq!(
+            result,
+            Some(Keyword::Ward(WardCost::GetPlayerCounters {
+                counter_kind: PlayerCounterKind::Poison,
+                count: 5,
+            }))
+        );
+    }
+
+    #[test]
+    fn ward_get_player_counters_accepts_digit_count_and_other_kinds() {
+        // Class-level coverage: digit form, and a non-poison counter kind.
+        let result = parse_ward_cost("Get 3 experience counters.");
+        assert_eq!(
+            result,
+            Some(Keyword::Ward(WardCost::GetPlayerCounters {
+                counter_kind: PlayerCounterKind::Experience,
+                count: 3,
+            }))
+        );
+    }
+
+    #[test]
+    fn ward_get_a_poison_counter_singular_defaults_to_count_one() {
+        let result = parse_ward_cost("Get a poison counter.");
+        assert_eq!(
+            result,
+            Some(Keyword::Ward(WardCost::GetPlayerCounters {
+                counter_kind: PlayerCounterKind::Poison,
+                count: 1,
+            }))
+        );
+    }
+
+    // Issue #6640 follow-up: counter-shaped "get ... counter(s)" text that
+    // fails to parse (malformed count, unknown kind) must fail closed
+    // (`None`) rather than silently falling through to the mana-cost
+    // fallback and becoming a free, always-paid Ward.
+    #[test]
+    fn ward_get_counters_with_unparseable_count_fails_closed() {
+        let result = parse_ward_cost("Get many poison counters.");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn ward_get_counters_with_unknown_kind_fails_closed() {
+        let result = parse_ward_cost("Get five sprocket counters.");
+        assert_eq!(result, None);
+    }
 
     #[test]
     fn parse_granted_keyword_fragment_cascade() {
@@ -3186,6 +3412,102 @@ mod tests {
     }
 
     #[test]
+    fn parse_oracle_text_extracts_storied_without_mtgjson_keyword_metadata() {
+        use crate::parser::oracle::parse_oracle_text;
+
+        for (name, text, types, subtypes) in [
+            (
+                "Balin, Loremaster",
+                "Storied (If you control three or more artifacts, legendaries, and/or Sagas, you have an enduring story for the rest of the game.)\nWhenever Balin or another Dwarf you control enters, you may discard your hand. Draw X cards, where X is the number of cards discarded this way. If you have an enduring story, Balin deals X damage to each opponent.",
+                &["Creature"],
+                &["Dwarf", "Wizard"],
+            ),
+            (
+                "Ori, Keeper of Songs",
+                "Storied (If you control three or more artifacts, legendaries, and/or Sagas, you have an enduring story for the rest of the game.)\nAs long as you have an enduring story, Ori gets +1/+0 and has vigilance.",
+                &["Creature"],
+                &["Dwarf", "Bard"],
+            ),
+        ] {
+            let parsed = parse_oracle_text(
+                text,
+                name,
+                &[],
+                &types.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                &subtypes.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            );
+
+            assert!(
+                parsed.extracted_keywords.contains(&Keyword::Storied),
+                "{name} must extract Storied when MTGJSON keyword metadata is absent: {:?}",
+                parsed.extracted_keywords
+            );
+            assert!(
+                parsed.abilities.is_empty(),
+                "{name} must not retain Storied as an unimplemented ability: {:?}",
+                parsed.abilities
+            );
+        }
+    }
+
+    /// CR 702.195a-b (Storied) + CR 502.3 (untap-step restriction): Bombur, Gentle
+    /// Dreamer pairs the already-implemented `Storied` keyword with a conditional
+    /// "doesn't untap ... unless you have an enduring story" restriction. This
+    /// full-card parse proves both halves land correctly in the SAME parse: the
+    /// `Storied` reminder-text keyword extraction is untouched, and the second line
+    /// becomes a `CantUntap` static gated on `Not(HasEnduringStory)` rather than an
+    /// `Effect::Unimplemented` swallow.
+    #[test]
+    fn parse_oracle_text_bombur_gentle_dreamer_storied_and_conditional_cant_untap() {
+        use crate::parser::oracle::parse_oracle_text;
+        use crate::types::ability::{StaticCondition, TargetFilter};
+        use crate::types::statics::StaticMode;
+
+        let parsed = parse_oracle_text(
+            "Storied (If you control three or more artifacts, legendaries, and/or Sagas, you have an enduring story for the rest of the game.)\nBombur doesn't untap during your untap step unless you have an enduring story.",
+            "Bombur, Gentle Dreamer",
+            &[],
+            &["Creature".to_string()],
+            &["Dwarf".to_string(), "Bard".to_string()],
+        );
+
+        // Storied itself must still be recognized exactly as it is on every other
+        // card that carries it (Balin, Ori) — this task must not touch that path.
+        assert!(
+            parsed.extracted_keywords.contains(&Keyword::Storied),
+            "Bombur must extract Storied: {:?}",
+            parsed.extracted_keywords
+        );
+
+        // No Unimplemented fallback ability anywhere in the parse.
+        assert!(
+            parsed.abilities.is_empty(),
+            "Bombur must not retain any unimplemented fallback ability: {:?}",
+            parsed.abilities
+        );
+
+        // The "doesn't untap ... unless ..." line must become exactly one CantUntap
+        // static, self-targeted, gated on the negated enduring-story condition.
+        assert_eq!(
+            parsed.statics.len(),
+            1,
+            "expected exactly one static (CantUntap), got {:?}",
+            parsed.statics
+        );
+        let cant_untap = &parsed.statics[0];
+        assert_eq!(cant_untap.mode, StaticMode::CantUntap);
+        assert_eq!(cant_untap.affected, Some(TargetFilter::SelfRef));
+        assert_eq!(
+            cant_untap.condition,
+            Some(StaticCondition::Not {
+                condition: Box::new(StaticCondition::HasEnduringStory),
+            }),
+            "unless-clause must negate HasEnduringStory, got {:?}",
+            cant_untap.condition
+        );
+    }
+
+    #[test]
     fn parse_granted_keyword_fragment_toxic() {
         // CR 702.164: Toxic N — parameterized keyword from Oracle text
         let kw = parse_granted_keyword_fragment("toxic 2").unwrap();
@@ -3397,11 +3719,52 @@ mod tests {
         assert_eq!(kw, Keyword::Gift(GiftKind::TappedFish));
     }
 
+    /// CR 702.174g: the article is part of the printed form and this is the one
+    /// kind that takes "an". Matching only "gift a " dropped it, and the outer
+    /// scan fell back to the bare `Gift` form, which defaults to `Card` — Perch
+    /// Protection promised a card draw instead of a turn (#7286).
+    #[test]
+    fn parse_granted_keyword_fragment_gift_an_extra_turn() {
+        use crate::types::keywords::GiftKind;
+        let kw = parse_granted_keyword_fragment("gift an extra turn").unwrap();
+        assert_eq!(kw, Keyword::Gift(GiftKind::ExtraTurn));
+    }
+
+    #[test]
+    fn router_gift_an_extra_turn_preserves_the_tail() {
+        use crate::types::keywords::GiftKind;
+
+        assert!(matches!(
+            parse_router_keyword_line("Gift an extra turn.").and_then(|routed| routed.keyword),
+            Some(Keyword::Gift(GiftKind::ExtraTurn))
+        ));
+        assert!(
+            parse_router_keyword_line("Gift an extra turn if you control a Bird").is_none(),
+            "a semantic suffix must remain unconsumed so the strict router declines the line"
+        );
+    }
+
+    /// The other "an" form, CR 702.174i's Octopus, has no `GiftKind` yet
+    /// (Octomancer, #5975). It must keep falling THROUGH the new scan to the
+    /// same answer it gave before, so this change touches exactly one card.
+    #[test]
+    fn parse_granted_keyword_fragment_gift_an_octopus_is_unchanged() {
+        assert_eq!(parse_granted_keyword_fragment("gift an octopus"), None);
+    }
+
     #[test]
     fn gift_is_keyword_cost_line() {
         assert!(is_keyword_cost_line("gift a card"));
         assert!(is_keyword_cost_line("gift a treasure"));
         assert!(is_keyword_cost_line("gift a tapped fish"));
+    }
+
+    /// CR 702.183a: the Tiered header is a bare keyword line. It is consumed at
+    /// Priority 0 by the modal block (`parse_oracle_block`), so the candidate
+    /// recognizer must nominate it exactly as it does Spree's.
+    #[test]
+    fn tiered_is_keyword_cost_line() {
+        assert!(is_keyword_cost_line("tiered"));
     }
 
     #[test]
@@ -5568,8 +5931,18 @@ mod router_registry_tests {
             reach: ProductionReach::SpecializedTypedRoute,
         },
         RouterKeywordCase {
+            prefix: "tiered",
+            valid_line: "Tiered",
+            reach: ProductionReach::SpecializedTypedRoute,
+        },
+        RouterKeywordCase {
             prefix: "bargain",
             valid_line: "Bargain",
+            reach: ProductionReach::KeywordCostLine,
+        },
+        RouterKeywordCase {
+            prefix: "storied",
+            valid_line: "Storied",
             reach: ProductionReach::KeywordCostLine,
         },
         RouterKeywordCase {
@@ -5690,7 +6063,7 @@ mod router_registry_tests {
         // "Champion an Elf", "Splice onto Arcane {G}", "Craft with Cave {5}{G}",
         // bare "Partner", "Bloodthirst 1" — so the mana-cost combinator cannot
         // measure where the parameter ends, and each needs its own
-        // remainder-preserving noun/filter sub-parser (`parse_type_phrase` already
+        // remainder-preserving noun/filter sub-parser (`parse_type_phrase_folding` already
         // returns a remainder and is the obvious substrate).
         //
         // Pinned as an EXACT set so the gate still bites: a NEW leaking family, or a

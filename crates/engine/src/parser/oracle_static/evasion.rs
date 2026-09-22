@@ -13,50 +13,6 @@ pub(crate) fn parse_min_blockers_phrase(input: &str) -> OracleResult<'_, u32> {
     Ok((rest, n))
 }
 
-pub(crate) fn parse_source_power_block_restriction(text: &str) -> Option<StaticDefinition> {
-    let lower = text.to_lowercase();
-    let (rest, _) = tag::<_, _, OracleError<'_>>("creatures with power less than ")
-        .parse(lower.as_str())
-        .ok()?;
-    let (rest, _) = alt((
-        tag::<_, _, OracleError<'_>>("~'s power"),
-        tag("this creature's power"),
-    ))
-    .parse(rest)
-    .ok()?;
-    let (rest, _) = tag::<_, _, OracleError<'_>>(" can't block ")
-        .parse(rest)
-        .ok()?;
-    let (rest, _) = tag::<_, _, OracleError<'_>>("creatures you control")
-        .parse(rest)
-        .ok()?;
-    let (rest, _) = opt(tag::<_, _, OracleError<'_>>(".")).parse(rest).ok()?;
-    if !rest.trim().is_empty() {
-        return None;
-    }
-
-    Some(
-        StaticDefinition::new(StaticMode::CantBeBlockedBy {
-            filter: TargetFilter::Typed(TypedFilter::creature().properties(vec![
-                FilterProp::PtComparison {
-                    stat: PtStat::Power,
-                    scope: PtValueScope::Current,
-                    comparator: Comparator::LT,
-                    value: QuantityExpr::Ref {
-                        qty: QuantityRef::Power {
-                            scope: ObjectScope::Source,
-                        },
-                    },
-                },
-            ])),
-        })
-        .affected(TargetFilter::Typed(
-            TypedFilter::creature().controller(ControllerRef::You),
-        ))
-        .description(text.to_string()),
-    )
-}
-
 /// CR 509.1b: classify the remainder after "can't be blocked except by " into a
 /// typed `BlockExceptionKind`. A leading count phrase ("N or more creatures")
 /// is a minimum-blocker constraint; everything else is a per-blocker quality
@@ -110,13 +66,12 @@ fn strip_redundant_block_exception_by(filter_text: &str) -> Cow<'_, str> {
 /// Oracle text. Trigger doublers name the doubled ability's source as
 /// "a triggered ability of <SOURCE>" — e.g. "a Ninja creature you control"
 /// (Splinter), "another creature you control of the chosen type" (Roaming
-/// Throne), or the unrestricted "a permanent you control" (Panharmonicon-class).
+/// Throne), or "a permanent you control" (Panharmonicon-class).
 ///
-/// Returns `Some(filter)` only when `<SOURCE>` narrows beyond a bare controlled
-/// permanent (a subtype, a specific core type, or a property such as "another"
-/// / "of the chosen type"). A bare "permanent you control" needs no filter —
-/// `apply_trigger_doubling`'s controller match already enforces control — so
-/// this returns `None`, leaving `affected` unset (Panharmonicon/Isshin/Drivnod).
+/// Returns `Some(filter)` when `<SOURCE>` supplies a source-domain constraint.
+/// In particular, "permanent you control" must remain a `Permanent` filter:
+/// the controller check alone would also admit spell-source triggers such as
+/// Storm, which this phrase does not name.
 ///
 /// CR 603.2d: The source may itself be a flat disjunction of typed clauses
 /// sharing one trailing controller scope — "a Shaman or another Wizard you
@@ -137,9 +92,9 @@ pub(crate) fn parse_doubler_source_filter(lower: &str) -> Option<TargetFilter> {
         .parse(i)
     })?;
 
-    // Parse the leading typed clause. A bare controlled permanent
-    // ("a permanent you control", Panharmonicon) adds nothing the controller
-    // match doesn't already enforce, so an unrestrictive clause yields `None`.
+    // Parse the leading typed clause. A bare controlled permanent remains a
+    // source-domain constraint: the controller match cannot distinguish a
+    // permanent's triggered ability from a spell's triggered ability.
     let (first, remainder) = parse_doubler_disjunct(source_phrase);
     if !doubler_source_is_restrictive(&first) {
         return None;
@@ -147,7 +102,7 @@ pub(crate) fn parse_doubler_source_filter(lower: &str) -> Option<TargetFilter> {
 
     // CR 603.2d: The source may be a flat type union sharing one trailing
     // controller scope — "a Shaman or another Wizard you control" (Harmonic
-    // Prodigy). `parse_type_phrase`'s own disjunction recursion only fires when
+    // Prodigy). `parse_type_phrase_folding`'s own disjunction recursion only fires when
     // the trailing disjunct opens with a bare type word, not an article or an
     // "another"/"other" designation ("another Wizard"), so it stops after the
     // first disjunct and leaves the connector in the remainder. Dispatch on that
@@ -161,12 +116,10 @@ pub(crate) fn parse_doubler_source_filter(lower: &str) -> Option<TargetFilter> {
     let mut branches = vec![first];
     loop {
         let (filter, remainder) = parse_doubler_disjunct(rest);
-        // Each disjunct must independently narrow to a restrictive typed clause.
+        // Each disjunct must independently name a source-domain constraint.
         // If one does not — e.g. a stray "or" inside an unrelated suffix
-        // ("power 4 or greater") split the phrase mid-clause — bail so the
-        // doubler falls back to its conservative controller-only scope. This
-        // keeps the fallback strictly safe: a mis-parse can only widen back to
-        // "all your triggers", never narrow to a wrong subset.
+        // ("power 4 or greater") split the phrase mid-clause — abort the
+        // union extraction instead of constructing a partial source scope.
         if !doubler_source_is_restrictive(&filter) {
             return None;
         }
@@ -198,20 +151,18 @@ fn doubler_disjunct_connector(input: &str) -> OracleResult<'_, ()> {
     .parse(input)
 }
 
-/// CR 603.2d: A doubler `affected` filter must narrow beyond a bare controlled
-/// permanent — `apply_trigger_doubling`'s controller match already enforces
-/// control, so `Permanent`/`Card`/`Any` core types add nothing. A clause is
-/// restrictive when it carries a concrete type/subtype restriction or any
-/// property (subtype designations, "another", "of the chosen type", etc.).
+/// CR 603.2d: A doubler `affected` filter must name a source-domain constraint.
+/// `Permanent` is a real constraint because spells are not permanents; `Card`
+/// and `Any` alone do not constrain the source. A clause is therefore valid
+/// when it carries a permanent or concrete type/subtype restriction, or a
+/// property such as "another" / "of the chosen type".
 fn doubler_source_is_restrictive(filter: &TargetFilter) -> bool {
     match filter {
         TargetFilter::Typed(tf) => {
-            tf.type_filters.iter().any(|t| {
-                !matches!(
-                    t,
-                    TypeFilter::Permanent | TypeFilter::Card | TypeFilter::Any
-                )
-            }) || !tf.properties.is_empty()
+            tf.type_filters
+                .iter()
+                .any(|t| !matches!(t, TypeFilter::Card | TypeFilter::Any))
+                || !tf.properties.is_empty()
         }
         TargetFilter::Or { filters } => filters.iter().all(doubler_source_is_restrictive),
         // CR 603.2d: "a triggered ability of ~" names the doubler's own source
@@ -223,13 +174,13 @@ fn doubler_source_is_restrictive(filter: &TargetFilter) -> bool {
 }
 
 /// CR 603.2d + CR 301.5a: Parse one disjunct of a trigger-doubler's source
-/// phrase, handling the two source-relative referents `parse_type_phrase` cannot
+/// phrase, handling the two source-relative referents `parse_type_phrase_folding` cannot
 /// express before falling back to it for ordinary typed clauses:
 /// - `~` — the normalized source name → [`TargetFilter::SelfRef`] (Cloud doubling
 ///   "a triggered ability of ~").
 /// - "an Equipment attached to it" — here "it" is anaphoric on the doubler's own
 ///   source, so it is the source-relative [`FilterProp::AttachedToSource`] set.
-///   `parse_type_phrase` maps "attached to it" to `AttachedToRecipient` (an
+///   `parse_type_phrase_folding` maps "attached to it" to `AttachedToRecipient` (an
 ///   enchanted-creature host), which is the wrong referent in a doubler, so this
 ///   clause is hand-built.
 fn parse_doubler_disjunct(phrase: &str) -> (TargetFilter, &str) {
@@ -251,7 +202,7 @@ fn parse_doubler_disjunct(phrase: &str) -> (TargetFilter, &str) {
     {
         return (filter, rest);
     }
-    parse_type_phrase(phrase)
+    parse_type_phrase_folding(phrase)
 }
 
 pub(crate) fn parse_max_combat_creatures_static(lower: &str) -> Option<StaticMode> {
@@ -272,6 +223,19 @@ pub(crate) fn parse_max_combat_creatures_static(lower: &str) -> Option<StaticMod
                 defender: Some(AttackDefenderScope::Controller),
             },
             tag::<_, _, OracleError<'_>>(" can attack you each combat"),
+        ),
+        // CR 508.5: "...can attack ~ each combat" is a defending-PERMANENT-
+        // scoped cap (The Eternal Wanderer) — only attacks declared against
+        // this static's own source (a planeswalker or battle), not against its
+        // controller's other permanents. Self-ref normalization rewrites the
+        // card's own name to `~` before this parser runs. Must precede the
+        // bare " can attack each combat" arm (longest match first).
+        value(
+            StaticMode::MaxAttackersEachCombat {
+                max,
+                defender: Some(AttackDefenderScope::ThisPermanent),
+            },
+            tag(" can attack ~ each combat"),
         ),
         value(
             StaticMode::MaxAttackersEachCombat {
@@ -354,7 +318,7 @@ fn parse_compound_subject_rule_static_inner(
         predicates
             .into_iter()
             .map(|(predicate, defended)| {
-                lower_rule_static(predicate, affected.clone(), text).attack_defended(defended)
+                lower_rule_static(predicate, None, affected.clone(), text).attack_defended(defended)
             })
             .collect(),
     )
@@ -432,12 +396,12 @@ pub(crate) fn parse_leading_except_for_rule_static(
 /// [`parse_leading_except_for_rule_static`]: a bare type-phrase exemption
 /// ("artifact creatures") or a named exemption within a type class ("creatures
 /// named Akron Legionnaire"). The " named " split happens BEFORE
-/// `parse_type_phrase` runs (mirroring `parse_control_named_type_filter` in
-/// `oracle_nom/condition.rs`) — `parse_type_phrase` has no grammar for a
+/// `parse_type_phrase_folding` runs (mirroring `parse_control_named_type_filter` in
+/// `oracle_nom/condition.rs`) — `parse_type_phrase_folding` has no grammar for a
 /// trailing "named `<Name>`" clause and would otherwise leave it unconsumed.
 fn parse_exempt_conjunct(conjunct: &str) -> Option<TargetFilter> {
     if let Ok((_, (type_text, name_text))) = nom_primitives::split_once_on(conjunct, " named ") {
-        let (filter, remainder) = parse_type_phrase(type_text);
+        let (filter, remainder) = parse_type_phrase_folding(type_text);
         // `merge_filter_prop` silently no-ops on a non-`Typed` filter (Or/And/
         // SelfRef/…), which would drop the Named constraint and over-claim
         // every object of the bare type instead of just the named one — fail
@@ -456,7 +420,7 @@ fn parse_exempt_conjunct(conjunct: &str) -> Option<TargetFilter> {
             },
         ));
     }
-    let (filter, remainder) = parse_type_phrase(conjunct);
+    let (filter, remainder) = parse_type_phrase_folding(conjunct);
     if remainder.trim().is_empty() && !matches!(filter, TargetFilter::Any) {
         return Some(filter);
     }
@@ -511,7 +475,7 @@ pub(crate) fn parse_compound_subject_keyword_static(
     // leading comma leaves the 2-item path's existing fallthrough to
     // `parse_rule_static_subject_filter` (which itself resolves an object
     // subject with an internal bare "and", e.g. "artifacts and creatures you
-    // control", via `parse_type_phrase`'s own trailing-suffix distribution)
+    // control", via `parse_type_phrase_folding`'s own trailing-suffix distribution)
     // completely unchanged.
     let (after_you, multi_object) = match nom_tag_tp(&body, "you, ") {
         Some(rest) => (rest, true),
@@ -590,7 +554,7 @@ pub(crate) fn parse_compound_subject_keyword_static(
 /// other creatures you control".
 ///
 /// Each conjunct is a COMPLETE, independently-resolvable subject phrase — unlike
-/// the Silkguard-class object list in `parse_type_phrase` (`oracle_target.rs`),
+/// the Silkguard-class object list in `parse_type_phrase_folding` (`oracle_target.rs`),
 /// where a single trailing suffix distributes backward across bare type nouns
 /// with no clause of their own ("Auras, Equipment, and modified creatures you
 /// control"). So every conjunct here is resolved one at a time through the same
@@ -598,7 +562,7 @@ pub(crate) fn parse_compound_subject_keyword_static(
 /// bespoke list grammar. Splitting is nom-based (`split_once_on`), peeling
 /// `", "`-separated conjuncts and stripping the final conjunct's `"and "`
 /// connector — never a bare `" and "` split, so the 2-item form's own
-/// internal-"and" handling (via `parse_type_phrase`'s trailing-suffix
+/// internal-"and" handling (via `parse_type_phrase_folding`'s trailing-suffix
 /// distribution) is never shadowed.
 ///
 /// Declines (returns `None`, the strict-fail signal) if any conjunct fails to
@@ -828,7 +792,7 @@ pub(crate) fn is_extra_blockers_static_candidate(lower: &str) -> bool {
 ///   old single `tag`, so unfiltered lines are unchanged.
 /// - Slot B — "<type-phrase> able to block " (Talruum Piper "creatures with
 ///   flying", Marble Priest "Walls") → `Some(filter)`. The type slot is parsed by
-///   the shared `parse_type_phrase` building block; the phrase must fully consume
+///   the shared `parse_type_phrase_folding` building block; the phrase must fully consume
 ///   up to the literal " able to block " (else the Some form is rejected as
 ///   mis-scoped and this returns `None`, letting the line fall through).
 ///
@@ -845,12 +809,12 @@ pub(crate) fn parse_forced_block_blocker_slot(input: &str) -> Option<(&str, Opti
         return Some((rest, None));
     }
     // Slot B: "<type-phrase> able to block " → Some(filter). Scope the type phrase
-    // to the text before the literal " able to block " so `parse_type_phrase`
+    // to the text before the literal " able to block " so `parse_type_phrase_folding`
     // cannot over-consume into the subject.
     let (rest, type_text) = take_until::<_, _, OracleError<'_>>(" able to block ")
         .parse(input)
         .ok()?;
-    let (filter, filter_remainder) = parse_type_phrase(type_text);
+    let (filter, filter_remainder) = parse_type_phrase_folding(type_text);
     if !filter_remainder.trim().is_empty() {
         return None; // mis-scoped Some — reject rather than accept a partial filter.
     }
@@ -1044,7 +1008,7 @@ pub(crate) fn try_split_and_must_attack_block(text: &str) -> Option<Vec<StaticDe
     }
     for (predicate, defended) in tail_predicates {
         let mut companion =
-            lower_rule_static(predicate, affected.clone(), text).attack_defended(defended);
+            lower_rule_static(predicate, None, affected.clone(), text).attack_defended(defended);
         if let Some(condition) = condition.clone() {
             companion = companion.condition(condition);
         }
@@ -1231,7 +1195,16 @@ pub(crate) fn try_split_and_doesnt_untap(text: &str) -> Option<Vec<StaticDefinit
     let affected = defs[0].affected.clone()?;
     // CR 502.3: a trailing "as long as …"/"if …" rider on the untap clause
     // belongs on the CantUntap companion; otherwise inherit the grant's gate.
-    let condition = extract_cant_untap_condition(&lower).or_else(|| defs[0].condition.clone());
+    // An inherited gate has to clear the same untap-step enforceability bar as a
+    // rider — the first conjunct's own enforcement point may supply a binding
+    // authority (a recipient, a combat anchor) that CR 502.3's turn-based untap
+    // never does, so it cannot be copied onto a CantUntap unchecked.
+    let condition = extract_cant_untap_condition(&lower).or_else(|| {
+        defs[0]
+            .condition
+            .clone()
+            .map(|inherited| gate_cant_untap_condition(inherited, text))
+    });
     let mut companion = StaticDefinition::new(StaticMode::CantUntap)
         .affected(affected)
         .description(text.to_string());
@@ -1750,7 +1723,7 @@ pub(crate) fn cant_be_blocked_mode(clause: &str) -> Option<(StaticMode, Option<S
         let (filter, remainder) = if let Some(filter) = parse_chosen_qualifier_subject(&filter_tp) {
             (filter, "")
         } else {
-            parse_type_phrase(filter_text)
+            parse_type_phrase_folding(filter_text)
         };
         if !matches!(filter, TargetFilter::Any) {
             let condition = parse_compound_cant_be_blocked_condition(remainder);
@@ -2311,7 +2284,20 @@ pub(crate) fn parse_subject_rule_static(text: &str) -> Option<StaticDefinition> 
                 .affected(affected.clone())
                 .description(text.to_string());
             if let Some(c) = condition {
-                def.condition = Some(c);
+                // `cant_be_blocked_mode`'s fallthrough runs the whole tail
+                // through `nom_condition::parse_condition`, whose `"unless "`
+                // branch can yield a raw CR 118.12a `UnlessPay` (a subject-led
+                // Awesome Presence phrasing reaches here). `CantBeBlocked` has no
+                // block-declaration payment prompt, so the gate defers it to the
+                // inert marker: a gap that evaluated `true` forever would make
+                // the creature UNCONDITIONALLY unblockable — stripping the
+                // defending player's printed escape hatch, not inventing an
+                // evasion out of nothing (the card DOES grant this evasion, but
+                // only while the tax goes unpaid). The inert marker evaluates
+                // `false`, which is exactly what the ungated raw `UnlessPay`
+                // already does at runtime, so deferring the gate leaves
+                // rules-visible behavior unchanged.
+                attach_gated_condition(&mut def, c, clause);
             }
             return Some(def);
         }
@@ -2330,10 +2316,23 @@ pub(crate) fn parse_subject_rule_static(text: &str) -> Option<StaticDefinition> 
             unless.lower.trim_end_matches('.'),
         ) {
             let predicate = parse_rule_static_predicate(base.original)?;
-            let mut def = lower_rule_static(predicate, affected, text);
-            def.condition = Some(StaticCondition::Not {
-                condition: Box::new(control),
-            });
+            let mut def = lower_rule_static(predicate, None, affected, text);
+            // `parse_rule_static_predicate` can yield `RuleStaticPredicate::CantUntap`,
+            // and this branch runs BEFORE the dedicated `CantUntap` arm below —
+            // so for `"doesn't untap … unless you control X"` phrasing it is the
+            // site that decides the gate. It therefore has to clear the same
+            // enforcement-point bar as every other attachment site rather than
+            // assigning straight through. `parse_control_conditions` only ever
+            // emits enforceable leaves today, so the gate is inert here; routing
+            // it anyway is what keeps `attach_gated_condition` an actual single
+            // authority instead of a documented-but-bypassed one.
+            attach_gated_condition(
+                &mut def,
+                StaticCondition::Not {
+                    condition: Box::new(control),
+                },
+                unless.original.trim().trim_end_matches('.'),
+            );
             return Some(def);
         }
     }
@@ -2342,7 +2341,9 @@ pub(crate) fn parse_subject_rule_static(text: &str) -> Option<StaticDefinition> 
         parse_combat_rule_static_predicate_with_defended_nom(predicate_text)
     {
         if rest.trim().is_empty() {
-            return Some(lower_rule_static(predicate, affected, text).attack_defended(defended));
+            return Some(
+                lower_rule_static(predicate, None, affected, text).attack_defended(defended),
+            );
         }
     }
 
@@ -2351,12 +2352,12 @@ pub(crate) fn parse_subject_rule_static(text: &str) -> Option<StaticDefinition> 
     if matches!(predicate, RuleStaticPredicate::CantUntap) {
         let pred_lower = predicate_text.to_lowercase();
         if let Some(condition) = extract_cant_untap_condition(&pred_lower) {
-            let mut def = lower_rule_static(predicate, affected, text);
+            let mut def = lower_rule_static(predicate, None, affected, text);
             def.condition = Some(condition);
             return Some(def);
         }
     }
-    Some(lower_rule_static(predicate, affected, text))
+    Some(lower_rule_static(predicate, None, affected, text))
 }
 
 /// CR 509.1b + CR 609.4 + CR 702.14c + CR 702.14d:
@@ -2396,9 +2397,10 @@ pub(crate) fn try_parse_ignore_landwalk_for_blocking(
     )
 }
 
-/// CR 508.1d + CR 508.1h + CR 509.1c + CR 118.12a: Parse the combat-tax static family:
+/// CR 508.1b-c + CR 508.1h + CR 509.1c + CR 118.12a: Parse the combat-tax static family:
 ///
-/// - "Creatures can't attack [you | you or planeswalkers you control] unless their
+/// - "Creatures can't attack [you | planeswalkers you control | you or planeswalkers
+///   you control] unless their
 ///   controller pays {N} [for each of those creatures][, where X is the number of
 ///   <filter>][.]"
 /// - "Creatures can't block unless their controller pays {N} [for each of those
@@ -2431,11 +2433,23 @@ pub(crate) fn parse_combat_tax_static(tp: &TextPair<'_>, text: &str) -> Option<S
     let mut def = StaticDefinition::new(mode)
         .affected(affected)
         .description(text.to_string());
-    def.condition = Some(StaticCondition::UnlessPay {
-        cost: base_cost,
-        scaling,
-        defended,
-    });
+    // Routed through the acceptance authority rather than assigned directly, so
+    // the "single authority" claim on `attach_gated_condition` is ENFORCED here
+    // instead of merely documented. This is a provable no-op today:
+    // `parse_combat_tax_body`'s mode `alt` yields only `CantAttackOrBlock` /
+    // `CantAttack` / `CantBlock`, which are exactly the modes
+    // `combat::combat_tax_mode_matches` taxes, so the gate always accepts. It
+    // stops being a no-op the day this parser learns a mode the combat-tax
+    // prompt does not walk — which is the moment the gap must be reported.
+    attach_gated_condition(
+        &mut def,
+        StaticCondition::UnlessPay {
+            cost: base_cost,
+            scaling,
+            defended,
+        },
+        original,
+    );
     Some(def)
 }
 
@@ -2445,22 +2459,232 @@ pub(crate) fn parse_subject_combat_rule_static(text: &str) -> Option<StaticDefin
         &lower,
         parse_combat_rule_static_predicate_with_defended_nom,
     )?;
+    // CR 509.1b + CR 604.1 (#7454): "<subject> can't block or be blocked by
+    // <object>" is a CONJUNCTION of two opposite-direction restrictions sharing
+    // ONE printed object, so it needs one definition per direction and belongs to
+    // `parse_symmetric_block_conjunction_static` on the multi-static path. This
+    // production returns ONE definition, so it is never the owner — decline the
+    // shape here, BEFORE the object is attempted, so an object this grammar
+    // cannot yet express declines too. Without this the object parse fails, the
+    // clause reaches the trailing-`unless` branch at the bottom of this function,
+    // and the whole line lowers to the INVERSE blanket `CantBlock` with the rider
+    // attached: it invents a restriction the card lacks (the subject could never
+    // block anything) and drops the one it prints, while the coverage anchor for
+    // `CantBlock` passes vacuously on the same "can't block" substring.
+    //
+    // The shared marker is applied POSITIONALLY — at the offset where THIS
+    // production's own predicate matched, `subject_lower` being the text before
+    // it — never scanned across the whole line. That distinction is load-bearing,
+    // and the two kinds of line that merely CONTAIN the phrase in a different
+    // clause are protected by DIFFERENT mechanisms:
+    //
+    //  * a quoted granted ability ("Spirits you control have \"This creature
+    //    can't block or be blocked by non-Spirit creatures.\"") is owned by
+    //    `anthem::parse_subject_continuous_static`, dispatched at
+    //    `dispatch.rs:1818` — well before this production at `dispatch.rs:2261` —
+    //    so it has already returned and nothing at THIS seam can reach it. Only a
+    //    line-wide gate hoisted to the TOP of `parse_static_line_inner` would
+    //    endanger it.
+    //  * a sibling `can't attack` sentence is owned by THIS VERY PRODUCTION, not
+    //    by some other arm: "Beasts can't attack unless you control a Wall. Beasts
+    //    can't block or be blocked by Walls." lowers HERE to mode `CantAttack` with
+    //    `affected: Typed(Beast)` plus the rider (measured) — a subject scope the
+    //    SelfRef-only terminal `can't attack` arm cannot produce. It
+    //    survives because `scan_preceded` matches this function's predicate at the
+    //    FIRST word boundary that parses, the `can't attack` offset, and the marker
+    //    check at THAT offset does not match. A line-wide gate here would decline
+    //    the line and destroy this production's own correct output; that, measured,
+    //    is why the check is positional.
+    //
+    // Sibling guard: the terminal blanket `can't block` arm in `dispatch.rs`,
+    // which is inside that arm and so may scan the line — with the one residual
+    // its line-wide scan implies (reversed sentence order, no card impact)
+    // recorded on `parse_cant_block_or_be_blocked_by_marker`'s doc comment.
+    if super::shared::parse_cant_block_or_be_blocked_by_marker(&lower[subject_lower.len()..])
+        .is_ok()
+    {
+        return None;
+    }
+    // CR 509.1b: the optional OBJECT of a blocking prohibition — "<subject>
+    // can't block <object>" (Gornog, the Red Reaper; Bower Passage; Hinterland
+    // Drake). The blocker-side mirror of `defended` (CR 508.1b) on the attack
+    // side, consumed here so the object composes with this function's shared
+    // subject scoping and trailing-condition handling below rather than needing
+    // a parallel arm that would reach neither.
+    let (rest, block_object, object_is_source) = match predicate {
+        RuleStaticPredicate::CantBlock => match opt(preceded(
+            tag::<_, _, OracleError<'_>>(" "),
+            alt((
+                nom_target::parse_self_reference,
+                super::shared::parse_block_object_filter,
+            )),
+        ))
+        .parse(rest)
+        {
+            // `it`, `this creature`, `this permanent`, and `~` name the static's
+            // source. The restriction is therefore attacker-side:
+            // the source can't be blocked by the parsed subject filter.
+            Ok((after, Some(TargetFilter::SelfRef))) => (after, None, true),
+            Ok((after, Some(object))) => (after, Some(object), false),
+            _ => (rest, None, false),
+        },
+        _ => (rest, None, false),
+    };
     let (rest, _) = opt(tag::<_, _, OracleError<'_>>(".")).parse(rest).ok()?;
     let subject = text[..subject_lower.len()].trim();
     let affected = parse_rule_static_subject_filter(subject)?;
-    let mut def = lower_rule_static(predicate, affected, text).attack_defended(defended);
+    let mut def = if object_is_source {
+        StaticDefinition::new(StaticMode::CantBeBlockedBy { filter: affected })
+            .affected(TargetFilter::SelfRef)
+            .description(text.to_string())
+    } else {
+        lower_rule_static(predicate, block_object, affected, text).attack_defended(defended)
+    };
     let trailing = rest.trim();
     if trailing.is_empty() {
         return Some(def);
     }
-    if let Some(unless_cond) = {
-        let tp = TextPair::new(text, &lower);
-        super::shared::parse_unless_static_condition(&tp)
-    } {
-        def.condition = Some(unless_cond);
+    let tp = TextPair::new(text, &lower);
+    if let Some(unless_cond) =
+        super::shared::parse_unless_static_condition(&tp, def.affected.as_ref())
+    {
+        // CR 118.12a: `parse_unless_static_condition` passes an `UnlessPay` leaf
+        // through RAW (no `Not` wrapper), so this site can attach a payment gate
+        // to whatever mode the predicate lowered to — including `BlockRestriction`
+        // (Hipparion: "This creature can't block creatures with power 3 or
+        // greater unless you pay {1}", which `lower_rule_static` turns into
+        // `BlockRestriction { Not(power>=3) }`) and `CantBeBlockedBy`. Neither is
+        // in the combat-tax enforcement set (CR 509.1c is offered only for
+        // `CantAttack`/`CantBlock`/`CantAttackOrBlock`; see
+        // `combat::combat_tax_mode_matches`), so the gate defers those to an
+        // honest gap instead of a condition no player can ever satisfy.
+        let gap_text = tp.split_around(" unless ").map_or_else(
+            || trailing.to_string(),
+            |(_, after)| after.original.trim().trim_end_matches('.').to_string(),
+        );
+        attach_gated_condition(&mut def, unless_cond, &gap_text);
         return Some(def);
     }
     None
+}
+
+/// CR 102.2 / CR 102.3 + CR 508.1b / CR 508.1d: the required defending player
+/// class after "attacks ". Currently "a[n] opponent[ with the most life [among
+/// your opponents]]". CR 102.2 (two-player) / CR 102.3 (team multiplayer) scope
+/// the candidate set to opponents. This lowers to a static attack REQUIREMENT (CR
+/// 508.1d), re-evaluated each declare-attackers step; when the class holds more
+/// than one legal defender (e.g. a most-life tie) CR 508.1b — the active player
+/// announcing which player each attacker attacks — is where the player picks among
+/// the tied legal defenders. NOT CR 608.2d: that rule governs choices offered
+/// while resolving a spell or ability, not this continuous static requirement.
+/// Structured as sequential combinators so a future "a[n] player" (relation `All`)
+/// arm slots in without disturbing the opponent path. Reuses the shared
+/// `parse_opponent_most_life_restriction` selector rather than re-deriving the
+/// `PlayerAttribute` shape.
+fn parse_required_defender_selector(input: &str) -> OracleResult<'_, PlayerFilter> {
+    let (input, _) = alt((tag::<_, _, OracleError<'_>>("an "), tag("a "))).parse(input)?;
+    let (input, _) = tag("opponent").parse(input)?;
+    // Optional "with the most life [among your opponents]" qualifier; fall back to
+    // the bare `Opponent` class when the qualifier is absent ("an opponent").
+    match super::oracle_effect::parse_opponent_most_life_restriction(input) {
+        Ok((rest, filter)) => Ok((rest, filter)),
+        Err(_) => Ok((input, PlayerFilter::Opponent)),
+    }
+}
+
+/// CR 508.1d: `attacks <player-class> each combat if able` — the required-attack
+/// predicate. Consumes the verb, the defender selector, and the recurring-combat
+/// suffix, returning the selected `PlayerFilter` for the required defender.
+fn parse_attacks_required_defender_nom(input: &str) -> OracleResult<'_, PlayerFilter> {
+    let (input, _) = tag::<_, _, OracleError<'_>>("attacks ").parse(input)?;
+    let (input, filter) = parse_required_defender_selector(input)?;
+    let (input, _) = alt((
+        tag::<_, _, OracleError<'_>>(" each combat if able"),
+        tag(" each turn if able"),
+    ))
+    .parse(input)?;
+    Ok((input, filter))
+}
+
+/// CR 508.1d + CR 508.1b + CR 604.1 / CR 604.2 + CR 102.2 / CR 102.3: "<subject>
+/// attacks <player-class> each combat if able [unless <condition>]" — a static
+/// attack requirement (CR 508.1d) whose defending player is a live-evaluated class
+/// (Galactus: "an opponent with the most life among your opponents"; CR 102.2 /
+/// CR 102.3 scope "opponent", CR 508.1b covers the active player's choice among
+/// tied legal defenders). Emits
+/// `MustAttackDefender { RequiredDefender::Matching { filter } }`, re-evaluated each
+/// declare-attackers step by the combat resolver.
+///
+/// The dispatcher receives the self-ref-normalized line WITHOUT the CR 207.2c /
+/// CR 207.2d ability-/flavor-word label stripped (Galactus's line arrives as
+/// "Insatiable Hunger — ~ attacks …"), so this wrapper tries the line as-is, then
+/// strips a leading flavor label via `strip_flavor_word_with_name` and retries
+/// ONCE on the body — mirroring the single-hop retry in
+/// `parse_static_line_multi_inner`. The strip is class-general (any leading
+/// flavor label preceding this static form) and safe: a false-positive strip
+/// yields a body that fails the strict subject / "attacks … each combat if able"
+/// match and returns `None`. The full Oracle line (label included) is preserved
+/// as the definition's description for display / round-trip.
+pub(crate) fn parse_forced_attack_defender_static(text: &str) -> Option<StaticDefinition> {
+    parse_forced_attack_defender_static_body(text).or_else(|| {
+        let (_label, body) = super::oracle_modal::strip_flavor_word_with_name(text)?;
+        parse_forced_attack_defender_static_body(&body).map(|def| def.description(text.to_string()))
+    })
+}
+
+fn parse_forced_attack_defender_static_body(text: &str) -> Option<StaticDefinition> {
+    let lower = text.to_lowercase();
+    let (subject_lower, filter, rest) =
+        nom_primitives::scan_preceded(&lower, parse_attacks_required_defender_nom)?;
+    let subject = text[..subject_lower.len()].trim();
+    let affected = parse_rule_static_subject_filter(subject)?;
+    let mut def = StaticDefinition::new(StaticMode::MustAttackDefender {
+        defender: RequiredDefender::Matching { filter },
+    })
+    .affected(affected)
+    .description(text.to_string());
+    // Consume an optional trailing period; any remaining tail MUST be a recognized
+    // `unless` gate (CR 604.1) — otherwise decline so an unrecognized rider cannot
+    // yield a half-parsed static (coverage stays honest / red).
+    let (rest, _) = opt(tag::<_, _, OracleError<'_>>(".")).parse(rest).ok()?;
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return Some(def);
+    }
+    // The ONLY permitted tail is an `unless` clause, and it must begin RIGHT HERE.
+    // Requiring `rest` to start with `unless ` (rather than letting the whole-text
+    // `unless` scan below find it anywhere) is what stops an unmodelled rider
+    // between the recurring-combat suffix and `unless` from being silently
+    // swallowed — e.g. "... each combat if able <rider> unless <cond>" must decline,
+    // not parse as if the rider were absent.
+    let (gap_text, _) = tag::<_, _, OracleError<'_>>("unless ").parse(rest).ok()?;
+    let tp = TextPair::new(text, &lower);
+    let condition = super::shared::parse_unless_static_condition(&tp, def.affected.as_ref())?;
+    // Coverage-honesty gate (CR 604.1): only emit the forced-attack static when the
+    // `unless` gate is a FULLY-MODELED condition. `parse_unless_static_condition`
+    // wraps an unrecognized inner clause as `Not(Unrecognized)` — which (a) would
+    // falsely report the card supported if checked with a top-level-only match, and
+    // (b) evaluates permanently false at runtime (`Unrecognized` is true; the
+    // wrapping `Not` negates it), silently disabling the whole requirement. Decline
+    // instead so the line stays honestly unsupported (coverage red) rather than
+    // shipping a broken static. `contains_unrecognized` (`types/ability.rs`) is the
+    // single shared authority for this recursive check — every coverage/support
+    // gate in the codebase (`game::coverage`) delegates to the same method so this
+    // parser-time decline and the coverage report can never disagree.
+    // The same decline must cover a gate that PARSES cleanly but has no
+    // enforcement-point continuation on `MustAttackDefender` (CR 118.12a
+    // `UnlessPay`: the payment prompt exists only for
+    // `CantAttack`/`CantBlock`/`CantAttackOrBlock`). Routing through the shared
+    // gate first turns such a leaf into the same `Not(Unrecognized)` shape, so
+    // the `contains_unrecognized` decline below catches both classes with one
+    // check instead of letting the un-satisfiable one through.
+    let condition =
+        gate_static_condition(&def.mode, condition, gap_text.trim().trim_end_matches('.'));
+    if condition.contains_unrecognized() {
+        return None;
+    }
+    def.condition = Some(condition);
+    Some(def)
 }
 
 /// CR 702.122a / 702.171a / 702.184c: nom parser for the crew/saddle/station
@@ -2544,7 +2768,7 @@ pub(crate) fn parse_crew_contribution_static(text: &str) -> Option<StaticDefinit
 ///              | "each creature with one or more counters on it " | "~ "
 ///   color     := ("non")? ("white"|"blue"|"black"|"red"|"green")
 ///   restriction := "can't attack" | "can't block" | "can't attack or block"
-///   scope     := " you" | " you or planeswalkers you control"
+///   scope     := " you" | " planeswalkers you control" | " you or planeswalkers you control"
 ///   payer     := "their controller pays " | "its controller pays " | "you pay "
 ///   suffix    := " for each ..." dynamic_x?
 ///   dynamic_x := ", where x is the number of " <filter-phrase>
@@ -2640,6 +2864,10 @@ pub(crate) fn parse_combat_tax_body(input: &str) -> OracleResult<'_, CombatTaxPa
             tag_no_case::<_, _, OracleError<'_>>(" you or planeswalkers you control"),
         ),
         value(
+            AttackTargetFilter::Planeswalker,
+            tag_no_case::<_, _, OracleError<'_>>(" planeswalkers you control"),
+        ),
+        value(
             AttackTargetFilter::Player,
             tag_no_case::<_, _, OracleError<'_>>(" you"),
         ),
@@ -2669,6 +2897,9 @@ pub(crate) fn parse_combat_tax_body(input: &str) -> OracleResult<'_, CombatTaxPa
         tag_no_case::<_, _, OracleError<'_>>(" for each of those creatures"),
         tag_no_case::<_, _, OracleError<'_>>(
             " for each creature they control that's attacking you or a planeswalker you control",
+        ),
+        tag_no_case::<_, _, OracleError<'_>>(
+            " for each creature they control that's attacking a planeswalker you control",
         ),
         tag_no_case::<_, _, OracleError<'_>>(
             " for each creature they control that's attacking you",

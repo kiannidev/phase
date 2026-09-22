@@ -3,31 +3,36 @@ use std::sync::Arc;
 
 use crate::database::synthesis::KeywordTriggerInstaller;
 use crate::game::arithmetic::saturating_pt_add;
+use crate::game::combat::AttackTarget;
 use crate::game::conditions::{
     counter_condition_matches, eval_chosen_label_is, eval_class_level_ge, eval_has_city_blessing,
-    eval_is_initiative, eval_is_monarch, eval_no_monarch, eval_recipient_attacking_owner_target,
-    eval_shares_color_with_most_common_color, eval_source_entered_this_turn,
-    eval_source_has_dealt_damage, eval_source_in_zone, eval_source_is_attacking,
-    eval_source_is_tapped_on_battlefield,
+    eval_has_enduring_story, eval_is_initiative, eval_is_monarch, eval_no_monarch,
+    eval_recipient_attacking_owner_target, eval_shares_color_with_most_common_color,
+    eval_source_entered_this_turn, eval_source_has_dealt_damage, eval_source_in_zone,
+    eval_source_is_attacking, eval_source_is_tapped_on_battlefield,
 };
 use crate::game::devotion::count_devotion;
-use crate::game::filter::{matches_target_filter, FilterContext};
+use crate::game::filter::{
+    matches_target_filter, target_filter_characteristic_reads,
+    target_filter_characteristic_reads_at, CharacteristicKinds, FilterContext,
+    CHARACTERISTIC_READ_DEPTH,
+};
 use crate::game::game_object::DisplaySource;
 use crate::game::printed_cards::{
     apply_copiable_values, ensure_keyword_triggers_for_copiable_values, intrinsic_copiable_values,
     is_runtime_host_lifetime_replacement, is_runtime_target_die_exile_replacement,
 };
 use crate::game::quantity::{
-    continuous_modification_dynamic_quantity, filter_uses_recipient, quantity_expr_uses_recipient,
-    QuantityContext,
+    continuous_modification_dynamic_quantity, filter_uses_recipient,
+    quantity_expr_characteristic_reads_at, quantity_expr_uses_recipient, QuantityContext,
 };
 use crate::game::speed::{effective_speed, has_max_speed};
 use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction, BasicLandType,
-    CastingPermission, ChosenSubtypeKind, CommanderOwnership, ContinuousModification,
-    CopiableValues, Duration, Effect, FilterProp, ManaContribution, ManaProduction, PlayerFilter,
-    PlayerScope, QuantityExpr, QuantityRef, StaticCondition, StaticDefinition, TargetFilter,
-    TriggerGrantProducerKey, TriggerProducerOrigin, TypedFilter,
+    CardTypeSetSource, CastingPermission, ChosenSubtypeKind, CommanderOwnership,
+    ContinuousModification, CopiableValues, Duration, Effect, FilterProp, ManaContribution,
+    ManaProduction, PlayerFilter, PlayerScope, QuantityExpr, QuantityRef, StaticCondition,
+    StaticDefinition, TargetFilter, TriggerGrantProducerKey, TriggerProducerOrigin, TypedFilter,
 };
 use crate::types::attribution::EffectRef;
 use crate::types::card_type::{
@@ -59,6 +64,7 @@ struct ActiveCombatAssignmentRuleEffect {
 #[derive(Default)]
 struct LayerZoneObjectCache {
     ids_by_zone: HashMap<Zone, Vec<ObjectId>>,
+    members_by_zone: HashMap<Zone, HashSet<ObjectId>>,
 }
 
 impl LayerZoneObjectCache {
@@ -69,6 +75,55 @@ impl LayerZoneObjectCache {
             super::targeting::zone_object_ids(state, zone)
         })
     }
+
+    /// Membership in EXACTLY the population [`Self::ids_for`] yields for `zone`
+    /// — the set is built from that very call, so the two can never disagree.
+    ///
+    /// CR 702.26b + CR 702.26e: that identity matters most for
+    /// `Zone::Battlefield`, whose population
+    /// (`targeting::zone_object_ids`) is the phased-IN subset, not every
+    /// object whose `zone` field says battlefield. CR 702.26b treats a
+    /// phased-out permanent as though it does not exist, and CR 702.26e keeps
+    /// it out of an affected set "even [for] continuous effects that reference
+    /// the permanent specifically" — which is precisely the identity filter
+    /// this index serves.
+    ///
+    /// Indexed once per zone per pass, so an identity filter costs O(1) instead
+    /// of re-walking the zone.
+    fn zone_contains(&mut self, state: &GameState, zone: Zone, id: ObjectId) -> bool {
+        if !self.members_by_zone.contains_key(&zone) {
+            let members: HashSet<ObjectId> = self.ids_for(state, zone).iter().copied().collect();
+            self.members_by_zone.insert(zone, members);
+        }
+        self.members_by_zone
+            .get(&zone)
+            .is_some_and(|members| members.contains(&id))
+    }
+}
+
+/// The single object a continuous effect's `affected_filter` provably denotes,
+/// given the effect's source, or `None` when the filter is a PREDICATE over the
+/// board whose membership only a scan can decide.
+///
+/// (No CR annotation: this decides nothing about the rules, it only reports
+/// what a filter's shape already tells us — same contract as
+/// `effect_names_single_affected_object`, which now delegates here.)
+///
+/// EXACT under the layer pass's own matcher, which is the only claim made here.
+/// Both layer call sites match their affected filter through a
+/// `FilterContext::from_source_with_controller(source_id, ..)`, whose
+/// `trigger_source` is `None`; `filter.rs::filter_inner_for_object` then
+/// reduces `TargetFilter::SelfRef` to `object_id == source_id`
+/// (via `object_matches_trigger_source`, whose `trigger_source.map_or` arm is
+/// exactly that comparison) and `TargetFilter::SpecificObject { id }` to
+/// `object_id == id`. Neither variant carries a `FilterProp`, a zone marker or
+/// a controller clause that could admit a second object.
+fn filter_names_single_object(filter: &TargetFilter, source_id: ObjectId) -> Option<ObjectId> {
+    match filter {
+        TargetFilter::SelfRef => Some(source_id),
+        TargetFilter::SpecificObject { id } => Some(*id),
+        _ => None,
+    }
 }
 
 /// CR 400.1 + CR 611.3a: Gather candidate recipients from every zone implied
@@ -77,18 +132,58 @@ impl LayerZoneObjectCache {
 fn effect_candidate_ids(
     state: &GameState,
     filter: &TargetFilter,
+    source_id: ObjectId,
     zone_cache: &mut LayerZoneObjectCache,
 ) -> Vec<ObjectId> {
     let zones = continuous_effect_scan_zones(state, filter);
-    let mut candidates = Vec::new();
-    let mut seen = HashSet::new();
-    for zone in zones {
-        for &id in zone_cache.ids_for(state, zone) {
-            if seen.insert(id) {
-                candidates.push(id);
+    // An IDENTITY filter (`filter_names_single_object`) denotes ONE object, so
+    // the candidate universe it needs is that object — not the whole of every
+    // zone the scan covers. This is an engine-representation fact, not a rules
+    // one, so it carries no CR annotation of its own; what it must not disturb
+    // is the rules-bearing behaviour of the scan it replaces, and it does not:
+    //
+    //  * SAME MEMBERS. Both callers filter every candidate through
+    //    `matches_target_filter` under a `trigger_source`-free `FilterContext`,
+    //    which passes the named object and rejects every other — so the union
+    //    scan could only ever have yielded `[named]` too. Narrowing the
+    //    candidate list cannot drop a match, only work the caller threw away.
+    //  * SAME ZONE GATE. CR 702.26b + CR 702.26e: membership is read from the
+    //    very list `ids_for` builds, so a phased-out permanent — or an object
+    //    parked in a zone this pass does not own — stays out of the population
+    //    exactly as it did, and the result is empty, not `[named]`.
+    //  * SAME ORDER. A one-element result cannot be ordered two ways, and the
+    //    caller's `newly_affected_ids` preserves candidate order either way.
+    //
+    // Not a rare shape: 2641 of the 6559 corpus cards that carry a static
+    // ability carry a `SelfRef`-affected one ("This creature gets +1/+0 for
+    // each other Rat you control"), and every resolved clone / bound grant is
+    // `SpecificObject`. Before this, each such effect copied the entire
+    // battlefield into a fresh `Vec` and `HashSet` EVERY layer pass, making a
+    // pass cost O(identity effects x |battlefield|) just to discover one
+    // recipient apiece.
+    let candidates = if let Some(named) = filter_names_single_object(filter, source_id) {
+        if zones
+            .into_iter()
+            .any(|zone| zone_cache.zone_contains(state, zone, named))
+        {
+            vec![named]
+        } else {
+            Vec::new()
+        }
+    } else {
+        let mut candidates = Vec::new();
+        let mut seen = HashSet::new();
+        for zone in zones {
+            for &id in zone_cache.ids_for(state, zone) {
+                if seen.insert(id) {
+                    candidates.push(id);
+                }
             }
         }
-    }
+        candidates
+    };
+    #[cfg(test)]
+    record_effect_candidates_scanned(candidates.len());
     candidates
 }
 
@@ -145,6 +240,32 @@ pub(crate) fn subtype_matches_core_types(
                 | (CoreType::Battle, SubtypeSet::Battle)
         )
     })
+}
+
+/// CR 205.3: Remove every subtype belonging to `set`. Creature-type membership
+/// comes from the game's runtime registry; the other subtype sets have fixed
+/// CR-defined membership. Shared by layered and copy-value applications so a
+/// copy exception removes the same subtype set it would remove in layer 4.
+pub(crate) fn remove_subtype_set(
+    subtypes: &mut Vec<String>,
+    set: SubtypeSet,
+    all_creature_types: &[String],
+) {
+    match set {
+        SubtypeSet::Creature => subtypes.retain(|subtype| {
+            !all_creature_types
+                .iter()
+                .any(|creature_type| creature_type == subtype)
+        }),
+        SubtypeSet::Land => subtypes.retain(|subtype| !is_land_subtype(subtype)),
+        SubtypeSet::Artifact
+        | SubtypeSet::Enchantment
+        | SubtypeSet::Planeswalker
+        | SubtypeSet::Spell
+        | SubtypeSet::Battle => {
+            subtypes.retain(|subtype| noncreature_subtype_set(subtype) != Some(set));
+        }
+    }
 }
 
 /// Remove transient effects that have expired based on their duration.
@@ -288,94 +409,303 @@ pub fn prune_until_next_upkeep_effects(state: &mut GameState, active_player: Pla
     }
 }
 
-/// CR 514.2: Remove durational casting permissions whose
-/// `Duration::UntilEndOfTurn` expires at cleanup. Called from the cleanup step
-/// alongside `prune_end_of_turn_effects`.
-// CR 611.2a: Consumers of the `duration`-bearing variants — `PlayFromExile`
-// (impulse-draw, Light Up the Stage class) and `ExileWithAltCost`
-// (Rebound, CR 702.88a).
+/// CR 500.4 + CR 514.2: the lifecycle seams at which a casting permission can
+/// expire. Exactly one prune runs at each seam.
 ///
-/// Variants without a `duration` field (`AdventureCreature`,
-/// `ExileWithEnergyCost`, `WarpExile`, `Plotted`, `Foretold`) and
-/// `ExileWithAltCost { duration: None }` (Airbending, Suspend, Discover,
-/// Cascade) persist until the object leaves exile (handled by
-/// `zones::apply_zone_exit_cleanup`).
-pub fn prune_end_of_turn_casting_permissions(state: &mut GameState) {
+/// The seam is the axis each prune used to encode by repeating a per-variant,
+/// per-duration arm list of its own. Naming it makes the mapping a single
+/// wildcard-free table (`permission_duration_expires_at`) instead of one
+/// hand-written list per prune.
+///
+/// The two shapes that shipped wrong are different failures, and only the
+/// second is a list omission:
+///
+///   * `ExileWithAltAbilityCost` appeared in every prune's list — but only in
+///     the retain-`true` arm, because the variant carried no `duration` field
+///     to match on. A per-variant list cannot express "this variant should have
+///     a lifetime and does not"; reading a permission through
+///     `CastingPermission::lifetime` does, because the field is the thing the
+///     accessor must produce.
+///   * `UntilNextStepOf { step: Untap }` was a duration shape present in the
+///     lists and owned by no prune at all. The seam table makes that a visible
+///     hole rather than an arm nobody wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PermissionSeam {
+    /// CR 514.2: the cleanup step.
+    Cleanup,
+    /// CR 500.4: the untap step of the turn beginning. (CR 502.3 is the untap
+    /// turn-based action itself; the expiry authority is CR 500.4.)
+    UntapStep,
+    /// CR 503.1: the upkeep step.
+    UpkeepStep,
+    /// CR 513.1: the end step.
+    EndStep,
+}
+
+impl PermissionSeam {
+    /// CR 500.4: the seam that owns a named step, or `None` when no
+    /// casting-permission prune runs at that step.
+    ///
+    /// Wildcard-free over `Phase`: a step gaining a prune must be recorded here
+    /// rather than silently inheriting `None`.
+    const fn for_step(step: Phase) -> Option<Self> {
+        match step {
+            Phase::Untap => Some(Self::UntapStep),
+            Phase::Upkeep => Some(Self::UpkeepStep),
+            Phase::End => Some(Self::EndStep),
+            // No prune keys on a duration that NAMES one of these steps, so a
+            // permission whose stated duration does has no expiry authority and
+            // is refused at grant time by
+            // `casting_permission_duration_is_enforceable` rather than granted
+            // unbounded. A code fact, not a rule one, so it carries no CR
+            // number.
+            //
+            // `Phase::Cleanup` is the one worth stating: `PermissionSeam::Cleanup`
+            // exists and `prune_end_of_turn_casting_permissions` runs there, but
+            // it is reached by `UntilEndOfTurn` (CR 514.2), never by a duration
+            // that names the step — `oracle_nom::duration::parse_next_step_name`
+            // reads "end step", "upkeep" and "untap step" and nothing else.
+            Phase::Draw
+            | Phase::PreCombatMain
+            | Phase::BeginCombat
+            | Phase::DeclareAttackers
+            | Phase::DeclareBlockers
+            | Phase::CombatDamage
+            | Phase::EndCombat
+            | Phase::PostCombatMain
+            | Phase::Cleanup => None,
+        }
+    }
+}
+
+/// CR 611.2a: can a turn boundary ever key on this `PlayerScope` at all?
+///
+/// **The single authority for that question**, consumed from both sides of it:
+/// [`permission_scope_selects`] asks it per prune run ("does it key on THIS
+/// active player?"), [`casting_permission_duration_is_enforceable`] asks it
+/// once at the grant ("could any run ever key on it?"). Answering it twice is
+/// what let a grant carrying `UntilNextTurnOf { player: Target }` or
+/// `UntilNextStepOf { step: End, player: Target }` pass the grant-site guard and
+/// then never end — no prune selects those scopes, so the permission stayed
+/// forever. That is the same shape of hole this change closes for
+/// `UntilNextStepOf { step: Untap }`.
+///
+/// `UntilEndOfNextTurnOf` is NOT answered here, and deliberately: it is ARMED
+/// rather than selected, and `prune_untap_step_casting_permissions` arms it for
+/// `PlayerScope::Controller` alone — stricter than keyability, which would also
+/// admit `AnyTurn` and `SpecificPlayer`. That arm asks the arming condition
+/// directly.
+///
+/// The three `true` scopes name a player a turn boundary can resolve.
+/// `Controller` and `AnyTurn` are the two
+/// `oracle_nom::duration::step_deadline_scope` emits from Oracle text.
+/// `SpecificPlayer` names its player outright and so needs no keying; its only
+/// producer is `effects::force_attack`, which builds no permissions, so that
+/// arm is written for the shape rather than for a card. The rest are
+/// target/recipient-relative, resolved where the effect is installed and never
+/// at a turn boundary.
+fn permission_scope_is_keyable(scope: &PlayerScope) -> bool {
+    match scope {
+        PlayerScope::AnyTurn | PlayerScope::Controller | PlayerScope::SpecificPlayer { .. } => true,
+        PlayerScope::ScopedPlayer
+        | PlayerScope::Target
+        | PlayerScope::Opponent { .. }
+        | PlayerScope::AllPlayers { .. }
+        | PlayerScope::RecipientController
+        | PlayerScope::DefendingPlayer
+        | PlayerScope::ParentObjectTargetController
+        | PlayerScope::SourceChosenPlayer => false,
+    }
+}
+
+/// CR 611.2a: does a `PlayerScope` on a permission duration select
+/// `active_player`?
+///
+/// `keyed` is the permission's own `PermissionLifetime::keyed_player`. Which
+/// scopes can be keyed at all is not decided here — that is
+/// [`permission_scope_is_keyable`], so the grant-site guard cannot disagree
+/// with this table.
+fn permission_scope_selects(
+    scope: &PlayerScope,
+    keyed: Option<PlayerId>,
+    active_player: Option<PlayerId>,
+) -> bool {
+    if !permission_scope_is_keyable(scope) {
+        return false;
+    }
+    match scope {
+        // CR 611.2a: the stated duration names no player, so it ends at the
+        // first occurrence of the step, whoever's turn it is (CR 500.4).
+        PlayerScope::AnyTurn => true,
+        PlayerScope::Controller => keyed.is_some() && keyed == active_player,
+        PlayerScope::SpecificPlayer { id } => active_player == Some(*id),
+        // Already refused above. Listed rather than swept into `_` so a new
+        // scope has to answer in BOTH functions.
+        PlayerScope::ScopedPlayer
+        | PlayerScope::Target
+        | PlayerScope::Opponent { .. }
+        | PlayerScope::AllPlayers { .. }
+        | PlayerScope::RecipientController
+        | PlayerScope::DefendingPlayer
+        | PlayerScope::ParentObjectTargetController
+        | PlayerScope::SourceChosenPlayer => false,
+    }
+}
+
+/// CR 611.2a: does `duration` end at `seam` for `active_player`?
+///
+/// **This is the single expiry table for casting permissions.** The match is
+/// wildcard-free, so a new `Duration` variant is a COMPILE ERROR here and must
+/// state its seam — the guard the four separate arm lists could not give.
+fn permission_duration_expires_at(
+    seam: PermissionSeam,
+    duration: &Duration,
+    keyed: Option<PlayerId>,
+    active_player: Option<PlayerId>,
+) -> bool {
+    match duration {
+        // CR 514.2: ends as the cleanup step begins.
+        Duration::UntilEndOfTurn => seam == PermissionSeam::Cleanup,
+        // CR 511.2: "Effects that last 'until end of combat' expire at the end
+        // of the combat phase." No casting-permission prune runs there, so
+        // cleanup catches this defensively — unchanged behavior.
+        Duration::UntilEndOfCombat => seam == PermissionSeam::Cleanup,
+        // CR 500.4: "As a step or phase begins, if there are effects that last
+        // until that step or phase, those effects expire." For "until your next
+        // turn" that instant is the keyed player's untap step.
+        Duration::UntilNextTurnOf { player } => {
+            seam == PermissionSeam::UntapStep
+                && permission_scope_selects(player, keyed, active_player)
+        }
+        // CR 514.2: "until the end of your next turn" is ARMED at the untap
+        // step (rewritten to `UntilEndOfTurn` by
+        // `prune_untap_step_casting_permissions`) and ended by the cleanup arm
+        // above. It never expires directly, at any seam.
+        Duration::UntilEndOfNextTurnOf { .. } => false,
+        Duration::UntilNextStepOf { step, player } => {
+            PermissionSeam::for_step(*step) == Some(seam)
+                && permission_scope_selects(player, keyed, active_player)
+        }
+        // CR 611.2a + CR 611.2b: host-bound lifetimes end on the battlefield
+        // exit / control change / phase-out of their host, not at a turn
+        // boundary — `prune_host_left_casting_permissions` and
+        // `prune_lapsed_host_bound_casting_permissions`.
+        Duration::UntilHostLeavesPlay
+        | Duration::WhileControllingHost
+        | Duration::WhileHostOnBattlefield => false,
+        // CR 611.2b: ended by the same lapse pass, which re-evaluates the
+        // condition against the live game state.
+        Duration::ForAsLongAs { .. } => false,
+        // CR 607.2a: ended by
+        // `exile_links::expire_until_source_exiles_another_card_durations` when
+        // the linked source exiles another card — which reads the permission
+        // through `CastingPermission::lifetime`, so every variant that can carry
+        // the duration is ended, not just the one a hand-written pattern named.
+        Duration::UntilSourceExilesAnotherCard => false,
+        // CR 610.3: ended by the monarch zone-change duration in
+        // `zone_pipeline`, not by a turn boundary.
+        Duration::UntilOpponentBecomesMonarch => false,
+        // CR 611.2a: no stated end.
+        Duration::Permanent => false,
+    }
+}
+
+/// CR 611.2a: is there ANY authority that ends `duration` on a casting
+/// permission?
+///
+/// Asked once where a grant is created, so a permission whose stated lifetime
+/// nothing can enforce is refused instead of being attached as an unbounded
+/// one. A code-reachable wrong lifetime is not made safe by the absence of a
+/// printed card that reaches it.
+///
+/// Wildcard-free for the same reason as `permission_duration_expires_at`: a new
+/// `Duration` variant must answer this before it can be granted.
+pub(crate) fn casting_permission_duration_is_enforceable(
+    duration: &Duration,
+    exile_resident: bool,
+) -> bool {
+    match duration {
+        Duration::UntilEndOfTurn
+        | Duration::UntilEndOfCombat
+        | Duration::UntilHostLeavesPlay
+        | Duration::WhileControllingHost
+        | Duration::WhileHostOnBattlefield
+        | Duration::UntilSourceExilesAnotherCard
+        | Duration::Permanent => true,
+        // CR 500.4: a turn-boundary deadline ends only if a prune can key on
+        // its scope. `permission_scope_is_keyable` is the authority
+        // `permission_duration_expires_at` already consumes, asked here too so
+        // a scope cannot be unselectable at the table and enforceable here.
+        Duration::UntilNextTurnOf { player } => permission_scope_is_keyable(player),
+        // CR 514.2: this shape is ARMED rather than expired — rewritten to
+        // `UntilEndOfTurn` at the untap step, which is why the expiry table
+        // answers `false` for it at every seam. The arming in
+        // `prune_untap_step_casting_permissions` matches
+        // `PlayerScope::Controller` alone, so any other scope is never armed
+        // and never ends: nothing would revoke the permission.
+        Duration::UntilEndOfNextTurnOf { player } => {
+            matches!(player, PlayerScope::Controller)
+        }
+        // CR 611.2b: enforceable ONLY on an exile-resident grant, and this is
+        // the one arm where residency decides.
+        //
+        // No pass in this file evaluates the condition (see
+        // `prune_lapsed_host_bound_casting_permissions` for why). The single
+        // authority that ends the shape is `zones::apply_zone_exit_cleanup`,
+        // which clears casting permissions when the card leaves EXILE — and
+        // that is exactly the condition every printed member of the shape
+        // states ("it/they remain exiled"), so for them the answer is right
+        // rather than merely convenient.
+        //
+        // An IN-PLACE grant — the card stays in the graveyard or the hand
+        // (Emry, Electrodominance, Resourceful Collector) — never reaches that
+        // cleanup, so nothing at all would end it. Answering `false` here is
+        // what makes the grant site fall back to the cleanup-step default it
+        // used before this field was plumbed through, instead of turning a
+        // permission that expired at end of turn into one that never expires.
+        Duration::ForAsLongAs { .. } => exile_resident,
+        // CR 500.4: only a step with a prune, AND a scope that prune can key
+        // on, can end a step-scoped permission. Asking only the step was the
+        // same half-answer as above.
+        Duration::UntilNextStepOf { step, player } => {
+            PermissionSeam::for_step(*step).is_some() && permission_scope_is_keyable(player)
+        }
+        // CR 610.3: the monarch duration is implemented for exile-return links
+        // (`zone_pipeline::ExileLinkKind::UntilOpponentBecomesMonarch`), not for
+        // casting permissions — no pass revokes a permission when an opponent
+        // becomes the monarch.
+        Duration::UntilOpponentBecomesMonarch => false,
+    }
+}
+
+/// Run one seam's expiry over every casting permission in the game.
+fn prune_casting_permissions_at(
+    state: &mut GameState,
+    seam: PermissionSeam,
+    active: Option<PlayerId>,
+) {
     for obj in state.objects.iter_mut().map(|(_, v)| v) {
-        obj.casting_permissions.retain(|p| match p {
-            CastingPermission::PlayFromExile {
-                duration: Duration::UntilEndOfTurn,
-                ..
-            } => false,
-            // CR 514.2: UntilEndOfCombat should have been pruned at end of combat,
-            // but if it leaked to cleanup, prune it here defensively.
-            CastingPermission::PlayFromExile {
-                duration: Duration::UntilEndOfCombat,
-                ..
-            } => false,
-            CastingPermission::PlayFromExile {
-                duration:
-                    Duration::UntilNextTurnOf { .. }
-                    | Duration::UntilSourceExilesAnotherCard
-                    | Duration::Permanent,
-                ..
-            } => true,
-            // CR 513.1: `UntilNextStepOf { step: End }` is expired by
-            // `prune_end_step_casting_permissions` at the End phase entry,
-            // NOT at cleanup. Retain here.
-            CastingPermission::PlayFromExile {
-                duration:
-                    Duration::UntilNextStepOf {
-                        step: Phase::End, ..
-                    },
-                ..
-            } => true,
-            // UntilHostLeavesPlay / ForAsLongAs / UntilNextStepOf { step: Untap }
-            // / UntilNextStepOf { step: Upkeep }: these are pruned by their own
-            // systems (zone-exit cleanup, condition re-evaluation, untap step,
-            // and `prune_upkeep_step_casting_permissions` at the Upkeep phase).
-            // Retain here — they are not end-of-turn.
-            CastingPermission::PlayFromExile { .. } => true,
-            // CR 702.88a: Rebound's upkeep recast offer carries
-            // `duration: Some(UntilEndOfTurn)` so the granted "cast this
-            // card without paying its mana cost" permission expires at the
-            // end of the same turn if the controller declines or fails to
-            // cast it. Mirrors the PlayFromExile arms above so all
-            // durational casting permissions share the same pruning
-            // semantics.
-            CastingPermission::ExileWithAltCost {
-                duration: Some(Duration::UntilEndOfTurn),
-                ..
-            } => false,
-            // CR 514.2: defensive — same handling as PlayFromExile.
-            CastingPermission::ExileWithAltCost {
-                duration: Some(Duration::UntilEndOfCombat),
-                ..
-            } => false,
-            // CR 513.1: end-step duration handled by
-            // `prune_end_step_casting_permissions`; retain here.
-            CastingPermission::ExileWithAltCost {
-                duration:
-                    Some(Duration::UntilNextStepOf {
-                        step: Phase::End, ..
-                    }),
-                ..
-            } => true,
-            // Other durational shapes (UntilNextTurnOf, Permanent, etc.)
-            // and the standing `duration: None` form persist here.
-            CastingPermission::AdventureCreature
-            | CastingPermission::ExileWithAltCost { .. }
-            | CastingPermission::ExileWithAltAbilityCost { .. }
-            | CastingPermission::ExileWithEnergyCost
-            | CastingPermission::WarpExile { .. }
-            // CR 702.170d: Plotted persists across turns (that is the whole
-            // point of Plot — cast "on a later turn"); never pruned at cleanup.
-            | CastingPermission::Plotted { .. }
-            // CR 702.143a: Foretold permissions likewise persist while the
-            // card remains in exile so it can be cast on a later turn.
-            | CastingPermission::Foretold { .. } => true,
+        obj.casting_permissions.retain(|p| {
+            let lifetime = p.lifetime();
+            match lifetime.duration {
+                Some(d) => !permission_duration_expires_at(seam, d, lifetime.keyed_player, active),
+                None => true,
+            }
         });
     }
+}
+
+/// CR 514.2: Remove durational casting permissions whose duration ends at the
+/// cleanup step. Called from the cleanup step alongside
+/// `prune_end_of_turn_effects`.
+///
+/// Takes no player: the only durations this seam owns — `UntilEndOfTurn` and
+/// the defensive `UntilEndOfCombat` — state no player (CR 514.2 ends them for
+/// everyone at the same cleanup step), so `permission_scope_selects` is never
+/// reached from here. Passing `None` makes that explicit instead of handing in
+/// an active player the table would silently ignore.
+pub fn prune_end_of_turn_casting_permissions(state: &mut GameState) {
+    prune_casting_permissions_at(state, PermissionSeam::Cleanup, None);
     // CR 601.2a + CR 603.7 + CR 611.2a: Garbage-collect single-use consumed
     // markers whose grant has expired. After the prune above, drop any consumed
     // tracked-set entry that no longer has a live single-use `PlayFromExile`
@@ -400,246 +730,78 @@ pub fn prune_end_of_turn_casting_permissions(state: &mut GameState) {
         .retain(|group| live_single_use_groups.contains(group));
 }
 
-/// CR 514.2: Remove durational casting permissions granted to
-/// `active_player` whose `Duration::UntilNextTurnOf { Controller }` expires
-/// at that player's untap step. Called from the untap step alongside
-/// `prune_until_next_turn_effects`.
-// CR 611.2a: Consumers of the `duration`-bearing variants — `PlayFromExile`
-// (impulse-draw, Light Up the Stage class) and `ExileWithAltCost`
-// (Rebound, CR 702.88a).
-pub fn prune_until_next_turn_casting_permissions(state: &mut GameState, active_player: PlayerId) {
+/// CR 500.4 + CR 514.2: the untap-step seam for casting permissions.
+///
+/// Two jobs at one seam, in order:
+///
+/// 1. **Arm** `UntilEndOfNextTurnOf { Controller }` grants keyed on
+///    `active_player` by rewriting them to `UntilEndOfTurn`, so the cleanup
+///    prune ends them at the end of THIS turn (CR 514.2) rather than at its
+///    beginning.
+/// 2. **Expire** every permission whose duration ends at the untap step:
+///    `UntilNextTurnOf` ("until your next turn") and
+///    `UntilNextStepOf { step: Untap }` ("until the next untap step" / "until
+///    its controller's next untap step"). CR 500.4 is the authority for both —
+///    "As a step or phase begins, if there are effects that last until that
+///    step or phase, those effects expire." CR 502.3 describes the untap
+///    turn-based action and says nothing about effects ending.
+///
+/// The second shape had no prune before: the parser emits it
+/// (`oracle_nom::duration::step_deadline_scope` pairs `ObjectController` with
+/// `Phase::Untap`) and `prune_controller_untap_step_effects` — the only pass
+/// the untap transition invoked that keyed on an untap-step deadline — retains
+/// `state.transient_continuous_effects` only, which is not where a casting
+/// permission lives.
+pub fn prune_untap_step_casting_permissions(state: &mut GameState, active_player: PlayerId) {
     for obj in state.objects.iter_mut().map(|(_, v)| v) {
-        // CR 514.2: arm "until the end of your next turn" play-permissions when
-        // the grantee's next turn begins — convert to `UntilEndOfTurn` so the
-        // cleanup-step prune (`prune_end_of_turn_casting_permissions`) ends them
-        // at this turn's cleanup, letting the cards be played throughout the
-        // grantee's next turn (Light Up the Stage class).
         for p in obj.casting_permissions.iter_mut() {
-            if let CastingPermission::PlayFromExile {
+            // CR 514.2: arming keys on the GRANTEE — "until the end of THEIR
+            // next turn" names the player the grant was made to, not the player
+            // a `PlayerScope::Controller` deadline resolves "your" against. See
+            // `CastingPermission::lifetime_mut` for why the two differ and what
+            // collapsing them costs (Suspend Aggression).
+            let (Some(duration), grantee) = p.lifetime_mut() else {
+                continue;
+            };
+            if matches!(
                 duration,
-                granted_to,
-                ..
-            } = p
-            {
-                if *granted_to == active_player
-                    && matches!(
-                        duration,
-                        Duration::UntilEndOfNextTurnOf {
-                            player: PlayerScope::Controller
-                        }
-                    )
-                {
-                    *duration = Duration::UntilEndOfTurn;
+                Duration::UntilEndOfNextTurnOf {
+                    player: PlayerScope::Controller
                 }
-            }
-            // CR 514.2: same arming for durational `ExileWithAltCost`
-            // (Rebound-class). `granted_to` is `Option<PlayerId>`; only
-            // arm when set and matching the active player.
-            if let CastingPermission::ExileWithAltCost {
-                duration: Some(d),
-                granted_to: Some(g),
-                ..
-            } = p
+            ) && grantee == Some(active_player)
             {
-                if *g == active_player
-                    && matches!(
-                        d,
-                        Duration::UntilEndOfNextTurnOf {
-                            player: PlayerScope::Controller
-                        }
-                    )
-                {
-                    *d = Duration::UntilEndOfTurn;
-                }
+                *duration = Duration::UntilEndOfTurn;
             }
         }
-
-        obj.casting_permissions.retain(|p| match p {
-            // CR 514.2 + CR 611.2a: "until your next turn" expires at the
-            // *granting effect's controller's* next untap step. For a normal
-            // impulse grant `granted_to == exiled_by_ability_controller ==
-            // controller`, so this is unchanged. For a per-owner grant
-            // (`PermissionGrantee::ObjectOwner`) where each card's `granted_to`
-            // is its own owner but "your" refers to the activator (Memory
-            // Vessel: "Until your next turn, players may play cards they exiled
-            // this way"), the expiry must key on the activator, carried by
-            // `exiled_by_ability_controller`. This mirrors the identical
-            // controller-keyed expiry the End-step prune already applies to
-            // `UntilNextStepOf { End }` grants (Rocco, Street Chef).
-            CastingPermission::PlayFromExile {
-                duration:
-                    Duration::UntilNextTurnOf {
-                        player: PlayerScope::Controller,
-                    },
-                granted_to,
-                exiled_by_ability_controller,
-                ..
-            } => exiled_by_ability_controller.unwrap_or(*granted_to) != active_player,
-            // CR 513.1 + CR 611.2a/b: `UntilNextStepOf { step: End }` is
-            // expired by `prune_end_step_casting_permissions` at the end
-            // step, NOT at the untap step. Retain here.
-            CastingPermission::PlayFromExile {
-                duration:
-                    Duration::UntilNextStepOf {
-                        step: Phase::End, ..
-                    },
-                ..
-            } => true,
-            // CR 514.2: durational `ExileWithAltCost` with
-            // `UntilNextTurnOf { Controller }` granted to the active
-            // player expires at their untap step (mirrors PlayFromExile).
-            CastingPermission::ExileWithAltCost {
-                duration:
-                    Some(Duration::UntilNextTurnOf {
-                        player: PlayerScope::Controller,
-                    }),
-                granted_to: Some(g),
-                ..
-            } => *g != active_player,
-            // CR 513.1: end-step duration is handled by
-            // `prune_end_step_casting_permissions`; retain here.
-            CastingPermission::ExileWithAltCost {
-                duration:
-                    Some(Duration::UntilNextStepOf {
-                        step: Phase::End, ..
-                    }),
-                ..
-            } => true,
-            CastingPermission::PlayFromExile { .. }
-            | CastingPermission::AdventureCreature
-            | CastingPermission::ExileWithAltCost { .. }
-            | CastingPermission::ExileWithAltAbilityCost { .. }
-            | CastingPermission::ExileWithEnergyCost
-            | CastingPermission::WarpExile { .. }
-            // CR 702.170d: Plotted persists across turns; never pruned at the
-            // untap step. Retention is zone-scoped (see zones::apply_zone_exit_cleanup).
-            | CastingPermission::Plotted { .. }
-            | CastingPermission::Foretold { .. } => true,
-        });
     }
+    prune_casting_permissions_at(state, PermissionSeam::UntapStep, Some(active_player));
 }
 
-/// CR 513.1: Remove durational casting permissions granted to
-/// `active_player` whose `Duration::UntilNextStepOf { step: End, player: Controller }`
-/// expires at that player's next end step. Called at the start of the
-/// End phase in `turns.rs::auto_advance`.
-// CR 611.2a: Consumers of the `duration`-bearing variants — `PlayFromExile`
-// (Rocco, Street Chef class) and `ExileWithAltCost` (Rebound, CR 702.88a).
+/// CR 513.1: the end-step seam for casting permissions. Called at the start of
+/// the End phase in `turns.rs::auto_advance`.
 ///
-/// CR 513.2 ordering: this prune runs BEFORE end-step triggers fire, so a
-/// new grant created by an end-step trigger (e.g., Rocco, Street Chef) is
-/// NOT wiped by the same end step's prune — the new trigger cannot back up
-/// per CR 513.2, so the new permission lands AFTER the prune completes.
+/// CR 513.2 ordering: this prune runs BEFORE end-step triggers fire, so a new
+/// grant created by an end-step trigger (e.g. Rocco, Street Chef) is NOT wiped
+/// by the same end step's prune — the new trigger cannot back up per CR 513.2,
+/// so the new permission lands AFTER the prune completes.
 ///
-/// 2023-05-12 Wizards ruling on Rocco, Street Chef: the permission outlives
-/// the granting permanent leaving the battlefield. This prune keys off the
-/// permission's `granted_to`, not the source object's presence on the
-/// battlefield.
+/// 2023-05-12 Wizards ruling on Rocco, Street Chef: the permission outlives the
+/// granting permanent leaving the battlefield. The seam table keys on the
+/// permission's own `keyed_player`, never on the source object's presence.
 pub fn prune_end_step_casting_permissions(state: &mut GameState, active_player: PlayerId) {
-    for obj in state.objects.iter_mut().map(|(_, v)| v) {
-        obj.casting_permissions.retain(|p| match p {
-            CastingPermission::PlayFromExile {
-                duration:
-                    Duration::UntilNextStepOf {
-                        step: Phase::End,
-                        player: PlayerScope::Controller,
-                    },
-                granted_to,
-                exiled_by_ability_controller,
-                ..
-            } => exiled_by_ability_controller.unwrap_or(*granted_to) != active_player,
-            // CR 513.1: durational `ExileWithAltCost` with
-            // `UntilNextStepOf { End, Controller }` granted to the active
-            // player expires at their end step (mirrors PlayFromExile).
-            CastingPermission::ExileWithAltCost {
-                duration:
-                    Some(Duration::UntilNextStepOf {
-                        step: Phase::End,
-                        player: PlayerScope::Controller,
-                    }),
-                granted_to: Some(g),
-                ..
-            } => *g != active_player,
-            CastingPermission::PlayFromExile { .. }
-            | CastingPermission::AdventureCreature
-            | CastingPermission::ExileWithAltCost { .. }
-            | CastingPermission::ExileWithAltAbilityCost { .. }
-            | CastingPermission::ExileWithEnergyCost
-            | CastingPermission::WarpExile { .. }
-            | CastingPermission::Plotted { .. }
-            | CastingPermission::Foretold { .. } => true,
-        });
-    }
+    prune_casting_permissions_at(state, PermissionSeam::EndStep, Some(active_player));
 }
 
-/// CR 500.4 + CR 503.1: Remove durational casting permissions granted to
-/// `active_player` whose `Duration::UntilNextStepOf { step: Upkeep, player: Controller }`
-/// expires as that player's upkeep step begins. Called from
-/// `turns.rs::auto_advance` at the Upkeep phase, next to
+/// CR 500.4 + CR 503.1: the upkeep-step seam for casting permissions. Called
+/// from `turns.rs::auto_advance` at the Upkeep phase, next to
 /// `prune_until_next_upkeep_effects`.
 ///
-/// Exact mirror of `prune_end_step_casting_permissions` one step axis over,
-/// including its `exiled_by_ability_controller`-before-`granted_to` keying. It
-/// is the *casting-permission* half of the upkeep deadline: Elkin Bottle and
-/// Grinning Totem lower "Until the beginning of your next upkeep, you may play
-/// that card" to `CastingPermission::PlayFromExile { duration: … Upkeep … }`, not
-/// to a transient continuous effect, so without this the play permission would
-/// never expire — `prune_end_of_turn_casting_permissions`'s catch-all
-/// deliberately retains every non-end-step durational shape for its own system
-/// to handle, and before this function the upkeep shape had no such system.
+/// Elkin Bottle and Grinning Totem lower "Until the beginning of your next
+/// upkeep, you may play that card" to a casting permission, not to a transient
+/// continuous effect, so without this seam the play permission would never
+/// expire.
 pub fn prune_upkeep_step_casting_permissions(state: &mut GameState, active_player: PlayerId) {
-    for obj in state.objects.iter_mut().map(|(_, v)| v) {
-        obj.casting_permissions.retain(|p| match p {
-            CastingPermission::PlayFromExile {
-                duration:
-                    Duration::UntilNextStepOf {
-                        step: Phase::Upkeep,
-                        player: PlayerScope::Controller,
-                    },
-                granted_to,
-                exiled_by_ability_controller,
-                ..
-            } => exiled_by_ability_controller.unwrap_or(*granted_to) != active_player,
-            // CR 503.1: durational `ExileWithAltCost` mirrors `PlayFromExile`,
-            // exactly as it does for the end-step deadline.
-            CastingPermission::ExileWithAltCost {
-                duration:
-                    Some(Duration::UntilNextStepOf {
-                        step: Phase::Upkeep,
-                        player: PlayerScope::Controller,
-                    }),
-                granted_to: Some(g),
-                ..
-            } => *g != active_player,
-            // CR 611.2a: the turn-AGNOSTIC stated duration names no player, so
-            // it expires at the first upkeep step and is not keyed on
-            // `active_player` at all.
-            CastingPermission::PlayFromExile {
-                duration:
-                    Duration::UntilNextStepOf {
-                        step: Phase::Upkeep,
-                        player: PlayerScope::AnyTurn,
-                    },
-                ..
-            } => false,
-            CastingPermission::ExileWithAltCost {
-                duration:
-                    Some(Duration::UntilNextStepOf {
-                        step: Phase::Upkeep,
-                        player: PlayerScope::AnyTurn,
-                    }),
-                ..
-            } => false,
-            CastingPermission::PlayFromExile { .. }
-            | CastingPermission::AdventureCreature
-            | CastingPermission::ExileWithAltCost { .. }
-            | CastingPermission::ExileWithAltAbilityCost { .. }
-            | CastingPermission::ExileWithEnergyCost
-            | CastingPermission::WarpExile { .. }
-            | CastingPermission::Plotted { .. }
-            | CastingPermission::Foretold { .. } => true,
-        });
-    }
+    prune_casting_permissions_at(state, PermissionSeam::UpkeepStep, Some(active_player));
 }
 
 /// Remove transient `UntilNextTurnOf { Controller }` effects whose controller's
@@ -656,13 +818,22 @@ pub fn prune_until_next_turn_effects(state: &mut GameState, active_player: Playe
     // turn's own cleanup because that turn's untap step already passed before
     // the effect was created, so this is the controller's *next* turn.
     for e in state.transient_continuous_effects.iter_mut() {
-        if matches!(
-            e.duration,
+        // CR 514.2 + CR 109.4: the player whose next turn ends this effect. The
+        // `Controller` scope reads the effect's own controller ("until the end of
+        // YOUR next turn"); `SpecificPlayer` is the resolution-time snapshot a
+        // resolver installs when the window belongs to someone else — Gideon
+        // Jura's "During target opponent's next turn". Both arm identically once
+        // that player becomes the active player.
+        let armed_for = match e.duration {
             Duration::UntilEndOfNextTurnOf {
-                player: PlayerScope::Controller
-            }
-        ) && e.controller == active_player
-        {
+                player: PlayerScope::Controller,
+            } => Some(e.controller),
+            Duration::UntilEndOfNextTurnOf {
+                player: PlayerScope::SpecificPlayer { id },
+            } => Some(id),
+            _ => None,
+        };
+        if armed_for == Some(active_player) {
             e.duration = Duration::UntilEndOfTurn;
         }
     }
@@ -749,10 +920,272 @@ pub fn prune_host_left_effects(state: &mut GameState, departed_id: ObjectId) {
     let before = state.transient_continuous_effects.len();
     state
         .transient_continuous_effects
-        .retain(|e| !(e.duration == Duration::UntilHostLeavesPlay && e.source_id == departed_id));
+        .retain(|e| !(e.duration.ends_when_host_leaves_play() && e.source_id == departed_id));
     if state.transient_continuous_effects.len() != before {
         state.layers_dirty.mark_full();
     }
+}
+
+/// CR 611.2a + CR 400.7: revoke every casting permission whose lifetime was
+/// bound to `departed_id` remaining on the battlefield.
+///
+/// `prune_host_left_effects` above retains only `transient_continuous_effects`.
+/// A host-bound casting permission is not stored there — it lives on the exiled
+/// object as a `GameObject::casting_permissions` entry — so it needs its own
+/// pass at the same lifecycle point. Without one, "you may play that card for
+/// as long as you control [this permanent]" (Gwen Stacy, Victor Mancha)
+/// survives its host indefinitely.
+///
+/// All three host readings end here, because all three end when the host
+/// leaves the battlefield: `UntilHostLeavesPlay` ("until ~ leaves the
+/// battlefield") ends ONLY here, while `WhileHostOnBattlefield` (CR 611.2b,
+/// "for as long as ~ remains on the battlefield" — Intet, the Dreamer; The Day
+/// of the Doctor) also ends on a phase-out and `WhileControllingHost`
+/// (CR 611.2b, "for as long as you control ~") also ends on a control change
+/// or phase-out, both of which
+/// `prune_lapsed_host_bound_casting_permissions` observes.
+/// `Duration::ends_when_host_leaves_play` is the shared predicate, so no
+/// reading can be dropped from this path by omission.
+///
+/// Every permission form is read through `CastingPermission::lifetime`, so all
+/// three lifetime-bearing forms are covered by construction: the cast half
+/// (`ExileWithAltCost`), the non-mana alternative-cost half
+/// (`ExileWithAltAbilityCost`, Nashi, Moon Sage's Scion) and the CR 305.1 land-play
+/// companion (`PlayFromExile`) that `cast_from_zone::record_lingering_permissions`
+/// emits alongside the cast grant. Pruning only some of them would leave a land
+/// playable from exile after its granting permanent died, or the reverse.
+///
+/// A grant carrying `source_id: None` is retained: its host is unknown, so
+/// there is nothing to compare against `departed_id`. Since
+/// `grant_permission::resolve` stamps every `None` host slot, the live case for
+/// that arm is a host-bound grant deserialized from a snapshot written before
+/// `source_id` existed on its variant. (The standing durationless grants —
+/// Suspend, Discover, Cascade, Airbending — are retained one step earlier, by
+/// carrying no duration at all, and are ended by
+/// `zones::apply_zone_exit_cleanup` when the card leaves exile.)
+pub fn prune_host_left_casting_permissions(state: &mut GameState, departed_id: ObjectId) {
+    for obj in state.objects.iter_mut().map(|(_, v)| v) {
+        obj.casting_permissions.retain(|p| {
+            let lifetime = p.lifetime();
+            let host_bound = lifetime
+                .duration
+                .is_some_and(Duration::ends_when_host_leaves_play);
+            !(host_bound && lifetime.source_id == Some(departed_id))
+        });
+    }
+}
+
+/// CR 611.2b: revoke every casting permission whose stated lifetime has ended
+/// while its host is still on the battlefield.
+///
+/// `Duration::WhileControllingHost` — "for as long as you control ~" — ends
+/// this way, and it is neither a turn boundary nor a zone change, so no pass in
+/// this file reached it before now. Six printed cards state that wording in the
+/// same sentence as a play/cast permission: Gwen Stacy, Hama, the Bloodbender;
+/// Kotose, the Silent Spider; Lightning, Security Sergeant; Taster of Wares and
+/// Victor Mancha, Runaway. All six are creatures, so the host is always a
+/// permanent.
+///
+/// CR 611.2b works this exact case through in its own Master Thief example:
+/// "If you lose control of Master Thief before the ability resolves, it does
+/// nothing, because its duration — as long as you control Master Thief — was
+/// over before the effect began." That is why this is a CONTINUOUS re-check and
+/// not an event hook: CR 611.2b requires the effect to do nothing when the
+/// duration is already over at grant time, which an exit-event hook cannot see.
+/// `replacement::controller_controls_source_gate` is the single authority —
+/// shared with the `ControllerControlsSource` replacement condition — and covers
+/// all three legs: host on the battlefield, host still controlled by the
+/// grantee, host phased in (CR 702.26f).
+///
+/// `Duration::ForAsLongAs { condition }` is deliberately NOT evaluated here.
+/// Measured over the parsed corpus: NO permission carrying that shape states a
+/// condition about the granting source, which is the only object this pass has.
+/// Every one of them except Resourceful Collector's states a "remains exiled"
+/// leg — most of them alone, three (Dead Man's Chest, Petty Larceny, Shadow of
+/// the Enemy) inside an `And[remains exiled, …]` whose second leg is not
+/// evaluated. That leg is exactly what `zones::apply_zone_exit_cleanup` already
+/// enforces, by clearing the permission when the card leaves exile.
+/// Resourceful Collector is the exception: "for as long as it's in your
+/// graveyard" is about the GRANTED card's zone.
+///
+/// Evaluating any of them against `source_id` would ask the question of the
+/// wrong object; refusing the shape would drop every one of them. Binding a
+/// permission's condition to the granted card is a separate piece of
+/// provenance, and a separate change.
+///
+/// Runs inside `evaluate_layers` after the Layer-2 control board is finalized,
+/// next to `prune_lapsed_controller_controls_source`, so the control question is
+/// asked of the same finalized board that pass uses.
+///
+/// A grant with no `source_id` or no `keyed_player` is retained: the pass has no
+/// host or no player to evaluate against. That is the deserialized-legacy case
+/// and the durationless standing grants, both of which end elsewhere.
+pub(crate) fn prune_lapsed_host_bound_casting_permissions(state: &mut GameState) {
+    // READ pass: `controller_controls_source_gate` borrows `&GameState`, so
+    // collect the lapsed identities first and mutate afterwards — the same
+    // read/mutate split as `prune_lapsed_controller_controls_source`.
+    let mut lapsed: Vec<(ObjectId, usize)> = Vec::new();
+    for (obj_id, obj) in state.objects.iter() {
+        for (idx, p) in obj.casting_permissions.iter().enumerate() {
+            let lifetime = p.lifetime();
+            let (Some(duration), Some(source)) = (lifetime.duration, lifetime.source_id) else {
+                continue;
+            };
+            let still_live = match duration {
+                // CR 611.2b: control, presence and phasing — all three legs.
+                Duration::WhileControllingHost => {
+                    let Some(player) = lifetime.keyed_player else {
+                        continue;
+                    };
+                    crate::game::replacement::controller_controls_source_gate(state, source, player)
+                }
+                // CR 611.2b + CR 702.26f: the presence leg. Deliberately NOT
+                // the control gate above — "for as long as ~ remains on the
+                // battlefield" (Intet, the Dreamer; The Day of the Doctor) is
+                // not ended by a control change, so asking the control question
+                // here would revoke it too early.
+                //
+                // Phasing IS part of presence, though: CR 702.26f — "effects
+                // with 'for as long as' durations that track that permanent
+                // (see rule 611.2b) end when that permanent phases out because
+                // they can no longer see it." CR 702.26d leaves zone and
+                // controller untouched, so the zone check alone would keep this
+                // grant alive across a Teferi's Protection.
+                Duration::WhileHostOnBattlefield => state.objects.get(&source).is_some_and(|o| {
+                    o.zone == crate::types::zones::Zone::Battlefield && o.is_phased_in()
+                }),
+                // CR 611.2a + CR 702.26d: the EVENT deadline ("until ~ leaves
+                // the battlefield") ends only at the host's battlefield exit —
+                // `prune_host_left_casting_permissions` on that event. A
+                // phase-out is not that event, so this pass must not touch it.
+                //
+                // Every other shape ends somewhere else, and each names where.
+                // Listed rather than swept into `_` so a new `Duration` variant
+                // is a compile error here too. Every match this PR introduces
+                // over the enum is wildcard-free, this one included — one of them
+                // behind a wildcard would silently retain a new shape forever,
+                // which is why none of them has one.
+                Duration::UntilHostLeavesPlay
+                | Duration::UntilEndOfTurn
+                | Duration::UntilEndOfCombat
+                | Duration::UntilNextTurnOf { .. }
+                | Duration::UntilEndOfNextTurnOf { .. }
+                | Duration::UntilNextStepOf { .. }
+                | Duration::ForAsLongAs { .. }
+                | Duration::UntilSourceExilesAnotherCard
+                | Duration::UntilOpponentBecomesMonarch
+                | Duration::Permanent => continue,
+            };
+            if !still_live {
+                lapsed.push((*obj_id, idx));
+            }
+        }
+    }
+    if lapsed.is_empty() {
+        return;
+    }
+    // MUTATE pass — owned data only. Indices are removed high-to-low per object
+    // so an earlier removal cannot shift a later index.
+    lapsed.sort_unstable_by(|a, b| b.cmp(a));
+    for (obj_id, idx) in lapsed {
+        if let Some(obj) = state.objects.get_mut(&obj_id) {
+            if idx < obj.casting_permissions.len() {
+                obj.casting_permissions.remove(idx);
+            }
+        }
+    }
+}
+
+/// CR 611.2b: drop transient continuous effects whose `WhileControllingHost`
+/// duration has ended, rather than only declining to apply them.
+///
+/// `transient_effect_is_live` already refuses to apply such an effect, but many
+/// consumers walk `state.transient_continuous_effects` directly without that
+/// filter — `static_abilities.rs`, `casting.rs`, `turns.rs`, `visibility.rs`,
+/// `effects/attach.rs`, `mana_payment.rs`, `end_continuous_effect.rs`,
+/// `derived_views.rs` and more; the list is a sample, not a census. For the
+/// PRESENCE reading those consumers are covered for free, because
+/// `prune_host_left_effects`
+/// REMOVES the effect from the vector on the battlefield exit. The control
+/// reading has no such event, so without this removal the filtered and the
+/// unfiltered consumers would answer the same question differently — the exact
+/// split `transient_effect_is_live`'s doc claims to rule out.
+///
+/// Removal rather than suppression matches how the sibling presence reading is
+/// handled — `prune_host_left_effects` removes on the exit event — and keeps a
+/// later re-gain of control from silently reviving the effect. CR 611.2b's own
+/// wording is about the grant window ("… and doesn't begin again during that
+/// spell or ability's resolution, the effect does nothing"), so it is cited
+/// here as the rule that ends the duration, not as a quotation about revival.
+///
+/// Runs at the same seam as `prune_lapsed_host_bound_casting_permissions`,
+/// inside `evaluate_layers` after the Layer-2 control board is finalized. Like
+/// `prune_lapsed_controller_controls_source` it does NOT mark layers dirty: it
+/// is already inside the pass, and marking would re-enter it.
+pub(crate) fn prune_lapsed_host_bound_effects(state: &mut GameState) {
+    if !state.transient_continuous_effects.iter().any(|e| {
+        matches!(
+            e.duration,
+            Duration::WhileControllingHost | Duration::WhileHostOnBattlefield
+        )
+    }) {
+        return;
+    }
+    // CR 611.2b: an effect is ENDED here, not suppressed. Both legs below are
+    // lapses that no zone change reports, so nothing else would remove the
+    // entry: `WhileControllingHost` lapses on a control change with the host
+    // still on the battlefield, `WhileHostOnBattlefield` lapses on the host's
+    // phase-out (CR 702.26f). The event deadline is NOT ended here — see the
+    // match arm below for why.
+    //
+    // Suppressing instead (declining to apply while the gate is false) is
+    // wrong twice over: CR 611.2b ends the duration rather than pausing it, so
+    // a later re-gain of control must not revive the effect, and the consumers
+    // that walk `transient_continuous_effects` without
+    // `transient_effect_is_live` would keep applying it meanwhile.
+    let lapsed: Vec<u64> = state
+        .transient_continuous_effects
+        .iter()
+        .filter(|e| match e.duration {
+            Duration::WhileControllingHost => {
+                !crate::game::replacement::controller_controls_source_gate(
+                    state,
+                    e.source_id,
+                    e.controller,
+                )
+            }
+            // CR 611.2b + CR 702.26f: the presence reading ends when its host
+            // is phased out — "effects with 'for as long as' durations that
+            // track that permanent (see rule 611.2b) end when that permanent
+            // phases out because they can no longer see it." The battlefield
+            // check keeps the arm honest if the exit event was missed; the
+            // phase-out is the leg only this pass can see.
+            Duration::WhileHostOnBattlefield => !state.objects.get(&e.source_id).is_some_and(|o| {
+                o.zone == crate::types::zones::Zone::Battlefield && o.is_phased_in()
+            }),
+            // CR 611.2a + CR 702.26d: the EVENT deadline ("until ~ leaves the
+            // battlefield") is NOT ended here. A phase-out is not the host
+            // leaving the battlefield, so it keeps running across one;
+            // `prune_host_left_effects` ends it on the exit event itself.
+            Duration::UntilHostLeavesPlay
+            | Duration::UntilEndOfTurn
+            | Duration::UntilEndOfCombat
+            | Duration::UntilNextTurnOf { .. }
+            | Duration::UntilEndOfNextTurnOf { .. }
+            | Duration::UntilNextStepOf { .. }
+            | Duration::ForAsLongAs { .. }
+            | Duration::UntilSourceExilesAnotherCard
+            | Duration::UntilOpponentBecomesMonarch
+            | Duration::Permanent => false,
+        })
+        .map(|e| e.id)
+        .collect();
+    if lapsed.is_empty() {
+        return;
+    }
+    state
+        .transient_continuous_effects
+        .retain(|e| !lapsed.contains(&e.id));
 }
 
 /// Remove transient effects bound to a specific affected object that has left the battlefield.
@@ -895,6 +1328,53 @@ pub(crate) fn prune_controller_controls_source_on_leave(
 ///
 /// Used by both intrinsic (permanent-based) and transient (state-level) continuous
 /// effects so that condition evaluation is consistent regardless of effect origin.
+/// CR 506.2 + CR 508.5 + CR 611.3a: the runtime anchors a [`StaticCondition`]
+/// may need that are NOT recoverable from `(controller, source_id)` alone.
+///
+/// One value per anchor axis. A future anchor is a new FIELD here, never a new
+/// `evaluate_condition_*` sibling and never a sixth positional parameter. This
+/// is the condition-evaluation layer's context: the `FilterContext` and
+/// `QuantityContext` the evaluator builds are DERIVED from it, which is why
+/// neither of those is the right carrier for these fields.
+///
+/// Construct via the associated functions, not a struct literal — the same
+/// convention `FilterContext` documents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConditionContext {
+    /// CR 611.3a: the object the effect is evaluated AGAINST when that differs
+    /// from its source (an Equipment's equipped creature, a remote grant's
+    /// affected creature). Forwarded to `QuantityContext.recipient` and, when
+    /// bound, to `FilterContext::from_source_with_recipient`.
+    pub recipient: Option<ObjectId>,
+    /// The attack target under validation for `recipient` during the
+    /// declare-attackers turn-based action (CR 508.1a-c). `state.combat` is
+    /// still empty at that point — the attacker is not recorded until
+    /// CR 508.1k — so this is the only anchor available there.
+    pub declared_attack: Option<AttackTarget>,
+}
+
+impl ConditionContext {
+    /// No anchors bound.
+    pub(crate) const NONE: Self = Self {
+        recipient: None,
+        declared_attack: None,
+    };
+
+    /// CR 611.3a recipient anchor only.
+    pub(crate) const fn recipient(id: ObjectId) -> Self {
+        Self {
+            recipient: Some(id),
+            declared_attack: None,
+        }
+    }
+
+    /// Add the declaration-time attack target (CR 508.1a-c).
+    pub(crate) const fn with_declared_attack(mut self, target: Option<AttackTarget>) -> Self {
+        self.declared_attack = target;
+        self
+    }
+}
+
 /// Evaluate a `StaticCondition` for the given controller and source object.
 /// Returns `true` if the condition is met (effect should apply), `false` otherwise.
 ///
@@ -906,7 +1386,13 @@ pub(crate) fn evaluate_condition(
     controller: PlayerId,
     source_id: ObjectId,
 ) -> bool {
-    evaluate_condition_with_context(state, condition, controller, source_id, None)
+    evaluate_condition_with_context(
+        state,
+        condition,
+        controller,
+        source_id,
+        ConditionContext::NONE,
+    )
 }
 
 pub(crate) fn evaluate_condition_with_recipient(
@@ -916,7 +1402,35 @@ pub(crate) fn evaluate_condition_with_recipient(
     source_id: ObjectId,
     recipient_id: ObjectId,
 ) -> bool {
-    evaluate_condition_with_context(state, condition, controller, source_id, Some(recipient_id))
+    evaluate_condition_with_context(
+        state,
+        condition,
+        controller,
+        source_id,
+        ConditionContext::recipient(recipient_id),
+    )
+}
+
+/// CR 109.4 + CR 725.5 (static analogue of the trigger-side CR 603.4 gate):
+/// layer evaluation has no triggering event and no combat anchor, so it cannot
+/// resolve any [`PlayerScope`] other than `Controller`. A scoped designation
+/// leaf is therefore unanswerable here.
+///
+/// Reject the whole condition at the entry boundary — returning `false` from the
+/// leaf would let [`StaticCondition::Not`] invert it into an APPLIED
+/// restriction, which is exactly the printed "unless that player is the
+/// monarch" shape. CR 725.5 independently prescribes "the effect does nothing"
+/// for the analogous vacant-monarch case, so `false` here is the
+/// rules-prescribed outcome rather than an invented default.
+///
+/// Purely structural (no `GameState` needed), mirroring the shape of
+/// `condition_uses_recipient_context` and `static_condition_uses_object_population`
+/// in this module. Delegates the leaf question and the Boolean-combinator walk
+/// to [`StaticCondition::has_unbindable_designation_anchor`] — the single
+/// authority shared with any parser-time gate that must decline to mark such a
+/// condition "supported" when it can never bind at runtime.
+fn static_condition_has_unresolvable_designation_anchor(condition: &StaticCondition) -> bool {
+    condition.has_unbindable_designation_anchor()
 }
 
 /// Selects the controller that supplies "you" for an active effect's
@@ -972,7 +1486,6 @@ fn condition_uses_recipient_context(condition: &StaticCondition) -> bool {
         StaticCondition::IsPresent {
             filter: Some(filter),
         }
-        | StaticCondition::DefendingPlayerControls { filter }
         | StaticCondition::SourceMatchesFilter { filter } => filter_uses_recipient(filter),
         StaticCondition::QuantityComparison { lhs, rhs, .. } => {
             quantity_expr_uses_recipient(lhs) || quantity_expr_uses_recipient(rhs)
@@ -983,6 +1496,10 @@ fn condition_uses_recipient_context(condition: &StaticCondition) -> bool {
         StaticCondition::Not { condition } => condition_uses_recipient_context(condition),
         StaticCondition::RecipientHasCounters { .. } => true,
         StaticCondition::RecipientMatchesFilter { .. } => true,
+        // CR 508.5: the defending player is resolved from the RECIPIENT (the attacking
+        // creature this static applies to), not the source, so this condition is
+        // recipient-relative regardless of what its filter reads.
+        StaticCondition::DefendingPlayerControls { .. } => true,
         // CR 105.2 + CR 611.3a: "Enchanted creature gets +3/+3 unless IT shares a
         // color…" — the color check is on the recipient (the enchanted creature),
         // not the Aura source, so it must route through the recipient-eval path.
@@ -1085,16 +1602,19 @@ fn static_condition_uses_object_population(condition: &StaticCondition) -> bool 
         | StaticCondition::RecipientAttackingOwnerTarget { .. }
         | StaticCondition::SourceIsBlocking
         | StaticCondition::SourceIsBlocked
-        | StaticCondition::IsMonarch
+        | StaticCondition::IsMonarch { .. }
         | StaticCondition::IsInitiative
         | StaticCondition::NoMonarch
         | StaticCondition::HasCityBlessing
+        | StaticCondition::HasEnduringStory
         | StaticCondition::CompletedADungeon
         | StaticCondition::WasStartingPlayer { .. }
         | StaticCondition::SpellCastWithVariantThisTurn { .. }
+        | StaticCondition::AnyPlayerAttackedYouLastTurn
         | StaticCondition::OpponentPoisonAtLeast { .. }
         | StaticCondition::UnlessPay { .. }
         | StaticCondition::DuringYourTurn
+        | StaticCondition::DuringOpponentsTurn
         | StaticCondition::SourceEnteredThisTurn
         | StaticCondition::SourceHasDealtDamage
         | StaticCondition::WasCast { .. }
@@ -1126,6 +1646,150 @@ fn static_condition_uses_object_population(condition: &StaticCondition) -> bool 
         | StaticCondition::AdditionalCostPaid
         | StaticCondition::CastingAsVariant { .. }
         | StaticCondition::None => false,
+    }
+}
+
+/// CR 613.1: Which layer-writable characteristic kinds does this source-level
+/// enabling condition read?
+///
+/// Characteristic-dependence twin of `static_condition_uses_object_population`:
+/// that predicate answers "can board MEMBERSHIP flip this gate", this one
+/// answers "which layer-writable CHARACTERISTICS does the gate read".
+///
+/// Two deliberate differences from the boolean twin:
+/// - it RECURSES `SourceMatchesFilter` / `RecipientMatchesFilter` (both are
+///   `false` there because a battlefield entry cannot change whether the source
+///   or the recipient matches — but a layer write to that object very much can);
+/// - `Unrecognized` maps to ALL, not to a kind.
+///
+/// EXHAUSTIVE and wildcard-free. Conditions over zones, turn structure, player
+/// totals, statuses (CR 110.5a) and counters (CR 122.1) read NO layer-writable
+/// characteristic and MUST classify EMPTY — a blanket-ALL here would saturate
+/// the read union on ordinary boards and turn the entry-flush gate into an
+/// unconditional full re-evaluation.
+fn static_condition_characteristic_reads(condition: &StaticCondition) -> CharacteristicKinds {
+    static_condition_characteristic_reads_at(condition, CHARACTERISTIC_READ_DEPTH)
+}
+
+fn static_condition_characteristic_reads_at(
+    condition: &StaticCondition,
+    depth: u32,
+) -> CharacteristicKinds {
+    let Some(depth) = depth.checked_sub(1) else {
+        return CharacteristicKinds::ALL;
+    };
+    match condition {
+        // Threshold gates: both operands are magnitudes.
+        StaticCondition::QuantityComparison { lhs, rhs, .. } => {
+            quantity_expr_characteristic_reads_at(lhs, depth)
+                .union(quantity_expr_characteristic_reads_at(rhs, depth))
+        }
+        // CR 700.5: devotion sums mana symbols in the mana costs of the
+        // permanents the source's controller controls.
+        StaticCondition::DevotionGE { .. } => {
+            CharacteristicKinds::MANA_COST.union(CharacteristicKinds::CONTROLLER)
+        }
+        // CR 105.1: color histogram over every battlefield permanent.
+        StaticCondition::SharesColorWithMostCommonColorAmongPermanents => {
+            CharacteristicKinds::COLOR
+        }
+        // CR 109.4: "you control [filter]" — controller-scoped membership over a
+        // live filter. A filterless `IsPresent` still reads the controller scope.
+        StaticCondition::IsPresent { filter } => {
+            filter
+                .as_ref()
+                .map_or(CharacteristicKinds::CONTROLLER, |f| {
+                    CharacteristicKinds::CONTROLLER
+                        .union(target_filter_characteristic_reads_at(f, depth))
+                })
+        }
+        // CR 509.1a + CR 109.4: per-player board census over a live filter.
+        StaticCondition::DefendingPlayerControls { filter } => CharacteristicKinds::CONTROLLER
+            .union(target_filter_characteristic_reads_at(filter, depth)),
+        // CR 903.3 + CR 613.1b: commander designation is fixed at deck
+        // construction; only the control scope is layer-writable.
+        StaticCondition::ControlsCommander { .. }
+        | StaticCondition::SourceControllerEquals { .. } => CharacteristicKinds::CONTROLLER,
+        // Recurse combinators, early-exiting once saturated.
+        StaticCondition::And { conditions } | StaticCondition::Or { conditions } => conditions
+            .iter()
+            .fold(CharacteristicKinds::EMPTY, |acc, c| {
+                if acc.is_all() {
+                    acc
+                } else {
+                    acc.union(static_condition_characteristic_reads_at(c, depth))
+                }
+            }),
+        StaticCondition::Not { condition } => {
+            static_condition_characteristic_reads_at(condition, depth)
+        }
+        // Parse fallback: text unknown, so every kind is conservatively assumed.
+        StaticCondition::Unrecognized { .. } => CharacteristicKinds::ALL,
+        // NET-NEW relative to the boolean twin: these match a live object
+        // against a filter, so every characteristic that filter reads is a live
+        // read of this condition.
+        StaticCondition::SourceMatchesFilter { filter }
+        | StaticCondition::RecipientMatchesFilter { filter } => {
+            target_filter_characteristic_reads_at(filter, depth)
+        }
+        // CR 301.5 + CR 303.4 + CR 306.1: attachment relationships are decided by
+        // the attachment's subtype (Equipment / Aura) and by the attached
+        // object's card type.
+        StaticCondition::SourceIsEquipped
+        | StaticCondition::SourceIsEnchanted
+        | StaticCondition::SourceAttachedToCreature => CharacteristicKinds::CARD_TYPES,
+        // Reads no layer-writable characteristic: zone contents, turn structure,
+        // combat state, player-scoped totals and designations, statuses
+        // (CR 110.5a), counters (CR 122.1), per-object chosen attributes, and
+        // cast history. Enumerated explicitly (no wildcard).
+        //
+        // CR 401.1: `TopOfLibraryMatches` reads the controller's LIBRARY top; no
+        // write to a battlefield object can change that card's characteristics.
+        StaticCondition::TopOfLibraryMatches { .. }
+        | StaticCondition::ChosenColorIs { .. }
+        | StaticCondition::ChosenLabelIs { .. }
+        | StaticCondition::HasMaxSpeed
+        | StaticCondition::SpeedGE { .. }
+        | StaticCondition::DayNightIs { .. }
+        | StaticCondition::HasCounters { .. }
+        | StaticCondition::CastVariantPaid { .. }
+        | StaticCondition::RecipientHasCounters { .. }
+        | StaticCondition::ClassLevelGE { .. }
+        | StaticCondition::SourceAttackingAlone
+        | StaticCondition::SourceIsAttacking
+        | StaticCondition::RecipientAttackingOwnerTarget { .. }
+        | StaticCondition::SourceIsBlocking
+        | StaticCondition::SourceIsBlocked
+        | StaticCondition::IsMonarch { .. }
+        | StaticCondition::IsInitiative
+        | StaticCondition::NoMonarch
+        | StaticCondition::HasCityBlessing
+        | StaticCondition::HasEnduringStory
+        | StaticCondition::CompletedADungeon
+        | StaticCondition::WasStartingPlayer { .. }
+        | StaticCondition::SpellCastWithVariantThisTurn { .. }
+        | StaticCondition::AnyPlayerAttackedYouLastTurn
+        | StaticCondition::OpponentPoisonAtLeast { .. }
+        | StaticCondition::UnlessPay { .. }
+        | StaticCondition::DuringYourTurn
+        | StaticCondition::DuringOpponentsTurn
+        | StaticCondition::SourceEnteredThisTurn
+        | StaticCondition::SourceHasDealtDamage
+        | StaticCondition::WasCast { .. }
+        | StaticCondition::IsRingBearer
+        | StaticCondition::RingLevelAtLeast { .. }
+        | StaticCondition::SourceIsTapped
+        | StaticCondition::IsTapped { .. }
+        | StaticCondition::SourceIsSaddled
+        | StaticCondition::SourceIsMonstrous
+        | StaticCondition::SourceIsHarnessed
+        | StaticCondition::SourceIsPaired
+        | StaticCondition::SourceInZone { .. }
+        | StaticCondition::EnchantedIsFaceDown
+        | StaticCondition::SourceIsFaceUp
+        | StaticCondition::AdditionalCostPaid
+        | StaticCondition::CastingAsVariant { .. }
+        | StaticCondition::None => CharacteristicKinds::EMPTY,
     }
 }
 
@@ -1221,16 +1885,19 @@ fn entered_object_perturbs_static_condition(
         | StaticCondition::RecipientAttackingOwnerTarget { .. }
         | StaticCondition::SourceIsBlocking
         | StaticCondition::SourceIsBlocked
-        | StaticCondition::IsMonarch
+        | StaticCondition::IsMonarch { .. }
         | StaticCondition::IsInitiative
         | StaticCondition::NoMonarch
         | StaticCondition::HasCityBlessing
+        | StaticCondition::HasEnduringStory
         | StaticCondition::CompletedADungeon
         | StaticCondition::WasStartingPlayer { .. }
         | StaticCondition::SpellCastWithVariantThisTurn { .. }
+        | StaticCondition::AnyPlayerAttackedYouLastTurn
         | StaticCondition::OpponentPoisonAtLeast { .. }
         | StaticCondition::UnlessPay { .. }
         | StaticCondition::DuringYourTurn
+        | StaticCondition::DuringOpponentsTurn
         | StaticCondition::SourceEnteredThisTurn
         | StaticCondition::SourceHasDealtDamage
         | StaticCondition::WasCast { .. }
@@ -1299,12 +1966,30 @@ fn source_condition_gate_passes(
     }
 }
 
-fn evaluate_condition_with_context(
+/// CR 109.4 + CR 725.5: the designation-anchor entry gate, applied here so the
+/// anchored entry point is guarded exactly like `evaluate_condition` and
+/// `evaluate_condition_with_recipient`. The And/Or/Not recursions deliberately
+/// bypass it by calling `evaluate_condition_inner` — preserving the pre-existing
+/// recursion shape, which never re-entered the gate.
+pub(crate) fn evaluate_condition_with_context(
     state: &GameState,
     condition: &StaticCondition,
     controller: PlayerId,
     source_id: ObjectId,
-    recipient_id: Option<ObjectId>,
+    context: ConditionContext,
+) -> bool {
+    if static_condition_has_unresolvable_designation_anchor(condition) {
+        return false;
+    }
+    evaluate_condition_inner(state, condition, controller, source_id, context)
+}
+
+fn evaluate_condition_inner(
+    state: &GameState,
+    condition: &StaticCondition,
+    controller: PlayerId,
+    source_id: ObjectId,
+    context: ConditionContext,
 ) -> bool {
     match condition {
         StaticCondition::DevotionGE { colors, threshold } => {
@@ -1345,8 +2030,10 @@ fn evaluate_condition_with_context(
                         entering: None,
                         source: source_id,
                         trigger_source: None,
-                        recipient: recipient_id,
+                        recipient: context.recipient,
                         scoped_player: None,
+                        damage_source: None,
+                        event_amount: None,
                     },
                 )
             };
@@ -1354,14 +2041,14 @@ fn evaluate_condition_with_context(
         }
         StaticCondition::HasMaxSpeed => has_max_speed(state, controller),
         StaticCondition::SpeedGE { threshold } => effective_speed(state, controller) >= *threshold,
-        StaticCondition::And { conditions } => conditions.iter().all(|c| {
-            evaluate_condition_with_context(state, c, controller, source_id, recipient_id)
-        }),
-        StaticCondition::Or { conditions } => conditions.iter().any(|c| {
-            evaluate_condition_with_context(state, c, controller, source_id, recipient_id)
-        }),
+        StaticCondition::And { conditions } => conditions
+            .iter()
+            .all(|c| evaluate_condition_inner(state, c, controller, source_id, context)),
+        StaticCondition::Or { conditions } => conditions
+            .iter()
+            .any(|c| evaluate_condition_inner(state, c, controller, source_id, context)),
         StaticCondition::Not { condition } => {
-            !evaluate_condition_with_context(state, condition, controller, source_id, recipient_id)
+            !evaluate_condition_inner(state, condition, controller, source_id, context)
         }
         // CR 731.1: True when the game has the requested day/night designation.
         StaticCondition::DayNightIs {
@@ -1392,7 +2079,8 @@ fn evaluate_condition_with_context(
             counters,
             minimum,
             maximum,
-        } => recipient_id
+        } => context
+            .recipient
             .and_then(|id| state.objects.get(&id))
             .map(|obj| counter_condition_matches(obj, counters, *minimum, *maximum))
             .unwrap_or(false),
@@ -1401,7 +2089,8 @@ fn evaluate_condition_with_context(
         // object being modified this layer cycle; tests THIS recipient against the
         // type/subtype/color filter (not mere existence of some matching object).
         // No recipient → false (mirrors the RecipientHasCounters defensive default).
-        StaticCondition::RecipientMatchesFilter { filter } => recipient_id
+        StaticCondition::RecipientMatchesFilter { filter } => context
+            .recipient
             .map(|id| {
                 matches_target_filter(
                     state,
@@ -1415,7 +2104,8 @@ fn evaluate_condition_with_context(
         // this static gates) is attacking its owner / a permanent its owner
         // controls. Owner-relative (CR 108.3); no recipient → false (mirrors the
         // RecipientMatchesFilter defensive default).
-        StaticCondition::RecipientAttackingOwnerTarget { target } => recipient_id
+        StaticCondition::RecipientAttackingOwnerTarget { target } => context
+            .recipient
             .map(|id| eval_recipient_attacking_owner_target(state, id, target))
             .unwrap_or(false),
         // CR 716.2a + CR 716.3: Level abilities are active at or above the specified
@@ -1440,6 +2130,16 @@ fn evaluate_condition_with_context(
                 .unwrap_or(controller);
             state.active_player == source_controller
         }
+        // CR 102.3 + CR 805.4a: team-aware opponent relation. A teammate
+        // holding `active_player` does not make this an opponent's turn.
+        StaticCondition::DuringOpponentsTurn => {
+            let source_controller = state
+                .objects
+                .get(&source_id)
+                .map(|obj| obj.controller)
+                .unwrap_or(controller);
+            super::players::is_opponent(state, source_controller, state.active_player)
+        }
         // CR 103.1: True when the scoped player took the first turn of the
         // game (fixed at game start). The parser emits `ControllerRef::You`.
         StaticCondition::WasStartingPlayer { .. } => state.current_starting_player == controller,
@@ -1448,11 +2148,19 @@ fn evaluate_condition_with_context(
         StaticCondition::SpellCastWithVariantThisTurn { variant } => {
             crate::game::restrictions::spell_cast_with_variant_this_turn(state, variant)
         }
+        // CR 508.6 + CR 109.5: True when any other player declared a creature
+        // attacking the controller ("you") during that player's most recent
+        // completed turn. Existential; the defender is the controller, so a player
+        // who attacked someone else — or the controller's own attacks — do not
+        // satisfy it.
+        StaticCondition::AnyPlayerAttackedYouLastTurn => state.players.iter().any(|p| {
+            p.id != controller && state.player_attacked_player_last_turn(p.id, controller)
+        }),
         // CR 105.2 + CR 611.3a: the subject is the recipient (the enchanted
         // creature, "it"), not the Aura source; fall back to the source only when
         // evaluated without a recipient (the source gate defers to per-recipient).
         StaticCondition::SharesColorWithMostCommonColorAmongPermanents => {
-            eval_shares_color_with_most_common_color(state, recipient_id.unwrap_or(source_id))
+            eval_shares_color_with_most_common_color(state, context.recipient.unwrap_or(source_id))
         }
         StaticCondition::SourceEnteredThisTurn => eval_source_entered_this_turn(state, source_id),
         // CR 120.3 + CR 120.6 + CR 702.11b: True once the source has actually dealt
@@ -1492,7 +2200,7 @@ fn evaluate_condition_with_context(
         // only ever emits `scope: Target` (the demonstrative "that creature
         // remains tapped" case — Zygon Infiltrator), bound at resolution time to
         // the copy target via `duration_subject` and surfaced here as the
-        // `recipient_id`. `Recipient` resolves identically. `Source` is spelled
+        // `context.recipient`. `Recipient` resolves identically. `Source` is spelled
         // `SourceIsTapped` and never reaches this arm; the remaining scopes are
         // never produced for a duration tap condition, so they fail safely.
         StaticCondition::IsTapped { scope } => match scope {
@@ -1501,7 +2209,7 @@ fn evaluate_condition_with_context(
             }
             crate::types::ability::ObjectScope::Target
             | crate::types::ability::ObjectScope::Recipient => {
-                recipient_id.is_some_and(|id| eval_source_is_tapped_on_battlefield(state, id))
+                context.recipient.is_some_and(|id| eval_source_is_tapped_on_battlefield(state, id))
             }
             crate::types::ability::ObjectScope::EventSource
             | crate::types::ability::ObjectScope::EventTarget
@@ -1511,7 +2219,9 @@ fn evaluate_condition_with_context(
             | crate::types::ability::ObjectScope::OtherRevealedCard
             | crate::types::ability::ObjectScope::OwnedLinkedExileCard
             | crate::types::ability::ObjectScope::Demonstrative
-            | crate::types::ability::ObjectScope::AmassedArmy => false,
+            | crate::types::ability::ObjectScope::AmassedArmy
+            | crate::types::ability::ObjectScope::ChainRootTarget
+            | crate::types::ability::ObjectScope::BatchSource => false,
         },
         // CR 702.171b + CR 110.5d: off-battlefield permanents have no saddled designation.
         StaticCondition::SourceIsSaddled => state.objects.get(&source_id).is_some_and(|obj| {
@@ -1613,26 +2323,55 @@ fn evaluate_condition_with_context(
             .objects
             .get(&source_id)
             .is_some_and(|obj| obj.paired_with.is_some()),
-        // CR 509.1b: True when the defending player controls a permanent matching the filter.
-        // Only meaningful during combat — finds the defending player from the source's
-        // attacker info in the CombatState.
-        StaticCondition::DefendingPlayerControls { filter } => state
-            .combat
-            .as_ref()
-            .and_then(|combat| {
-                combat
-                    .attackers
-                    .iter()
-                    .find(|a| a.object_id == source_id)
-                    .map(|a| a.defending_player)
+        // CR 506.2 + CR 508.5 + CR 509.1b: "the defending player" is determined
+        // relative to an ATTACKING CREATURE, so the anchor is the creature this
+        // static is evaluated AGAINST — the recipient. For an intrinsic SelfRef
+        // static that is the source itself; for a remote grant ("Each creature
+        // you control can't be blocked…", Tanglewalker) it is the affected
+        // attacker, NOT the granting permanent, which need not be attacking at
+        // all. CR 509.1b (and its second paragraph, which names evasion
+        // abilities specifically) is the authorizing rule for this condition's
+        // block-side half — the 7 cards that grant a "can't be blocked unless
+        // defending player controls…" restriction (Hazy Homunculus,
+        // Tanglewalker, Arctic Foxes, Bouncing/Bubbling Beebles, Neurok Spy,
+        // Scrapdiver Serpent) consume the same arm as the attack-side cards
+        // below.
+        //
+        // CR 506.2 (two-player) fixes the defending player for the whole combat phase;
+        // CR 508.5 is the general rule, resolving it from the target that creature is
+        // attacking. During the declare-attackers turn-based action the creature is not
+        // yet recorded as an attacker (that is CR 508.1k), so the target under
+        // validation is the only available anchor. When `declared_attack` is bound it
+        // is AUTHORITATIVE for CR 508.1c's proposed-declaration question: it does not
+        // fall through to the latched `AttackerInfo` even if the target resolves to no
+        // defending player (an unprotected battle) — that IS the CR 508.1c answer.
+        //
+        // CR 508.5 last sentence: once declared (`declared_attack` unbound), the
+        // latched `AttackerInfo` keeps answering, including after the creature leaves
+        // combat.
+        //
+        // No anchor bindable => no defending player => false. A `Not` wrapper inverting
+        // this is the printed "unless" and is correct.
+        StaticCondition::DefendingPlayerControls { filter } => {
+            let attacking = context.recipient.unwrap_or(source_id);
+            let defending = match context.declared_attack {
+                Some(target) => crate::game::combat::defending_player_for_target(state, target),
+                None => crate::game::combat::defending_player_for_attacker(state, attacking),
+            };
+            defending.is_some_and(|defending| {
+                // CR 109.2 + CR 108.4 + CR 110.1: battlefield-scoped census (Unit 1).
+                // CR 109.5 + CR 611.3a: source-relative filter props stay anchored to
+                // the STATIC'S source; per-recipient props bind to the affected
+                // attacker via the existing `from_source_with_recipient` constructor.
+                let ctx = match context.recipient {
+                    Some(recipient) => {
+                        FilterContext::from_source_with_recipient(state, source_id, recipient)
+                    }
+                    None => FilterContext::from_source(state, source_id),
+                };
+                crate::game::filter::player_controls_matching(state, defending, filter, &ctx)
             })
-            .is_some_and(|defending| {
-                let ctx = FilterContext::from_source(state, source_id);
-                state.objects.values().any(|obj| {
-                    obj.controller == defending
-                        && matches_target_filter(state, obj.id, filter, &ctx)
-                })
-            }),
+        }
         // CR 506.5: True when the source creature is the only attacking creature.
         StaticCondition::SourceAttackingAlone => state.combat.as_ref().is_some_and(|combat| {
             combat.attackers.len() == 1
@@ -1656,14 +2395,30 @@ fn evaluate_condition_with_context(
                 .find(|a| a.object_id == source_id)
                 .is_some_and(|a| a.blocked)
         }),
-        // CR 725.1: True when the controller is the monarch.
-        StaticCondition::IsMonarch => eval_is_monarch(state, controller),
+        // CR 725.1 + CR 109.5: a static ability's "you" is the object's current
+        // controller. Layer evaluation has no trigger event and no combat
+        // anchor, so no other scope can EVER resolve here. The scoped form never
+        // reaches this arm — `evaluate_condition{,_with_recipient}` has already
+        // rejected the condition at its entry boundary — and
+        // `coverage::static_condition_feature` reports those scopes `Unhandled`,
+        // so coverage does not claim support.
+        //
+        // CR 725.5: while there is no monarch, a monarch-dependent continuous
+        // effect does nothing, and begins to apply once a player becomes the
+        // monarch. `eval_is_monarch` returns false for a vacant designation and
+        // layers re-evaluate on the monarch change, which is exactly that.
+        StaticCondition::IsMonarch {
+            player: PlayerScope::Controller,
+        } => eval_is_monarch(state, controller),
+        StaticCondition::IsMonarch { .. } => false,
         // CR 726.3: True when the controller has the initiative.
         StaticCondition::IsInitiative => eval_is_initiative(state, controller),
         // CR 725.1: True when no player holds the monarch designation.
         StaticCondition::NoMonarch => eval_no_monarch(state),
         // CR 702.131a: True when the controller has the city's blessing.
         StaticCondition::HasCityBlessing => eval_has_city_blessing(state, controller),
+        // CR 702.195b: True when the controller has the enduring story designation.
+        StaticCondition::HasEnduringStory => eval_has_enduring_story(state, controller),
         StaticCondition::OpponentPoisonAtLeast { count } => state
             .players
             .iter()
@@ -1748,13 +2503,66 @@ fn record_active_effect_collection() {
     ACTIVE_EFFECT_COLLECTION_COUNT.with(|count| count.set(count.get() + 1));
 }
 
+// Test-only counter incremented once per SHARED (recipient-independent)
+// dynamic-quantity resolution performed by `apply_continuous_effect_filtered`.
+// A single such resolution can cost a whole-battlefield census
+// (`quantity::object_count_matching_ids`), so it is the unit the
+// empty-affected-set skip below is measured in. Thread-local for the same
+// reason as its siblings: layer evaluation is synchronous, so a test reads only
+// the work its own thread did.
 #[cfg(test)]
-fn reset_active_effect_collection_count() {
+thread_local! {
+    static SHARED_DYNAMIC_QUANTITY_RESOLUTIONS: core::cell::Cell<usize> =
+        const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_shared_dynamic_quantity_resolution() {
+    SHARED_DYNAMIC_QUANTITY_RESOLUTIONS.with(|count| count.set(count.get() + 1));
+}
+
+// Test-only counter of the CANDIDATE objects `effect_candidate_ids` hands back,
+// summed over every continuous effect in a pass. It is the unit the identity-
+// filter shortcut is measured in: an effect whose `affected_filter` names ONE
+// object contributes 1 here, where a whole-zone scan would contribute
+// |battlefield|.
+#[cfg(test)]
+thread_local! {
+    static EFFECT_CANDIDATES_SCANNED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_effect_candidates_scanned(count: usize) {
+    EFFECT_CANDIDATES_SCANNED.with(|c| c.set(c.get() + count));
+}
+
+#[cfg(test)]
+fn reset_effect_candidates_scanned() {
+    EFFECT_CANDIDATES_SCANNED.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+fn effect_candidates_scanned() -> usize {
+    EFFECT_CANDIDATES_SCANNED.with(core::cell::Cell::get)
+}
+
+#[cfg(test)]
+fn reset_shared_dynamic_quantity_resolution_count() {
+    SHARED_DYNAMIC_QUANTITY_RESOLUTIONS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+fn shared_dynamic_quantity_resolution_count() -> usize {
+    SHARED_DYNAMIC_QUANTITY_RESOLUTIONS.with(core::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_active_effect_collection_count() {
     ACTIVE_EFFECT_COLLECTION_COUNT.with(|count| count.set(0));
 }
 
 #[cfg(test)]
-fn active_effect_collection_count() -> usize {
+pub(crate) fn active_effect_collection_count() -> usize {
     ACTIVE_EFFECT_COLLECTION_COUNT.with(core::cell::Cell::get)
 }
 
@@ -1822,8 +2630,9 @@ fn rebuild_static_index_at_top() -> bool {
 /// stops re-deriving them, and a naturally-menace creature keeps its printed
 /// menace when it stops being suspected.
 ///
-/// Called from the Step-1 reset of both the full (`evaluate_layers`) and
-/// incremental (`apply_layers_incremental`) passes, immediately after the live
+/// Called from `reset_recipient_to_base`, which both passes go through — the
+/// full one (`evaluate_layers`) board-wide, the incremental one
+/// (`prepare_incremental_flush`) over recipients — immediately after the live
 /// fields are reset to base, so the derived grant rides along with every reset.
 fn derive_suspected_abilities(obj: &mut crate::game::game_object::GameObject) {
     if !obj.is_suspected {
@@ -1850,15 +2659,28 @@ fn derive_suspected_abilities(obj: &mut crate::game::game_object::GameObject) {
 /// CR 613.1 + CR 707.2 + CR 708.2: seed live characteristics from base_*; shared
 /// by Step-1 top-of-pass reset and the CR 613.2b Layer-1b face-down re-seed.
 ///
-/// Assigns the live copiable-characteristic fields from their `base_*` baseline,
-/// exactly mirroring the Step-1 reset block field-for-field. Does NOT call
-/// `sync_missing_base_characteristics`, and does NOT touch controller, the
-/// combat-assignment flags, or `derive_suspected_abilities` — those stay inline
-/// in Step 1 (they are not part of the face-down CR 708.2a re-seed).
+/// Assigns the live copiable-characteristic fields from their `base_*` baseline.
+/// Does NOT call `sync_missing_base_characteristics`, and does NOT touch
+/// controller, the combat-assignment flags, or `derive_suspected_abilities` —
+/// those live in `reset_recipient_to_base`, which calls this as its second step
+/// (they are not part of the face-down CR 708.2a re-seed, which is why this is
+/// separable at all).
 fn seed_live_characteristics_from_base(obj: &mut crate::game::game_object::GameObject) {
     obj.name = obj.base_name.clone();
+    // CR 707.2 + CR 613.1a: the copied Room half data is layer-derived — it
+    // survives only as long as a Layer-1a copy effect keeps re-applying it.
+    // (The door-gated Room NAME is derived at layer-1 exit, in
+    // `derive_room_battlefield_names`, from the post-copy effective form.)
+    obj.copied_room_halves = None;
+    // CR 707.9b: restore the persistent base origin (materialized exception
+    // names); a Layer-1 copy application overwrites it within the pass.
+    obj.layer1_name_origin = obj.base_name_origin;
     obj.power = obj.base_power;
     obj.toughness = obj.base_toughness;
+    // CR 208.4b + CR 613.4b: layer 7b starts from the printed/copiable base;
+    // later 7b setters update this carrier while 7c leaves it unchanged.
+    obj.layer_base_power = obj.base_power;
+    obj.layer_base_toughness = obj.base_toughness;
     obj.loyalty = obj.base_loyalty;
     obj.card_types = obj.base_card_types.clone();
     obj.mana_cost = obj.base_mana_cost.clone();
@@ -1871,7 +2693,18 @@ fn seed_live_characteristics_from_base(obj: &mut crate::game::game_object::GameO
     // trigger copy-on-write via `Arc::make_mut`.
     obj.abilities = Arc::clone(&obj.base_abilities);
     obj.materialize_base_trigger_definitions();
-    obj.replacement_definitions = Arc::clone(&obj.base_replacement_definitions).into();
+    // CR 611.2c + CR 613.1: reseed the printed baseline, carrying resolution-created
+    // continuous effects across the reset. See
+    // `game_object::reseed_replacements_carrying_resolution_effects`. This single
+    // edit covers ALL THREE call sites of `seed_live_characteristics_from_base`:
+    // both `reset_recipient_to_base` reach paths (the full-board pass and the
+    // incremental flush) and the CR 613.2b Layer-1b face-down reseed, which calls
+    // this function directly rather than through `reset_recipient_to_base`.
+    obj.replacement_definitions =
+        crate::game::game_object::reseed_replacements_carrying_resolution_effects(
+            &obj.replacement_definitions,
+            &obj.base_replacement_definitions,
+        );
     obj.static_definitions = Arc::clone(&obj.base_static_definitions).into();
     obj.color = obj.base_color.clone();
     // Reset the display-identity pointer to its baseline; the Copy layer
@@ -2027,23 +2860,12 @@ pub fn evaluate_layers(state: &mut GameState) {
     let mut face_down_ids: Vec<ObjectId> = Vec::new();
     for &id in &bf_ids {
         if let Some(obj) = state.objects.get_mut(&id) {
-            obj.sync_missing_base_characteristics();
-            seed_live_characteristics_from_base(obj);
+            reset_recipient_to_base(obj);
+            // Reset does not touch `face_down`, so this reads the same value
+            // whichever side of the reset it sits on.
             if obj.face_down {
                 face_down_ids.push(id);
             }
-            // CR 613.1b: Reset controller to the object's base controller;
-            // Layer 2 re-applies continuous control-changing effects.
-            obj.controller = obj.base_controller.unwrap_or(obj.owner);
-            // CR 613.11 + CR 510.1a: Reset combat-assignment rule flags;
-            // re-applied after object-characteristic layers are complete.
-            obj.assigns_damage_from_toughness = false;
-            obj.assigns_damage_as_though_unblocked = false;
-            obj.assigns_no_combat_damage = false;
-            // CR 701.60c: re-derive the suspected designation's menace +
-            // "can't block" onto the just-reset live fields (not base), so
-            // the grant lasts exactly as long as the designation.
-            derive_suspected_abilities(obj);
         }
     }
     // CR 702.94a + CR 400.3: Hand-zone continuous effects (Lorehold-style
@@ -2079,18 +2901,87 @@ pub fn evaluate_layers(state: &mut GameState) {
     // Toxic) would accumulate one instance per evaluation, and a grant would outlive the
     // transient continuous effect that produced it.
     //
-    // Scoped narrowly to `keywords`: remote type-changing effects use
+    // Scoped narrowly to `{keywords, controller}`: remote type-changing effects use
     // `reset_remote_type_layer_recipients` above, which resets only their prior
     // recipients and therefore preserves independent cast-time state on every
     // other stack object. Extend the relevant reset authority before landing a
     // static that modifies another stack characteristic.
-    let stack_ids = super::targeting::zone_object_ids(state, crate::types::zones::Zone::Stack);
-    for id in stack_ids {
+    //
+    // CR 112.2 + CR 613.1: a spell's controller is, BY DEFAULT, the player who put it on
+    // the stack; every applicable continuous effect is then applied on top, starting from
+    // that base. Stack objects sit outside the battlefield reset loop above, so without
+    // this seed a layer-2 control change (CR 613.1b) applied to a spell is a STICKY
+    // ONE-SHOT — measured: it survives removal of its own effect, so it outlives its own
+    // expiry — and a spell cast from a zone its caster does not own keeps the OWNER as its
+    // controller, contradicting CR 112.2. Scoped to `controller` alongside `keywords` for
+    // the same stated reason: extend this reset set before landing a static that modifies
+    // another stack characteristic.
+    //
+    // `targeting::zone_object_ids(state, Zone::Stack)` is defined as exactly
+    // `state.stack.iter().map(|e| e.id)`, so enumerating the entries directly here visits
+    // the identical set while also carrying each entry's CR 112.2 default.
+    //
+    // CR 608.2m: the POPPED-but-still-Zone::Stack entry exposed through
+    // `state.resolving_stack_entry` is not in `state.stack`, yet BOTH stack-object
+    // enumerators add it back under exactly this guard —
+    // `targeting::targetable_stack_spell_entries` and
+    // `filter::matches_stack_target_filter`. A controller value those two read must be one
+    // this reset maintains, or a mid-resolution exchange's expiry leaves it stale. Mirror
+    // their fallback verbatim rather than arguing the window is unreachable.
+    let stack_bases: Vec<(ObjectId, PlayerId)> = state
+        .stack
+        .iter()
+        .map(|e| (e.id, e.controller))
+        .chain(
+            state
+                .resolving_stack_entry
+                .iter()
+                .filter(|entry| {
+                    state
+                        .objects
+                        .get(&entry.id)
+                        .is_some_and(|obj| obj.zone == Zone::Stack)
+                        && !state.stack.iter().any(|live| live.id == entry.id)
+                })
+                .map(|e| (e.id, e.controller)),
+        )
+        .collect();
+    for (id, base) in stack_bases {
         if let Some(obj) = state.objects.get_mut(&id) {
             obj.sync_missing_base_characteristics();
-            obj.keywords = obj.base_keywords.clone();
+            obj.keywords = obj.base_keywords.clone(); // pre-existing, unchanged
+                                                      // CR 109.4 (r5/§F-1): "Only objects on the stack or on the battlefield
+                                                      // have a controller." This loop enumerates STACK ENTRY ids
+                                                      // (`zone_object_ids(.., Zone::Stack)` is `state.stack.iter().map(|e| e.id)`,
+                                                      // unfiltered), and the CR 601.2a announcement puts the ENTRY on the stack
+                                                      // while the OBJECT is still in its origin zone until cast finalization —
+                                                      // MEASURED: a full pass forced at a real `TargetSelection` pause visits an
+                                                      // object living in `Zone::Exile`. Writing a controller there would stamp the
+                                                      // caster onto an opponent-owned card in Exile, which no rule gives a
+                                                      // controller and which `filter::is_owner_scoped_zone` (Hand | Library |
+                                                      // Graveyard) does NOT shield. Guard verbatim the way the `.chain()` above and
+                                                      // both stack-object enumerators guard — `targeting::targetable_stack_spell_
+                                                      // entries` and `filter::matches_stack_target_filter`'s `or_else` — so the seed
+                                                      // and its consumers agree by construction. Scoped to this write: the keyword
+                                                      // reset above keeps its pre-existing unguarded shape.
+            if obj.zone == Zone::Stack {
+                obj.controller = base; // NEW
+            }
         }
     }
+    // CR 109.4 + CR 108.4a: this seed maintains a stack object's controller on
+    // the way IN. The way OUT is owned by `zones::apply_zone_exit_cleanup`,
+    // which resets `controller` to the owner fallback for every destination
+    // that is neither Battlefield nor Stack and snapshots the at-exit
+    // controller into `state.lki_cache` first (CR 608.2h). The class that
+    // needed it is the NON-RESOLVING stack exit — a stolen spell countered and
+    // exiled (Dissipate), the CR 724.1b "end the turn" / CR 724.2b "end the
+    // combat phase" stack exiles, and stack-exile riders. A stolen spell that
+    // exiles ON RESOLUTION (rebound, CR 702.88a) is NOT that class: MEASURED,
+    // the mid-resolution flush re-seeds the object from
+    // `resolving_stack_entry.controller` while the layer-2 scan can no longer
+    // reach it (`zone_object_ids(Stack)` no longer lists the popped entry), so
+    // the caster is already restored before the move.
 
     // CR 611.2 + CR 613.1: Rebuild the static-effect-source index from the
     // just-reset base `static_definitions` so the Copy / main gathers below
@@ -2108,25 +2999,24 @@ pub fn evaluate_layers(state: &mut GameState) {
     // Step 2: Apply copy effects first so copied static abilities exist before later layers.
     let mut zone_cache = LayerZoneObjectCache::default();
     let mut started_effect_sets = StartedContinuousEffectSets::new();
-    let copy_effects = gather_active_effects_for_layer(state, Layer::Copy);
-    let ordered_copy = order_active_continuous_effects(Layer::Copy, &copy_effects, state);
-    for effect in &ordered_copy {
-        apply_continuous_effect(
-            state,
-            effect,
-            &mut abilities_suppressed,
-            &mut zone_cache,
-            &mut started_effect_sets,
-        );
-    }
-    if crate::game::stickers::apply_battlefield_name_and_ability_stickers(state, &bf_ids) {
-        // Sticker ability text is appended after the top-of-pass reset/copy
-        // application, so a sticker can turn a non-generator into a continuous
-        // static source mid-pass. Refresh the generator index before the main
-        // gather so those sticker-granted statics participate in this pass
-        // without broadening the non-sticker top-of-pass rebuild contract.
-        crate::types::game_state::StaticSourceIndex::rebuild_from_state(state);
-    }
+    // Narrowed by payload rather than by "did layer 1a run": `CopyValues` carries
+    // the whole copiable static set in the modification, so the payload answers
+    // both questions 1a needs with no plumbing and no battlefield rescan. They are
+    // two different questions and are asked separately — `copy_grants_continuous_static`
+    // for the flag returned here (does the recipient become a generator layers 2-7
+    // must see?) and the narrower `copy_grants_copy_layer_static` for continuing
+    // 1a's own discovery loop. A clone of a vanilla creature — a permanent-duration
+    // TCE that outlives the clone — therefore pays nothing extra at all, and a
+    // clone of an ordinary lord pays one rebuild here rather than a second
+    // gather-and-rebuild generation inside 1a. Only a copy-granted COPY ability
+    // pays for a generation, which is the point of an index whose stated job is
+    // keeping per-flush work off `|battlefield|`.
+    let copy_added_generator = apply_copy_sublayer_to_fixed_point(
+        state,
+        &mut abilities_suppressed,
+        &mut zone_cache,
+        &mut started_effect_sets,
+    );
 
     // CR 613.2b + CR 708.2a + CR 708.10: Layer 1b. After Layer-1a copiable effects
     // (copy per CR 707, merge per CR 730) are applied, re-set each face-down
@@ -2138,6 +3028,41 @@ pub fn evaluate_layers(state: &mut GameState) {
         if let Some(obj) = state.objects.get_mut(&id) {
             seed_live_characteristics_from_base(obj);
         }
+    }
+
+    let stickers_applied = apply_room_names_then_stickers(state, &bf_ids);
+
+    // Both producers say the same thing: layer 1 can turn a non-generator into a
+    // continuous static source mid-pass, and the top-of-pass index was built from
+    // the just-reset BASE definitions, which predate that. Refresh the generator
+    // index before the main gather so those statics participate in this pass,
+    // without broadening the top-of-pass rebuild contract for boards that have
+    // neither.
+    //
+    // CR 613.2a + CR 613.2c: a copy effect can hand a permanent a static ability
+    // its copiable base does not carry (an embalm token copying a Painter's
+    // Servant). After all of layer 1 has been applied the object's characteristics
+    // ARE its copiable values, so a static granted there must generate effects for
+    // layers 2-7 of THIS pass, not the next one.
+    //
+    // Sticker ability text is likewise appended after the top-of-pass reset/copy
+    // application.
+    //
+    // Placed below the 1b face-down reseed so the rebuild observes the whole of
+    // layer 1, which is the invariant CR 613.2c actually states. 1b only ever
+    // clears statics (`apply_face_down_creature_characteristics` clears live and
+    // base alike), so ordering the two the other way is inert today — but only via
+    // that non-local fact, not via the rule cited here.
+    //
+    // `apply_copy_sublayer_to_fixed_point` already rebuilt mid-1a whenever a
+    // generation of copies added a COPY-LAYER generator, but that rebuild is scoped
+    // to 1a's own discovery loop and predates 1b by construction. This one is the
+    // layer-1
+    // exit rebuild the CR 613.2c invariant asks for; on the rare board that pays
+    // both it is one extra O(battlefield) walk, the same order as the Step-1 reset
+    // that already runs unconditionally.
+    if copy_added_generator || stickers_applied {
+        crate::types::game_state::StaticSourceIndex::rebuild_from_state(state);
     }
 
     // Step 3: Gather active continuous effects after layer 1 is applied.
@@ -2367,6 +3292,13 @@ pub fn evaluate_layers(state: &mut GameState) {
     // `layers_dirty = Clean` is set unconditionally below, so a mark would be
     // dead code — consistency relies on the in-pass live+base mutation.
     prune_lapsed_controller_controls_source(state);
+    // CR 611.2b: the transient-effect half of the same question, then the
+    // casting-permission half. Both run at the same seam and against the same
+    // finalized Layer-2 control board, so a control change — or a phase-out,
+    // CR 702.26f — ends an effect, a permission and a replacement condition at
+    // the same moment rather than at three different ones.
+    prune_lapsed_host_bound_effects(state);
+    prune_lapsed_host_bound_casting_permissions(state);
 
     // CR 611.3a + CR 611.3b: refresh the source-level enabling-condition truth
     // cache from this fully-derived board. Placed AFTER the ring-normalization
@@ -2432,6 +3364,15 @@ pub fn evaluate_layers(state: &mut GameState) {
         crate::types::game_state::StaticSourceIndex::rebuild_from_state(state);
     }
 
+    // CR 616.1 + CR 613.1: settle carried resolution-created replacements behind
+    // this pass's derived grants, so the `base ++ derived` prefix stays
+    // index-stable for `PendingReplacement.candidates` / `AppliedReplacementKey`.
+    for &id in &bf_ids {
+        if let Some(obj) = state.objects.get_mut(&id) {
+            settle_resolution_replacements_to_tail(obj);
+        }
+    }
+
     // Step 5: Clear dirty flag. A full evaluation satisfies any pending request
     // (Clean / EnteredObjects / Full).
     crate::game::effects::attach::refresh_protection_start_attachment_snapshots(state);
@@ -2485,15 +3426,56 @@ fn static_condition_reads_zone_membership(condition: &StaticCondition, zone: Zon
 }
 
 /// CR 404: Does a `ZoneRef` denote the game `zone`?
+///
+/// Delegates to [`ZoneRef::zone`](crate::types::ability::ZoneRef::zone) rather
+/// than restating the pairing: the hand-written `matches!` this replaced was a
+/// second copy of the mapping that a new `ZoneRef` variant would have left
+/// silently answering `false` instead of failing to compile.
 fn zone_ref_denotes_zone(zone_ref: &crate::types::ability::ZoneRef, zone: Zone) -> bool {
-    use crate::types::ability::ZoneRef;
-    matches!(
-        (zone_ref, zone),
-        (ZoneRef::Graveyard, Zone::Graveyard)
-            | (ZoneRef::Exile, Zone::Exile)
-            | (ZoneRef::Library, Zone::Library)
-            | (ZoneRef::Hand, Zone::Hand)
-    )
+    zone_ref.zone() == zone
+}
+
+/// CR 613.4a + CR 400.1: Does a [`CardTypeSetSource`] population read `zone`?
+///
+/// Delegates to [`CardTypeSetSource::reads_zone`], which is THE authority for
+/// the population-zone axis and is the same function
+/// `game::quantity::visit_characteristic_source` walks to enumerate members.
+/// This wrapper exists only to keep the local call sites reading like their
+/// `characteristic_source_reads_*` siblings — it must never re-derive the
+/// answer.
+///
+/// It previously did re-derive it, and reported `false` for every `Objects`
+/// population. That is what let a craft characteristic (`And[ExiledBySource,
+/// Owned{You}]`, Sunbird Effigy) be evaluated against exile while no exile
+/// transition ever dirtied it, stranding a stale value in a layer.
+fn characteristic_source_reads_zone(source: &CardTypeSetSource, zone: Zone) -> bool {
+    source.reads_zone(zone)
+}
+
+/// CR 119 + CR 613.4a: Does a [`CardTypeSetSource`] population route a filter
+/// that reads a life total? Mirrors [`characteristic_source_reads_zone`]'s
+/// recursion over the same axis.
+fn characteristic_source_reads_life_total(source: &CardTypeSetSource) -> bool {
+    let mut found = false;
+    let complete =
+        source.try_for_each_member(crate::types::ability::UNION_DEPTH_BUDGET, &mut |leaf| {
+            if found {
+                return;
+            }
+            found = match leaf {
+                CardTypeSetSource::Objects { filter } => target_filter_reads_life_total(filter),
+                CardTypeSetSource::TurnJournal { filter, .. } => {
+                    filter.as_ref().is_some_and(target_filter_reads_life_total)
+                }
+                CardTypeSetSource::Zone { .. }
+                | CardTypeSetSource::ExiledBySource
+                | CardTypeSetSource::TrackedSet { .. }
+                | CardTypeSetSource::AnyOf { .. } => false,
+            };
+        });
+    // A truncated walk claims the read: one redundant recompute beats a stale
+    // layer surviving a life change.
+    found || !complete
 }
 
 /// CR 404 + CR 611.3a: Does a `QuantityExpr` read the card count / object
@@ -2519,13 +3501,76 @@ fn quantity_expr_reads_zone(expr: &QuantityExpr, zone: Zone) -> bool {
     }
 }
 
+/// CR 404 + CR 611.3a: Does a `PlayerFilter` population/predicate depend on the
+/// membership of `zone`? Mirrors `player_filter_reads_life`'s recursion at the
+/// zone axis — a `PlayerCount`/`EventContextPlayerCount` quantity wraps a
+/// `PlayerFilter`, and that filter's nested `TargetFilter` / `QuantityRef` /
+/// `QuantityExpr` payloads must be walked here or the wrapping quantity
+/// silently reports zone-independent. Master's Councillors class ("+2/+0 for
+/// each graveyard with seven or more cards in it") parses to `PlayerCount {
+/// filter: PlayerAttribute { attr: GraveyardSize, .. } }`: without this route,
+/// an ordinary mill/discard/zone move through `zones::move_to_zone` never
+/// re-evaluates the census, so the P/T boost can go stale after any graveyard
+/// move that isn't the one full-refresh path some other unrelated static
+/// happens to trigger.
+fn player_filter_reads_zone(filter: &PlayerFilter, zone: Zone) -> bool {
+    match filter {
+        // CR 120.9: the damage-history player set can restrict by a source
+        // `TargetFilter`; route it.
+        PlayerFilter::OpponentDealtDamage { source, .. } => source
+            .as_deref()
+            .is_some_and(|f| target_filter_reads_zone(f, zone)),
+        // CR 608.2c: self-composing exclusion anchor — recurse on the exclude.
+        PlayerFilter::AllExcept { exclude } => player_filter_reads_zone(exclude, zone),
+        // CR 109.4 + CR 109.5: controls-count routes its object `filter` and its
+        // comparison `count` expression.
+        PlayerFilter::ControlsCount { filter, count, .. } => {
+            target_filter_reads_zone(filter, zone) || quantity_expr_reads_zone(count, zone)
+        }
+        // CR 404.1 (graveyard) / CR 402.1 (hand) / etc: per-candidate scalar
+        // attribute (`attr = GraveyardSize` reads `zone` when `zone ==
+        // Graveyard`) compared against a controller-relative `value`
+        // expression (Master's Councillors / Wolfcaller's Howl class). Route
+        // both.
+        PlayerFilter::PlayerAttribute { attr, value, .. } => {
+            quantity_ref_reads_zone(attr, zone) || quantity_expr_reads_zone(value, zone)
+        }
+        // CR 608.2c + CR 109.4: the tracked-set possession predicate applies its
+        // object `filter` to each member; route it like `ControlsCount`.
+        PlayerFilter::TrackedSetPossessor { filter, .. } => target_filter_reads_zone(filter, zone),
+        // Payload-free player sets, action/vote ledgers, and combat/attack
+        // relations — none read zone membership. Enumerated explicitly (no
+        // wildcard), mirroring `player_filter_reads_life`.
+        PlayerFilter::Controller
+        | PlayerFilter::Opponent
+        | PlayerFilter::DefendingPlayer
+        | PlayerFilter::OpponentLostLife
+        | PlayerFilter::OpponentGainedLife
+        | PlayerFilter::HasLostTheGame
+        | PlayerFilter::OpponentAttacked { .. }
+        | PlayerFilter::OpponentAttackingEnchantedPlayer
+        | PlayerFilter::All
+        | PlayerFilter::HighestSpeed
+        | PlayerFilter::ZoneChangedThisWay
+        | PlayerFilter::PerformedActionThisWay { .. }
+        | PlayerFilter::OwnersOfCardsExiledBySource
+        | PlayerFilter::TriggeringPlayer
+        | PlayerFilter::OpponentOtherThanTriggering
+        | PlayerFilter::OpponentOfTriggeringPlayer
+        | PlayerFilter::OpponentOfTriggeringPlayerNotAttacked
+        | PlayerFilter::VotedFor { .. }
+        | PlayerFilter::ParentObjectTargetController
+        | PlayerFilter::ChosenPlayer { .. }
+        | PlayerFilter::ParentObjectTargetOwner => false,
+    }
+}
+
 /// CR 404 + CR 611.3a: Leaf classification for `quantity_expr_reads_zone` — does
 /// a `QuantityRef` read the card count / object population of `zone`? EXHAUSTIVE
 /// and wildcard-free (mirroring `quantity_ref_uses_object_count`) so any future
 /// quantity reference that reads a zone must be classified intentionally rather
 /// than silently under-escalating a zone-membership gate.
 fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
-    use crate::types::ability::CardTypeSetSource;
     match qty {
         // Direct graveyard card count (CR 404). `player` scope is irrelevant to
         // the zone identity — any player's graveyard is still the graveyard.
@@ -2548,25 +3593,32 @@ fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
         // (an `ObjectCount` filter can carry `FilterProp::InZone { zone }`).
         QuantityRef::ObjectCount { filter }
         | QuantityRef::ObjectCountDistinct { filter, .. }
-        | QuantityRef::ObjectCountBySharedQuality { filter, .. }
-        | QuantityRef::Aggregate { filter, .. } => target_filter_reads_zone(filter, zone),
-        // Distinct card types read `zone` only when sourced from that zone's cards
-        // (Tarmogoyf: card types among cards in all graveyards).
-        QuantityRef::DistinctCardTypes { source } => match source {
-            CardTypeSetSource::Zone { zone: zone_ref, .. } => zone_ref_denotes_zone(zone_ref, zone),
-            CardTypeSetSource::ExiledBySource
-            | CardTypeSetSource::Objects { .. }
-            | CardTypeSetSource::TrackedSet { .. } => false,
-        },
-        // CR 613.4a: Distinct subtypes read `zone` when sourced from that zone's
-        // cards (Subgoyf: different subtypes among cards in all graveyards) — layer
-        // 7a CDA P/T must re-derive when that zone changes.
-        QuantityRef::DistinctSubtypes { source, .. } => match source {
-            CardTypeSetSource::Zone { zone: zone_ref, .. } => zone_ref_denotes_zone(zone_ref, zone),
-            CardTypeSetSource::ExiledBySource
-            | CardTypeSetSource::Objects { .. }
-            | CardTypeSetSource::TrackedSet { .. } => false,
-        },
+        | QuantityRef::ObjectCountBySharedQuality { filter, .. } => {
+            target_filter_reads_zone(filter, zone)
+        }
+        // CR 613.4a: A distinct-characteristic count reads `zone` only when its
+        // population is sourced from that zone's cards (Tarmogoyf: card types
+        // among cards in all graveyards; Subgoyf: different subtypes among the
+        // same) — layer 7a CDA P/T must re-derive when that zone changes. All
+        // three characteristics share the population axis, so they share this
+        // classification.
+        QuantityRef::DistinctCardTypes { source }
+        | QuantityRef::DistinctSubtypes { source, .. }
+        | QuantityRef::DistinctColorsAmong { source } => {
+            characteristic_source_reads_zone(source, zone)
+        }
+        // CR 404.1 + CR 611.3a: a player-population census routes its
+        // `PlayerFilter` — `PlayerCount{PlayerAttribute{attr: GraveyardSize}}`
+        // (Master's Councillors: "for each graveyard with seven or more cards
+        // in it") reads `zone` exactly when the wrapped filter does. Mirrors
+        // `quantity_ref_reads_life`'s identical routing of these two variants
+        // through `player_filter_reads_life`.
+        QuantityRef::PlayerCount { filter } | QuantityRef::EventContextPlayerCount { filter } => {
+            player_filter_reads_zone(filter, zone)
+        }
+        QuantityRef::PropertyAggregate(aggregate) => {
+            characteristic_source_reads_zone(aggregate.source(), zone)
+        }
         // Everything else reads player-level state, single-object state, battle-
         // field-only population, history records, choices, or tracked sets — none
         // depend on `zone` membership. Enumerated explicitly (no wildcard) so a
@@ -2584,17 +3636,15 @@ fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
         | QuantityRef::Devotion { .. }
         | QuantityRef::BasicLandTypeCount { .. }
         | QuantityRef::PartySize { .. }
-        | QuantityRef::DistinctColorsAmongPermanents { .. }
         | QuantityRef::DistinctCounterKindsAmong { .. }
         | QuantityRef::EnteredThisTurn { .. }
         | QuantityRef::CommanderManaValue { .. }
-        | QuantityRef::PlayerCount { .. }
-        | QuantityRef::EventContextPlayerCount { .. }
         | QuantityRef::CountersOn { .. }
         | QuantityRef::PlayerCounter { .. }
         | QuantityRef::TargetControllerCounter { .. }
         | QuantityRef::Variable { .. }
         | QuantityRef::Power { .. }
+        | QuantityRef::BasePower { .. }
         | QuantityRef::Intensity { .. }
         | QuantityRef::Toughness { .. }
         | QuantityRef::ObjectManaValue { .. }
@@ -2608,9 +3658,9 @@ fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
         | QuantityRef::ExiledCardPower { .. }
         | QuantityRef::TrackedSetSize
         | QuantityRef::FilteredTrackedSetSize { .. }
-        | QuantityRef::TrackedSetAggregate { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::PreviousEffectCount
         | QuantityRef::LifeLostThisTurn { .. }
         | QuantityRef::Speed { .. }
         | QuantityRef::EventContextAmount
@@ -2618,6 +3668,7 @@ fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
         | QuantityRef::EventContextSourceCostX
         | QuantityRef::EventContextSourceModesChosen
         | QuantityRef::SpellsCastThisTurn { .. }
+        | QuantityRef::SpellsCastBeforeTriggeringSpell { .. }
         | QuantityRef::SacrificedThisTurn { .. }
         | QuantityRef::CrimesCommittedThisTurn
         | QuantityRef::LifeGainedThisTurn { .. }
@@ -2630,6 +3681,7 @@ fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
         // Per-turn bend-type tracking (Avatar Aang) — turn history, not a zone read.
         | QuantityRef::BendTypesThisTurn
         | QuantityRef::ChosenNumber
+        | QuantityRef::PlayerChosenNumber { .. }
         | QuantityRef::ColorsInCommandersColorIdentity
         | QuantityRef::CommanderCastFromCommandZoneCount
         | QuantityRef::ConvokedCreatureCount
@@ -2812,7 +3864,7 @@ fn quantity_expr_reads_life(expr: &QuantityExpr) -> bool {
 /// and every filter-bearing variant ROUTES its nested payload (universal
 /// routing rule). EXHAUSTIVE and wildcard-free.
 fn quantity_ref_reads_life(qty: &QuantityRef) -> bool {
-    use crate::types::ability::{CardTypeSetSource, CastManaSpentMetric};
+    use crate::types::ability::CastManaSpentMetric;
     match qty {
         // CR 119.3 + CR 119.9: the direct-leaf life-family readers — the exact
         // quantities a guarded life-mutation site changes (119.3: gain/loss
@@ -2836,9 +3888,7 @@ fn quantity_ref_reads_life(qty: &QuantityRef) -> bool {
         | QuantityRef::ObjectCountDistinct { filter, .. }
         | QuantityRef::ObjectCountBySharedQuality { filter, .. }
         | QuantityRef::CountersOnObjects { filter, .. }
-        | QuantityRef::Aggregate { filter, .. }
         | QuantityRef::ControlledByEachPlayer { filter, .. }
-        | QuantityRef::DistinctColorsAmongPermanents { filter }
         | QuantityRef::DistinctCounterKindsAmong { filter }
         | QuantityRef::EnteredThisTurn { filter }
         | QuantityRef::SacrificedThisTurn { filter, .. }
@@ -2859,6 +3909,7 @@ fn quantity_ref_reads_life(qty: &QuantityRef) -> bool {
         // Optional-`TargetFilter` variants route through the `Option`.
         QuantityRef::ZoneCardCount { filter, .. }
         | QuantityRef::SpellsCastThisTurn { filter, .. }
+        | QuantityRef::SpellsCastBeforeTriggeringSpell { filter, .. }
         | QuantityRef::SpellsCastThisGame { filter, .. }
         | QuantityRef::AttackedThisTurn { filter, .. } => {
             filter.as_ref().is_some_and(target_filter_reads_life_total)
@@ -2874,15 +3925,17 @@ fn quantity_ref_reads_life(qty: &QuantityRef) -> bool {
         // reads `life_lost_this_turn` per candidate.
         QuantityRef::PlayerCount { filter } => player_filter_reads_life(filter),
 
-        // Distinct card-type / subtype counts route an `Objects { filter }`
-        // set-source; the other set-sources carry no `TargetFilter`.
+        // Distinct card-type / subtype / colour counts route the filters their
+        // population carries (`Objects { filter }` and the journal's optional
+        // narrowing filter); the fixed-vocabulary set-sources carry none.
         QuantityRef::DistinctCardTypes { source }
-        | QuantityRef::DistinctSubtypes { source, .. } => match source {
-            CardTypeSetSource::Objects { filter } => target_filter_reads_life_total(filter),
-            CardTypeSetSource::Zone { .. }
-            | CardTypeSetSource::ExiledBySource
-            | CardTypeSetSource::TrackedSet { .. } => false,
-        },
+        | QuantityRef::DistinctSubtypes { source, .. }
+        | QuantityRef::DistinctColorsAmong { source } => {
+            characteristic_source_reads_life_total(source)
+        }
+        QuantityRef::PropertyAggregate(aggregate) => {
+            characteristic_source_reads_life_total(aggregate.source())
+        }
 
         // CR 601.2h: `ManaSpentToCast` carries no direct `TargetFilter`, but its
         // `metric` can nest a mana-source filter one level deeper
@@ -2894,7 +3947,9 @@ fn quantity_ref_reads_life(qty: &QuantityRef) -> bool {
             CastManaSpentMetric::FromSource { source_filter } => {
                 target_filter_reads_life_total(source_filter)
             }
-            CastManaSpentMetric::Total | CastManaSpentMetric::DistinctColors => false,
+            CastManaSpentMetric::Total
+            | CastManaSpentMetric::DistinctColors
+            | CastManaSpentMetric::OfColor { .. } => false,
         },
 
         // CR 603.2c: the trigger-event player set filters candidates through a
@@ -2919,6 +3974,7 @@ fn quantity_ref_reads_life(qty: &QuantityRef) -> bool {
         | QuantityRef::TargetControllerCounter { .. }
         | QuantityRef::Variable { .. }
         | QuantityRef::Power { .. }
+        | QuantityRef::BasePower { .. }
         | QuantityRef::Intensity { .. }
         | QuantityRef::Toughness { .. }
         | QuantityRef::ObjectManaValue { .. }
@@ -2933,9 +3989,9 @@ fn quantity_ref_reads_life(qty: &QuantityRef) -> bool {
         | QuantityRef::ExiledCardPower { .. }
         | QuantityRef::BasicLandTypeCount { .. }
         | QuantityRef::TrackedSetSize
-        | QuantityRef::TrackedSetAggregate { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::PreviousEffectCount
         | QuantityRef::PartySize { .. }
         | QuantityRef::UnspentMana { .. }
         | QuantityRef::Speed { .. }
@@ -2949,6 +4005,7 @@ fn quantity_ref_reads_life(qty: &QuantityRef) -> bool {
         | QuantityRef::LandsPlayedThisTurn { .. }
         | QuantityRef::TurnsTaken
         | QuantityRef::ChosenNumber
+        | QuantityRef::PlayerChosenNumber { .. }
         | QuantityRef::DescendedThisTurn
         | QuantityRef::LoyaltyAbilitiesActivatedThisTurn { .. }
         | QuantityRef::SpellsCastLastTurn
@@ -2996,6 +4053,9 @@ fn player_filter_reads_life(pf: &PlayerFilter) -> bool {
         PlayerFilter::PlayerAttribute { attr, value, .. } => {
             quantity_ref_reads_life(attr) || quantity_expr_reads_life(value)
         }
+        // CR 608.2c + CR 109.4: the tracked-set possession predicate applies its
+        // object `filter` to each member; route it like `ControlsCount`.
+        PlayerFilter::TrackedSetPossessor { filter, .. } => target_filter_reads_life_total(filter),
         // Payload-free player sets — none read the life family. Enumerated
         // explicitly (no wildcard).
         PlayerFilter::Controller
@@ -3031,6 +4091,12 @@ fn filter_prop_reads_life(prop: &FilterProp) -> bool {
         // `PlayerFilter` — route it (`ControllerMatches{OpponentLostLife}` anthem
         // flips its affected set at a life-loss site).
         FilterProp::ControllerMatches { player } => player_filter_reads_life(player),
+        // CR 109.4 + CR 120.1: the recipient scope is an `Option<PlayerFilter>`
+        // that can nest a life-reading predicate, so it routes here rather than
+        // counting as payload-free. `None` = any recipient, which reads nothing.
+        FilterProp::DealtDamageThisTurn { recipient, .. } => {
+            recipient.as_ref().is_some_and(player_filter_reads_life)
+        }
         // The six TargetFilter-bearing props all route their nested filter
         // (deref coercion → &TargetFilter). Field names differ; unified here.
         FilterProp::CanEnchant { target: f }
@@ -3085,6 +4151,7 @@ fn filter_prop_reads_life(prop: &FilterProp) -> bool {
         | FilterProp::EquippedBy
         | FilterProp::AttachedToSource
         | FilterProp::AttachedToRecipient
+        | FilterProp::AttachedToPlayer { .. }
         | FilterProp::HasAttachment { .. }
         | FilterProp::HasAnyAttachmentOf { .. }
         | FilterProp::Another
@@ -3112,7 +4179,6 @@ fn filter_prop_reads_life(prop: &FilterProp) -> bool {
         | FilterProp::PowerExceedsBase
         | FilterProp::InAnyZone { .. }
         | FilterProp::WasDealtDamageThisTurn
-        | FilterProp::DealtDamageThisTurn
         | FilterProp::EnteredThisTurn
         | FilterProp::ControlledContinuouslySinceTurnBegan
         | FilterProp::ZoneChangedThisTurn { .. }
@@ -3131,6 +4197,7 @@ fn filter_prop_reads_life(prop: &FilterProp) -> bool {
         | FilterProp::Named { .. }
         | FilterProp::SameName
         | FilterProp::SameNameAsParentTarget
+        | FilterProp::SameNameAsExiledBySource
         | FilterProp::NameMatchesAnyPermanent { .. }
         | FilterProp::IsCommander
         | FilterProp::SharesCreatureTypeWithCommander
@@ -3156,6 +4223,14 @@ fn target_filter_reads_life_total(filter: &TargetFilter) -> bool {
         TargetFilter::ChosenDamageSource { filter } => filter
             .as_deref()
             .is_some_and(target_filter_reads_life_total),
+        // CR 102.1 + CR 119 + CR 611.3a: the player-axis crossing. A
+        // `PlayerAttribute { attr: LifeTotal, .. }` payload reads the life family
+        // directly (Namor, Atlantean King's "a player who has more life than
+        // you"), so route it through the same authority the object-axis mirror
+        // `FilterProp::ControllerMatches` uses. Grouping this with the
+        // payload-free player references below would under-report the layer
+        // dependency at a life-change site.
+        TargetFilter::PlayerMatching { player } => player_filter_reads_life(player),
         // Payload-free / player-reference / stack-reference / anaphoric filters —
         // none carry a nested walked payload and none read the life family.
         // Enumerated explicitly (no wildcard).
@@ -3163,6 +4238,7 @@ fn target_filter_reads_life_total(filter: &TargetFilter) -> bool {
         | TargetFilter::Any
         | TargetFilter::Player
         | TargetFilter::Controller
+        | TargetFilter::SourceController
         | TargetFilter::ControllerAndControlledPermanents { .. }
         | TargetFilter::Opponent
         | TargetFilter::SelfRef
@@ -3180,6 +4256,7 @@ fn target_filter_reads_life_total(filter: &TargetFilter) -> bool {
         | TargetFilter::LastRevealed
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
+        | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
@@ -3190,6 +4267,7 @@ fn target_filter_reads_life_total(filter: &TargetFilter) -> bool {
         | TargetFilter::TriggeringSource
         | TargetFilter::EventTarget
         | TargetFilter::TriggeringSourceController
+        | TargetFilter::EventTargetController
         | TargetFilter::ParentTarget
         | TargetFilter::ParentTargetSlot { .. }
         | TargetFilter::ParentTargetController
@@ -3253,17 +4331,20 @@ fn static_condition_reads_life(condition: &StaticCondition) -> bool {
         | StaticCondition::SourceIsAttacking
         | StaticCondition::SourceIsBlocking
         | StaticCondition::SourceIsBlocked
-        | StaticCondition::IsMonarch
+        | StaticCondition::IsMonarch { .. }
         | StaticCondition::IsInitiative
         | StaticCondition::NoMonarch
         | StaticCondition::HasCityBlessing
+        | StaticCondition::HasEnduringStory
         | StaticCondition::CompletedADungeon
         | StaticCondition::WasStartingPlayer { .. }
         | StaticCondition::SpellCastWithVariantThisTurn { .. }
+        | StaticCondition::AnyPlayerAttackedYouLastTurn
         | StaticCondition::OpponentPoisonAtLeast { .. }
         | StaticCondition::UnlessPay { .. }
         | StaticCondition::Unrecognized { .. }
         | StaticCondition::DuringYourTurn
+        | StaticCondition::DuringOpponentsTurn
         | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
         | StaticCondition::SourceEnteredThisTurn
         | StaticCondition::SourceHasDealtDamage
@@ -3414,6 +4495,74 @@ pub fn flush_layers(state: &mut GameState) {
     }
 }
 
+/// CR 616.1 + CR 613.1: put carried resolution-created replacements BEHIND the
+/// per-pass derived grants, reproducing the pre-#8485 live layout
+/// (`base ++ derived ++ runtime`) exactly.
+///
+/// `PendingReplacement.candidates` (`types/game_state.rs`) parks raw
+/// `ReplacementId { source, index }` values on `GameState` across a CR 616.1
+/// `WaitingFor::ReplacementChoice` prompt, and `engine::finish_action_boundary`
+/// -> `public_state::finalize_rules_state` -> `flush_layers` runs a layer pass
+/// in between; `ProposedEvent`'s `applied: HashSet<AppliedReplacementKey>` is
+/// keyed on the same `(source, index)` pair across the same park. Any placement
+/// that inserted carried entries AHEAD of the derived grants would shift every
+/// derived slot and mis-resolve both. Appending at the tail leaves the
+/// `base ++ derived` prefix index-stable, which is the layout the park already
+/// depends on today.
+///
+/// Idempotent and allocation-free unless the object holds a carried entry that
+/// is not already part of a contiguous tail — i.e. only when the host also
+/// received a per-pass derived grant this pass.
+fn settle_resolution_replacements_to_tail(obj: &mut crate::game::game_object::GameObject) {
+    let Some(first) = obj
+        .replacement_definitions
+        .iter_all()
+        .position(|d| d.is_resolution_installed())
+    else {
+        return;
+    };
+    if obj
+        .replacement_definitions
+        .iter_all()
+        .skip(first)
+        .all(|d| d.is_resolution_installed())
+    {
+        return;
+    }
+    let carried: Vec<crate::types::ability::ReplacementDefinition> = obj
+        .replacement_definitions
+        .iter_all()
+        .filter(|d| d.is_resolution_installed())
+        .cloned()
+        .collect();
+    obj.replacement_definitions
+        .retain(|d| !d.is_resolution_installed());
+    for def in carried {
+        obj.replacement_definitions.push(def);
+    }
+}
+
+/// CR 613.1: Single authority for the per-object "back to base" reset. Both
+/// arms go through here — the full pass applies it board-wide over the
+/// phased-in battlefield, the incremental arm applies it to recipients only —
+/// so the two arms cannot drift in what "base" means.
+fn reset_recipient_to_base(obj: &mut crate::game::game_object::GameObject) {
+    obj.sync_missing_base_characteristics();
+    seed_live_characteristics_from_base(obj);
+    // CR 613.1b: layer 2 control-change effects are re-applied from the base
+    // controller, not accumulated on top of the previous pass's result.
+    obj.controller = obj.base_controller.unwrap_or(obj.owner);
+    // CR 613.11 + CR 510.1a: combat-assignment rule effects are re-derived every
+    // pass, so the previous pass's grants must not persist through the reset.
+    obj.assigns_damage_from_toughness = false;
+    obj.assigns_damage_as_though_unblocked = false;
+    obj.assigns_no_combat_damage = false;
+    // CR 701.60c: re-derive the suspected designation's menace + "can't block"
+    // onto the just-reset live fields (not base), so the grant lasts exactly as
+    // long as the designation.
+    derive_suspected_abilities(obj);
+}
+
 fn prepare_incremental_flush(
     state: &mut GameState,
     entered_ids: &BTreeSet<ObjectId>,
@@ -3433,13 +4582,7 @@ fn prepare_incremental_flush(
     // and collecting the prepared effect set so local CDAs are visible again.
     for &id in &recipient_ids {
         if let Some(obj) = state.objects.get_mut(&id) {
-            obj.sync_missing_base_characteristics();
-            seed_live_characteristics_from_base(obj);
-            obj.controller = obj.base_controller.unwrap_or(obj.owner);
-            obj.assigns_damage_from_toughness = false;
-            obj.assigns_damage_as_though_unblocked = false;
-            obj.assigns_no_combat_damage = false;
-            derive_suspected_abilities(obj);
+            reset_recipient_to_base(obj);
         }
     }
     crate::types::game_state::StaticSourceIndex::rebuild_from_state(state);
@@ -3452,8 +4595,64 @@ fn prepare_incremental_flush(
         return None;
     }
     if active_effects_force_incremental_escalation(state, entered_ids, &active_effects)
+        || population_probe_blinded_by_entrant_characteristic_change(
+            state,
+            entered_ids,
+            &active_effects,
+        )
         || any_active_static_condition_perturbed_by_entry(state, entered_ids)
+        // CR 613.1 + CR 613.1b: the incremental arm re-derives only BATTLEFIELD recipients
+        // (`incremental_recipient_ids`), so a continuous effect naming a STACK object as a
+        // recipient would leave that object's controller at whatever the last full pass wrote
+        // — stale the moment the effect's duration expires or a later CR 613.7 timestamp wins.
+        // Escalate to the full pass rather than skip. `continuous_effect_scan_zones` already
+        // resolves `SpecificObject` to the object's LIVE zone, so this is the same authority
+        // the apply step uses, not a second one.
+        || active_effects.iter().any(|effect| {
+            continuous_effect_scan_zones(state, &effect.affected_filter).contains(&Zone::Stack)
+        })
     {
+        return None;
+    }
+    // CR 613.2a + CR 613.2c: a copy effect applied on this path can hand a
+    // recipient a continuous static ability its copiable base does not carry, and
+    // after layer 1 that static is part of the board layers 2-7 derive from.
+    //
+    // The incremental arm cannot absorb that. `entered_object_blocks_incremental`
+    // (1) escalates for an entrant that arrives sourcing a continuous effect,
+    // precisely because effects here are re-applied only to `recipient_ids` —
+    // pre-existing permanents are never reset, so a board-wide anthem a recipient
+    // acquires would never reach the objects it must apply to. A copy that grants
+    // a static reaches the same state one step later, so it takes the same exit.
+    // Escalating BEFORE any copy is applied also keeps the generator set of the
+    // index built above true for the whole of `apply_layers_incremental`.
+    //
+    // Reached by filter match, not only by name: the copy set below is applied
+    // with `apply_continuous_effect_to(state, effect, &recipient_ids, ..)`, which
+    // restricts an ordinary board-wide `affected_filter` to the recipients rather
+    // than requiring `TargetFilter::SpecificObject`. Neither
+    // `active_effects_force_incremental_escalation` (magnitude / affected-set
+    // population sensitivity) nor the source-side guard above sees that case: the
+    // copy's source is a pre-existing permanent and its filter counts nothing.
+    //
+    // That same `restrict_to` intersection is why the guard asks
+    // `effect_can_reach_incremental_recipients` rather than firing on the mere
+    // presence of a copy: a `SelfRef` / `SpecificObject` copy that names a
+    // PRE-EXISTING permanent — the ordinary shape, every resolved clone on the
+    // board carries one — applies to the empty set on this path, so it can hand no
+    // recipient anything, and escalating for it would put every board that has
+    // ever cast a clone back on the O(|battlefield|) full pass this module exists
+    // to avoid. A copy that does name a recipient still escalates; so does any
+    // copy whose affected set is a predicate, since that set is not decidable
+    // here.
+    //
+    // O(active-effect-count), and zero on the overwhelmingly common board with no
+    // copy effect at all.
+    if active_effects.iter().any(|effect| {
+        effect.layer == Layer::Copy
+            && effect_can_reach_incremental_recipients(effect, &recipient_ids)
+            && copy_grants_continuous_static(&effect.modification)
+    }) {
         return None;
     }
 
@@ -3466,72 +4665,595 @@ fn prepare_incremental_flush(
 /// Decide whether an `EnteredObjects` flush must conservatively escalate to a
 /// full re-evaluation.
 ///
-/// Two axes, both required-clean for the fast path:
+/// SINGLE AUTHORITY: this delegates to `prepare_incremental_flush` — the exact
+/// gate `flush_layers` consults — rather than re-deriving the decision. It
+/// previously carried its own two-axis reimplementation, which had already
+/// drifted from production in two ways: it omitted the recipient-sourced-effect
+/// check, and it evaluated the active-effect axis against a board on which the
+/// recipient reset had NOT yet run (production resets first, so a stale layer-6
+/// removal could hide a recipient's live static from the test predicate but not
+/// from production). A test predicate that answers a different question than the
+/// production gate cannot certify the production gate.
 ///
-/// 1. Per-entered preconditions: the entered object must not itself be the
-///    source of a continuous effect, carry a CDA static, or carry a
-///    control-override / type-change / text-change / counter / attachment /
-///    transient effect (the entry enqueued none for a plain token).
+/// The escalation disjuncts are enumerated at the `prepare_incremental_flush`
+/// call site and documented on each disjunct's own function. This wrapper
+/// deliberately restates neither: a second enumeration here is exactly what
+/// drifted last time.
 ///
-/// 2. Board-wide escalation: no ACTIVE continuous effect may have a magnitude,
-///    affected set, or source-level enabling CONDITION that reads battlefield
-///    object population.
-///    CR 611.3a: a static-ability continuous effect isn't locked in; it applies
-///    at any moment to whatever its text indicates — so a board-population-
-///    dependent magnitude, affected set, or enabling condition re-evaluates when
-///    an object enters, changing PRE-EXISTING recipients. CR 613.7d: the entering
-///    object receives its timestamp on zone entry. CR 613.8a: dependency/timestamp
-///    ordering operates on the live set. This scan is O(active-effect-count), NOT
-///    O(battlefield).
+/// CR 611.3a: a static-ability continuous effect isn't locked in; it applies
+/// at any moment to whatever its text indicates — so a board-population-
+/// dependent magnitude, affected set, or enabling condition re-evaluates when
+/// an object enters, changing PRE-EXISTING recipients. CR 613.7d: the entering
+/// object receives its timestamp on zone entry. CR 613.8a: dependency/timestamp
+/// ordering operates on the live set.
+///
+/// Takes `&GameState` and works on a clone because `prepare_incremental_flush`
+/// mutates: after its per-entrant precondition scan it resets every recipient
+/// to base. The caller asks a question and must not have its board
+/// half-flushed by the asking.
 #[cfg(test)]
 pub(crate) fn incremental_flush_must_escalate(
     state: &GameState,
     entered_ids: &BTreeSet<ObjectId>,
 ) -> bool {
-    // Axis 1 — per-entered preconditions.
-    for &id in entered_ids {
-        let Some(obj) = state.objects.get(&id) else {
-            // The entered object already left (e.g. it was a token that died to
-            // an SBA before flush). A full pass is the safe handling.
-            return true;
-        };
-        if entered_object_blocks_incremental(state, obj) {
-            return true;
+    let mut scratch = state.clone();
+    prepare_incremental_flush(&mut scratch, entered_ids).is_none()
+}
+
+/// The two population-read channels of a single effect, computed once:
+/// `(dynamic-magnitude sensitivity, affected-set sensitivity)`. Axis 2a
+/// (`active_effects_force_incremental_escalation`) needs the split to pick which
+/// per-entrant narrowing applies without walking the affected filter twice.
+///
+/// MEMBERSHIP question, not a characteristic question — see
+/// [`CharacteristicKinds`] for the deliberate split.
+fn effect_population_reads(e: &ActiveContinuousEffect) -> (bool, bool) {
+    (
+        continuous_modification_dynamic_quantity(&e.modification)
+            .is_some_and(crate::game::quantity::quantity_expr_uses_object_count),
+        crate::game::filter::affected_filter_uses_object_population(&e.affected_filter),
+    )
+}
+
+/// The live read union, split by whether a contribution is attributable to one
+/// continuous effect.
+struct LiveCharacteristicReads {
+    /// Read kinds that belong to no single effect, so no writer is ever exempt
+    /// from them: dynamic magnitudes and Continuous statics' enabling
+    /// conditions.
+    global: CharacteristicKinds,
+    /// `global` plus every live affected filter's kinds — the full ReadKinds
+    /// union that drives the entrant-independent global exit.
+    total: CharacteristicKinds,
+}
+
+/// CR 613.1: the union of layer-writable characteristic kinds that the CURRENT
+/// board actually READS, per the live read channels.
+///
+/// Entrant-independent, so the entry-flush gate computes it once per flush:
+///
+/// ```text
+/// global    := ⋃ dynamic-magnitude kinds     // every live modification's magnitude
+///            ∪ ⋃ live condition kinds        // every live effect's retained condition
+///            ∪ ⋃ Continuous condition kinds  // every live Continuous static's condition
+///            ∪ ⋃ transient gate kinds        // every INSTALLED transient's duration + condition
+/// ReadKinds := global ∪ ⋃ affected-filter kinds  // every live modification's affected filter
+/// ```
+///
+/// All five channels are unioned UNCONDITIONALLY. An earlier design gated the
+/// affected-filter channel on the write set already intersecting, which is
+/// unsound: a board whose only name-sensitive read lives in another static's
+/// affected filter has an empty base union, so the gate would never notice a
+/// layer-3 name rewrite reaching the entrant.
+///
+/// The affected-filter channel is reported separately because it is the only
+/// one attributable to a single effect, and CR 613.6 puts an effect's own
+/// affected filter out of reach of its own writes — see
+/// [`AffectedFilterReadTally`]. The other four channels are board-level and
+/// admit no such exclusion.
+///
+/// WHAT CONVERGES WHERE. The `e.condition` channel below is NOT a single
+/// authority over every gate on the board, and must not be documented as one.
+/// The full producer census of `ActiveContinuousEffect::condition`, and which
+/// channel can see each one. One row per construction site — the eight
+/// `ActiveContinuousEffect { .. }` literals in the engine, six here and two in
+/// `stickers.rs`, all reached through
+/// [`collect_shared_active_continuous_effects`]:
+///
+/// | producer | `condition` it writes | seen by |
+/// |---|---|---|
+/// | The Ring emblem (CR 701.54c) | `None` | nothing to see |
+/// | [`active_continuous_effects_from_static_definitions`] (printed statics) | `def.condition` | `e.condition` AND the source walk |
+/// | [`expand_granted_static_effects`] | `inner.condition` | `e.condition` ONLY |
+/// | `expand_granted_activated_abilities` | `None` | nothing to see |
+/// | `expand_granted_triggered_abilities` | `None` | nothing to see |
+/// | [`gather_transient_continuous_effects`] | recipient-context `tce.condition` only | `e.condition`, plus the transient walk for what it drops |
+/// | `stickers.rs` (two P/T sites) | `None` | nothing to see |
+///
+/// One alternate ENTRY into row 2 is out of this census by scope:
+/// [`active_continuous_effects_from_base_static_source`] re-enters
+/// [`active_continuous_effects_from_static_definitions`] for off-zone keyword
+/// queries (sole caller `off_zone_characteristics.rs`) and never feeds
+/// [`evaluate_layers`], so no flush channel needs to see its conditions.
+///
+/// Two consequences a reader must not get backwards:
+///
+/// * a GRANTED-INNER static's condition lives in `inner.condition`, nested in
+///   `ContinuousModification::GrantStaticAbility`. The source walk below reads
+///   `obj.static_definitions.iter_all()`, i.e. OUTER definitions, so it sees
+///   that condition only once a previous pass has materialized the granted
+///   definition onto the recipient. On a never-yet-evaluated state — hand-built
+///   or freshly deserialized — `e.condition` is the ONLY channel that sees it.
+///   That is what the `e.condition` union is load-bearing for; it is not
+///   redundant with the source walk.
+/// * a TRANSIENT reaches `e.condition` only when its gate is currently ON *and*
+///   the condition is recipient-context, because
+///   [`gather_transient_continuous_effects`] skips a transient that is not live
+///   and strips a source-level condition from the effect it pushes. Both
+///   discarded shapes are exactly the ones an entry can flip, hence the
+///   separate walk over `state.transient_continuous_effects`.
+///
+/// `active_combat_assignment_rule_effects_from_static_definitions` /
+/// `collect_transient_combat_assignment_rule_effects` duplicate the same
+/// retain/strip logic for `ActiveCombatAssignmentRuleEffect`; those effects
+/// change CR 613.11 rules, not characteristics, so they are outside this union
+/// — but a future condition channel added here needs patching there too.
+///
+/// Walks early-exit the moment the union saturates to
+/// [`CharacteristicKinds::ALL`].
+fn live_characteristic_reads(
+    state: &GameState,
+    active_effects: &[ActiveContinuousEffect],
+) -> LiveCharacteristicReads {
+    let mut global = CharacteristicKinds::EMPTY;
+    let mut affected = CharacteristicKinds::EMPTY;
+    for e in active_effects {
+        if global.union(affected).is_all() {
+            break;
+        }
+        if let Some(q) = continuous_modification_dynamic_quantity(&e.modification) {
+            global = global.union(quantity_expr_characteristic_reads_at(
+                q,
+                CHARACTERISTIC_READ_DEPTH,
+            ));
+        }
+        affected = affected.union(target_filter_characteristic_reads(&e.affected_filter));
+        // CR 611.2c + CR 611.3a: CR 611.2c locks in the affected SET of a
+        // resolution-created continuous effect, but nothing locks in its
+        // enabling condition — a retained recipient-context condition is
+        // re-evaluated per recipient on every pass, exactly like the
+        // "isn't locked in" static-ability effect of CR 611.3a. The condition
+        // gates WHETHER the effect applies at all, so it is a board-level read
+        // and belongs in `global`, NOT in the per-effect `affected` channel
+        // that CR 613.6 lets an effect exclude from its own writes. Covers the
+        // gathered producers only — see the walks below for what this channel
+        // structurally cannot see.
+        if let Some(condition) = e.condition.as_ref() {
+            global = global.union(static_condition_characteristic_reads(condition));
         }
     }
-
-    // Axis 2a — magnitude + affected-set over the EXISTING active effect set,
-    // NARROWED to entries that actually perturb the population input.
+    // CR 611.2b + CR 611.2c: both gates of a resolution-created effect — its
+    // "for as long as" duration and its retained enabling condition — decide
+    // WHETHER the effect applies at all, so both are board-level reads.
     //
-    // Two-stage test per effect: the committed exhaustive classifier
-    // (`quantity_expr_uses_object_count` / `affected_filter_uses_object_population`)
-    // is the OUTER conjunct (compile-time tripwire — a future population-reading
-    // variant forces a classification). Then the entry-aware narrowing layer asks
-    // whether any ENTERED object can flip THIS effect's population input.
-    //
-    // CR 109.5: the filter's "you control" must resolve against the EFFECT
-    // SOURCE's controller, not the entered object's — so `ctx` is built per-effect
-    // from `e.source_id` + `e.controller`. Escalation is `classifier(e) &&
-    // any_entered_perturbs(e)`; both required.
-    let active_effects = collect_shared_active_continuous_effects(state);
-    if active_effects_force_incremental_escalation(state, entered_ids, &active_effects) {
-        return true;
+    // Walked straight off `state.transient_continuous_effects` rather than off
+    // `active_effects`, because neither shape that matters survives that
+    // projection: `gather_transient_continuous_effects` skips a transient whose
+    // gate is currently OFF (an OFF gate is exactly the one an entry can turn
+    // ON), and it strips a source-level condition from the effect it pushes,
+    // leaving `e.condition == None` above.
+    if !global.union(affected).is_all() {
+        for tce in &state.transient_continuous_effects {
+            if global.union(affected).is_all() {
+                break;
+            }
+            for condition in transient_gate_conditions(tce) {
+                global = global.union(static_condition_characteristic_reads(condition));
+            }
+        }
     }
+    if !global.union(affected).is_all() {
+        // CR 611.3a: a Continuous static's enabling condition re-evaluates as the
+        // board changes, so it is a live read channel in its own right.
+        let affected_so_far = affected;
+        for_each_static_effect_source(state, |_state, obj| {
+            if global.union(affected_so_far).is_all() {
+                return;
+            }
+            for def in obj.static_definitions.iter_all() {
+                if def.mode != StaticMode::Continuous {
+                    continue;
+                }
+                if let Some(condition) = def.condition.as_ref() {
+                    global = global.union(static_condition_characteristic_reads(condition));
+                }
+            }
+        });
+    }
+    LiveCharacteristicReads {
+        global,
+        total: global.union(affected),
+    }
+}
 
-    // Axis 2b — source-level enabling CONDITION over the EXISTING static-ability
-    // sources, NARROWED to entries that actually perturb the condition. Conditions
-    // remain attached to collected effects for application-time evaluation, while
-    // this source walk supplies the before/after truth comparison required for an
-    // incremental full-rebuild decision.
-    //
-    // CR 611.3a + CR 611.3b: when such a source-level enabling condition depends
-    // on board population, an object entering can flip the condition for the
-    // WHOLE recipient set, changing PRE-EXISTING recipients — so escalate to a
-    // full rebuild. The entry-aware narrowing (built per-source from the visited
-    // object, CR 109.5) skips escalation when no entered object can perturb the
-    // gate; the truth-delta refinement (below) skips escalation even when an
-    // entry perturbs the gate INPUT but does not flip its truth value.
-    any_active_static_condition_perturbed_by_entry(state, entered_ids)
+/// CR 613.6: a continuous effect whose modifications span several layers uses
+/// ONE affected-object set. It is determined the first time the effect applies
+/// and then retained for every other applicable layer — `started_effect_sets`
+/// in [`apply_continuous_effect_filtered`] is exactly that retention, keyed by
+/// [`ContinuousEffectGroupKey`]. The set is therefore fixed BEFORE any of that
+/// effect's own modifications run, in the full pass and in the incremental pass
+/// alike, so a modification can never move the affected set of the effect it
+/// belongs to — not for the entrant and not for a pre-existing object.
+///
+/// That makes the affected-filter read channel self-exclusive. When the gate
+/// asks whether writer `M` can invalidate a live read, `M`'s own effect's
+/// affected filter is not a read `M` can move; only OTHER effects' affected
+/// filters are. `name_rewrite_entry_escalates_through_affected_filter_reads`
+/// pins the cross-effect direction, where the rename is definition 0 and the
+/// name-sensitive buff is definition 1, so the buff's set is determined AFTER
+/// the rename applied. `incremental_entry_retains_multi_layer_effect_affected_set`
+/// pins the self direction: one definition whose layer-4 `AddType` write is
+/// read only by its own `Non(Creature)` affected filter, which CR 613.6 has
+/// already locked in.
+///
+/// Attribution is per retention group, never per modification: the sibling
+/// modifications of one definition each carry a clone of the same affected
+/// filter, so excluding one modification's copy would leave its siblings'
+/// identical copies contributing the same kinds.
+///
+/// `duplicated` keeps the exclusion O(effects) instead of O(effects²): a kind
+/// read by two or more distinct groups survives excluding any single group.
+struct AffectedFilterReadTally {
+    by_group: HashMap<ContinuousEffectGroupKey, CharacteristicKinds>,
+    /// Kinds read by at least one attributed group's affected filter.
+    attributed: CharacteristicKinds,
+    /// Kinds read by at least two DISTINCT attributed groups.
+    duplicated: CharacteristicKinds,
+    /// Affected-filter reads from effects with no retention identity. Fail
+    /// closed — these are never excluded.
+    unattributed: CharacteristicKinds,
+}
+
+impl AffectedFilterReadTally {
+    /// The affected-filter reads that survive excluding `effect`'s own CR 613.6
+    /// retention group.
+    fn excluding_own_group(
+        &self,
+        state: &GameState,
+        effect: &ActiveContinuousEffect,
+    ) -> CharacteristicKinds {
+        let own = continuous_effect_group_key(state, effect)
+            .and_then(|key| self.by_group.get(&key).copied())
+            .unwrap_or(CharacteristicKinds::EMPTY);
+        self.unattributed
+            .union(self.duplicated)
+            .union(self.attributed.without(own))
+    }
+}
+
+/// Attribute every live affected filter's characteristic reads to its CR 613.6
+/// retention group. Deliberately built only after the global disjointness exit
+/// has already failed, so the boards that leave the gate at that exit never pay
+/// for the grouping.
+fn tally_affected_filter_reads(
+    state: &GameState,
+    active_effects: &[ActiveContinuousEffect],
+) -> AffectedFilterReadTally {
+    let mut by_group: HashMap<ContinuousEffectGroupKey, CharacteristicKinds> = HashMap::new();
+    let mut unattributed = CharacteristicKinds::EMPTY;
+    for e in active_effects {
+        let reads = target_filter_characteristic_reads(&e.affected_filter);
+        if reads.is_empty() {
+            continue;
+        }
+        match continuous_effect_group_key(state, e) {
+            Some(key) => {
+                let slot = by_group.entry(key).or_insert(CharacteristicKinds::EMPTY);
+                *slot = slot.union(reads);
+            }
+            None => unattributed = unattributed.union(reads),
+        }
+    }
+    // Order-independent: `duplicated` ends up as the kinds present in two or
+    // more group entries however the map iterates.
+    let mut attributed = CharacteristicKinds::EMPTY;
+    let mut duplicated = CharacteristicKinds::EMPTY;
+    for reads in by_group.values() {
+        duplicated = duplicated.union(attributed.intersection(*reads));
+        attributed = attributed.union(*reads);
+    }
+    AffectedFilterReadTally {
+        by_group,
+        attributed,
+        duplicated,
+        unattributed,
+    }
+}
+
+/// CR 613.1 + CR 613.1d + CR 613.4a: escalate when the population probes below
+/// are asking about an object whose characteristics the pass is about to change.
+/// Layers apply in order (CR 613.1), so a layer-4 type rewrite (CR 613.1d) has
+/// already happened by the time any later layer's population read — including a
+/// layer-7a CDA's P/T definition (CR 613.4a) — is evaluated; the gate's probes
+/// run BEFORE any layer.
+///
+/// `active_effects_force_incremental_escalation` asks "does the ENTERING object
+/// join this counted population?" against the entrant's characteristics as they
+/// stand at gate time — which is BEFORE any layer has applied to it. If some
+/// other active effect will change those characteristics later in the same pass,
+/// the probe answered about the wrong object. The same blindness afflicts the
+/// per-entrant probe in `any_active_static_condition_perturbed_by_entry`: a
+/// static's enabling condition (CR 611.3a) that counts a population also reads
+/// the entrant pre-layer.
+///
+/// Found by differential verification against a full re-evaluation during
+/// development, on Ashaya, Soul of the Wild: its CDA counts "lands you control"
+/// (layer 7a) while its own second static makes nontoken creatures Forest LANDS
+/// (layer 4). An entering Grizzly Bears is not a land at gate time, so the probe
+/// reported no perturbation, the incremental arm ran, and Ashaya kept a stale
+/// 1/1 where a full pass derives 2/2. Condition-channel twin of the same
+/// blindness: Life and Limb (layer 4: all Saprolings are Forest lands) plus
+/// Sylvan Advocate ("as long as you control six or more lands...") — an
+/// entering Saproling flips the Advocate's condition only post-layer. The
+/// discriminating fixture for that channel is the synthetic
+/// `condition_gated_anthem_entry_escalates_when_entrant_types_rewritten`, which
+/// is constructed to take the incremental path; the printed Life and Limb pair
+/// is pinned end-to-end separately in
+/// `tests/integration/life_and_limb_sylvan_advocate.rs`.
+///
+/// Closed by a typed READ/WRITE-KIND RELATION rather than by a one-sided list
+/// of "population-keying" writers. Both sides are classified over the same
+/// lattice ([`CharacteristicKinds`], one bit per layer-writable characteristic
+/// kind), and the gate fires only when they INTERSECT:
+///
+/// ```text
+/// escalate ⇔ ∃ live M reaching an entrant with writes(M) ∩ reads_M_can_move ≠ ∅
+///
+/// reads_M_can_move := global reads (magnitudes, conditions)
+///                   ∪ affected-filter reads of every effect EXCEPT M's own
+/// ```
+///
+/// The exclusion is CR 613.6, not an optimisation: M's own effect's affected
+/// set is retained from the moment that effect first applies, so it is already
+/// fixed before M runs and M cannot move it. See [`AffectedFilterReadTally`].
+///
+/// `writes(M)` comes from [`modification_characteristic_writes`], `ReadKinds`
+/// from [`live_characteristic_reads`]. The predecessor of this gate recognized
+/// only three write kinds (card types, controller, color) and did not classify
+/// the read side at all, so it was simultaneously too narrow (a layer-3 name
+/// rewrite or a layer-6 keyword grant reaching the entrant was invisible to a
+/// name- or keyword-keyed population) and too wide (any recognized writer
+/// escalated even against a board that reads no kind it writes).
+///
+/// SOUNDNESS:
+///
+/// 1. If no live modification matches an entrant pre-layer, nothing applies to
+///    it, so post-layer characteristics equal pre-layer ones and the pre-layer
+///    population probe is exact. Chains cannot start without a pre-layer match.
+/// 2. If M reaches the entrant and writes kind K, staleness requires some live
+///    read to depend on K — through a counted magnitude, through a static's
+///    enabling condition, or through another modification's affected filter.
+///    `ReadKinds` unions all three unconditionally, so no live read of K can lie
+///    outside it; kinds disjoint from every live read cannot flip any verdict.
+///    The only read subtracted per modification is M's own effect's affected
+///    filter, and CR 613.6 proves that one is not a read M can move: the
+///    effect's affected set is determined when the effect first applies and
+///    retained for its later layers, so it is fixed strictly before any of that
+///    effect's own modifications run. Every other effect's affected filter stays
+///    in, which is what the layer-3 rename channel rides on.
+/// 3. Every uncertain form on either side maps to [`CharacteristicKinds::ALL`]
+///    (unparsed conditions, arbitrary player predicates, recursion overflow,
+///    `RemoveAllAbilities` stripping CDAs), so classification error can only
+///    OVER-escalate: a full re-evaluation is slower, never wrong.
+/// 4. STATED BOUNDARY, inherited unchanged. The reach probe below evaluates
+///    affected filters against the previous FINAL state, while full evaluation
+///    matches them at intermediate layer states; a count-thresholded affected
+///    filter can therefore diverge from the probe in either direction. This
+///    relation neither narrows nor widens that pre-existing limitation — it is a
+///    property of the probe, not of the kind typing. Points 1-3 are a soundness
+///    argument for the KIND RELATION, not a proof that the probe itself is
+///    exact.
+///
+/// Both classifiers are EXHAUSTIVE and wildcard-free, which is what actually
+/// holds the line: a future `ContinuousModification` or `FilterProp` cannot be
+/// added without deciding which kinds it writes and reads.
+///
+/// Evaluation order is cheapest-first, and each stage can return "no escalation"
+/// on its own:
+///
+/// 1. `all_writes` — pure enum matches over the live modifications, no filter
+///    work at all.
+/// 2. `ReadKinds` — entrant-independent, computed once per flush, early-exiting
+///    at ALL.
+/// 3. their intersection — if empty, ZERO `matches_target_filter` calls happen.
+///    This is the exit taken by the pinned fast paths, whose anthems write
+///    `{PowerToughness}` while their boards read `{CardTypes, Controller}` or
+///    `{ManaCost, Controller, CardTypes}`.
+/// 4. only then, the CR 613.6 group attribution and the per-entrant
+///    affected-filter reach probe, and only for the modifications that survived
+///    stage 3.
+fn population_probe_blinded_by_entrant_characteristic_change(
+    state: &GameState,
+    entered_ids: &BTreeSet<ObjectId>,
+    active_effects: &[ActiveContinuousEffect],
+) -> bool {
+    // Stage 1: pure enum matches.
+    let mut all_writes = CharacteristicKinds::EMPTY;
+    for e in active_effects {
+        all_writes = all_writes.union(modification_characteristic_writes(&e.modification));
+        if all_writes.is_all() {
+            break;
+        }
+    }
+    if all_writes.is_empty() {
+        return false;
+    }
+    // Stage 2: entrant-independent read union, computed once.
+    let read_kinds = live_characteristic_reads(state, active_effects);
+    // Stage 3: global disjointness — no per-entrant filter matching at all.
+    if !all_writes.intersects(read_kinds.total) {
+        return false;
+    }
+    // Stage 3.5: only boards that survive stage 3 pay for attributing the
+    // affected-filter reads to their CR 613.6 retention groups.
+    let affected_reads = tally_affected_filter_reads(state, active_effects);
+    // Stage 4: per-entrant reach probe, restricted to modifications whose own
+    // write set intersects a live read that modification could actually move.
+    active_effects.iter().any(|e| {
+        let reads_e_can_move = read_kinds
+            .global
+            .union(affected_reads.excluding_own_group(state, e));
+        if !modification_characteristic_writes(&e.modification).intersects(reads_e_can_move) {
+            return false;
+        }
+        let ctx = FilterContext::from_source_with_controller(e.source_id, e.controller);
+        entered_ids
+            .iter()
+            .any(|id| matches_target_filter(state, *id, &e.affected_filter, &ctx))
+    })
+}
+
+/// CR 613.1: which layer-writable characteristic kinds a modification WRITES.
+///
+/// EXHAUSTIVE and wildcard-free over `ContinuousModification`, the write half of
+/// the relation documented on
+/// [`population_probe_blinded_by_entrant_characteristic_change`]. A variant that
+/// writes several kinds returns their union; a variant whose effect cannot be
+/// bounded returns [`CharacteristicKinds::ALL`].
+fn modification_characteristic_writes(m: &ContinuousModification) -> CharacteristicKinds {
+    modification_characteristic_writes_at(m, GRANTED_STATIC_WRITE_DEPTH)
+}
+
+/// Depth bound for `GrantStaticAbility` recursion: a granted static may itself
+/// grant a static, and the granted `StaticDefinition` is owned data with no
+/// structural bound, so the walk is capped and falls back to
+/// [`CharacteristicKinds::ALL`] — conservative, per soundness point 3.
+const GRANTED_STATIC_WRITE_DEPTH: u32 = 4;
+
+fn modification_characteristic_writes_at(
+    m: &ContinuousModification,
+    depth: u32,
+) -> CharacteristicKinds {
+    let Some(depth) = depth.checked_sub(1) else {
+        return CharacteristicKinds::ALL;
+    };
+    match m {
+        // ---- CR 613.1d (layer 4): typeline. ----
+        ContinuousModification::AddType { .. }
+        | ContinuousModification::RemoveType { .. }
+        | ContinuousModification::SetCardTypes { .. }
+        | ContinuousModification::AddSubtype { .. }
+        | ContinuousModification::RemoveSubtype { .. }
+        | ContinuousModification::RemoveAllSubtypes { .. }
+        | ContinuousModification::AddAllCreatureTypes
+        | ContinuousModification::AddAllBasicLandTypes
+        | ContinuousModification::AddAllLandTypes
+        | ContinuousModification::AddChosenSubtype { .. }
+        | ContinuousModification::AddSupertype { .. }
+        | ContinuousModification::RemoveSupertype { .. } => CharacteristicKinds::CARD_TYPES,
+        // CR 305.7: setting a basic land type replaces the land's subtypes AND
+        // removes its abilities (the Song of the Dryads / Blood Moon class), so
+        // it is a genuine two-kind writer.
+        ContinuousModification::SetBasicLandType { .. }
+        | ContinuousModification::SetChosenBasicLandType => {
+            CharacteristicKinds::CARD_TYPES.union(CharacteristicKinds::ABILITIES)
+        }
+
+        // ---- CR 613.1c (layer 3) + CR 612.8: name. ----
+        ContinuousModification::SetName { .. }
+        | ContinuousModification::SetTextName { .. }
+        | ContinuousModification::SetChosenName => CharacteristicKinds::NAME_TEXT,
+
+        // ---- CR 613.1e (layer 5): color. ----
+        ContinuousModification::SetColor { .. }
+        | ContinuousModification::AddColor { .. }
+        | ContinuousModification::AddChosenColor { .. } => CharacteristicKinds::COLOR,
+
+        // ---- CR 613.1b (layer 2): control. ----
+        // CR 109.3: control is not a characteristic, but it moves the object
+        // between controller-keyed populations, which is the read this gate
+        // protects.
+        ContinuousModification::ChangeController => CharacteristicKinds::CONTROLLER,
+
+        // ---- CR 613.1g + CR 613.4a-d (layer 7): power/toughness. ----
+        ContinuousModification::AddPower { .. }
+        | ContinuousModification::AddToughness { .. }
+        | ContinuousModification::SetPower { .. }
+        | ContinuousModification::SetToughness { .. }
+        | ContinuousModification::SetDynamicPower { .. }
+        | ContinuousModification::SetDynamicToughness { .. }
+        | ContinuousModification::SetPowerDynamic { .. }
+        | ContinuousModification::SetToughnessDynamic { .. }
+        | ContinuousModification::AddDynamicPower { .. }
+        | ContinuousModification::AddDynamicToughness { .. }
+        | ContinuousModification::SwitchPowerToughness => CharacteristicKinds::POWER_TOUGHNESS,
+
+        // ---- CR 613.1f (layer 6): abilities. ----
+        ContinuousModification::AddKeyword { .. }
+        | ContinuousModification::RemoveKeyword { .. }
+        | ContinuousModification::AddChosenKeyword
+        | ContinuousModification::RemoveChosenKeyword
+        | ContinuousModification::AddDynamicKeyword { .. }
+        | ContinuousModification::GrantAbility { .. }
+        | ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
+        | ContinuousModification::GrantAllTriggeredAbilitiesOf { .. }
+        | ContinuousModification::GrantTrigger { .. }
+        | ContinuousModification::GrantReplacement { .. }
+        // CR 707.9a: retaining a printed ability through a copy still only
+        // rewrites the ability set, despite sitting in the copy layer.
+        | ContinuousModification::RetainPrintedTriggerFromSource { .. }
+        | ContinuousModification::RetainPrintedAbilityFromSource { .. }
+        | ContinuousModification::RetainAllOtherAbilitiesFromSource
+        // Battlefield application is a no-op (the real write happens on off-zone
+        // characteristics), but the truthful kind is still Abilities.
+        | ContinuousModification::AddKeywordWithDerivedCost { .. }
+        // Manufactures a `StaticDefinition` with a mode but no inner
+        // modifications, so there is nothing to recurse into.
+        | ContinuousModification::AddStaticMode { .. } => CharacteristicKinds::ABILITIES,
+        // CR 613.1f: grants a whole static, so it writes Abilities PLUS whatever
+        // the granted static's own modifications write.
+        ContinuousModification::GrantStaticAbility { definition } => definition
+            .modifications
+            .iter()
+            .fold(CharacteristicKinds::ABILITIES, |acc, inner| {
+                if acc.is_all() {
+                    acc
+                } else {
+                    acc.union(modification_characteristic_writes_at(inner, depth))
+                }
+            }),
+        // CR 613.1f + CR 604.3: removing all abilities also strips
+        // characteristic-defining abilities, so it can second-order rewrite any
+        // kind the stripped CDA was defining.
+        ContinuousModification::RemoveAllAbilities => CharacteristicKinds::ALL,
+
+        // ---- CR 613.1a + CR 707.9b (layer 1): copy effects. ----
+        // A copy effect replaces the copiable values wholesale — name, mana
+        // cost, color, types, P/T and abilities — i.e. every kind except control
+        // (CR 109.3). `CopyChosen` applies as a no-op here because the real copy
+        // is installed as a latched `CopyValues`, but classifying it truthfully
+        // is free.
+        ContinuousModification::CopyValues { .. } | ContinuousModification::CopyChosen => {
+            CharacteristicKinds::ALL
+        }
+        // CR 202.1: the mana cost is only writable by copy effects; this variant
+        // is unreachable through the layer pipeline (its apply site asserts), but
+        // it is classified truthfully rather than as EMPTY.
+        ContinuousModification::RemoveManaCost => CharacteristicKinds::MANA_COST,
+
+        // ---- Writes no characteristic. ----
+        // CR 510.1a: combat damage ASSIGNMENT rules, not characteristics.
+        ContinuousModification::AssignDamageFromToughness
+        | ContinuousModification::AssignDamageAsThoughUnblocked
+        | ContinuousModification::AssignNoCombatDamage
+        // CR 121.1 + CR 613.1: consumed as an entry replacement at resolution and
+        // never reached through the layer pipeline (its apply site asserts);
+        // counters are not characteristics in any case.
+        | ContinuousModification::AddCounterOnEnter { .. }
+        // CR 306.5b: loyalty is read from the copiable values, not written as a
+        // layer effect; the apply site asserts unreachable.
+        | ContinuousModification::SetStartingLoyalty { .. } => CharacteristicKinds::EMPTY,
+    }
 }
 
 fn active_effects_force_incremental_escalation(
@@ -3540,14 +5262,11 @@ fn active_effects_force_incremental_escalation(
     active_effects: &[ActiveContinuousEffect],
 ) -> bool {
     active_effects.iter().any(|e| {
-        let magnitude = continuous_modification_dynamic_quantity(&e.modification);
-        let magnitude_sensitive =
-            magnitude.is_some_and(crate::game::quantity::quantity_expr_uses_object_count);
-        let affected_sensitive =
-            crate::game::filter::affected_filter_uses_object_population(&e.affected_filter);
+        let (magnitude_sensitive, affected_sensitive) = effect_population_reads(e);
         if !magnitude_sensitive && !affected_sensitive {
             return false;
         }
+        let magnitude = continuous_modification_dynamic_quantity(&e.modification);
         let ctx = FilterContext::from_source_with_controller(e.source_id, e.controller);
         entered_ids.iter().any(|id| {
             let Some(entered) = state.objects.get(id) else {
@@ -3570,12 +5289,23 @@ fn active_effects_force_incremental_escalation(
     })
 }
 
-/// Scan every live static-ability source for a CONTINUOUS `StaticDefinition`
-/// whose enabling `condition` is board-population-dependent AND that one of the
-/// `entered_ids` actually perturbs. Walks the same source set as
-/// `collect_shared_active_continuous_effects` (`for_each_static_effect_source`)
-/// and reads the source definition's `condition` field.
-/// O(active-source-count × entered-count); short-circuits on the first match.
+/// Scan every live continuous-effect generator for an enabling `condition` that
+/// is board-population-dependent AND that one of the `entered_ids` actually
+/// perturbs. Two generator channels are walked, matching the two kinds of
+/// generator that carry a condition:
+///
+///  * PRINTED (and granted-inner) CONTINUOUS `StaticDefinition`s, over the same
+///    source set as `collect_shared_active_continuous_effects`
+///    (`for_each_static_effect_source`), reading each definition's `condition`.
+///  * RESOLUTION-CREATED `TransientContinuousEffect`s, reading BOTH gates that
+///    [`transient_effect_is_live`] consults, via [`transient_gate_conditions`]:
+///    the "for as long as" duration (CR 611.2b) and the retained enabling
+///    condition. CR 611.2c locks in a resolved effect's affected SET, not
+///    either gate, so both flip on entry while the frozen set goes stale with
+///    them — see the transient walk below for why it has no truth-delta stage.
+///
+/// O((active-source-count + transient-count) × entered-count); short-circuits on
+/// the first match.
 ///
 /// Three-stage test:
 ///  1. The committed exhaustive classifier
@@ -3660,7 +5390,39 @@ fn any_active_static_condition_perturbed_by_entry(
             found = true;
         }
     });
-    found
+    if found {
+        return true;
+    }
+    // CR 611.2b + CR 611.2c: the walk above sees only PRINTED (and granted-inner)
+    // static definitions. A continuous effect created by the resolution of a
+    // spell or ability keeps BOTH of its gates live — CR 611.2c locks in the
+    // affected SET, and nothing else — so a population-dependent gate riding on
+    // a transient flips on entry while every recipient frozen into that effect's
+    // set goes stale with it. Both gates are walked through
+    // `transient_gate_conditions`: the "for as long as" duration is CR 611.2b
+    // (Master Thief), and the retained condition is the source definition's own
+    // CR 611.3a gate (`effects/counter.rs::apply_source_static`).
+    //
+    // No truth-delta stage here: `static_gate_truth` is keyed by
+    // `(source, def_index)` over printed definitions, and a transient has no
+    // `def_index` in that key space (several transients can share one
+    // `source_id`). Escalating on perturbation alone is the direction the whole
+    // gate is built on — over-escalation costs a full pass, under-escalation
+    // ships a wrong board — and it matches the recipient-context arm above,
+    // which also escalates on perturbation with no cache consult.
+    state.transient_continuous_effects.iter().any(|tce| {
+        // CR 109.5: a resolved spell or ability RETAINS its controller, so "you"
+        // in either retained gate names `tce.controller` — not whoever controls
+        // the source object now (that reading is only correct for static
+        // abilities).
+        let ctx = FilterContext::from_source_with_controller(tce.source_id, tce.controller);
+        transient_gate_conditions(tce).any(|condition| {
+            static_condition_uses_object_population(condition)
+                && entered_ids
+                    .iter()
+                    .any(|id| entered_object_perturbs_static_condition(state, *id, &ctx, condition))
+        })
+    })
 }
 
 /// CR 611.3a + CR 611.3b: rewrite the source-level enabling-condition truth
@@ -3784,14 +5546,364 @@ fn incremental_recipient_ids(
     recipients
 }
 
+/// The single object an effect's `affected_filter` provably names, when it names
+/// one by id at all. `None` means the filter is a PREDICATE over the board
+/// (`Typed`, `And`, `Or`, ...) whose membership can only be decided by evaluating
+/// it against every object — which neither caller below does, so each supplies
+/// its own conservative answer for that case.
+///
+/// An id-naming filter is exactly the case where the affected set is known
+/// without a board scan. (No CR annotation: this decides nothing about the rules,
+/// it only reports what a filter's shape already tells us.)
+fn effect_names_single_affected_object(effect: &ActiveContinuousEffect) -> Option<ObjectId> {
+    filter_names_single_object(&effect.affected_filter, effect.source_id)
+}
+
+/// Is this effect provably CONFINED to the incremental recipients — i.e. can the
+/// restricted pass reproduce it in full? Unknown affected sets answer `false`
+/// (escalate on doubt): a board-wide filter also touches pre-existing objects
+/// that the incremental arm never resets.
 fn effect_is_restricted_to_incremental_recipients(
     effect: &ActiveContinuousEffect,
     recipient_ids: &BTreeSet<ObjectId>,
 ) -> bool {
-    match &effect.affected_filter {
-        TargetFilter::SelfRef => recipient_ids.contains(&effect.source_id),
-        TargetFilter::SpecificObject { id } => recipient_ids.contains(id),
+    effect_names_single_affected_object(effect).is_some_and(|id| recipient_ids.contains(&id))
+}
+
+/// Can this effect REACH at least one incremental recipient? The dual question to
+/// [`effect_is_restricted_to_incremental_recipients`], and deliberately not the
+/// same predicate: the two agree on an id-naming filter (a set of one is confined
+/// iff it is reached) but their conservative answers for an unknown affected set
+/// are OPPOSITE, because both must escalate on doubt and doubt sits on different
+/// sides of the two questions.
+fn effect_can_reach_incremental_recipients(
+    effect: &ActiveContinuousEffect,
+    recipient_ids: &BTreeSet<ObjectId>,
+) -> bool {
+    effect_names_single_affected_object(effect).is_none_or(|id| recipient_ids.contains(&id))
+}
+
+/// CR 613.2a + CR 613.2c: does applying this layer-1 copy modification hand its
+/// recipient a continuous static ability — i.e. can it turn a non-generator into a
+/// `StaticSourceIndex` generator mid-pass?
+///
+/// Shares the index's own classification predicate
+/// (`static_source_index::defs_source_continuous_effect`, the body of
+/// `object_sources_continuous_effect`): a generator is an object carrying a
+/// `StaticMode::Continuous` def. `CopyValues` carries its whole copiable static
+/// set in the modification payload and `apply_copiable_values` assigns that set
+/// wholesale, so the answer is exact — no id plumbing out of the apply path, and
+/// no battlefield rescan.
+///
+/// The six variants below are exactly `ContinuousModification::layer()`'s
+/// `Layer::Copy` set; every other variant belongs to layers 2-7 and is filtered
+/// out by both callers before they ask.
+fn copy_grants_continuous_static(modification: &ContinuousModification) -> bool {
+    match modification {
+        ContinuousModification::CopyValues { values, .. } => {
+            crate::game::static_source_index::defs_source_continuous_effect(
+                &values.static_definitions,
+            )
+        }
+        // CR 707.9b: name-only override; never writes `static_definitions`.
+        ContinuousModification::SetName { .. } => false,
+        // CR 707.2c: parse-time marker whose apply arm is an explicit no-op. The
+        // real copy is the latched `CopyValues` TCE, which sits in this same
+        // bucket and is classified on its own payload.
+        ContinuousModification::CopyChosen => false,
+        // CR 707.9a: trigger-set retention only.
+        ContinuousModification::RetainPrintedTriggerFromSource { .. } => false,
+        // CR 707.9a: single-ability retention. Its apply arm pushes one
+        // `AbilityDefinition` read from the source's `base_abilities` onto
+        // `obj.abilities` and touches no other set — `static_definitions` is
+        // structurally out of its reach, so the Sakashima-class single-ability
+        // retain provably adds no generator.
+        ContinuousModification::RetainPrintedAbilityFromSource { .. } => false,
+        // CR 707.9a: the unbounded retain genuinely merges the source's
+        // `base_static_definitions` back onto the copy, so it can add a
+        // generator. Answered `true` without inspecting the retained set, which
+        // lives on the live source rather than in this payload.
+        ContinuousModification::RetainAllOtherAbilitiesFromSource => true,
+        // Layers 2-7. `ContinuousModification` spans all eleven layers in one
+        // enum, so this arm is required for totality; it is EXACT rather than a
+        // fallback guess — no modification outside layer 1 writes copied
+        // `static_definitions`, and both callers filter to `Layer::Copy` first.
+        // Deliberately does not consult `other.layer()`: six of that method's
+        // arms are `unreachable!()` panics (`AddCounterOnEnter`,
+        // `SetStartingLoyalty`, `RemoveManaCost`, and the three
+        // combat-assignment variants), so the guard that was meant to make this
+        // arm safe could abort inside itself.
         _ => false,
+    }
+}
+
+/// CR 613.2a: can applying this copy modification produce ANOTHER generation of
+/// sublayer 1a — i.e. does its payload grant a continuous static that itself
+/// generates a LAYER-1 effect?
+///
+/// Strictly narrower than [`copy_grants_continuous_static`], and the two are not
+/// interchangeable. That one asks "does the recipient become a
+/// `StaticSourceIndex` generator?", which is the right question for the layer-1
+/// exit rebuild that feeds layers 2-7 and for the incremental-flush guard.
+/// Cloning an ordinary lord answers it yes — an anthem is a continuous static —
+/// but an anthem is a layer-7c effect and can never appear in a `Layer::Copy`
+/// gather however many times 1a re-runs. Continuing the loop on that answer buys
+/// a `StaticSourceIndex::rebuild_from_state` plus a board-wide
+/// `collect_shared_active_continuous_effects` for a generation that is
+/// guaranteed to find nothing, on the very common board that merely contains a
+/// cloned lord. Only a copy-LAYER static can extend the chain.
+///
+/// Asks [`ContinuousModification::is_copy_layer`] rather than `layer()`: these
+/// are payload modifications that have never been through the gather filter, and
+/// six of `layer()`'s arms are `unreachable!()` panics.
+fn copy_grants_copy_layer_static(modification: &ContinuousModification) -> bool {
+    match modification {
+        ContinuousModification::CopyValues { values, .. } => values
+            .static_definitions
+            .iter()
+            // CR 604.2 + CR 613.1: a STATIC ability is what creates a continuous
+            // effect here, so only a `Continuous` def counts. (CR 611.2, which
+            // `defs_source_continuous_effect` cites for the same test, is the
+            // resolution-generated case; the answer is identical, the rule for a
+            // static is 604.2.)
+            .filter(|def| def.mode == StaticMode::Continuous)
+            .flat_map(|def| def.modifications.iter())
+            // `is_copy_layer` is total over `Layer::Copy`, so it answers `true` for
+            // a nested `CopyValues` too. That sub-case is unreachable, for the same
+            // reason `apply_continuous_effect`'s `"CopyValues must originate from a
+            // transient continuous effect"` expect is sound: every construction of
+            // `CopyValues` installs it through `add_transient_continuous_effect`
+            // (`become_copy::apply_precomputed_copy_values`,
+            // `merge::install_merge_layer_effect`) and card data never authors one,
+            // so no `StaticDefinition` — and hence no `CopiableValues` snapshot of
+            // one — can hold it. The two seams therefore disagree about whether the
+            // state is possible — this one buys a discovery generation for it, that
+            // one panics on it — and the disagreement is deliberate: the expect is
+            // where the invariant is enforced, so a future reachable case is a
+            // construction-site bug to fix there, not a case to quietly admit by
+            // special-casing it out of this totality.
+            .any(ContinuousModification::is_copy_layer),
+        // CR 707.9a: the unbounded retain merges the LIVE source's
+        // `base_static_definitions`, which are not in this payload to inspect, so
+        // it is answered conservatively — as in `copy_grants_continuous_static`.
+        // Over-answering costs at most one extra generation, which then gathers
+        // nothing fresh and exits.
+        ContinuousModification::RetainAllOtherAbilitiesFromSource => true,
+        // The remaining `Layer::Copy` variants write no `static_definitions` at
+        // all (`SetName` is name-only, `CopyChosen`'s apply arm is a no-op, and
+        // the two single-item retains push one ability / one trigger), and every
+        // layers-2-7 variant is out of both callers' `Layer::Copy` filter.
+        _ => false,
+    }
+}
+
+/// CR 613.2a + CR 613.2c: apply sublayer 1a to a fixed point.
+///
+/// A copy effect can hand a permanent a static ability its copiable base does not
+/// carry, and CR 613.2c says that after all of layer 1 has been applied the
+/// object's characteristics ARE its copiable values. When that granted static is
+/// itself a copy effect, it belongs to THIS sublayer — so gathering layer 1 once
+/// is not enough: the sublayer has to be iterated until no new copy effect
+/// appears.
+///
+/// Ordering is preserved ACROSS generations, not just within one: each generation
+/// re-orders and re-applies the whole started set (CR 613.2 timestamp order,
+/// CR 613.8a dependency order), never just the newly discovered tail. That
+/// matters because `depends_on` sorts every `CopyValues` ahead of the other
+/// layer-1 modifications, so a copy discovered late can legitimately need to
+/// apply before one already applied. Re-application is safe, and CR 707.2c is
+/// why: the copiable values a copy effect grants are fixed the first time it
+/// starts to apply, so re-applying a started effect re-applies that same locked
+/// snapshot. Mechanically, `CopyValues` / `SetName` assign wholesale from the
+/// payload, the retains dedupe per item, `CopyChosen` is a no-op, and
+/// `started_effect_sets` hands an already-started effect back its original
+/// affected set (CR 613.6). Nothing is ever pruned from the started set for the
+/// same reason: an effect whose provenance slot has since been overwritten still
+/// applies the values it locked in, so dropping it would be the CR 707.2c
+/// violation, not keeping it.
+///
+/// Termination. The loop's identity ([`CopySublayerEffectId`]) is provenance,
+/// never payload, so the space it draws from is finite and does not grow during
+/// the pass:
+///
+/// - The battlefield object set is fixed for the duration of layer 1 — nothing
+///   in sublayer 1a creates, destroys or moves an object — so the `Static` and
+///   `GrantedStatic` arms of `ContinuousEffectGroupKey` range over a fixed set of
+///   `ObjectIncarnationRef`s (`incarnation` changes only on a zone change), and
+///   the `Transient` arm over the fixed id set of
+///   `state.transient_continuous_effects`.
+/// - `definition_index` and `mod_index` are bounded by the largest static set any
+///   object can hold during the pass, and no arm can mint fresh ones without
+///   bound: `apply_copiable_values` ASSIGNS `obj.static_definitions` wholesale
+///   from the payload's snapshot rather than appending,
+///   `RetainAllOtherAbilitiesFromSource` merges the source's
+///   `base_static_definitions` behind a per-item `contains` dedupe, and every
+///   other `Layer::Copy` arm writes no static at all. Each payload is itself a
+///   snapshot taken before the pass began, so the reachable static sets are fixed
+///   too.
+///
+/// Each iteration therefore either inserts at least one identity into the
+/// monotonically growing `started_ids` — bounded above by that finite space — or
+/// gathers nothing fresh and returns. So the loop terminates, with no generation
+/// cap needed to force it.
+///
+/// Returns whether any applied copy added a `StaticSourceIndex` generator, which
+/// the caller needs for the layer-1 exit rebuild that feeds layers 2-7.
+fn apply_copy_sublayer_to_fixed_point(
+    state: &mut GameState,
+    abilities_suppressed: &mut HashSet<ObjectId>,
+    zone_cache: &mut LayerZoneObjectCache,
+    started_effect_sets: &mut StartedContinuousEffectSets,
+) -> bool {
+    let mut started: Vec<ActiveContinuousEffect> = Vec::new();
+    let mut started_ids: HashSet<CopySublayerEffectId> = HashSet::new();
+    let mut copy_added_generator = false;
+
+    loop {
+        // `insert` returns `false` for an identity already started, so this both
+        // selects the fresh effects and records them in one O(1)-per-effect pass.
+        let fresh: Vec<ActiveContinuousEffect> =
+            gather_active_effects_for_layer(state, Layer::Copy)
+                .into_iter()
+                .filter(|effect| started_ids.insert(copy_sublayer_effect_id(state, effect)))
+                .collect();
+        if fresh.is_empty() {
+            // Fixed point: this generation's gather produced nothing the
+            // previous ones had not already started applying.
+            return copy_added_generator;
+        }
+
+        copy_added_generator |= fresh
+            .iter()
+            .any(|effect| copy_grants_continuous_static(&effect.modification));
+        // Loop continuation is the NARROW question: only a copy-layer static can
+        // show up in the next `Layer::Copy` gather. A cloned lord answers
+        // `copy_grants_continuous_static` yes and still cannot extend the chain.
+        let fresh_added_copy_generator = fresh
+            .iter()
+            .any(|effect| copy_grants_copy_layer_static(&effect.modification));
+
+        let reapplying = !started.is_empty();
+        started.extend(fresh);
+        let ordered = order_active_continuous_effects(Layer::Copy, &started, state);
+        if reapplying {
+            // 1a re-runs from the top, so its display attribution is re-derived
+            // from the top too — otherwise a re-applied effect would be listed
+            // twice, in stale order. Only the Copy bucket exists yet: Step 1
+            // cleared the table and no later layer has run.
+            for (_, attribution) in state.attribution.iter_mut() {
+                attribution.by_layer.remove(&Layer::Copy);
+            }
+        }
+        for effect in &ordered {
+            apply_continuous_effect(
+                state,
+                effect,
+                abilities_suppressed,
+                zone_cache,
+                started_effect_sets,
+            );
+        }
+
+        if !fresh_added_copy_generator {
+            // Nothing this generation can put a copy-layer static on the board,
+            // so the next gather would return the same set. Stop without paying
+            // the O(battlefield) rebuild. If a NON-copy generator was added, the
+            // returned flag makes the caller do the layer-1 exit rebuild instead.
+            return copy_added_generator;
+        }
+        // The index was built from definitions that predate these copies; refresh
+        // it so the next gather can see a copy-granted copy ability.
+        crate::types::game_state::StaticSourceIndex::rebuild_from_state(state);
+    }
+}
+
+/// CR 707.2c: identity of a layer-1 copy effect for the fixed-point loop.
+///
+/// PROVENANCE ONLY — never the payload. CR 707.2c: "If a static ability generates
+/// a continuous effect that's a copy effect, the copiable values that effect
+/// grants are determined only at the time that effect first starts to apply." So
+/// re-reading a provenance that has already started is the SAME effect granting
+/// the SAME locked values; a rewritten payload does not mint a new one. Keying on
+/// the payload instead both contradicts that rule and
+/// makes the loop non-convergent by construction — two permanents that rewrite
+/// each other's static sets would produce payload-distinct identities forever,
+/// which is exactly what a generation cap used to have to paper over.
+///
+/// Built on [`ContinuousEffectGroupKey`], this file's canonical "which effect is
+/// this" answer, rather than a hand-rolled tuple. Two reasons: it is what
+/// `started_effect_sets` already keys on, so the loop and `apply_continuous_effect`
+/// can no longer disagree about whether an effect has started (a disagreement is a
+/// CR 613.6 bug — the loop calls an effect new while the applier hands it back an
+/// already-locked affected set); and it distinguishes
+/// `GrantedStatic { grant_origin, recipient }` occurrences that a raw
+/// `(source_id, def_index, transient_id)` tuple collides on. That second reason is
+/// forward-looking here, not load-bearing: `GrantedStatic` is live in the layers
+/// that share this key, but reaching it from THIS loop needs a
+/// `GrantStaticAbility` whose inner definition is copy-layer, and no card prints
+/// one (see the pool argument below). Sharing the key is still the right call —
+/// the alternative is a second identity that can drift from the one
+/// `apply_continuous_effect` enforces.
+///
+/// The three provenances are not equally precise, and this identity claims no more
+/// than each one carries. `Transient { continuous_effect_id }` names an allocated
+/// id and `GrantedStatic { grant_origin, recipient }` names a grant origin —
+/// nothing in a layer pass can make either denote a different ability.
+/// `Static { source, definition_index }` names a POSITION in
+/// `obj.static_definitions`, and [`apply_copiable_values`] assigns that vector
+/// wholesale from the copy payload. So slot `i` could in principle denote a
+/// different static ability in generation N+1 than in generation N, and the
+/// newcomer would be filtered out as already-started while the effect it displaced
+/// kept re-applying.
+///
+/// That board is not constructible today, and the residual is accepted rather than
+/// closed: `ContinuousEffectGroupKey` is the shared key `started_effect_sets` uses
+/// in every layer, so de-positioning its `Static` arm is a change to all seven
+/// layers rather than to this loop. Reaching the hazard needs a `Layer::Copy`
+/// effect that is `Static`-keyed, and no producer makes one:
+///
+/// - Both engine construction sites of a `Layer::Copy` modification —
+///   `become_copy::apply_precomputed_copy_values` and
+///   `merge::install_merge_layer_effect` — install through
+///   `add_transient_continuous_effect`, so the effect is `Transient`-keyed.
+/// - `expand_granted_static_effects` sets `def_index: None`, so a granted
+///   copy-layer static is `GrantedStatic`-keyed.
+/// - Card data is the only other producer of `StaticDefinition`s. The resolving
+///   name changes on Awakening of Vitu-Ghazi, Tenth District Hero, The Curse of
+///   Fenric, and The Irencrag are `SetTextName` modifications in Layer 3 inside
+///   `GenericEffect` payloads, not copy-layer producers. No card carries a
+///   copy-layer modification in its printed `static_abilities`, so no route into
+///   an object's `static_definitions` can carry one either: the copy payload
+///   ([`apply_copiable_values`]), the `GrantStaticAbility` graft, and the
+///   `RetainPrintedAbilityFromSource` graft all replay card-data statics.
+///
+/// The first card to print a copy-layer static ability directly — rather than
+/// creating its copy effect from a resolving spell or ability — is the trigger to
+/// revisit this.
+///
+/// `mod_index` rides alongside because the group key deliberately drops it — every
+/// modification of one definition shares one CR 613.6 affected set — while this
+/// loop must re-apply EACH modification of a multi-modification copy definition
+/// (`CopyValues` + its `SetName` exception, say), not just the first.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CopySublayerEffectId {
+    /// `None` only for a synthetic effect carrying no static, transient or grant
+    /// provenance at all (the Ring emblem, stickers). No synthetic producer emits
+    /// a `Layer::Copy` modification today, so this is unreachable here; carrying
+    /// `source_id` keeps the identity total instead of resting on that fact.
+    group: Option<ContinuousEffectGroupKey>,
+    source_id: ObjectId,
+    mod_index: usize,
+}
+
+fn copy_sublayer_effect_id(
+    state: &GameState,
+    effect: &ActiveContinuousEffect,
+) -> CopySublayerEffectId {
+    CopySublayerEffectId {
+        group: continuous_effect_group_key(state, effect),
+        source_id: effect.source_id,
+        mod_index: effect.mod_index,
     }
 }
 
@@ -3806,10 +5918,50 @@ fn effect_is_restricted_to_incremental_recipients(
 /// visibility). It does NOT clear attribution globally or touch the rest of the
 /// battlefield: pre-existing objects keep their already-derived characteristics.
 ///
-/// Caller (`flush_layers`) only reaches this path after
-/// `incremental_flush_must_escalate` returned false, which guarantees no active
-/// effect's magnitude or affected set reads board population — so re-deriving
-/// just the entered objects yields a board identical to a full pass (CR 613.1).
+/// Caller (`flush_layers`) only reaches this path when `prepare_incremental_flush`
+/// returned `Some`, i.e. none of its escalation disjuncts fired. The disjuncts are
+/// listed once, at that function; they are deliberately NOT restated here, because
+/// a second enumeration is exactly what drifted last time.
+///
+/// Within the limits those disjuncts detect, re-deriving just the entered objects
+/// yields a board identical to a full pass (CR 613.1). Note what that does and
+/// does not promise: the guarantee is "no DETECTED perturbation", not "no
+/// population read is live". The residual blind spots are enumerated on
+/// `population_probe_blinded_by_entrant_characteristic_change`.
+/// CR 709.5 + CR 707.2 + CR 613.1a: derive each battlefield Room's door-gated
+/// NAME from its effective (post-Layer-1) form. A locked half doesn't have its
+/// name; the halves come from the copied snapshot when a copy applied, else
+/// from the object's own printed form (`room::door_gated_battlefield_name`).
+/// Face-down objects keep their CR 708.2a profile — no name to derive.
+fn derive_room_battlefield_names(state: &mut GameState, ids: &[ObjectId]) {
+    for id in ids {
+        let Some(obj) = state.objects.get_mut(id) else {
+            continue;
+        };
+        if obj.face_down {
+            continue;
+        }
+        // CR 707.9b: a Layer-1 name EXCEPTION is the copy's final name —
+        // CR 709.5 removes locked HALVES' names, never a separate exception.
+        if obj.layer1_name_origin == Some(crate::types::ability::CopiedNameOrigin::Exception) {
+            continue;
+        }
+        if let Some(room_name) = crate::game::room::door_gated_battlefield_name(obj) {
+            obj.name = room_name;
+        }
+    }
+}
+
+/// CR 709.5 + CR 123.6c + CR 613.1c: first derive a Room permanent's name from
+/// its unlocked halves, then apply name-sticker text changes to that resulting
+/// name. The full and incremental paths must share this exact ordering or a
+/// stickered Room can have different characteristics depending on the flush
+/// path. Ability stickers ride the same existing sticker pass.
+fn apply_room_names_then_stickers(state: &mut GameState, ids: &[ObjectId]) -> bool {
+    derive_room_battlefield_names(state, ids);
+    crate::game::stickers::apply_battlefield_name_and_ability_stickers(state, ids)
+}
+
 fn apply_layers_incremental(state: &mut GameState, prepared: PreparedIncrementalFlush) {
     let PreparedIncrementalFlush {
         recipient_ids,
@@ -3822,9 +5974,18 @@ fn apply_layers_incremental(state: &mut GameState, prepared: PreparedIncremental
     // static-source index rebuild and shared active-effect collection.
 
     // Step 2: Copy effects first (Layer 1), restricted to recipient objects.
+    //
+    // `effect_can_reach_incremental_recipients` drops a copy that provably names a
+    // NON-recipient — the ordinary resolved-clone shape. `apply_continuous_effect_to`
+    // would skip every one of its objects at the `restrict_to` test anyway, so this
+    // changes no state; what it buys is an accurate `copy_effects.is_empty()` below,
+    // which is what decides whether this flush pays a second board-wide gather.
     let copy_effects: Vec<ActiveContinuousEffect> = active_effects
         .iter()
-        .filter(|effect| effect.layer == Layer::Copy)
+        .filter(|effect| {
+            effect.layer == Layer::Copy
+                && effect_can_reach_incremental_recipients(effect, &recipient_ids)
+        })
         .cloned()
         .collect();
     let ordered_copy = order_active_continuous_effects(Layer::Copy, &copy_effects, state);
@@ -3840,8 +6001,37 @@ fn apply_layers_incremental(state: &mut GameState, prepared: PreparedIncremental
     }
 
     let recipient_vec: Vec<ObjectId> = recipient_ids.iter().copied().collect();
-    let stickers_changed =
-        crate::game::stickers::apply_battlefield_name_and_ability_stickers(state, &recipient_vec);
+    let stickers_changed = apply_room_names_then_stickers(state, &recipient_vec);
+    // CR 613.2a + CR 613.2c: deliberately no copy disjunct on this rebuild, unlike
+    // the full pass. A copy applied here could only add a generator by landing on
+    // a recipient, and it cannot: `recipient_ids` is `entered_ids` alone, because
+    // an attached entrant — the one way a pre-existing host joins the set — is
+    // rejected outright by `entered_object_blocks_incremental` guard (3); and a
+    // copy TCE naming a fresh entrant can only have been installed by that same
+    // entry, which called `layers_dirty.mark_full()` (`game_state.rs`,
+    // `apply_resolved_continuous_effect`) and so made this flush a full pass.
+    //
+    // That argument covers only a copy that NAMES a recipient. A pre-existing copy
+    // effect also reaches a recipient by plain filter match, because
+    // `apply_continuous_effect_to` restricts an ordinary board-wide
+    // `affected_filter` to `recipient_ids` rather than requiring
+    // `TargetFilter::SpecificObject`. What rules that case out is the escalation
+    // guard in `prepare_incremental_flush`: any active copy that can REACH a
+    // recipient and whose payload grants a continuous static sends the whole flush
+    // to `evaluate_layers`. The copies it lets through are exactly those confined
+    // to a named non-recipient, which the `copy_effects` filter above then drops —
+    // so either way no copy surviving to this line can turn a recipient into a
+    // `StaticSourceIndex` generator. The index built there still names exactly the
+    // right sources and a rebuild would find the identical set. (It would also be
+    // the wrong repair anyway: a guard that fans a copy-granted static over
+    // `recipient_ids` alone would not agree with the full pass, which derives it
+    // board-wide.)
+    //
+    // The re-collect below is not dead weight, though. A copy changes its
+    // recipients' characteristics, and a pre-existing generator's
+    // `GrantStaticAbility` fan-out is computed per matching recipient when that
+    // generator is visited — same generator set, different collected effects. So
+    // the effect set must be re-read after the copy even though the index need not.
     let active_effects = if stickers_changed {
         // Incremental resets clear the entered/attached recipients back to base,
         // so retained stickers must be re-applied before the restricted main
@@ -3957,6 +6147,17 @@ fn apply_layers_incremental(state: &mut GameState, prepared: PreparedIncremental
     // sees the entered objects' (and any granted) trigger sets.
     crate::types::game_state::TriggerIndex::rebuild_from_battlefield(state);
 
+    // CR 616.1 + CR 613.1: same tail settle as the full pass (see
+    // `settle_resolution_replacements_to_tail`). `evaluate_layers` and
+    // `apply_layers_incremental` are the only two pass tails; the calls live
+    // inside them rather than in `flush_layers` because production also calls
+    // `evaluate_layers` directly from many sites.
+    for &id in &recipient_ids {
+        if let Some(obj) = state.objects.get_mut(&id) {
+            settle_resolution_replacements_to_tail(obj);
+        }
+    }
+
     // Test-only buggy end-of-pass static-index placement (see `evaluate_layers`).
     if !rebuild_static_index_at_top() {
         crate::types::game_state::StaticSourceIndex::rebuild_from_state(state);
@@ -3970,6 +6171,7 @@ fn gather_active_effects_for_layer(state: &GameState, layer: Layer) -> Vec<Activ
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn has_active_copy_layer_effects(state: &GameState) -> bool {
     !gather_active_effects_for_layer(state, Layer::Copy).is_empty()
 }
@@ -4194,13 +6396,17 @@ fn for_each_static_effect_source(
         }
     }
 
-    // CR 113.6 + CR 113.6b: Statics that opt into non-battlefield functional
-    // zones (Incarnation cycle — Anger/Filth/Brawn/Wonder/Valor — "as long as
-    // this card is in your graveyard, ...") must be collected from wherever the
-    // source currently lives. `active_continuous_effects_from_static_definitions`
-    // applies the zone-of-function gate per-static, so scanning every object
-    // outside the battlefield / command-zone passes already covered above is
-    // safe: battlefield-default statics filter themselves out.
+    // CR 113.6 + CR 113.6b + CR 604.3: Statics that opt into non-battlefield
+    // functional zones (Incarnation cycle — Anger/Filth/Brawn/Wonder/Valor —
+    // "as long as this card is in your graveyard, ...") must be collected
+    // from wherever the source currently lives, and so must characteristic-
+    // defining abilities (CDAs), which function in all zones by definition
+    // (CR 604.3) rather than through an opt-in `active_zones` list.
+    // `active_continuous_effects_from_static_definitions` applies the
+    // zone-of-function gate per-static (including the CDA all-zones rule via
+    // `static_functions_in_zone`), so scanning every object outside the
+    // battlefield / command-zone passes already covered above is safe:
+    // battlefield-default statics filter themselves out.
     for obj in state.objects.values() {
         // Battlefield objects were already processed above (phased-out gate
         // included). Command-zone sources (emblems, face-up conspiracies, and
@@ -4215,12 +6421,18 @@ fn for_each_static_effect_source(
             continue;
         }
         // Cheap pre-check: only scan objects that carry at least one
-        // opt-in-zone static. Avoids iterating libraries/hands full of
-        // ordinary cards on every layer recomputation.
+        // opt-in-zone static OR a characteristic-defining ability. Avoids
+        // iterating libraries/hands full of ordinary cards on every layer
+        // recomputation. A CDA (`characteristic_defining`) must be included
+        // here even though it typically carries an empty `active_zones` list
+        // (CR 604.3: CDAs function in all zones by definition, not by opt-in
+        // list) — otherwise a source whose ONLY static is a bare CDA would
+        // never even reach `active_continuous_effects_from_static_definitions`
+        // to have that CDA evaluated off-battlefield.
         if !obj
             .static_definitions
             .iter_all()
-            .any(|def| !def.active_zones.is_empty())
+            .any(|def| !def.active_zones.is_empty() || def.characteristic_defining)
         {
             continue;
         }
@@ -4246,6 +6458,7 @@ pub(crate) fn active_continuous_effects_from_static_source(
         source.controller,
         source.timestamp,
         source.static_definitions.as_slice(),
+        StaticZoneAdmission::LiveSource,
     )
 }
 
@@ -4265,6 +6478,7 @@ pub(crate) fn active_continuous_effects_from_base_static_source(
         source.controller,
         source.timestamp,
         &static_definitions,
+        StaticZoneAdmission::PreFilteredBaseStatic,
     )
 }
 
@@ -4291,32 +6505,94 @@ fn static_condition_has_source_zone_gate(condition: &StaticCondition) -> bool {
     }
 }
 
+/// CR 113.6 + CR 113.6b: Which zone-of-function screening a call into
+/// `active_continuous_effects_from_static_definitions` has already applied to
+/// the `static_definitions` it's handed. The function has two callers with
+/// different provenance, so a single unconditional gate can't serve both:
+///
+/// - `active_continuous_effects_from_static_source` hands it a source's LIVE
+///   `static_definitions`, unfiltered — nothing upstream has screened them by
+///   zone, so the shared `functioning_abilities::static_functions_in_zone`
+///   gate must run here (`LiveSource`). Without it, a source visited only
+///   because ONE of its static definitions opts into a non-battlefield zone
+///   (Gwaihir the Windlord's cost-reduction static lists `[Hand, Stack,
+///   Command, Graveyard, Exile, Library]`) leaked every OTHER definition on
+///   that same source too — including one with empty `active_zones` that
+///   should default to battlefield-only, like "Other Birds you control have
+///   vigilance." (issue #8158). `static_functions_in_zone` itself resolves
+///   this as a three-way split, not two: a characteristic-defining ability
+///   (`characteristic_defining`) functions in all zones unconditionally per
+///   CR 604.3 — even though it too carries empty `active_zones` — while a
+///   plain empty-`active_zones` definition without the CDA flag stays
+///   battlefield-only, and a non-empty `active_zones` list is the explicit
+///   opt-in case. So a CDA visited only because a sibling definition on the
+///   same source opts into a non-battlefield zone is correctly admitted on
+///   its own CR 604.3 authority rather than rejected alongside the plain
+///   battlefield-only case.
+/// - `active_continuous_effects_from_base_static_source` hands it
+///   `base_static_definitions` already screened by
+///   `base_static_can_source_off_zone_keyword_query`, which intentionally
+///   admits a self-referential (`affected: SelfRef`) definition off-zone for
+///   "what would this object's own characteristics be" queries
+///   (`off_zone_characteristics.rs`, e.g. Dream Devourer). Re-running the
+///   ordinary gate here would reject exactly what that pre-filter meant to
+///   admit, so `PreFilteredBaseStatic` skips it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StaticZoneAdmission {
+    LiveSource,
+    PreFilteredBaseStatic,
+}
+
 fn active_continuous_effects_from_static_definitions(
     state: &GameState,
     source_id: ObjectId,
     controller: PlayerId,
     timestamp: u64,
     static_definitions: &[StaticDefinition],
+    admission: StaticZoneAdmission,
 ) -> Vec<ActiveContinuousEffect> {
     let mut effects = Vec::new();
-    // CR 113.6 + CR 113.6b: A static's functional zone is the battlefield by
-    // default (empty `active_zones`). A non-empty `active_zones` lists the
-    // non-battlefield zones in which the static functions (e.g., Incarnation
-    // cycle: "as long as this card is in your graveyard, ..."). If the source
-    // is currently outside every declared zone, the static contributes no
-    // effects.
-    let source_zone = state.objects.get(&source_id).map(|o| o.zone);
+    let source_obj = state.objects.get(&source_id);
     for (def_idx, def) in static_definitions.iter().enumerate() {
         if def.mode != StaticMode::Continuous {
             continue;
         }
 
-        // CR 113.6 + CR 113.6b: Zone-of-function gate.
-        if !def.active_zones.is_empty() {
-            let Some(zone) = source_zone else { continue };
-            if !def.active_zones.contains(&zone) {
-                continue;
-            }
+        // CR 709.5 + CR 709.5c: on the battlefield a locked Room half doesn't
+        // have its rules text — a door-stamped static contributes no
+        // continuous effects while its half is locked. `static_functions_in_zone`
+        // (below) also applies this door check for `LiveSource`, but it stays
+        // here unconditionally because it remains the ONLY door check for
+        // `PreFilteredBaseStatic`, which skips the block below.
+        if source_obj.is_some_and(|obj| !crate::game::room::door_text_functions(obj, def.room_door))
+        {
+            continue;
+        }
+
+        // CR 113.6 + CR 113.6b: Zone-of-function gate. `LiveSource` delegates
+        // to the shared `functioning_abilities::static_functions_in_zone`
+        // authority — the same predicate
+        // `active_combat_assignment_rule_effects_from_static_definitions`
+        // (below) already uses — so a definition with empty `active_zones`
+        // correctly defaults to battlefield-only even when this source was
+        // only visited because a DIFFERENT definition on it opts into a
+        // non-battlefield zone, UNLESS the definition is itself a CDA, which
+        // `static_functions_in_zone` admits unconditionally per CR 604.3
+        // (checked there, not duplicated here, so all six call sites that
+        // delegate to it — not just this one — get the CDA exception; see
+        // that function's doc comment for the full three-way split). A source
+        // that has since vanished from `state.objects` (`source_obj: None`)
+        // is treated as functioning nowhere, same as the door check above.
+        // `PreFilteredBaseStatic` already had this screening applied by its
+        // caller and must not be gated again (see `StaticZoneAdmission`).
+        let admitted = match admission {
+            StaticZoneAdmission::LiveSource => source_obj.is_some_and(|obj| {
+                crate::game::functioning_abilities::static_functions_in_zone(obj, def)
+            }),
+            StaticZoneAdmission::PreFilteredBaseStatic => true,
+        };
+        if !admitted {
+            continue;
         }
 
         let retained_condition = def.condition.clone();
@@ -4773,20 +7049,56 @@ pub(crate) fn transient_effect_is_live(state: &GameState, tce: &TransientContinu
     // CR 400.7: a recipient that has changed zones is a new object, so a
     // continuous effect tied to its prior incarnation cannot keep applying.
     if let Some(recipient) = tce.affected_recipient {
-        if !state
-            .objects
-            .get(&recipient.object_id)
-            .is_some_and(|object| ObjectIncarnationRef::from_object(object) == recipient)
-        {
+        if !recipient.is_current(state) {
             return false;
         }
     }
-    // UntilHostLeavesPlay: skip if source is no longer on the battlefield
-    if tce.duration == Duration::UntilHostLeavesPlay
+    // CR 611.2a: every host-bound lifetime — the event deadline and both
+    // state readings — is dead once the source has left the battlefield.
+    if tce.duration.ends_when_host_leaves_play()
         && !state
             .objects
             .get(&tce.source_id)
             .is_some_and(|obj| obj.zone == crate::types::zones::Zone::Battlefield)
+    {
+        return false;
+    }
+    // CR 611.2b + CR 702.26f: the presence-bound state reading ("for as long
+    // as ~ remains on the battlefield") additionally ends when its host phases
+    // out — "effects with 'for as long as' durations that track that permanent
+    // (see rule 611.2b) end when that permanent phases out because they can no
+    // longer see it." The event deadline (`UntilHostLeavesPlay`, "until ~
+    // leaves the battlefield") is deliberately NOT asked this question: a
+    // phase-out is not the host leaving the battlefield (CR 702.26d), so that
+    // reading keeps running across one, and ending it here would be wrong for
+    // every event-bound card. The wording now lives on the variant itself, so
+    // this filter no longer has to conflate the two.
+    //
+    // This check only declines to APPLY the effect; the ENDING that CR 702.26f
+    // demands — a later phase-in must not revive it — is
+    // `prune_lapsed_host_bound_effects`' presence arm, the same
+    // filter-plus-removal split the control reading below uses.
+    if tce.duration == Duration::WhileHostOnBattlefield
+        && !state
+            .objects
+            .get(&tce.source_id)
+            .is_some_and(|obj| obj.is_phased_in())
+    {
+        return false;
+    }
+
+    // CR 611.2b: the control-bound reading additionally ends when another
+    // player gains control of the source, or when it phases out (CR 702.26f).
+    // `controller_controls_source_gate` is the single authority for all three
+    // legs and is already shared with the `ControllerControlsSource`
+    // replacement condition, so the duration and the condition can never
+    // disagree about when this window closed.
+    if tce.duration == Duration::WhileControllingHost
+        && !crate::game::replacement::controller_controls_source_gate(
+            state,
+            tce.source_id,
+            tce.controller,
+        )
     {
         return false;
     }
@@ -4844,10 +7156,20 @@ pub(crate) fn gather_transient_continuous_effects(
             // characteristic. Grafting it onto each affected object would let
             // `battlefield_active_statics` see it too and double-apply the
             // discount, so skip it here for the same reason.
+            // CR 601.2b + CR 118.9: `CastFromHandFree` joins them for the same
+            // reason. It is read directly off the TCE by
+            // `casting::transient_cast_free_permission` — the transient arm of
+            // the single free-cast authority
+            // `casting::unlimited_hand_cast_free_source` — and grafting it onto
+            // every affected object would additionally expose it to
+            // `iter_cast_free_permission_source_ids`, giving one grant two
+            // sources.
             if matches!(
                 modification,
                 ContinuousModification::AddStaticMode {
-                    mode: StaticMode::MayLookAtFaceDown | StaticMode::ReduceAbilityCost { .. },
+                    mode: StaticMode::MayLookAtFaceDown
+                        | StaticMode::ReduceAbilityCost { .. }
+                        | StaticMode::CastFromHandFree { .. },
                 }
             ) {
                 continue;
@@ -4892,8 +7214,99 @@ pub(crate) fn gather_transient_continuous_effects(
     }
 }
 
-fn transient_duration_holds(state: &GameState, tce: &TransientContinuousEffect) -> bool {
+/// CR 611.2b: the enabling condition a `"for as long as …"` DURATION carries.
+///
+/// Single authority for "which condition does `tce.duration` gate on". The
+/// liveness evaluator ([`transient_duration_holds`]), the read union
+/// ([`live_characteristic_reads`]) and the entry-perturbation probe
+/// ([`any_active_static_condition_perturbed_by_entry`]) all ask through here,
+/// so a second condition-bearing `Duration` variant is wired into all three by
+/// editing one function.
+fn transient_duration_condition(tce: &TransientContinuousEffect) -> Option<&StaticCondition> {
     let Duration::ForAsLongAs { ref condition } = tce.duration else {
+        return None;
+    };
+    Some(condition)
+}
+
+/// CR 611.2b + CR 611.2c: every condition that gates whether a
+/// resolution-created continuous effect is live on THIS pass.
+///
+/// CR 611.2c freezes such an effect's affected SET when it begins and nothing
+/// else, so both gates below stay live and can flip long after that set is
+/// fixed:
+///
+/// * the `"for as long as …"` DURATION (CR 611.2b — Master Thief's "gain
+///   control of target artifact for as long as you control this creature");
+/// * the retained enabling CONDITION, which is the source `StaticDefinition`'s
+///   own CR 611.3a gate riding along on the transient
+///   (`effects/counter.rs::apply_source_static`).
+///
+/// [`transient_effect_is_live`] consults this pair plus four gates that sit
+/// outside this iterator and outside [`live_characteristic_reads`]. Three read
+/// no layer-writable characteristic at all — the CR 400.7
+/// recipient-incarnation check, the host source-zone check
+/// (`ends_when_host_leaves_play`) and the CR 702.26f `WhileHostOnBattlefield`
+/// phased-in check — because a zone, identity or phasing change is not
+/// something layers 1-7 can write. The fourth, the CR 611.2b
+/// `WhileControllingHost` control gate, does read one (the source's
+/// controller, layer 2) and is still not registered here: the effect it gates
+/// is REMOVED by `prune_lapsed_host_bound_effects` inside `evaluate_layers`,
+/// the same seam and the same treatment as the pre-existing sibling question
+/// `prune_lapsed_controller_controls_source`, which is likewise absent from
+/// [`live_characteristic_reads`].
+///
+/// Every consumer that EVALUATES whether this effect is live walks the pair
+/// through here: [`transient_effect_is_live`] (via
+/// [`transient_duration_holds`] and its own `tce.condition` arm),
+/// [`live_characteristic_reads`] and
+/// [`any_active_static_condition_perturbed_by_entry`] in this module, six
+/// static-mode/protection queries in `static_abilities`, plus
+/// `casting::transient_granted_spell_keywords_for`,
+/// `casting::transient_cast_free_permission`,
+/// `turns::scan_step_end_mana_handlers` and
+/// `visibility::viewer_may_look_at_face_down`. All but the first evaluate with
+/// `evaluate_condition` rather than `source_condition_gate_passes` — the
+/// authority is over WHICH conditions gate the effect, not over how a given
+/// caller evaluates them.
+///
+/// Two classes sit deliberately outside that claim.
+///
+/// Walkers that CLASSIFY a duration without evaluating it are not consumers:
+/// `analysis::resource` (two hand-destructuring sibling-mutability scans),
+/// plus the `ability_rw` / `ability_scan` / `coverage` walkers. They ask what a
+/// duration reads, never whether it holds, and they stay variant-safe through
+/// `ability_scan`'s exhaustive matches rather than through this authority.
+///
+/// Gate-blind consumers are a tracked pre-existing gap, not an exemption:
+/// `casting::apply_static_activated_ability_cost_reduction` and
+/// `effects::attach::protection_blocks_attachment` apply a transient effect
+/// without consulting either gate, so a lapsed condition still reduces a cost
+/// or blocks an attachment. Routing them through here changes behavior and
+/// needs its own CR analysis and tests, so it is out of scope here.
+///
+/// The grep that surfaces a new offender is `for tce in
+/// &state.transient_continuous_effects` — the iteration site, not
+/// `Duration::ForAsLongAs`. The latter only matches sites that already
+/// destructure the duration, so it cannot see the gate-blind pair above. A new
+/// iteration site that decides liveness by hand instead of calling this is the
+/// regression to look for.
+///
+/// One deliberate non-consumer inside this file: the lapsed-attachment sweep in
+/// [`evaluate_layers`] destructures the exact `ForAsLongAs {
+/// RecipientMatchesFilter { AttachedTo } }` shape (CR 301.5) to decide
+/// permanent EXPIRY, not liveness. It needs the structural match, not the
+/// condition list, so routing it through here would lose the thing it matches on.
+pub(crate) fn transient_gate_conditions(
+    tce: &TransientContinuousEffect,
+) -> impl Iterator<Item = &StaticCondition> {
+    transient_duration_condition(tce)
+        .into_iter()
+        .chain(tce.condition.as_ref())
+}
+
+fn transient_duration_holds(state: &GameState, tce: &TransientContinuousEffect) -> bool {
+    let Some(condition) = transient_duration_condition(tce) else {
         return true;
     };
 
@@ -4909,7 +7322,15 @@ fn transient_duration_holds(state: &GameState, tce: &TransientContinuousEffect) 
             // Infiltrator) when it diverges from `affected`; otherwise the
             // affected object (Shield Broker's recipient-relative control
             // duration, where the recipient IS the tracked object).
-            let recipient = tce.duration_subject.unwrap_or(*id);
+            let recipient = match tce.duration_subject {
+                // CR 400.7 + CR 611.2b: an explicit duration subject is an
+                // exact object binding, not a rediscoverable storage id. A
+                // zone change makes the old target a new object, so its
+                // duration cannot be sustained by a later incarnation.
+                Some(subject) if subject.is_current(state) => subject.object_id,
+                Some(_) => return false,
+                None => *id,
+            };
             evaluate_condition_with_recipient(
                 state,
                 condition,
@@ -4962,7 +7383,12 @@ fn apply_combat_assignment_rule_effects_filtered(
     let mut zone_cache = LayerZoneObjectCache::default();
 
     for effect in effects {
-        let scan_ids = effect_candidate_ids(state, &effect.affected_filter, &mut zone_cache);
+        let scan_ids = effect_candidate_ids(
+            state,
+            &effect.affected_filter,
+            effect.source_id,
+            &mut zone_cache,
+        );
         let condition_controller = combat_effect_condition_controller(state, &effect);
         let ctx =
             FilterContext::from_source_with_controller(effect.source_id, condition_controller);
@@ -5134,11 +7560,37 @@ fn collect_transient_combat_assignment_rule_effects(
     effects: &mut Vec<ActiveCombatAssignmentRuleEffect>,
 ) {
     for tce in &state.transient_continuous_effects {
-        if tce.duration == Duration::UntilHostLeavesPlay
+        // CR 611.2a: same presence question, same answer — see
+        // `transient_effect_is_live`.
+        if tce.duration.ends_when_host_leaves_play()
             && !state
                 .objects
                 .get(&tce.source_id)
                 .is_some_and(|obj| obj.zone == crate::types::zones::Zone::Battlefield)
+        {
+            continue;
+        }
+        // CR 611.2b + CR 702.26f: same phasing leg for the presence-bound
+        // state reading as `transient_effect_is_live` — this collector answers
+        // the identical liveness question for combat assignment rules and must
+        // not answer it differently for a phased-out host.
+        if tce.duration == Duration::WhileHostOnBattlefield
+            && !state
+                .objects
+                .get(&tce.source_id)
+                .is_some_and(|obj| obj.is_phased_in())
+        {
+            continue;
+        }
+        // CR 611.2b: same control leg as `transient_effect_is_live`, same
+        // authority — this collector answers the identical liveness question
+        // for combat assignment rules and must not answer it differently.
+        if tce.duration == Duration::WhileControllingHost
+            && !crate::game::replacement::controller_controls_source_gate(
+                state,
+                tce.source_id,
+                tce.controller,
+            )
         {
             continue;
         }
@@ -5489,8 +7941,8 @@ fn static_mode_needs_source_controller_anchor(mode: &crate::types::statics::Stat
 
 /// CR 508.1d + CR 611.2c: True when a granted static mode belongs to the
 /// directing-source attribution class — modes whose consumers need to name
-/// the object that grafted the requirement (currently `MustAttackPlayer`,
-/// consumed by `combat::must_attack_player_directives_for_creature`). This
+/// the object that grafted the requirement (currently `MustAttackDefender`,
+/// consumed by `combat::must_attack_defender_directives_for_creature`). This
 /// gates the `source_object` stamp so ONLY these modes split into distinct
 /// defs per directing source; every other `AddStaticMode` mode keeps
 /// `source_object == None` and dedups unchanged (crew/keyword/evasion/…
@@ -5499,7 +7951,7 @@ fn static_mode_needs_source_controller_anchor(mode: &crate::types::statics::Stat
 /// match arm when a new consumer needs another mode's directing source.
 fn static_mode_carries_directing_source(mode: &crate::types::statics::StaticMode) -> bool {
     use crate::types::statics::StaticMode;
-    matches!(mode, StaticMode::MustAttackPlayer { .. })
+    matches!(mode, StaticMode::MustAttackDefender { .. })
 }
 
 /// CR 109.5: True when a `TargetFilter` constrains the controller of matched
@@ -5806,7 +8258,16 @@ fn unstarted_effect_generator_is_suppressed(
 /// * `Battlefield` — `seed_live_characteristics_from_base` resets the full characteristic set.
 /// * `Hand` — CR 702.94a hand-zone keyword grants; keywords-only reset.
 /// * `Stack` — CR 613.1 stack-object keyword grants (Taigam's rebound, Waystone's mobilize, and
-///   `StackSpell`-filtered statics); keywords-only reset.
+///   `StackSpell`-filtered statics); `{keywords, controller}` reset. CR 112.2: this pass also
+///   reseeds each stack object's controller from its `StackEntry` default.
+///
+/// SCOPE OF THIS PREDICATE — it does NOT govern the keyword half only. Its single call site
+/// is `collect_scan_zones`' `TargetFilter::SpecificObject` arm, which picks the scan zone for
+/// EVERY identity-filtered continuous effect regardless of modification kind. That includes
+/// the `ContinuousModification::ChangeController` that `exchange_control::resolve` installs on
+/// a stolen spell, so `Zone::Stack`'s membership here is load-bearing for the CR 613.1b
+/// controller derivation and not merely for keyword grants. Narrowing this predicate would
+/// silently stop a stolen spell's control change from reaching its object.
 ///
 /// Every OTHER zone (library, graveyard, exile) is owned by `off_zone_characteristics`, which
 /// computes keywords ON DEMAND from base + active effects and never materializes them.
@@ -5964,7 +8425,8 @@ fn apply_continuous_effect_filtered(
     let affected_ids: &[ObjectId] = if let Some(retained) = retained_affected_ids {
         retained
     } else {
-        let scan_ids = effect_candidate_ids(state, &effect.affected_filter, zone_cache);
+        let scan_ids =
+            effect_candidate_ids(state, &effect.affected_filter, effect.source_id, zone_cache);
         // CR 109.5 + CR 611.2c: a continuous effect created by a RESOLVED spell
         // or ability reads "you"/"your" as that spell or ability's controller,
         // not as whoever controls the source object at the moment of some later
@@ -6059,6 +8521,28 @@ fn apply_continuous_effect_filtered(
     // granting source's chosen color must be baked into the granted modifier
     // at apply-time, because the modifier lives on the granted creature
     // (which has no chosen-color attribute of its own).
+    //
+    // A resolution-generated `AddKeyword { Protection | HexproofFrom(ChosenColor) }`
+    // effect (CR 608.2h) now arrives here PRE-BAKED to a concrete
+    // `Color(c)` by `effects/effect.rs::snapshot_transient_modifications` — that
+    // latch fires once, at resolution, and is why a later choice by the same
+    // source can no longer retroactively change a grant already in flight. This
+    // pre-read therefore still exists for, and this loop still runs live for,
+    // all four remaining consumers of the unresolved `ChosenColor` form:
+    // (a) a printed STATIC ability's `AddKeyword { .. ChosenColor }` grant
+    //     (CR 611.3a: a continuous effect generated by a static ability is
+    //     never "locked in" — it is gathered by `gather_active_continuous_effects`
+    //     and reaches this function directly from `static_definitions`, so it
+    //     is baked live, every evaluation, right here);
+    // (b) a resolution-generated `AddKeyword { .. ChosenColor }` grant whose
+    //     source announced no colour at all (the `None` fallback arm of
+    //     `snapshot_transient_modifications`, CR 609.3 + follow-up F1) — the
+    //     modification is left unresolved and still needs this live read;
+    // (c) `ContinuousModification::AddChosenColor` (CR 105.3) — Mondo Gecko,
+    //     Foraging Wickermaw;
+    // (d) `ContinuousModification::AddStaticMode` carrying an `IsChosenColor`
+    //     filter prop — Skrelv, Defector Mite; Sungold Sentinel.
+    // Cross-reference the sibling `chosen_keyword` pre-read immediately below.
     let chosen_color = if matches!(
         effect.modification,
         ContinuousModification::AddChosenColor { .. }
@@ -6098,10 +8582,13 @@ fn apply_continuous_effect_filtered(
     // Caveat (mirrors `chosen_color` semantics): if the same source has
     // multiple concurrent `RemoveChosenKeyword` effects (e.g., Urborg
     // activated twice in the same turn), each currently reads the FIRST
-    // `ChosenAttribute::Keyword` on the source. Same limitation applies to
-    // `chosen_color` / `chosen_card_type` upstream; documented here for
-    // symmetry. Acceptable for v1 — fix paired with the broader
-    // chosen-attribute scoping refactor.
+    // `ChosenAttribute::Keyword` on the source, which is genuinely a
+    // limitation. It is NOT the same for `chosen_color`: since the accessor
+    // split that read is deliberately oldest-since-entry (CR 607.2d, the linked
+    // ability's own choice), with `current_chosen_color()` for CR 608.2d's
+    // "current answer". `chosen_card_type` remains in the Keyword case.
+    // Acceptable for v1 — fix paired with the broader chosen-attribute scoping
+    // refactor.
     let chosen_keyword = if matches!(
         effect.modification,
         ContinuousModification::RemoveChosenKeyword
@@ -6195,13 +8682,50 @@ fn apply_continuous_effect_filtered(
         .unwrap_or(PlayerId(0));
     let dynamic_uses_recipient =
         dynamic_pt_expr.is_some_and(crate::game::quantity::quantity_expr_uses_recipient);
+    // The shared value is read ONLY by the per-recipient loop below (`for &id in
+    // affected_ids`, its single reader), so an effect whose affected set is
+    // empty on this pass has nothing to spend it on. No CR annotation: the
+    // magnitude spans layer 6 (`AddDynamicKeyword`), 7b (`SetDynamic*`) and 7c
+    // (`AddDynamic*`) alike, and this guard says nothing about any of them — it
+    // is a dead-computation elision, not a rules decision.
+    //
+    // Resolving it anyway is not free: an `ObjectCount` magnitude is a whole-battlefield census
+    // (`quantity::object_count_matching_ids`), so the previous unconditional
+    // resolve made every pass cost O(dynamic-count effects x |battlefield|) even
+    // when none of those effects touched an object being derived.
+    //
+    // That is the incremental arm's normal shape, not a corner case:
+    // `apply_layers_incremental` passes `restrict_to = recipient_ids`, which
+    // filters a `TargetFilter::SelfRef` static on a PRE-EXISTING permanent down
+    // to the empty set — the entrant is not its source — while the census it
+    // demanded still swept the whole board, once per such permanent per entry.
+    //
+    // WHICH CARDS: only those whose magnitude is recipient-INDEPENDENT, since a
+    // recipient-DEPENDENT one is resolved inside the loop below and never
+    // reaches this binding at all. That excludes Rat Colony ("each OTHER Rat"
+    // carries `FilterProp::Another`, which `quantity::filter_uses_recipient`
+    // reports as recipient-relative) and includes the 161 corpus cards shaped
+    // like Beanstalk Giant / Ashaya / Adeline ("equal to the number of lands you
+    // control"). The test pair below is built on the latter for exactly that
+    // reason — a Rat Colony fixture would assert zero against a counter that can
+    // never move.
+    //
+    // Skipping it is a pure evaluation-order change, not a semantic one: the
+    // affected set is already fixed above (and CR 613.6-retained through
+    // `started_effect_sets`), it is not a function of this value, and no other
+    // reader of `dynamic_pt_shared` exists. `resolve_quantity` is a read-only
+    // query over `&GameState`, so eliding it writes nothing either.
     let dynamic_pt_shared = match (dynamic_pt_expr, dynamic_uses_recipient) {
-        (Some(value), false) => Some(crate::game::quantity::resolve_quantity(
-            state,
-            value,
-            effect_controller,
-            effect.source_id,
-        )),
+        (Some(value), false) if !affected_ids.is_empty() => {
+            #[cfg(test)]
+            record_shared_dynamic_quantity_resolution();
+            Some(crate::game::quantity::resolve_quantity(
+                state,
+                value,
+                effect_controller,
+                effect.source_id,
+            ))
+        }
         _ => None,
     };
 
@@ -6328,6 +8852,9 @@ fn apply_continuous_effect_filtered(
             // follows `CopyValues` in `add_transient_continuous_effect`).
             ContinuousModification::SetName { name } => {
                 obj.name = name.clone();
+                // CR 707.9b: the exception is the copy's FINAL copiable name —
+                // `derive_room_battlefield_names` must leave it alone.
+                obj.layer1_name_origin = Some(crate::types::ability::CopiedNameOrigin::Exception);
             }
             // CR 612.8 + CR 613.1c: Literal name changes from continuous
             // effects apply in Layer 3 and are not copiable values.
@@ -6355,9 +8882,14 @@ fn apply_continuous_effect_filtered(
             }
             ContinuousModification::SetPower { value } => {
                 obj.power = Some(*value);
+                // CR 613.4b: a fixed set effect changes current base power,
+                // not only the post-layer live power field.
+                obj.layer_base_power = Some(*value);
             }
             ContinuousModification::SetToughness { value } => {
                 obj.toughness = Some(*value);
+                // CR 613.4b: a fixed set effect changes current base toughness.
+                obj.layer_base_toughness = Some(*value);
             }
             // CR 702.16g: "Protection from [A] and from [B]" behaves as two
             // separate protection abilities. Parameterized keywords like
@@ -6549,7 +9081,13 @@ fn apply_continuous_effect_filtered(
             ContinuousModification::RemoveAllAbilities => {
                 Arc::make_mut(&mut obj.abilities).clear();
                 obj.trigger_definitions.clear();
-                obj.replacement_definitions.clear();
+                // CR 613.1f + CR 611.2c: Layer 6 removes the object's ABILITIES.
+                // A replacement created by the resolution of a spell or ability is
+                // not one of the object's abilities — and per CR 611.2c not one of
+                // its characteristics at all — so Humility does not end a
+                // prevention/regeneration shield already resolved onto this object.
+                obj.replacement_definitions
+                    .retain(|d| d.is_resolution_installed());
                 obj.static_definitions.clear();
                 obj.keywords.clear();
                 abilities_suppressed.insert(id);
@@ -6590,27 +9128,7 @@ fn apply_continuous_effect_filtered(
             // against the runtime-populated `state.all_creature_types` — the
             // same source `AddAllCreatureTypes` uses below.
             ContinuousModification::RemoveAllSubtypes { set } => {
-                match set {
-                    SubtypeSet::Creature => {
-                        obj.card_types
-                            .subtypes
-                            .retain(|s| !all_creature_types.iter().any(|c| c == s));
-                    }
-                    SubtypeSet::Land => {
-                        // CR 205.3i: land-type membership via the basic/non-basic
-                        // land-subtype classification.
-                        obj.card_types.subtypes.retain(|s| !is_land_subtype(s));
-                    }
-                    SubtypeSet::Artifact
-                    | SubtypeSet::Enchantment
-                    | SubtypeSet::Planeswalker
-                    | SubtypeSet::Spell
-                    | SubtypeSet::Battle => {
-                        obj.card_types
-                            .subtypes
-                            .retain(|s| noncreature_subtype_set(s) != Some(*set));
-                    }
-                }
+                remove_subtype_set(&mut obj.card_types.subtypes, *set, &all_creature_types);
             }
             // CR 205.4 + CR 707.9d: "in addition to its other types" — append
             // the supertype if absent. Idempotent.
@@ -6711,23 +9229,35 @@ fn apply_continuous_effect_filtered(
             ContinuousModification::SetDynamicPower { .. } => {
                 if let Some(val) = dynamic_pt {
                     obj.power = Some(val);
+                    // CR 613.4a: a characteristic-defining power sets the
+                    // current base power before layer-7b set effects run.
+                    obj.layer_base_power = Some(val);
                 }
             }
             ContinuousModification::SetDynamicToughness { .. } => {
                 if let Some(val) = dynamic_pt {
                     obj.toughness = Some(val);
+                    // CR 613.4a: a dynamic characteristic-defining toughness sets
+                    // the current base toughness before layer-7b effects.
+                    obj.layer_base_toughness = Some(val);
                 }
             }
             // CR 613.4b: Layer 7b — set base power to dynamic value (e.g., Biomass Mutation).
             ContinuousModification::SetPowerDynamic { .. } => {
                 if let Some(val) = dynamic_pt {
                     obj.power = Some(val);
+                    // CR 613.4b: dynamic layer-7b setters share the same
+                    // authoritative current-base carrier as fixed setters.
+                    obj.layer_base_power = Some(val);
                 }
             }
             // CR 613.4b: Layer 7b — set base toughness to dynamic value.
             ContinuousModification::SetToughnessDynamic { .. } => {
                 if let Some(val) = dynamic_pt {
                     obj.toughness = Some(val);
+                    // CR 613.4b: dynamic layer-7b setters update the authoritative
+                    // current-base carrier just like fixed setters.
+                    obj.layer_base_toughness = Some(val);
                 }
             }
             // CR 613.4c: Additive dynamic P/T modification (layer 7c).
@@ -6897,7 +9427,7 @@ fn apply_continuous_effect_filtered(
                 // CR 611.2c: stamp the directing object so combat / future
                 // attribution consumers can name the object that grafted this
                 // static (the ForceAttack / Encore / mass-coerce source for a
-                // MustAttackPlayer requirement). Gated on the attribution-class
+                // MustAttackDefender requirement). Gated on the attribution-class
                 // predicate so only those modes split per source; every other
                 // mode stays None and dedups unchanged (see the census in the
                 // plan / the crew-delta scoped-stamp guard test). Mirrors the
@@ -7045,7 +9575,13 @@ fn set_land_subtype_replacing(obj: &mut crate::game::game_object::GameObject, su
     obj.card_types.subtypes.push(subtype);
     Arc::make_mut(&mut obj.abilities).clear();
     obj.trigger_definitions.clear();
-    obj.replacement_definitions.clear();
+    // CR 305.7: "It loses all abilities generated from its rules text... Note that
+    // this doesn't remove any abilities that were granted to the land by other
+    // effects." A resolution-created replacement is neither: CR 611.2c says it is
+    // not a characteristic of the object at all, so a Blood Moon-class subtype set
+    // must not end a shield already resolved onto this land.
+    obj.replacement_definitions
+        .retain(|d| d.is_resolution_installed());
     obj.static_definitions.clear();
     obj.keywords.clear();
 }
@@ -7177,6 +9713,7 @@ pub(crate) fn compute_current_copiable_values(
                     let triggers = Arc::make_mut(&mut values.trigger_definitions);
                     if !triggers.iter().any(|t| t == trigger.as_ref()) {
                         triggers.push(*trigger.clone());
+                        Arc::make_mut(&mut values.trigger_printed_origins).push(None);
                     }
                 }
             }
@@ -7186,6 +9723,9 @@ pub(crate) fn compute_current_copiable_values(
             // source's name.
             ContinuousModification::SetName { name } => {
                 values.name = name.clone();
+                // CR 707.9b + CR 707.3: mark the fold so a later copy (and its
+                // Room name derivation) treats X as the final name.
+                values.name_origin = crate::types::ability::CopiedNameOrigin::Exception;
             }
             // CR 707.9b + CR 306.5b: Starting loyalty is a copy-effect
             // characteristic exception. A later copy of this copy must see
@@ -7214,6 +9754,14 @@ pub(crate) fn compute_current_copiable_values(
                     let triggers = Arc::make_mut(&mut values.trigger_definitions);
                     if !triggers.iter().any(|t| t == &trigger) {
                         triggers.push(trigger);
+                        Arc::make_mut(&mut values.trigger_printed_origins).push(
+                            crate::game::printed_cards::base_trigger_printed_origins(
+                                &state.objects[&effect.source_id],
+                            )
+                            .get(*source_trigger_index)
+                            .cloned()
+                            .flatten(),
+                        );
                     }
                 }
             }
@@ -7248,9 +9796,15 @@ pub(crate) fn compute_current_copiable_values(
                         }
                     }
                     let triggers = Arc::make_mut(&mut values.trigger_definitions);
-                    for trigger in src.base_trigger_definitions.iter() {
+                    let origins = Arc::make_mut(&mut values.trigger_printed_origins);
+                    let source_origins =
+                        crate::game::printed_cards::base_trigger_printed_origins(src);
+                    for (printed_occurrence, trigger) in
+                        src.base_trigger_definitions.iter().enumerate()
+                    {
                         if !triggers.contains(trigger) {
                             triggers.push(trigger.clone());
+                            origins.push(source_origins[printed_occurrence].clone());
                         }
                     }
                     let statics = Arc::make_mut(&mut values.static_definitions);
@@ -7277,6 +9831,69 @@ pub(crate) fn compute_current_copiable_values(
 
 #[cfg(test)]
 mod tests {
+
+    /// CR 514.2 + CR 109.4: `prune_until_next_turn_effects` arms an
+    /// `UntilEndOfNextTurnOf { SpecificPlayer }` effect on the SNAPSHOTTED
+    /// player's turn — not its controller's.
+    ///
+    /// This drives the arming function directly, which the Gideon integration
+    /// tests do not: they set `active_player` by hand and assert the INSTALLED
+    /// duration, so they would still pass if the prune never recognized the new
+    /// scope and the requirement silently never expired.
+    ///
+    /// The controller (P0) and the snapshotted player (P1) are deliberately
+    /// different — that difference is the whole reason the variant exists, and a
+    /// prune that keyed on `e.controller` would arm on the wrong turn and pass a
+    /// same-player fixture.
+    #[test]
+    fn until_end_of_next_turn_of_specific_player_arms_on_that_players_turn() {
+        fn armed_after_pruning(active: PlayerId) -> Duration {
+            let mut state = GameState::new_two_player(42);
+            let source = create_object(
+                &mut state,
+                CardId(1),
+                P0,
+                "Gideon Jura".to_string(),
+                Zone::Battlefield,
+            );
+            // Controller P0; the window belongs to P1.
+            state.add_transient_continuous_effect(
+                source,
+                P0,
+                Duration::UntilEndOfNextTurnOf {
+                    player: PlayerScope::SpecificPlayer { id: P1 },
+                },
+                TargetFilter::Typed(
+                    TypedFilter::default().controller(ControllerRef::SpecificPlayer { id: P1 }),
+                ),
+                vec![ContinuousModification::AddStaticMode {
+                    mode: crate::types::statics::StaticMode::MustAttackDefender {
+                        defender: crate::types::statics::RequiredDefender::Fixed { player: P0 },
+                    },
+                }],
+                None,
+            );
+            prune_until_next_turn_effects(&mut state, active);
+            state.transient_continuous_effects[0].duration.clone()
+        }
+
+        // The CONTROLLER's turn must not arm it — the window is not theirs.
+        assert_eq!(
+            armed_after_pruning(P0),
+            Duration::UntilEndOfNextTurnOf {
+                player: PlayerScope::SpecificPlayer { id: P1 }
+            },
+            "the controller's untap step leaves a SpecificPlayer window un-armed"
+        );
+
+        // The SNAPSHOTTED player's turn arms it, so the existing cleanup-step
+        // prune ends it at that turn's cleanup (CR 514.2).
+        assert_eq!(
+            armed_after_pruning(P1),
+            Duration::UntilEndOfTurn,
+            "the snapshotted player's untap step arms the window"
+        );
+    }
     use super::*;
     use crate::game::elimination::eliminate_player;
     use crate::game::scenario::{GameScenario, P0, P1};
@@ -7369,6 +9986,1074 @@ mod tests {
         obj.base_toughness = Some(toughness);
         obj.timestamp = ts;
         id
+    }
+
+    // ---- CR 611.3a + CR 613.1: per-effect scan cost on a populated board ----
+
+    /// A permanent carrying the Rat Colony static: "This creature gets +1/+0 for
+    /// each other Rat you control" — `TargetFilter::SelfRef` affected set, an
+    /// `ObjectCount` magnitude. The two axes this module's per-effect cost rides
+    /// on, with the affected filter and the census filter transcribed from the
+    /// card's own parse (base P/T is left at the helper's 1/1 rather than the
+    /// printed 2/1; nothing here reads it but the arithmetic in the
+    /// assertions).
+    fn make_rat_colony(state: &mut GameState, name: &str, player: PlayerId) -> ObjectId {
+        let id = make_plain_rat(state, name, player);
+        let def = StaticDefinition::continuous()
+            .affected(TargetFilter::SelfRef)
+            .modifications(vec![ContinuousModification::AddDynamicPower {
+                value: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        // Corpus-exact: the parsed card's census filter is
+                        // `type_filters: [Subtype("Rat")], controller: You,
+                        // properties: [Another]` — no explicit Creature leg.
+                        filter: TargetFilter::Typed(
+                            TypedFilter::default()
+                                .subtype("Rat".to_string())
+                                .controller(ControllerRef::You)
+                                .properties(vec![FilterProp::Another]),
+                        ),
+                    },
+                },
+            }]);
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.static_definitions.push(def.clone());
+        obj.base_static_definitions = Arc::new(vec![def]);
+        id
+    }
+
+    /// A vanilla 1/1 Rat — joins the counted population, sources nothing.
+    fn make_plain_rat(state: &mut GameState, name: &str, player: PlayerId) -> ObjectId {
+        let id = make_creature(state, name, 1, 1, player);
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.subtypes.push("Rat".to_string());
+        obj.base_card_types = obj.card_types.clone();
+        id
+    }
+
+    /// CR 611.2c + CR 613.1: an IDENTITY affected filter (`SelfRef` here; every
+    /// resolved clone's `SpecificObject` is the same shape) denotes exactly one
+    /// object, so the candidate universe `effect_candidate_ids` builds for it
+    /// must be that one object — not a copy of the whole battlefield that the
+    /// caller's very next `matches_target_filter` throws all but one member of
+    /// away.
+    ///
+    /// The old scan was O(|battlefield|) with two allocations PER EFFECT PER
+    /// PASS, so a board of k self-referential statics cost k x |battlefield| just
+    /// to discover k recipients.
+    ///
+    /// REVERT-PROBE (discriminating, RUN): drop the `filter_names_single_object`
+    /// arm from `effect_candidate_ids` ⇒ `effect_candidates_scanned() == 44`
+    /// (4 sources x the 11-object battlefield) and the equality below fails.
+    #[test]
+    fn identity_affected_filter_scans_one_candidate_not_the_whole_battlefield() {
+        let mut state = setup();
+        let player = P0;
+        let mut sources = Vec::new();
+        for i in 0..4 {
+            let id = make_creature(&mut state, &format!("Selfish{i}"), 2, 2, player);
+            let def = StaticDefinition::continuous()
+                .affected(TargetFilter::SelfRef)
+                .modifications(vec![ContinuousModification::AddPower { value: 1 }]);
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.static_definitions.push(def.clone());
+            obj.base_static_definitions = Arc::new(vec![def]);
+            sources.push(id);
+        }
+        for i in 0..7 {
+            make_creature(&mut state, &format!("Bystander{i}"), 2, 2, player);
+        }
+        // LOAD-BEARING FIXTURE: the battlefield really is much larger than the
+        // affected set, so "one candidate per effect" is a real reduction and not
+        // an artifact of a one-object board.
+        assert_eq!(
+            state.battlefield.len(),
+            11,
+            "4 self-referential sources + 7 bystanders must be on the battlefield"
+        );
+
+        reset_effect_candidates_scanned();
+        evaluate_layers(&mut state);
+
+        assert_eq!(
+            effect_candidates_scanned(),
+            4,
+            "each of the 4 identity-filtered effects must scan exactly its own one \
+             named object"
+        );
+        // POSITIVE control: the shortcut did not simply drop the effects. Each
+        // source is derived 2 + 1 = 3 power; no bystander gained anything.
+        for &id in &sources {
+            assert_eq!(
+                state.objects[&id].power,
+                Some(3),
+                "the SelfRef anthem must still apply to its own source"
+            );
+        }
+        assert!(
+            state
+                .battlefield
+                .iter()
+                .filter(|id| !sources.contains(id))
+                .all(|id| state.objects[id].power == Some(2)),
+            "and must still reach nobody else"
+        );
+    }
+
+    /// CR 702.26e: the shortcut must keep the ZONE test the whole-zone scan did.
+    /// `targeting::zone_object_ids(Battlefield)` yields the phased-IN subset, so a
+    /// `SpecificObject` grant bound to a phased-out permanent finds it outside the
+    /// scanned population and applies to nothing. The shortcut reads membership
+    /// from that very list, so the two cannot disagree.
+    ///
+    /// REVERT-PROBE (discriminating, RUN): replace the
+    /// `zone_cache.zone_contains(..)` test in `effect_candidate_ids` with an
+    /// unconditional `true` ⇒ the candidate assertion below fails, 1 against 0.
+    /// The POWER assertion still holds under that revert, and deliberately so:
+    /// `filter.rs::filter_inner` rejects a phased-out object independently, so
+    /// phasing is defended twice and only the counter can see the difference.
+    /// The zone gate is not merely a saving, though — see
+    /// `identity_shortcut_declines_for_a_predicate_and_spans_non_battlefield_zones`,
+    /// where the same revert makes a graveyard-bound grant LAND.
+    #[test]
+    fn identity_affected_filter_still_respects_the_scanned_zone_population() {
+        let mut state = setup();
+        let player = P0;
+        let target = make_creature(&mut state, "Target", 2, 2, player);
+        let source = make_creature(&mut state, "Granter", 2, 2, player);
+        let def = StaticDefinition::continuous()
+            .affected(TargetFilter::SpecificObject { id: target })
+            .modifications(vec![ContinuousModification::AddPower { value: 1 }]);
+        {
+            let obj = state.objects.get_mut(&source).unwrap();
+            obj.static_definitions.push(def.clone());
+            obj.base_static_definitions = Arc::new(vec![def]);
+        }
+        // The GRANTER stays phased in throughout, so the effect is always
+        // collected (`for_each_static_effect_source` skips phased-out sources);
+        // only the TARGET's population membership is under test.
+        state.objects.get_mut(&target).unwrap().phase_status =
+            crate::game::game_object::PhaseStatus::PhasedOut {
+                cause: crate::game::game_object::PhaseOutCause::Directly,
+            };
+        assert!(
+            !state.objects[&target].is_phased_in() && state.objects[&source].is_phased_in(),
+            "the fixture must really have a phased-out target and a live granter"
+        );
+        reset_effect_candidates_scanned();
+        evaluate_layers(&mut state);
+        assert_eq!(
+            effect_candidates_scanned(),
+            0,
+            "CR 702.26e: a phased-out permanent is outside the scanned battlefield \
+             population, so the identity shortcut must yield NO candidate for it"
+        );
+        assert_eq!(
+            state.objects[&target].power,
+            Some(2),
+            "and the grant must not reach it"
+        );
+
+        // POSITIVE control: phase it back in and the very same grant lands — so the
+        // zero above is a real zone gate, not a grant that never worked, and the
+        // counter is not simply dead.
+        state.objects.get_mut(&target).unwrap().phase_status =
+            crate::game::game_object::PhaseStatus::PhasedIn;
+        reset_effect_candidates_scanned();
+        evaluate_layers(&mut state);
+        assert_eq!(
+            effect_candidates_scanned(),
+            1,
+            "phased in, the same filter names exactly one candidate"
+        );
+        assert_eq!(
+            state.objects[&target].power,
+            Some(3),
+            "phased in, the identity-filtered grant applies"
+        );
+    }
+
+    /// HOSTILE FIXTURE for the identity shortcut: one pass, one board, four
+    /// affected filters chosen so the shortcut must APPLY to two of them,
+    /// DECLINE for one that is a single combinator away from an identity, and
+    /// yield NOTHING for one whose object sits in a zone this pass does not own.
+    /// The whole-zone scan answers the same on all four; only the candidate
+    /// COUNT separates them, which is what the counter reads.
+    ///
+    ///
+    /// `SelfRef` — 1 candidate. The shortcut applies, on the battlefield.
+    ///
+    /// `And[Typed(creature You), Not(SelfRef)]` — 8 candidates, the whole
+    /// battlefield. The shortcut DECLINES: "other creatures you control" is a
+    /// predicate, not an identity, even though `SelfRef` appears inside it.
+    ///
+    /// `SpecificObject` naming a card in HAND — 1 candidate, found in
+    /// `Zone::Hand`. The membership index is per zone, not battlefield-only.
+    ///
+    /// `SpecificObject` naming a card in a GRAVEYARD — 0 candidates.
+    /// `layer_pass_materializes_keywords` owns no graveyard, so the zone list
+    /// falls back to the battlefield default and the named card is not in it.
+    ///
+    /// REVERT-PROBES (discriminating, both RUN):
+    ///  * drop the `filter_names_single_object` arm from `effect_candidate_ids`
+    ///    ⇒ `effect_candidates_scanned() == 25` (8 + 8 for the two battlefield
+    ///    scans, 1 for the one-card hand, 8 again for the graveyard-bound grant
+    ///    falling back to the battlefield default) against the 10 asserted here.
+    ///  * replace the `zone_cache.zone_contains(..)` test with an unconditional
+    ///    `true` ⇒ the count goes to 11 AND the graveyard assertion at the foot
+    ///    of this test fails: the grant lands on a card in a zone this pass does
+    ///    not own. That gate is correctness, not just cost.
+    #[test]
+    fn identity_shortcut_declines_for_a_predicate_and_spans_non_battlefield_zones() {
+        let mut state = setup();
+        let player = P0;
+
+        let selfish = make_creature(&mut state, "Selfish", 2, 2, player);
+        let anthem_source = make_creature(&mut state, "Anthem", 2, 2, player);
+        let hand_granter = make_creature(&mut state, "Hand Granter", 2, 2, player);
+        let graveyard_granter = make_creature(&mut state, "Graveyard Granter", 2, 2, player);
+        for i in 0..4 {
+            make_creature(&mut state, &format!("Bystander{i}"), 2, 2, player);
+        }
+
+        let hand_card = create_object(
+            &mut state,
+            CardId(0),
+            player,
+            "Hand Card".to_string(),
+            Zone::Hand,
+        );
+        let graveyard_card = create_object(
+            &mut state,
+            CardId(0),
+            player,
+            "Graveyard Card".to_string(),
+            Zone::Graveyard,
+        );
+
+        let install = |state: &mut GameState, source: ObjectId, def: StaticDefinition| {
+            let obj = state.objects.get_mut(&source).unwrap();
+            obj.static_definitions.push(def.clone());
+            obj.base_static_definitions = Arc::new(vec![def]);
+        };
+        install(
+            &mut state,
+            selfish,
+            StaticDefinition::continuous()
+                .affected(TargetFilter::SelfRef)
+                .modifications(vec![ContinuousModification::AddPower { value: 1 }]),
+        );
+        install(
+            &mut state,
+            anthem_source,
+            StaticDefinition::continuous()
+                .affected(TargetFilter::And {
+                    filters: vec![
+                        TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
+                        TargetFilter::Not {
+                            filter: Box::new(TargetFilter::SelfRef),
+                        },
+                    ],
+                })
+                .modifications(vec![ContinuousModification::AddToughness { value: 1 }]),
+        );
+        install(
+            &mut state,
+            hand_granter,
+            StaticDefinition::continuous()
+                .affected(TargetFilter::SpecificObject { id: hand_card })
+                .modifications(vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Flying,
+                }]),
+        );
+        install(
+            &mut state,
+            graveyard_granter,
+            StaticDefinition::continuous()
+                .affected(TargetFilter::SpecificObject { id: graveyard_card })
+                .modifications(vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Flying,
+                }]),
+        );
+
+        // LOAD-BEARING FIXTURE: the battlefield is 8 objects, so the predicate's
+        // whole-zone scan is eight times the identity's and the counts below
+        // cannot coincide by accident; and the two off-battlefield cards really
+        // are off the battlefield.
+        assert_eq!(state.battlefield.len(), 8, "4 sources + 4 bystanders");
+        assert_eq!(state.objects[&hand_card].zone, Zone::Hand);
+        assert_eq!(state.objects[&graveyard_card].zone, Zone::Graveyard);
+
+        reset_effect_candidates_scanned();
+        evaluate_layers(&mut state);
+
+        assert_eq!(
+            effect_candidates_scanned(),
+            10,
+            "1 (identity) + 8 (predicate, declined) + 1 (hand identity) + \
+             0 (unowned-zone identity)"
+        );
+
+        // BEHAVIOUR PRESERVED, on every one of the four.
+        assert_eq!(
+            state.objects[&selfish].power,
+            Some(3),
+            "the SelfRef pump still reaches its own source"
+        );
+        assert_eq!(
+            state.objects[&anthem_source].toughness,
+            Some(2),
+            "and the 'other creatures' anthem still exempts its own source"
+        );
+        assert!(
+            state
+                .battlefield
+                .iter()
+                .filter(|id| **id != anthem_source)
+                .all(|id| state.objects[id].toughness == Some(3)),
+            "while still reaching every OTHER creature — the declined scan is a \
+             real whole-board population, not an empty one"
+        );
+        assert!(
+            state.objects[&hand_card]
+                .keywords
+                .contains(&Keyword::Flying),
+            "the hand-bound identity grant lands in Zone::Hand"
+        );
+        assert!(
+            !state.objects[&graveyard_card]
+                .keywords
+                .contains(&Keyword::Flying),
+            "CR 613.1: the graveyard-bound grant is delivered by the off-zone \
+             authority, not by this pass — exactly as the whole-zone scan left it"
+        );
+    }
+
+    /// CR 611.3a: the verdict on issue #4745 ("Token Creation takes Forever"),
+    /// pinned as an invariant rather than a timing.
+    ///
+    /// The escalation gate is NOT indiscriminate: a dynamic `ObjectCount`
+    /// magnitude on the board does not by itself send every battlefield entry to
+    /// the full pass. `active_effects_force_incremental_escalation` asks
+    /// `quantity::entered_object_perturbs_quantity_expr`, so an entrant outside
+    /// the counted population keeps the incremental arm.
+    ///
+    /// What DOES escalate is a Rat entering a board of Rat Colonies — and that is
+    /// correct, not a defect to optimize away: CR 611.3a says a static ability's
+    /// continuous effect "applies at any given moment to whatever its text
+    /// indicates", so every Colony's power really does change when the seventh Rat
+    /// arrives, and every Colony must be re-derived. Any "fast path" that skipped
+    /// that would compute a wrong board. The cost of #4745 is a correct full pass
+    /// per Rat token, not a missed incremental one.
+    #[test]
+    fn a_dynamic_object_count_escalates_only_for_an_entrant_that_perturbs_it() {
+        let mut state = setup();
+        let player = P0;
+        let colonies: Vec<ObjectId> = (0..3)
+            .map(|i| make_rat_colony(&mut state, &format!("Rat Colony {i}"), player))
+            .collect();
+        for i in 0..4 {
+            make_plain_rat(&mut state, &format!("Rat {i}"), player);
+        }
+        evaluate_layers(&mut state);
+
+        // LOAD-BEARING FIXTURE: 7 Rats, so each Colony counts 6 OTHER Rats and is
+        // a live 7/1. A census that answered 0 would make both arms below look
+        // alike.
+        assert_eq!(state.battlefield.len(), 7, "3 Colonies + 4 plain Rats");
+        for &id in &colonies {
+            assert_eq!(state.objects[&id].power, Some(7), "1 base + 6 other Rats");
+        }
+
+        // A NON-Rat entrant joins no counted population: incremental, and every
+        // Colony keeps the value the last full pass gave it.
+        let bear = make_creature(&mut state, "Grizzly Bears", 2, 2, player);
+        state.layers_dirty = LayersDirty::EnteredObjects([bear].into());
+        crate::game::perf_counters::reset();
+        flush_layers(&mut state);
+        let counters = crate::game::perf_counters::snapshot();
+        assert_eq!(
+            (counters.layers_incremental, counters.layers_escalated),
+            (1, 0),
+            "a non-Rat entrant must NOT escalate a board of dynamic Rat counts"
+        );
+        for &id in &colonies {
+            assert_eq!(state.objects[&id].power, Some(7));
+        }
+
+        // A RAT entrant perturbs every Colony's count: escalation, and the derived
+        // power really does move — which is why the escalation is required.
+        let rat = make_plain_rat(&mut state, "Rat 4", player);
+        state.layers_dirty = LayersDirty::EnteredObjects([rat].into());
+        crate::game::perf_counters::reset();
+        flush_layers(&mut state);
+        let counters = crate::game::perf_counters::snapshot();
+        assert_eq!(
+            (counters.layers_incremental, counters.layers_escalated),
+            (0, 1),
+            "a Rat entrant MUST escalate: it changes every Colony's magnitude"
+        );
+        for &id in &colonies {
+            assert_eq!(
+                state.objects[&id].power,
+                Some(8),
+                "1 base + 7 other Rats — the escalation is load-bearing, not \
+                 conservatism"
+            );
+        }
+    }
+
+    /// A permanent carrying the Beanstalk Giant / Ashaya CDA: "This creature's
+    /// power and toughness are each equal to the number of lands you control" —
+    /// `TargetFilter::SelfRef` affected set, an `ObjectCount` magnitude over a
+    /// filter with NO recipient-relative property, transcribed from the card's
+    /// own parse.
+    ///
+    /// That last part is what makes this the fixture for the `dynamic_pt_shared`
+    /// guard and Rat Colony NOT: "each OTHER Rat" carries `FilterProp::Another`,
+    /// which `quantity::filter_uses_recipient` reports as recipient-dependent, so
+    /// a Colony's census is resolved per recipient INSIDE the affected loop and
+    /// never reaches `dynamic_pt_shared` at all. 161 corpus cards carry this
+    /// recipient-INDEPENDENT `SelfRef` + `ObjectCount` shape (Ashaya, Adeline,
+    /// Beanstalk Giant, ...), and they are the ones the guard is for.
+    fn make_land_count_cda_creature(
+        state: &mut GameState,
+        name: &str,
+        player: PlayerId,
+    ) -> ObjectId {
+        let id = make_creature(state, name, 0, 0, player);
+        let count = QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(TypedFilter::land().controller(ControllerRef::You)),
+            },
+        };
+        let def = StaticDefinition::continuous()
+            .cda()
+            .affected(TargetFilter::SelfRef)
+            .modifications(vec![
+                ContinuousModification::SetDynamicPower {
+                    value: count.clone(),
+                },
+                ContinuousModification::SetDynamicToughness { value: count },
+            ]);
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.static_definitions.push(def.clone());
+        obj.base_static_definitions = Arc::new(vec![def]);
+        id
+    }
+
+    /// The SHARED (recipient-independent) dynamic magnitude is read only by the
+    /// per-recipient loop, so an effect whose affected set came out EMPTY on this
+    /// pass must not pay for it. An `ObjectCount` magnitude is a whole-board
+    /// census, and the empty set is the incremental arm's normal shape:
+    /// `apply_layers_incremental` restricts every effect to the entrants, which
+    /// empties a PRE-EXISTING `SelfRef` static's set — the entrant is not its
+    /// source — while the census it demanded still swept the board, once per such
+    /// permanent per entry.
+    ///
+    /// REVERT-PROBE (discriminating, RUN): drop the `if !affected_ids.is_empty()`
+    /// guard from `dynamic_pt_shared` ⇒ `shared_dynamic_quantity_resolution_count()
+    /// == 6` after the incremental flush (3 Giants x 2 modifications) and the
+    /// zero-assertion below fails.
+    #[test]
+    fn incremental_flush_skips_the_census_of_a_dynamic_count_reaching_no_recipient() {
+        let mut state = setup();
+        let player = P0;
+        let giants: Vec<ObjectId> = (0..3)
+            .map(|i| {
+                make_land_count_cda_creature(&mut state, &format!("Beanstalk Giant {i}"), player)
+            })
+            .collect();
+        for i in 0..5 {
+            make_land(&mut state, &format!("Forest {i}"), player);
+        }
+        evaluate_layers(&mut state);
+
+        // LOAD-BEARING FIXTURE: 5 lands, so each Giant is a live 5/5. A board
+        // where the census answered 0 would make the assertions below satisfiable
+        // by an effect that never ran.
+        assert_eq!(state.battlefield.len(), 8, "3 Giants + 5 lands");
+        for &id in &giants {
+            assert_eq!(
+                (state.objects[&id].power, state.objects[&id].toughness),
+                (Some(5), Some(5)),
+                "the land census must really be live and non-zero"
+            );
+        }
+
+        // A NON-LAND entrant: it joins no counted population, so the magnitude is
+        // unperturbed and the flush stays on the incremental arm.
+        let entrant = make_creature(&mut state, "Grizzly Bears", 2, 2, player);
+        state.layers_dirty = LayersDirty::EnteredObjects([entrant].into());
+        crate::game::perf_counters::reset();
+        reset_shared_dynamic_quantity_resolution_count();
+        flush_layers(&mut state);
+        let counters = crate::game::perf_counters::snapshot();
+
+        // REACH GUARD: we really are on the fast path, so a zero census count is
+        // attributable to the guard rather than to a full pass never happening.
+        assert_eq!(
+            (counters.layers_incremental, counters.layers_full_eval),
+            (1, 0),
+            "a non-land entrant must not escalate a board of dynamic land counts"
+        );
+        assert_eq!(
+            shared_dynamic_quantity_resolution_count(),
+            0,
+            "no Giant's SelfRef effect reaches the entrant, so no whole-board \
+             census may run for one"
+        );
+        // BEHAVIOUR PRESERVED: the pre-existing Giants keep their derived P/T and
+        // the entrant is derived correctly.
+        for &id in &giants {
+            assert_eq!(
+                (state.objects[&id].power, state.objects[&id].toughness),
+                (Some(5), Some(5))
+            );
+        }
+        assert_eq!(state.objects[&entrant].power, Some(2));
+    }
+
+    /// The other side of that guard: a dynamic count whose effect DOES reach a
+    /// recipient must still be resolved, and resolved against the post-entry
+    /// board. Without this pair the guard above could be satisfied by never
+    /// resolving a census at all.
+    #[test]
+    fn incremental_flush_still_runs_the_census_of_a_dynamic_count_reaching_a_recipient() {
+        let mut state = setup();
+        let player = P0;
+        for i in 0..4 {
+            make_plain_rat(&mut state, &format!("Rat {i}"), player);
+        }
+        // A board-wide lord: "creatures you control get +1/+0 for each Rat you
+        // control". Its affected set is a predicate, so the incremental arm's
+        // restriction keeps the ENTRANT in it.
+        let lord = make_creature(&mut state, "Rat Lord", 2, 2, player);
+        let def = StaticDefinition::continuous()
+            .affected(TargetFilter::Typed(
+                TypedFilter::creature().controller(ControllerRef::You),
+            ))
+            .modifications(vec![ContinuousModification::AddDynamicPower {
+                value: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(
+                            TypedFilter::creature()
+                                .subtype("Rat".to_string())
+                                .controller(ControllerRef::You),
+                        ),
+                    },
+                },
+            }]);
+        {
+            let obj = state.objects.get_mut(&lord).unwrap();
+            obj.static_definitions.push(def.clone());
+            obj.base_static_definitions = Arc::new(vec![def]);
+        }
+        evaluate_layers(&mut state);
+        assert_eq!(
+            state.objects[&lord].power,
+            Some(6),
+            "2 base + 4 Rats — the fixture's census is live and non-zero"
+        );
+
+        // A NON-Rat entrant: the count does not change, so no escalation, but the
+        // lord's board-wide effect still reaches the entrant.
+        let entrant = make_creature(&mut state, "Grizzly Bears", 2, 2, player);
+        state.layers_dirty = LayersDirty::EnteredObjects([entrant].into());
+        crate::game::perf_counters::reset();
+        reset_shared_dynamic_quantity_resolution_count();
+        flush_layers(&mut state);
+        let counters = crate::game::perf_counters::snapshot();
+
+        assert_eq!(
+            (counters.layers_incremental, counters.layers_full_eval),
+            (1, 0),
+            "a non-Rat entrant must not escalate"
+        );
+        assert_eq!(
+            shared_dynamic_quantity_resolution_count(),
+            1,
+            "the lord's effect DOES reach the entrant, so its census must run"
+        );
+        assert_eq!(
+            state.objects[&entrant].power,
+            Some(6),
+            "2 base + 4 Rats: the entrant must be derived with the live count"
+        );
+    }
+
+    // ---- Issue #8485: CR 611.2c / CR 613.1 resolution-shield durability ----
+
+    /// Build a resolution-created prevention shield with runtime state already
+    /// mutated: consumed once and depleted to `Next(1)`.
+    fn spent_resolution_shield() -> crate::types::ability::ReplacementDefinition {
+        let mut def =
+            crate::types::ability::ReplacementDefinition::new(ReplacementEvent::DamageDone)
+                .prevention_shield(crate::types::ability::PreventionAmount::Next(1))
+                .expiry(crate::types::ability::RestrictionExpiry::EndOfTurn);
+        def.is_consumed = true;
+        def
+    }
+
+    fn printed_base_shield() -> crate::types::ability::ReplacementDefinition {
+        crate::types::ability::ReplacementDefinition::new(ReplacementEvent::DamageDone)
+            .prevention_shield(crate::types::ability::PreventionAmount::All)
+    }
+
+    /// CR 611.2c + CR 613.1 (issue #8485): a `Resolution`-origin definition survives
+    /// the layer reset WITH its runtime state.
+    ///
+    /// CR 613.1 determines the values of an object's CHARACTERISTICS. CR 611.2c
+    /// settles that a prevention effect is not one — "An effect that reads 'Prevent
+    /// all damage creatures would deal this turn' doesn't modify any object's
+    /// characteristics, so it's modifying the rules of the game." So the CR 613.1
+    /// reseed must CARRY it, and carry the same single copy the appliers mutate
+    /// (CR 615.3 "used up", CR 615.7 depletion), never a pristine re-seeded twin.
+    ///
+    /// Revert-failing: undo the `seed_live_characteristics_from_base` carry-over and
+    /// the carried def is gone entirely.
+    #[test]
+    fn resolution_origin_replacement_survives_the_layer_reset_with_its_runtime_state() {
+        let mut state = setup();
+        let host = make_creature(&mut state, "Shield Host", 2, 2, PlayerId(0));
+        {
+            let obj = state.objects.get_mut(&host).unwrap();
+            obj.base_replacement_definitions = Arc::new(vec![printed_base_shield()]);
+            obj.replacement_definitions = vec![printed_base_shield()].into();
+            obj.base_characteristics_initialized = true;
+            obj.install_resolution_replacement(spent_resolution_shield());
+        }
+        assert_eq!(state.objects[&host].replacement_definitions.len(), 2);
+
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+
+        let live = &state.objects[&host].replacement_definitions;
+        assert_eq!(
+            live.len(),
+            2,
+            "printed def reseeded, resolution def carried"
+        );
+        assert_eq!(
+            live[0],
+            printed_base_shield(),
+            "the printed def came from base"
+        );
+        let carried = &live[1];
+        assert!(carried.is_resolution_installed());
+        assert!(
+            carried.is_consumed,
+            "CR 615.3: the carried shield keeps its consumed state"
+        );
+        assert!(
+            matches!(
+                carried.shield_kind,
+                crate::types::ability::ShieldKind::Prevention {
+                    amount: crate::types::ability::PreventionAmount::Next(1)
+                }
+            ),
+            "CR 615.7: the carried shield keeps its depleted amount"
+        );
+    }
+
+    /// NEGATIVE SIBLING: the carry-over keys on the typed `origin` field, not on
+    /// "anything that happens to be in the live store". A `Characteristic`-origin
+    /// def pushed live-only is still reset away, exactly as before #8485.
+    #[test]
+    fn characteristic_origin_live_only_replacement_is_still_reset_away() {
+        let mut state = setup();
+        let host = make_creature(&mut state, "Host", 2, 2, PlayerId(0));
+        {
+            let obj = state.objects.get_mut(&host).unwrap();
+            obj.base_characteristics_initialized = true;
+            obj.replacement_definitions.push(printed_base_shield());
+        }
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+        assert!(
+            state.objects[&host].replacement_definitions.is_empty(),
+            "a live-only Characteristic def must still be reset away"
+        );
+    }
+
+    /// NEGATIVE SIBLING: a base-only def is reseeded exactly once — the carry-over
+    /// must not duplicate it.
+    #[test]
+    fn base_only_replacement_is_not_duplicated_by_the_carry_over() {
+        let mut state = setup();
+        let host = make_creature(&mut state, "Host", 2, 2, PlayerId(0));
+        {
+            let obj = state.objects.get_mut(&host).unwrap();
+            obj.base_replacement_definitions = Arc::new(vec![printed_base_shield()]);
+            obj.replacement_definitions = vec![printed_base_shield()].into();
+            obj.base_characteristics_initialized = true;
+        }
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+        assert_eq!(state.objects[&host].replacement_definitions.len(), 1);
+    }
+
+    /// CR 613.1a + CR 707.2 + CR 611.2c (issue #8485, MG2; settles U8): a Layer-1a
+    /// COPY effect must not destroy a carried resolution shield.
+    ///
+    /// CR 707.2 defines copiable values as "the values derived from the text printed
+    /// on the object" and closes "Other effects ..., status, counters, and stickers
+    /// are not copied." A shield created by a resolving spell or ability is not a
+    /// characteristic at all (CR 611.2c), so a Clone / Vesuvan / Mirrorweave /
+    /// Copy-Enchantment recipient keeps it.
+    ///
+    /// Driven through `evaluate_layers` with a real `ContinuousModification::
+    /// CopyValues`, NOT by calling `apply_copiable_values` directly — the point is
+    /// that the production path is closed. Revert-failing against B4.
+    #[test]
+    fn copy_effect_does_not_destroy_a_carried_resolution_shield() {
+        let mut state = setup();
+        let player = PlayerId(0);
+        let donor = make_creature(&mut state, "Donor", 7, 7, player);
+        let donor_values =
+            crate::game::printed_cards::intrinsic_copiable_values(&state.objects[&donor]);
+        let recipient = make_creature(&mut state, "Recipient", 1, 1, player);
+        {
+            let obj = state.objects.get_mut(&recipient).unwrap();
+            obj.base_characteristics_initialized = true;
+            obj.install_resolution_replacement(spent_resolution_shield());
+        }
+        state.add_transient_continuous_effect(
+            recipient,
+            player,
+            Duration::Permanent,
+            TargetFilter::SpecificObject { id: recipient },
+            vec![ContinuousModification::CopyValues {
+                values: Box::new(donor_values),
+                display_source: crate::game::game_object::DisplaySource::Card,
+                printed_ref: None,
+                token_image_ref: None,
+            }],
+            None,
+        );
+
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+
+        // Positive reach-guard: layer 1a really ran.
+        let obj = &state.objects[&recipient];
+        assert_eq!(obj.name, "Donor", "reach-guard: the copy effect applied");
+        assert_eq!(obj.power, Some(7));
+        assert_eq!(obj.toughness, Some(7));
+        // CR 611.2c: and the carried shield is still there, runtime state intact.
+        let carried = obj
+            .replacement_definitions
+            .iter_all()
+            .find(|d| d.is_resolution_installed())
+            .expect("CR 707.2: a copy effect may not remove a resolution shield");
+        assert!(carried.is_consumed);
+    }
+
+    /// CR 613.2b (issue #8485): the Layer-1b face-down reseed is the THIRD
+    /// `seed_live_characteristics_from_base` call site — it does not go through
+    /// `reset_recipient_to_base`. Exercise it rather than merely naming it.
+    #[test]
+    fn face_down_reseed_does_not_drop_a_carried_shield() {
+        let mut state = setup();
+        let player = PlayerId(0);
+        let fd = make_face_down(&mut state, player, FaceDownProfile::vanilla_2_2(), "Hidden");
+        state
+            .objects
+            .get_mut(&fd)
+            .unwrap()
+            .install_resolution_replacement(spent_resolution_shield());
+
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+
+        // Reach-guard: the face-down profile really was re-seeded this pass.
+        assert_eq!(state.objects[&fd].power, state.objects[&fd].base_power);
+        assert!(
+            state.objects[&fd]
+                .replacement_definitions
+                .iter_all()
+                .any(|d| d.is_resolution_installed()),
+            "the CR 613.2b Layer-1b reseed must carry the shield too"
+        );
+
+        // FACE-UP SIBLING: identical behavior, so the assertion is not an artifact
+        // of the face-down path.
+        let up = make_creature(&mut state, "Face Up", 2, 2, player);
+        state
+            .objects
+            .get_mut(&up)
+            .unwrap()
+            .install_resolution_replacement(spent_resolution_shield());
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+        assert!(state.objects[&up]
+            .replacement_definitions
+            .iter_all()
+            .any(|d| d.is_resolution_installed()));
+    }
+
+    /// CR 616.1 (issue #8485; settles U4): carried resolution defs sort BEHIND the
+    /// per-pass derived grants, reproducing the pre-#8485 `base ++ derived` prefix
+    /// exactly so `PendingReplacement.candidates` and `AppliedReplacementKey` — both
+    /// keyed on `(source, index)` and both parked across a CR 616.1
+    /// `ReplacementChoice` prompt that runs a layer flush — stay index-stable.
+    ///
+    /// Revert-failing against `settle_resolution_replacements_to_tail`: without it
+    /// the carried def sits at index `len(base)`, shifting the derived grant.
+    #[test]
+    fn carried_resolution_defs_sort_after_derived_grants() {
+        let mut state = setup();
+        let host = make_creature(&mut state, "Host", 2, 2, PlayerId(0));
+        let granted = crate::types::ability::ReplacementDefinition::new(ReplacementEvent::GainLife);
+        {
+            let obj = state.objects.get_mut(&host).unwrap();
+            obj.base_replacement_definitions = Arc::new(vec![printed_base_shield()]);
+            obj.replacement_definitions = vec![printed_base_shield()].into();
+            obj.base_characteristics_initialized = true;
+            obj.install_resolution_replacement(spent_resolution_shield());
+        }
+        let grantor = create_object(
+            &mut state,
+            CardId(9),
+            PlayerId(0),
+            "Grantor".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&grantor).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.base_card_types = obj.card_types.clone();
+            obj.static_definitions.push(
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::SpecificObject { id: host })
+                    .modifications(vec![ContinuousModification::GrantReplacement {
+                        replacement: Box::new(granted.clone()),
+                    }]),
+            );
+            obj.base_static_definitions = obj.static_definitions.as_slice().to_vec().into();
+        }
+
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+
+        let live = &state.objects[&host].replacement_definitions;
+        assert_eq!(live.len(), 3, "base ++ derived ++ carried");
+        assert_eq!(live[0], printed_base_shield(), "index 0: printed base");
+        assert_eq!(live[1], granted, "index 1: the per-pass derived grant");
+        assert!(
+            live[2].is_resolution_installed(),
+            "index 2: the carried resolution shield sorts to the tail"
+        );
+    }
+
+    /// M9 HOSTILE FIXTURE: `origin` participates in `PartialEq`, and that is what
+    /// keeps the two structural-equality dedups in this file honest — a carried
+    /// resolution def must never SUPPRESS a per-pass derived grant. The accepted
+    /// dual consequence is that the structurally-identical-but-for-`origin` pair
+    /// leaves TWO entries.
+    ///
+    /// Synthetic by construction: in practice `expiry` already discriminates (a
+    /// resolution shield carries `Some(..)`, a derived grant `None`), so this shape
+    /// does not arise from any card. It pins the coupling anyway.
+    #[test]
+    fn carried_resolution_def_does_not_suppress_an_identical_derived_grant() {
+        let mut state = setup();
+        let host = make_creature(&mut state, "Host", 2, 2, PlayerId(0));
+        // A def that IS structurally identical to the derived grant except for
+        // `origin` — so it must carry an expiry (the authority's fail-closed arm
+        // would otherwise refuse to stamp it) and the grant must carry the same one.
+        let granted = crate::types::ability::ReplacementDefinition::new(ReplacementEvent::GainLife)
+            .expiry(crate::types::ability::RestrictionExpiry::EndOfTurn);
+        {
+            let obj = state.objects.get_mut(&host).unwrap();
+            obj.base_characteristics_initialized = true;
+            obj.install_resolution_replacement(granted.clone());
+        }
+        let grantor = create_object(
+            &mut state,
+            CardId(9),
+            PlayerId(0),
+            "Grantor".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&grantor).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.base_card_types = obj.card_types.clone();
+            obj.static_definitions.push(
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::SpecificObject { id: host })
+                    .modifications(vec![ContinuousModification::GrantReplacement {
+                        replacement: Box::new(granted.clone()),
+                    }]),
+            );
+            obj.base_static_definitions = obj.static_definitions.as_slice().to_vec().into();
+        }
+
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+
+        let live = &state.objects[&host].replacement_definitions;
+        assert_eq!(
+            live.len(),
+            2,
+            "the carried def must not suppress the derived grant"
+        );
+        assert!(
+            live.iter_all()
+                .any(|d| !d.is_resolution_installed() && *d == granted),
+            "the derived grant is still installed"
+        );
+        assert!(
+            live.iter_all().any(|d| d.is_resolution_installed()),
+            "and the carried resolution def is still present"
+        );
+    }
+
+    /// CR 305.7 + CR 611.2c (issue #8485): Blood Moon-class `SetBasicLandType`
+    /// removes the land's rules-text abilities; it does not end a continuous effect
+    /// that already resolved onto it.
+    ///
+    /// The CR 305.7 sibling of `humility_does_not_end_a_resolution_created_shield`.
+    /// `set_land_subtype_replacing` got the same
+    /// `.retain(|d| d.is_resolution_installed())` as the CR 613.1f
+    /// `RemoveAllAbilities` arm, but only the latter had a fixture — and this is the
+    /// path that hosts `add_target_replacement` riders on LANDS, so a regression
+    /// here would be silent. CR 305.7: "It loses all abilities generated from its
+    /// rules text... Note that this doesn't remove any abilities that were granted
+    /// to the land by other effects." A resolution-created replacement is neither:
+    /// CR 611.2c says it is not a characteristic of the object at all.
+    #[test]
+    fn blood_moon_does_not_end_a_resolution_created_shield() {
+        let mut state = setup();
+        let land = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Nonbasic Land".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&land).unwrap();
+            obj.card_types.core_types.push(CoreType::Land);
+            obj.card_types.subtypes.push("Desert".to_string());
+            obj.base_card_types = obj.card_types.clone();
+            obj.base_replacement_definitions = Arc::new(vec![printed_base_shield()]);
+            obj.replacement_definitions = vec![printed_base_shield()].into();
+            obj.base_characteristics_initialized = true;
+            obj.install_resolution_replacement(spent_resolution_shield());
+        }
+        // Reach-guard: the printed def is present before the pass, so its removal
+        // below is an observed change rather than a vacuous absence.
+        assert!(state.objects[&land]
+            .replacement_definitions
+            .iter_all()
+            .any(|d| !d.is_resolution_installed()));
+
+        let blood_moon = create_object(
+            &mut state,
+            CardId(9),
+            PlayerId(0),
+            "Blood Moon".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&blood_moon).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.base_card_types = obj.card_types.clone();
+            obj.static_definitions.push(
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::SpecificObject { id: land })
+                    .modifications(vec![ContinuousModification::SetBasicLandType {
+                        land_type: crate::types::ability::BasicLandType::Mountain,
+                    }]),
+            );
+            obj.base_static_definitions = obj.static_definitions.as_slice().to_vec().into();
+        }
+
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+
+        // Positive reach-guard: the subtype set really applied this pass.
+        assert!(
+            state.objects[&land]
+                .card_types
+                .subtypes
+                .contains(&"Mountain".to_string()),
+            "reach-guard: CR 305.7 subtype replacement must have run"
+        );
+        assert!(
+            !state.objects[&land]
+                .card_types
+                .subtypes
+                .contains(&"Desert".to_string()),
+            "CR 205.3i: the old land subtype is replaced"
+        );
+
+        let live = &state.objects[&land].replacement_definitions;
+        assert_eq!(
+            live.len(),
+            1,
+            "the printed rules-text def is removed, the resolution shield stays"
+        );
+        assert!(live[0].is_resolution_installed());
+        assert!(
+            live[0].is_consumed,
+            "CR 615.3: the carried shield keeps its runtime state through Blood Moon"
+        );
+    }
+
+    /// CR 613.1f + CR 611.2c (issue #8485): Humility-class `RemoveAllAbilities`
+    /// removes the object's ABILITIES; it does not end a continuous effect that
+    /// already resolved onto it. Paired positive reach-guard: the printed def
+    /// existed before the pass and IS removed.
+    #[test]
+    fn humility_does_not_end_a_resolution_created_shield() {
+        let mut state = setup();
+        let host = make_creature(&mut state, "Host", 2, 2, PlayerId(0));
+        {
+            let obj = state.objects.get_mut(&host).unwrap();
+            obj.base_replacement_definitions = Arc::new(vec![printed_base_shield()]);
+            obj.replacement_definitions = vec![printed_base_shield()].into();
+            obj.base_characteristics_initialized = true;
+            obj.install_resolution_replacement(spent_resolution_shield());
+        }
+        // Reach-guard: the printed def is present before the pass.
+        assert!(state.objects[&host]
+            .replacement_definitions
+            .iter_all()
+            .any(|d| !d.is_resolution_installed()));
+
+        let humility = create_object(
+            &mut state,
+            CardId(9),
+            PlayerId(0),
+            "Humility".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&humility).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.base_card_types = obj.card_types.clone();
+            obj.static_definitions.push(
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::SpecificObject { id: host })
+                    .modifications(vec![ContinuousModification::RemoveAllAbilities]),
+            );
+            obj.base_static_definitions = obj.static_definitions.as_slice().to_vec().into();
+        }
+
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+
+        let live = &state.objects[&host].replacement_definitions;
+        assert_eq!(
+            live.len(),
+            1,
+            "the printed def is removed, the shield stays"
+        );
+        assert!(live[0].is_resolution_installed());
+        assert!(live[0].is_consumed, "runtime state survives Humility too");
     }
 
     fn add_unspent_blue_mana(state: &mut GameState, player: PlayerId, count: usize) {
@@ -8597,6 +12282,138 @@ mod tests {
         }
     }
 
+    /// CR 604.3 + CR 113.6 + CR 113.6b: PR #8229 review (HIGH finding).
+    /// `static_functions_in_zone` is a three-way split — CDA (all zones,
+    /// unconditional), opt-in off-zone (non-empty `active_zones`), and plain
+    /// (empty `active_zones`, battlefield-only) — not the two-way split the
+    /// original #8158 fix assumed. A CDA carries an empty `active_zones` list
+    /// (see `parser/oracle_static/cda.rs`'s constructors: `.cda()` never
+    /// pairs with `.active_zones(...)`), so without the `characteristic_defining`
+    /// check, `static_functions_in_zone` would apply the plain battlefield-only
+    /// default to it — rejecting a CDA exactly like an ordinary printed static,
+    /// which contradicts CR 604.3's unconditional "function in all zones."
+    ///
+    /// Mirrors `combat_assignment_rule_effects_respect_zone_of_function_active_zones`
+    /// immediately above, and Gwaihir the Windlord's own real shape: a Hand
+    /// source with TWO static definitions, one opt-in off-zone (so
+    /// `for_each_static_effect_source`'s off-zone candidate scan visits the
+    /// source at all) and one that must be independently zone-gated on its
+    /// OWN terms (there, a plain empty-`active_zones` grant that must stay
+    /// battlefield-only; here, a CDA with empty `active_zones` that must
+    /// function anyway). Exercises both fixed call sites directly:
+    /// `for_each_static_effect_source`'s pre-check (bullet 1) via the
+    /// `visited` probe, and `StaticZoneAdmission::LiveSource` (bullet 2) via
+    /// `active_continuous_effects_from_static_source`'s returned modifications.
+    #[test]
+    fn cda_admitted_off_battlefield_via_sibling_broad_zone_static() {
+        let mut state = setup();
+        let source_id = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Hand CDA Source".to_string(),
+            Zone::Hand,
+        );
+        {
+            let obj = state.objects.get_mut(&source_id).unwrap();
+            // Sibling opt-in off-zone static (mirrors Gwaihir's cost
+            // reducer): non-empty `active_zones` including Hand. Its mode
+            // and effect are irrelevant to this test — only its presence,
+            // which is what makes `for_each_static_effect_source`'s
+            // pre-check visit this Hand source at all.
+            let sibling = StaticDefinition::continuous()
+                .affected(TargetFilter::SelfRef)
+                .modifications(vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Haste,
+                }])
+                .active_zones(vec![Zone::Hand]);
+            Arc::make_mut(&mut obj.base_static_definitions).push(sibling.clone());
+            obj.static_definitions.push(sibling);
+
+            // The CDA under test: empty `active_zones` (as every real CDA
+            // constructor emits — see `parser/oracle_static/cda.rs`),
+            // `characteristic_defining: true`.
+            let cda = StaticDefinition::continuous()
+                .affected(TargetFilter::SelfRef)
+                .modifications(vec![ContinuousModification::SetDynamicPower {
+                    value: QuantityExpr::Fixed { value: 3 },
+                }])
+                .cda();
+            Arc::make_mut(&mut obj.base_static_definitions).push(cda.clone());
+            obj.static_definitions.push(cda);
+        }
+        crate::types::game_state::StaticSourceIndex::rebuild_from_state(&mut state);
+
+        // Bullet 1: the off-zone candidate scan must visit this Hand source
+        // because of its sibling's non-empty `active_zones`, exactly as
+        // Gwaihir's cost reducer admits Gwaihir itself.
+        let mut visited = Vec::new();
+        for_each_static_effect_source(&state, |_state, obj| visited.push(obj.id));
+        assert!(
+            visited.contains(&source_id),
+            "the off-zone candidate scan must visit a Hand source that \
+             carries a sibling static with non-empty `active_zones`"
+        );
+
+        // Bullet 2: `StaticZoneAdmission::LiveSource` must admit the CDA
+        // definition specifically — not just visit the source. Before this
+        // fix, `static_functions_in_zone` rejected it under the plain
+        // empty-`active_zones` battlefield-only default.
+        let source_obj = state.objects.get(&source_id).unwrap();
+        let effects = active_continuous_effects_from_static_source(&state, source_obj);
+        assert!(
+            effects.iter().any(|e| {
+                e.characteristic_defining
+                    && matches!(
+                        e.modification,
+                        ContinuousModification::SetDynamicPower { .. }
+                    )
+            }),
+            "CR 604.3: a characteristic-defining ability functions in all \
+             zones — the CDA's `SetDynamicPower` modification must be \
+             admitted while its source sits in Hand, reached via its OWN \
+             CR 604.3 authority rather than rejected under the plain \
+             empty-`active_zones` battlefield-only default that correctly \
+             still applies to its non-CDA sibling shape"
+        );
+    }
+
+    /// CR 604.3: the command-zone source walk must admit a non-emblem CDA
+    /// without requiring an explicit `active_zones: [Command]` opt-in. This
+    /// drives the normal source index and layer evaluation and observes the
+    /// CDA's continuous modification on a battlefield object.
+    #[test]
+    fn command_zone_cda_reaches_layer_pipeline() {
+        let mut state = setup();
+        let target_id = make_creature(&mut state, "CDA Observer", 2, 2, PlayerId(0));
+        let source_id = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Command CDA Source".to_string(),
+            Zone::Command,
+        );
+        {
+            let source = state.objects.get_mut(&source_id).unwrap();
+            let cda = StaticDefinition::continuous()
+                .affected(TargetFilter::SpecificObject { id: target_id })
+                .modifications(vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Flying,
+                }])
+                .cda();
+            Arc::make_mut(&mut source.base_static_definitions).push(cda.clone());
+            source.static_definitions.push(cda);
+        }
+
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+
+        assert!(
+            state.objects[&target_id].keywords.contains(&Keyword::Flying),
+            "a non-emblem Command-zone CDA must be collected and applied by the production layer pipeline"
+        );
+    }
+
     /// Helper: creatures you control filter
     fn creature_you_ctrl() -> TargetFilter {
         TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You))
@@ -9284,6 +13101,110 @@ mod tests {
         assert!(
             equipped.has_keyword(&Keyword::Shroud),
             "equipped creature must gain Shroud from the keyword companion"
+        );
+    }
+
+    /// Attach `line`'s parsed static to a fresh Aura on a fresh 2/2, run the real
+    /// layer pipeline, and hand back the enchanted creature's post-layer state.
+    ///
+    /// Shared by the pair of tests below so the gated and ungated cases differ in
+    /// exactly one thing — the Oracle text — rather than in test scaffolding.
+    fn apply_aura_static(line: &str) -> (GameState, ObjectId, StaticDefinition) {
+        let mut state = setup();
+        let bear = make_creature(&mut state, "Bear", 2, 2, PlayerId(0));
+        let def = crate::parser::oracle_static::parse_static_line(line)
+            .unwrap_or_else(|| panic!("{line} should parse to a static"));
+        let aura = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Test Aura".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let ts = state.next_timestamp();
+            let obj = state.objects.get_mut(&aura).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.card_types.subtypes.push("Aura".into());
+            obj.base_card_types = obj.card_types.clone();
+            obj.attached_to = Some(bear.into());
+            obj.timestamp = ts;
+            obj.static_definitions.push(def.clone());
+        }
+        state.objects.get_mut(&bear).unwrap().attachments.push(aura);
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+        (state, bear, def)
+    }
+
+    /// CR 118.12a + CR 611.3a + CR 613.1f + CR 613.4c: an "as long as <payment>"
+    /// gate on a continuous GRANT must leave the grant off at runtime, because the
+    /// CR 613 layer pipeline offers no optional-payment round-trip and the player
+    /// is therefore never given the "may".
+    ///
+    /// The two layers cited are the two this test actually drives: CR 613.1f is
+    /// Layer 6 (ability-adding effects), which carries the `has flying` shape, and
+    /// CR 613.4c is Layer 7c (effects that MODIFY power/toughness without setting
+    /// it), which carries the `gets +2/+2` shape. Both are gated by the same
+    /// condition slot, which is why one gate defect would surface in both.
+    ///
+    /// This is the runtime half of
+    /// `oracle_static::tests::attached_conditional_grant_payment_gate_is_deferred_not_accepted`,
+    /// and it exists because the parser assertion alone cannot see the defect it
+    /// guards: the deferral marker's SHAPE decides whether the grant applies.
+    /// `evaluate_condition` reads `StaticCondition::Unrecognized` as `true`, so a
+    /// bare marker would have made `"Enchanted creature gets +2/+2 as long as you
+    /// pay {1}"` an UNCONDITIONAL +2/+2 — a buff the printed card never grants for
+    /// free — while the coverage gap marker still looked correct.
+    /// `static_helpers::unenforceable_gate_marker` emits the `Not`-wrapped inert
+    /// shape instead, which pins the gate `false` and keeps the grant off.
+    ///
+    /// Both grant shapes the branch serves are exercised (P/T and keyword),
+    /// because the gate is shared by the class, not by one Oracle phrasing.
+    #[test]
+    fn conditional_grant_with_unenforceable_payment_gate_does_not_apply() {
+        let (state, bear, def) =
+            apply_aura_static("Enchanted creature gets +2/+2 as long as you pay {1}.");
+        assert!(
+            def.condition
+                .as_ref()
+                .is_some_and(StaticCondition::contains_unrecognized),
+            "the coverage marker must survive alongside the fail-closed runtime, got {:?}",
+            def.condition
+        );
+        let enchanted = state.objects.get(&bear).unwrap();
+        assert_eq!(
+            (enchanted.power, enchanted.toughness),
+            (Some(2), Some(2)),
+            "an unofferable CR 118.12a payment gate must leave the grant INACTIVE — \
+             the creature must stay 2/2, not become 4/4"
+        );
+
+        let (state, bear, _) =
+            apply_aura_static("Enchanted creature has flying as long as you pay {1}.");
+        assert!(
+            !state
+                .objects
+                .get(&bear)
+                .unwrap()
+                .has_keyword(&Keyword::Flying),
+            "the keyword shape of the same branch must also stay inactive"
+        );
+    }
+
+    /// Non-vacuity control for the test above: the identical scaffolding DOES
+    /// apply an ungated grant. Without this, a harness that silently failed to
+    /// wire the Aura's static into the layer pipeline would make the fail-closed
+    /// assertion pass for the wrong reason.
+    #[test]
+    fn unconditional_aura_grant_applies_through_the_same_harness() {
+        let (state, bear, def) = apply_aura_static("Enchanted creature gets +2/+2.");
+        assert_eq!(def.condition, None, "control line must carry no gate");
+        let enchanted = state.objects.get(&bear).unwrap();
+        assert_eq!(
+            (enchanted.power, enchanted.toughness),
+            (Some(4), Some(4)),
+            "the harness must actually apply an ungated Aura grant"
         );
     }
 
@@ -14297,6 +18218,78 @@ mod tests {
         );
     }
 
+    /// CR 702.26f vs CR 702.26d: with the SAME phased-out host, the
+    /// presence-bound state reading is ENDED — removed from the vector, not
+    /// merely skipped — while the event deadline keeps running AND keeps
+    /// applying.
+    ///
+    /// DISCRIMINATING both ways: dropping the presence arm of
+    /// `prune_lapsed_host_bound_effects` (or collapsing the parser split so
+    /// the wording never reaches `WhileHostOnBattlefield`) reds the first
+    /// half; asking the phasing question of every host-bound duration — the
+    /// over-reach a previous review round shipped and reverted — reds the
+    /// second.
+    #[test]
+    fn a_phased_out_host_ends_the_presence_effect_and_spares_the_event_deadline() {
+        let mut state = setup();
+        let host = make_creature(&mut state, "Phasing Host", 2, 2, PlayerId(0));
+        let ts = state.next_timestamp();
+        for (id, duration) in [
+            (1, Duration::WhileHostOnBattlefield),
+            (2, Duration::UntilHostLeavesPlay),
+        ] {
+            state
+                .transient_continuous_effects
+                .push_back(TransientContinuousEffect {
+                    id,
+                    source_id: host,
+                    controller: PlayerId(0),
+                    timestamp: ts,
+                    duration,
+                    affected: TargetFilter::SelfRef,
+                    affected_recipient: None,
+                    modifications: vec![ContinuousModification::AddKeyword {
+                        keyword: Keyword::Flying,
+                    }],
+                    condition: None,
+                    duration_subject: None,
+                    end_permission: None,
+                    source_name: String::new(),
+                });
+        }
+
+        let mut events = Vec::new();
+        crate::game::phasing::phase_out_object(
+            &mut state,
+            host,
+            crate::game::game_object::PhaseOutCause::Directly,
+            &mut events,
+        );
+        assert!(
+            !state.objects[&host].is_phased_in(),
+            "reach-guard: the production phase-out must actually phase the host out"
+        );
+
+        prune_lapsed_host_bound_effects(&mut state);
+        let survivors: Vec<u64> = state
+            .transient_continuous_effects
+            .iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(
+            survivors,
+            vec![2],
+            "CR 702.26f ends the presence reading; CR 702.26d spares the event deadline"
+        );
+        assert!(
+            state
+                .transient_continuous_effects
+                .iter()
+                .all(|e| transient_effect_is_live(&state, e)),
+            "the surviving event-deadline effect must still APPLY across the phase-out"
+        );
+    }
+
     // CR 110.5d: a tapped source that has left the battlefield is neither tapped
     // nor untapped — `SourceIsTapped` must evaluate false once it is off-battlefield.
     #[test]
@@ -15463,7 +19456,9 @@ mod tests {
             obj.timestamp = anthem_ts;
             obj.static_definitions.push(
                 StaticDefinition::continuous()
-                    .condition(StaticCondition::IsMonarch)
+                    .condition(StaticCondition::IsMonarch {
+                        player: PlayerScope::Controller,
+                    })
                     .affected(TargetFilter::Typed(
                         TypedFilter::creature().controller(ControllerRef::You),
                     ))
@@ -15498,6 +19493,77 @@ mod tests {
         let bear_obj = state.objects.get(&bear).unwrap();
         assert_eq!(bear_obj.power, Some(3));
         assert_eq!(bear_obj.toughness, Some(3));
+    }
+
+    /// CR 109.4 + CR 725.5: layer evaluation has no triggering event and no
+    /// combat anchor, so a SCOPED monarch subject is unanswerable there. It must
+    /// be false in BOTH polarities.
+    ///
+    /// The negated case is the revert-failing one: without the entry-boundary
+    /// gate in `evaluate_condition{,_with_recipient}` the leaf's `false` inverts
+    /// under `StaticCondition::Not` and the anthem applies UNCONDITIONALLY —
+    /// which is exactly the printed "unless that player is the monarch"
+    /// (Fall from Favor) restriction shape, applied when the engine cannot
+    /// identify the player at all.
+    #[test]
+    fn scoped_monarch_static_condition_is_false_in_both_polarities_cr_725_5() {
+        for (label, condition) in [
+            (
+                "affirmative",
+                StaticCondition::IsMonarch {
+                    player: PlayerScope::DefendingPlayer,
+                },
+            ),
+            (
+                "negated",
+                StaticCondition::Not {
+                    condition: Box::new(StaticCondition::IsMonarch {
+                        player: PlayerScope::DefendingPlayer,
+                    }),
+                },
+            ),
+        ] {
+            let mut state = setup();
+            // Even with the controller AS the monarch, an unresolvable subject
+            // must not let the effect apply.
+            state.monarch = Some(PlayerId(0));
+
+            let anthem = create_object(
+                &mut state,
+                CardId(0),
+                PlayerId(0),
+                "Scoped Monarch Anthem".to_string(),
+                Zone::Battlefield,
+            );
+            let anthem_ts = state.next_timestamp();
+            {
+                let obj = state.objects.get_mut(&anthem).unwrap();
+                obj.card_types.core_types.push(CoreType::Enchantment);
+                obj.timestamp = anthem_ts;
+                obj.static_definitions.push(
+                    StaticDefinition::continuous()
+                        .condition(condition)
+                        .affected(TargetFilter::Typed(
+                            TypedFilter::creature().controller(ControllerRef::You),
+                        ))
+                        .modifications(vec![
+                            ContinuousModification::AddPower { value: 1 },
+                            ContinuousModification::AddToughness { value: 1 },
+                        ]),
+                );
+            }
+            let bear = make_creature(&mut state, "Bear", 2, 2, PlayerId(0));
+
+            evaluate_layers(&mut state);
+
+            let bear_obj = state.objects.get(&bear).unwrap();
+            assert_eq!(
+                bear_obj.power,
+                Some(2),
+                "{label}: an unanswerable monarch subject must not apply"
+            );
+            assert_eq!(bear_obj.toughness, Some(2), "{label}: toughness unchanged");
+        }
     }
 
     /// CR 702.94a + CR 400.3: A continuous static ability whose `affected`
@@ -15641,6 +19707,8 @@ mod tests {
             .unwrap()
             .casting_permissions
             .push(CastingPermission::PlayFromExile {
+                provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: Duration::UntilEndOfTurn,
                 granted_to: PlayerId(0),
                 frequency: crate::types::statics::CastFrequency::Unlimited,
@@ -15651,7 +19719,8 @@ mod tests {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
 
@@ -15663,12 +19732,410 @@ mod tests {
         );
     }
 
+    /// Build an `ExileWithAltCost` with only the two fields this prune reads.
+    fn alt_cost_permission(
+        duration: Option<Duration>,
+        source_id: Option<ObjectId>,
+    ) -> CastingPermission {
+        CastingPermission::ExileWithAltCost {
+            cost: crate::types::mana::ManaCost::zero(),
+            cost_provenance: crate::types::ability::ExileGrantCostProvenance::Alternative,
+            cast_transformed: false,
+            constraint: None,
+            granted_to: None,
+            resolution_cleanup: None,
+            duration,
+            source_id,
+            graveyard_replacement: None,
+            enters_with_counter: None,
+            enters_with_modifications: Vec::new(),
+            mana_spend_permission: None,
+            cast_cost_modifier: None,
+        }
+    }
+
+    /// CR 611.2b: whether a `ForAsLongAs` lifetime can be enforced depends on
+    /// WHERE the grant sits, and this is the only arm of
+    /// `casting_permission_duration_is_enforceable` for which that is true.
+    ///
+    /// `zones::apply_zone_exit_cleanup` is the shape's only authority and it
+    /// fires when the card leaves EXILE. An in-place grant — the card stays in
+    /// the graveyard or the hand — never reaches it, so nothing would end the
+    /// permission; answering `false` there is what makes
+    /// `cast_from_zone::record_lingering_permissions` fall back to the
+    /// cleanup-step default instead of attaching an unbounded grant.
+    ///
+    /// Pinned as a predicate rather than through a card, deliberately: the one
+    /// printed card that reaches the in-place arm is Resourceful Collector,
+    /// whose grant hangs off a random permanent pick at the beginning of the
+    /// end step, which no fixture can force. The revert-to-red is direct —
+    /// changing the arm back to an unconditional `true` fails the second
+    /// assertion.
+    #[test]
+    fn for_as_long_as_is_enforceable_only_on_an_exile_resident_grant() {
+        let condition = Duration::ForAsLongAs {
+            condition: StaticCondition::None,
+        };
+        assert!(
+            casting_permission_duration_is_enforceable(&condition, true),
+            "an exile-resident grant is ended by `zones::apply_zone_exit_cleanup`"
+        );
+        assert!(
+            !casting_permission_duration_is_enforceable(&condition, false),
+            "an in-place grant never leaves exile, so nothing would end it"
+        );
+        // Residency changes nothing for any other shape — the seams that own
+        // them do not care where the card sits.
+        for other in [
+            Duration::UntilEndOfTurn,
+            Duration::UntilHostLeavesPlay,
+            Duration::WhileControllingHost,
+            Duration::Permanent,
+        ] {
+            assert_eq!(
+                casting_permission_duration_is_enforceable(&other, true),
+                casting_permission_duration_is_enforceable(&other, false),
+                "residency must only matter for ForAsLongAs, but it moved {other:?}"
+            );
+        }
+    }
+
+    /// CR 611.2a: the grant-site guard and the expiry table answer the same
+    /// question, so a turn deadline no seam can ever fire on must not pass the
+    /// guard.
+    ///
+    /// `permission_scope_is_keyable` is the shared authority. Without it the
+    /// guard read only the VARIANT — and, for `UntilNextStepOf`, only the STEP.
+    /// `UntilEndOfNextTurnOf { player: Target }` is a shape
+    /// `oracle_nom::duration::parse_during_body` produces and
+    /// `with_clause_duration` routes onto a permission node; it was admitted as
+    /// enforceable, then never armed by
+    /// `prune_untap_step_casting_permissions` (which matches
+    /// `PlayerScope::Controller` alone) and never selected at any seam. An
+    /// unbounded permission — the same hole this change closes for
+    /// `UntilNextStepOf { step: Untap }`.
+    ///
+    /// No printed card pairs these variants with an unkeyable scope today —
+    /// every TURN-DEADLINE permission node in the corpus carries `Controller`;
+    /// the rest of the permission nodes carry no player scope at all — so the
+    /// assertions are at the predicate rather than through a fixture.
+    #[test]
+    fn a_turn_deadline_no_seam_can_key_is_refused_at_the_grant() {
+        let unkeyable = [
+            Duration::UntilEndOfNextTurnOf {
+                player: PlayerScope::Target,
+            },
+            Duration::UntilNextTurnOf {
+                player: PlayerScope::Target,
+            },
+            Duration::UntilNextStepOf {
+                step: Phase::End,
+                player: PlayerScope::Target,
+            },
+        ];
+        for duration in &unkeyable {
+            // First: no seam ends it, asked for every seam and every keying.
+            for seam in [
+                PermissionSeam::Cleanup,
+                PermissionSeam::UntapStep,
+                PermissionSeam::UpkeepStep,
+                PermissionSeam::EndStep,
+            ] {
+                for keyed in [None, Some(PlayerId(0)), Some(PlayerId(1))] {
+                    for active in [None, Some(PlayerId(0)), Some(PlayerId(1))] {
+                        assert!(
+                            !permission_duration_expires_at(seam, duration, keyed, active),
+                            "no seam may end {duration:?}, so the guard below must refuse it"
+                        );
+                    }
+                }
+            }
+            // Therefore the grant site must refuse it instead of attaching an
+            // unbounded permission — in either residency.
+            for exile_resident in [false, true] {
+                assert!(
+                    !casting_permission_duration_is_enforceable(duration, exile_resident),
+                    "{duration:?} is ended by nothing and must not be enforceable \
+                     (exile_resident = {exile_resident})"
+                );
+            }
+        }
+
+        // Positive control: the same three variants with a scope a prune CAN
+        // key on stay enforceable, so the guard refuses the SCOPE and not the
+        // variant.
+        for duration in [
+            Duration::UntilEndOfNextTurnOf {
+                player: PlayerScope::Controller,
+            },
+            Duration::UntilNextTurnOf {
+                player: PlayerScope::Controller,
+            },
+            Duration::UntilNextStepOf {
+                step: Phase::End,
+                player: PlayerScope::Controller,
+            },
+        ] {
+            assert!(
+                casting_permission_duration_is_enforceable(&duration, false),
+                "{duration:?} is armed or selected and must stay enforceable"
+            );
+        }
+    }
+
+    /// CR 702.26f: a host-bound permission ends when its host PHASES OUT, even
+    /// though phasing changes neither zone nor controller (CR 702.26d).
+    ///
+    /// "Effects with 'for as long as' durations that track that permanent (see
+    /// rule 611.2b) end when that permanent phases out because they can no
+    /// longer see it." Both STATE readings track the permanent, so both legs of
+    /// `prune_lapsed_host_bound_casting_permissions` must ask. The control leg
+    /// gets it from `replacement::controller_controls_source_gate`, which
+    /// already carries the check; the presence leg
+    /// (`WhileHostOnBattlefield`) asks here. The event deadline
+    /// (`UntilHostLeavesPlay`) tracks nothing — CR 702.26d — and the companion
+    /// test below pins that this pass leaves it alone.
+    ///
+    /// DISCRIMINATING: the first assertion pins that a phased-IN host retains
+    /// the grant, so dropping the `is_phased_in()` call reds the second while a
+    /// prune that revoked unconditionally reds the first.
+    ///
+    /// The phase-out itself goes through the production entry point,
+    /// `game::phasing::phase_out_object` — the same call
+    /// `effects::phase_out::resolve` makes for Clever Concealment, Spectral
+    /// Adversary, Teferi's Protection and the rest. Setting `phase_status` by
+    /// hand would prove only that this predicate reads the field, not that the
+    /// engine's own phase-out reaches it.
+    ///
+    /// Unit-level rather than card-level because the grant path is already
+    /// covered end-to-end by
+    /// `a_lifetime_already_over_at_grant_time_produces_no_permission`; this
+    /// test isolates the phase-out leg against an installed permission.
+    #[test]
+    fn presence_bound_permission_ends_when_its_host_phases_out() {
+        let mut state = setup();
+        let host = create_object(
+            &mut state,
+            CardId(7),
+            PlayerId(0),
+            "Presence Host".to_string(),
+            Zone::Battlefield,
+        );
+        let exiled = make_exiled_card(&mut state, PlayerId(0));
+        state.objects.get_mut(&exiled).unwrap().casting_permissions = vec![alt_cost_permission(
+            Some(Duration::WhileHostOnBattlefield),
+            Some(host),
+        )];
+
+        prune_lapsed_host_bound_casting_permissions(&mut state);
+        assert_eq!(
+            state.objects[&exiled].casting_permissions.len(),
+            1,
+            "a phased-in host on the battlefield keeps the grant alive"
+        );
+
+        let mut events = Vec::new();
+        crate::game::phasing::phase_out_object(
+            &mut state,
+            host,
+            crate::game::game_object::PhaseOutCause::Directly,
+            &mut events,
+        );
+        assert!(
+            !state.objects[&host].is_phased_in(),
+            "reach-guard: the production phase-out must actually phase the host out"
+        );
+
+        prune_lapsed_host_bound_casting_permissions(&mut state);
+        assert!(
+            state.objects[&exiled].casting_permissions.is_empty(),
+            "CR 702.26f: the host phased out, so the tracking duration ended"
+        );
+    }
+
+    /// CR 702.26d: the EVENT deadline ("until ~ leaves the battlefield") is
+    /// not a "for as long as" duration, so a phase-out — which is not the host
+    /// leaving the battlefield — must NOT end it.
+    ///
+    /// DISCRIMINATING counterpart to the presence test above: an
+    /// implementation that asked the phasing question of every host-bound
+    /// duration (the exact over-reach a previous round shipped and reverted)
+    /// reds this while keeping that one green.
+    #[test]
+    fn event_deadline_permission_survives_its_hosts_phase_out() {
+        let mut state = setup();
+        let host = create_object(
+            &mut state,
+            CardId(7),
+            PlayerId(0),
+            "Deadline Host".to_string(),
+            Zone::Battlefield,
+        );
+        let exiled = make_exiled_card(&mut state, PlayerId(0));
+        state.objects.get_mut(&exiled).unwrap().casting_permissions = vec![alt_cost_permission(
+            Some(Duration::UntilHostLeavesPlay),
+            Some(host),
+        )];
+
+        let mut events = Vec::new();
+        crate::game::phasing::phase_out_object(
+            &mut state,
+            host,
+            crate::game::game_object::PhaseOutCause::Directly,
+            &mut events,
+        );
+        assert!(
+            !state.objects[&host].is_phased_in(),
+            "reach-guard: the production phase-out must actually phase the host out"
+        );
+
+        prune_lapsed_host_bound_casting_permissions(&mut state);
+        assert_eq!(
+            state.objects[&exiled].casting_permissions.len(),
+            1,
+            "CR 702.26d: a phase-out is not the host leaving the battlefield, \
+             so the event deadline keeps running"
+        );
+    }
+
+    /// CR 611.2a + CR 702.26d: the EVENT deadline ("until ~ leaves the
+    /// battlefield") is deliberately skipped by the continuous lapse pass —
+    /// nothing but the host's actual battlefield exit may end it. The exit
+    /// hook (`zones::apply_zone_exit_cleanup` →
+    /// `prune_host_left_casting_permissions`) is therefore its ONLY authority,
+    /// and this is the test that discriminates that wiring. The two
+    /// `host_departure_*` integration tests do NOT: their
+    /// `WhileControllingHost` grants are also revoked by the continuous lapse
+    /// pass, so they stay green without the exit hook.
+    ///
+    /// DISCRIMINATING both ways: dropping the
+    /// `prune_host_left_casting_permissions` call from the exit cleanup reds
+    /// the second assertion; a lapse pass that grabbed the event deadline (the
+    /// over-reach) reds the first.
+    #[test]
+    fn an_event_deadline_permission_ends_only_at_the_hosts_battlefield_exit() {
+        let mut state = setup();
+        let host = create_object(
+            &mut state,
+            CardId(7),
+            PlayerId(0),
+            "Deadline Host".to_string(),
+            Zone::Battlefield,
+        );
+        let exiled = make_exiled_card(&mut state, PlayerId(0));
+        state.objects.get_mut(&exiled).unwrap().casting_permissions = vec![alt_cost_permission(
+            Some(Duration::UntilHostLeavesPlay),
+            Some(host),
+        )];
+
+        prune_lapsed_host_bound_casting_permissions(&mut state);
+        assert_eq!(
+            state.objects[&exiled].casting_permissions.len(),
+            1,
+            "CR 702.26d: with the host still on the battlefield, no continuous \
+             pass may end an event deadline"
+        );
+
+        crate::game::zones::apply_zone_exit_cleanup(
+            &mut state,
+            host,
+            Zone::Battlefield,
+            Zone::Graveyard,
+            Vec::new(),
+        );
+        assert!(
+            state.objects[&exiled].casting_permissions.is_empty(),
+            "CR 611.2a: the host's battlefield exit is the deadline — the exit \
+             hook must revoke the permission"
+        );
+    }
+
+    /// CR 611.2a + CR 400.7: the departing host revokes the permissions IT
+    /// granted — and only those.
+    ///
+    /// The three retained entries are the over-pruning guard. Without them a
+    /// prune that ignored `source_id` entirely, or one that treated `None` as a
+    /// match, would still pass the two positive assertions.
+    #[test]
+    fn host_left_prune_revokes_only_the_departing_hosts_permissions() {
+        let mut state = setup();
+        let host = ObjectId(9_001);
+        let other_host = ObjectId(9_002);
+        let exiled = make_exiled_card(&mut state, PlayerId(0));
+
+        let play_from_exile = |duration, source_id| CastingPermission::PlayFromExile {
+            provenance: crate::types::ability::PlayFromExileProvenance::LandLookCompanion,
+            mode: crate::types::ability::CardPlayMode::Play,
+            duration,
+            granted_to: PlayerId(0),
+            frequency: crate::types::statics::CastFrequency::Unlimited,
+            source_id,
+            invalidation: None,
+            exiled_by_ability_controller: None,
+            mana_spend_permission: None,
+            card_filter: None,
+            single_use_group: None,
+            single_use: false,
+            cast_cost_modifier: None,
+            alt_ability_cost: None,
+            land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+        };
+
+        let permissions = &mut state.objects.get_mut(&exiled).unwrap().casting_permissions;
+        // Revoked: both halves of the departing host's own grant.
+        permissions.push(alt_cost_permission(
+            Some(Duration::UntilHostLeavesPlay),
+            Some(host),
+        ));
+        permissions.push(play_from_exile(Duration::UntilHostLeavesPlay, Some(host)));
+        // Retained: another permanent's grant with the same duration.
+        permissions.push(alt_cost_permission(
+            Some(Duration::UntilHostLeavesPlay),
+            Some(other_host),
+        ));
+        // Retained, and a stated limit: a grant deserialized before `source_id`
+        // existed has no host to compare against.
+        permissions.push(alt_cost_permission(
+            Some(Duration::UntilHostLeavesPlay),
+            None,
+        ));
+        // Retained: a standing exile-resident grant (Suspend, Discover) carries
+        // no duration and is pruned by `zones::apply_zone_exit_cleanup` instead.
+        permissions.push(alt_cost_permission(None, Some(host)));
+
+        prune_host_left_casting_permissions(&mut state, host);
+
+        let remaining = &state.objects[&exiled].casting_permissions;
+        assert_eq!(
+            remaining.len(),
+            3,
+            "exactly the two host-bound grants issued by `host` are revoked"
+        );
+        assert_eq!(
+            remaining[0],
+            alt_cost_permission(Some(Duration::UntilHostLeavesPlay), Some(other_host)),
+            "another permanent's grant with the same duration must survive"
+        );
+        assert_eq!(
+            remaining[1],
+            alt_cost_permission(Some(Duration::UntilHostLeavesPlay), None),
+            "a grant with no recorded host must survive — there is nothing to match"
+        );
+        assert_eq!(
+            remaining[2],
+            alt_cost_permission(None, Some(host)),
+            "a durationless standing grant is not this pass's business"
+        );
+    }
+
     #[test]
     fn end_of_turn_prune_preserves_other_durations() {
         let mut state = setup();
         let exiled = make_exiled_card(&mut state, PlayerId(0));
         let perms = &mut state.objects.get_mut(&exiled).unwrap().casting_permissions;
         perms.push(CastingPermission::PlayFromExile {
+            provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+            mode: crate::types::ability::CardPlayMode::Play,
             duration: Duration::UntilNextTurnOf {
                 player: PlayerScope::Controller,
             },
@@ -15681,10 +20148,13 @@ mod tests {
             card_filter: None,
             single_use_group: None,
             single_use: false,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
+            alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         });
         perms.push(CastingPermission::PlayFromExile {
+            provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+            mode: crate::types::ability::CardPlayMode::Play,
             duration: Duration::Permanent,
             granted_to: PlayerId(0),
             frequency: crate::types::statics::CastFrequency::Unlimited,
@@ -15695,7 +20165,8 @@ mod tests {
             card_filter: None,
             single_use_group: None,
             single_use: false,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
+            alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         });
         perms.push(CastingPermission::AdventureCreature);
@@ -15706,6 +20177,82 @@ mod tests {
             state.objects[&exiled].casting_permissions.len(),
             3,
             "non-UntilEndOfTurn permissions must survive cleanup"
+        );
+    }
+
+    /// CR 514.2: arming keys on the GRANTEE, not on the player a
+    /// `PlayerScope::Controller` deadline resolves "your" against.
+    ///
+    /// Suspend Aggression prints "For each of those cards, ITS OWNER may play
+    /// it until the end of THEIR next turn", and lowers with
+    /// `PermissionGrantee::ObjectOwner`: `granted_to` is the card's owner while
+    /// `exiled_by_ability_controller` is the activator. Memory Vessel prints
+    /// the other shape — "Until YOUR next turn, players may play cards they
+    /// exiled this way" — and its `UntilNextTurnOf { Controller }` deadline is
+    /// keyed the other way round (`PermissionLifetime::keyed_player`).
+    ///
+    /// Reading the arming through the deadline's key arms the grant on the
+    /// ACTIVATOR's untap step, which extends it by a full turn cycle.
+    ///
+    /// DISCRIMINATING: both assertions are needed. The first fails if arming
+    /// keys on `exiled_by_ability_controller`; the second fails if it keys on
+    /// nothing at all.
+    #[test]
+    fn arming_keys_on_the_grantee_not_on_the_granting_ability_controller() {
+        let per_owner_grant = |state: &mut GameState, exiled| {
+            state
+                .objects
+                .get_mut(&exiled)
+                .unwrap()
+                .casting_permissions
+                .push(CastingPermission::PlayFromExile {
+                    provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                    mode: crate::types::ability::CardPlayMode::Play,
+                    duration: Duration::UntilEndOfNextTurnOf {
+                        player: PlayerScope::Controller,
+                    },
+                    // The card's OWNER is the grantee ...
+                    granted_to: PlayerId(1),
+                    frequency: crate::types::statics::CastFrequency::Unlimited,
+                    source_id: None,
+                    invalidation: None,
+                    // ... while the ACTIVATOR granted it.
+                    exiled_by_ability_controller: Some(PlayerId(0)),
+                    mana_spend_permission: None,
+                    card_filter: None,
+                    single_use_group: None,
+                    single_use: false,
+                    cast_cost_modifier: None,
+                    alt_ability_cost: None,
+                    land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                });
+        };
+        let armed = |state: &GameState, exiled| {
+            matches!(
+                state.objects[&exiled].casting_permissions[0],
+                CastingPermission::PlayFromExile {
+                    duration: Duration::UntilEndOfTurn,
+                    ..
+                }
+            )
+        };
+
+        let mut state = setup();
+        let exiled = make_exiled_card(&mut state, PlayerId(1));
+        per_owner_grant(&mut state, exiled);
+        prune_untap_step_casting_permissions(&mut state, PlayerId(0));
+        assert!(
+            !armed(&state, exiled),
+            "the ACTIVATOR's untap step must not arm a grant made to someone else"
+        );
+
+        let mut state = setup();
+        let exiled = make_exiled_card(&mut state, PlayerId(1));
+        per_owner_grant(&mut state, exiled);
+        prune_untap_step_casting_permissions(&mut state, PlayerId(1));
+        assert!(
+            armed(&state, exiled),
+            "the GRANTEE's untap step arms it (CR 514.2)"
         );
     }
 
@@ -15725,6 +20272,8 @@ mod tests {
             .unwrap()
             .casting_permissions
             .push(CastingPermission::PlayFromExile {
+                provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: Duration::UntilEndOfNextTurnOf {
                     player: PlayerScope::Controller,
                 },
@@ -15737,12 +20286,13 @@ mod tests {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
 
         // Untap step of the grantee's next turn: armed to UntilEndOfTurn, kept.
-        prune_until_next_turn_casting_permissions(&mut state, PlayerId(0));
+        prune_untap_step_casting_permissions(&mut state, PlayerId(0));
         let perms = &state.objects[&exiled].casting_permissions;
         assert_eq!(
             perms.len(),
@@ -15866,6 +20416,8 @@ mod tests {
             .unwrap()
             .casting_permissions
             .push(CastingPermission::PlayFromExile {
+                provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: Duration::UntilNextStepOf {
                     step: Phase::Upkeep,
                     player: PlayerScope::Controller,
@@ -15879,12 +20431,13 @@ mod tests {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
 
         // Neither the grantee's untap step nor an OPPONENT's upkeep reaches it.
-        prune_until_next_turn_casting_permissions(&mut state, PlayerId(0));
+        prune_untap_step_casting_permissions(&mut state, PlayerId(0));
         prune_upkeep_step_casting_permissions(&mut state, PlayerId(1));
         assert_eq!(
             state.objects[&exiled].casting_permissions.len(),
@@ -16016,6 +20569,8 @@ mod tests {
             .unwrap()
             .casting_permissions
             .push(CastingPermission::PlayFromExile {
+                provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: Duration::UntilNextTurnOf {
                     player: PlayerScope::Controller,
                 },
@@ -16028,7 +20583,8 @@ mod tests {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
         state
@@ -16037,6 +20593,8 @@ mod tests {
             .unwrap()
             .casting_permissions
             .push(CastingPermission::PlayFromExile {
+                provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: Duration::UntilNextTurnOf {
                     player: PlayerScope::Controller,
                 },
@@ -16049,12 +20607,13 @@ mod tests {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
 
         // Active player is P0 — only P0's permission should expire.
-        prune_until_next_turn_casting_permissions(&mut state, PlayerId(0));
+        prune_untap_step_casting_permissions(&mut state, PlayerId(0));
 
         assert!(
             state.objects[&card_a].casting_permissions.is_empty(),
@@ -16077,6 +20636,8 @@ mod tests {
             .unwrap()
             .casting_permissions
             .push(CastingPermission::PlayFromExile {
+                provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                mode: crate::types::ability::CardPlayMode::Play,
                 duration: Duration::UntilEndOfTurn,
                 granted_to: PlayerId(0),
                 frequency: crate::types::statics::CastFrequency::Unlimited,
@@ -16087,11 +20648,12 @@ mod tests {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
+                alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
 
-        prune_until_next_turn_casting_permissions(&mut state, PlayerId(0));
+        prune_untap_step_casting_permissions(&mut state, PlayerId(0));
 
         assert_eq!(
             state.objects[&exiled].casting_permissions.len(),
@@ -16229,6 +20791,172 @@ mod tests {
         assert!(
             !bear_obj.has_keyword(&Keyword::Haste),
             "Without a Mountain, the compound condition fails and Haste is not granted"
+        );
+    }
+
+    /// CR 113.6a + CR 604.3: a characteristic-defining ability functions in
+    /// every zone.
+    /// This exercises the shared layer-source gather directly: a Hand source
+    /// with only an empty-`active_zones` CDA must survive both the off-zone
+    /// candidate pre-check and the LiveSource per-definition admission gate.
+    #[test]
+    fn live_layer_gather_admits_characteristic_defining_static_from_hand() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Off-Zone CDA".to_string(),
+            Zone::Hand,
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .static_definitions
+            .push(
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::SelfRef)
+                    .modifications(vec![ContinuousModification::SetDynamicPower {
+                        value: QuantityExpr::Fixed { value: 7 },
+                    }])
+                    .cda(),
+            );
+
+        let effects = collect_shared_active_continuous_effects(&state);
+        assert!(effects.iter().any(|effect| {
+            effect.source_id == source
+                && effect.characteristic_defining
+                && matches!(
+                    &effect.modification,
+                    ContinuousModification::SetDynamicPower { .. }
+                )
+        }));
+    }
+
+    /// CR 709.5 + CR 123.6c + CR 613.1c: Room door-gated naming must precede
+    /// name-sticker text modification on both the full and incremental paths.
+    /// This differential fixture forces the incremental fast path for the same
+    /// stickered Room that a full pass evaluates and compares the final name.
+    #[test]
+    fn stickered_room_name_matches_between_full_and_incremental_layer_paths() {
+        use crate::game::game_object::{RoomDoor, RoomUnlockState};
+        use crate::types::stickers::{AppliedSticker, StickerLocator};
+
+        let mut base = setup();
+        let room = create_object(
+            &mut base,
+            CardId(0),
+            PlayerId(0),
+            "Weight Room".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = base.objects.get_mut(&room).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.card_types.subtypes.push("Room".to_string());
+            obj.base_card_types = obj.card_types.clone();
+            obj.room_unlocks = Some(RoomUnlockState {
+                left_unlocked: true,
+                right_unlocked: false,
+            });
+            obj.stickers.push(AppliedSticker::Name {
+                locator: StickerLocator {
+                    sheet: "Layer Path Probe".to_string(),
+                    index: 0,
+                },
+                text: "Cool".to_string(),
+                position: 0,
+                timestamp: 1,
+            });
+            assert!(obj.room_unlocks.unwrap().is_unlocked(RoomDoor::Left));
+        }
+
+        let mut full = base.clone();
+        evaluate_layers(&mut full);
+
+        let mut incremental = base;
+        crate::game::perf_counters::reset();
+        incremental.layers_dirty = LayersDirty::EnteredObjects([room].into());
+        flush_layers(&mut incremental);
+        let counters = crate::game::perf_counters::snapshot();
+        assert_eq!(
+            counters.layers_incremental, 1,
+            "fixture must take the fast path"
+        );
+        assert_eq!(
+            counters.layers_full_eval, 0,
+            "fixture must not silently escalate"
+        );
+
+        assert_eq!(full.objects[&room].name, "Cool Weight Room");
+        assert_eq!(
+            incremental.objects[&room].name, full.objects[&room].name,
+            "full and incremental Layer-1 exits must produce the same stickered Room name"
+        );
+    }
+
+    /// CR 709.5 + CR 709.5c: the layers gather applies the Room door
+    /// authority itself (it bypasses `static_functions_in_zone`, see the
+    /// `functioning_abilities` module doc) — a locked half's Continuous
+    /// anthem contributes nothing, unlocking the half turns it on, and
+    /// re-locking (CR 709.5g) turns it back off on the next recompute.
+    #[test]
+    fn a_door_stamped_anthem_applies_only_while_its_half_is_unlocked() {
+        use crate::game::game_object::{RoomDoor, RoomUnlockState};
+
+        let mut state = setup();
+        let room = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Weight Room".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&room).unwrap();
+            obj.card_types.core_types.push(CoreType::Enchantment);
+            obj.card_types.subtypes.push("Room".to_string());
+            let anthem = StaticDefinition::continuous()
+                .affected(TargetFilter::Typed(
+                    TypedFilter::creature().controller(ControllerRef::You),
+                ))
+                .modifications(vec![
+                    ContinuousModification::AddPower { value: 1 },
+                    ContinuousModification::AddToughness { value: 1 },
+                ])
+                .room_door(RoomDoor::Right);
+            obj.static_definitions.push(anthem.clone());
+            std::sync::Arc::make_mut(&mut obj.base_static_definitions).push(anthem);
+            // Uncast entry (CR 709.5d): neither door unlocked.
+            obj.room_unlocks = Some(RoomUnlockState::default());
+        }
+        let bear = make_creature(&mut state, "Bear", 2, 2, PlayerId(0));
+
+        evaluate_layers(&mut state);
+        assert_eq!(
+            state.objects[&bear].power,
+            Some(2),
+            "CR 709.5: the locked half's anthem must not apply"
+        );
+
+        state.objects.get_mut(&room).unwrap().room_unlocks = Some(RoomUnlockState {
+            left_unlocked: false,
+            right_unlocked: true,
+        });
+        evaluate_layers(&mut state);
+        assert_eq!(
+            state.objects[&bear].power,
+            Some(3),
+            "CR 709.5c: the unlocked half's anthem applies"
+        );
+
+        state.objects.get_mut(&room).unwrap().room_unlocks = Some(RoomUnlockState::default());
+        evaluate_layers(&mut state);
+        assert_eq!(
+            state.objects[&bear].power,
+            Some(2),
+            "CR 709.5g: the re-locked half's anthem stops applying"
         );
     }
 
@@ -18445,8 +23173,11 @@ mod tests {
             keywords: vec![],
             abilities: Default::default(),
             trigger_definitions: Default::default(),
+            trigger_printed_origins: Default::default(),
             replacement_definitions: Default::default(),
             static_definitions: Default::default(),
+            room_halves: None,
+            name_origin: Default::default(),
         };
         let _ = state.add_transient_continuous_effect(
             source,
@@ -19623,7 +24354,7 @@ mod tests {
     ) -> ResolvedAbility {
         ResolvedAbility::new(
             Effect::BecomeCopy {
-                recipient: TargetFilter::SelfRef,
+                recipient: crate::types::ability::CopyRecipient::Source,
                 target: TargetFilter::Any,
                 duration: None,
                 mana_value_limit: None,
@@ -20051,6 +24782,24 @@ mod tests {
                 min_sources: 1,
             }
         ));
+        // CR 120.1: the damage-recipient scope routes through the same player
+        // classifier, so a life-reading recipient must be reported. Grouping the
+        // arm with the payload-free props would under-report the layer
+        // dependency at a life-change site.
+        assert!(filter_prop_reads_life(&FilterProp::DealtDamageThisTurn {
+            kind: DamageKindFilter::Any,
+            recipient: Some(PlayerFilter::OpponentLostLife),
+        }));
+        // Negative controls: a recipient that reads no life, and no recipient at
+        // all, so the positive above is not passing vacuously.
+        assert!(!filter_prop_reads_life(&FilterProp::DealtDamageThisTurn {
+            kind: DamageKindFilter::Any,
+            recipient: Some(PlayerFilter::Opponent),
+        }));
+        assert!(!filter_prop_reads_life(&FilterProp::DealtDamageThisTurn {
+            kind: DamageKindFilter::Any,
+            recipient: None,
+        }));
         // CR 608.2c: exclusion anchor recurses.
         assert!(player_filter_reads_life(&PlayerFilter::AllExcept {
             exclude: Box::new(PlayerFilter::OpponentGainedLife),
@@ -20075,6 +24824,47 @@ mod tests {
                 filter: life_filter,
             }
         ));
+    }
+
+    /// CR 102.1 + CR 119 + CR 611.3a: `TargetFilter::PlayerMatching` — the
+    /// player-axis mirror of `FilterProp::ControllerMatches` — must ROUTE its
+    /// payload here, not sit with the payload-free player references.
+    ///
+    /// Namor, Atlantean King's "a player who has more life than you" is exactly
+    /// a `PlayerAttribute { attr: LifeTotal, value: LifeTotal }`, so grouping the
+    /// variant with the non-reading arms would under-report the layer dependency
+    /// at a life-change site. Revert-failing: move the arm into that group and
+    /// the first assertion flips.
+    #[test]
+    fn player_matching_routes_its_payloads_life_reads() {
+        let reads = TargetFilter::PlayerMatching {
+            player: Box::new(PlayerFilter::PlayerAttribute {
+                relation: PlayerRelation::All,
+                attr: Box::new(QuantityRef::LifeTotal {
+                    player: PlayerScope::ScopedPlayer,
+                }),
+                comparator: Comparator::GT,
+                value: Box::new(QuantityExpr::Ref {
+                    qty: QuantityRef::LifeTotal {
+                        player: PlayerScope::Controller,
+                    },
+                }),
+            }),
+        };
+        assert!(target_filter_reads_life_total(&reads));
+
+        // Negative sibling: a life-free payload must stay `false`, so the
+        // assertion above is about the ROUTING and not about the variant
+        // answering `true` unconditionally.
+        let life_free = TargetFilter::PlayerMatching {
+            player: Box::new(PlayerFilter::ControlsCount {
+                relation: PlayerRelation::All,
+                filter: TargetFilter::Typed(TypedFilter::land()),
+                comparator: Comparator::GE,
+                count: Box::new(QuantityExpr::Fixed { value: 8 }),
+            }),
+        };
+        assert!(!target_filter_reads_life_total(&life_free));
     }
 
     /// Filter-routed reads: the classifier descends nested payloads on every
@@ -20333,6 +25123,544 @@ mod tests {
         );
     }
 
+    /// CR 613.2a + CR 613.2c: an entry-incremental flush must ESCALATE while a
+    /// copy effect whose payload carries a continuous static is active.
+    ///
+    /// The incremental arm applies every active effect through
+    /// `apply_continuous_effect_to(state, effect, &recipient_ids, ..)`, which
+    /// NARROWS an ordinary board-wide `affected_filter` down to the entrants — so
+    /// a PRE-EXISTING copy effect reaches a fresh entrant by FILTER MATCH, never
+    /// having to name it with `TargetFilter::SpecificObject`. The entrant would
+    /// then hold a continuous static (here an anthem) that the incremental arm
+    /// can never fan out over the pre-existing board, because pre-existing
+    /// objects are not reset — the same state `entered_object_blocks_incremental`
+    /// already escalates for, reached one step later. Neither existing guard sees
+    /// it: the entrant's own BASE carries no static, and the copy's source is a
+    /// pre-existing permanent whose filter counts nothing.
+    ///
+    /// REVERT-PROBE (discriminating, RUN): delete the `Layer::Copy` guard at the
+    /// end of `prepare_incremental_flush` ⇒ `layers_incremental == 1` and
+    /// `layers_full_eval == 0`, and this test fails on the branch assertions.
+    #[test]
+    fn entry_incremental_escalates_when_a_live_copy_payload_carries_a_static() {
+        let mut state = setup();
+        let player = PlayerId(0);
+        let template = make_creature(&mut state, "Template", 2, 2, player);
+        let mut copied_values = intrinsic_copiable_values(&state.objects[&template]);
+        Arc::make_mut(&mut copied_values.static_definitions).push(
+            StaticDefinition::continuous()
+                .affected(TargetFilter::Typed(
+                    TypedFilter::creature().controller(ControllerRef::You),
+                ))
+                .modifications(vec![ContinuousModification::AddPower { value: 1 }]),
+        );
+        // Board-wide `affected`, NOT `SpecificObject`: this is the shape that
+        // reaches an object which did not exist when the effect was registered.
+        let caster = make_creature(&mut state, "Caster", 1, 1, player);
+        state.add_transient_continuous_effect(
+            caster,
+            player,
+            Duration::Permanent,
+            TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
+            vec![ContinuousModification::CopyValues {
+                values: Box::new(copied_values),
+                display_source: crate::game::game_object::DisplaySource::Card,
+                printed_ref: None,
+                token_image_ref: None,
+            }],
+            None,
+        );
+        evaluate_layers(&mut state);
+
+        let entrant = make_creature(&mut state, "Entrant", 1, 1, player);
+        // Reach-guard asked of the guard ITSELF, not of a neighbouring field: this
+        // is the exact predicate `prepare_incremental_flush` consults first, and it
+        // reads the LIVE `static_definitions`. If it answered true the escalation
+        // below would be its doing and this test would stop probing the copy guard.
+        assert!(
+            !entered_object_blocks_incremental(&state, &state.objects[&entrant]),
+            "the entrant must be an ordinary entry, or the existing \
+             `entered_object_blocks_incremental` guard would escalate instead"
+        );
+
+        crate::game::perf_counters::reset();
+        state.layers_dirty = LayersDirty::EnteredObjects([entrant].into());
+        flush_layers(&mut state);
+        let counters = crate::game::perf_counters::snapshot();
+
+        assert_eq!(
+            counters.layers_full_eval, 1,
+            "a live copy effect whose payload grants a continuous static must force \
+             a full pass"
+        );
+        assert_eq!(
+            counters.layers_incremental, 0,
+            "the incremental arm must not run for this entry"
+        );
+        // POSITIVE reach-guard: the copy really did reach the entrant by filter
+        // match, so the escalation above is not vacuous.
+        assert!(
+            !state.objects[&entrant].static_definitions.is_empty(),
+            "the board-wide copy must have handed the entrant the payload's static"
+        );
+    }
+
+    /// The other side of that guard: a copy effect that provably names a
+    /// PRE-EXISTING permanent must NOT escalate. This is the ordinary resolved
+    /// clone — every Clone / Vizier copy on a board carries a `SpecificObject`
+    /// (or `SelfRef`) filter naming one permanent — so escalating on the mere
+    /// PRESENCE of a copy would drop every board that has ever resolved one back
+    /// onto the O(|battlefield|) full pass this module exists to avoid.
+    ///
+    /// It is sound because the incremental arm applies copies through
+    /// `apply_continuous_effect_to(state, effect, &recipient_ids, ..)`: a filter
+    /// naming a non-recipient intersects `recipient_ids` to the empty set, so it
+    /// can hand the entrant nothing, and the clone's own copy-granted static —
+    /// already live on it from the earlier full pass, never reset here — is picked
+    /// up by the top-of-pass `StaticSourceIndex` rebuild like any other generator.
+    /// The differential assertion below is what pins that: the entrant must come
+    /// out of the incremental flush wearing the CLONE's anthem.
+    ///
+    /// REVERT-PROBE (discriminating, RUN): drop
+    /// `effect_can_reach_incremental_recipients` from the guard ⇒
+    /// `layers_full_eval == 1` / `layers_incremental == 0` and the two branch
+    /// assertions fail.
+    #[test]
+    fn entry_incremental_stays_incremental_for_a_copy_naming_a_pre_existing_object() {
+        let mut state = setup();
+        let player = PlayerId(0);
+        let template = make_creature(&mut state, "Template", 2, 2, player);
+        let mut copied_values = intrinsic_copiable_values(&state.objects[&template]);
+        Arc::make_mut(&mut copied_values.static_definitions).push(
+            StaticDefinition::continuous()
+                .affected(TargetFilter::Typed(
+                    TypedFilter::creature().controller(ControllerRef::You),
+                ))
+                .modifications(vec![ContinuousModification::AddPower { value: 1 }]),
+        );
+        // The clone exists BEFORE the flush under test, and the copy effect names
+        // it — the shape a resolved clone actually has on a live board.
+        let clone = make_creature(&mut state, "Clone", 1, 1, player);
+        let caster = make_creature(&mut state, "Caster", 1, 1, player);
+        state.add_transient_continuous_effect(
+            caster,
+            player,
+            Duration::Permanent,
+            TargetFilter::SpecificObject { id: clone },
+            vec![ContinuousModification::CopyValues {
+                values: Box::new(copied_values),
+                display_source: crate::game::game_object::DisplaySource::Card,
+                printed_ref: None,
+                token_image_ref: None,
+            }],
+            None,
+        );
+        evaluate_layers(&mut state);
+
+        // POSITIVE reach-guards, both on the live fields the guard consults: the
+        // copy really did land, so `copy_grants_continuous_static` answers TRUE for
+        // this effect and the only thing keeping the flush incremental is the reach
+        // test. Without this the assertions below would pass for the wrong reason.
+        assert!(
+            !state.objects[&clone].static_definitions.is_empty(),
+            "the clone must be carrying the payload's continuous static, or the \
+             guard's copy branch is never exercised"
+        );
+
+        let entrant = make_creature(&mut state, "Entrant", 1, 1, player);
+        // Same reach-guard as the escalating sibling, asked of the predicate itself
+        // (it reads the LIVE `static_definitions`, not the base).
+        assert!(
+            !entered_object_blocks_incremental(&state, &state.objects[&entrant]),
+            "the entrant must be an ordinary entry, or the incremental arm would be \
+             refused for a reason unrelated to the copy guard"
+        );
+
+        crate::game::perf_counters::reset();
+        state.layers_dirty = LayersDirty::EnteredObjects([entrant].into());
+        flush_layers(&mut state);
+        let counters = crate::game::perf_counters::snapshot();
+
+        assert_eq!(
+            counters.layers_incremental, 1,
+            "a copy confined to a pre-existing permanent cannot reach the entrant, \
+             so the flush must stay incremental"
+        );
+        assert_eq!(
+            counters.layers_full_eval, 0,
+            "no full pass may be forced by a copy the entrant is out of reach of"
+        );
+        // CR 613.2c: after layer 1 the clone's copied static is part of the board,
+        // so its anthem must reach the entrant on THIS path — 1/1 printed, +1/+0
+        // from the clone.
+        assert_eq!(
+            (
+                state.objects[&entrant].power,
+                state.objects[&entrant].toughness
+            ),
+            (Some(2), Some(1)),
+            "the entrant must still receive the clone's copy-granted anthem"
+        );
+    }
+
+    /// CR 613.2a: `copy_grants_continuous_static` answers over the COMPLETE
+    /// `Layer::Copy` modification set, and its `_ => false` arm is exact rather
+    /// than a fallback guess. Every variant here is also asserted to report
+    /// `Layer::Copy` (and the layers-2-7 sample NOT to), which pins the claim the
+    /// catch-all rests on. `layer()` itself is deliberately not consulted by the
+    /// function under test: six of its arms are `unreachable!()` panics, so the
+    /// `debug_assert_eq!(other.layer(), Layer::Copy)` guard this replaced could
+    /// abort inside itself — `AddCounterOnEnter` below is one such variant and is
+    /// answered without ever asking for its layer.
+    #[test]
+    fn copy_grants_continuous_static_covers_every_copy_layer_variant() {
+        let mut state = setup();
+        let player = PlayerId(0);
+        let donor = make_creature(&mut state, "Donor", 2, 2, player);
+        let plain_values = intrinsic_copiable_values(&state.objects[&donor]);
+        assert!(
+            plain_values.static_definitions.is_empty(),
+            "the vanilla donor must carry no static, or the negative case below \
+             would not be a negative case"
+        );
+        let mut anthem_values = plain_values.clone();
+        Arc::make_mut(&mut anthem_values.static_definitions).push(
+            StaticDefinition::continuous()
+                .modifications(vec![ContinuousModification::AddPower { value: 1 }]),
+        );
+        // Same shape, but the payload's static is a LAYER-1 one — the only thing
+        // that can extend sublayer 1a's discovery chain.
+        let mut copy_static_values = plain_values.clone();
+        Arc::make_mut(&mut copy_static_values.static_definitions).push(
+            StaticDefinition::continuous().modifications(vec![ContinuousModification::SetName {
+                name: "Renamed".into(),
+            }]),
+        );
+        let copy_of = |values: CopiableValues| ContinuousModification::CopyValues {
+            values: Box::new(values),
+            display_source: crate::game::game_object::DisplaySource::Card,
+            printed_ref: None,
+            token_image_ref: None,
+        };
+
+        // The whole `Layer::Copy` set: (modification, adds ANY generator, adds a
+        // COPY-LAYER generator). The two columns are the two different questions
+        // layer 1 asks, and the anthem row is where they must disagree.
+        let copy_layer_cases = [
+            // Payload-exact: the copiable static set travels inside the
+            // modification, so no live-source read and no battlefield rescan.
+            // An anthem makes its recipient a generator for layers 2-7 but can
+            // never appear in a `Layer::Copy` gather, so it must NOT buy a
+            // discovery generation.
+            (copy_of(anthem_values), true, false),
+            (copy_of(copy_static_values), true, true),
+            (copy_of(plain_values), false, false),
+            // CR 707.9a: merges the source's whole printed set, INCLUDING its
+            // `base_static_definitions`, onto the recipient (see the apply arm).
+            // The live source is not in the payload, so both answers are
+            // conservative.
+            (
+                ContinuousModification::RetainAllOtherAbilitiesFromSource,
+                true,
+                true,
+            ),
+            // CR 707.9a: pushes ONE `AbilityDefinition` onto `obj.abilities`;
+            // `static_definitions` is structurally out of reach.
+            (
+                ContinuousModification::RetainPrintedAbilityFromSource {
+                    source_ability_index: 0,
+                },
+                false,
+                false,
+            ),
+            // CR 707.9a: pushes one trigger; likewise never a static.
+            (
+                ContinuousModification::RetainPrintedTriggerFromSource {
+                    source_trigger_index: 0,
+                },
+                false,
+                false,
+            ),
+            // CR 707.9b: name-only override.
+            (
+                ContinuousModification::SetName {
+                    name: "Renamed".into(),
+                },
+                false,
+                false,
+            ),
+            // CR 707.2c: parse-time marker whose apply arm is an explicit no-op.
+            (ContinuousModification::CopyChosen, false, false),
+        ];
+        for (modification, expected_any, expected_copy_layer) in &copy_layer_cases {
+            assert_eq!(
+                modification.layer(),
+                Layer::Copy,
+                "{modification:?} must be a layer-1 modification for this table to be \
+                 the complete `Layer::Copy` set"
+            );
+            // Pins the panic-free companion to `layer()` over the same set — the
+            // invariant `is_copy_layer`'s doc claims.
+            assert!(
+                modification.is_copy_layer(),
+                "{modification:?} is in the `Layer::Copy` set, so `is_copy_layer` \
+                 must agree with `layer()`"
+            );
+            assert_eq!(
+                copy_grants_continuous_static(modification),
+                *expected_any,
+                "wrong generator answer for {modification:?}"
+            );
+            assert_eq!(
+                copy_grants_copy_layer_static(modification),
+                *expected_copy_layer,
+                "wrong copy-layer generator answer for {modification:?}"
+            );
+        }
+
+        // Layers 2-7 fall to the catch-all. `AddCounterOnEnter` is one of the six
+        // variants whose `layer()` is `unreachable!()`, so it is exactly the input
+        // that made the replaced `debug_assert_eq!(other.layer(), ..)` unsafe —
+        // and exactly why `is_copy_layer` exists to be asked instead.
+        for modification in [
+            ContinuousModification::AddCounterOnEnter {
+                counter_type: CounterType::Plus1Plus1,
+                count: QuantityExpr::Fixed { value: 1 },
+                if_type: None,
+            },
+            ContinuousModification::AddPower { value: 1 },
+        ] {
+            assert!(
+                !modification.is_copy_layer(),
+                "{modification:?} is not a layer-1 modification"
+            );
+            assert!(
+                !copy_grants_continuous_static(&modification),
+                "{modification:?} is not a layer-1 modification and must not claim to \
+                 add a generator"
+            );
+            assert!(
+                !copy_grants_copy_layer_static(&modification),
+                "{modification:?} is not a layer-1 modification and must not buy a \
+                 discovery generation"
+            );
+        }
+    }
+
+    /// CR 707.2c + CR 613.2c: sublayer 1a runs to a FIXED POINT on the exact
+    /// construction the deleted `MAX_COPY_SUBLAYER_GENERATIONS = 8` named — "two
+    /// permanents that rewrite each other's static sets". Reaching the assertions
+    /// at all IS the termination evidence; the assertions are the CR-correctness
+    /// evidence.
+    ///
+    /// Each half of the pair is copied from a donor whose copiable values carry a
+    /// copy-LAYER static (CR 707.2), so BOTH second-generation effects exist only
+    /// because the first generation applied, in both directions at once. The board
+    /// is synthetic in the sense that no printed pair does exactly this, but every
+    /// piece is a real mechanism: a latched `CopyValues` TCE (the only way a copy
+    /// effect can originate — `apply_continuous_effect` requires `transient_id` for
+    /// it) whose payload carries a `SetName` copy exception.
+    ///
+    /// The two copy-granted renames land on neutral watchers rather than on the
+    /// pair itself, ON PURPOSE. Two permanents copying each other is a CR 613.8b
+    /// dependency LOOP, so the engine correctly discards the dependency edges and
+    /// falls back to timestamp order, under which each half's older static applies
+    /// before the newer `CopyValues` overwrites its name. That is a separate rule
+    /// from the one under test, and asserting on the pair's own names would pin
+    /// 613.8b's tie-break instead of 1a's fixed point.
+    ///
+    /// REVERT-PROBE (discriminating, run): make the loop return after its first
+    /// generation ⇒ both watchers keep their printed names and both rename
+    /// assertions fail, while the copy assertions stay green.
+    #[test]
+    fn mutually_copying_permanents_reach_a_layer_one_fixed_point() {
+        let mut state = setup();
+        let player = PlayerId(0);
+        let left = make_creature(&mut state, "Left", 1, 1, player);
+        let right = make_creature(&mut state, "Right", 1, 1, player);
+        let watcher_l = make_creature(&mut state, "Watcher L", 1, 1, player);
+        let watcher_r = make_creature(&mut state, "Watcher R", 1, 1, player);
+        let donor_p = make_creature(&mut state, "Donor P", 4, 4, player);
+        let donor_q = make_creature(&mut state, "Donor Q", 5, 5, player);
+
+        // Donor payloads: each carries a copy-layer static that renames a watcher.
+        let renames = |state: &GameState, donor: ObjectId, target: ObjectId, name: &str| {
+            let mut values = intrinsic_copiable_values(&state.objects[&donor]);
+            Arc::make_mut(&mut values.static_definitions).push(
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::SpecificObject { id: target })
+                    .modifications(vec![ContinuousModification::SetName {
+                        name: name.to_string(),
+                    }]),
+            );
+            values
+        };
+        let p_values = renames(&state, donor_p, watcher_l, "Marked by right");
+        let q_values = renames(&state, donor_q, watcher_r, "Marked by left");
+
+        let mut copy_onto = |source: ObjectId, target: ObjectId, values: CopiableValues| {
+            state.add_transient_continuous_effect(
+                source,
+                player,
+                Duration::Permanent,
+                TargetFilter::SpecificObject { id: target },
+                vec![ContinuousModification::CopyValues {
+                    values: Box::new(values),
+                    display_source: crate::game::game_object::DisplaySource::Card,
+                    printed_ref: None,
+                    token_image_ref: None,
+                }],
+                None,
+            );
+        };
+        // `left` copies donor P onto `right`; `right` copies donor Q onto `left`.
+        copy_onto(left, right, p_values);
+        copy_onto(right, left, q_values);
+
+        // POSITIVE reach-guards, on the live field the top-of-pass reset writes and
+        // `for_each_static_effect_source` gathers: neither permanent carries a
+        // PRINTED static, so every second-generation effect below can only exist
+        // because generation 1's copy put it there.
+        assert!(
+            state.objects[&left].base_static_definitions.is_empty()
+                && state.objects[&right].base_static_definitions.is_empty(),
+            "neither half of the pair may carry a printed static, or the renames \
+             would not depend on the copies at all"
+        );
+
+        evaluate_layers(&mut state);
+
+        assert!(
+            !state.objects[&left].static_definitions.is_empty()
+                && !state.objects[&right].static_definitions.is_empty(),
+            "each copy must have handed its recipient the donor's copy-layer static, \
+             or there is no second generation to reach a fixed point over"
+        );
+        // CR 707.2: each half took its donor's copiable P/T.
+        assert_eq!(
+            (state.objects[&right].power, state.objects[&right].toughness),
+            (Some(4), Some(4)),
+            "the right half must be a copy of donor P"
+        );
+        assert_eq!(
+            (state.objects[&left].power, state.objects[&left].toughness),
+            (Some(5), Some(5)),
+            "the left half must be a copy of donor Q"
+        );
+        // Generation 2, both directions at once: each half's copy-granted static
+        // reached its watcher inside this same layer-1 pass.
+        assert_eq!(
+            state.objects[&watcher_l].name, "Marked by right",
+            "the copy-granted static on the RIGHT half must apply inside the same \
+             layer-1 pass that applied the copy"
+        );
+        assert_eq!(
+            state.objects[&watcher_r].name, "Marked by left",
+            "the copy-granted static on the LEFT half must apply inside the same \
+             layer-1 pass that applied the copy"
+        );
+    }
+
+    /// CR 613.2a: `copy_grants_continuous_static` is the WRONG question for
+    /// CONTINUING sublayer 1a's discovery loop. An anthem makes its recipient a
+    /// `StaticSourceIndex` generator, which layers 2-7 must see, but it can never
+    /// appear in a `Layer::Copy` gather — so answering the broad question at the
+    /// continuation site charged every board holding a cloned lord for an extra
+    /// index rebuild plus an extra board-wide
+    /// `collect_shared_active_continuous_effects`, inside the module whose stated
+    /// job is keeping per-flush work off `|battlefield|`.
+    ///
+    /// Three boards differing ONLY in the copy payload's static set, measured in
+    /// board-wide gathers.
+    ///
+    /// REVERT-PROBE (discriminating, run): put `copy_grants_continuous_static`
+    /// back at the loop-continuation site ⇒ the anthem board costs one gather more
+    /// than the vanilla board and the first assertion fails.
+    #[test]
+    fn only_a_copy_layer_payload_buys_a_layer_one_discovery_generation() {
+        /// Returns (board-wide gathers during the pass, statics landed on the
+        /// recipient).
+        fn probe(payload_static: Option<StaticDefinition>) -> (usize, usize) {
+            let mut state = setup();
+            let player = PlayerId(0);
+            let template = make_creature(&mut state, "Template", 2, 2, player);
+            let recipient = make_creature(&mut state, "Recipient", 1, 1, player);
+            let caster = make_creature(&mut state, "Caster", 1, 1, player);
+            let mut values = intrinsic_copiable_values(&state.objects[&template]);
+            assert!(
+                values.static_definitions.is_empty(),
+                "the template must be vanilla so the payload static is the only variable"
+            );
+            if let Some(def) = payload_static {
+                Arc::make_mut(&mut values.static_definitions).push(def);
+            }
+            state.add_transient_continuous_effect(
+                caster,
+                player,
+                Duration::Permanent,
+                TargetFilter::SpecificObject { id: recipient },
+                vec![ContinuousModification::CopyValues {
+                    values: Box::new(values),
+                    display_source: crate::game::game_object::DisplaySource::Card,
+                    printed_ref: None,
+                    token_image_ref: None,
+                }],
+                None,
+            );
+            reset_active_effect_collection_count();
+            evaluate_layers(&mut state);
+            (
+                active_effect_collection_count(),
+                state.objects[&recipient].static_definitions.len(),
+            )
+        }
+
+        let board_wide =
+            || TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You));
+        let (vanilla_gathers, vanilla_statics) = probe(None);
+        let (anthem_gathers, anthem_statics) = probe(Some(
+            StaticDefinition::continuous()
+                .affected(board_wide())
+                .modifications(vec![ContinuousModification::AddPower { value: 1 }]),
+        ));
+        // Same shape, but a `Layer::Copy` modification — the only kind that can
+        // show up in the next gather.
+        let (copy_layer_gathers, copy_layer_statics) = probe(Some(
+            StaticDefinition::continuous()
+                .affected(board_wide())
+                .modifications(vec![ContinuousModification::SetName {
+                    name: "Renamed".into(),
+                }]),
+        ));
+
+        // POSITIVE reach-guards: the payload static really landed on the recipient
+        // in both static cases, so the gather counts below are not comparing two
+        // boards where the copy did nothing.
+        assert_eq!(
+            vanilla_statics, 0,
+            "the vanilla control must land no static"
+        );
+        assert_eq!(
+            anthem_statics, 1,
+            "the anthem payload must reach the recipient"
+        );
+        assert_eq!(
+            copy_layer_statics, 1,
+            "the copy-layer payload must reach the recipient"
+        );
+
+        assert_eq!(
+            anthem_gathers, vanilla_gathers,
+            "cloning an ordinary lord must buy no layer-1 discovery generation: an \
+             anthem is a layer-7c effect and cannot appear in a `Layer::Copy` gather"
+        );
+        assert_eq!(
+            copy_layer_gathers,
+            vanilla_gathers + 1,
+            "a copy-LAYER payload static must buy exactly one discovery generation"
+        );
+    }
+
     /// Shared reach-guard: run ONLY the guard from a Clean baseline and assert it
     /// forces a full escalation (the `mark_layers_full` the guarded site would
     /// otherwise call unconditionally).
@@ -20344,5 +25672,242 @@ mod tests {
             matches!(state.layers_dirty, LayersDirty::Full),
             "a live life-reading continuous static must force full escalation"
         );
+    }
+
+    /// CR 613.1: the characteristic a layer exists to rewrite, or `None` for
+    /// layer 1 (CR 613.1a — copy effects rewrite the whole copiable-value set,
+    /// so no single kind is implied) and for the counter sublayer (CR 613.4c —
+    /// counters are not continuous modifications).
+    fn layer_implied_kind(layer: Layer) -> Option<CharacteristicKinds> {
+        match layer {
+            // CR 613.1a: copy effects rewrite every copiable value at once.
+            Layer::Copy => None,
+            // CR 613.1b.
+            Layer::Control => Some(CharacteristicKinds::CONTROLLER),
+            // CR 613.1c.
+            Layer::Text => Some(CharacteristicKinds::NAME_TEXT),
+            // CR 613.1d.
+            Layer::Type => Some(CharacteristicKinds::CARD_TYPES),
+            // CR 613.1e.
+            Layer::Color => Some(CharacteristicKinds::COLOR),
+            // CR 613.1f.
+            Layer::Ability => Some(CharacteristicKinds::ABILITIES),
+            // CR 613.4a-d.
+            Layer::CharDef | Layer::SetPT | Layer::ModifyPT | Layer::SwitchPT => {
+                Some(CharacteristicKinds::POWER_TOUGHNESS)
+            }
+            // CR 613.4c: no `ContinuousModification` maps here.
+            Layer::CounterPT => None,
+        }
+    }
+
+    /// Every `ContinuousModification` variant that reaches the layer pipeline.
+    ///
+    /// The six omitted variants are exactly the ones whose `layer()` arm is
+    /// `unreachable!()` — `RemoveManaCost`, `AddCounterOnEnter`,
+    /// `SetStartingLoyalty` (all consumed at copy resolution) and the three
+    /// combat-damage assignment rules (applied after layer evaluation). They
+    /// have no layer to be consistent with, so the check below cannot include
+    /// them; their kinds are still pinned by the exhaustive `match` in
+    /// `modification_characteristic_writes_at`.
+    fn every_layered_modification() -> Vec<ContinuousModification> {
+        use crate::types::ability::{
+            ColorChangeMode, CopiableValues, CostDerivation, ReplacementDefinition,
+        };
+        use crate::types::card_type::{CardType, SubtypeSet};
+        use crate::types::keywords::{CostBearingKeywordKind, DynamicKeywordKind};
+        let dynamic = QuantityExpr::Fixed { value: 1 };
+        vec![
+            // ---- Layer 1 (CR 613.1a). ----
+            ContinuousModification::CopyValues {
+                values: Box::new(CopiableValues {
+                    name: "Copy".to_string(),
+                    mana_cost: ManaCost::default(),
+                    color: Vec::new(),
+                    card_types: CardType::default(),
+                    power: None,
+                    toughness: None,
+                    loyalty: None,
+                    printed_loyalty: None,
+                    keywords: Vec::new(),
+                    abilities: Arc::new(Vec::new()),
+                    trigger_definitions: Arc::new(Vec::new()),
+                    trigger_printed_origins: Arc::new(Vec::new()),
+                    replacement_definitions: Arc::new(Vec::new()),
+                    static_definitions: Arc::new(Vec::new()),
+                    room_halves: None,
+                    name_origin: Default::default(),
+                }),
+                display_source: Default::default(),
+                printed_ref: None,
+                token_image_ref: None,
+            },
+            ContinuousModification::CopyChosen,
+            ContinuousModification::SetName {
+                name: "N".to_string(),
+            },
+            ContinuousModification::RetainPrintedTriggerFromSource {
+                source_trigger_index: 0,
+            },
+            ContinuousModification::RetainPrintedAbilityFromSource {
+                source_ability_index: 0,
+            },
+            ContinuousModification::RetainAllOtherAbilitiesFromSource,
+            // ---- Layer 2 (CR 613.1b). ----
+            ContinuousModification::ChangeController,
+            // ---- Layer 3 (CR 613.1c). ----
+            ContinuousModification::SetTextName {
+                name: "N".to_string(),
+            },
+            ContinuousModification::SetChosenName,
+            // ---- Layer 4 (CR 613.1d). ----
+            ContinuousModification::AddType {
+                core_type: CoreType::Creature,
+            },
+            ContinuousModification::RemoveType {
+                core_type: CoreType::Creature,
+            },
+            ContinuousModification::SetCardTypes {
+                core_types: vec![CoreType::Creature],
+            },
+            ContinuousModification::AddSubtype {
+                subtype: "Bear".to_string(),
+            },
+            ContinuousModification::RemoveSubtype {
+                subtype: "Bear".to_string(),
+            },
+            ContinuousModification::RemoveAllSubtypes {
+                set: SubtypeSet::Creature,
+            },
+            ContinuousModification::AddAllCreatureTypes,
+            ContinuousModification::AddAllBasicLandTypes,
+            ContinuousModification::AddAllLandTypes,
+            ContinuousModification::AddChosenSubtype {
+                kind: ChosenSubtypeKind::CreatureType,
+            },
+            ContinuousModification::AddSupertype {
+                supertype: Supertype::Legendary,
+            },
+            ContinuousModification::RemoveSupertype {
+                supertype: Supertype::Legendary,
+            },
+            ContinuousModification::SetBasicLandType {
+                land_type: BasicLandType::Forest,
+            },
+            ContinuousModification::SetChosenBasicLandType,
+            // ---- Layer 5 (CR 613.1e). ----
+            ContinuousModification::SetColor {
+                colors: vec![ManaColor::Green],
+            },
+            ContinuousModification::AddColor {
+                color: ManaColor::Green,
+            },
+            ContinuousModification::AddChosenColor {
+                mode: ColorChangeMode::default(),
+            },
+            // ---- Layer 6 (CR 613.1f). ----
+            ContinuousModification::AddKeyword {
+                keyword: Keyword::Flying,
+            },
+            ContinuousModification::RemoveKeyword {
+                keyword: Keyword::Flying,
+            },
+            ContinuousModification::AddChosenKeyword,
+            ContinuousModification::RemoveChosenKeyword,
+            ContinuousModification::AddDynamicKeyword {
+                kind: DynamicKeywordKind::Annihilator,
+                value: dynamic.clone(),
+            },
+            ContinuousModification::AddKeywordWithDerivedCost {
+                kind: CostBearingKeywordKind::Foretell,
+                derivation: CostDerivation::ManaCostReducedBy(ManaCost::default()),
+            },
+            ContinuousModification::GrantAbility {
+                definition: Box::new(AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        player: TargetFilter::Controller,
+                    },
+                )),
+            },
+            ContinuousModification::GrantAllActivatedAbilitiesOf {
+                source: TargetFilter::SelfRef,
+                cap: None,
+            },
+            ContinuousModification::GrantAllTriggeredAbilitiesOf {
+                source: TargetFilter::SelfRef,
+            },
+            ContinuousModification::GrantTrigger {
+                trigger: Box::new(TriggerDefinition::new(TriggerMode::ChangesZone)),
+            },
+            ContinuousModification::GrantReplacement {
+                replacement: Box::new(ReplacementDefinition::new(ReplacementEvent::DamageDone)),
+            },
+            ContinuousModification::RemoveAllAbilities,
+            ContinuousModification::AddStaticMode {
+                mode: StaticMode::Continuous,
+            },
+            ContinuousModification::GrantStaticAbility {
+                definition: Box::new(StaticDefinition::new(StaticMode::Continuous)),
+            },
+            // ---- Layer 7 (CR 613.4a-d). ----
+            ContinuousModification::SetDynamicPower {
+                value: dynamic.clone(),
+            },
+            ContinuousModification::SetDynamicToughness {
+                value: dynamic.clone(),
+            },
+            ContinuousModification::SetPower { value: 1 },
+            ContinuousModification::SetToughness { value: 1 },
+            ContinuousModification::SetPowerDynamic {
+                value: dynamic.clone(),
+            },
+            ContinuousModification::SetToughnessDynamic {
+                value: dynamic.clone(),
+            },
+            ContinuousModification::AddPower { value: 1 },
+            ContinuousModification::AddToughness { value: 1 },
+            ContinuousModification::AddDynamicPower {
+                value: dynamic.clone(),
+            },
+            ContinuousModification::AddDynamicToughness { value: dynamic },
+            ContinuousModification::SwitchPowerToughness,
+        ]
+    }
+
+    /// CR 613.1: a modification's declared LAYER and its declared WRITE KIND
+    /// are two views of the same fact, so they must agree — an effect applied
+    /// in the type-changing layer must report that it writes card types, and so
+    /// on. This is the second tripwire on `modification_characteristic_writes`:
+    /// the exhaustive wildcard-free `match` catches a variant that was never
+    /// classified, and this catches one that was classified into the WRONG
+    /// kind (which the gate would silently under-escalate on).
+    ///
+    /// Both directions are only a containment, not an equality: a modification
+    /// may write MORE than its layer implies. CR 305.7's `SetBasicLandType`
+    /// sits in layer 4 but also strips abilities, and CR 613.1f's
+    /// `RemoveAllAbilities` sits in layer 6 but is classified `ALL` because it
+    /// turns off characteristic-defining abilities (CR 604.3).
+    #[test]
+    fn modification_write_kinds_agree_with_their_layer() {
+        for m in every_layered_modification() {
+            let writes = modification_characteristic_writes(&m);
+            let layer = m.layer();
+            let Some(implied) = layer_implied_kind(layer) else {
+                // Layer 1: no single implied kind, but a copy effect always
+                // rewrites SOMETHING.
+                assert!(
+                    !writes.is_empty(),
+                    "{m:?} is a layer-1 copy effect but was classified as writing nothing"
+                );
+                continue;
+            };
+            assert!(
+                writes.contains(implied),
+                "{m:?} is applied in {layer:?} but its write kinds {writes:?} do not \
+                 include the characteristic that layer exists to rewrite ({implied:?})"
+            );
+        }
     }
 }

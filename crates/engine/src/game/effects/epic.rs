@@ -78,6 +78,10 @@ pub(crate) fn epic_upkeep_trigger(effect: &EpicEffect) -> DelayedTrigger {
             phase: Phase::Upkeep,
             player: effect.controller,
             gate: crate::types::ability::TurnGate::None,
+            // Already-concrete `player` (synthesized fresh each upkeep, never
+            // passed through the placeholder-resolving `resolve()` path), so
+            // `binding` is unread here; `Controller` is the accurate label.
+            binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
         },
         ability: Box::new(ResolvedAbility::new(
             Effect::EpicCopy {
@@ -92,6 +96,7 @@ pub(crate) fn epic_upkeep_trigger(effect: &EpicEffect) -> DelayedTrigger {
         // Synthesized fresh each upkeep; the one-shot flag is irrelevant because
         // it is never stored — `epic_effects` is the persistent generator.
         one_shot: true,
+        provenance: crate::types::identifiers::DelayedInstallIdentity::LegacyDelayed,
     }
 }
 
@@ -162,6 +167,7 @@ pub(crate) fn resolve(
                 actual_mana_spent: 0,
             },
         },
+        None,
         events,
     );
 

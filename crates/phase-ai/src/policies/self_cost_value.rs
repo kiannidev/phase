@@ -31,6 +31,39 @@
 //! its softmax weight is `exp(-inf) = 0`. So a graduated "discouragement" on a
 //! trade this policy has certified as a loss means "do it eventually", which is
 //! the opposite of what the certification says.
+//!
+//! # Why the trivial-payoff bound is a life COUNT and not a price
+//!
+//! The law above says a bound cannot be enforced by a rate — but stating a bound
+//! still requires choosing the unit it is expressed in, and for the trivial
+//! branch that unit is the resource, not its price.
+//!
+//! `self_cost::real_self_cost` prices pay-life at `points *
+//! self_cost_pay_life_per_point` (0.15/point), multiplied by 4.0 only when life
+//! is already a pressured resource. An unpressured Adanto Vanguard ("Pay 4 life:
+//! this creature gains indestructible until end of turn") therefore prices at
+//! 0.60, under `REAL_COST_FLOOR`, and lands on the graduated `self_cost_marginal`
+//! branch — a −0.60 rate against an ability that can be activated in every
+//! priority window, which is exactly the shape the law above forbids. Raising
+//! `self_cost_pay_life_per_point` until 4 life clears the floor would reach that
+//! case, but only by moving every *priced* comparison a life leg participates in
+//! (the `Priced` arm's net, every mixed-cost outlet boundary) — a measured AI
+//! behaviour change that needs an ai-gate calibration to justify.
+//!
+//! The veto side needs no calibration at all, because it never compares against
+//! a benefit: the payoff has already been certified trivial. So the question it
+//! asks is the one the player actually faces — **is this at least
+//! `self_cost_material_life` life?** A count is the right unit for the same
+//! reason `-inf` is the right verdict: the answer must not move when the rate
+//! moves, and must not drift when CMA-ES retrains the per-point price.
+//!
+//! **The veto fires only on a Trivial-proper chain**
+//! (`BenefitAppraisal::Trivial { any_unmodeled: false }`), where every effect
+//! was explicitly classified trivial. A chain carrying an unmodeled effect —
+//! `Effect::Pump` among them, so the whole Desolation Prowler class ("Pay 2
+//! life: this creature gets +2/+2 until end of turn") — reports "no payoff" only
+//! as an absence of evidence, so it keeps the graduated branch. Its activation
+//! *timing* is a separate policy's job, not this one's.
 
 use engine::types::ability::AbilityTag;
 use engine::types::actions::GameAction;
@@ -40,8 +73,9 @@ use engine::types::player::PlayerId;
 use super::context::PolicyContext;
 use super::registry::{DecisionKind, PolicyId, PolicyReason, PolicyVerdict, TacticalPolicy};
 use super::self_cost::{
-    appraise_benefit, real_self_cost, self_cost_in_scope, self_counter_cost_preview,
-    synergy_justifies_self_cost, BenefitAppraisal, SelfCounterCostPreview,
+    appraise_benefit, cost_is_material, real_self_cost, self_cost_in_scope,
+    self_counter_cost_preview, synergy_justifies_self_cost, BenefitAppraisal,
+    SelfCounterCostPreview,
 };
 use crate::features::DeckFeatures;
 
@@ -112,7 +146,7 @@ impl TacticalPolicy for SelfCostValuePolicy {
             .cloned()
             .unwrap_or_default();
 
-        if synergy_justifies_self_cost(&features, ctx.state, ctx.ai_player, &ability) {
+        if synergy_justifies_self_cost(&features, &ability) {
             return PolicyVerdict::neutral(PolicyReason::new("self_cost_synergy_justified"));
         }
 
@@ -128,8 +162,23 @@ impl TacticalPolicy for SelfCostValuePolicy {
             &ability,
             ctx.penalties(),
         ) {
-            BenefitAppraisal::Trivial => {
-                if cost_value >= REAL_COST_FLOOR {
+            BenefitAppraisal::Trivial { any_unmodeled } => {
+                // Two independent grounds for the same categorical veto. The
+                // priced one applies to every chain that reached here. The
+                // materiality one is restricted to Trivial-PROPER chains: with
+                // an unmodeled effect in the chain, "trivial" is an absence of
+                // evidence rather than a finding, and a bound may not rest on
+                // it. See the module docs for why the second is a life count.
+                if cost_value >= REAL_COST_FLOOR
+                    || (!any_unmodeled
+                        && cost_is_material(
+                            ctx.state,
+                            ctx.ai_player,
+                            *source_id,
+                            cost,
+                            ctx.penalties(),
+                        ))
+                {
                     return PolicyVerdict::reject(
                         PolicyReason::new("self_cost_trivial_benefit")
                             .with_fact("cost_milli", cost_milli)
@@ -246,17 +295,19 @@ mod tests {
     use crate::features::lifegain::LifegainFeature;
     use crate::features::reanimator::ReanimatorFeature;
     use crate::features::DeckFeatures;
+    use crate::policies::self_cost::{chain_effect_trivialities, EffectTriviality};
     use crate::session::AiSession;
     use engine::ai_support::{ActionMetadata, AiDecisionContext, CandidateAction, TacticalClass};
     use engine::game::bracket_estimate::CommanderBracketTier;
     use engine::game::effects::draw::can_draw_at_least_one;
     use engine::game::zones::create_object;
     use engine::types::ability::{
-        AbilityCost, AbilityDefinition, AbilityKind, ContinuousModification, ControllerRef,
-        DrawReplacementScope, Effect, ManaContribution, ManaProduction, ObjectScope, QuantityExpr,
-        QuantityModification, QuantityRef, ReplacementCondition, ReplacementDefinition,
-        ReplacementMode, ReplacementPlayerScope, SacrificeCost, StaticDefinition, TargetFilter,
-        TypeFilter, TypedFilter,
+        AbilityCost, AbilityDefinition, AbilityKind, CardSelectionMode, ContinuousModification,
+        ControllerRef, DiscardSelfScope, DrawReplacementScope, Duration, Effect, ManaContribution,
+        ManaProduction, ObjectScope, PlayerScope, PtValue, QuantityExpr, QuantityModification,
+        QuantityRef, ReplacementCondition, ReplacementDefinition, ReplacementMode,
+        ReplacementPlayerScope, SacrificeCost, StaticDefinition, TargetFilter, TypeFilter,
+        TypedFilter,
     };
     use engine::types::card_type::CoreType;
     use engine::types::counter::{CounterMatch, CounterType};
@@ -367,6 +418,95 @@ mod tests {
             target: Some(TargetFilter::SelfRef),
             duration: None,
             end_cost: None,
+        }
+    }
+
+    /// Adanto Vanguard's payoff: "This creature gains indestructible until end
+    /// of turn."
+    ///
+    /// Rebuilt from the parsed shape in `data/card-data.json`
+    /// (`.["adanto vanguard"].abilities[0].effect`): `target: null` and
+    /// `duration: "UntilEndOfTurn"`, with the static's `affected: SelfRef`. The
+    /// `affected` field is the load-bearing one — `is_self_protection_effect`
+    /// reads the outer `target` only as the fallback for an inner
+    /// `ParentTarget`, so this classifies as self-protection on `affected`
+    /// alone, exactly as the printed card does.
+    fn indestructible_self_grant() -> Effect {
+        Effect::GenericEffect {
+            static_abilities: vec![StaticDefinition::continuous()
+                .affected(TargetFilter::SelfRef)
+                .modifications(vec![ContinuousModification::AddKeyword {
+                    keyword: Keyword::Indestructible,
+                }])],
+            target: None,
+            duration: Some(Duration::UntilEndOfTurn),
+            end_cost: None,
+        }
+    }
+
+    /// Selenia, Dark Angel / Crovax, Ascendant Hero: "Pay 2 life: Return ~ to
+    /// its owner's hand."
+    ///
+    /// Rebuilt from the parsed shape in `data/card-data.json`
+    /// (`.["selenia, dark angel"].abilities[0]`): `Bounce` with
+    /// `target: SelfRef` and `destination: null`, cost `PayLife { Fixed 2 }`.
+    fn self_bounce() -> Effect {
+        Effect::Bounce {
+            target: TargetFilter::SelfRef,
+            destination: None,
+            selection: Default::default(),
+        }
+    }
+
+    /// Puts an opponent-controlled `Destroy` on the stack aimed at `victim`, so
+    /// `any_immediate_threat` sees a live threat to an AI permanent.
+    fn stack_removal_targeting(state: &mut GameState, victim: ObjectId) {
+        use engine::types::ability::{ResolvedAbility, TargetRef};
+        use engine::types::game_state::{StackEntry, StackEntryKind};
+
+        let spell_id = create_object(
+            state,
+            CardId(next_id()),
+            OPP,
+            "Doom Blade".to_string(),
+            Zone::Stack,
+        );
+        let ability = ResolvedAbility::new(
+            Effect::Destroy {
+                target: TargetFilter::Any,
+                cant_regenerate: false,
+            },
+            vec![TargetRef::Object(victim)],
+            spell_id,
+            OPP,
+        );
+        state.stack.push_back(StackEntry {
+            id: spell_id,
+            source_id: spell_id,
+            controller: OPP,
+            kind: StackEntryKind::Spell {
+                card_id: CardId(99),
+                ability: Some(Box::new(ability)),
+                casting_variant: Default::default(),
+                actual_mana_spent: 0,
+            },
+        });
+    }
+
+    /// Desolation Prowler's payoff: "This creature gets +2/+2 until end of
+    /// turn." `Effect::Pump` has no `effect_triviality` arm, so this is the
+    /// Unmodeled side of the Trivial-proper split.
+    fn pump_self(power: i32, toughness: i32) -> Effect {
+        Effect::Pump {
+            power: PtValue::Fixed(power),
+            toughness: PtValue::Fixed(toughness),
+            target: TargetFilter::SelfRef,
+        }
+    }
+
+    fn pay_life_cost(amount: i32) -> AbilityCost {
+        AbilityCost::PayLife {
+            amount: QuantityExpr::Fixed { value: amount },
         }
     }
 
@@ -492,6 +632,66 @@ mod tests {
         let obj = state.objects.get_mut(&id).unwrap();
         obj.card_types.core_types.push(CoreType::Creature);
         obj.static_definitions.push(StaticDefinition::new(mode));
+    }
+
+    /// Install a typed individual-draw replacement owned by the AI. These
+    /// fixtures exercise the same engine preview that production pricing calls;
+    /// none reproduces replacement applicability in phase-AI.
+    fn install_ai_draw_replacement(state: &mut GameState, replacement: ReplacementDefinition) {
+        let id = create_object(
+            state,
+            CardId(next_id()),
+            AI,
+            "AI Draw Replacement".to_string(),
+            Zone::Battlefield,
+        );
+        let object = state
+            .objects
+            .get_mut(&id)
+            .expect("replacement source exists");
+        object.card_types.core_types.push(CoreType::Creature);
+        object.power = Some(1);
+        object.toughness = Some(1);
+        object.replacement_definitions.push(replacement);
+    }
+
+    fn mandatory_draw_prevent() -> ReplacementDefinition {
+        ReplacementDefinition::new(ReplacementEvent::Draw)
+            .draw_scope(DrawReplacementScope::IndividualDraw)
+            .quantity_modification(QuantityModification::Prevent)
+    }
+
+    fn optional_draw_prevent() -> ReplacementDefinition {
+        ReplacementDefinition::new(ReplacementEvent::Draw)
+            .draw_scope(DrawReplacementScope::IndividualDraw)
+            .quantity_modification(QuantityModification::Prevent)
+            .mode(ReplacementMode::Optional { decline: None })
+    }
+
+    fn mandatory_search_draw_substitute() -> ReplacementDefinition {
+        ReplacementDefinition::new(ReplacementEvent::Draw)
+            .draw_scope(DrawReplacementScope::IndividualDraw)
+            .execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                search_for_land(),
+            ))
+    }
+
+    fn add_library_land(state: &mut GameState) {
+        let id = create_object(
+            state,
+            CardId(next_id()),
+            AI,
+            "Search Fixture Land".to_string(),
+            Zone::Library,
+        );
+        state
+            .objects
+            .get_mut(&id)
+            .expect("library land exists")
+            .card_types
+            .core_types
+            .push(CoreType::Land);
     }
 
     // --- state / context helpers -----------------------------------------
@@ -728,6 +928,17 @@ mod tests {
         );
     }
 
+    fn assert_trivial_facts(verdict: &PolicyVerdict, cost_milli: i64) {
+        let reason = match verdict {
+            PolicyVerdict::Reject { reason } | PolicyVerdict::Score { reason, .. } => reason,
+        };
+        assert_eq!(
+            reason.facts,
+            vec![("cost_milli", cost_milli), ("benefit", 0)],
+            "trivial verdict facts"
+        );
+    }
+
     fn assert_neutral(verdict: &PolicyVerdict, kind: &str) {
         match verdict {
             PolicyVerdict::Score { delta, reason } => {
@@ -950,22 +1161,80 @@ mod tests {
     }
 
     #[test]
-    fn cedh_bracket_stands_down_self_cost() {
-        // Same trivial sac-for-lifegain that rejects in a Core deck is stood
-        // down at the Cedh bracket.
+    fn cedh_bracket_does_not_waive_a_trivial_sacrifice_cost() {
+        // Bracket classification is deck metadata, not a payment exemption:
+        // a trivial sacrifice activation remains a real loss in CEDH too.
         let mut state = GameState::new_two_player(42);
         creature(&mut state, AI, "Bear", 2, 2);
+        creature(&mut state, AI, "Diregraf Captain", 2, 2);
         let source = source_with(
             &mut state,
-            "High Market",
-            &[CoreType::Land],
+            "Spark Reaper",
+            &[CoreType::Creature],
             activated(gain_life(1), sac_creature_cost()),
         );
-        let features = features_with(0.0, 0.0, 0.0, Vec::new(), CommanderBracketTier::Cedh);
-        assert_neutral(
-            &verdict_for(&state, source, features),
-            "self_cost_synergy_justified",
+        let source_object = state
+            .objects
+            .get_mut(&source)
+            .expect("Spark Reaper source exists");
+        source_object.power = Some(1);
+        source_object.toughness = Some(1);
+        let features = features_with(
+            0.0,
+            0.0,
+            0.0,
+            vec!["Diregraf Captain".to_string()],
+            CommanderBracketTier::Cedh,
         );
+        assert_reject(
+            &verdict_for(&state, source, features),
+            "self_cost_trivial_benefit",
+        );
+    }
+
+    #[test]
+    fn cedh_aristocrats_never_waives_a_sacrifice_leaf_direct_or_nested() {
+        let features = features_with(
+            0.0,
+            1.0,
+            0.0,
+            vec!["Diregraf Captain".to_string()],
+            CommanderBracketTier::Cedh,
+        );
+        let costs = [
+            sac_creature_cost(),
+            AbilityCost::Composite {
+                costs: vec![AbilityCost::Tap, sac_creature_cost()],
+            },
+            AbilityCost::OneOf {
+                costs: vec![
+                    sac_creature_cost(),
+                    AbilityCost::PayLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                    },
+                ],
+            },
+            AbilityCost::Composite {
+                costs: vec![
+                    AbilityCost::PerCounter {
+                        counter: CounterType::Age,
+                        target: TargetFilter::SelfRef,
+                        base: Box::new(sac_creature_cost()),
+                    },
+                    AbilityCost::PayLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                    },
+                ],
+            },
+        ];
+
+        for cost in costs {
+            let ability = activated(gain_life(1), cost);
+            assert!(
+                !synergy_justifies_self_cost(&features, &ability),
+                "a sacrifice leaf must remain priced even in a CEDH aristocrats deck"
+            );
+        }
     }
 
     // --- Row 6: discard-to-grant no-threat rejected -----------------------
@@ -1298,10 +1567,25 @@ mod tests {
 
     #[test]
     fn pay_five_life_trivial_deprioritizes_not_neutral() {
-        // MED-1: pay 5 life (0.75 priced, in the [0.5, 1.0) sub-veto range) for a
-        // trivial 1 lifegain used to fall through to `self_cost_benefit_present`
-        // (a losing play mislabeled as a benefit). It must now deprioritize.
-        // Reverting the widening flips this back to `self_cost_benefit_present`.
+        // RE-CHARTERED. This row was written for MED-1, which only had to prove
+        // that pay 5 life (0.75 priced, inside the [0.5, 1.0) sub-veto range)
+        // for a trivial 1 lifegain stopped resolving to
+        // `self_cost_benefit_present` — a losing play mislabeled as a benefit.
+        // It asserted `self_cost_marginal` because that was the strongest
+        // verdict the priced floor could reach at 0.75.
+        //
+        // The materiality veto now reaches further on this exact input: the
+        // chain is Trivial-proper (`gain_life(1)` is classified trivial by an
+        // explicit arm, not left unmodeled) and 5 life is at or above
+        // `self_cost_material_life`, so the correct verdict is `Reject`. The
+        // MED-1 claim is strictly preserved — a reject is even further from
+        // `self_cost_benefit_present` than the marginal score was — and the
+        // assertion is strengthened rather than relaxed.
+        //
+        // A verdict of `self_cost_marginal` here now means the materiality veto
+        // is gone; `self_cost_benefit_present` means MED-1's own fix regressed.
+        // The name is kept so the MED-1 audit trail stays greppable — read it as
+        // "not neutral", which is still exactly what the row certifies.
         let mut state = GameState::new_two_player(42);
         let cost = AbilityCost::PayLife {
             amount: QuantityExpr::Fixed { value: 5 },
@@ -1313,16 +1597,243 @@ mod tests {
             activated(gain_life(1), cost),
         );
         let verdict = verdict_for(&state, source, plain_features());
+        assert_reject(&verdict, "self_cost_trivial_benefit");
+        assert_trivial_facts(&verdict, 750);
+    }
+
+    // --- S19: pay-life materiality veto on Trivial-PROPER chains -----------
+
+    #[test]
+    fn pay_four_life_for_trivial_payoff_is_rejected() {
+        // Adanto Vanguard, Oracle text confirmed against Scryfall: "Pay 4 life:
+        // This creature gains indestructible until end of turn."
+        //
+        // The chain is Trivial-PROPER, not merely unmodeled: the grant matches
+        // `is_self_protection_effect`, so the classifier's explicit
+        // self-protection arm judges it — and with the AI active, an empty
+        // stack, and full life there is no threat for indestructible to answer,
+        // so that arm returns Trivial. (Same fixture conditions as
+        // `discard_for_self_protection_no_threat_rejected`.)
+        //
+        // REVERT-FAILING: 4 life prices at 4 * 0.15 = 0.60, below
+        // `REAL_COST_FLOOR`, so with the materiality veto removed this input
+        // falls through to `self_cost_marginal` — a −0.60 rate on an ability
+        // with no activation limit, which is the shape the module's law forbids.
+        let mut state = GameState::new_two_player(42);
+        state.active_player = AI;
+        let source = source_with(
+            &mut state,
+            "Adanto Vanguard",
+            &[CoreType::Creature],
+            activated(indestructible_self_grant(), pay_life_cost(4)),
+        );
+        let verdict = verdict_for(&state, source, plain_features());
+        assert_reject(&verdict, "self_cost_trivial_benefit");
+        // Pinned so the row certifies the MATERIALITY ground and not the priced
+        // one: 600 is well below `REAL_COST_FLOOR * 1000`, so a reject carrying
+        // this fact cannot have come from `cost_value >= REAL_COST_FLOOR`.
+        assert_trivial_facts(&verdict, 600);
+    }
+
+    #[test]
+    fn pay_one_life_for_trivial_payoff_is_marginal_not_rejected() {
+        // Hostile boundary for the row above: the identical chain at 1 life is
+        // below `self_cost_material_life`, so the bound does not apply and the
+        // graduated branch keeps it. Without this pair the veto could be
+        // "reject every pay-life trivial activation" and still pass.
+        let mut state = GameState::new_two_player(42);
+        state.active_player = AI;
+        let source = source_with(
+            &mut state,
+            "Adanto Vanguard",
+            &[CoreType::Creature],
+            activated(indestructible_self_grant(), pay_life_cost(1)),
+        );
+        let verdict = verdict_for(&state, source, plain_features());
         match verdict {
             PolicyVerdict::Score { delta, reason } => {
-                assert_eq!(
-                    reason.kind, "self_cost_marginal",
-                    "must not be benefit_present"
-                );
+                assert_eq!(reason.kind, "self_cost_marginal");
                 assert!(delta < 0.0, "expected a deprioritizing nudge, got {delta}");
             }
-            PolicyVerdict::Reject { .. } => panic!("0.75 priced cost must not hard-veto"),
+            PolicyVerdict::Reject { .. } => {
+                panic!("one life is below the materiality bound and must not hard-veto")
+            }
         }
+    }
+
+    #[test]
+    fn pay_life_with_priced_benefit_unchanged() {
+        // The materiality bound belongs to the trivial branch alone. The same 4
+        // life that is vetoed above, against a payoff the module CAN price,
+        // still resolves through the net comparison: 0.60 cost vs a 1.0 draw is
+        // not a loss, so the verdict is `covers_cost` — the facts pin both
+        // sides, so a materiality check leaking into the `Priced` arm would show
+        // up as a `Reject` here rather than as a silent re-band.
+        let mut state = state_with_library();
+        let source = source_with(
+            &mut state,
+            "Necropotence-ish",
+            &[CoreType::Enchantment],
+            activated(draw(1), pay_life_cost(4)),
+        );
+        let verdict = verdict_for(&state, source, plain_features());
+        assert_neutral(&verdict, "self_cost_benefit_covers_cost");
+        assert_facts(&verdict, 600, 1000);
+    }
+
+    #[test]
+    fn prowler_shape_unmodeled_pump_is_not_rejected() {
+        // Desolation Prowler, Oracle text confirmed against Scryfall: "Pay 2
+        // life: This creature gets +2/+2 until end of turn."
+        //
+        // 2 life IS material, so this row isolates the OTHER half of the gate:
+        // `Effect::Pump` has no classifier arm, so the chain is
+        // `Trivial { any_unmodeled: true }` and "no payoff" is an absence of
+        // evidence, not a finding. A bound may not rest on that, so the veto
+        // stands down and the graduated branch keeps the candidate. Whether a
+        // pump is worth activating outside a combat window is a timing question
+        // owned by the tactical gate, not a cost-materiality one.
+        let mut state = GameState::new_two_player(42);
+        state.active_player = AI;
+        let source = source_with(
+            &mut state,
+            "Desolation Prowler",
+            &[CoreType::Creature],
+            activated(pump_self(2, 2), pay_life_cost(2)),
+        );
+        let verdict = verdict_for(&state, source, plain_features());
+        assert_not_reject(&verdict);
+        match verdict {
+            PolicyVerdict::Score { reason, .. } => assert_eq!(reason.kind, "self_cost_marginal"),
+            PolicyVerdict::Reject { .. } => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn unmodeled_chain_still_rejects_on_the_priced_floor() {
+        // The stand-down above is scoped to the MATERIALITY ground only — the
+        // pre-existing priced veto still applies to an unmodeled chain. Same
+        // unmodeled pump payoff, but discarding a card prices at 1.0, which is
+        // at `REAL_COST_FLOOR`. Reverting the `!any_unmodeled` guard would leave
+        // this green; weakening the priced arm to Trivial-proper chains only
+        // would turn it red, which is the regression this row exists to catch.
+        let mut state = GameState::new_two_player(42);
+        state.active_player = AI;
+        create_object(
+            &mut state,
+            CardId(next_id()),
+            AI,
+            "Filler".to_string(),
+            Zone::Hand,
+        );
+        let cost = AbilityCost::Discard {
+            count: QuantityExpr::Fixed { value: 1 },
+            filter: None,
+            selection: Default::default(),
+            self_scope: Default::default(),
+        };
+        let source = source_with(
+            &mut state,
+            "Pump Loop",
+            &[CoreType::Creature],
+            activated(pump_self(2, 2), cost),
+        );
+        let verdict = verdict_for(&state, source, plain_features());
+        assert_reject(&verdict, "self_cost_trivial_benefit");
+        assert_trivial_facts(&verdict, 1000);
+    }
+
+    #[test]
+    fn self_bounce_save_under_hostile_removal_is_not_rejected() {
+        // Selenia, Dark Angel: "Pay 2 life: Return Selenia to its owner's hand."
+        // A self-bounce is a SAVE (CR 400.7 — it comes back a new object), so
+        // with opposing removal on the stack aimed at it the dodge is a real
+        // payoff and the veto must stand down.
+        //
+        // REVERT-FAILING for the routing fix: `Bounce` matches the removal arm,
+        // where `targetable_threat_value` prices the AI's own creature at 0 →
+        // Trivial-proper, and 2 life is material, so without the self-scoped
+        // save arm this is a `-inf` veto on the save.
+        let mut state = GameState::new_two_player(42);
+        state.active_player = OPP;
+        let source = source_with(
+            &mut state,
+            "Selenia, Dark Angel",
+            &[CoreType::Creature],
+            activated(self_bounce(), pay_life_cost(2)),
+        );
+        stack_removal_targeting(&mut state, source);
+        assert_neutral(
+            &verdict_for(&state, source, plain_features()),
+            "self_cost_benefit_present",
+        );
+    }
+
+    #[test]
+    fn self_bounce_with_no_threat_pays_material_life_is_rejected() {
+        // Hostile boundary for the row above, and the reason the fix routes
+        // through the threat gate rather than blanket-exempting self-bounces:
+        // the identical ability with an empty stack, the AI active and full life
+        // has nothing to dodge, so returning Selenia to hand for 2 life is the
+        // repeatable no-payoff activation S19 exists to veto.
+        let mut state = GameState::new_two_player(42);
+        state.active_player = AI;
+        let source = source_with(
+            &mut state,
+            "Selenia, Dark Angel",
+            &[CoreType::Creature],
+            activated(self_bounce(), pay_life_cost(2)),
+        );
+        let verdict = verdict_for(&state, source, plain_features());
+        assert_reject(&verdict, "self_cost_trivial_benefit");
+        // 300 is far below `REAL_COST_FLOOR * 1000`, so the reject provably
+        // comes from the materiality ground, not the priced floor.
+        assert_trivial_facts(&verdict, 300);
+    }
+
+    #[test]
+    fn one_of_with_a_free_alternative_is_not_material() {
+        // `cost_is_material` mirrors `real_self_cost`'s `OneOf` fold: the payer
+        // picks, so the cost is material only when EVERY alternative is. This is
+        // the same input as `one_of_min_picks_free_alternative_never_rejects`
+        // read at the materiality seam, and it is what keeps that row green by
+        // construction rather than by luck.
+        let mut state = GameState::new_two_player(42);
+        let penalties = crate::config::PolicyPenalties::default();
+        // Any AI-controlled object serves as the quantity-resolution source; the
+        // costs under test carry `Fixed` amounts.
+        let source = land(&mut state, "Forest");
+
+        let mixed = AbilityCost::OneOf {
+            costs: vec![
+                pay_life_cost(3),
+                AbilityCost::Mana {
+                    cost: engine::types::mana::ManaCost::generic(2),
+                },
+            ],
+        };
+        assert!(
+            !cost_is_material(&state, AI, source, &mixed, &penalties),
+            "a payable-with-mana alternative is not material"
+        );
+
+        // Both alternatives material → the payer has no escape, so the cost is.
+        let both = AbilityCost::OneOf {
+            costs: vec![pay_life_cost(3), pay_life_cost(2)],
+        };
+        assert!(
+            cost_is_material(&state, AI, source, &both, &penalties),
+            "every alternative material means the cost is material"
+        );
+
+        // Composite charges every leg, so one material leg is enough.
+        let composite = AbilityCost::Composite {
+            costs: vec![AbilityCost::Tap, pay_life_cost(2)],
+        };
+        assert!(
+            cost_is_material(&state, AI, source, &composite, &penalties),
+            "a composite is material when any leg is"
+        );
     }
 
     #[test]
@@ -1408,9 +1919,6 @@ mod tests {
 
     #[test]
     fn discard_for_self_protection_allowed_under_threat() {
-        use engine::types::ability::{ResolvedAbility, TargetRef};
-        use engine::types::game_state::{StackEntry, StackEntryKind};
-
         let mut state = GameState::new_two_player(42);
         state.active_player = OPP;
         let cost = AbilityCost::Discard {
@@ -1427,33 +1935,7 @@ mod tests {
         );
         // Opponent removal on the stack targeting the creature that receives
         // shroud makes the protection grant a live payoff.
-        let spell_id = create_object(
-            &mut state,
-            CardId(next_id()),
-            OPP,
-            "Doom Blade".to_string(),
-            Zone::Stack,
-        );
-        let ability = ResolvedAbility::new(
-            Effect::Destroy {
-                target: TargetFilter::Any,
-                cant_regenerate: false,
-            },
-            vec![TargetRef::Object(source)],
-            spell_id,
-            OPP,
-        );
-        state.stack.push_back(StackEntry {
-            id: spell_id,
-            source_id: spell_id,
-            controller: OPP,
-            kind: StackEntryKind::Spell {
-                card_id: CardId(99),
-                ability: Some(Box::new(ability)),
-                casting_variant: Default::default(),
-                actual_mana_spent: 0,
-            },
-        });
+        stack_removal_targeting(&mut state, source);
         assert_neutral(
             &verdict_for(&state, source, plain_features()),
             "self_cost_benefit_present",
@@ -1734,6 +2216,467 @@ mod tests {
             rider,
         )));
         ability
+    }
+
+    fn with_riders(mut ability: AbilityDefinition, riders: Vec<Effect>) -> AbilityDefinition {
+        let mut current = &mut ability;
+        for rider in riders {
+            current.sub_ability = Some(Box::new(AbilityDefinition::new(
+                AbilityKind::Activated,
+                rider,
+            )));
+            current = current
+                .sub_ability
+                .as_deref_mut()
+                .expect("rider was just attached");
+        }
+        ability
+    }
+
+    fn draw_to(count: i32, target: TargetFilter) -> Effect {
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: count },
+            target,
+        }
+    }
+
+    fn parent_discard(count: QuantityExpr) -> Effect {
+        Effect::Discard {
+            count,
+            target: TargetFilter::ParentTarget,
+            selection: CardSelectionMode::Chosen,
+            unless_filter: None,
+            filter: None,
+        }
+    }
+
+    fn discard_cost(count: i32) -> AbilityCost {
+        AbilityCost::Discard {
+            count: QuantityExpr::Fixed { value: count },
+            filter: None,
+            selection: CardSelectionMode::Chosen,
+            self_scope: DiscardSelfScope::FromHand,
+        }
+    }
+
+    fn sacrifice_self_cost() -> AbilityCost {
+        AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1))
+    }
+
+    fn add_hand_cards(state: &mut GameState, player: PlayerId, count: usize) {
+        for index in 0..count {
+            create_object(
+                state,
+                CardId(next_id()),
+                player,
+                format!("Hand Card {index}"),
+                Zone::Hand,
+            );
+        }
+    }
+
+    fn opponent_player_filter() -> TargetFilter {
+        TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent))
+    }
+
+    #[test]
+    fn cephalid_coliseum_shape_rejects_trivial_opponent_churn() {
+        let mut state = state_with_library();
+        let source = source_with(
+            &mut state,
+            "Cephalid Coliseum",
+            &[CoreType::Land],
+            with_rider(
+                activated(draw_to(3, TargetFilter::Player), sacrifice_self_cost()),
+                parent_discard(QuantityExpr::Fixed { value: 3 }),
+            ),
+        );
+
+        let verdict = verdict_for(&state, source, plain_features());
+        assert_reject(&verdict, "self_cost_trivial_benefit");
+        assert_trivial_facts(&verdict, 4500);
+    }
+
+    #[test]
+    fn ai_draw_then_parent_discard_prices_the_drawback() {
+        let mut state = state_with_library();
+        add_hand_cards(&mut state, AI, 2);
+        let source = source_with(
+            &mut state,
+            "Drawback Fixture",
+            &[CoreType::Enchantment],
+            with_rider(
+                activated(draw_to(3, TargetFilter::Player), discard_cost(2)),
+                parent_discard(QuantityExpr::Fixed { value: 2 }),
+            ),
+        );
+
+        let verdict = verdict_for(&state, source, plain_features());
+        assert_reject(&verdict, "self_cost_benefit_underwater");
+        assert_facts(&verdict, 2000, 1000);
+    }
+
+    /// T15: delivery of all three cards makes the ordered mandatory discard cap
+    /// two cards from a formerly empty hand: `3 - 2 = 1` benefit against a 2.0
+    /// discard cost.
+    #[test]
+    fn full_ai_draw_delivery_feeds_parent_discard_cap() {
+        let mut state = state_with_library();
+        let source = source_with(
+            &mut state,
+            "Full Draw Delivery Cap",
+            &[CoreType::Enchantment],
+            with_rider(
+                activated(draw_to(3, TargetFilter::Player), discard_cost(2)),
+                parent_discard(QuantityExpr::Fixed { value: 2 }),
+            ),
+        );
+
+        let verdict = verdict_for(&state, source, plain_features());
+        assert_reject(&verdict, "self_cost_benefit_underwater");
+        assert_facts(&verdict, 2000, 1000);
+    }
+
+    /// T16: CR 121.2b leaves only one delivered card under this draw limit, so
+    /// the following mandatory discard can only discard that one card and the
+    /// exact ordered benefit is zero, not the requested-three arithmetic.
+    #[test]
+    fn partial_ai_draw_delivery_feeds_parent_discard_cap() {
+        let mut state = state_with_library();
+        add_draw_restricting_static(
+            &mut state,
+            StaticMode::PerTurnDrawLimit {
+                who: ProhibitionScope::AllPlayers,
+                max: 1,
+            },
+        );
+        let source = source_with(
+            &mut state,
+            "Partial Draw Delivery Cap",
+            &[CoreType::Enchantment],
+            with_rider(
+                activated(draw_to(3, TargetFilter::Player), discard_cost(2)),
+                parent_discard(QuantityExpr::Fixed { value: 2 }),
+            ),
+        );
+
+        let verdict = verdict_for(&state, source, plain_features());
+        assert_reject(&verdict, "self_cost_benefit_underwater");
+        assert_facts(&verdict, 2000, 0);
+    }
+
+    /// T17a: a mandatory CR 614.6 prevention is a certified exact-zero draw,
+    /// so it is priced as zero rather than treated as an unresolved branch.
+    #[test]
+    fn prevented_ai_draw_is_exact_zero_for_parent_discard_cap() {
+        let mut state = state_with_library();
+        install_ai_draw_replacement(&mut state, mandatory_draw_prevent());
+        let source = source_with(
+            &mut state,
+            "Prevented Draw Delivery Cap",
+            &[CoreType::Enchantment],
+            with_rider(
+                activated(draw_to(3, TargetFilter::Player), discard_cost(2)),
+                parent_discard(QuantityExpr::Fixed { value: 2 }),
+            ),
+        );
+
+        let verdict = verdict_for(&state, source, plain_features());
+        assert_reject(&verdict, "self_cost_benefit_underwater");
+        assert_facts(&verdict, 2000, 0);
+    }
+
+    /// T17b: the mandatory replacement is not enough to price its search
+    /// continuation. The engine reaches `SearchChoice` (covered at the engine
+    /// seam), so the policy must fail open as an unpriced benefit.
+    #[test]
+    fn mandatory_search_substitute_stands_down_parent_discard_cap() {
+        let mut state = state_with_library();
+        add_library_land(&mut state);
+        install_ai_draw_replacement(&mut state, mandatory_search_draw_substitute());
+        let source = source_with(
+            &mut state,
+            "Search Substitute Delivery Cap",
+            &[CoreType::Enchantment],
+            with_rider(
+                activated(draw_to(3, TargetFilter::Player), discard_cost(2)),
+                parent_discard(QuantityExpr::Fixed { value: 2 }),
+            ),
+        );
+
+        assert_neutral(
+            &verdict_for(&state, source, plain_features()),
+            "self_cost_benefit_present",
+        );
+    }
+
+    /// T18: CR 614.11 offers the optional replacement even with no library
+    /// cards. Its choice is unknown rather than an empty-library zero, so the
+    /// benefit comparison remains neutral.
+    #[test]
+    fn empty_library_optional_draw_replacement_stands_down_parent_discard_cap() {
+        let mut state = GameState::new_two_player(42);
+        install_ai_draw_replacement(&mut state, optional_draw_prevent());
+        let source = source_with(
+            &mut state,
+            "Empty Library Optional Replacement Cap",
+            &[CoreType::Enchantment],
+            with_rider(
+                activated(draw_to(3, TargetFilter::Player), discard_cost(2)),
+                parent_discard(QuantityExpr::Fixed { value: 2 }),
+            ),
+        );
+
+        assert_neutral(
+            &verdict_for(&state, source, plain_features()),
+            "self_cost_benefit_present",
+        );
+    }
+
+    #[test]
+    fn limestone_golem_shape_prices_a_player_draw_for_the_ai() {
+        let mut state = state_with_library();
+        let source = source_with(
+            &mut state,
+            "Limestone Golem",
+            &[CoreType::Creature],
+            activated(draw_to(1, TargetFilter::Player), sacrifice_self_cost()),
+        );
+        let object = state.objects.get_mut(&source).expect("source exists");
+        object.power = Some(3);
+        object.toughness = Some(4);
+
+        let verdict = verdict_for(&state, source, plain_features());
+        assert_reject(&verdict, "self_cost_benefit_underwater");
+        assert_facts(&verdict, 8500, 1000);
+    }
+
+    #[test]
+    fn opponent_only_draw_is_trivial() {
+        let mut state = state_with_library();
+        let source = source_with(
+            &mut state,
+            "Opponent Draw Fixture",
+            &[CoreType::Creature],
+            activated(draw_to(2, opponent_player_filter()), sacrifice_self_cost()),
+        );
+        let object = state.objects.get_mut(&source).expect("source exists");
+        object.power = Some(3);
+        object.toughness = Some(4);
+
+        let verdict = verdict_for(&state, source, plain_features());
+        assert_reject(&verdict, "self_cost_trivial_benefit");
+        assert_trivial_facts(&verdict, 8500);
+    }
+
+    #[test]
+    fn each_player_draw_stands_down_as_mixed() {
+        let mut state = state_with_library();
+        let source = source_with(
+            &mut state,
+            "Each Player Draw Fixture",
+            &[CoreType::Land],
+            activated(draw_to(1, TargetFilter::Any), sacrifice_self_cost()),
+        );
+
+        assert_neutral(
+            &verdict_for(&state, source, plain_features()),
+            "self_cost_benefit_present",
+        );
+    }
+
+    #[test]
+    fn optional_parent_discard_is_not_charged() {
+        let mut state = state_with_library();
+        add_hand_cards(&mut state, AI, 2);
+        let source = source_with(
+            &mut state,
+            "Optional Drawback Fixture",
+            &[CoreType::Enchantment],
+            with_rider(
+                activated(draw_to(2, TargetFilter::Player), discard_cost(2)),
+                parent_discard(QuantityExpr::up_to(QuantityExpr::Fixed { value: 2 })),
+            ),
+        );
+
+        let verdict = verdict_for(&state, source, plain_features());
+        assert_neutral(&verdict, "self_cost_benefit_covers_cost");
+        assert_facts(&verdict, 2000, 2000);
+    }
+
+    #[test]
+    fn survey_mechan_damage_rider_remains_unpriced() {
+        let mut state = state_with_library();
+        let source = source_with(
+            &mut state,
+            "Survey Mechan",
+            &[CoreType::Land],
+            with_rider(
+                activated(deal_fixed(3), sacrifice_self_cost()),
+                draw_to(3, TargetFilter::Player),
+            ),
+        );
+
+        assert_neutral(
+            &verdict_for(&state, source, plain_features()),
+            "self_cost_benefit_present",
+        );
+    }
+
+    #[test]
+    fn opponent_discard_beyond_draw_churn_stands_down() {
+        let mut state = state_with_library();
+        add_hand_cards(&mut state, AI, 3);
+        let source = source_with(
+            &mut state,
+            "Bounded Opponent Churn",
+            &[CoreType::Land],
+            with_rider(
+                activated(draw_to(1, TargetFilter::Player), sacrifice_self_cost()),
+                parent_discard(QuantityExpr::Fixed { value: 3 }),
+            ),
+        );
+
+        assert_neutral(
+            &verdict_for(&state, source, plain_features()),
+            "self_cost_benefit_present",
+        );
+    }
+
+    #[test]
+    fn mandatory_parent_discard_caps_to_available_hand_cards() {
+        for (hand_cards, benefit_milli) in [(3, -3000), (0, 0)] {
+            let mut state = state_with_library();
+            add_hand_cards(&mut state, AI, hand_cards);
+            add_draw_restricting_static(
+                &mut state,
+                StaticMode::CantDraw {
+                    who: ProhibitionScope::AllPlayers,
+                },
+            );
+            let source = source_with(
+                &mut state,
+                "Mandatory Drawback Cap",
+                &[CoreType::Land],
+                with_rider(
+                    activated(draw_to(4, TargetFilter::Player), sacrifice_self_cost()),
+                    parent_discard(QuantityExpr::Fixed { value: 3 }),
+                ),
+            );
+
+            let verdict = verdict_for(&state, source, plain_features());
+            assert_reject(&verdict, "self_cost_benefit_underwater");
+            assert_facts(&verdict, 4500, benefit_milli);
+        }
+    }
+
+    #[test]
+    fn controller_wheel_discard_remains_unmodeled() {
+        let mut state = state_with_library();
+        let wheel_discard = Effect::Discard {
+            count: QuantityExpr::Ref {
+                qty: QuantityRef::HandSize {
+                    player: PlayerScope::Controller,
+                },
+            },
+            target: TargetFilter::Controller,
+            selection: CardSelectionMode::Chosen,
+            unless_filter: None,
+            filter: None,
+        };
+        let source = source_with(
+            &mut state,
+            "Wheel Fixture",
+            &[CoreType::Land],
+            with_rider(
+                activated(wheel_discard, sacrifice_self_cost()),
+                draw_to(7, TargetFilter::Controller),
+            ),
+        );
+
+        assert_neutral(
+            &verdict_for(&state, source, plain_features()),
+            "self_cost_benefit_present",
+        );
+    }
+
+    #[test]
+    fn conflicting_player_target_choices_stand_down_as_mixed() {
+        let mut state = state_with_library();
+        let source = source_with(
+            &mut state,
+            "Conflicting Player Targets",
+            &[CoreType::Land],
+            with_riders(
+                activated(draw_to(1, TargetFilter::Player), sacrifice_self_cost()),
+                vec![
+                    Effect::ExtraTurn {
+                        target: TargetFilter::Player,
+                        count: QuantityExpr::Fixed { value: 1 },
+                    },
+                    Effect::LoseLife {
+                        amount: QuantityExpr::Fixed { value: 20 },
+                        target: Some(TargetFilter::Controller),
+                    },
+                ],
+            ),
+        );
+
+        assert_neutral(
+            &verdict_for(&state, source, plain_features()),
+            "self_cost_benefit_present",
+        );
+    }
+
+    #[test]
+    fn opponent_draw_churn_is_consumed_once_per_parent_discard() {
+        let mut state = state_with_library();
+        let ability = with_riders(
+            activated(draw_to(1, TargetFilter::Player), sacrifice_self_cost()),
+            vec![
+                parent_discard(QuantityExpr::Fixed { value: 1 }),
+                parent_discard(QuantityExpr::Fixed { value: 1 }),
+            ],
+        );
+        let source = source_with(
+            &mut state,
+            "Churn Saturation Fixture",
+            &[CoreType::Land],
+            ability,
+        );
+        let ability = state.objects[&source].abilities[0].clone();
+
+        assert_eq!(
+            chain_effect_trivialities(&state, AI, source, &ability),
+            vec![
+                EffectTriviality::Trivial,
+                EffectTriviality::Trivial,
+                EffectTriviality::NonTrivial,
+            ],
+        );
+        assert_neutral(
+            &verdict_for(&state, source, plain_features()),
+            "self_cost_benefit_present",
+        );
+    }
+
+    #[test]
+    fn non_player_root_keeps_parent_target_mixed() {
+        let mut state = state_with_library();
+        let source = source_with(
+            &mut state,
+            "Non-Player Parent Target",
+            &[CoreType::Land],
+            with_rider(
+                activated(draw_to(3, opponent_player_filter()), sacrifice_self_cost()),
+                parent_discard(QuantityExpr::Fixed { value: 1 }),
+            ),
+        );
+
+        assert_neutral(
+            &verdict_for(&state, source, plain_features()),
+            "self_cost_benefit_present",
+        );
     }
 
     /// A token-creation rider: no `effect_triviality` arm models `Effect::Token`,
@@ -2470,11 +3413,11 @@ mod tests {
     }
 
     #[test]
-    fn optional_thief_mode_still_prices_the_draw() {
-        // CR 614.6: an OPTIONAL replacement is an accept/decline choice, so it
-        // can never be ASSUMED to apply — the draw is still deliverable and the
-        // crack still pays. The over-suppression guard: a gate hardened to "any
-        // Draw replacement present ⇒ zero" vetoes this and goes red.
+    fn optional_thief_mode_stands_down_as_unpriced() {
+        // An OPTIONAL replacement requires an accept/decline decision. The
+        // preview must not select either branch, so delivery is Unknown rather
+        // than the mandatory thief's settled zero. That makes the benefit
+        // unpriced and leaves the cost comparison neutral.
         //
         // Multi-authority row: identical source, identical player scope,
         // identical substitute — only the MODE differs from
@@ -2495,8 +3438,7 @@ mod tests {
             activated(draw(1), sac_artifact_cost()),
         );
         let verdict = verdict_for(&state, source, plain_features());
-        assert_neutral(&verdict, "self_cost_benefit_covers_cost");
-        assert_facts(&verdict, 500, 1000);
+        assert_neutral(&verdict, "self_cost_benefit_present");
     }
 
     #[test]

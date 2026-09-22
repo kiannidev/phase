@@ -34,6 +34,8 @@ const P0: PlayerId = PlayerId(0);
 /// presence of `back_face` is consulted by `room::eligible_doors`.
 fn room_back_face() -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
+        trigger_printed_origins: Vec::new(),
         name: "Right Door".to_string(),
         power: None,
         toughness: None,
@@ -55,6 +57,7 @@ fn room_back_face() -> BackFaceData {
         casting_restrictions: Vec::new(),
         casting_options: Vec::new(),
         layout_kind: Some(LayoutKind::Split),
+        parse_warnings: vec![],
     }
 }
 

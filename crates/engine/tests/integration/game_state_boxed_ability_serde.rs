@@ -42,6 +42,7 @@
 
 use engine::game::scenario::{P0, P1};
 use engine::game::triggers::PendingTrigger;
+use engine::game::zones::create_object;
 use engine::types::ability::{Effect, QuantityExpr, ResolvedAbility, TargetFilter, TargetRef};
 use engine::types::game_state::{
     GameState, PendingCast, PendingDiscardForCostResume, PersistedGameState, StackEntry,
@@ -49,6 +50,7 @@ use engine::types::game_state::{
 };
 use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::mana::ManaCost;
+use engine::types::zones::Zone;
 
 const SOURCE: ObjectId = ObjectId(700);
 
@@ -103,24 +105,16 @@ fn populated_state() -> GameState {
             source_name: String::new(),
             subject_match_count: None,
             die_result: None,
+            provenance: None,
         },
     });
-    state.pending_trigger = Some(Box::new(PendingTrigger {
-        source_id: SOURCE,
-        controller: P0,
-        condition: None,
-        ability: Box::new(damage_ability()),
-        timestamp: 9,
-        target_constraints: Vec::new(),
-        distribute: None,
-        trigger_event: None,
-        modal: None,
-        mode_abilities: Vec::new(),
-        description: None,
-        may_trigger_origin: None,
-        subject_match_count: None,
-        die_result: None,
-    }));
+    state.pending_trigger = Some(Box::new(PendingTrigger::ordinary(
+        SOURCE,
+        P0,
+        None,
+        Box::new(damage_ability()),
+        9,
+    )));
     // Populated so the `#[serde(skip)]` assertion in
     // `boxing_introduces_no_wrapper_level_in_the_wire_shape` discriminates. With
     // this field left `None`, that assertion could only distinguish `skip` from
@@ -132,7 +126,7 @@ fn populated_state() -> GameState {
     // Safe for `boxed_abilities_round_trip_through_serde`: `GameState`'s manual
     // `PartialEq` deliberately excludes this field, so an intentionally-dropped
     // skipped field cannot make the round-trip equality assertion red.
-    state.pending_discard_for_cost = Some(Box::new(PendingDiscardForCostResume {
+    state.pending_discard_for_cost = Some(Box::new(PendingDiscardForCostResume::Chosen {
         player: P0,
         pending: PendingCast::new(
             ObjectId(704),
@@ -148,7 +142,10 @@ fn populated_state() -> GameState {
 
 #[test]
 fn boxed_abilities_round_trip_through_serde() {
-    let state = populated_state();
+    let mut value = serde_json::to_value(populated_state()).expect("populated state serializes");
+    value["stack_trigger_firings"] = serde_json::json!({ "703": "Ordinary" });
+    value["pending_trigger_firing"] = serde_json::json!("Ordinary");
+    let state: GameState = serde_json::from_value(value).expect("canonical state deserializes");
 
     // Reach-guard: the fixture really does populate every retyped field, so a
     // later refactor cannot quietly degenerate this back into the default-state
@@ -163,7 +160,7 @@ fn boxed_abilities_round_trip_through_serde() {
         "reach-guard: pending_trigger is populated"
     );
 
-    let json = serde_json::to_string(&state).expect("populated state serializes");
+    let json = serde_json::to_string(&state).expect("canonical state serializes");
     let mut restored: GameState = serde_json::from_str(&json).expect("and deserializes");
     restored.rng = state.rng.clone(); // skipped by serde; not under test here
 
@@ -264,7 +261,13 @@ fn boxing_introduces_no_wrapper_level_in_the_wire_shape() {
 /// round trip, so this test covers the persisted seam on its own terms.
 fn state_with_resolving_stack_entry() -> GameState {
     let mut state = GameState::new_two_player(42);
-    state.waiting_for = WaitingFor::Priority { player: P0 };
+    state.waiting_for = WaitingFor::OptionalEffectChoice {
+        player: P0,
+        source_id: SOURCE,
+        description: None,
+        may_trigger_key: None,
+        same_card_may_trigger_choice_available: false,
+    };
     state.resolving_stack_entry = Some(StackEntry {
         id: ObjectId(704),
         source_id: SOURCE,
@@ -311,7 +314,8 @@ fn persisted_round_trip_preserves_the_boxed_resolving_stack_entry() {
     // just the derived `GameState` one.
     let restored = serde_json::from_str::<PersistedGameState>(&json)
         .expect("and deserializes back through the persisted codec")
-        .into_game_state();
+        .into_game_state()
+        .expect("persisted test snapshot satisfies the checked restore contract");
 
     let restored_entry = restored
         .resolving_stack_entry
@@ -336,5 +340,76 @@ fn persisted_round_trip_preserves_the_boxed_resolving_stack_entry() {
         persisted_ability.get("effect").is_some(),
         "resolving_stack_entry's boxed ability must serialize as a bare \
          ResolvedAbility object on the persisted wire, got {persisted_ability}"
+    );
+}
+
+#[test]
+fn persisted_restore_migrates_legacy_jeskas_will_mana_target_role() {
+    let mut state = state_with_resolving_stack_entry();
+    let source = create_object(
+        &mut state,
+        CardId(2),
+        P0,
+        "Jeska's Will".to_string(),
+        Zone::Hand,
+    );
+    let entry = state
+        .resolving_stack_entry
+        .as_mut()
+        .expect("reach-guard: resolving stack entry is populated");
+    entry.source_id = source;
+    let ability = entry
+        .ability_mut()
+        .expect("reach-guard: resolving spell has an ability");
+    ability.source_id = source;
+
+    let mut persisted = serde_json::to_value(PersistedGameState::capture(state))
+        .expect("a current persisted snapshot serializes");
+    let effect =
+        &mut persisted["state"]["resolving_stack_entry"]["kind"]["data"]["ability"]["effect"];
+    *effect = serde_json::json!({
+        "type": "Mana",
+        "produced": {
+            "type": "AnyOneColor",
+            "count": {
+                "type": "Ref",
+                "qty": { "type": "TargetZoneCardCount", "zone": "Hand" }
+            },
+            "color_options": ["Red"]
+        },
+        "target": {
+            "type": "Typed",
+            "type_filters": [],
+            "controller": "Opponent",
+            "properties": []
+        }
+    });
+
+    let target =
+        &persisted["state"]["resolving_stack_entry"]["kind"]["data"]["ability"]["effect"]["target"];
+    assert!(
+        target.get("role").is_none(),
+        "reach-guard: the fixture must carry the pre-ManaTargetRole target encoding"
+    );
+
+    let restored = serde_json::from_value::<PersistedGameState>(persisted)
+        .expect("legacy Jeska's Will snapshot restores through the persisted codec")
+        .into_game_state()
+        .expect("persisted test snapshot satisfies the checked restore contract");
+    let reserialized = serde_json::to_value(PersistedGameState::capture(restored))
+        .expect("the migrated state reserializes");
+    assert_eq!(
+        reserialized["state"]["resolving_stack_entry"]["kind"]["data"]["ability"]["effect"]
+            ["target"],
+        serde_json::json!({
+            "role": "CountSource",
+            "count_source": {
+                "type": "Typed",
+                "type_filters": [],
+                "controller": "Opponent",
+                "properties": []
+            }
+        }),
+        "Jeska's Will target must restore as its Oracle-defined count source"
     );
 }

@@ -13,6 +13,7 @@ import { buildGameState, buildPlayers, buildPriorityWaitingFor } from "../../../
 import { LibraryPile } from "../LibraryPile.tsx";
 
 vi.mock("../../../hooks/useCardImage", () => ({
+  useCardBackImage: () => ({ src: "/test-card-back.png", isLoading: false }),
   useCardImage: () => ({ src: null, isLoading: false }),
 }));
 
@@ -46,6 +47,7 @@ function setStore({
   actions: GameAction[];
 }) {
   const top = makeObject(topCardId, topCardName);
+  top.display_visible_to_viewer = canPeek;
   const gameState = buildGameState({
     active_player: 0,
     objects: buildObjectMap(top),
@@ -100,12 +102,12 @@ function setOpponentLibraryTop(
   topCardName: string,
   reveal: {
     revealedCards?: number[];
-    privateLookPlayer?: number;
-    privateLookIds?: number[];
+    displayVisible?: boolean;
   } = {},
 ) {
   const topCardId = 77;
   const top = makeObject(topCardId, topCardName);
+  top.display_visible_to_viewer = reveal.displayVisible ?? false;
   const gameState = buildGameState({
     active_player: 0,
     objects: buildObjectMap(top),
@@ -124,8 +126,6 @@ function setOpponentLibraryTop(
     exile: [],
     stack: [],
     revealed_cards: reveal.revealedCards ?? [],
-    private_look_player: reveal.privateLookPlayer,
-    private_look_ids: reveal.privateLookIds ?? [],
     waiting_for: buildPriorityWaitingFor(),
   });
 
@@ -193,16 +193,15 @@ describe("LibraryPile play/cast surfacing (#297)", () => {
     });
   });
 
-  it("shows opponent library top after a private look peek (Mishra's Bauble)", () => {
-    // CR 701.20e: I (player 0) privately look at the opponent's (player 1) top.
-    // The engine records the look in private_look_player/ids; the pile shows it.
-    setOpponentLibraryTop("Lightning Bolt", { privateLookPlayer: 0, privateLookIds: [77] });
+  it("shows an opponent library top when Rust projects it as visible", () => {
+    setOpponentLibraryTop("Lightning Bolt", { displayVisible: true });
     render(<LibraryPile playerId={1} />);
     const button = screen.getByRole("button", { name: /library \(1 card\)/i });
     expect(button).toBeInTheDocument();
+    expect(button).toHaveAttribute("data-grouped-ids", "77");
     // Peeked tops use the cyan border; card-back alt text is hidden.
     expect(button.className).toContain("border-cyan-600");
-    expect(screen.queryByAltText("Library")).not.toBeInTheDocument();
+    expect(screen.queryByAltText("Card back")).not.toBeInTheDocument();
   });
 
   it("keeps an opponent library top hidden when nothing reveals it (no leak)", () => {
@@ -213,17 +212,16 @@ describe("LibraryPile play/cast surfacing (#297)", () => {
     render(<LibraryPile playerId={1} />);
     const button = screen.getByRole("button", { name: /library \(1 card\)/i });
     expect(button.className).toContain("border-gray-600");
-    expect(screen.getByAltText("Library")).toBeInTheDocument();
+    expect(button).not.toHaveAttribute("data-grouped-ids");
+    expect(screen.getByAltText("Card back")).toBeInTheDocument();
   });
 
-  it("shows an opponent library top that is publicly revealed (revealed_cards)", () => {
-    // CR 701.20b: opponent's own public reveal (Oracle of Mul Daya) — visible to
-    // all players via revealed_cards, so the pile shows it with the amber border.
-    setOpponentLibraryTop("Lightning Bolt", { revealedCards: [77] });
+  it("uses reveal state only for the public-reveal treatment, not visibility", () => {
+    setOpponentLibraryTop("Lightning Bolt", { revealedCards: [77], displayVisible: true });
     render(<LibraryPile playerId={1} />);
     const button = screen.getByRole("button", { name: /library \(1 card\)/i });
     expect(button.className).toContain("border-amber-500");
-    expect(screen.queryByAltText("Library")).not.toBeInTheDocument();
+    expect(screen.queryByAltText("Card back")).not.toBeInTheDocument();
   });
 
   it("keeps a masked opponent library top hidden", () => {
@@ -231,7 +229,7 @@ describe("LibraryPile play/cast surfacing (#297)", () => {
     render(<LibraryPile playerId={1} />);
     const button = screen.getByRole("button", { name: /library \(1 card\)/i });
     expect(button.className).toContain("border-gray-600");
-    expect(screen.getByAltText("Library")).toBeInTheDocument();
+    expect(screen.getByAltText("Card back")).toBeInTheDocument();
   });
 
   it("does not dispatch when there is no play action", () => {

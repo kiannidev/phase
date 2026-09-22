@@ -41,6 +41,8 @@ fn make_back_face(
     layout_kind: Option<LayoutKind>,
 ) -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
+        trigger_printed_origins: Vec::new(),
         name: name.to_string(),
         power: None,
         toughness: None,
@@ -62,6 +64,7 @@ fn make_back_face(
         casting_restrictions: Vec::new(),
         casting_options: Vec::new(),
         layout_kind,
+        parse_warnings: vec![],
     }
 }
 

@@ -1,6 +1,7 @@
 pub mod ability_rw;
 pub mod ability_scan;
 pub mod ability_utils;
+pub(crate) mod ante;
 pub mod arithmetic;
 pub mod attractions;
 pub mod augment;
@@ -11,6 +12,7 @@ pub mod blitz;
 #[cfg(test)]
 #[path = "blitz_tests.rs"]
 mod blitz_tests;
+pub mod boosters;
 pub mod bracket_estimate;
 pub mod card_subset;
 pub mod casting;
@@ -78,10 +80,14 @@ mod haunt_tests;
 pub mod keywords;
 pub mod layers;
 pub mod ledger;
+pub(crate) mod legend_scope;
 pub mod library;
 pub mod life_costs;
+pub mod life_safety;
+mod lifecycle;
 pub mod log;
 pub mod mana_abilities;
+pub(crate) mod mana_burn;
 pub mod mana_payment;
 pub mod mana_sources;
 pub mod match_flow;
@@ -143,6 +149,7 @@ pub mod public_state;
 pub mod quantity;
 pub mod replacement;
 pub mod replay;
+pub(crate) mod resolution_prompt;
 pub mod restrictions;
 pub mod room;
 pub(crate) mod sacrifice;
@@ -168,11 +175,18 @@ pub mod token_presets;
 pub mod topology;
 pub mod transform;
 pub mod trigger_index;
+// Tests for the `trigger_index` live-zone guard live in a sibling file
+// (declared here, not in `trigger_index.rs`, so that file stays
+// implementation-only).
+#[cfg(test)]
+#[path = "trigger_index_zone_guard_tests.rs"]
+mod trigger_index_zone_guard_tests;
 pub(crate) mod trigger_matchers;
 pub mod triggers;
 pub mod turn_control;
 pub mod turns;
 pub mod visibility;
+pub(crate) mod wish_scope;
 pub mod zone_pipeline;
 // Zone-mutation primitives. Production code outside the engine crate must go
 // through zone_pipeline::move_object — the module is only public to test
@@ -190,12 +204,13 @@ pub use bracket_estimate::{
     BracketViolation, CommanderBracketTier,
 };
 // Plumbing: read-only re-export of the X-affordability authority
-// (`max_x_value`) so the `phase-ai` consumer crate can price "the only legal X
-// is 0" without duplicating the cost machinery. `casting_costs` is otherwise
+// (`max_x_value`) and the cost-leg extractor that feeds it
+// (`extract_x_mana_cost`) so the `phase-ai` consumer crate can price "the only
+// legal X is 0" without duplicating the cost machinery. `casting_costs` is otherwise
 // `pub(crate)`; this exposes exactly that one function from it. The governing
 // rule annotation lives on the function definition in `casting_costs.rs`, not
 // on this visibility re-export.
-pub use casting_costs::max_x_value;
+pub use casting_costs::{extract_x_mana_cost, max_x_value};
 pub use deck_loading::{
     create_commander_from_card_face, load_and_hydrate_decks, load_deck_into_state,
     resolve_deck_list, resolve_player_deck_list, DeckEntry, DeckList, DeckPayload, PlayerDeckList,
@@ -208,17 +223,25 @@ pub use deck_validation::{
     DeckCompatibilityResult, DeckCoverage, SignatureSpellSelectionPolicy, UnsupportedCard,
 };
 pub use engine::{
-    apply, apply_as_current, new_game, start_game, start_game_skip_mulligan,
+    apply, apply_as_current, apply_with_rejection, new_game, preflight_debug_action,
+    preflight_debug_action_with_rejection, require_explicit_debug_permission,
+    resolve_all_ready_prefix_with_rejection, start_game, start_game_skip_mulligan,
     start_game_with_starting_player, EngineError,
 };
-pub use engine_debug::route_debug_create_to_battlefield;
+pub use engine_debug::{
+    create_debug_cards, create_debug_cards_with_rejection, debug_card_entry_source,
+    route_debug_create_to_battlefield, DebugCardCreateRequest,
+};
 pub use engine_resolve_batch::{
     resolve_all_fast_forward, ResolveAllCallbackDecision, ResolveAllFastForwardResult,
 };
 pub use game_object::{BackFaceData, GameObject, PhaseOutCause, PhaseStatus};
 pub use keywords::parse_keywords;
 pub use mana_payment::{can_pay, pay_from_pool, produce_mana, PaymentError};
-pub use printed_cards::rehydrate_game_from_card_db;
+pub use printed_cards::{
+    install_card_db, rehydrate_game_from_card_db, rehydrate_game_from_card_db_with_finalization,
+    CardDbRehydrationFinalization,
+};
 pub use public_state::finalize_public_state;
 pub use replay::{reconstruct_initial_state, ReplayError, ReplayPlayer};
 pub use triggers::process_triggers;

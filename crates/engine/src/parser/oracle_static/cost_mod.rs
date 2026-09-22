@@ -5,6 +5,7 @@ use super::prelude::*;
 #[allow(unused_imports)]
 use super::support::*;
 use crate::types::ability::CastTimingPermission;
+use crate::types::mana::{ManaCost, ManaCostShard};
 
 /// CR 602.1: Parse the leading keyword of a "<Keyword> abilities of …" class-wide
 /// activation cost-modification static, returning the canonical keyword string that
@@ -167,7 +168,7 @@ pub(crate) fn parse_cost_payment_prohibition_statics(
     let (_, _) = (opt(tag::<_, _, OracleError<'_>>(".")), eof)
         .parse(after_suffix)
         .ok()?;
-    let (filter, filter_remainder) = parse_type_phrase(filter_text.trim());
+    let (filter, filter_remainder) = parse_type_phrase_folding(filter_text.trim());
     if !filter_remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
         return None;
     }
@@ -307,7 +308,7 @@ fn parse_cast_spells_alternative_cost(text: &str) -> Option<StaticDefinition> {
         .parse(remainder_lower.as_str())
         .is_ok();
 
-    let base_filter = parse_type_phrase(filter_original).0;
+    let base_filter = parse_type_phrase_folding(filter_original).0;
     let affected = apply_spell_keyword_subject_constraints(base_filter, None, None, Vec::new());
 
     let cost = parse_oracle_cost(cost_slice);
@@ -370,6 +371,18 @@ pub(crate) fn parse_alt_cost_frequency_prefix(input: &str) -> OracleResult<'_, C
 ///
 /// Strict-fails to `None` (never misparses) when the payment cannot be parsed
 /// as an `AbilityCost` (Dream Halls discard, Bolas's Citadel life-as-MV).
+///
+/// CR 107.3c + CR 118.9: a trailing "where X is that spell's mana value"
+/// defines the alternative-cost X rather than leaving it for the caster to
+/// choose. The binding is only valid for the standalone `{X}` mana-cost shape.
+fn parse_x_bound_to_spell_mana_value(input: &str) -> OracleResult<'_, ()> {
+    let (input, _) = opt(tag(",")).parse(input)?;
+    let (input, _) =
+        preceded(opt(tag(" ")), tag("where x is that spell's mana value")).parse(input)?;
+    let (input, _) = opt(tag(".")).parse(input)?;
+    Ok((input, ()))
+}
+
 pub(crate) fn parse_spells_alternative_cost(text: &str) -> Option<StaticDefinition> {
     type VE<'a> = OracleError<'a>;
 
@@ -440,10 +453,44 @@ pub(crate) fn parse_spells_alternative_cost(text: &str) -> Option<StaticDefiniti
     let type_prefix_original = subject.original[..type_prefix_lower.len()].trim();
     let after_spells = after_spells_lower.trim();
 
+    // CR 601.2a + CR 118.9: optional origin-zone qualifier on the subject — "a
+    // spell you cast from exile" (Warped Space, Dragon's Smile, Tlincalli
+    // Hunter), "a colorless spell you cast from your hand" (Darksteel
+    // Monolith). Shared zone authority with the keyword-grant subject walk;
+    // the runtime filter compares the cast's origin zone.
+    let (after_spells, zone_filter) =
+        match super::keyword_grant::parse_cast_origin_zone_qualifier(after_spells) {
+            Some((rest, prop)) => (rest, Some(prop)),
+            None => (after_spells, None),
+        };
+
+    let parsed_cost = parse_oracle_cost(cost_slice);
+    if !supported_alternative_cast_cost(&parsed_cost) {
+        return None;
+    }
+
+    // CR 107.3c + CR 118.9: Kentaro-class alternatives bind their lone `{X}`
+    // to the spell's mana value. This is distinct from an announced X, which
+    // is left as `ManaCostShard::X` by normal cost parsing.
+    let spell_mana_value_x = parse_x_bound_to_spell_mana_value(after_spells)
+        .is_ok_and(|(rest, _)| rest.trim().is_empty());
+    let cost = if spell_mana_value_x {
+        match parsed_cost {
+            AbilityCost::Mana {
+                cost: ManaCost::Cost { shards, generic: 0 },
+            } if shards == vec![ManaCostShard::X] => AbilityCost::Mana {
+                cost: ManaCost::SelfManaValue,
+            },
+            _ => return None,
+        }
+    } else {
+        parsed_cost
+    };
+
     // Optional "with mana value N or greater" qualifier (Jodah MV-5+ class). If
     // an MV qualifier is present but does not parse cleanly into FilterProp::Cmc,
     // strict-fail (None) rather than over-broadening to any spell.
-    let mv_filter = if after_spells.is_empty() {
+    let mv_filter = if after_spells.is_empty() || spell_mana_value_x {
         None
     } else {
         let (prop, consumed) = parse_mana_value_suffix(after_spells, &mut ParseContext::default())?;
@@ -463,18 +510,39 @@ pub(crate) fn parse_spells_alternative_cost(text: &str) -> Option<StaticDefiniti
 
     // CR 118.9: a bare leading article ("a"/"an") with no type word — "a spell you
     // cast" (As Foretold) — scopes to any spell, same as the no-prefix case.
-    let base_filter = if matches!(type_prefix_lower.trim(), "" | "a" | "an") {
-        TargetFilter::Typed(TypedFilter::card())
+    let (base_filter, color_props) = if matches!(type_prefix_lower.trim(), "" | "a" | "an") {
+        (TargetFilter::Typed(TypedFilter::card()), Vec::new())
     } else {
-        parse_type_phrase(type_prefix_original).0
+        // CR 601.2a: singular subjects carry an article before the type word —
+        // "a creature spell", "a colorless spell" — peel it before the type
+        // phrase so the article is not read as a type word. Grammar tokens are
+        // matched on the LOWERCASE view (mixed-case input must not skip the
+        // peel); only the preserved type tail hands the original-case slice on.
+        let prefix_lower = type_prefix_lower.trim();
+        let after_article = opt(alt((tag::<_, _, VE<'_>>("a "), tag("an "))))
+            .parse(prefix_lower)
+            .map_or(prefix_lower, |(rest, _)| rest);
+        // CR 105.2: peel a color-quality prefix ("colorless spell" — Darksteel
+        // Monolith) via the shared authority — `parse_type_phrase_folding` drops the
+        // word, which would silently over-broaden the grant to any spell. The
+        // helper expects the word with its trailing space, so re-pad the
+        // trimmed prefix slice.
+        let padded = format!("{after_article} ");
+        let (rest_padded, color_prop) = super::shared::peel_color_quality_prefix(&padded);
+        let rest = rest_padded.trim();
+        let base = if rest.is_empty() {
+            TargetFilter::Typed(TypedFilter::card())
+        } else {
+            // End-anchored original tail: the peels only removed a prefix, so
+            // the remaining type words are the last `rest.len()` bytes of the
+            // trimmed original slice (the TextPair length-mapping convention).
+            let tail = &type_prefix_original[type_prefix_original.len() - rest.len()..];
+            parse_type_phrase_folding(tail).0
+        };
+        (base, color_prop.into_iter().collect::<Vec<_>>())
     };
     let affected =
-        apply_spell_keyword_subject_constraints(base_filter, None, mv_filter, Vec::new());
-
-    let cost = parse_oracle_cost(cost_slice);
-    if !supported_alternative_cast_cost(&cost) {
-        return None;
-    }
+        apply_spell_keyword_subject_constraints(base_filter, zone_filter, mv_filter, color_props);
 
     Some(
         StaticDefinition::new(StaticMode::CastWithAlternativeCost {
@@ -493,7 +561,7 @@ pub(crate) fn parse_spells_alternative_cost(text: &str) -> Option<StaticDefiniti
 /// you cast." (Conspiracy Unraveler class).
 /// Structural sibling of `parse_spells_alternative_cost` — same output shape
 /// (`CastWithAlternativeCost`), different cost verb prefix.
-/// Verified: CR 118.9 (docs/MagicCompRules.txt:1014), CR 701.59a.
+/// Verified: CR 118.9, CR 701.59a.
 pub(crate) fn parse_collect_evidence_alt_cost(text: &str) -> Option<StaticDefinition> {
     type VE<'a> = OracleError<'a>;
 
@@ -542,7 +610,7 @@ pub(crate) fn parse_collect_evidence_alt_cost(text: &str) -> Option<StaticDefini
     let base_filter = if type_prefix_original.is_empty() {
         TargetFilter::Typed(TypedFilter::card())
     } else {
-        parse_type_phrase(type_prefix_original).0
+        parse_type_phrase_folding(type_prefix_original).0
     };
     let affected = apply_spell_keyword_subject_constraints(base_filter, None, None, Vec::new());
 
@@ -564,9 +632,9 @@ pub(crate) fn parse_collect_evidence_alt_cost(text: &str) -> Option<StaticDefini
 /// "[As long as <cond>, ]You may [cost] rather than pay [card-ref's] [keyword] cost[s]."
 /// An optional leading "As long as <cond>," gate (New Perspectives) is split off via
 /// `try_split_inverted_as_long_as` and attached as a `StaticCondition`.
-/// Verified: CR 702.29a (docs/MagicCompRules.txt:4202),
-///           CR 702.122a (docs/MagicCompRules.txt:4870),
-///           CR 118.9 (docs/MagicCompRules.txt:1014).
+/// Verified: CR 702.29a,
+///           CR 702.122a,
+///           CR 118.9.
 pub(crate) fn parse_alternative_keyword_cost(text: &str) -> Option<StaticDefinition> {
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
@@ -744,13 +812,13 @@ pub(crate) fn parse_cast_by_paying_life_alt_cost(text: &str) -> Option<StaticDef
         };
 
     // Strip trailing "spell" / "spells" before type parsing — "enchantment spell" →
-    // "enchantment". `parse_type_phrase` expects bare type words.
+    // "enchantment". `parse_type_phrase_folding` expects bare type words.
     let filter_for_parse = strip_cost_mod_spell_noun_suffix(filter_for_parse);
 
     let base_filter = if filter_for_parse.is_empty() {
         TargetFilter::Typed(TypedFilter::card())
     } else {
-        let (filter, remainder) = parse_type_phrase(filter_for_parse);
+        let (filter, remainder) = parse_type_phrase_folding(filter_for_parse);
         if !remainder.trim().is_empty() {
             return None;
         }

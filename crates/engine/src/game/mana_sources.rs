@@ -33,11 +33,12 @@ use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
 use crate::types::TriggerMode;
 
-use super::engine::EngineError;
+use super::engine::{EngineError, PriorityAnnouncementFacadeAccess, PriorityPrincipal};
 use super::mana_abilities;
 use super::mana_payment;
 use super::restrictions;
 use super::triggers::trigger_source_context_for_latch;
+use super::turn_control;
 
 pub use crate::types::mana::ManaSourcePenalty;
 
@@ -49,6 +50,153 @@ pub use crate::types::mana::ManaSourcePenalty;
 pub(crate) struct LiveManaOutputUnit {
     pub mana_type: ManaType,
     pub restrictions: Vec<ManaRestriction>,
+}
+
+/// The reducer-owned Priority entry point for a selected mana source.
+///
+/// This is intentionally a route rather than a legality result. The normal
+/// reducer remains responsible for validating the frozen selection before it
+/// activates the source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PriorityManaRoute {
+    LandTap,
+    NonlandActivation,
+}
+
+/// An engine-authored land-mana announcement for the Priority preflight.
+/// Its frozen selection can cross into the reducer facade only through the
+/// engine-only conversion capability.
+pub(in crate::game) struct PriorityLandManaAnnouncement {
+    selection: ManaSourceSelection,
+}
+
+impl PriorityLandManaAnnouncement {
+    fn new(selection: ManaSourceSelection) -> Self {
+        Self { selection }
+    }
+
+    pub(in crate::game) fn selection(
+        &self,
+        _access: &PriorityAnnouncementFacadeAccess,
+    ) -> &ManaSourceSelection {
+        &self.selection
+    }
+}
+
+/// An engine-authored nonland-mana announcement for the Priority preflight.
+/// Its frozen selection can cross into the reducer facade only through the
+/// engine-only conversion capability.
+pub(in crate::game) struct PriorityNonlandManaAnnouncement {
+    selection: ManaSourceSelection,
+}
+
+impl PriorityNonlandManaAnnouncement {
+    fn new(selection: ManaSourceSelection) -> Self {
+        Self { selection }
+    }
+
+    pub(in crate::game) fn selection(
+        &self,
+        _access: &PriorityAnnouncementFacadeAccess,
+    ) -> &ManaSourceSelection {
+        &self.selection
+    }
+}
+
+/// The provider's complete, family-partitioned mana announcements. The
+/// partition is intentionally opaque: only the Priority facade can consume it
+/// through its internal access capability.
+pub(in crate::game) struct PriorityManaAnnouncements {
+    land_taps: Vec<PriorityLandManaAnnouncement>,
+    nonland_activations: Vec<PriorityNonlandManaAnnouncement>,
+}
+
+/// An engine-authored undo announcement for a land tapped for mana in the
+/// current Priority window. The tracked object identity stays provider-owned
+/// until the Priority facade reconstructs the reducer primer.
+pub(in crate::game) struct PriorityUntapLandAnnouncement {
+    object_id: ObjectId,
+}
+
+impl PriorityUntapLandAnnouncement {
+    fn new(object_id: ObjectId) -> Self {
+        Self { object_id }
+    }
+
+    pub(in crate::game) fn object_id(
+        &self,
+        _access: &PriorityAnnouncementFacadeAccess,
+    ) -> ObjectId {
+        self.object_id
+    }
+}
+
+impl PriorityManaAnnouncements {
+    pub(in crate::game) fn into_partitioned(
+        self,
+    ) -> (
+        Vec<PriorityLandManaAnnouncement>,
+        Vec<PriorityNonlandManaAnnouncement>,
+    ) {
+        (self.land_taps, self.nonland_activations)
+    }
+}
+
+/// Classifies a source using its current characteristics, matching the
+/// reducer's Priority mana-action partition.
+pub(crate) fn priority_mana_route(
+    state: &GameState,
+    selection: &ManaSourceSelection,
+) -> Option<PriorityManaRoute> {
+    let object = state.objects.get(&selection.source.object_id)?;
+    if object.card_types.core_types.contains(&CoreType::Land) {
+        Some(PriorityManaRoute::LandTap)
+    } else {
+        Some(PriorityManaRoute::NonlandActivation)
+    }
+}
+
+/// Enumerates the mana provider's complete finite Priority announcements for
+/// the authenticated Priority holder. The normal reducer remains responsible
+/// for validating the frozen selection when the announcement is replayed.
+pub(in crate::game) fn priority_mana_announcements(
+    state: &GameState,
+    principal: &PriorityPrincipal,
+) -> PriorityManaAnnouncements {
+    let mut land_taps = Vec::new();
+    let mut nonland_activations = Vec::new();
+    for selection in activatable_mana_source_selections(state, principal.semantic_holder()) {
+        match priority_mana_route(state, &selection) {
+            Some(PriorityManaRoute::LandTap) => {
+                land_taps.push(PriorityLandManaAnnouncement::new(selection));
+            }
+            Some(PriorityManaRoute::NonlandActivation) => {
+                nonland_activations.push(PriorityNonlandManaAnnouncement::new(selection));
+            }
+            None => {}
+        }
+    }
+    PriorityManaAnnouncements {
+        land_taps,
+        nonland_activations,
+    }
+}
+
+/// Enumerates the current holder's existing mana-undo eligibility. The normal
+/// reducer remains authoritative for tracked membership and current object
+/// validity when the announcement is replayed on a clone.
+pub(in crate::game) fn priority_untap_land_announcements(
+    state: &GameState,
+    principal: &PriorityPrincipal,
+) -> Vec<PriorityUntapLandAnnouncement> {
+    state
+        .lands_tapped_for_mana
+        .get(&principal.semantic_holder())
+        .into_iter()
+        .flatten()
+        .copied()
+        .map(PriorityUntapLandAnnouncement::new)
+        .collect()
 }
 
 impl ManaSourcePenalty {
@@ -228,6 +376,12 @@ impl ManaSourceOption {
 /// cost and every component of a `Composite`. Single walker behind all
 /// component-presence predicates (`has_tap_component`, `has_untap_component`,
 /// `cost_includes_sacrifice`, `cost_includes_loyalty`).
+///
+/// Walks **one `Composite` level only**: a component nested inside a child
+/// `Composite` is not seen. Sound for presence checks, whose `false` merely
+/// declines a fast path, but never sound for an arity bound — for that use
+/// [`count_leaf_components`], which recurses to the same flattened leaf
+/// multiset the payment path actually pays.
 pub(crate) fn cost_has_component(
     cost: &Option<AbilityCost>,
     pred: impl Fn(&AbilityCost) -> bool,
@@ -683,9 +837,13 @@ fn live_mana_output_units(
 /// Pure action-boundary validation for semantic land-mana submissions. It is
 /// deliberately called before interaction rebinding or transient-state cleanup
 /// so a hostile stale/ambiguous payload leaves the complete game state intact.
+/// `authenticated_actor` is the submitting connection, not the seat whose mana
+/// sources are being activated: CR 723.5a lets a controller spend only the
+/// controlled player's resources, so the seat comes from `state.waiting_for`
+/// and only the right to submit for it is checked here.
 pub(crate) fn preflight_tap_land_action(
     state: &GameState,
-    player: PlayerId,
+    authenticated_actor: PlayerId,
     action: &GameAction,
 ) -> Result<(), EngineError> {
     if !matches!(action, GameAction::TapLandForMana { .. }) {
@@ -701,10 +859,13 @@ pub(crate) fn preflight_tap_land_action(
             ));
         }
     };
-    if waiting_player != player {
+    // CR 723.5 + CR 723.5a: a turn controller makes the waiting player's
+    // choices, but activates that player's mana sources and spends only that
+    // player's resources.
+    if turn_control::authorized_submitter_for_player(state, waiting_player) != authenticated_actor {
         return Err(EngineError::WrongPlayer);
     }
-    let matches = activatable_mana_actions_for_player(state, player)
+    let matches = activatable_mana_actions_for_player(state, waiting_player)
         .into_iter()
         .filter(|candidate| candidate == action)
         .count();
@@ -822,6 +983,12 @@ pub(crate) fn activate_mana_source_option_with_output(
             produced,
             tap_state: ManaTapState::FromTap,
         });
+        events.push(GameEvent::ManaAbilityProduced {
+            player_id: player,
+            source_id: option.object_id,
+            produced: vec![option.mana_type],
+            trigger_state: crate::types::events::ManaAbilityTriggerState::Pending,
+        });
         mana_abilities::resume_waiting_for(player, resume)
     };
 
@@ -883,22 +1050,85 @@ pub(crate) fn has_untap_component(cost: &Option<AbilityCost>) -> bool {
 /// prompt is never bypassed. It stays off the auto-tap path and remains
 /// reachable only through
 /// `has_activatable_non_tap_mana_ability_for_payment`'s manual-payment flow.
+///
+/// The tree is additionally ARITY-BOUNDED: exactly one self-sacrifice leaf and
+/// at most one `{T}` leaf, counted over the FLATTENED tree, with no nested
+/// `Composite`. A multi-consuming-leaf tree is choice-free yet unpayable,
+/// because the payment path pays leaves one at a time against the already
+/// mutated source: a second self-sacrifice leaf finds the source no longer on
+/// the battlefield (CR 701.21a) and a second `{T}` leaf finds it already tapped
+/// (CR 118.3), so each errors. Without the bound this predicate would answer
+/// `true` where the legality simulation answers `false` — an unsafe flip, since
+/// callers use it to skip that simulation.
 pub(crate) fn has_unambiguous_self_sacrifice_component(cost: &Option<AbilityCost>) -> bool {
-    // Whole-tree invariant first (shared authority): rejects any interactive
-    // sibling such as LED's `Discard`. Then confirm a self-sacrifice component
-    // is actually present, so a pure `{T}` cost is not misclassified as
-    // self-sacrifice by this predicate.
-    cost.as_ref()
-        .is_some_and(mana_abilities::cost_component_choice_free)
-        && cost_has_component(cost, |c| {
-            matches!(
-                c,
-                AbilityCost::Sacrifice(SacrificeCost {
-                    target: TargetFilter::SelfRef,
-                    requirement: SacrificeRequirement::Count { count: 1 },
-                })
-            )
-        })
+    cost.as_ref().is_some_and(|inner| {
+        // Whole-tree invariant first (shared authority): rejects any interactive
+        // sibling such as LED's `Discard`, so only `Tap` and single-token
+        // self-sacrifice leaves survive to be counted below.
+        mana_abilities::cost_component_choice_free(inner)
+            // Keep the leaf multiset visible to the one-level walkers that gate
+            // this activation (see `cost_tree_is_flat`).
+            && cost_tree_is_flat(inner)
+            // CR 701.21a: sacrificing moves the permanent from the battlefield,
+            // so a second self-sacrifice leaf has nothing left to move. Requiring
+            // a component to be PRESENT also keeps a pure `{T}` cost from being
+            // misclassified as self-sacrifice.
+            && count_leaf_components(inner, &|leaf| {
+                matches!(
+                    leaf,
+                    AbilityCost::Sacrifice(SacrificeCost {
+                        target: TargetFilter::SelfRef,
+                        requirement: SacrificeRequirement::Count { count: 1 },
+                    })
+                )
+            }) == 1
+            // CR 118.3: a permanent that's already tapped can't be tapped to pay
+            // a cost, so a second `{T}` leaf errors the same way.
+            && count_leaf_components(inner, &|leaf| matches!(leaf, AbilityCost::Tap)) <= 1
+    })
+}
+
+/// Number of FLATTENED LEAF components of `cost` satisfying `pred`.
+///
+/// Unlike [`cost_has_component`] — presence, one `Composite` level — this walker
+/// recurses to the leaves, so it counts the same multiset the payment path pays:
+/// `mana_abilities::append_mana_ability_cost_components` flattens nested
+/// `Composite`s identically, then pays one leaf at a time. Every arity bound must
+/// use this walker; a one-level count reports `1` for
+/// `Composite[Composite[Tap, Sacrifice], Sacrifice]`, where the payer pays two
+/// sacrifices. `OneOf` stays opaque — only one of its branches is ever paid, so
+/// its contents are not part of the flattened multiset.
+fn count_leaf_components(cost: &AbilityCost, pred: &impl Fn(&AbilityCost) -> bool) -> usize {
+    match cost {
+        AbilityCost::Composite { costs } => costs
+            .iter()
+            .map(|cost| count_leaf_components(cost, pred))
+            .sum(),
+        leaf => usize::from(pred(leaf)),
+    }
+}
+
+/// True when every leaf of `cost` is visible at the top level: a non-`Composite`
+/// cost, or a `Composite` with no `Composite` child.
+///
+/// The gates that surround an unambiguous self-sacrifice activation read the cost
+/// tree with the ONE-LEVEL [`cost_has_component`] walker:
+/// `mana_abilities::mana_ability_ready_without_simulation_gated` gates its tapped,
+/// `object_cant_tap` and summoning-sickness checks on [`has_tap_component`]
+/// (CR 106.12 + CR 302.6), and [`object_has_tapless_self_sacrifice_mana_ability`]
+/// reads `!has_tap_component`. A nested
+/// `Composite[Composite[Tap, Sacrifice(SelfRef, 1)]]` hides its `{T}` from both,
+/// so an already-tapped source would clear readiness while the payment path —
+/// which does flatten — still errors on that `Tap` leaf (CR 118.3). Requiring a
+/// flat tree keeps this predicate aligned with every walker that gates it, rather
+/// than depending on those walkers to be changed in lockstep.
+fn cost_tree_is_flat(cost: &AbilityCost) -> bool {
+    match cost {
+        AbilityCost::Composite { costs } => !costs
+            .iter()
+            .any(|cost| matches!(cost, AbilityCost::Composite { .. })),
+        _ => true,
+    }
 }
 
 /// CR 605.3a + CR 106.12 + CR 302.6: True when `obj` has an activated mana
@@ -1262,7 +1492,7 @@ pub(crate) fn trigger_chain_benefits_controller(trigger: &TriggerDefinition) -> 
 }
 
 /// CR 605.1b (+ CR 603.3): True when `trigger` is a *non-mana* tap-triggered
-/// ability — mode `TapsForMana` or `ManaAdded` whose `execute` chain contains
+/// ability — mode `TapsForMana`, `ManaAbilityProduced`, or `ManaAdded` whose `execute` chain contains
 /// any effect other than mana production.
 ///
 /// Such a trigger FAILS CR 605.1b's mana-ability criteria (it does not "add mana
@@ -1276,7 +1506,7 @@ pub(crate) fn trigger_chain_benefits_controller(trigger: &TriggerDefinition) -> 
 pub(crate) fn is_non_mana_tap_trigger(trigger: &TriggerDefinition) -> bool {
     matches!(
         trigger.mode,
-        TriggerMode::TapsForMana | TriggerMode::ManaAdded
+        TriggerMode::TapsForMana | TriggerMode::ManaAbilityProduced | TriggerMode::ManaAdded
     ) && trigger.execute.as_deref().is_some_and(|execute| {
         !matches!(*execute.effect, Effect::Mana { .. }) || chain_has_non_mana_effect(execute)
     })
@@ -1461,6 +1691,20 @@ pub fn display_land_mana_pips(
                     }
                 }
             },
+            // CR 106.1b + CR 106.5: Engine-set noted type (Jeweled Amulet class).
+            // Unreachable in practice today — no printed land has this
+            // mechanic — but display the noted type when present, mirroring
+            // `ChoiceAmongExiledColors`'s "compute, push if non-empty" shape.
+            ManaProduction::NotedType { .. } => {
+                if let Some(mana_type) = super::effects::mana::noted_mana_type_for(state, object_id)
+                {
+                    if let Some(color) = mana_type_to_color(mana_type) {
+                        push(&mut pips, ManaPip::Color(color));
+                    } else {
+                        push(&mut pips, ManaPip::Colorless);
+                    }
+                }
+            }
             // CR 106.7: Dynamically computed from opponent lands.
             ManaProduction::OpponentLandColors { .. } => {
                 let colors: Vec<ManaColor> = opponent_land_color_options(state, controller)
@@ -2040,6 +2284,17 @@ fn activatable_mana_profiles_for_object(
             if ability.kind != AbilityKind::Activated || !mana_abilities::is_mana_ability(ability) {
                 return None;
             }
+            // CR 601.2g: A tap mana ability that itself needs mana (such as
+            // a filter land) must stay with the exact auto-tap payment probe.
+            // A standalone profile cannot represent the mana it consumes to
+            // activate, and would let that mana cover the spell as well. Plain
+            // tap sources remain here so they can combine with a manual-choice
+            // mana ability during the same cost-payment step.
+            if has_tap_component(&ability.cost)
+                && mana_abilities::mana_sub_cost_of(&ability.cost).is_some()
+            {
+                return None;
+            }
             if !mana_abilities::can_activate_mana_ability_now(
                 state, controller, object_id, idx, ability,
             ) {
@@ -2348,26 +2603,62 @@ fn land_mana_options(
         gates,
     );
 
-    // Legacy fallback for basic-land subtype-only objects (no explicit mana ability).
-    if options.is_empty() {
+    // CR 305.6 + CR 602.5: Legacy fallback for basic-land subtype-only objects that
+    // carry NO EXPLICIT mana ability at all (a nonbasic granted a basic land
+    // type by Urborg/Blood Moon-class effects with no accompanying
+    // `Effect::Mana` grant). This must NOT fire merely because
+    // `scan_mana_abilities` came back empty — it can be empty because a REAL
+    // `Effect::Mana` ability exists but was just filtered out by a legality
+    // gate (CantBeActivated, CantActivateDuring, an unsatisfied activation
+    // condition). Falling back to unconditional subtype-inferred production
+    // in that case would silently defeat the gate that filtered it (issue
+    // #6469: Karn, the Great Creator's "activated abilities of artifacts your
+    // opponents control can't be activated" stopped blocking a Liquimetal-
+    // Coating-turned-artifact land's own {T}: Add mana ability, because the
+    // ability's legitimate absence from `options` was mistaken for "no
+    // ability exists").
+    let has_explicit_mana_ability = obj
+        .abilities
+        .iter()
+        .any(|ability| matches!(*ability.effect, Effect::Mana { .. }));
+    if options.is_empty() && !has_explicit_mana_ability {
         if let Some(mana_type) = obj
             .card_types
             .subtypes
             .iter()
             .find_map(|s| mana_payment::land_subtype_to_mana_type(s))
         {
-            options.push(ManaSourceOption {
-                object_id,
-                ability_index: None,
-                mana_type,
-                source_could_produce_two_or_more_colors: source_could_produce_two_or_more_colors(
-                    state, object_id, controller,
-                ),
-                penalty: ManaSourcePenalty::None,
-                atomic_combination: None,
-                restrictions: Vec::new(),
-                taps_for_mana_overrides: Vec::new(),
-            });
+            // CR 305.6 + CR 602.5: the intrinsic "{T}: Add [mana symbol]"
+            // ability this fallback synthesizes is still an activated (mana)
+            // ability — every readiness gate a printed one is checked against
+            // (phased-out, detained, tapped/can't-tap, summoning sickness,
+            // CantBeActivated/CantActivateDuring, static activation
+            // restrictions) must apply to it too, not just the two activation-
+            // prohibition statics. Mirrors the `require_current_payability`
+            // gating `is_active_tap_mana_ability` applies to a real ability: the
+            // auto-tap PLANNING pass (`require_current_payability == false`)
+            // does not consult per-source legality gates for ANY mana source,
+            // real or intrinsic, so this only fires on the interactive/
+            // legal-action path.
+            let blocked = require_current_payability
+                && mana_type_to_color(mana_type).is_some_and(|color| {
+                    mana_abilities::intrinsic_land_mana_ability_blocked(
+                        state, controller, object_id, color, gates,
+                    )
+                });
+            if !blocked {
+                options.push(ManaSourceOption {
+                    object_id,
+                    ability_index: None,
+                    mana_type,
+                    source_could_produce_two_or_more_colors:
+                        source_could_produce_two_or_more_colors(state, object_id, controller),
+                    penalty: ManaSourcePenalty::None,
+                    atomic_combination: None,
+                    restrictions: Vec::new(),
+                    taps_for_mana_overrides: Vec::new(),
+                });
+            }
         }
     }
 
@@ -2735,6 +3026,13 @@ fn mana_options_from_production(
         ManaProduction::ChosenColor {
             fixed_alternative, ..
         } => chosen_color_mana_type_options(state, object_id, *fixed_alternative),
+        // CR 106.1b + CR 106.5: Engine-set noted type (Jeweled Amulet class).
+        // Unreachable in practice today — no printed land has this mechanic.
+        ManaProduction::NotedType { .. } => {
+            super::effects::mana::noted_mana_type_for(state, object_id)
+                .into_iter()
+                .collect()
+        }
         // CR 106.7: Compute colors dynamically from opponent-controlled lands.
         ManaProduction::OpponentLandColors { .. } => opponent_land_color_options(state, controller),
         // CR 106.7 + CR 106.1b: Compute the full type set (incl. Colorless)
@@ -4028,6 +4326,280 @@ mod tests {
         );
     }
 
+    /// Adjacent-shape hostiles for `has_unambiguous_self_sacrifice_component`,
+    /// which is also the classifier the mana-display legality fast path
+    /// (`mana_abilities::legality_simulation_is_redundant`) composes. Covers only
+    /// what `led_shaped_discard_sacrifice_stays_off_auto_tap` above does not —
+    /// that test already pins Gold, Treasure, LED and LED-reordered.
+    ///
+    /// The point of the negative rows is that **none of them needs a guard**: the
+    /// literal `SelfRef` / `Count { count: 1 }` struct pattern excludes every one
+    /// of them by construction. In particular `SacrificeRequirement::Aggregate`
+    /// (Phyrexian Dreadnought class) cannot match `Count { count: 1 }`, so it can
+    /// never reach a fast path — pinned here so a later "simplification" of the
+    /// pattern into a wildcard is caught.
+    #[test]
+    fn self_sacrifice_classifier_excludes_hostile_shapes() {
+        use crate::types::ability::{
+            Comparator, SacrificeAggregateStat, SacrificeRequirement, TargetFilter, TypedFilter,
+        };
+
+        // Positive controls first: without these, every `!` below could pass on a
+        // classifier that returns `false` unconditionally.
+        assert!(
+            has_unambiguous_self_sacrifice_component(&Some(AbilityCost::Composite {
+                costs: vec![
+                    AbilityCost::Tap,
+                    AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1)),
+                ],
+            })),
+            "positive control: Treasure's {{T}} + single self-sacrifice is accepted"
+        );
+        assert!(
+            has_unambiguous_self_sacrifice_component(&Some(AbilityCost::Sacrifice(
+                SacrificeCost::count(TargetFilter::SelfRef, 1)
+            ))),
+            "positive control: Gold's bare single self-sacrifice is accepted"
+        );
+
+        // CR 701.21: sacrificing TWO of this permanent is not the deterministic
+        // single-self shape — `Count { count: 2 }` does not match `Count { count: 1 }`.
+        assert!(
+            !has_unambiguous_self_sacrifice_component(&Some(AbilityCost::Sacrifice(
+                SacrificeCost::count(TargetFilter::SelfRef, 2)
+            ))),
+            "Count {{ count: 2 }} is excluded by construction"
+        );
+
+        // CR 701.21: an aggregate requirement (Phyrexian Dreadnought class) needs a
+        // player-chosen SET of permanents — excluded by construction, no guard.
+        assert!(
+            !has_unambiguous_self_sacrifice_component(&Some(AbilityCost::Sacrifice(
+                SacrificeCost::new(
+                    TargetFilter::SelfRef,
+                    SacrificeRequirement::Aggregate {
+                        stat: SacrificeAggregateStat::TotalPower,
+                        comparator: Comparator::GE,
+                        value: 12,
+                    },
+                )
+            ))),
+            "SacrificeRequirement::Aggregate is excluded by construction"
+        );
+
+        // A non-self target (Phyrexian Altar class) may have no legal victim, so
+        // its payability is NOT decided by the cost's shape.
+        assert!(
+            !has_unambiguous_self_sacrifice_component(&Some(AbilityCost::Sacrifice(
+                SacrificeCost::count(TargetFilter::Typed(TypedFilter::creature()), 1)
+            ))),
+            "a non-self Sacrifice target is not an unambiguous self-sacrifice"
+        );
+
+        // A pure {T} cost is choice-free but carries NO self-sacrifice component,
+        // so this predicate must not claim it.
+        assert!(
+            !has_unambiguous_self_sacrifice_component(&Some(AbilityCost::Composite {
+                costs: vec![AbilityCost::Tap],
+            })),
+            "a {{T}}-only cost has no self-sacrifice component to classify"
+        );
+
+        // The degenerate empty Composite is vacuously choice-free, but requiring a
+        // self-sacrifice component to be PRESENT rejects it — which is why this
+        // predicate needs no `{T}`/`{Q}` anchor of its own.
+        assert!(
+            !has_unambiguous_self_sacrifice_component(&Some(AbilityCost::Composite {
+                costs: vec![],
+            })),
+            "the degenerate empty Composite is rejected because a self-sacrifice \
+             component is required to be present"
+        );
+    }
+
+    /// CR 118.3 + CR 701.21a: the classifier's LEAF-ARITY bound. A cost tree can
+    /// be choice-free and still unpayable, because the payment path pays leaves
+    /// one at a time against the already-mutated source: a second
+    /// `Sacrifice(SelfRef, 1)` leaf finds the source no longer on the battlefield
+    /// and a second `{T}` leaf finds it already tapped, so `activate_mana_ability`
+    /// errors and the legality simulation answers `false`. Unbounded, the
+    /// classifier answers `true` for these shapes and
+    /// `mana_abilities::legality_simulation_is_redundant` would skip the
+    /// simulation and FLIP the answer — the one direction the fast path may never
+    /// take.
+    ///
+    /// The census runs over the FLATTENED tree, but the nested rows below do NOT
+    /// prove that: `cost_tree_is_flat` rejects them first, so they would still
+    /// pass on a one-level census. The flattening itself is pinned directly on the
+    /// walker, in `leaf_component_census_counts_the_flattened_tree`.
+    #[test]
+    fn self_sacrifice_classifier_bounds_leaf_arity() {
+        use crate::types::ability::TargetFilter;
+
+        let self_sac = || AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1));
+
+        // Positive controls first: without them every `!` below would pass on a
+        // classifier that returns `false` unconditionally, and these two shapes
+        // are precisely what the fast path exists to keep.
+        assert!(
+            has_unambiguous_self_sacrifice_component(&Some(AbilityCost::Composite {
+                costs: vec![AbilityCost::Tap, self_sac()],
+            })),
+            "positive control: Treasure's single {{T}} + single self-sacrifice stays eligible"
+        );
+        assert!(
+            has_unambiguous_self_sacrifice_component(&Some(self_sac())),
+            "positive control: Gold's bare single self-sacrifice stays eligible"
+        );
+
+        // CR 701.21a: the second self-sacrifice leaf has nothing left to move from
+        // the battlefield, so `sacrifice_permanent` errors and the simulation says
+        // `false`.
+        assert!(
+            !has_unambiguous_self_sacrifice_component(&Some(AbilityCost::Composite {
+                costs: vec![self_sac(), self_sac()],
+            })),
+            "two self-sacrifice leaves are not unambiguously payable"
+        );
+
+        // CR 118.3: the second {T} leaf finds the source already tapped, so
+        // `tap_source` errors and the simulation says `false`.
+        assert!(
+            !has_unambiguous_self_sacrifice_component(&Some(AbilityCost::Composite {
+                costs: vec![AbilityCost::Tap, AbilityCost::Tap, self_sac()],
+            })),
+            "two {{T}} leaves are not unambiguously payable"
+        );
+
+        // Both hostile axes in one tree.
+        assert!(
+            !has_unambiguous_self_sacrifice_component(&Some(AbilityCost::Composite {
+                costs: vec![AbilityCost::Tap, self_sac(), self_sac()],
+            })),
+            "a {{T}} beside two self-sacrifice leaves is not unambiguously payable"
+        );
+
+        // Two self-sacrifice leaves again, this time split across a nested
+        // `Composite`: the payer flattens this to [Tap, Sac, Sac] and pays three
+        // leaves. Rejected by `cost_tree_is_flat` before the census runs — the
+        // census's own flattening is pinned directly in
+        // `leaf_component_census_counts_the_flattened_tree`, since this clause
+        // would mask an undercount here.
+        assert!(
+            !has_unambiguous_self_sacrifice_component(&Some(AbilityCost::Composite {
+                costs: vec![
+                    AbilityCost::Composite {
+                        costs: vec![AbilityCost::Tap, self_sac()],
+                    },
+                    self_sac(),
+                ],
+            })),
+            "a nested Composite's self-sacrifice leaf must be counted: the arity \
+             census walks the flattened tree, not one Composite level"
+        );
+
+        // NESTING GUARD: flattened this is the payable [Tap, Sac], but the {T} is
+        // invisible to the one-level `has_tap_component` that gates readiness's
+        // tapped / summoning-sickness checks (CR 106.12 + CR 302.6), so a TAPPED
+        // source would clear readiness while the payment path still errors on the
+        // Tap leaf (CR 118.3). Rejected so this predicate never outruns the
+        // walkers that gate it.
+        assert!(
+            !has_unambiguous_self_sacrifice_component(&Some(AbilityCost::Composite {
+                costs: vec![AbilityCost::Composite {
+                    costs: vec![AbilityCost::Tap, self_sac()],
+                }],
+            })),
+            "a nested cost tree is rejected: its leaves are invisible to the \
+             one-level walkers that gate this activation"
+        );
+
+        // Order is NOT an axis of this bound, and the arity census did not make it
+        // one: sacrificing before tapping still classifies. The payment path
+        // tolerates it — after the sacrifice the object stays in `state.objects`
+        // with `zone = Graveyard`, and neither `tap_source` (which reads only
+        // `tapped`) nor `tap_permanent_for_cost` has a zone guard — so the fast
+        // path and the simulation agree. Pinned as a no-regression row, not as an
+        // endorsement of the shape.
+        assert!(
+            has_unambiguous_self_sacrifice_component(&Some(AbilityCost::Composite {
+                costs: vec![self_sac(), AbilityCost::Tap],
+            })),
+            "the leaf-arity bound is order-blind: one leaf of each still classifies"
+        );
+    }
+
+    /// `count_leaf_components` must report the multiset the PAYMENT path actually
+    /// pays: `mana_abilities::append_mana_ability_cost_components` flattens nested
+    /// `Composite`s before paying one leaf at a time, so a census that walked a
+    /// single level (as [`cost_has_component`] does) reports `1` where the payer
+    /// pays `2` — and an arity bound built on it would re-admit the very shapes
+    /// `self_sacrifice_classifier_bounds_leaf_arity` rejects.
+    ///
+    /// Pinned on the building block rather than through the classifier because the
+    /// classifier rejects nested trees on a separate clause (`cost_tree_is_flat`),
+    /// which would mask an undercount here.
+    #[test]
+    fn leaf_component_census_counts_the_flattened_tree() {
+        use crate::types::ability::{SacrificeRequirement, TargetFilter};
+
+        let self_sac = || AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1));
+        let is_self_sac = |cost: &AbilityCost| {
+            matches!(
+                cost,
+                AbilityCost::Sacrifice(SacrificeCost {
+                    target: TargetFilter::SelfRef,
+                    requirement: SacrificeRequirement::Count { count: 1 },
+                })
+            )
+        };
+        let is_tap = |cost: &AbilityCost| matches!(cost, AbilityCost::Tap);
+
+        // A bare leaf is its own multiset.
+        assert_eq!(
+            count_leaf_components(&self_sac(), &is_self_sac),
+            1,
+            "a bare self-sacrifice cost is one self-sacrifice leaf"
+        );
+
+        // Flat control: here a one-level census and a flattened census agree, so
+        // the nested rows below are what discriminate between them.
+        let flat = AbilityCost::Composite {
+            costs: vec![AbilityCost::Tap, self_sac()],
+        };
+        assert_eq!(
+            count_leaf_components(&flat, &is_self_sac),
+            1,
+            "control: Treasure's flat tree has one self-sacrifice leaf"
+        );
+        assert_eq!(
+            count_leaf_components(&flat, &is_tap),
+            1,
+            "control: Treasure's flat tree has one {{T}} leaf"
+        );
+
+        // The discriminating rows: the payer flattens this to [Tap, Sac, Sac].
+        let nested = AbilityCost::Composite {
+            costs: vec![
+                AbilityCost::Composite {
+                    costs: vec![AbilityCost::Tap, self_sac()],
+                },
+                self_sac(),
+            ],
+        };
+        assert_eq!(
+            count_leaf_components(&nested, &is_self_sac),
+            2,
+            "a nested self-sacrifice leaf must be counted: a one-level census \
+             reports 1 here, which is the undercount that re-admits the defect"
+        );
+        assert_eq!(
+            count_leaf_components(&nested, &is_tap),
+            1,
+            "a nested {{T}} leaf must be counted: a one-level census reports 0 here"
+        );
+    }
+
     #[test]
     fn life_payment_mana_source_marks_controller_harm() {
         let mut state = GameState::new_two_player(42);
@@ -5143,6 +5715,57 @@ mod tests {
             player: PlayerId(0),
         };
         forest
+    }
+
+    #[test]
+    fn priority_mana_route_uses_current_source_characteristics() {
+        let mut state = GameState::new_two_player(42);
+        let forest = subtype_forest_with_priority(&mut state);
+        let artifact = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Mana Rock".to_string(),
+            Zone::Battlefield,
+        );
+        let artifact_object = state.objects.get_mut(&artifact).unwrap();
+        artifact_object
+            .card_types
+            .core_types
+            .push(CoreType::Artifact);
+        Arc::make_mut(&mut artifact_object.abilities).push(verge_ability(ManaColor::Green));
+
+        let selections = activatable_mana_source_selections(&state, PlayerId(0));
+        let forest_selection = selections
+            .iter()
+            .find(|selection| selection.source.object_id == forest)
+            .expect("Forest fallback supplies a mana selection");
+        let artifact_selection = selections
+            .iter()
+            .find(|selection| selection.source.object_id == artifact)
+            .expect("mana artifact supplies a mana selection");
+
+        assert_eq!(
+            priority_mana_route(&state, forest_selection),
+            Some(PriorityManaRoute::LandTap)
+        );
+        assert_eq!(
+            priority_mana_route(&state, artifact_selection),
+            Some(PriorityManaRoute::NonlandActivation)
+        );
+
+        state
+            .objects
+            .get_mut(&forest)
+            .expect("Forest remains a live object")
+            .card_types
+            .core_types
+            .clear();
+        assert_eq!(
+            priority_mana_route(&state, forest_selection),
+            Some(PriorityManaRoute::NonlandActivation),
+            "the route follows current characteristics; the clone reducer later rejects a stale selection"
+        );
     }
 
     #[test]

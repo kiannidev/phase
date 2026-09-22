@@ -108,6 +108,11 @@ pub(crate) enum OracleSemanticFeature {
     Apnap,
     /// CR 700.2: a modal choice whose maximum number of modes is dynamic.
     ModalDynamicMaxDropped,
+    /// CR 608.2f: a damage clause whose subject conjoins a player scope and an
+    /// object scope is ONE action taken on multiple players and/or objects,
+    /// processed simultaneously — so a parse carrying only one of the two
+    /// audiences has silently discarded the other.
+    DamageSubjectConjunction,
 }
 
 impl OracleSemanticFeature {
@@ -140,6 +145,7 @@ impl OracleSemanticFeature {
             Self::ConditionAsLongAs => "Condition_AsLongAs",
             Self::Apnap => "APNAP",
             Self::ModalDynamicMaxDropped => "Modal_DynamicMaxDropped",
+            Self::DamageSubjectConjunction => "DamageSubjectConjunction",
         }
     }
 }
@@ -465,19 +471,17 @@ pub(crate) fn scope_to_unit(
             }
             OracleNodeIr::CastingRestriction(r) => scoped.casting_restrictions.push(r.clone()),
             OracleNodeIr::CastingOption(o) => scoped.casting_options.push(o.clone()),
-            // The residual contributes through the ability id track above, like
-            // every other spell shape: it lowers into `result.abilities`, so the
-            // `pick` over `tracks.abilities` already attributes it to this unit.
-            // Adding it here as well would double-count it as unit evidence.
+            // The residual contributes through the ability id track, while a
+            // relation synthesis contributes solely through the replacement id
+            // track. Adding either here would double-count unit evidence.
             OracleNodeIr::Unsupported { .. }
+            | OracleNodeIr::RelationSynthesis(_)
             | OracleNodeIr::Spell(_)
             | OracleNodeIr::Trigger(_)
             | OracleNodeIr::Static(_)
             | OracleNodeIr::Replacement(_)
             | OracleNodeIr::PreLoweredSpell(_)
-            | OracleNodeIr::PreLoweredTrigger(_)
-            | OracleNodeIr::PreLoweredStatic(_)
-            | OracleNodeIr::PreLoweredReplacement(_) => {}
+            | OracleNodeIr::PreLoweredTrigger(_) => {}
         }
     }
     scoped
@@ -612,6 +616,7 @@ mod tests {
             (F::ConditionAsLongAs, "Condition_AsLongAs"),
             (F::Apnap, "APNAP"),
             (F::ModalDynamicMaxDropped, "Modal_DynamicMaxDropped"),
+            (F::DamageSubjectConjunction, "DamageSubjectConjunction"),
         ];
         for (feature, label) in expected {
             assert_eq!(feature.detector_label(), label);
@@ -691,7 +696,7 @@ mod tests {
 /// checkout does not have. Point it at one and run it explicitly:
 ///
 /// ```text
-/// ORACLE_POOL_DIR=/path/to/data cargo test -p engine --lib pool_structure_census \
+/// ORACLE_POOL_DIR=/path/to/data cargo test -p phase-engine --lib pool_structure_census \
 ///     -- --ignored --nocapture
 /// ```
 #[cfg(test)]

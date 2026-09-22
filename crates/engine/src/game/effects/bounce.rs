@@ -67,16 +67,37 @@ fn filter_uses_scoped_player(filter: &TargetFilter) -> bool {
     }
 }
 
+/// Finds a spell's casting variant while it is on the stack or resolving.
+///
+/// Resolving spells leave `GameState::stack` before their chained instructions
+/// run, so the resolution carrier is also an authoritative source.
 fn stack_spell_casting_variant(
     state: &GameState,
     obj_id: crate::types::identifiers::ObjectId,
 ) -> Option<CastingVariant> {
-    state.stack.iter().find_map(|entry| match &entry.kind {
-        StackEntryKind::Spell {
-            casting_variant, ..
-        } if entry.id == obj_id => Some(*casting_variant),
-        _ => None,
-    })
+    state
+        .stack
+        .iter()
+        .find_map(|entry| match &entry.kind {
+            StackEntryKind::Spell {
+                casting_variant, ..
+            } if entry.id == obj_id => Some(*casting_variant),
+            _ => None,
+        })
+        .or_else(|| {
+            // CR 608.2m + CR 608.2n: resolving spells are popped from the live
+            // stack before their effect chain runs, but their casting variant stays
+            // authoritative in the resolution carrier until the chain completes.
+            state
+                .resolving_stack_entry
+                .as_ref()
+                .and_then(|entry| match &entry.kind {
+                    StackEntryKind::Spell {
+                        casting_variant, ..
+                    } if entry.id == obj_id => Some(*casting_variant),
+                    _ => None,
+                })
+        })
 }
 
 /// CR 400.6: Zone change — return target object to the destination zone
@@ -237,6 +258,7 @@ pub fn resolve(
                     conditional_enter_with_counters: vec![],
                     count_param: 0,
                     library_position: None,
+                    mass_library_order: None,
                     is_cost_payment: false,
                     enters_modified_if: None,
                     duration: None,
@@ -332,6 +354,7 @@ pub fn resolve(
                     conditional_enter_with_counters: vec![],
                     count_param: 0,
                     library_position: None,
+                    mass_library_order: None,
                     is_cost_payment: false,
                     enters_modified_if: None,
                     duration: None,
@@ -442,7 +465,7 @@ pub fn resolve_all(
             properties: vec![],
         })
     } else {
-        crate::game::effects::resolved_object_filter(ability, &target_filter)
+        crate::game::effects::resolved_object_filter(state, ability, &target_filter)
     };
     let scoped_ability;
     let ability = if filter_uses_scoped_player(&effective_filter) && ability.scoped_player.is_none()
@@ -512,6 +535,7 @@ pub fn resolve_all(
                 conditional_enter_with_counters: vec![],
                 count_param: 0,
                 library_position: None,
+                mass_library_order: None,
                 is_cost_payment: false,
                 enters_modified_if: None,
                 duration: None,
@@ -807,6 +831,7 @@ mod tests {
                 source_name: "Ability Source".to_string(),
                 subject_match_count: None,
                 die_result: None,
+                provenance: None,
             },
         });
 

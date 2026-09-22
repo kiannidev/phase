@@ -3,15 +3,15 @@ import { motion, AnimatePresence } from "framer-motion";
 import { useTranslation } from "react-i18next";
 
 import { getCardImageSrcSetProps } from "../card/cardImageSrcSet.ts";
-import { useCardImage } from "../../hooks/useCardImage.ts";
+import { useCardBackImage, useCardImage } from "../../hooks/useCardImage.ts";
 import { useCardHover } from "../../hooks/useCardHover.ts";
 import { useIsCompactHeight } from "../../hooks/useIsCompactHeight.ts";
 import { CARD_BACK_URL } from "../../services/scryfall.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
 import { usePerspectivePlayerId } from "../../hooks/usePlayerId.ts";
-import type { ObjectId, PlayerId } from "../../adapter/types.ts";
-import { getOpponentIds, isPrivatelyLookedAtByViewer, resolveFocusedOpponent } from "../../viewmodel/gameStateView.ts";
+import type { GameObject, ObjectId, PlayerId } from "../../adapter/types.ts";
+import { getOpponentIds, resolveFocusedOpponent } from "../../viewmodel/gameStateView.ts";
 import {
   OPPONENT_CARD_SCALE,
   OPPONENT_HAND_VERTICAL_SCALE,
@@ -40,8 +40,6 @@ export function OpponentHand({ playerId, showCards = false, layout = "default" }
     ?? (myId === 0 ? 1 : 0);
   const opponent = players?.[opponentId];
   const objects = useGameStore((s) => s.gameState?.objects);
-  const revealedCards = useGameStore((s) => s.gameState?.revealed_cards);
-  const publicRevealedCards = useGameStore((s) => s.gameState?.public_revealed_cards);
 
   if (!opponent) return null;
 
@@ -77,12 +75,7 @@ export function OpponentHand({ playerId, showCards = false, layout = "default" }
       <AnimatePresence>
         {opponent.hand.map((id, i) => {
           const obj = objects ? objects[id] : null;
-          const isRevealed = (revealedCards?.includes(id) ?? false)
-            || (publicRevealedCards?.includes(id) ?? false)
-            // CR 701.20e: Glasses of Urza / Gitaxian Probe "look at target
-            // player's hand" surfaces the card's identity only to the looker.
-            || isPrivatelyLookedAtByViewer(gameState ?? null, id, myId);
-          const showFace = showCards || isRevealed;
+          const showFace = showCards || (obj?.display_visible_to_viewer ?? false);
           const rotation = -fan.rotation(i);
           const arcOffset = fan.arc(i);
 
@@ -104,7 +97,7 @@ export function OpponentHand({ playerId, showCards = false, layout = "default" }
             >
               <OpponentCardThumbnail
                 cardId={id}
-                cardName={showFace && obj ? obj.name : null}
+                card={showFace ? obj ?? null : null}
               />
             </motion.div>
           );
@@ -126,17 +119,38 @@ const cardStyle = {
 } as const;
 
 /** Renders a single opponent hand card — face or back, same sizing either way. */
-function OpponentCardThumbnail({ cardId, cardName }: { cardId: ObjectId; cardName: string | null }) {
+function HiddenOpponentCardThumbnail() {
   const { t } = useTranslation("game");
-  const { src } = useCardImage(cardName ?? "", { size: "small" });
-  const { handlers: hoverHandlers } = useCardHover(cardName ? cardId : null);
+  const { src, advanceFailedSource } = useCardBackImage();
 
-  if (cardName && src) {
+  return (
+    <img
+      src={src ?? CARD_BACK_URL}
+      alt={t("hand.cardBack")}
+      className="rounded-lg border border-gray-600 shadow-md object-cover"
+      style={cardStyle}
+      draggable={false}
+      onError={() => src && advanceFailedSource?.(src)}
+    />
+  );
+}
+
+function VisibleOpponentCardThumbnail({ cardId, card }: { cardId: ObjectId; card: GameObject }) {
+  const { src, rungs, advanceFailedSource } = useCardImage(card.name, {
+    size: "small",
+    oracleId: card.printed_ref?.oracle_id,
+    faceName: card.printed_ref?.face_name,
+    isToken: card.display_source === "Token",
+    tokenImageRef: card.token_image_ref,
+  });
+  const { handlers: hoverHandlers } = useCardHover(cardId);
+
+  if (src) {
     return (
       <img
         src={src}
-        {...getCardImageSrcSetProps(src)}
-        alt={cardName}
+        {...getCardImageSrcSetProps(src, rungs)}
+        alt={card.name}
         // `pointer-events-auto` so the card is the hit-test target even when an
         // ancestor opts out of pointer events (the split-seat fan wrapper does,
         // so gaps between cards fall through to the seat header beneath). In the
@@ -146,17 +160,27 @@ function OpponentCardThumbnail({ cardId, cardName }: { cardId: ObjectId; cardNam
         style={cardStyle}
         draggable={false}
         {...hoverHandlers}
+        onError={() => advanceFailedSource?.(src)}
       />
     );
   }
 
   return (
-    <img
-      src={CARD_BACK_URL}
-      alt={t("hand.cardBack")}
-      className="rounded-lg border border-gray-600 shadow-md object-cover"
+    <div
+      role="img"
+      aria-label={card.name}
+      className="flex items-center justify-center rounded-lg border border-gray-600 bg-gray-700 text-xs text-gray-200 shadow-md"
       style={cardStyle}
-      draggable={false}
-    />
+      {...hoverHandlers}
+    >
+      {card.name}
+    </div>
   );
+}
+
+/** Renders a single opponent hand card — face or back, same sizing either way. */
+function OpponentCardThumbnail({ cardId, card }: { cardId: ObjectId; card: GameObject | null }) {
+  return card
+    ? <VisibleOpponentCardThumbnail cardId={cardId} card={card} />
+    : <HiddenOpponentCardThumbnail />;
 }

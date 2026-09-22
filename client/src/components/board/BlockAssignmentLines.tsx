@@ -2,11 +2,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 import { usePreferencesStore } from "../../stores/preferencesStore.ts";
+import type { MultiplayerBoardLayout } from "../../stores/preferencesStore.ts";
 import { blockerAssignmentPairs, useUiStore } from "../../stores/uiStore.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { usePlayerId } from "../../hooks/usePlayerId.ts";
 import { useRafPositions } from "../../hooks/useRafPositions.ts";
 import { arcPath } from "../../hooks/useAttackerArrowPositions.ts";
+import { GAME_Z_LAYER } from "../../constants/ui.ts";
 import { objectAnchorSelector } from "../../utils/objectAnchorSelector.ts";
 import { getVisibleBoardPlayerIds, isOneOnOne } from "../../viewmodel/gameStateView.ts";
 import type { BlockerAssignmentPair, ObjectId, PlayerId } from "../../adapter/types.ts";
@@ -15,14 +17,17 @@ const BLOCK_COLOR = "rgba(56,189,248,0.95)";
 const BLOCK_COLOR_HEAD = "rgba(56,189,248,0.9)";
 const EMPTY_BLOCKER_ASSIGNMENT_PAIRS: readonly BlockerAssignmentPair[] = [];
 
-export function BlockAssignmentLines() {
+export function BlockAssignmentLines({
+  effectiveMultiplayerBoardLayout,
+}: {
+  effectiveMultiplayerBoardLayout: MultiplayerBoardLayout;
+}) {
   const blockerAssignments = useUiStore((s) => s.blockerAssignments);
   const combatMode = useUiStore((s) => s.combatMode);
   const focusedOpponent = useUiStore((s) => s.focusedOpponent) as PlayerId | null;
   const combat = useGameStore((s) => s.gameState?.combat ?? null);
   const objects = useGameStore((s) => s.gameState?.objects);
   const vfxQuality = usePreferencesStore((s) => s.vfxQuality);
-  const multiplayerBoardLayout = usePreferencesStore((s) => s.multiplayerBoardLayout);
   const localPlayerId = usePlayerId();
 
   const gameState = useGameStore((s) => s.gameState);
@@ -32,9 +37,9 @@ export function BlockAssignmentLines() {
       gameState,
       localPlayerId,
       focusedOpponent,
-      multiplayerBoardLayout,
+      effectiveMultiplayerBoardLayout,
     )),
-    [focusedOpponent, gameState, localPlayerId, multiplayerBoardLayout],
+    [effectiveMultiplayerBoardLayout, focusedOpponent, gameState, localPlayerId],
   );
 
   const pairs = useMergedPairs(
@@ -62,7 +67,7 @@ export function BlockAssignmentLines() {
   const isMinimal = vfxQuality === "minimal";
 
   return createPortal(
-    <svg className="pointer-events-none fixed inset-0 z-30 h-full w-full">
+    <svg className={`pointer-events-none fixed inset-0 ${GAME_Z_LAYER.combatArrow} h-full w-full`}>
       <defs>
         {!isMinimal && (
           <filter id="block-line-glow">

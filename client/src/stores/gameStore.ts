@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { subscribeWithSelector } from "zustand/middleware";
 import type {
+  AbilityBlockEntry,
   EngineAdapter,
   EngineSnapshot,
   FormatConfig,
@@ -15,18 +16,21 @@ import type {
   ObjectId,
   PlayerId,
   PersistedGameState,
+  RewindOption,
+  RestoredStackAutomationPresentation,
   StuckDecisionDiagnostic,
   WaitingFor,
 } from "../adapter/types";
 import type { ViewerInteraction } from "../adapter/generated/interaction";
 import { MAX_UNDO_HISTORY, UNDOABLE_ACTIONS } from "../constants/game";
 import { applySpellPaymentPreference } from "../game/castPaymentMode";
+import { reportStructuredActionRejection } from "../game/actionRejectionReporter";
 import { getPlayerId } from "../hooks/usePlayerId";
 import { loadCheckpoints, saveAuthoritativeGame } from "../services/gamePersistence";
 import { resetStackThroughput } from "../utils/stackThroughput";
 
 /** Map a LegalActionsResult to the store fields it owns — single source of truth. */
-export function legalResultState(result: LegalActionsResult): Pick<GameStoreState, "legalActions" | "autoPassRecommended" | "endContinuousEffectOffers" | "manaPaymentShortcutActions" | "spellCosts" | "legalActionsByObject" | "stuckDiagnostic" | "viewerInteraction"> {
+export function legalResultState(result: LegalActionsResult): Pick<GameStoreState, "legalActions" | "autoPassRecommended" | "endContinuousEffectOffers" | "manaPaymentShortcutActions" | "spellCosts" | "legalActionsByObject" | "activationBlockReasons" | "stuckDiagnostic" | "viewerInteraction"> {
   return {
     legalActions: result.actions,
     autoPassRecommended: result.autoPassRecommended,
@@ -34,6 +38,7 @@ export function legalResultState(result: LegalActionsResult): Pick<GameStoreStat
     manaPaymentShortcutActions: result.manaPaymentShortcutActions ?? [],
     spellCosts: result.spellCosts ?? {},
     legalActionsByObject: result.legalActionsByObject ?? {},
+    activationBlockReasons: result.activationBlockReasons ?? {},
     stuckDiagnostic: result.stuckDiagnostic ?? null,
     viewerInteraction: result.viewerInteraction ?? null,
   };
@@ -76,9 +81,28 @@ export type EngineAuthority = "client" | "wire";
  *  nothing they do can desync a peer or leak hidden info across a wire. */
 export type TableCompany = "solo" | "remote-humans";
 
+/** Where this client's OWN seat number comes from.
+ *
+ * `"seat-zero"` — a solo game. There is one local human and the engine seats
+ * them at 0 by construction; nothing on a wire can say otherwise, so a stale
+ * `activePlayerId` left behind by an earlier online game must not be read.
+ *
+ * `"wire-assigned"` — somebody else hands this client its seat: a server
+ * (`playerIdentity` from `WebSocketAdapter`), a P2P host (`game_setup`'s
+ * `assignedPlayerId`), or the pod that paired this match
+ * (`setupDraftMatchAvatars`). `multiplayerStore.activePlayerId` carries it.
+ *
+ * `"no-seat"` — a spectator holds no seat at all. The two seat resolvers in
+ * `usePlayerId.ts` deliberately answer this case differently; see the comment
+ * there for the contract `HudBadges.tsx` depends on. */
+export type SeatSource = "seat-zero" | "wire-assigned" | "no-seat";
+
 interface GameModeTraits {
   readonly authority: EngineAuthority;
   readonly company: TableCompany;
+  readonly seat: SeatSource;
+  /** Whether this client can request the unredacted state from its authority. */
+  readonly mayExportAuthoritativeState: boolean;
 }
 
 /**
@@ -92,15 +116,15 @@ interface GameModeTraits {
  *
  * `spectate` is `remote-humans` by the *game* it observes, not by the observer.
  */
-const GAME_MODE_TRAITS: Record<GameMode, GameModeTraits> = {
-  "ai": { authority: "client", company: "solo" },
-  "local": { authority: "client", company: "solo" },
-  "native-ai": { authority: "wire", company: "solo" },
-  "online": { authority: "wire", company: "remote-humans" },
-  "p2p-host": { authority: "wire", company: "remote-humans" },
-  "p2p-join": { authority: "wire", company: "remote-humans" },
-  "draft-match": { authority: "wire", company: "remote-humans" },
-  "spectate": { authority: "wire", company: "remote-humans" },
+export const GAME_MODE_TRAITS: Record<GameMode, GameModeTraits> = {
+  "ai": { authority: "client", company: "solo", seat: "seat-zero", mayExportAuthoritativeState: true },
+  "local": { authority: "client", company: "solo", seat: "seat-zero", mayExportAuthoritativeState: true },
+  "native-ai": { authority: "wire", company: "solo", seat: "seat-zero", mayExportAuthoritativeState: true },
+  "online": { authority: "wire", company: "remote-humans", seat: "wire-assigned", mayExportAuthoritativeState: false },
+  "p2p-host": { authority: "wire", company: "remote-humans", seat: "seat-zero", mayExportAuthoritativeState: true },
+  "p2p-join": { authority: "wire", company: "remote-humans", seat: "wire-assigned", mayExportAuthoritativeState: false },
+  "draft-match": { authority: "wire", company: "remote-humans", seat: "wire-assigned", mayExportAuthoritativeState: false },
+  "spectate": { authority: "wire", company: "remote-humans", seat: "no-seat", mayExportAuthoritativeState: false },
 };
 
 /** True when the authoritative engine state lives off this client — i.e. the
@@ -119,20 +143,21 @@ export function isAuthorityRemote(mode: GameMode | null): boolean {
  * are safe when false — there is nobody else's game to disturb and no hidden
  * info to leak across a wire.
  *
- * **This predicate has no production caller today, deliberately.** Every gate
- * that reads `gameMode` asks the authority question above; the company
- * question is what the merged predicate silently got *wrong* for `native-ai`,
- * and naming it is the fix. It is exported rather than left implicit so that
- * the next gate needing "are other humans watching?" has an answer to call
- * instead of an `||` to append — and so the classification is observable, which
- * is what lets a test prove the two axes actually disagree for `native-ai`.
- * Without it a test could still tabulate `isAuthorityRemote` across all eight
- * modes and go red on any classification change; that test would not be
- * vacuous, it would just be a no-op restatement of the behaviour before the
- * split, unable to say anything about the axis this change exists to name.
- * No lint flags unused exports here (`client/eslint.config.js` configures only
- * `@typescript-eslint/no-unused-vars`, and there is no knip), so this comment,
- * not a suppression, is the honest handling.
+ * **First and only production consumer: `GamePage`'s `takebackAudience`.**
+ * `GamePage` passes `hasRemoteHumans(storeGameMode) ? "table" : "solo"` to
+ * `GameMenu`, which is what makes the desktop solo-vs-AI menu entry read "Undo
+ * Last Action" rather than "Request Takeback". That gate is the company
+ * question, not the authority one: `native-ai` is `authority: "wire"` (the
+ * sidecar owns the state) but has no other human at the table, and asking
+ * `isAuthorityRemote` there would label a solo undo as a request to somebody.
+ * That mislabelling is exactly what the merged predicate got wrong, and
+ * splitting the two axes is the fix.
+ *
+ * Every *other* gate that reads `gameMode` still asks the authority question
+ * above; keep it that way. Reach for this one only when the question really is
+ * "are other humans watching?", and prefer calling it over appending an `||` to
+ * a mode list — the string union is frozen taxonomy, and a hand-rolled list
+ * silently misses the next mode added.
  *
  * Do not repurpose it for transport questions: `canRestoreCheckpoints`
  * (`DebugPanel.tsx`) looks like a company gate but is really "does this
@@ -140,6 +165,32 @@ export function isAuthorityRemote(mode: GameMode | null): boolean {
  */
 export function hasRemoteHumans(mode: GameMode | null): boolean {
   return mode !== null && GAME_MODE_TRAITS[mode].company === "remote-humans";
+}
+
+/**
+ * Whether this client may download the engine's unredacted persistence envelope.
+ * Only the client that owns the P2P authority may export from a shared table.
+ * Guests and spectators receive redacted views, while the host's local WASM
+ * engine or native server owns the unredacted persistence envelope.
+ */
+export function canExportAuthoritativeState(mode: GameMode | null): boolean {
+  return mode !== null && GAME_MODE_TRAITS[mode].mayExportAuthoritativeState;
+}
+
+/**
+ * The seat axis of the census: where this client's own seat number comes from.
+ *
+ * Read this instead of testing `gameMode` against a list at the call site. The
+ * list form is what seated a pod-draft guest at 0: `"draft-match"` joined the
+ * union long after `usePlayerId`'s list was written, and nothing made the two
+ * meet. A mode added to `GAME_MODE_TRAITS` cannot compile without declaring
+ * its seat source, so it can never again default into somebody else's chair.
+ *
+ * `null` — no game yet — is `"seat-zero"`: nothing has assigned this client
+ * anything.
+ */
+export function seatSource(mode: GameMode | null): SeatSource {
+  return mode === null ? "seat-zero" : GAME_MODE_TRAITS[mode].seat;
 }
 
 interface GameStoreState {
@@ -176,6 +227,13 @@ interface GameStoreState {
    */
   legalActionsByObject: Record<string, ObjectAction[]>;
   /**
+   * CR 118.3: acting-player-scoped read-out of activated abilities withheld
+   * solely because their cost is unpayable right now, keyed by object_id
+   * string. Display only — never dispatchable. Default `{}`, matching
+   * `legalActionsByObject`.
+   */
+  activationBlockReasons: Record<string, AbilityBlockEntry[]>;
+  /**
    * Engine-owned non-fatal progress-wedge diagnostic (an engine anomaly, not a
    * rules outcome) — present only when the current decision is wedged (no legal
    * action for any authorized submitter). `null` in normal play. Display-only
@@ -187,25 +245,21 @@ interface GameStoreState {
   stateHistory: GameState[];
   turnCheckpoints: GameState[];
   /**
+   * Server-published turn boundaries offered as rollback targets. Mirrors the
+   * server exactly — never appended to client-side, never derived. Empty on
+   * every transport that does not publish them (which is all of them except a
+   * `SingleUser` phase-server sidecar).
+   */
+  rewindTargets: RewindOption[];
+  /**
    * Pre-game P2P lobby fill state, populated by the `lobbyProgress` adapter
    * event and cleared when `game_setup` arrives (game starts). `null` when
    * not in a pre-game P2P lobby (i.e. during AI/online games or after the
    * game has started).
    */
   lobbyProgress: { joined: number; total: number } | null;
-  /**
-   * Live stack-resolution progress during a large auto-resolve / "Resolve All"
-   * drain, populated per chunk by `dispatchResolveAll` and cleared when the
-   * drain finishes. `null` when no resolution storm is in flight. Display-only:
-   * `resolved`/`total` are engine-provided counts, never frontend-derived.
-   */
-  resolutionProgress: { resolved: number; total: number } | null;
-  /**
-   * True while the worker is draining a Resolve All batch. Separate from
-   * `resolutionProgress` because small drains may finish without showing the
-   * storm progress overlay, but controls should still be disabled.
-   */
-  isResolvingAll: boolean;
+  /** One-shot engine-authored summary of automation completed during a restore. */
+  restoredStackAutomation: RestoredStackAutomationPresentation | null;
   /**
    * Pure-data carrier for the starting-player d20 contest (CR 103.1): the
    * game-start `DieRolled` batch plus the engine's authoritative starting
@@ -258,6 +312,7 @@ type CommitExtraState = Partial<Omit<GameStoreState,
   | "manaPaymentShortcutActions"
   | "spellCosts"
   | "legalActionsByObject"
+  | "activationBlockReasons"
   | "stuckDiagnostic"
   | "lastCommittedSeq"
   | "engineCommitEpoch"
@@ -291,6 +346,12 @@ interface GameStoreActions {
   resumeNativeSolo: (gameId: string, adapter: EngineAdapter) => Promise<void>;
   dispatch: (action: GameAction) => Promise<GameEvent[]>;
   undo: () => Promise<void>;
+  /**
+   * Replace the server-published rollback targets. Only `dispatch.ts` calls
+   * this, and only from inside its generation gate — a superseded remote update
+   * must not clobber the list with a stale one.
+   */
+  setRewindTargets: (targets: RewindOption[]) => void;
   reset: () => void;
   setAdapter: (adapter: EngineAdapter) => void;
   /**
@@ -342,8 +403,7 @@ interface GameStoreActions {
   setGameMode: (mode: GameMode) => void;
   setEngineMode: (mode: "native" | "wasm" | null, fallbackReason?: string | null) => void;
   setLobbyProgress: (progress: { joined: number; total: number } | null) => void;
-  setResolutionProgress: (progress: { resolved: number; total: number } | null) => void;
-  setIsResolvingAll: (isResolvingAll: boolean) => void;
+  dismissRestoredStackAutomation: () => void;
   setManaPaymentPreviewSourceIds: (sourceIds: ObjectId[]) => void;
   clearManaPaymentPreview: () => void;
   /** Clear the starting-player contest after the overlay has consumed it. */
@@ -375,9 +435,10 @@ async function seedResumedServerGame(
   // one just played; stale churn must not carry across.
   resetStackThroughput();
   await adapter.initialize();
-  // Fetched after `initialize()` restored/attached the engine state, so the
-  // snapshot is newest-by-construction and always passes the commit gate.
-  const snapshot = await adapter.getSnapshot();
+  const resumed = await adapter.resumeRestoredGameState?.() ?? null;
+  // P2P host initialization completes its persisted automation before a guest
+  // reconnects. Consume that exact pair rather than making a second read.
+  const snapshot = resumed?.snapshot ?? await adapter.getSnapshot();
   get().commitEngineSnapshot(snapshot, {
     extraState: {
       gameId,
@@ -389,6 +450,8 @@ async function seedResumedServerGame(
       nextLogSeq: 0,
       stateHistory: [],
       turnCheckpoints: [],
+      rewindTargets: [],
+      restoredStackAutomation: resumed?.presentation ?? null,
     },
   });
 }
@@ -412,13 +475,14 @@ const initialState: GameStoreState = {
   manaPaymentShortcutActions: [],
   spellCosts: {},
   legalActionsByObject: {},
+  activationBlockReasons: {},
   stuckDiagnostic: null,
   viewerInteraction: null,
   stateHistory: [],
   turnCheckpoints: [],
+  rewindTargets: [],
   lobbyProgress: null,
-  resolutionProgress: null,
-  isResolvingAll: false,
+  restoredStackAutomation: null,
   startingContest: null,
   aiSeatIds: [],
   lastCommittedSeq: 0,
@@ -540,7 +604,9 @@ export const useGameStore = create<GameStore>()(
           nextLogSeq: initLogEntries.length,
           stateHistory: [],
           turnCheckpoints: [],
+          rewindTargets: [],
           startingContest,
+          restoredStackAutomation: null,
         },
       });
       void saveAuthoritativeGame(gameId, adapter, state);
@@ -552,8 +618,10 @@ export const useGameStore = create<GameStore>()(
       resetStackThroughput();
       await adapter.initialize();
       await adapter.restoreState(savedState);
-      // Post-restore fetch — newest-by-construction, so it always passes the gate.
-      const snapshot = await adapter.getSnapshot();
+      // Saved-game loading is the sole client restore boundary that resumes an
+      // engine-owned stack session. Undo and developer restores stay pure.
+      const resumed = await adapter.resumeRestoredGameState?.() ?? null;
+      const snapshot = resumed?.snapshot ?? await adapter.getSnapshot();
       const savedCheckpoints = await loadCheckpoints(gameId);
       get().commitEngineSnapshot(snapshot, {
         extraState: {
@@ -566,8 +634,11 @@ export const useGameStore = create<GameStore>()(
           nextLogSeq: 0,
           stateHistory: [],
           turnCheckpoints: savedCheckpoints,
+          rewindTargets: [],
+          restoredStackAutomation: resumed?.presentation ?? null,
         },
       });
+      await saveAuthoritativeGame(gameId, adapter, snapshot.state);
     },
 
     resumeP2PHost: async (gameId, adapter) => {
@@ -609,7 +680,18 @@ export const useGameStore = create<GameStore>()(
       // `getPlayerId()` returns the local human's authenticated seat ID.
       // The engine rejects the action if this doesn't match the authorized
       // submitter — never trust the UI to route actions to the right seat.
-      const result = await adapter.submitAction(submittedAction, getPlayerId());
+      let result: Awaited<ReturnType<EngineAdapter["submitAction"]>>;
+      try {
+        result = await adapter.submitAction(submittedAction, getPlayerId());
+      } catch (err) {
+        if (reportStructuredActionRejection(err) === "stale") {
+          const snapshot = await adapter.getSnapshot();
+          get().commitEngineSnapshot(snapshot, { events: [], logEntries: [] });
+          if (gameId) void saveAuthoritativeGame(gameId, adapter, snapshot.state);
+          return [];
+        }
+        throw err;
+      }
       // ONE atomic pair — a separate getState()/getLegalActions() pair could
       // straddle an engine advance and commit a mismatched state/actions pair.
       const snapshot = await adapter.getSnapshot();
@@ -622,6 +704,7 @@ export const useGameStore = create<GameStore>()(
         events: result.events,
         logEntries: result.log_entries ?? [],
         stateHistory,
+        extraState: { restoredStackAutomation: null },
       });
 
       if (gameId) void saveAuthoritativeGame(gameId, adapter, snapshot.state);
@@ -647,8 +730,13 @@ export const useGameStore = create<GameStore>()(
         extraState: {
           events: [],
           stateHistory: stateHistory.slice(0, -1),
+          restoredStackAutomation: null,
         },
       });
+    },
+
+    setRewindTargets: (targets) => {
+      set({ rewindTargets: targets });
     },
 
     reset: () => {
@@ -675,12 +763,8 @@ export const useGameStore = create<GameStore>()(
       set({ lobbyProgress: progress });
     },
 
-    setResolutionProgress: (progress) => {
-      set({ resolutionProgress: progress });
-    },
-
-    setIsResolvingAll: (isResolvingAll) => {
-      set({ isResolvingAll });
+    dismissRestoredStackAutomation: () => {
+      set({ restoredStackAutomation: null });
     },
 
     setManaPaymentPreviewSourceIds: (sourceIds) => {

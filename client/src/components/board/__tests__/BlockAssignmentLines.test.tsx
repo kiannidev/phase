@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useGameStore } from "../../../stores/gameStore.ts";
 import { usePreferencesStore } from "../../../stores/preferencesStore.ts";
 import { useUiStore } from "../../../stores/uiStore.ts";
+import { GAME_Z_LAYER } from "../../../constants/ui.ts";
 import {
   buildGameObject,
   buildObjectMap,
@@ -71,11 +72,14 @@ describe("BlockAssignmentLines", () => {
       document.body.append(anchor);
     }
 
-    render(<BlockAssignmentLines />);
+    render(<BlockAssignmentLines effectiveMultiplayerBoardLayout="focused" />);
     act(() => {
       rafCallbacks.shift()?.(0);
     });
 
+    const portal = document.querySelector("svg");
+    expect(portal).toHaveClass(GAME_Z_LAYER.combatArrow);
+    expect(portal).not.toHaveClass(GAME_Z_LAYER.dialogHost);
     expect(document.querySelectorAll('path[marker-end="url(#block-arrow-head)"]')).toHaveLength(4);
   });
 
@@ -107,7 +111,7 @@ describe("BlockAssignmentLines", () => {
     attackerAnchor.dataset.objectId = "100";
     document.body.append(hud, attackerAnchor);
 
-    render(<BlockAssignmentLines />);
+    render(<BlockAssignmentLines effectiveMultiplayerBoardLayout="focused" />);
     act(() => {
       rafCallbacks.shift()?.(0);
     });

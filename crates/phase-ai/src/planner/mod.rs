@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use engine::ai_support::{
-    build_decision_context, classify_payment_continuation, witness_payment_continuation,
-    AiDecisionContext, CandidateAction, PaymentContinuationState, TacticalClass,
+    build_decision_context, classify_payment_continuation, witness_payment_continuations,
+    AiDecisionContext, CandidateAction, PaymentContinuationBatchStatus, PaymentContinuationState,
+    TacticalClass,
 };
 use engine::game::engine::apply_as_current_for_simulation;
 use engine::game::players;
@@ -28,6 +29,10 @@ pub struct RankedCandidate {
     pub candidate: CandidateAction,
     pub score: f64,
     pub(crate) payment_successor: Option<GameState>,
+    /// A reducer-certified downstream evaluation that reaches beyond the
+    /// ordinary one-action root simulation. It is an alternative continuation
+    /// witness, not a tactical policy score.
+    pub(crate) continuation_witness: Option<f64>,
 }
 
 impl RankedCandidate {
@@ -36,6 +41,7 @@ impl RankedCandidate {
             candidate,
             score,
             payment_successor: None,
+            continuation_witness: None,
         }
     }
 
@@ -48,7 +54,31 @@ impl RankedCandidate {
             candidate,
             score,
             payment_successor: Some(state),
+            continuation_witness: None,
         }
+    }
+
+    pub(crate) fn with_continuation_witness(mut self, value: f64) -> Self {
+        self.continuation_witness = value.is_finite().then_some(value);
+        self
+    }
+
+    /// Preserve any proven continuation through the existing tactical-score
+    /// beam order. The terminal witness is deliberately not scaled here: beam
+    /// truncation must not discard a reducer-proven route before search can
+    /// compare it with an ordinary continuation.
+    pub(crate) fn beam_priority(&self) -> f64 {
+        self.continuation_witness
+            .filter(|witness| witness.is_finite())
+            .map_or(self.score, |witness| self.score.max(witness))
+    }
+
+    pub(crate) fn root_score(&self, tactical_weight: f64) -> f64 {
+        self.continuation_witness
+            .filter(|witness| witness.is_finite())
+            .map_or(self.score * tactical_weight, |witness| {
+                (self.score * tactical_weight).max(witness)
+            })
     }
 }
 
@@ -57,6 +87,9 @@ impl RankedCandidate {
 /// owns both the carrier classification and the finalization proof.
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedCandidate {
+    /// Position in the engine-issued action list. This is the provenance key
+    /// for payment certificates; equivalent GameActions are not interchangeable.
+    pub source_index: usize,
     pub candidate: CandidateAction,
     pub payment_successor: Option<GameState>,
 }
@@ -69,26 +102,71 @@ pub(crate) fn prepare_payment_candidates(
     state: &GameState,
     candidates: impl IntoIterator<Item = CandidateAction>,
 ) -> Vec<PreparedCandidate> {
+    let candidates: Vec<_> = candidates.into_iter().collect();
     match classify_payment_continuation(state) {
         PaymentContinuationState::NotAffiliated => candidates
             .into_iter()
-            .map(|candidate| PreparedCandidate {
+            .enumerate()
+            .map(|(source_index, candidate)| PreparedCandidate {
+                source_index,
                 candidate,
                 payment_successor: None,
             })
             .collect(),
         PaymentContinuationState::UnsupportedAffiliated(_) => Vec::new(),
-        PaymentContinuationState::Affiliated(_) => candidates
-            .into_iter()
-            .filter_map(|candidate| {
-                witness_payment_continuation(state, &candidate.action).map(|accepted| {
-                    PreparedCandidate {
-                        candidate,
-                        payment_successor: Some(accepted.state),
+        PaymentContinuationState::Affiliated(_) => {
+            let actions: Vec<_> = candidates
+                .iter()
+                .map(|candidate| candidate.action.clone())
+                .collect();
+            let batch = witness_payment_continuations(state, &actions);
+            match batch.status {
+                PaymentContinuationBatchStatus::Complete => candidates
+                    .into_iter()
+                    .enumerate()
+                    .zip(batch.successors)
+                    .filter_map(|((source_index, candidate), accepted)| {
+                        accepted.map(|accepted| PreparedCandidate {
+                            source_index,
+                            candidate,
+                            payment_successor: Some(accepted.state),
+                        })
+                    })
+                    .collect(),
+                PaymentContinuationBatchStatus::Indeterminate(_) => {
+                    if batch.successors.iter().any(Option::is_some) {
+                        candidates
+                            .into_iter()
+                            .enumerate()
+                            .zip(batch.successors)
+                            .filter_map(|((source_index, candidate), accepted)| {
+                                accepted.map(|accepted| PreparedCandidate {
+                                    source_index,
+                                    candidate,
+                                    payment_successor: Some(accepted.state),
+                                })
+                            })
+                            .collect()
+                    } else {
+                        candidates
+                            .into_iter()
+                            .enumerate()
+                            .filter_map(|(source_index, candidate)| {
+                                matches!(candidate.action, GameAction::CancelCast).then_some(
+                                    PreparedCandidate {
+                                        source_index,
+                                        candidate,
+                                        payment_successor: None,
+                                    },
+                                )
+                            })
+                            .collect()
                     }
-                })
-            })
-            .collect(),
+                }
+                PaymentContinuationBatchStatus::NotAffiliated
+                | PaymentContinuationBatchStatus::UnsupportedAffiliated(_) => Vec::new(),
+            }
+        }
     }
 }
 
@@ -739,6 +817,28 @@ impl<'a> PlannerServices<'a> {
         state: &GameState,
         candidates: Vec<CandidateAction>,
     ) -> Vec<CandidateAction> {
+        candidates
+            .into_iter()
+            .filter(|candidate| Self::candidate_is_valid(state, candidate))
+            .collect()
+    }
+
+    /// Preserve batch-certificate provenance across the ordinary legality gate.
+    pub(crate) fn validate_prepared_candidates(
+        &self,
+        state: &GameState,
+        candidates: Vec<PreparedCandidate>,
+    ) -> Vec<PreparedCandidate> {
+        candidates
+            .into_iter()
+            .filter(|candidate| {
+                candidate.payment_successor.is_some()
+                    || Self::candidate_is_valid(state, &candidate.candidate)
+            })
+            .collect()
+    }
+
+    fn candidate_is_valid(state: &GameState, candidate: &CandidateAction) -> bool {
         // PassPriority is always legal during Priority (skip simulation for perf),
         // but during ManaPayment it means "finalize payment" which can fail if the
         // player can't actually pay the cost (e.g., Thalia tax makes it unaffordable).
@@ -752,27 +852,24 @@ impl<'a> PlannerServices<'a> {
             state.waiting_for,
             engine::types::game_state::WaitingFor::OptionalCostChoice { .. }
         );
-        candidates
-            .into_iter()
-            .filter(|candidate| match &candidate.action {
-                engine::types::actions::GameAction::PassPriority if pass_always_valid => true,
-                engine::types::actions::GameAction::ChooseTarget { .. } => true,
-                engine::types::actions::GameAction::DecideOptionalCost { pay: false }
-                    if is_optional_cost =>
-                {
-                    true
-                }
-                // MulliganDecision is always valid — the engine generates Keep and
-                // Mulligan as the complete legal set; neither can fail apply_as_current.
-                // Skipping the clone+simulate eliminates ~2 state clones per mulligan step.
-                engine::types::actions::GameAction::MulliganDecision { .. } => true,
-                _ => {
-                    engine::game::perf_counters::record_state_clone_for_legality();
-                    let mut sim = state.clone();
-                    apply_as_current_for_simulation(&mut sim, candidate.action.clone()).is_ok()
-                }
-            })
-            .collect()
+        match &candidate.action {
+            engine::types::actions::GameAction::PassPriority if pass_always_valid => true,
+            engine::types::actions::GameAction::ChooseTarget { .. } => true,
+            engine::types::actions::GameAction::DecideOptionalCost { pay: false }
+                if is_optional_cost =>
+            {
+                true
+            }
+            // MulliganDecision is always valid — the engine generates Keep and
+            // Mulligan as the complete legal set; neither can fail apply_as_current.
+            // Skipping the clone+simulate eliminates ~2 state clones per mulligan step.
+            engine::types::actions::GameAction::MulliganDecision { .. } => true,
+            _ => {
+                engine::game::perf_counters::record_state_clone_for_legality();
+                let mut sim = state.clone();
+                apply_as_current_for_simulation(&mut sim, candidate.action.clone()).is_ok()
+            }
+        }
     }
 
     pub fn apply_candidate(
@@ -1214,11 +1311,8 @@ impl<'a> PlannerServices<'a> {
             scoring_player,
             SearchDepth::Lookahead,
         );
-        for prior in &mut priors {
-            prior.payment_successor = candidates
-                .iter()
-                .find(|prepared| prepared.candidate.action == prior.candidate.action)
-                .and_then(|prepared| prepared.payment_successor.clone());
+        for (prior, prepared) in priors.iter_mut().zip(&candidates) {
+            prior.payment_successor = prepared.payment_successor.clone();
         }
         PlannerEvaluation {
             // Rollout leaf: every node reached here is deep lookahead, never the
@@ -1463,6 +1557,7 @@ impl ContinuationPlanner for BeamContinuationPlanner {
     }
 }
 
+#[cfg(test)]
 pub fn rank_candidates<F>(
     candidates: impl IntoIterator<Item = CandidateAction>,
     mut scorer: F,
@@ -1472,10 +1567,14 @@ where
     F: FnMut(&CandidateAction) -> f64,
 {
     rank_prepared_candidates(
-        candidates.into_iter().map(|candidate| PreparedCandidate {
-            candidate,
-            payment_successor: None,
-        }),
+        candidates
+            .into_iter()
+            .enumerate()
+            .map(|(source_index, candidate)| PreparedCandidate {
+                source_index,
+                candidate,
+                payment_successor: None,
+            }),
         |candidate| scorer(candidate),
         limit,
     )
@@ -1483,10 +1582,9 @@ where
 
 pub fn apply_candidate(state: &GameState, candidate: &CandidateAction) -> Option<GameState> {
     match classify_payment_continuation(state) {
-        PaymentContinuationState::Affiliated(_) => {
-            return witness_payment_continuation(state, &candidate.action)
-                .map(|accepted| accepted.state);
-        }
+        // Payment edges must consume the cached decision-wide witness produced
+        // before ranking. Re-running it here would multiply its global bound.
+        PaymentContinuationState::Affiliated(_) => return None,
         PaymentContinuationState::UnsupportedAffiliated(_) => return None,
         PaymentContinuationState::NotAffiliated => {}
     }

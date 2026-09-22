@@ -13,6 +13,8 @@ use engine::types::phase::Phase;
 
 fn specialize_back(name: &str, color: ManaColor, shard: ManaCostShard) -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
+        trigger_printed_origins: Vec::new(),
         name: name.into(),
         power: Some(3),
         toughness: Some(3),
@@ -41,6 +43,7 @@ fn specialize_back(name: &str, color: ManaColor, shard: ManaCostShard) -> BackFa
         casting_restrictions: vec![],
         casting_options: vec![],
         layout_kind: None,
+        parse_warnings: vec![],
     }
 }
 

@@ -1,9 +1,11 @@
 {
+  "playerLatency": {"host":"Host","waiting":"Waiting","value":"{{ms}} ms","description":"Round-trip latency to the host. A missing reply does not disconnect the game."},
   "abilityBlock": {
     "badge": "Blocked",
     "cantBeActivated": "This ability can't be activated",
     "cantActivateDuring": "Can't be activated right now",
-    "prohibited": "Activating this ability is prohibited"
+    "prohibited": "Activating this ability is prohibited",
+    "costNotPayableNow": "You can't pay this cost right now"
   },
   "manaSourceSelection": {
     "title": "Choose a mana source",
@@ -16,16 +18,38 @@
     "declareTitle": "Loop Shortcut",
     "declareSubtitle": "You control a loop with a determined outcome. Take the shortcut to resolve it.",
     "respondTitle": "Loop Shortcut Proposed",
-    "respondSubtitle": "An opponent proposes taking a loop shortcut. Accept it, or break out to keep playing manually.",
+    "respondSubtitle": "An opponent proposes taking a loop shortcut. Accept it, or name the place where the sequence stops.",
     "confirm": "Take the shortcut",
     "accept": "Accept",
-    "shorten": "Break out",
+    "shorten": "Shorten it",
     "decline": "Decline the shortcut",
     "untilLethal": "Repeat until the game ends.",
-    "fixedCount_one": "Repeat once.",
-    "fixedCount_other": "Repeat {{count}} times.",
+    "fixedCount_one": "Repeat at most once.",
+    "fixedCount_other": "Repeat at most {{count}} times.",
     "convokeInfo_one": "Auto-taps up to 1 creature for convoke each iteration.",
     "convokeInfo_other": "Auto-taps up to {{count}} creatures for convoke each iteration.",
+    "countAria": "Number of iterations",
+    "countDecreaseAria": "Decrease the number of iterations",
+    "countIncreaseAria": "Increase the number of iterations",
+    "previewTitle_one": "Repeating once produces:",
+    "previewTitle_other": "Repeating {{count}} times produces:",
+    "previewEntry": "{{amount}} {{resource}}",
+    "previewEntryPlayer": "{{amount}} {{resource}} — {{player}}",
+    "allocationTitle": "Split the repetitions across targets:",
+    "allocationAria": "Repetitions for {{subject}}",
+    "allocationDecreaseAria": "Decrease repetitions for {{subject}}",
+    "allocationIncreaseAria": "Increase repetitions for {{subject}}",
+    "allocationSum": "{{allocated}} of {{total}} repetitions allocated.",
+    "evenSplit": "Reset to the even split",
+    "customDistribution": "Custom distribution — the engine has not previewed this split.",
+    "announceTitle": "Choose the target every repetition announces:",
+    "announce": "Announce",
+    "announceAria": "Announce {{subject}}",
+    "mayTitle": "Optional ability {{group}} — repeat this choice each iteration?",
+    "mayTake": "Take it",
+    "mayDecline": "Decline it",
+    "mayTakeAria": "Take optional ability {{group}}",
+    "mayDeclineAria": "Decline optional ability {{group}}",
     "winKind": {
       "LethalDamage": "This loop deals lethal damage.",
       "PoisonLoss": "This loop gives lethal poison counters.",
@@ -33,6 +57,13 @@
       "ImmediateWin": "This loop wins the game.",
       "ExtraTurns": "This loop takes infinite extra turns.",
       "Advantage": "This loop generates unbounded advantage."
+    },
+    "respondDeclaredTitle": "Proposed declaration:",
+    "respondAllocationEntry": "{{subject}} — ×{{repetitions}}",
+    "respondOrderEntry": "{{position}}. {{subject}}",
+    "respondDecision": {
+      "take": "{{subject}} — taken each iteration",
+      "decline": "{{subject}} — declined each iteration"
     }
   },
   "precastShortcut": {
@@ -45,17 +76,48 @@
     "respondSubtitle": "Accept the verified route or stop at one of your issued boundaries.",
     "shortenAtBreakpoint": "Stop at boundary {{breakpointId}}"
   },
-  "resolutionProgress": {
-    "label": "Resolving {{resolved}} / {{total}}",
-    "collapse": "Collapse resolving progress",
-    "expand": "Expand resolving progress"
+  "restoredAutomation": {
+    "dismiss": "Dismiss",
+    "noop": {
+      "title": "Saved game loaded",
+      "summary_one": "No stack automation needed to resume.",
+      "summary_other": "No stack automation needed to resume."
+    },
+    "progressed": {
+      "title": "Stack automation resumed",
+      "summary_one": "The engine completed {{count}} automated resolution.",
+      "summary_other": "The engine completed {{count}} automated resolutions.",
+      "omitted_one": "{{count}} intermediate event was omitted.",
+      "omitted_other": "{{count}} intermediate events were omitted."
+    },
+    "zeroResolutionRepair": {
+      "title": "Stack automation repaired",
+      "summary_one": "The saved automation was safely repaired before play resumed.",
+      "summary_other": "The saved automation was safely repaired before play resumed."
+    }
+  },
+  "resolveAllConsent": {
+    "eyebrow": "Resolve All",
+    "title": "Approve fast resolution?",
+    "subtitle": "All players must approve before the engine resolves a safe stack prefix.",
+    "grant": "Approve",
+    "decline": "Keep priority"
   },
   "debugCreate": {
+    "copies": "Copies",
+    "asToken": "Create as token",
     "tokenPower": "Power",
     "tokenToughness": "Toughness",
     "tokenPowerPlaceholder": "Power",
     "tokenToughnessPlaceholder": "Toughness",
     "sourceDefinedPtRequired": "Enter power and toughness for this source-defined token."
+  },
+  "debugMove": {
+    "runEtbEffects": "Run ETB effects",
+    "simulate": "Simulate (ETB effects, triggers + SBAs)"
+  },
+  "debugLibrary": {
+    "openActions": "Open debug actions for {{name}}"
   },
   "nextUp": {
     "label": "Next Up",
@@ -255,18 +317,24 @@
     "underAttack_other": "Attacked by {{count}} creatures",
     "target": "Target",
     "sacrifice": "Sacrifice",
+    "token": "Token",
+    "tokenTooltip": "Token copy of a real card",
     "copy": "Copy",
-    "copyTooltip": "Token copy of a real card",
+    "copyTooltip": "Nontoken permanent copying another card",
     "cantBeBlocked": "Can't be blocked",
     "ringBearer": "Ring",
     "ringBearerTooltip": "Ring-bearer",
     "hiddenAttachments": "+{{count}} more attached",
+    "hiddenAttachmentsAria_few": "Show {{count}} hidden attached cards",
+    "hiddenAttachmentsAria_many": "Show {{count}} hidden attached cards",
     "hiddenAttachmentsAria_one": "Show {{count}} hidden attached card",
     "hiddenAttachmentsAria_other": "Show {{count}} hidden attached cards",
     "fanPick": "Pick",
     "fanConfirm": "Confirm ({{count}})",
     "viewAttachments_one": "View attached card",
     "viewAttachments_other": "View {{count}} attached cards",
+    "viewAttachmentsFor_few": "View {{name}}'s {{count}} attached cards",
+    "viewAttachmentsFor_many": "View {{name}}'s {{count}} attached cards",
     "viewAttachmentsFor_one": "View {{name}}'s attached card",
     "viewAttachmentsFor_other": "View {{name}}'s {{count}} attached cards",
     "hiddenExileCards": "+{{count}} more exiled",
@@ -275,6 +343,7 @@
       "return": "Return",
       "exile": "Exile",
       "tap": "Tap",
+      "untap": "Untap",
       "crew": "Crew",
       "saddle": "Saddle",
       "station": "Station",
@@ -289,6 +358,7 @@
       "return": "Return",
       "exile": "Exile",
       "tap": "Tap",
+      "untap": "Untap",
       "crew": "Crew",
       "saddle": "Saddle",
       "station": "Station",
@@ -478,8 +548,13 @@
     "initiativeTooltip": "Has the Initiative — ventures into Undercity at start of upkeep",
     "cityBlessing": "City's Blessing",
     "cityBlessingTooltip": "City's Blessing — controls ten or more permanents (Ascend)",
-    "dungeonAriaLabel": "Venturing in {{name}}, room {{room}}",
-    "dungeonTooltip": "Venturing in {{name}} — room {{room}}",
+    "enduringStory": "Enduring Story",
+    "enduringStoryTooltip": "Enduring Story — gained by controlling a Storied permanent and three or more artifacts, legendary permanents, and/or Sagas; lasts for the rest of the game",
+    "dungeonAriaLabel": "Venturing in {{name}}, {{roomName}}, room {{room}} of {{total}}",
+    "dungeonRoomTooltip": "{{roomName}} — room {{room}} of {{total}}",
+    "dungeonMapLoading": "Loading dungeon card…",
+    "dungeonMapUnavailable": "Dungeon card image unavailable",
+    "dungeonTooltip": "Venturing in {{name}}",
     "poisonAriaLabel_one": "{{count}} poison counter",
     "poisonAriaLabel_other": "{{count}} poison counters",
     "poisonTooltip": "Poison counters: {{count}}\nA player with ten or more poison counters loses the game.",
@@ -519,6 +594,15 @@
     "pendingCheaper": "Next spell costs {{amount}} less",
     "companion": "Companion",
     "unboundedTooltip": "Unbounded {{resource}} (∞)",
+    "unboundedScheduledTooltip": "Unbounded {{resource}} (∞) — collapse pending; a finite amount will be chosen",
+    "unboundedScheduledYouTooltip": "Unbounded {{resource}} (∞) — collapse pending; you'll name the count",
+    "unboundedScheduledGlyph": "∞→N",
+    "unboundedConditionalTooltip": "Unbounded {{resource}} (∞) — collapse pending; this may stay unbounded",
+    "unboundedConditionalYouTooltip": "Unbounded {{resource}} (∞) — collapse pending; this may stay unbounded, and you'll name the count if it doesn't",
+    "unboundedMixedTooltip": "Unbounded {{resource}} (∞) — part of this group has a pending collapse; part remains unbounded",
+    "unboundedConditionalGlyph": "∞→?",
+    "boundedLoopGlyph": "≤{{bound}}×",
+    "boundedLoopTooltip": "{{resource}} from a detected loop, bounded at {{bound}} repetitions",
     "unboundedManaPoolMarker": "Unbounded mana (∞)",
     "unboundedMana": "mana",
     "unboundedLife": "life",
@@ -552,6 +636,7 @@
     "onlyForSpellWithColorCount": "Spend only to cast spells meeting a color-count requirement",
     "onlyForSpellColor": "Spend only to cast spells of the chosen color",
     "onlyForSpellFromZone": "Spend only to cast spells from an allowed zone",
+    "cannotCastSpellFromZone": "Can't be spent to cast spells from the named zone",
     "onlyForFaceDownSpell": "Spend only to cast face-down spells",
     "onlyForActivation": "Spend only to activate abilities",
     "onlyForXCosts": "Spend only on costs that include {X}",
@@ -607,13 +692,17 @@
   "mana": {
     "free": "Free",
     "chooseXTitle": "Choose a value for X",
-    "chooseXAria": "Choose X value",
     "chooseXInputAria": "Enter X value",
     "decreaseX": "Decrease X value",
     "increaseX": "Increase X value",
-    "xEquals": "X = {{value}}",
+    "maximum": "Max",
+    "setXToMaximum": "Set X to maximum",
     "minMax": "min {{min}} / max {{max}}",
     "maxOnly": "max {{max}}",
+    "amountOutOfRange": "Enter a whole number between {{min}} and {{max}}",
+    "decreaseAmount": "Decrease amount",
+    "increaseAmount": "Increase amount",
+    "confirmAmount": "Confirm",
     "confirmX": "Confirm X = {{value}}",
     "payMana": "Pay Mana Cost",
     "convokeHint": "Tap creatures to help pay.",
@@ -660,6 +749,12 @@
     "cardBack": "Card back",
     "organizeLabel": "Organize hand",
     "reorderPausedHint": "Drag-to-reorder is paused while the hand is sorted or filtered."
+  },
+  "storm": {
+    "copies_one": "Storm: {{count}} copy",
+    "copies_other": "Storm: {{count}} copies",
+    "count_one": "Storm count: {{count}} copy",
+    "count_other": "Storm count: {{count}} copies"
   },
   "opponentHud": {
     "ally": "Ally",
@@ -784,19 +879,34 @@
     "sacrificeRange_one": "Sacrifice {{min}}-{{count}} permanent",
     "sacrificeRange_other": "Sacrifice {{min}}-{{count}} permanents",
     "chooseTargetOf": "Choose target {{current}} of {{total}}",
+    "slotProgress": "Target {{current}} of {{total}}",
+    "choosePlayerTarget": "Choose: {{name}}",
+    "expandDescription": "Show the full description",
+    "collapseDescription": "Show less",
+    "descriptionDisclosure": "{{action}}: {{description}}",
     "chooseTarget": "Choose a target",
     "triggerDamageAmount": "This trigger: {{amount}} damage",
     "noLegalTargets": "No legal targets available",
-    "modeContext": "{{mode}} — {{prompt}}",
-    "upToOne": "up to one {{target}}",
-    "one": "a {{target}}",
-    "nounPlayer": "player",
-    "nounNonlandPermanent": "nonland permanent",
-    "nounSpell": "spell",
-    "nounCreature": "creature",
-    "nounPlaneswalker": "planeswalker",
-    "nounTargetPermanent": "target permanent",
-    "nounTarget": "target",
+    "one": {
+      "player": "a player",
+      "spell": "a spell",
+      "creature": "a creature",
+      "planeswalker": "a planeswalker",
+      "nonlandPermanent": "a nonland permanent",
+      "targetPermanent": "a target permanent",
+      "target": "a target",
+      "orPlayer": "{{noun}} or player"
+    },
+    "upToOne": {
+      "player": "up to one player",
+      "spell": "up to one spell",
+      "creature": "up to one creature",
+      "planeswalker": "up to one planeswalker",
+      "nonlandPermanent": "up to one nonland permanent",
+      "targetPermanent": "up to one target permanent",
+      "target": "up to one target",
+      "orPlayer": "{{noun}} or player"
+    },
     "confirmTap": "Confirm Tap ({{selected}}/{{count}})",
     "confirmSacrifice": "Sacrifice ({{selected}}/{{count}})",
     "skipSacrifice": "Skip Sacrifice",
@@ -806,6 +916,8 @@
   },
   "log": {
     "title": "Game Log",
+    "dockLeft": "Dock game log on the left",
+    "dockRight": "Dock game log on the right",
     "noEvents": "No events yet",
     "closeLog": "Close game log",
     "verbosityFull": "full",
@@ -813,6 +925,7 @@
     "verbosityMinimal": "minimal",
     "searchPlaceholder": "Search log…",
     "allTurns": "All turns",
+    "turnFilterLabel": "Filter by turn",
     "turnChip": "T{{turn}}",
     "entryCount": "{{count}} entries",
     "copy": "Copy",
@@ -830,6 +943,43 @@
     "categorySpecial": "Special",
     "categoryDestroy": "Destroy",
     "categoryDebug": "Debug",
+    "panelLabel": "Game log panel",
+    "viewLabel": "Log view",
+    "viewTimeline": "Timeline",
+    "viewDetails": "Details",
+    "viewDiagnostics": "Diagnostics",
+    "showHiddenInformation": "Show hidden information",
+    "filters": "Filters ({{count}})",
+    "filters_one": "Filters ({{count}})",
+    "filters_few": "Filters ({{count}})",
+    "filters_many": "Filters ({{count}})",
+    "filters_other": "Filters ({{count}})",
+    "filterSummary": "{{count}} entries",
+    "filterSummary_one": "{{count}} entry",
+    "filterSummary_few": "{{count}} entries",
+    "filterSummary_many": "{{count}} entries",
+    "filterSummary_other": "{{count}} entries",
+    "clearFilters": "Clear filters",
+    "searchLabel": "Search game log",
+    "noMatchingEvents": "No matching events",
+    "jumpToLatest": "Jump to latest ({{count}})",
+    "jumpToLatest_one": "Jump to latest ({{count}})",
+    "jumpToLatest_few": "Jump to latest ({{count}})",
+    "jumpToLatest_many": "Jump to latest ({{count}})",
+    "jumpToLatest_other": "Jump to latest ({{count}})",
+    "copyFiltered": "Copy {{count}} filtered log entries",
+    "copyFiltered_one": "Copy {{count}} filtered log entry",
+    "copyFiltered_few": "Copy {{count}} filtered log entries",
+    "copyFiltered_many": "Copy {{count}} filtered log entries",
+    "copyFiltered_other": "Copy {{count}} filtered log entries",
+    "exportFiltered": "Export {{count}} filtered log entries",
+    "exportFiltered_one": "Export {{count}} filtered log entry",
+    "exportFiltered_few": "Export {{count}} filtered log entries",
+    "exportFiltered_many": "Export {{count}} filtered log entries",
+    "exportFiltered_other": "Export {{count}} filtered log entries",
+    "copyContext": "Turn {{turn}} · {{phase}} · {{category}}",
+    "copySuccess": "Log copied to clipboard",
+    "copyFailure": "Could not copy the log",
     "gameStarted": "Game started",
     "turnStarted": "Turn {{turn}} -- {{player}}",
     "phaseChanged": "Phase: {{phase}}",
@@ -1051,7 +1201,10 @@
       "subtitlePreparedCopy": "Cast the prepared spell?",
       "subtitleActivate": "Activate this ability?",
       "subtitlePlay": "Choose how to play this card",
-      "subtitleChoose": "Choose an ability to activate"
+      "subtitleChoose": "Choose an ability to activate",
+      "unlockThisDoor": "Unlock this door",
+      "unlockHalf": "Unlock {{name}}",
+      "unlockHalfWithCost": "Unlock {{name}} ({{cost}})"
     },
     "manaRestrictions": {
       "tapForMana": "Tap for mana",
@@ -1073,6 +1226,7 @@
       "onlyForSpellWithColorCount": "Only for spells with {{comparator}} {{count}} colors.",
       "onlyForSpellColor": "Only for spells of the {{color}} color.",
       "onlyForSpellFromZone": "Only for spells {{polarity}} {{zone}}.",
+      "cannotCastSpellFromZone": "Can't be spent to cast spells from {{zone}}.",
       "onlyForFaceDownSpell": "Only for face-down spells.",
       "onlyForAny": "Only for one of these uses: {{restrictions}}",
       "onlyForSpecialAction": "Only for the {{action}} special action.",
@@ -1121,6 +1275,14 @@
       "returnToHand_one": "return a permanent to hand",
       "returnToHand_other": "return {{count}} permanents to hand",
       "energy": "{{amount}} energy",
+      "playerCounters_one": "get {{count}} {{kind}} counter",
+      "playerCounters_other": "get {{count}} {{kind}} counters",
+      "playerCounterKind": {
+        "Poison": "poison",
+        "Experience": "experience",
+        "Rad": "rad",
+        "Ticket": "ticket"
+      },
       "generic": "a cost",
       "pay": "Pay {{cost}}"
     },
@@ -1434,7 +1596,12 @@
       "labelReturn": "Return ({{selected}}/{{count}})",
       "labelExile": "Exile ({{selected}}/{{count}})",
       "labelAttach": "Attach ({{selected}}/{{count}})",
-      "orderTop": "Top"
+      "orderTop": "Top",
+      "orderSecond": "2nd",
+      "orderThird": "3rd",
+      "orderFourth": "4th",
+      "orderFifth": "5th",
+      "orderPosition": "Position {{position}}"
     },
     "drawnThisTurn": {
       "title": "Drawn This Turn",
@@ -1548,6 +1715,10 @@
       "labelExile": "Exile",
       "labelBehold": "Behold"
     },
+    "empowerJace": {
+      "title": "Empower Jace",
+      "subtitle": "Choose a Jace token you control to gain +{{count}} loyalty"
+    },
     "collectEvidence": {
       "title": "Collect Evidence",
       "subtitle": "Exile cards from your graveyard with total mana value {{minimum}} or greater"
@@ -1569,6 +1740,9 @@
       "filterCreatures": "Creatures",
       "filterLands": "Lands",
       "filterNonland": "Nonland",
+      "searchLabel": "Filter",
+      "searchPlaceholder": "Card name",
+      "searchCardsAria": "Filter cards by name",
       "counterDiscard": "Discard {{selected}} of {{cap}}",
       "counterKeep": "Keep {{selected}} of {{cap}}",
       "keepInstead": "Keep instead",
@@ -1600,7 +1774,11 @@
     "legend": {
       "title": "Legend Rule",
       "subtitle": "Choose which \"{{name}}\" to keep",
-      "keepAria": "Keep {{name}} ({{status}})",
+      "keepAria": "Keep {{name}} ({{identity}}, {{status}})",
+      "keepAriaUnknown": "Keep {{name}} ({{status}})",
+      "identityOriginal": "Original",
+      "identityCopy": "Copy",
+      "identityTokenCopy": "Token copy",
       "statusJustEntered": "Just entered",
       "statusAlready": "Already on battlefield"
     },
@@ -1653,6 +1831,12 @@
     "untapSubset": {
       "title": "Choose permanents to untap",
       "subtitle": "Untap up to {{count}} of these permanents."
+    },
+    "rippleBottom": {
+      "title": "Order the rest on the bottom",
+      "subtitle_one": "Put {{count}} revealed card on the bottom of your library",
+      "subtitle_other": "Put {{count}} revealed cards on the bottom of your library, in any order",
+      "hint": "Drag to reorder · position 1 ends up on top of this pile"
     }
   },
   "specializeColor": {
@@ -1732,7 +1916,22 @@
     "emergeEyebrow": "Emerge",
     "emergeNormalLabel": "Cast Normally",
     "emergeAltLabel": "Cast with Emerge",
-    "emergeSubtitle": "Cast {{name}} normally, or pay its Emerge cost by sacrificing a creature, reducing the cost by that creature's mana value.",
+    "emergeSubtitle": "Cast {{name}} normally, or pay its Emerge cost by sacrificing {{sacrifice}}, reducing the cost by that permanent's mana value.",
+    "emergeFallbackSacrifice": "a matching permanent",
+    "emergeSacrificeQuality": {
+      "artifact": "an artifact",
+      "battle": "a battle",
+      "card": "a card",
+      "creature": "a creature",
+      "enchantment": "an enchantment",
+      "instant": "an instant",
+      "kindred": "a kindred",
+      "land": "a land",
+      "permanent": "a permanent",
+      "planeswalker": "a planeswalker",
+      "sorcery": "a sorcery",
+      "subtype": "a permanent of type {{subtype}}"
+    },
     "impendingEyebrow": "Impending",
     "impendingNormalLabel": "Cast Normally",
     "impendingAltLabel": "Cast with Impending",
@@ -1792,6 +1991,10 @@
     "title": "Choose Gift Recipient",
     "subtitle": "Choose which opponent receives the promised gift."
   },
+  "entryController": {
+    "title": "Choose Entry Controller",
+    "subtitle": "Choose which opponent controls this permanent as it enters."
+  },
   "optionalCost": {
     "gift": {
       "title": "Promise a gift?",
@@ -1801,7 +2004,8 @@
         "card": "a card",
         "treasure": "a Treasure",
         "food": "a Food",
-        "tappedFish": "a tapped Fish"
+        "tappedFish": "a tapped Fish",
+        "extraTurn": "an extra turn"
       }
     }
   },
@@ -1845,10 +2049,15 @@
     "subtitleCascade": "Cascade exiled {{name}} (mana value below {{sourceMv}}). Cast it without paying its mana cost, or decline and shuffle all {{total}} exiled cards to the bottom of your library.",
     "subtitleDiscover": "Discover exiled {{name}}. Cast it without paying its mana cost, or put it into your hand and shuffle the other {{missCount}} exiled cards to the bottom of your library.",
     "subtitleRipple": "Ripple revealed {{name}}. Cast it without paying its mana cost, or decline and put all {{total}} revealed cards on the bottom of your library in a random order.",
-    "subtitleGraveyardPaid": "Cast {{name}} from a graveyard by paying its mana cost — mana of any type may be spent. Or decline and leave it in the graveyard.",
+    "subtitleGraveyardPaid": "Cast {{name}} from a graveyard by paying its mana cost{{extra}}{{concession}}. Or decline and leave it in the graveyard.",
     "castNamed": "Cast {{name}}",
     "castSuffix": "(without paying its mana cost)",
-    "castPaidSuffix": "(pay its mana cost — any type of mana may be spent)",
+    "castPaidSuffix": "(pay its mana cost{{extra}}{{concession}})",
+    "paidExtraFragment": " plus {{extra}}",
+    "paidAnyTypeSubtitleFragment": " — mana of any type may be spent",
+    "paidAnyColorSubtitleFragment": " — mana of any color may be spent",
+    "paidAnyTypeSuffixFragment": " — any type of mana may be spent",
+    "paidAnyColorSuffixFragment": " — any color of mana may be spent",
     "putIntoHand": "Put into hand",
     "decline": "Decline",
     "discoverDeclineSuffix": "(put the rest on the bottom)",
@@ -1860,6 +2069,7 @@
     "title": "Cast a spell for free",
     "subtitle": "Choose a spell to cast without paying its mana cost ({{remaining}} remaining). Total mana value left: {{budget}}.",
     "subtitleNoBudget": "Choose a spell to cast without paying its mana cost ({{remaining}} remaining).",
+    "remainingAny": "any number",
     "castNamed": "Cast {{name}}",
     "castSuffix": "(without paying its mana cost)",
     "done": "Done",
@@ -1956,8 +2166,10 @@
     "diagnostic": "diagnostic: {{reason}}",
     "showDetails": "Show details",
     "exportGameState": "Export Game State",
+    "exportClientSnapshot": "Export client snapshot",
     "exported": "Exported",
     "exportFailed": "Export failed",
+    "exportRequested": "Export unconfirmed",
     "copyDiagnostic": "Copy diagnostic",
     "copied": "Copied!",
     "reportOnGithub": "Report on GitHub",
@@ -2025,6 +2237,7 @@
     "searchPlaceholder": "Search by name...",
     "noCardsFound": "No cards found",
     "buttonSubtitle": "Select one option",
+    "numberSubtitle": "Enter a whole number {{min}} or greater",
     "filterPlaceholder": "Filter options...",
     "noOptionsMatch": "No options match"
   },
@@ -2059,7 +2272,28 @@
     "title": "{{name}} - Optional Effect",
     "yes": "Yes",
     "no": "No",
-    "dontAskAgain": "Don't ask again this game"
+    "dontAskAgain": "Don't ask again this game",
+    "dontAskAgainForSameCard": "Use this choice for every copy of this card this game"
+  },
+  "resolutionOptionalPayment": {
+    "title": "Choose an optional payment",
+    "pay": "Pay {{cost}}",
+    "decline": "Decline",
+    "cost": {
+      "card": "card",
+      "cards": "cards",
+      "filteredCard": "{{types}} card",
+      "filteredCards": "{{types}} cards",
+      "nonType": "non{{type}}",
+      "orSeparator": " or ",
+      "zoneBattlefield": "the battlefield",
+      "zoneGraveyard": "your graveyard",
+      "zoneLibrary": "your library",
+      "zoneExile": "exile",
+      "zoneHand": "your hand",
+      "discard": "Discard {{count}} {{cards}}",
+      "exile": "Exile {{count}} {{cards}} from {{zone}}"
+    }
   },
   "topOrBottom": {
     "cardFallback": "Card",
@@ -2106,8 +2340,21 @@
   "replacement": {
     "eyebrow": "Resolution Order",
     "title": "Replacement Effects",
-    "subtitle": "Choose which replacement effect applies first.",
-    "candidateFallback": "Replacement Effect {{number}}"
+    "orderSubtitle": "These effects all change how this event happens. Drag to set the order they apply in — the last one applied is the one that takes effect (CR 616.1).",
+    "appliedFirst": "Applied first (overwritten)",
+    "appliedLast": "Applied last — this wins",
+    "resultLabel": "Result: {{outcome}}",
+    "confirmOrder": "Confirm Order",
+    "dragHint": "Drag to reorder, or use the arrows.",
+    "chooseSubtitle": "Choose which replacement effect to apply.",
+    "candidateFallback": "Replacement Effect {{number}}",
+    "orderSubtitleComposing": "These effects all change how this event happens. Drag to set the order they apply in — each one applies, so the order changes the result (CR 616.1).",
+    "appliedEarlier": "Applied earlier",
+    "appliedLater": "Applied later",
+    "composesNote": "Every effect applies — the order changes how they combine.",
+    "moveUpNamed": "Move {{name}} earlier",
+    "moveDownNamed": "Move {{name}} later",
+    "positionAnnounce": "Position {{position}} of {{total}}"
   },
   "retargetChoice": {
     "title": "Change Target",
@@ -2160,6 +2407,24 @@
     "moveDown": "Move down",
     "triggerFallback": "Trigger {{number}}"
   },
+  "costReductionOrder": {
+    "eyebrow": "Cost Reduction Order",
+    "title": "Order Your Cost Reductions",
+    "subtitle": "These reductions lock in a different total depending on the order you apply them (CR 601.2f). The top of this list is applied first.",
+    "appliedFirst": "Applied first",
+    "appliedLast": "Applied last",
+    "lockedCost": "Total cost locked in",
+    "lockedCostUnknown": "Same as one of the totals below",
+    "outcomesHeading": "Totals you can lock in",
+    "reachColoredOnly": "Reduces only colored mana",
+    "reachSpills": "Can reduce generic mana",
+    "multiplier": "×{{count}}",
+    "confirmOrder": "Confirm Order",
+    "cancelCast": "Cancel Cast",
+    "moveUp": "Move up",
+    "moveDown": "Move down",
+    "reductionFallback": "Reduction {{number}}"
+  },
   "unhandledWaitingFor": {
     "title": "Action required, but UI is missing",
     "body": "The game is waiting on you for an action, but this version of phase.rs does not yet have a UI for it. This is a bug — please report it so we can fix it. Use the button below to leave the game.",
@@ -2186,7 +2451,17 @@
   },
   "outsideGame": {
     "fromExile": "From exile",
-    "fromSideboard": "From sideboard"
+    "fromSideboard": "From sideboard",
+    "fromBoosterPack": "From {{setCode}} booster pack",
+    "fromCubeBoosterPack": "From a Cube booster pack"
+  },
+  "boosterPack": {
+    "title": "{{setCode}} Booster Pack",
+    "cubeTitle": "Cube Booster Pack",
+    "subtitleExact_one": "Choose {{count}} card to keep — the rest are removed from the game",
+    "subtitleExact_other": "Choose {{count}} cards to keep — the rest are removed from the game",
+    "subtitleUpTo_one": "Choose up to {{count}} card to keep — the rest are removed from the game",
+    "subtitleUpTo_other": "Choose up to {{count}} cards to keep — the rest are removed from the game"
   },
   "phaseName": {
     "Untap": "Untap",
@@ -2222,6 +2497,18 @@
       "keep": "Keep this"
     }
   },
+  "dieRoll": {
+    "ignore": {
+      "title": "Ignore a Roll",
+      "subtitle_one": "Choose which of the tied lowest rolls to ignore.",
+      "subtitle_other": "Choose {{count}} of the tied lowest rolls to ignore."
+    },
+    "buttons": {
+      "ignore": "Ignore this",
+      "ignoring": "Ignoring",
+      "keep": "Kept"
+    }
+  },
   "planechase": {
     "active": "Active plane",
     "none": "None",
@@ -2237,6 +2524,23 @@
     "deckCount": "{{count}} in deck",
     "heroCount": "{{count}} heroes"
   },
+  "debugPanel": {
+    "aiDecisionVisibility": "Show AI decisions",
+    "aiDecisionUnavailable": "AI decision diagnostics are unavailable for this game."
+  },
+  "aiDecisionOverlay": {
+    "title": "AI decision",
+    "rankedSubtitle": "Softmax sample at temperature {{temperature}}.",
+    "directSubtitle": "Selected by a direct AI policy.",
+    "metrics": "S {{score}} · W {{weight}}",
+    "top": "TOP",
+    "chosen": "CHOSEN",
+    "legendTop": "Top ranked",
+    "legendChosen": "Chosen",
+    "collapse": "Collapse AI decision details",
+    "expand": "Expand AI decision details",
+    "close": "Close AI decision overlay"
+  },
   "status": {
     "yourPriority": "Your priority",
     "yourPriorityReason": "Your priority — {{reason}}",
@@ -2251,6 +2555,7 @@
       "mulligan": "mulligan decision",
       "discarding": "discarding",
       "orderingTriggers": "ordering triggers",
+      "orderingCostReductions": "ordering cost reductions",
       "respondingToStack": "responding to the stack",
       "priorityCombat": "combat",
       "priorityMain": "main phase",
@@ -2266,11 +2571,21 @@
       "mulligan": "Mulligan",
       "discarding": "Discarding",
       "orderingTriggers": "Ordering triggers",
+      "orderingCostReductions": "Ordering cost reductions",
       "respondingToStack": "Responding",
       "priorityCombat": "Combat",
       "priorityMain": "Main phase",
       "priority": "Priority",
       "thinking": "Thinking"
     }
+  },
+  "rippleReveal": {
+    "eyebrow": "Ripple",
+    "title": "Reveal the top of your library?",
+    "subtitle_one": "You may reveal the top {{count}} card. Same-named cards can be cast free; the rest go to the bottom.",
+    "subtitle_other": "You may reveal the top {{count}} cards. Same-named cards can be cast free; the rest go to the bottom.",
+    "reveal_one": "Reveal {{count}} card",
+    "reveal_other": "Reveal {{count}} cards",
+    "decline": "Don't reveal"
   }
 }

@@ -8,7 +8,13 @@
 //! upkeep", "until its controller's next untap step"), "until ~/this creature
 //! leaves the battlefield", "until you exile another card with ~/this
 //! ability", "for the rest of the game", "for as long as [condition]", "this
-//! turn", "this/that combat".
+//! turn", "this/that combat", and the "during target opponent's/player's next
+//! turn" WINDOW (Gideon Jura).
+//!
+//! A phrase added here is taken away from every clause-level grammar that owned
+//! it, because the positional wrappers below run first — see
+//! `parse_next_turn_window_possessor` for why the "during …" arm accepts only
+//! the targeted possessives.
 //!
 //! Positional wrappers (`strip_trailing_duration` / `strip_leading_duration`
 //! in `oracle_effect/lower.rs`, the clause shell, and the combat-grant
@@ -26,7 +32,9 @@ use nom::Parser;
 use super::condition::{parse_inner_condition, parse_recipient_has_counters};
 use super::error::{oracle_err, OracleError, OracleResult};
 use super::primitives::scan_contains;
-use crate::types::ability::{Duration, ObjectScope, PlayerScope, StaticCondition, TargetFilter};
+use crate::types::ability::{
+    ControllerRef, Duration, ObjectScope, PlayerScope, StaticCondition, TargetFilter,
+};
 use crate::types::phase::Phase;
 
 /// Parse a duration phrase from Oracle text.
@@ -40,9 +48,131 @@ pub fn parse_duration(input: &str) -> OracleResult<'_, Duration> {
     alt((
         preceded(tag("until "), parse_until_body),
         preceded(tag("for "), parse_for_body),
+        preceded(tag("during "), parse_during_body),
         parse_current_phase_duration,
     ))
     .parse(input)
+}
+
+/// Alternatives after the shared "during " prefix.
+///
+/// CR 514.2 + CR 508.1d: "during <possessor> next turn" names a WINDOW — the
+/// whole of that player's next turn — which is exactly the span
+/// [`Duration::UntilEndOfNextTurnOf`] already models (armed at that player's
+/// untap step, pruned at that turn's cleanup). CR 508.1d's closing sentence
+/// makes the whole-turn reading load-bearing rather than incidental: "If a
+/// requirement that says a creature attacks if able during a certain turn refers
+/// to a turn with multiple combat phases, the creature attacks if able during
+/// each declare attackers step in that turn." Gideon Jura's official ruling says
+/// the same in card terms — the "+2" "applies during each combat phase of the
+/// affected player's next turn (as opposed to applying during the affected
+/// player's next combat phase)".
+///
+/// The possessor is its own axis (`parse_next_turn_window_possessor`), so
+/// "during your next turn" and "during target opponent's next turn" are one
+/// production rather than enumerated full-string arms.
+fn parse_during_body(input: &str) -> OracleResult<'_, Duration> {
+    let (rest, possessor) = parse_next_turn_window_possessor(input)?;
+    let (rest, _) = tag(" next turn").parse(rest)?;
+    Ok((
+        rest,
+        Duration::UntilEndOfNextTurnOf {
+            player: possessor.scope(),
+        },
+    ))
+}
+
+/// The possessor of a "during <possessor> next turn" window, **as written**.
+///
+/// Deliberately distinct from the emitted [`PlayerScope`], for the same reason
+/// [`StepDeadlinePossessor`] is: two spellings that produce the SAME runtime
+/// `PlayerScope` can still differ in what the rest of the parser must do about
+/// them. Here, "target player's" and "target opponent's" both emit
+/// `PlayerScope::Target` (CR 109.4 — the duration reads the first player target
+/// either way), but they declare different companion target SLOTS, and the
+/// clause body's "that player" anaphor must inherit the matching
+/// [`ControllerRef`] so the slot's legal-target set is right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NextTurnWindowPossessor {
+    /// CR 109.4: "target player's".
+    TargetPlayer,
+    /// CR 109.4 + CR 102.2: "target opponent's" (Gideon Jura). Runtime-read
+    /// identical to `TargetPlayer`; the slot excludes the controller.
+    TargetOpponent,
+}
+
+impl NextTurnWindowPossessor {
+    /// The duration's runtime scope. Both spellings collapse here — the legality
+    /// difference lives in [`Self::controller_ref`], not in the duration.
+    fn scope(self) -> PlayerScope {
+        match self {
+            Self::TargetPlayer | Self::TargetOpponent => PlayerScope::Target,
+        }
+    }
+
+    /// CR 608.2c: the `ControllerRef` a "that player" anaphor in the clause body
+    /// must bind to.
+    pub(crate) fn controller_ref(self) -> ControllerRef {
+        match self {
+            Self::TargetPlayer => ControllerRef::TargetPlayer,
+            Self::TargetOpponent => ControllerRef::TargetOpponent,
+        }
+    }
+}
+
+/// CR 109.4: the possessor axis of a "during <possessor> next turn" window.
+///
+/// **Deliberately TARGETED possessives only** — not
+/// [`parse_controller_possessive_pronoun`]'s "your"/"their". This grammar is
+/// reached through the POSITIONAL wrappers (`strip_leading_duration` /
+/// `strip_trailing_duration`), which peel a duration phrase off ANY clause, so a
+/// phrase added here is taken away from every other clause-level grammar that
+/// owns it. "during their next turn" is owned by the CR 723.1 control-next-turn
+/// grammar (`try_parse_control_next_turn_suffix` — Mindslaver, Construct a
+/// Cosmic Cube's "you control target opponent during their next turn"), where
+/// the window is part of the effect rather than a separable duration. Accepting
+/// the pronoun forms here silently stripped that window and left the
+/// control-opponent rider unparsed.
+///
+/// "during target opponent's next turn" (Gideon Jura) is owned by no other
+/// grammar, so it is safe — and necessary — here.
+///
+/// The possessive marker is a shared trailing `alt()` over both apostrophe
+/// glyphs and the apostrophe-less spelling, matching the factoring in
+/// [`parse_object_controller_possessive`] — the noun and the marker are separate
+/// axes, not enumerated pairs.
+fn parse_next_turn_window_possessor(input: &str) -> OracleResult<'_, NextTurnWindowPossessor> {
+    terminated(
+        preceded(
+            tag("target "),
+            alt((
+                value(NextTurnWindowPossessor::TargetOpponent, tag("opponent")),
+                value(NextTurnWindowPossessor::TargetPlayer, tag("player")),
+            )),
+        ),
+        alt((tag("\u{2019}s"), tag("'s"), tag("s"))),
+    )
+    .parse(input)
+}
+
+/// CR 608.2c + CR 109.4: The possessor of a LEADING "during <possessor> next
+/// turn, …" window, for callers that must publish the window's targeted player
+/// as the clause body's relative-player scope.
+///
+/// Shares the single possessor combinator with [`parse_during_body`], so the
+/// duration value and the anaphor scope can never disagree about which spelling
+/// was written. Returns `None` when `input` does not open with such a window.
+pub(crate) fn leading_next_turn_window_possessor(input: &str) -> Option<NextTurnWindowPossessor> {
+    let (rest, possessor) = preceded(
+        tag::<_, _, OracleError<'_>>("during "),
+        parse_next_turn_window_possessor,
+    )
+    .parse(input)
+    .ok()?;
+    let (_, _) = (tag::<_, _, OracleError<'_>>(" next turn"), tag(", "))
+        .parse(rest)
+        .ok()?;
+    Some(possessor)
 }
 
 /// Alternatives after the shared "until " prefix.
@@ -323,8 +453,8 @@ fn parse_until_next_turn(input: &str) -> OracleResult<'_, Duration> {
 /// - "[subject] remains tapped" → `ForAsLongAs(SourceIsTapped)` for source
 ///   subjects, `ForAsLongAs(IsTapped { scope: Target })` for demonstrative
 ///   subjects (see `parse_remains_tapped`)
-/// - "you control [subject]" → `UntilHostLeavesPlay`
-/// - "[subject] remains on the battlefield" → `UntilHostLeavesPlay`
+/// - "you control [subject]" → `WhileControllingHost`
+/// - "[subject] remains on the battlefield" → `WhileHostOnBattlefield`
 /// - "[subject] has [N] [type] counter(s) on it" → `ForAsLongAs(HasCounters)`
 /// - any whole-clause condition `parse_inner_condition` recognizes →
 ///   `ForAsLongAs(condition)`
@@ -351,15 +481,27 @@ pub fn parse_for_as_long_as_condition(input: &str) -> OracleResult<'_, Duration>
         // plane-face-up-gated continuous-effect duration. Kept adjacent to
         // `parse_remains_tapped` (the sibling source-status "remains X" family).
         parse_remains_face_up,
-        // "you control [subject]" → host-control lifetime, modeled with the
-        // existing UntilHostLeavesPlay variant.
+        // CR 611.2b: "you control [subject]" → the CONTROL-bound host lifetime.
+        // Kept distinct from the presence-bound reading below because the two
+        // end at different moments and both are printed: a control change with
+        // the permanent still on the battlefield ends this one (CR 611.2b's own
+        // Master Thief example is this duration CLASS — it illustrates the
+        // duration failing to START, not this end, which is read off the
+        // wording) and leaves the other running.
         value(
-            Duration::UntilHostLeavesPlay,
+            Duration::WhileControllingHost,
             preceded(tag("you control "), rest),
         ),
-        // "[subject] remains on the battlefield" → UntilHostLeavesPlay.
+        // CR 611.2b + CR 702.26f: "[subject] remains on the battlefield" → the
+        // PRESENCE-bound host lifetime, a stated "for as long as . . ."
+        // duration. Intet, the Dreamer and The Day of the Doctor print this
+        // wording on a play permission, Sower of Temptation on a control
+        // effect. A control change does not end it; a phase-out of the host
+        // does, which is why it is a separate variant from the
+        // `UntilHostLeavesPlay` event deadline parsed in `parse_duration`
+        // (CR 702.26d: a phase-out is not the host leaving the battlefield).
         value(
-            Duration::UntilHostLeavesPlay,
+            Duration::WhileHostOnBattlefield,
             verify(rest, |tail: &str| {
                 scan_contains(tail, "remains on the battlefield")
             }),
@@ -550,12 +692,33 @@ fn parse_compound_for_as_long_as(input: &str) -> OracleResult<'_, Duration> {
 }
 
 /// Convert a `Duration` back into a `StaticCondition` for compound "and"
-/// clauses. `UntilHostLeavesPlay` maps to `IsPresent { filter: None }`
-/// (source must remain on the battlefield).
+/// clauses. The host-lifetime readings map to `IsPresent { filter: None }` —
+/// which is NOT a runtime presence test (it evaluates to `true`; the arm's
+/// comment below says exactly what it is and is not).
 fn duration_to_condition(dur: Duration) -> StaticCondition {
     match dur {
         Duration::ForAsLongAs { condition } => condition,
-        Duration::UntilHostLeavesPlay => StaticCondition::IsPresent { filter: None },
+        // CR 611.2a + CR 611.2b: all three host-lifetime readings map to the
+        // value this conversion produced for the "you control ~" wording
+        // BEFORE the readings were split. The explicit arm exists for parity:
+        // the compound "and" form must not change because of either split.
+        //
+        // What it is NOT: a presence test. `IsPresent { filter: None }`
+        // evaluates to `true` (`layers::evaluate_condition_with_context`), the
+        // same answer the `_` arm's `StaticCondition::None` gives; the two
+        // differ only in which characteristic changes re-invalidate the layer
+        // cache (`CONTROLLER` vs. nothing). Neither carries the host leg, and
+        // the control leg cannot be carried at all here —
+        // `StaticCondition::SourceControllerEquals` stores a concrete
+        // `PlayerId` and the parser has no player.
+        //
+        // Printed compounds reaching here — Helm of Possession, Hivis of the
+        // Scale, Rubinia Soulsinger, Seasinger, Willow Satyr — all pair the
+        // wording with "… and ~ remains tapped", and THAT leg is carried
+        // exactly, so each of them stays gated on its tapped condition.
+        Duration::UntilHostLeavesPlay
+        | Duration::WhileControllingHost
+        | Duration::WhileHostOnBattlefield => StaticCondition::IsPresent { filter: None },
         _ => StaticCondition::None,
     }
 }
@@ -894,17 +1057,55 @@ mod tests {
         }
     }
 
+    /// CR 611.2a vs CR 611.2b: the two host-lifetime wordings are DIFFERENT
+    /// durations and must not collapse onto one variant.
+    ///
+    /// All three are printed on play permissions or effects, so the differences
+    /// are observable at runtime rather than cosmetic: Gwen Stacy and Hama, the
+    /// Bloodbender print "for as long as you control ~" (ends on a control
+    /// change, CR 611.2b's own Master Thief example); Intet, the Dreamer and
+    /// The Day of the Doctor print "for as long as ~ remains on the
+    /// battlefield" (CR 611.2b — a control change leaves it running, a
+    /// phase-out ends it, CR 702.26f); the event deadline "until ~ leaves the
+    /// battlefield" is ended by neither a control change nor a phase-out
+    /// (CR 702.26d).
+    ///
+    /// Revert-to-red: mapping "you control" back onto a presence variant fails
+    /// the first assertion; collapsing "remains on the battlefield" back into
+    /// the event deadline fails the second and would keep Sower of
+    /// Temptation's steal running across a phase-out; mapping it onto the
+    /// control-bound variant would revoke Intet's permission on a control
+    /// change that does not end it.
     #[test]
-    fn test_for_as_long_as_you_control_maps_to_until_host_leaves() {
-        let (rest, d) = parse_duration("for as long as you control ~").unwrap();
-        assert_eq!(d, Duration::UntilHostLeavesPlay);
+    fn test_the_three_host_lifetime_wordings_do_not_collapse() {
+        let (rest, control_bound) = parse_duration("for as long as you control ~").unwrap();
         assert_eq!(rest, "");
-    }
+        assert_eq!(control_bound, Duration::WhileControllingHost);
 
-    #[test]
-    fn test_for_as_long_as_remains_on_battlefield_maps_to_until_host_leaves() {
-        let (_, d) = parse_duration("for as long as ~ remains on the battlefield").unwrap();
-        assert_eq!(d, Duration::UntilHostLeavesPlay);
+        let (rest, presence_bound) =
+            parse_duration("for as long as ~ remains on the battlefield").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(presence_bound, Duration::WhileHostOnBattlefield);
+
+        let (rest, event_bound) = parse_duration("until ~ leaves the battlefield").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(event_bound, Duration::UntilHostLeavesPlay);
+
+        assert_ne!(
+            control_bound, presence_bound,
+            "CR 611.2b: continued control and continued presence end at different \
+             moments; one variant cannot carry both"
+        );
+        assert_ne!(
+            presence_bound, event_bound,
+            "CR 702.26f vs CR 702.26d: a phase-out ends the presence reading but \
+             not the event deadline; one variant cannot carry both"
+        );
+        // All three still end when the host leaves the battlefield — that leg
+        // is shared, and every battlefield-exit consumer asks this predicate.
+        assert!(control_bound.ends_when_host_leaves_play());
+        assert!(presence_bound.ends_when_host_leaves_play());
+        assert!(event_bound.ends_when_host_leaves_play());
     }
 
     #[test]

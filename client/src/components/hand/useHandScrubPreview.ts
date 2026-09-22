@@ -131,7 +131,7 @@ export function useHandScrubPreview(
         width: card.offsetWidth || rect.width,
       };
       cardGrabOffsetXRef.current = x - centerX;
-      inspectObject(objectId, undefined, "immediate");
+      inspectObject(objectId, undefined, "immediate", "cursor", "playerHand");
       setPreviewSticky(true);
       return objectId;
     },
@@ -220,6 +220,16 @@ export function useHandScrubPreview(
   const onPointerDown = useCallback(
     (event: ReactPointerEvent<HTMLElement>) => {
       if (!enabled || event.pointerType === "mouse" || !event.isPrimary || event.button !== 0) {
+        return;
+      }
+
+      // Castable exile/graveyard wings own their Framer Motion drag gesture.
+      // Do not capture the pointer at the hand container: doing so prevents the
+      // wing from receiving the move/up events needed for flick-up-to-cast.
+      if (
+        event.target instanceof Element
+        && event.target.closest("[data-zone-fan-card]")
+      ) {
         return;
       }
 

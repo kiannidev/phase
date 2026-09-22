@@ -88,6 +88,8 @@ fn tamiyo_third_draw_returns_transformed_not_stranded_in_exile() {
         .get_mut(&tamiyo)
         .unwrap()
         .back_face = Some(BackFaceData {
+        is_swap_snapshot: false,
+        trigger_printed_origins: Vec::new(),
         name: "Tamiyo, Seasoned Scholar".to_string(),
         power: None,
         toughness: None,
@@ -113,6 +115,7 @@ fn tamiyo_third_draw_returns_transformed_not_stranded_in_exile() {
         casting_restrictions: vec![],
         casting_options: vec![],
         layout_kind: None,
+        parse_warnings: vec![],
     });
 
     // Precondition: Tamiyo is on the battlefield, front-face (not transformed).

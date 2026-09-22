@@ -16,7 +16,7 @@
  * WASM adapter, deckCompatibility, useBracketEstimate) are mocked so the
  * test only exercises the warning-chip render condition.
  */
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -153,6 +153,20 @@ describe("GameSetupPage — cEDH bracket warning chip", () => {
     expect(screen.getByRole("button", { name: /Free-for-All/i })).toBeInTheDocument();
   });
 
+  it("restores the format chip after a pointer-style open does not move focus", async () => {
+    renderGameSetupPage();
+    const trigger = await screen.findByRole("button", { name: /Commander/i });
+
+    expect(document.activeElement).toBe(document.body);
+    fireEvent.click(trigger);
+    const dialog = await screen.findByRole("dialog");
+    await waitFor(() => expect(dialog).toHaveFocus());
+    fireEvent.keyDown(dialog, { key: "Escape" });
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(trigger).toHaveFocus();
+  });
+
   it("accepts a Two-Headed Giant URL format on the setup page", async () => {
     renderGameSetupPage("/game-setup?format=TwoHeadedGiant");
 
@@ -210,11 +224,8 @@ describe("GameSetupPage — cEDH bracket warning chip", () => {
 
     renderGameSetupPage();
 
-    // Allow any async effects to settle.
-    await waitFor(() => {
-      // The deck name should appear (deck is loaded).
-      expect(screen.getByText("cEDH Deck")).toBeInTheDocument();
-    });
+    // The deck name appearing is the signal that the deck finished loading.
+    expect(await screen.findByText("cEDH Deck")).toBeInTheDocument();
 
     // Warning must not be present.
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -232,9 +243,7 @@ describe("GameSetupPage — cEDH bracket warning chip", () => {
 
     renderGameSetupPage();
 
-    await waitFor(() => {
-      expect(screen.getByText("Casual Deck")).toBeInTheDocument();
-    });
+    expect(await screen.findByText("Casual Deck")).toBeInTheDocument();
 
     // No warning chip.
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();

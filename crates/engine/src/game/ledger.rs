@@ -1,7 +1,7 @@
 //! Final authority for composable per-event ledger facts.
 
 use crate::types::ability::TriggerDefinitionRef;
-use crate::types::game_state::{GameState, SpellCastRecord};
+use crate::types::game_state::{CastOccurrence, GameState, SpellCastRecord};
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::player::PlayerId;
 use crate::types::resolved_commands::{
@@ -38,7 +38,7 @@ pub fn record_spell_cast(
     state: &mut GameState,
     player: PlayerId,
     record: SpellCastRecord,
-) -> Result<(), ResolvedLedgerEditReplayInvariantError> {
+) -> Result<CastOccurrence, ResolvedLedgerEditReplayInvariantError> {
     let expected_turn_history_len = history_len(
         state
             .spells_cast_this_turn_by_player
@@ -65,7 +65,50 @@ pub fn record_spell_cast(
             expected_turn_history_len,
             expected_game_history_len,
         },
-    )
+    )?;
+    Ok(CastOccurrence {
+        caster: player,
+        turn_journal_index: expected_turn_history_len,
+    })
+}
+
+/// Validate every fallible spell-cast ledger precondition without mutation.
+///
+/// CR 601.2g provides the mana-ability window before payment, CR 601.2h pays
+/// the total cost, and CR 601.2i makes the spell cast. Cast finalization calls
+/// this before those payment/finalization steps or changing the announced
+/// object's zone. Mana payment cannot mutate these cast-history axes, so a
+/// later [`record_spell_cast`] cannot discover an overflow after the cast has
+/// partially committed.
+pub(crate) fn validate_spell_cast_recording(
+    state: &GameState,
+    player: PlayerId,
+) -> Result<(), ResolvedLedgerEditReplayInvariantError> {
+    if !state.players.iter().any(|candidate| candidate.id == player) {
+        return Err(ResolvedLedgerEditReplayInvariantError::UnknownPlayer(
+            player,
+        ));
+    }
+    history_len(
+        state
+            .spells_cast_this_turn_by_player
+            .get(&player)
+            .map_or(0, |history| history.len()),
+    )?;
+    history_len(
+        state
+            .spells_cast_this_game_by_player
+            .get(&player)
+            .map_or(0, |history| history.len()),
+    )?;
+    state
+        .spells_cast_this_game
+        .get(&player)
+        .copied()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(ResolvedLedgerEditReplayInvariantError::CounterOverflow)?;
+    Ok(())
 }
 
 /// CR 602.5b: Increment exactly one activated-ability occurrence's turn and
@@ -91,6 +134,34 @@ pub fn record_ability_activation(
                 .get(&key)
                 .copied()
                 .unwrap_or(0),
+        },
+    )
+}
+
+/// CR 700.13: Record that the player has committed a crime this turn after
+/// the targeting action survives its complete announcement and is placed on
+/// the stack. Individual `CrimeCommitted` events are still emitted for every
+/// qualifying action; this durable record only backs the per-turn condition.
+pub fn record_crime_committed(
+    state: &mut GameState,
+    player: PlayerId,
+) -> Result<(), ResolvedLedgerEditReplayInvariantError> {
+    let expected_turn_count = state
+        .players
+        .iter()
+        .find(|candidate| candidate.id == player)
+        .ok_or(ResolvedLedgerEditReplayInvariantError::UnknownPlayer(
+            player,
+        ))?
+        .crimes_committed_this_turn;
+    if expected_turn_count > 0 {
+        return Ok(());
+    }
+    resolve_and_apply_ledger_edit(
+        state,
+        ResolvedLedgerEdit::CrimeCommitted {
+            player,
+            expected_turn_count,
         },
     )
 }
@@ -295,6 +366,28 @@ pub fn apply_resolved_ledger_edit(
                 .activated_abilities_this_game
                 .insert(key, next_game_count);
         }
+        ResolvedLedgerEdit::CrimeCommitted {
+            player,
+            expected_turn_count,
+        } => {
+            let player_state = state
+                .players
+                .iter_mut()
+                .find(|candidate| candidate.id == *player)
+                .ok_or(ResolvedLedgerEditReplayInvariantError::UnknownPlayer(
+                    *player,
+                ))?;
+            if *expected_turn_count != 0
+                || player_state.crimes_committed_this_turn != *expected_turn_count
+            {
+                return Err(
+                    ResolvedLedgerEditReplayInvariantError::CrimeCommittedPreconditionMismatch,
+                );
+            }
+            player_state.crimes_committed_this_turn = expected_turn_count
+                .checked_add(1)
+                .ok_or(ResolvedLedgerEditReplayInvariantError::CounterOverflow)?;
+        }
         ResolvedLedgerEdit::CardsDrawn {
             player,
             drawn_object,
@@ -462,5 +555,127 @@ pub fn apply_resolved_ledger_edit(
 }
 
 fn history_len(len: usize) -> Result<u32, ResolvedLedgerEditReplayInvariantError> {
-    u32::try_from(len).map_err(|_| ResolvedLedgerEditReplayInvariantError::CounterOverflow)
+    let len =
+        u32::try_from(len).map_err(|_| ResolvedLedgerEditReplayInvariantError::CounterOverflow)?;
+    (len != u32::MAX)
+        .then_some(len)
+        .ok_or(ResolvedLedgerEditReplayInvariantError::CounterOverflow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game::game_object::GameObject;
+    use crate::types::ability::{TriggerDefinition, TriggerDefinitionOccurrenceRef, TriggerEntry};
+    use crate::types::identifiers::ObjectId;
+    use crate::types::player::PlayerId;
+    use crate::types::resolved_commands::{ResolvedCommandOrdinal, RulesExecutionNodeRef};
+    use crate::types::triggers::TriggerMode;
+    use crate::types::zones::Zone;
+    use crate::types::CardId;
+
+    #[test]
+    fn record_spell_cast_returns_zero_based_per_caster_turn_occurrences() {
+        let mut state = GameState::new_two_player(7);
+        let object = GameObject::new(
+            ObjectId(71),
+            CardId(71),
+            PlayerId(0),
+            "Coordinate Test".to_string(),
+            Zone::Stack,
+        );
+        let record = crate::game::restrictions::spell_cast_record_for(
+            &object,
+            Zone::Hand,
+            crate::types::game_state::CastingVariant::Normal,
+            false,
+        );
+
+        let first = record_spell_cast(&mut state, PlayerId(0), record.clone())
+            .expect("first cast is recorded");
+        let second = record_spell_cast(&mut state, PlayerId(0), record.clone())
+            .expect("second cast is recorded");
+        let other = record_spell_cast(&mut state, PlayerId(1), record)
+            .expect("other player's first cast is recorded");
+
+        assert_eq!(
+            first,
+            CastOccurrence {
+                caster: PlayerId(0),
+                turn_journal_index: 0
+            }
+        );
+        assert_eq!(
+            second,
+            CastOccurrence {
+                caster: PlayerId(0),
+                turn_journal_index: 1
+            }
+        );
+        assert_eq!(
+            other,
+            CastOccurrence {
+                caster: PlayerId(1),
+                turn_journal_index: 0
+            }
+        );
+        assert_eq!(state.spells_cast_this_turn_by_player[&PlayerId(0)].len(), 2);
+        assert_eq!(state.spells_cast_this_turn_by_player[&PlayerId(1)].len(), 1);
+
+        let before_turn = state.spells_cast_this_turn;
+        let before_game = state.spells_cast_this_game.clone();
+        let before_turn_history = state.spells_cast_this_turn_by_player.clone();
+        let before_game_history = state.spells_cast_this_game_by_player.clone();
+        let before_journal = state.resolved_rules_journal.entries().len();
+        assert_eq!(
+            history_len(u32::MAX as usize),
+            Err(ResolvedLedgerEditReplayInvariantError::CounterOverflow)
+        );
+        assert_eq!(state.spells_cast_this_turn, before_turn);
+        assert_eq!(state.spells_cast_this_game, before_game);
+        assert_eq!(state.spells_cast_this_turn_by_player, before_turn_history);
+        assert_eq!(state.spells_cast_this_game_by_player, before_game_history);
+        assert_eq!(state.resolved_rules_journal.entries().len(), before_journal);
+    }
+
+    #[test]
+    fn max_times_replay_resolves_recipient_key() {
+        let object_id = ObjectId(1);
+        let mut state = GameState::new_two_player(42);
+        let mut object = GameObject::new(
+            object_id,
+            CardId(1),
+            PlayerId(0),
+            "Granted trigger".to_string(),
+            Zone::Battlefield,
+        );
+        let entry = TriggerEntry::new(
+            TriggerDefinitionOccurrenceRef::Printed {
+                base_set: object.trigger_base_set_instance,
+                printed_index: 0,
+            },
+            TriggerDefinition::new(TriggerMode::Attacks),
+        );
+        let trigger = object.trigger_definition_ref(&entry);
+        object.trigger_definitions.push(entry);
+        state.objects.insert(object_id, object);
+        state
+            .trigger_fire_counts_this_turn
+            .insert(trigger.clone(), 2);
+
+        let command = ResolvedLedgerEditCommand {
+            edit: ResolvedLedgerEdit::TriggerFired {
+                trigger: trigger.clone(),
+                edit: ResolvedTriggerLedgerEdit::MaxTimesPerTurn { expected_old: 2 },
+            },
+            cause: RulesExecutionNodeRef::Proposal(ResolvedCommandOrdinal(0)),
+        };
+
+        apply_resolved_ledger_edit(&mut state, &command).expect("legacy replay resolves grant key");
+        assert_eq!(
+            state.trigger_fire_counts_this_turn.get(&trigger).copied(),
+            Some(3)
+        );
+        assert_eq!(state.trigger_fire_counts_this_turn.len(), 1);
+    }
 }

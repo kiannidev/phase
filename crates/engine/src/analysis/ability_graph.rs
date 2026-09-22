@@ -561,6 +561,7 @@ fn project_mana_production(p: &ManaProduction) -> (Vec<(usize, i64)>, AxisMagnit
             (vec![(slot, a)], mag)
         }
         ManaProduction::ChosenColor { count, .. }
+        | ManaProduction::NotedType { count, .. }
         | ManaProduction::OpponentLandColors { count, .. }
         | ManaProduction::AnyTypeProduceableBy { count, .. }
         | ManaProduction::AnyInCommandersColorIdentity { count, .. }
@@ -811,8 +812,9 @@ fn effect_projection(effect: &Effect) -> Projection {
             }
         }
         // ----- EXTRA TURNS / PHASES (CR 500.7 / CR 500.8) -----
-        Effect::ExtraTurn { .. } => {
-            b.add_extra_turn(1, AxisMagnitude::Fixed(1));
+        Effect::ExtraTurn { count, .. } => {
+            let (a, mag) = count_seed(count);
+            b.add_extra_turn(a, mag);
         }
         // CR 500.8: only an additional *combat* phase pumps a modeled axis; any
         // other extra phase carries no countable resource ⇒ Unmodeled (M2).
@@ -867,7 +869,7 @@ fn effect_projection(effect: &Effect) -> Projection {
         | Effect::ExploreAll { .. }
         | Effect::Tribute { .. }
         | Effect::TimeTravel
-        | Effect::BecomeMonarch
+        | Effect::BecomeMonarch { .. }
         | Effect::NoOp
         | Effect::Populate
         | Effect::Clash
@@ -892,6 +894,10 @@ fn effect_projection(effect: &Effect) -> Projection {
         | Effect::DoublePT { .. }
         | Effect::DoublePTAll { .. }
         | Effect::MoveCounters { .. }
+        // CR 122.1 + CR 603.2c: the reproduced counter kind is event-derived (not
+        // statically known), so it projects onto no fixed resource axis — like
+        // `MoveCounters`, it is Unmodeled.
+        | Effect::ReproduceEventCounters { .. }
         | Effect::Animate { .. }
         | Effect::ReturnAsAura { .. }
         | Effect::RegisterBending { .. }
@@ -904,6 +910,8 @@ fn effect_projection(effect: &Effect) -> Projection {
         // like `Transform`.
         | Effect::FlipPermanent { .. }
         | Effect::SearchOutsideGame { .. }
+        // CR 400.11b: carries no nested ability edge.
+        | Effect::OpenBoosterPack { .. }
         | Effect::RevealHand { .. }
         | Effect::RevealFromHand { .. }
         | Effect::Reveal { .. }
@@ -913,6 +921,7 @@ fn effect_projection(effect: &Effect) -> Projection {
         | Effect::TargetOnly { .. }
         | Effect::Choose { .. }
         | Effect::SwapChosenLabels { .. }
+        | Effect::RevealChosenNumbers { .. }
         | Effect::ChooseDamageSource { .. }
         | Effect::Suspect { .. }
         | Effect::Unsuspect { .. }
@@ -969,6 +978,7 @@ fn effect_projection(effect: &Effect) -> Projection {
         | Effect::GrantCastingPermission { .. }
         | Effect::ChooseFromZone { .. }
         | Effect::RememberCard { .. }
+        | Effect::NoteManaSpent
         | Effect::ForEachCategory { .. }
         | Effect::ChooseObjectsIntoTrackedSet { .. }
         | Effect::ChooseAndSacrificeRest { .. }
@@ -1003,6 +1013,7 @@ fn effect_projection(effect: &Effect) -> Projection {
         | Effect::RuntimeHandled { .. }
         | Effect::Incubate { .. }
         | Effect::Amass { .. }
+        | Effect::EmpowerJace { .. }
         | Effect::Monstrosity { .. }
         | Effect::Specialize
         | Effect::Renown { .. }
@@ -1010,6 +1021,7 @@ fn effect_projection(effect: &Effect) -> Projection {
         | Effect::Adapt { .. }
         | Effect::Learn
         | Effect::Forage
+        | Effect::CompletePlayerAction { .. }
         | Effect::Harness
         | Effect::CollectEvidence { .. }
         | Effect::Endure { .. }
@@ -1065,7 +1077,9 @@ fn trigger_axis(trig: &TriggerDefinition) -> Option<AxisKey> {
         // CR 701.26a: "becomes tapped" requires untapped state to consume.
         TriggerMode::Taps | TriggerMode::TapAll => Some(AxisKey::Tap),
         // CR 106.1: mana-added / tap-for-mana triggers consume the mana axis.
-        TriggerMode::TapsForMana | TriggerMode::ManaAdded => Some(AxisKey::Mana),
+        TriggerMode::TapsForMana | TriggerMode::ManaAdded | TriggerMode::ManaAbilityProduced => {
+            Some(AxisKey::Mana)
+        }
         // CR 603.6a / 700.4 / 603.6c: zone-change triggers consume the ETB / dies /
         // LTB event axis, disambiguated by the definition's destination/origin.
         TriggerMode::ChangesZone | TriggerMode::ChangesZoneAll => {
@@ -1179,6 +1193,9 @@ fn trigger_axis(trig: &TriggerDefinition) -> Option<AxisKey> {
         | TriggerMode::RoomEntered
         | TriggerMode::PlanarDice
         | TriggerMode::Planeswalked { .. }
+        // CR 714.2e: a final-chapter meta-trigger consumes another permanent's
+        // chapter-ability lifecycle; no modeled producer axis.
+        | TriggerMode::FinalSagaChapterAbility { .. }
         | TriggerMode::ChaosEnsues
         | TriggerMode::RolledDie
         | TriggerMode::RolledDieOnce
@@ -1455,7 +1472,7 @@ fn sink_mana_cost(acc: &mut NodeAcc, cost: &ManaCost) {
 }
 
 /// CR 118 cost fold: the fourth compile-time drift gate — an exhaustive
-/// **no-wildcard** match over all 29 [`AbilityCost`] variants. Polarity/sign
+/// **no-wildcard** match over all 30 [`AbilityCost`] variants. Polarity/sign
 /// aware: a cost consumes a resource (negative `net`, ⇒ `requires`) or, in cost
 /// position, *produces* one (positive `net`, ⇒ `produces`). Field-less axes
 /// (`Tap`, `AnyCounter`) are injected directly.
@@ -1569,6 +1586,11 @@ fn fold_cost(acc: &mut NodeAcc, cost: &AbilityCost) {
         // cast (the spell being cast), never an activation cost of this ability,
         // so it carries no modeled axis for the loop detector.
         | AbilityCost::KeywordCostOfCastSpell { .. }
+        // CR 702.21a: a Ward player-counter cost, like the effect-side
+        // `Effect::GivePlayerCounter` above, carries no modeled axis here —
+        // poison accumulation is a loss condition, not a combo resource this
+        // loop detector tracks.
+        | AbilityCost::GetPlayerCounters { .. }
         | AbilityCost::Unimplemented { .. } => {}
     }
 }
@@ -2130,7 +2152,7 @@ pub(crate) fn candidate_cycles_from_nodes(nodes: Vec<AbilityNode>) -> Vec<Candid
 mod tests {
     use super::*;
     use crate::types::ability::{
-        default_target_filter_any, EffectScope, PlayerFilter, PtValue, SacrificeCost,
+        default_target_filter_any, EffectScope, PlayerFilter, PtValue, QuantityRef, SacrificeCost,
         TriggerDefinition, TypedFilter,
     };
     use crate::types::counter::CounterType;
@@ -2948,11 +2970,34 @@ mod tests {
             "TimeWalk",
             &activated(Effect::ExtraTurn {
                 target: TargetFilter::Controller,
+                count: fixed(1),
             }),
             None,
         );
         assert_eq!(et.net.extra_turns, 1);
         assert!(et.produces.contains(&AxisKey::ExtraTurn));
+
+        let two = build_node(
+            "TimeStretch",
+            &activated(Effect::ExtraTurn {
+                target: TargetFilter::Controller,
+                count: fixed(2),
+            }),
+            None,
+        );
+        assert_eq!(two.net.extra_turns, 2);
+
+        let dynamic = effect_projection(&Effect::ExtraTurn {
+            target: TargetFilter::Controller,
+            count: QuantityExpr::Ref {
+                qty: QuantityRef::Variable { name: "X".into() },
+            },
+        });
+        assert!(matches!(
+            dynamic,
+            Projection::Modeled { ref magnitudes, .. }
+                if magnitudes.get(&AxisKey::ExtraTurn) == Some(&AxisMagnitude::Unbounded)
+        ));
 
         // CR 500.8: an additional combat phase pumps the Combat axis.
         let combat = build_node(

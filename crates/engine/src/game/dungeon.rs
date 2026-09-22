@@ -79,7 +79,14 @@ pub struct DungeonProgress {
 
 /// Static room definition within a dungeon graph.
 pub struct RoomDefinition {
+    /// CR 309.4b: The room's printed name. Flavor text — it never affects play,
+    /// but it is how players and the UI identify a room.
     pub name: &'static str,
+    /// CR 309.4c: The room ability's printed effect — the "[effect]" half of
+    /// "When you move your venture marker into this room, [effect]". Verbatim
+    /// Oracle text minus the "(Leads to: ...)" reminder, which `next_rooms`
+    /// already encodes.
+    pub text: &'static str,
     /// Indices of rooms this room leads to (empty = bottommost room).
     pub next_rooms: &'static [u8],
 }
@@ -89,6 +96,234 @@ pub struct DungeonDefinition {
     pub id: DungeonId,
     pub name: &'static str,
     pub rooms: &'static [RoomDefinition],
+}
+
+/// CR 309.4: Where a room sits on the printed dungeon card, in permille of
+/// the card image (0-1000, origin top-left).
+///
+/// The dungeon cards are the rare case where the "art" IS the game state: each
+/// card is a labeled floor plan whose rooms are drawn as rectangles, not a
+/// framed illustration. That is what makes overlaying a venture marker on the
+/// image meaningful rather than decorative — the marker lands in the drawn room
+/// it represents.
+///
+/// Relative units, not pixels, because the client renders the card at whatever
+/// width the panel gives it and picks an image rung by viewport. They also
+/// transfer across printings: the token-set and oversized printings of a
+/// dungeon are the same layout at the same proportions (verified by comparing
+/// the `tafr` and `oafr` Lost Mine scans, identical at every rung).
+///
+/// `x`/`y` are the room rectangle's CENTER, which is where the marker is drawn.
+///
+/// Stored as PERMILLE (0-1000) rather than a float. `DerivedViews` derives `Eq`
+/// so that state snapshots can be compared for equality, and `f32` is not `Eq`
+/// — a float here would force the whole projection down to `PartialEq`. Permille
+/// is far finer than the overlay needs: one part in a thousand of a 672px card
+/// is under a pixel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomMarkerPoint {
+    /// Distance from the card's left edge, in thousandths of its width.
+    pub x_permille: u16,
+    /// Distance from the card's top edge, in thousandths of its height.
+    pub y_permille: u16,
+}
+
+/// Authoring shorthand so the tables below read as coordinate pairs rather
+/// than repeated struct literals. Takes permille directly — the values are
+/// measured off the card face and written in the stored unit.
+const fn pt(x_permille: u16, y_permille: u16) -> RoomMarkerPoint {
+    RoomMarkerPoint {
+        x_permille,
+        y_permille,
+    }
+}
+
+/// Centers of each room's drawn rectangle on the dungeon card, indexed in the
+/// same order as the dungeon's `rooms` table.
+///
+/// Deliberately carries no CR annotation: this is display geometry, not a rule.
+/// CR 309.4 describes the rooms and the venture marker but specifies no
+/// coordinates, and annotating plumbing would surface it as rules coverage.
+///
+/// Authored from the printed card faces; there is no coordinate data on
+/// Scryfall (its `oracle_text` gives only ordered "Name — Effect. (Leads to:)"
+/// lines), so these are the single place the geometry exists. The
+/// `dungeon_marker_points_cover_every_room` test pins each list's length to its
+/// room table so a dungeon can never carry a partial or stale list.
+pub fn marker_points(id: DungeonId) -> &'static [RoomMarkerPoint] {
+    match id {
+        DungeonId::LostMineOfPhandelver => &LOST_MINE_MARKERS,
+        DungeonId::DungeonOfTheMadMage => &MAD_MAGE_MARKERS,
+        DungeonId::TombOfAnnihilation => &TOMB_MARKERS,
+        DungeonId::Undercity => &UNDERCITY_MARKERS,
+        DungeonId::BaldursGateWilderness => &BALDURS_GATE_MARKERS,
+    }
+}
+
+/// Lost Mine of Phandelver — 4 rows: full / halves / thirds / full.
+/// Read off the printed card face (AFR token #021).
+static LOST_MINE_MARKERS: [RoomMarkerPoint; 7] = [
+    pt(500, 215), // 0 Cave Entrance   (full width)
+    pt(310, 390), // 1 Goblin Lair     (left half)
+    pt(690, 390), // 2 Mine Tunnels    (right half)
+    pt(180, 610), // 3 Storeroom       (left third)
+    pt(500, 610), // 4 Dark Pool       (centre third)
+    pt(810, 610), // 5 Fungi Cavern    (right third)
+    pt(500, 800), // 6 Temple of Dumathoin (full width)
+];
+
+/// Dungeon of the Mad Mage — alternating full-width corridors and half-width
+/// branch pairs. The branch rows are drawn roughly twice as tall as the
+/// single-room corridors, so the y values are not evenly spaced.
+/// Read off the printed card face (AFR token #020).
+static MAD_MAGE_MARKERS: [RoomMarkerPoint; 9] = [
+    pt(500, 184), // 0 Yawning Portal      (full width)
+    pt(500, 259), // 1 Dungeon Level       (full width)
+    pt(290, 376), // 2 Goblin Bazaar       (left half, tall)
+    pt(715, 376), // 3 Twisted Caverns     (right half, tall)
+    pt(500, 494), // 4 Lost Level          (full width)
+    pt(290, 606), // 5 Runestone Caverns   (left half, tall)
+    pt(715, 606), // 6 Muiral's Graveyard  (right half, tall)
+    pt(500, 723), // 7 Deep Mines          (full width)
+    pt(500, 814), // 8 Mad Wizard's Lair   (full width, bottommost)
+];
+
+/// Tomb of Annihilation — irregular: Oubliette is a single TALL room on the
+/// right spanning the vertical extent of both Veils of Fear and Sandfall Cell,
+/// which are stacked on the left. Not a 2x2 grid.
+/// Read off the printed card face (AFR token #022).
+static TOMB_MARKERS: [RoomMarkerPoint; 5] = [
+    pt(500, 220), // 0 Trapped Entry           (full width)
+    pt(290, 400), // 1 Veils of Fear           (left, upper)
+    pt(720, 480), // 2 Oubliette               (right, spans both left rows)
+    pt(290, 580), // 3 Sandfall Cell           (left, lower)
+    pt(500, 775), // 4 Cradle of the Death God (full width, bottommost)
+];
+
+/// Undercity — the "You can't enter this dungeon unless you 'venture into
+/// Undercity.'" line above the grid pushes every row down relative to the AFR
+/// dungeons, and the Trap!/Arena/Stash row is asymmetric (Arena is a narrow
+/// centre room). Archives/Catacombs below it are unequal halves.
+/// Read off the printed card face (CLB token #020).
+static UNDERCITY_MARKERS: [RoomMarkerPoint; 9] = [
+    pt(500, 248), // 0 Secret Entrance
+    pt(310, 370), // 1 Forge            (left half)
+    pt(710, 370), // 2 Lost Well        (right half)
+    pt(200, 508), // 3 Trap!            (left)
+    pt(490, 508), // 4 Arena            (narrow centre)
+    pt(780, 508), // 5 Stash            (right)
+    pt(280, 654), // 6 Archives         (left)
+    pt(700, 660), // 7 Catacombs        (right, taller)
+    pt(500, 818), // 8 Throne of the Dead Three (bottommost)
+];
+
+/// Baldur's Gate Wilderness — 19 rooms in an alternating lattice, NOT a
+/// diamond: one full-width entry, then rows of 3 and 2 alternating down the
+/// card (3/2/3/2/3/2/3). Rooms in the 3-rows sit at the thirds; rooms in the
+/// 2-rows sit offset between them, which is what makes the diagonal corridors
+/// line up on the printed card.
+/// Read off the printed card face (`tclb` token, released 2022-06-10).
+static BALDURS_GATE_MARKERS: [RoomMarkerPoint; 19] = [
+    // Row 1 — full width
+    pt(500, 170), // 0  Crash Landing
+    // Row 2 — three
+    pt(210, 253), // 1  Goblin Camp
+    pt(500, 253), // 2  Emerald Grove
+    pt(800, 253), // 3  Auntie's Teahouse
+    // Row 3 — two
+    pt(295, 336), // 4  Defiled Temple
+    pt(730, 336), // 5  Mountain Pass
+    // Row 4 — three
+    pt(210, 440), // 6  Ebonlake Grotto
+    pt(500, 440), // 7  Grymforge
+    pt(800, 440), // 8  Githyanki Crèche
+    // Row 5 — two
+    pt(285, 545), // 9  Last Light Inn
+    pt(700, 545), // 10 Reithwin Tollhouse
+    // Row 6 — three
+    pt(210, 622), // 11 Moonrise Towers
+    pt(500, 622), // 12 Gauntlet of Shar
+    pt(800, 622), // 13 Balthazar's Lab
+    // Row 7 — two
+    pt(300, 710), // 14 Circus of the Last Days
+    pt(715, 710), // 15 Undercity Ruins
+    // Row 8 — three (bottommost row)
+    pt(190, 822), // 16 Steel Watch Foundry
+    pt(500, 822), // 17 Ansur's Sanctum
+    pt(810, 822), // 18 Temple of Bhaal
+];
+
+/// The dungeon card's identity on Scryfall, so the client can show the printed
+/// card the venture marker moves across.
+///
+/// A dungeon is a real printed card, not a synthesized object, so it has no
+/// `printed_ref` on any battlefield object to borrow — a dungeon never enters
+/// the battlefield (CR 309.2b: a dungeon card brought into the game is put into
+/// the command zone). This is the only place its printing identity exists,
+/// which is why it lives beside the room tables rather than in the client.
+///
+/// Two lookup paths, because the five dungeons are not indexed uniformly by the
+/// client's Scryfall sidecars (verified against the Scryfall API):
+///
+///   * Four dungeons are `layout: "normal"`, so `scryfall-data.json` keys them
+///     by `oracle_id` like any other card.
+///   * Undercity is `layout: "double_faced_token"` — it is printed as
+///     `Undercity // The Initiative`, whose front face is the dungeon. That
+///     layout is in `gen-scryfall-images.sh`'s NON_PLAYABLE exclusion list, so
+///     it is absent from `scryfall-data.json` entirely and resolves ONLY
+///     through `scryfall-token-images.json`, which is keyed by printing id.
+///
+/// Emitting both ids lets the client try the card table and fall back to the
+/// token table without knowing which dungeon is which — the asymmetry stays
+/// here, in the engine, instead of becoming a special case in the display layer.
+pub struct DungeonCardRef {
+    /// Scryfall `oracle_id` — the `scryfall-data.json` key.
+    pub oracle_id: &'static str,
+    /// Scryfall printing id of the token-set printing — the
+    /// `scryfall-token-images.json` key. This is the `tafr`/`tclb` printing,
+    /// whose art is identical at every image rung to its oversized `oafr`/`oclb`
+    /// twin (both scan to 488x680 `normal` / 672x936 `large`), so nothing is
+    /// lost by pinning one.
+    pub scryfall_id: &'static str,
+    /// The dungeon's own face name. Meaningful only for the double-faced
+    /// Undercity, where it selects the dungeon face over `The Initiative`;
+    /// for the single-faced dungeons it equals the card name.
+    pub face_name: &'static str,
+}
+
+/// The printed card behind each dungeon. Ids verified against the Scryfall API
+/// rather than transcribed from memory. Identity plumbing, not a rule — no CR
+/// annotation belongs here.
+pub fn card_ref(id: DungeonId) -> DungeonCardRef {
+    match id {
+        DungeonId::LostMineOfPhandelver => DungeonCardRef {
+            oracle_id: "5c446a7f-0301-4343-b0df-146cf2db605b",
+            scryfall_id: "59b11ff8-f118-4978-87dd-509dc0c8c932",
+            face_name: "Lost Mine of Phandelver",
+        },
+        DungeonId::DungeonOfTheMadMage => DungeonCardRef {
+            oracle_id: "30d0398c-bf5a-4b30-936f-afdb5a109b4b",
+            scryfall_id: "6f509dbe-6ec7-4438-ab36-e20be46c9922",
+            face_name: "Dungeon of the Mad Mage",
+        },
+        DungeonId::TombOfAnnihilation => DungeonCardRef {
+            oracle_id: "d2ea2605-0ca0-4782-851d-e706bd0114e4",
+            scryfall_id: "70b284bd-7a8f-4b60-8238-f746bdc5b236",
+            face_name: "Tomb of Annihilation",
+        },
+        // The only double-faced dungeon. `face_name` is what picks the dungeon
+        // face out of `Undercity // The Initiative`.
+        DungeonId::Undercity => DungeonCardRef {
+            oracle_id: "36b61021-72f0-4c22-a41d-9b2f093d7ca8",
+            scryfall_id: "2c65185b-6cf0-451d-985e-56aa45d9a57d",
+            face_name: "Undercity",
+        },
+        DungeonId::BaldursGateWilderness => DungeonCardRef {
+            oracle_id: "06b9590d-01bf-4fae-9837-352c9e04267a",
+            scryfall_id: "a9d56324-8293-4500-a9ad-fed351ccf966",
+            face_name: "Baldur's Gate Wilderness",
+        },
+    }
 }
 
 /// CR 309: Look up a dungeon's static definition.
@@ -120,6 +355,66 @@ pub fn next_rooms(id: DungeonId, room: u8) -> &'static [u8] {
 pub fn room_name(id: DungeonId, room: u8) -> &'static str {
     let def = get_definition(id);
     def.rooms.get(room as usize).map_or("Unknown", |r| r.name)
+}
+
+/// CR 309.4c: Get the printed effect text of a room's room ability.
+pub fn room_text(id: DungeonId, room: u8) -> &'static str {
+    let def = get_definition(id);
+    def.rooms.get(room as usize).map_or("", |r| r.text)
+}
+
+/// CR 309.4: How many rooms the dungeon card has, so a display can place the
+/// venture marker's room within the whole dungeon ("room 3 of 7").
+pub fn room_count(id: DungeonId) -> u8 {
+    get_definition(id).rooms.len() as u8
+}
+
+/// CR 309.4b + CR 309.4c: A room as the UI presents it — index, printed name,
+/// and printed effect.
+///
+/// SINGLE AUTHORITY for "what does this room do" at the client boundary. Every
+/// surface that names a room to a player (the dungeon prompt, the branch-point
+/// room prompt, the dungeon HUD badge, the game log) reads this, so a room's
+/// description can never disagree between surfaces. Per the display-layer rule,
+/// the frontend renders these strings rather than carrying its own room table.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomPreview {
+    /// Index of this room within its dungeon — the value a
+    /// `GameAction::ChooseDungeonRoom` carries.
+    pub index: u8,
+    pub name: String,
+    pub text: String,
+}
+
+/// CR 309.4b + CR 309.4c: Build the preview for one room of a dungeon.
+pub fn room_preview(id: DungeonId, room: u8) -> RoomPreview {
+    RoomPreview {
+        index: room,
+        name: room_name(id, room).to_string(),
+        text: room_text(id, room).to_string(),
+    }
+}
+
+/// CR 309.2a + CR 309.4a: A dungeon as the UI presents it at the point of
+/// choosing one — its name plus the topmost room, which the venturing player
+/// enters immediately and unavoidably on making this choice. Without
+/// `entry_room` the choice is between five bare names with no visible
+/// consequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DungeonPreview {
+    pub dungeon: DungeonId,
+    pub name: String,
+    /// CR 309.4a: The topmost room — where the venture marker lands.
+    pub entry_room: RoomPreview,
+}
+
+/// CR 309.2a + CR 309.4a: Build the preview for a choosable dungeon.
+pub fn dungeon_preview(id: DungeonId) -> DungeonPreview {
+    DungeonPreview {
+        dungeon: id,
+        name: get_definition(id).name.to_string(),
+        entry_room: room_preview(id, 0),
+    }
 }
 
 /// CR 701.49a / CR 701.49d: Get available dungeons for a new venture.
@@ -349,6 +644,8 @@ pub fn room_effects(
             let grant = simple(
                 Effect::GrantCastingPermission {
                     permission: CastingPermission::PlayFromExile {
+                        provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+                        mode: crate::types::ability::CardPlayMode::Play,
                         duration: Duration::UntilEndOfTurn,
                         // Placeholder — rewritten to ability.controller at
                         // grant time by `grant_permission::resolve`.
@@ -361,7 +658,8 @@ pub fn room_effects(
                         card_filter: None,
                         single_use_group: None,
                         single_use: false,
-                        cast_cost_raise: None,
+                        cast_cost_modifier: None,
+                        alt_ability_cost: None,
                         land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     },
                     target: TargetFilter::Any,
@@ -867,6 +1165,7 @@ pub fn room_effects(
                         source_object: None,
                         bypass_beneficiary: None,
                         protection_does_not_remove: None,
+                        room_door: None,
                     }],
                     triggers: Vec::new(),
                 },
@@ -1011,6 +1310,8 @@ fn mad_wizards_lair(source_id: ObjectId, controller: PlayerId) -> ResolvedAbilit
             duration: None,
             driver: CastFromZoneDriver::DuringResolution,
             mana_spend_permission: None,
+            additional_cost: None,
+            cast_cost_modifier: None,
         },
         source_id,
         controller,
@@ -1169,36 +1470,43 @@ static LOST_MINE_OF_PHANDELVER: DungeonDefinition = DungeonDefinition {
         // 0: Cave Entrance → {Goblin Lair, Mine Tunnels}
         RoomDefinition {
             name: "Cave Entrance",
+            text: "Scry 1.",
             next_rooms: &[1, 2],
         },
         // 1: Goblin Lair → {Storeroom, Dark Pool}
         RoomDefinition {
             name: "Goblin Lair",
+            text: "Create a 1/1 red Goblin creature token.",
             next_rooms: &[3, 4],
         },
         // 2: Mine Tunnels → {Dark Pool, Fungi Cavern}
         RoomDefinition {
             name: "Mine Tunnels",
+            text: "Create a Treasure token.",
             next_rooms: &[4, 5],
         },
         // 3: Storeroom → Temple of Dumathoin
         RoomDefinition {
             name: "Storeroom",
+            text: "Put a +1/+1 counter on target creature.",
             next_rooms: &[6],
         },
         // 4: Dark Pool → Temple of Dumathoin
         RoomDefinition {
             name: "Dark Pool",
+            text: "Each opponent loses 1 life and you gain 1 life.",
             next_rooms: &[6],
         },
         // 5: Fungi Cavern → Temple of Dumathoin
         RoomDefinition {
             name: "Fungi Cavern",
+            text: "Target creature gets -4/-0 until your next turn.",
             next_rooms: &[6],
         },
         // 6: Temple of Dumathoin (bottommost)
         RoomDefinition {
             name: "Temple of Dumathoin",
+            text: "Draw a card.",
             next_rooms: &[],
         },
     ],
@@ -1213,46 +1521,55 @@ static DUNGEON_OF_THE_MAD_MAGE: DungeonDefinition = DungeonDefinition {
         // 0: Yawning Portal → Dungeon Level
         RoomDefinition {
             name: "Yawning Portal",
+            text: "You gain 1 life.",
             next_rooms: &[1],
         },
         // 1: Dungeon Level → {Goblin Bazaar, Twisted Caverns}
         RoomDefinition {
             name: "Dungeon Level",
+            text: "Scry 1.",
             next_rooms: &[2, 3],
         },
         // 2: Goblin Bazaar → Lost Level
         RoomDefinition {
             name: "Goblin Bazaar",
+            text: "Create a Treasure token.",
             next_rooms: &[4],
         },
         // 3: Twisted Caverns → Lost Level
         RoomDefinition {
             name: "Twisted Caverns",
+            text: "Target creature can't attack until your next turn.",
             next_rooms: &[4],
         },
         // 4: Lost Level → {Runestone Caverns, Muiral's Graveyard}
         RoomDefinition {
             name: "Lost Level",
+            text: "Scry 2.",
             next_rooms: &[5, 6],
         },
         // 5: Runestone Caverns → Deep Mines
         RoomDefinition {
             name: "Runestone Caverns",
+            text: "Exile the top two cards of your library. You may play them.",
             next_rooms: &[7],
         },
         // 6: Muiral's Graveyard → Deep Mines
         RoomDefinition {
             name: "Muiral's Graveyard",
+            text: "Create two 1/1 black Skeleton creature tokens.",
             next_rooms: &[7],
         },
         // 7: Deep Mines → Mad Wizard's Lair
         RoomDefinition {
             name: "Deep Mines",
+            text: "Scry 3.",
             next_rooms: &[8],
         },
         // 8: Mad Wizard's Lair (bottommost)
         RoomDefinition {
             name: "Mad Wizard's Lair",
+            text: "Draw three cards and reveal them. You may cast one of them without paying its mana cost.",
             next_rooms: &[],
         },
     ],
@@ -1267,26 +1584,31 @@ static TOMB_OF_ANNIHILATION: DungeonDefinition = DungeonDefinition {
         // 0: Trapped Entry → {Veils of Fear, Oubliette}
         RoomDefinition {
             name: "Trapped Entry",
+            text: "Each player loses 1 life.",
             next_rooms: &[1, 2],
         },
         // 1: Veils of Fear → Sandfall Cell
         RoomDefinition {
             name: "Veils of Fear",
+            text: "Each player loses 2 life unless they discard a card.",
             next_rooms: &[3],
         },
         // 2: Oubliette → Cradle of the Death God
         RoomDefinition {
             name: "Oubliette",
+            text: "Discard a card and sacrifice a creature, an artifact, and a land.",
             next_rooms: &[4],
         },
         // 3: Sandfall Cell → Cradle of the Death God
         RoomDefinition {
             name: "Sandfall Cell",
+            text: "Each player loses 2 life unless they sacrifice a creature, artifact, or land of their choice.",
             next_rooms: &[4],
         },
         // 4: Cradle of the Death God (bottommost)
         RoomDefinition {
             name: "Cradle of the Death God",
+            text: "Create The Atropal, a legendary 4/4 black God Horror creature token with deathtouch.",
             next_rooms: &[],
         },
     ],
@@ -1301,46 +1623,55 @@ static UNDERCITY: DungeonDefinition = DungeonDefinition {
         // 0: Secret Entrance → {Forge, Lost Well}
         RoomDefinition {
             name: "Secret Entrance",
+            text: "Search your library for a basic land card, reveal it, put it into your hand, then shuffle.",
             next_rooms: &[1, 2],
         },
         // 1: Forge → {Trap!, Arena}
         RoomDefinition {
             name: "Forge",
+            text: "Put two +1/+1 counters on target creature.",
             next_rooms: &[3, 4],
         },
         // 2: Lost Well → {Arena, Stash}
         RoomDefinition {
             name: "Lost Well",
+            text: "Scry 2.",
             next_rooms: &[4, 5],
         },
         // 3: Trap! → Archives
         RoomDefinition {
             name: "Trap!",
+            text: "Target player loses 5 life.",
             next_rooms: &[6],
         },
         // 4: Arena → {Archives, Catacombs}
         RoomDefinition {
             name: "Arena",
+            text: "Goad target creature.",
             next_rooms: &[6, 7],
         },
         // 5: Stash → Catacombs
         RoomDefinition {
             name: "Stash",
+            text: "Create a Treasure token.",
             next_rooms: &[7],
         },
         // 6: Archives → Throne of the Dead Three
         RoomDefinition {
             name: "Archives",
+            text: "Draw a card.",
             next_rooms: &[8],
         },
         // 7: Catacombs → Throne of the Dead Three
         RoomDefinition {
             name: "Catacombs",
+            text: "Create a 4/1 black Skeleton creature token with menace.",
             next_rooms: &[8],
         },
         // 8: Throne of the Dead Three (bottommost)
         RoomDefinition {
             name: "Throne of the Dead Three",
+            text: "Reveal the top ten cards of your library. Put a creature card from among them onto the battlefield with three +1/+1 counters on it. It gains hexproof until your next turn. Then shuffle.",
             next_rooms: &[],
         },
     ],
@@ -1357,103 +1688,122 @@ static BALDURS_GATE_WILDERNESS: DungeonDefinition = DungeonDefinition {
         // 0: Crash Landing → {Goblin Camp, Emerald Grove}
         RoomDefinition {
             name: "Crash Landing",
+            text: "Search your library for a basic land card, reveal it, put it into your hand, then shuffle.",
             next_rooms: &[1, 2],
         },
         // Row 2
         // 1: Goblin Camp → {Auntie's Teahouse, Defiled Temple}
         RoomDefinition {
             name: "Goblin Camp",
+            text: "Create a Treasure token.",
             next_rooms: &[3, 4],
         },
         // 2: Emerald Grove → {Defiled Temple, Mountain Pass}
         RoomDefinition {
             name: "Emerald Grove",
+            text: "Create a 2/2 white Knight creature token.",
             next_rooms: &[4, 5],
         },
         // Row 3
         // 3: Auntie's Teahouse → {Ebonlake Grotto, Grymforge}
         RoomDefinition {
             name: "Auntie's Teahouse",
+            text: "Scry 3.",
             next_rooms: &[6, 7],
         },
         // 4: Defiled Temple → {Grymforge, Githyanki Crèche}
         RoomDefinition {
             name: "Defiled Temple",
+            text: "You may sacrifice a permanent. If you do, draw a card.",
             next_rooms: &[7, 8],
         },
         // 5: Mountain Pass → {Githyanki Crèche, Last Light Inn}
         RoomDefinition {
             name: "Mountain Pass",
+            text: "You may put a land card from your hand onto the battlefield.",
             next_rooms: &[8, 9],
         },
         // Row 4 (widest)
         // 6: Ebonlake Grotto → {Reithwin Tollhouse, Moonrise Towers}
         RoomDefinition {
             name: "Ebonlake Grotto",
+            text: "Create two 1/1 blue Faerie Dragon creature tokens with flying.",
             next_rooms: &[10, 11],
         },
         // 7: Grymforge → {Reithwin Tollhouse, Moonrise Towers}
         RoomDefinition {
             name: "Grymforge",
+            text: "For each opponent, goad up to one target creature that player controls.",
             next_rooms: &[10, 11],
         },
         // 8: Githyanki Crèche → {Moonrise Towers, Gauntlet of Shar}
         RoomDefinition {
             name: "Githyanki Crèche",
+            text: "Distribute three +1/+1 counters among up to three target creatures you control.",
             next_rooms: &[11, 12],
         },
         // 9: Last Light Inn → {Moonrise Towers, Gauntlet of Shar}
         RoomDefinition {
             name: "Last Light Inn",
+            text: "Draw two cards.",
             next_rooms: &[11, 12],
         },
         // Row 5
         // 10: Reithwin Tollhouse → {Balthazar's Lab, Circus of the Last Days}
         RoomDefinition {
             name: "Reithwin Tollhouse",
+            text: "Roll 2d4 and create that many Treasure tokens.",
             next_rooms: &[13, 14],
         },
         // 11: Moonrise Towers → {Circus of the Last Days, Undercity Ruins}
         RoomDefinition {
             name: "Moonrise Towers",
+            text: "Instant and sorcery spells you cast this turn cost {3} less to cast.",
             next_rooms: &[14, 15],
         },
         // 12: Gauntlet of Shar → {Undercity Ruins}
         RoomDefinition {
             name: "Gauntlet of Shar",
+            text: "Each opponent loses 5 life.",
             next_rooms: &[15],
         },
         // Row 6
         // 13: Balthazar's Lab → {Steel Watch Foundry}
         RoomDefinition {
             name: "Balthazar's Lab",
+            text: "Return up to two target creature cards from your graveyard to your hand.",
             next_rooms: &[16],
         },
         // 14: Circus of the Last Days → {Steel Watch Foundry, Ansur's Sanctum}
         RoomDefinition {
             name: "Circus of the Last Days",
+            text: "Create a token that's a copy of one of your commanders, except it's not legendary.",
             next_rooms: &[16, 17],
         },
         // 15: Undercity Ruins → {Ansur's Sanctum}
         RoomDefinition {
             name: "Undercity Ruins",
+            text: "Create three 4/1 black Skeleton creature tokens with menace.",
             next_rooms: &[17],
         },
         // Row 7
         // 16: Steel Watch Foundry → Temple of Bhaal
         RoomDefinition {
             name: "Steel Watch Foundry",
+            text: "You get an emblem with \"Creatures you control get +2/+2 and have trample.\"",
             next_rooms: &[18],
         },
         // 17: Ansur's Sanctum → Temple of Bhaal
         RoomDefinition {
             name: "Ansur's Sanctum",
+            text: "Reveal the top four cards of your library and put them into your hand. Each opponent loses life equal to those cards' total mana value.",
             next_rooms: &[18],
         },
         // Row 8 (bottom)
         // 18: Temple of Bhaal (bottommost)
         RoomDefinition {
             name: "Temple of Bhaal",
+            text: "Creatures your opponents control get -5/-5 until end of turn.",
             next_rooms: &[],
         },
     ],
@@ -1488,6 +1838,89 @@ pub fn has_completed_dungeon(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ALL_DUNGEONS: [DungeonId; 5] = [
+        DungeonId::LostMineOfPhandelver,
+        DungeonId::DungeonOfTheMadMage,
+        DungeonId::TombOfAnnihilation,
+        DungeonId::Undercity,
+        DungeonId::BaldursGateWilderness,
+    ];
+
+    /// CR 309.4c: Every room has a room ability, so every room must carry its
+    /// printed effect — the prompts, stack entry, and game log all render it.
+    #[test]
+    fn every_room_has_printed_effect_text() {
+        for id in ALL_DUNGEONS {
+            let def = get_definition(id);
+            for (index, room) in def.rooms.iter().enumerate() {
+                assert!(
+                    !room.text.is_empty(),
+                    "{id} room {index} ({}) has no printed effect text",
+                    room.name
+                );
+                assert!(
+                    !room.text.contains("Leads to"),
+                    "{id} room {index} ({}) kept the (Leads to: ...) reminder; \
+                     next_rooms already encodes it",
+                    room.name
+                );
+            }
+        }
+    }
+
+    /// The previews handed to the client must agree with the static definitions
+    /// they are built from — the client has no room table of its own.
+    #[test]
+    fn previews_mirror_the_static_definitions() {
+        for id in ALL_DUNGEONS {
+            let def = get_definition(id);
+
+            let dungeon = dungeon_preview(id);
+            assert_eq!(dungeon.dungeon, id);
+            assert_eq!(dungeon.name, def.name);
+            // CR 309.4a: the entry room is always the topmost room.
+            assert_eq!(dungeon.entry_room, room_preview(id, 0));
+
+            for index in 0..def.rooms.len() as u8 {
+                let preview = room_preview(id, index);
+                assert_eq!(preview.index, index);
+                assert_eq!(preview.name, room_name(id, index));
+                assert_eq!(preview.text, room_text(id, index));
+            }
+        }
+    }
+
+    /// Spot-check the Oracle text of one room per dungeon against the printed
+    /// card, so a bad bulk edit cannot silently shift every room's description.
+    #[test]
+    fn room_text_matches_printed_oracle_text() {
+        assert_eq!(
+            room_text(DungeonId::LostMineOfPhandelver, 4),
+            "Each opponent loses 1 life and you gain 1 life.",
+            "Lost Mine — Dark Pool"
+        );
+        assert_eq!(
+            room_text(DungeonId::DungeonOfTheMadMage, 8),
+            "Draw three cards and reveal them. You may cast one of them without paying its mana cost.",
+            "Mad Mage — Mad Wizard's Lair"
+        );
+        assert_eq!(
+            room_text(DungeonId::TombOfAnnihilation, 0),
+            "Each player loses 1 life.",
+            "Tomb — Trapped Entry"
+        );
+        assert_eq!(
+            room_text(DungeonId::Undercity, 3),
+            "Target player loses 5 life.",
+            "Undercity — Trap!"
+        );
+        assert_eq!(
+            room_text(DungeonId::BaldursGateWilderness, 12),
+            "Each opponent loses 5 life.",
+            "Baldur's Gate Wilderness — Gauntlet of Shar"
+        );
+    }
 
     /// Verify all dungeons have valid graph structure:
     /// - Every room index in `next_rooms` is a valid room index
@@ -1946,5 +2379,85 @@ mod tests {
             get_definition(DungeonId::BaldursGateWilderness).rooms.len(),
             19
         );
+    }
+
+    /// Every dungeon must carry exactly one marker point per room.
+    ///
+    /// This is the guard that keeps the hand-authored geometry honest. The
+    /// coordinates are read off the printed card faces and cannot be derived
+    /// from anything the engine or Scryfall stores, so the failure mode they
+    /// invite is a silent one: add a room, forget the point, and the client
+    /// draws the venture marker on the wrong room — asserting something false
+    /// about game state rather than merely looking wrong.
+    #[test]
+    fn dungeon_marker_points_cover_every_room() {
+        for id in ALL_DUNGEONS {
+            let rooms = get_definition(id).rooms.len();
+            let points = marker_points(id).len();
+            assert_eq!(
+                points, rooms,
+                "{id} has {rooms} rooms but {points} marker points",
+            );
+        }
+    }
+
+    /// Marker points are permille of the card image, so every coordinate has to
+    /// land inside it. A point past 1000 would place the marker off the card
+    /// entirely.
+    #[test]
+    fn dungeon_marker_points_are_normalized() {
+        for id in ALL_DUNGEONS {
+            for (index, point) in marker_points(id).iter().enumerate() {
+                assert!(
+                    point.x_permille <= 1000 && point.y_permille <= 1000,
+                    "{id} room {index} marker {point:?} is outside the card",
+                );
+            }
+        }
+    }
+
+    /// Rooms are drawn top-to-bottom on the card in the same order the room
+    /// table lists them, so a room can never sit ABOVE one that precedes it.
+    /// This catches a transposed or misordered coordinate list — the shape of
+    /// error that `dungeon_marker_points_cover_every_room` cannot see because
+    /// the count still matches.
+    #[test]
+    fn dungeon_marker_points_descend_the_card() {
+        for id in ALL_DUNGEONS {
+            let points = marker_points(id);
+            for (index, window) in points.windows(2).enumerate() {
+                assert!(
+                    window[1].y_permille >= window[0].y_permille,
+                    "{id}: room {} sits above room {index} ({:?} then {:?})",
+                    index + 1,
+                    window[0],
+                    window[1],
+                );
+            }
+        }
+    }
+
+    /// The Scryfall ids behind each dungeon must be distinct and well-formed.
+    /// Undercity is the one that matters most: it is the only double-faced
+    /// dungeon, and its `face_name` is what selects the dungeon half of
+    /// `Undercity // The Initiative`.
+    #[test]
+    fn dungeon_card_refs_are_distinct_and_well_formed() {
+        let mut oracle_ids = std::collections::BTreeSet::new();
+        let mut scryfall_ids = std::collections::BTreeSet::new();
+        for id in ALL_DUNGEONS {
+            let card = card_ref(id);
+            assert_eq!(card.oracle_id.len(), 36, "{id} oracle_id is not a uuid");
+            assert_eq!(card.scryfall_id.len(), 36, "{id} scryfall_id is not a uuid");
+            assert!(!card.face_name.is_empty(), "{id} has no face name");
+            assert!(
+                oracle_ids.insert(card.oracle_id),
+                "{id} duplicate oracle_id"
+            );
+            assert!(
+                scryfall_ids.insert(card.scryfall_id),
+                "{id} duplicate scryfall_id",
+            );
+        }
     }
 }

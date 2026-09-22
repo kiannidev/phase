@@ -120,6 +120,13 @@ fn is_plain_parent_target_delivery(delivery: &ResolvedAbility) -> bool {
     // `ZoneMoveRequest`, where neither provenance field changes the delivery;
     // rejecting them would make an otherwise identical triggered search fall
     // back to sequential resolution while the spell form batches correctly.
+    //
+    // `description` is deliberately absent from this list for the same reason.
+    // It is display text for whatever prompt a link raises, never behavior the
+    // `ZoneMoveRequest` would have to preserve — and since CR 608.2c chain
+    // links inherit the head's printed text
+    // (`ResolvedAbility::backfill_chain_description`), every delivery now
+    // carries one, so its presence discriminates nothing.
     delivery.targets.is_empty()
         && delivery.sub_ability.is_none()
         && delivery.else_ability.is_none()
@@ -133,7 +140,6 @@ fn is_plain_parent_target_delivery(delivery: &ResolvedAbility) -> bool {
         && matches!(delivery.target_choice_timing, TargetChoiceTiming::Stack)
         && delivery.target_selection_mode.is_chosen()
         && delivery.target_chooser.is_none()
-        && delivery.description.is_none()
         && delivery.repeat_for.is_none()
         && delivery.min_x_value == 0
         && !delivery.cant_be_copied
@@ -219,6 +225,13 @@ pub(crate) fn handle_optional_decision(
     accept: bool,
     events: &mut Vec<GameEvent>,
 ) -> Result<bool, EffectError> {
+    // CR 608.2c: A regular optional effect owns its direct-choice frame until
+    // its answer is consumed. The scoped protocol has no such frame, so it
+    // must not claim a coincidentally matching player/source prompt and leave
+    // that ordinary frame orphaned.
+    if state.active_optional_effect_frame().is_some() {
+        return Ok(false);
+    }
     let Some(pending) = state.pending_scoped_library_search.as_ref() else {
         return Ok(false);
     };
@@ -454,6 +467,7 @@ fn advance_acceptance(
         source_id,
         description,
         may_trigger_key: None,
+        same_card_may_trigger_choice_available: false,
     };
     Ok(())
 }
@@ -543,6 +557,7 @@ fn prepare_scoped_group(
                 action: PlayerActionKind::SearchedLibrary,
                 look_count: None,
                 scry_bottom_count: None,
+                scry_top_count: None,
             });
             state.players_who_searched_library_this_turn.insert(player);
             state
@@ -553,6 +568,12 @@ fn prepare_scoped_group(
                 .push((player, PlayerActionKind::SearchedLibrary));
         }
         if let Some(search) = prepared.active_search {
+            let looked_at = search
+                .looked_at()
+                .iter()
+                .map(|(_, _, identity)| identity.object_id)
+                .collect::<Vec<_>>();
+            state.remember_card_identities(search.learned_audience().iter().copied(), &looked_at);
             state.active_library_searches.insert(search);
         }
         if let Some(event) = prepared.hidden_event {
@@ -575,6 +596,7 @@ fn prepare_scoped_group(
                 up_to: prepared.up_to,
                 allows_partial_find: prepared.allows_partial_find,
                 constraint: prepared.constraint,
+                ordering_hint: prepared.ordering_hint,
             },
         );
         if auto_completed {
@@ -667,6 +689,7 @@ fn advance_selection(
         up_to: choice.up_to,
         allows_partial_find: choice.allows_partial_find,
         constraint: choice.constraint,
+        ordering_hint: choice.ordering_hint,
         split: None,
     };
     state.priority_player = choice.player;
@@ -893,6 +916,7 @@ mod tests {
     use crate::types::actions::GameAction;
     use crate::types::game_state::GameState;
     use crate::types::identifiers::CardId;
+    use crate::types::resolution::OptionalEffectFrame;
 
     fn three_player_scoped_search(reveal: bool) -> (GameState, ResolvedAbility, Vec<ObjectId>) {
         let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 3, 42);
@@ -950,6 +974,40 @@ mod tests {
         )
         .sub_ability(delivery);
         (state, search, cards)
+    }
+
+    #[test]
+    fn ordinary_optional_frame_prevents_scoped_protocol_prompt_collision() {
+        let (mut state, mut scoped_search, _) = three_player_scoped_search(true);
+        scoped_search.optional = true;
+        let mut events = Vec::new();
+        start(
+            &mut state,
+            &scoped_search,
+            &[PlayerId(0)],
+            None,
+            &mut events,
+        )
+        .expect("scoped search starts its acceptance prompt");
+
+        let mut ordinary_optional = scoped_search.clone();
+        ordinary_optional.optional = true;
+        ordinary_optional.set_controller_recursive(PlayerId(0));
+        state.push_optional_effect_frame(OptionalEffectFrame {
+            ability: Box::new(ordinary_optional),
+            trigger_event: None,
+            trigger_events: Vec::new(),
+            trigger_match_count: None,
+        });
+
+        apply_as_current(
+            &mut state,
+            GameAction::DecideOptionalEffect { accept: true },
+        )
+        .expect("the ordinary optional effect owns the player action");
+
+        assert!(state.pending_scoped_library_search.is_some());
+        assert!(state.active_optional_effect_frame().is_none());
     }
 
     /// The batch shortcut is deliberately limited to the two delivery shapes

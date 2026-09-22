@@ -61,6 +61,7 @@ function compatibility(legal: boolean): DeckCompatibilityResult {
     selected_format_compatible: legal,
     selected_format_reasons: legal ? [] : ["Illegal"],
     color_identity: [],
+    color_distribution: [],
     coverage: { total_unique: 10, supported_unique: 9, unsupported_cards: [] },
   };
 }
@@ -84,6 +85,33 @@ beforeEach(() => {
 });
 
 describe("buildLegalAiDeckCatalog", () => {
+  it("keeps catalog compatibility checks serial so setup cannot flood the engine worker", async () => {
+    saveDeck("First", deck("First Card"));
+    saveDeck("Second", deck("Second Card"));
+    saveDeck("Third", deck("Third Card"));
+    let activeChecks = 0;
+    let maximumActiveChecks = 0;
+    vi.mocked(evaluateDeckCompatibility).mockImplementation(async () => {
+      activeChecks += 1;
+      maximumActiveChecks = Math.max(maximumActiveChecks, activeChecks);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      activeChecks -= 1;
+      return compatibility(true);
+    });
+
+    const catalog = await buildLegalAiDeckCatalog({
+      selectedFormat: "Standard",
+      selectedMatchType: "Bo1",
+    });
+
+    expect(maximumActiveChecks).toBe(1);
+    expect(catalog.candidates.map((candidate) => candidate.id)).toEqual([
+      "saved:First",
+      "saved:Second",
+      "saved:Third",
+    ]);
+  });
+
   it("includes legal saved Pauper Commander user decks", async () => {
     saveDeck("PDH Legal", deck("Command Tower", "Murmuring Mystic"));
 

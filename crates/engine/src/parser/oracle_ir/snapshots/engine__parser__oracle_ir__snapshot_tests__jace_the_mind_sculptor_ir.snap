@@ -67,7 +67,8 @@ expression: "&ir"
                     },
                     "rest_destination": null,
                     "reveal": false,
-                    "enter_tapped": false
+                    "enter_tapped": false,
+                    "enters_attacking": false
                   },
                   "duration": null,
                   "sub_ability": null,
@@ -572,6 +573,9 @@ expression: "&ir"
                     "destination": "Library",
                     "target": {
                       "type": "ParentTargetController"
+                    },
+                    "library_shuffle": {
+                      "type": "TerminalShuffle"
                     }
                   },
                   "duration": null,

@@ -268,10 +268,7 @@ pub(super) fn apply_attack_enlist(
     let Some(obj) = state.objects.get(&tapped) else {
         return Ok(());
     };
-    let snapshot = CostPaidObjectSnapshot {
-        object_id: tapped,
-        lki: obj.snapshot_public_characteristics(),
-    };
+    let snapshot = CostPaidObjectSnapshot::capture(obj, obj.snapshot_public_characteristics());
 
     // CR 508.1g + CR 702.154b + CR 701.26a: the enlisted creature is tapped to
     // pay an optional attack cost, so route it through the single tap-cost
@@ -355,15 +352,7 @@ pub(super) fn finish_declare_attackers(
     }
 
     if attacks_empty {
-        state.phase = Phase::EndCombat;
-        events.push(GameEvent::PhaseChanged {
-            phase: Phase::EndCombat,
-        });
-        state.combat = None;
-        super::layers::prune_end_of_combat_effects(state);
-        super::layers::prune_controller_end_combat_step_effects(state, state.active_player);
-        turns::advance_phase(state, events);
-        Ok(turns::auto_advance(state, events))
+        Ok(turns::advance_after_empty_attackers(state, events))
     } else {
         priority::reset_priority(state);
         Ok(WaitingFor::Priority {
@@ -850,15 +839,7 @@ pub(super) fn handle_empty_attackers(
         return Ok(waiting_for);
     }
 
-    state.phase = Phase::EndCombat;
-    events.push(GameEvent::PhaseChanged {
-        phase: Phase::EndCombat,
-    });
-    state.combat = None;
-    super::layers::prune_end_of_combat_effects(state);
-    super::layers::prune_controller_end_combat_step_effects(state, state.active_player);
-    turns::advance_phase(state, events);
-    Ok(turns::auto_advance(state, events))
+    Ok(turns::advance_after_empty_attackers(state, events))
 }
 
 pub(super) fn handle_empty_blockers(

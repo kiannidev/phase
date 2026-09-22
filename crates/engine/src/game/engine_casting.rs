@@ -1,5 +1,5 @@
 use crate::types::ability::{
-    AbilityCost, AdditionalCost, BeholdCostAction, TapCreaturesAggregate, TargetFilter,
+    AbilityCost, AdditionalCost, BeholdCostAction, TapCreaturesSelectionMode, TargetFilter,
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
@@ -25,7 +25,35 @@ pub(super) fn cancel_pending_cast(
             "Cannot cancel an activation after a cost is paid".to_string(),
         ));
     }
+    // CR 601.2: if a player cannot comply with a casting step, that illegal
+    // cast returns to the moment before the spell was proposed. This rules
+    // note covers only that incomplete-casting rollback fact.
+    //
+    // Capture and consume the exact resolution-owned grant before generic
+    // rollback removes the placeholder stack entry.  A normal pending cast
+    // has no such cleanup and retains the historical Priority result; a
+    // resolution cast must instead dispose of its offered card/misses and
+    // resume the parked parent exactly once.
+    let resolution_cleanup = match pending_cast.casting_permission_index {
+        Some(index) => casting::take_resolution_cast_cleanup(
+            state,
+            player,
+            pending_cast.object_id,
+            pending_cast.card_id,
+            index,
+        )?,
+        None => None,
+    };
     casting::handle_cancel_cast(state, pending_cast, events);
+    if let Some(cleanup) = resolution_cleanup {
+        return super::engine_resolution_choices::abort_resolution_cast(
+            state,
+            player,
+            pending_cast.object_id,
+            cleanup,
+            events,
+        );
+    }
     Ok(WaitingFor::Priority { player })
 }
 
@@ -58,12 +86,14 @@ pub(super) fn handle_optional_cost_choice(
     casting_costs::handle_decide_additional_cost(state, player, pending_cast, cost, pay, events)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_defiler_payment(
     state: &mut GameState,
     player: PlayerId,
     pending_cast: PendingCast,
     life_cost: u32,
     mana_reduction: &crate::types::mana::ManaCost,
+    reach: crate::types::statics::CostReductionReach,
     pay: bool,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
@@ -73,7 +103,29 @@ pub(super) fn handle_defiler_payment(
         pending_cast,
         life_cost,
         mana_reduction,
+        reach,
         pay,
+        events,
+    )
+}
+
+/// CR 601.2b + CR 601.2f: Apply the caster's elected cost-determination choices.
+pub(super) fn handle_order_cost_reductions(
+    state: &mut GameState,
+    player: PlayerId,
+    pending_cast: PendingCast,
+    reductions: &[crate::types::casting_costs::CostReductionEntry],
+    order: &[usize],
+    hybrid_announcement: &[crate::types::mana::ManaCostShard],
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    casting_costs::handle_order_cost_reductions(
+        state,
+        player,
+        pending_cast,
+        reductions,
+        order,
+        hybrid_announcement,
         events,
     )
 }
@@ -165,8 +217,9 @@ pub(super) fn handle_tap_creatures_for_spell_cost(
     state: &mut GameState,
     player: PlayerId,
     pending_cast: PendingCast,
+    min_count: usize,
     count: usize,
-    aggregate: Option<TapCreaturesAggregate>,
+    mode: TapCreaturesSelectionMode,
     creatures: &[ObjectId],
     chosen: &[ObjectId],
     events: &mut Vec<GameEvent>,
@@ -175,8 +228,9 @@ pub(super) fn handle_tap_creatures_for_spell_cost(
         state,
         player,
         pending_cast,
+        min_count,
         count,
-        aggregate,
+        mode,
         creatures,
         chosen,
         events,
@@ -206,9 +260,12 @@ pub(super) fn handle_behold_for_cost(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_tap_creatures_for_mana_ability(
     state: &mut GameState,
+    min_count: usize,
     count: usize,
+    mode: TapCreaturesSelectionMode,
     creatures: &[ObjectId],
     pending_mana_ability: &PendingManaAbility,
     chosen: &[ObjectId],
@@ -216,7 +273,9 @@ pub(super) fn handle_tap_creatures_for_mana_ability(
 ) -> Result<WaitingFor, EngineError> {
     mana_abilities::handle_tap_creatures_for_mana_ability(
         state,
+        min_count,
         count,
+        mode,
         creatures,
         pending_mana_ability,
         chosen,
@@ -386,11 +445,15 @@ pub(super) fn handle_collect_evidence_cancel(
     player: PlayerId,
     resume: &CollectEvidenceResume,
     events: &mut Vec<GameEvent>,
-) -> WaitingFor {
+) -> Result<WaitingFor, EngineError> {
     if let CollectEvidenceResume::Casting { pending_cast, .. } = resume {
-        casting::handle_cancel_cast(state, pending_cast, events);
+        let pending_cast = state
+            .pending_cast
+            .take()
+            .unwrap_or_else(|| pending_cast.clone());
+        return cancel_pending_cast(state, player, &pending_cast, events);
     }
-    WaitingFor::Priority { player }
+    Ok(WaitingFor::Priority { player })
 }
 
 pub(super) fn handle_harmonize_tap_choice(
@@ -435,6 +498,7 @@ pub(super) fn handle_harmonize_tap_choice(
     }
 
     let base_cost = pending.base_cost.clone();
+    let lock = casting_costs::CostLockInput::from_pending(&pending);
     casting_costs::pay_and_push_adventure(
         state,
         player,
@@ -449,6 +513,7 @@ pub(super) fn handle_harmonize_tap_choice(
         pending.distribute,
         pending.origin_zone,
         pending.payment_mode,
+        lock,
         events,
     )
 }

@@ -85,10 +85,17 @@ fn is_zero(v: &u32) -> bool {
     *v == 0
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PrintedCardRef {
     pub oracle_id: String,
     pub face_name: String,
+}
+
+/// A card ability that changes how the booster draft proceeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftEffect {
+    AdditionalPick,
 }
 
 /// Exact image reference for a printed token.

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use crate::game::filter;
+use crate::game::priority;
 use crate::game::replacement::{self, ReplacementResult};
 use crate::game::zone_pipeline::{self, BatchMoveResult, ZoneMoveRequest};
 use crate::types::ability::{
@@ -352,8 +353,10 @@ pub(crate) fn resolve_explore_effect(
             up_to: true,
             kept_destination: Some(crate::types::zones::Zone::Library),
             rest_destination: Some(crate::types::zones::Zone::Graveyard),
+            rest_order: crate::types::ability::DigRestOrder::Preserve,
             source_id: Some(ability.source_id),
             enter_tapped: false,
+            enters_attacking: false,
         };
 
         events.push(GameEvent::EffectResolved {
@@ -413,6 +416,15 @@ pub fn handle_choice(
             "Invalid explore choice".to_string(),
         ));
     }
+
+    // CR 701.44d + CR 608.2c + CR 117.3b: Retire the consumed APNAP-ordering
+    // choice before carrying out this explorer's instruction. `Priority` is an
+    // internal neutral sentinel here, not a mid-resolution priority grant; the
+    // resolving ability grants the active player priority only after it finishes.
+    priority::reset_priority(state);
+    state.waiting_for = WaitingFor::Priority {
+        player: state.active_player,
+    };
 
     let remaining: Vec<ObjectId> = remaining
         .iter()

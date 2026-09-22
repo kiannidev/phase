@@ -8,11 +8,11 @@ use serde::Serialize;
 
 use super::ast::parsed_clause;
 use super::context::ParseContext;
-use super::effect_chain::{DieResultBranchIr, EffectChainIr};
+use super::effect_chain::{DieResultBranchIr, EffectChainIr, ModalModeIr};
 use crate::types::ability::{
-    AbilityCost, AbilityDefinition, AbilityKind, ChoiceType, ControllerRef, Effect, ModalChoice,
-    TargetFilter, TargetSelectionMode, TriggerCondition, TriggerConstraint, TriggerDefinition,
-    UnlessPayModifier,
+    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ChoiceType, ControllerRef,
+    Effect, ModalChoice, TargetFilter, TargetSelectionMode, TriggerCondition, TriggerConstraint,
+    TriggerDefinition, UnlessPayModifier,
 };
 use crate::types::triggers::TriggerMode;
 
@@ -85,24 +85,54 @@ pub(crate) struct TriggerIr {
     /// CR 706.3b result-table rows for the terminal die roll in this trigger.
     /// They remain IR until trigger-body lowering attaches them before finalization.
     pub(crate) die_results: Vec<DieResultBranchIr>,
+    /// Complete context established from the trigger condition before its body
+    /// is parsed. Nested modal modes must start from this same seed so event
+    /// anaphora (notably spell-cast "it") keep their trigger-body meaning.
+    #[serde(skip)]
+    pub(crate) body_context: ParseContext,
 }
 
 impl TriggerIr {
     /// Whether the body ends in the typed die-roll node that owns a result table.
     pub(crate) fn has_terminal_roll_die(&self) -> bool {
-        let chain = match &self.body {
-            Some(TriggerBody::EffectChain(chain)) => chain,
-            Some(TriggerBody::ReflexivePayment(reflexive)) => &reflexive.effect_chain,
+        match &self.body {
+            Some(TriggerBody::EffectChain(chain)) => effect_chain_has_terminal_roll_die(chain),
+            // CR 706.3b: the table belongs to the printed die-roll instruction,
+            // not the reflexive `WhenYouDo` body it creates. A modal reflexive
+            // body contains only the mode marker, so looking there drops rows
+            // for a parent such as "roll a d20. When you do, choose one".
+            Some(TriggerBody::Reflexive(reflexive)) => {
+                effect_chain_has_terminal_roll_die(&reflexive.effect_chain)
+                    || match &reflexive.parent {
+                        ReflexiveParent::MayPay {
+                            payment_chain: Some(chain),
+                            ..
+                        } => effect_chain_has_terminal_roll_die(chain),
+                        ReflexiveParent::MayPay {
+                            payment_chain: None,
+                            ..
+                        } => false,
+                        ReflexiveParent::Mandatory { instruction } => {
+                            effect_chain_has_terminal_roll_die(instruction)
+                        }
+                    }
+            }
             Some(TriggerBody::Modal(_))
             | Some(TriggerBody::Vote(_))
             | Some(TriggerBody::Pile(_))
-            | None => return false,
-        };
-        let Some(clause) = chain.clauses.last() else {
-            return false;
-        };
-        matches!(clause.parsed.effect, Effect::RollDie { .. })
+            | None => false,
+        }
     }
+}
+
+/// Whether this exact chain ends at the typed die roll that owns its following
+/// result table. Parent and reflexive chains are distinct printed instructions,
+/// so callers use this to preserve the table on whichever one owns the roll.
+pub(crate) fn effect_chain_has_terminal_roll_die(chain: &EffectChainIr) -> bool {
+    chain
+        .clauses
+        .last()
+        .is_some_and(|clause| matches!(clause.parsed.effect, Effect::RollDie { .. }))
 }
 
 /// The body of a trigger. Whole-body recognizers retain their typed payloads
@@ -111,9 +141,9 @@ impl TriggerIr {
 pub(crate) enum TriggerBody {
     /// Normal effect chain — lowering calls `lower_effect_chain_ir`.
     EffectChain(EffectChainIr),
-    /// CR 118.12 + CR 603.12: A resolution-time optional cost and the
-    /// reflexive effect that follows when the player pays it.
-    ReflexivePayment(Box<ReflexivePaymentIr>),
+    /// CR 603.12: A printed parent instruction and the reflexive
+    /// effect that follows when its event occurred.
+    Reflexive(Box<ReflexiveParentIr>),
     /// CR 700.2: An inline modal's marker clause and its already-lowered mode
     /// bodies. The marker still flows through ordinary trigger-chain lowering;
     /// this payload carries the modal metadata no clause can represent.
@@ -125,10 +155,42 @@ pub(crate) enum TriggerBody {
     Pile(Box<PileIr>),
 }
 
+/// CR 603.12: A reflexive "when you do" body together with the printed parent
+/// instruction it rides on.
+///
+/// `parent` is the axis that used to be assumed rather than represented: this
+/// node only existed for the `"you may <instruction>. When you do"` surface, so
+/// a mandatory parent had nowhere to live. Keeping the parent as a parameterized
+/// field rather than a sibling node means the reflexive lowering has exactly one
+/// shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct ReflexivePaymentIr {
-    pub(crate) cost: AbilityCost,
+pub(crate) struct ReflexiveParentIr {
+    /// How the parent instruction is printed and offered.
+    pub(crate) parent: ReflexiveParent,
+    /// The connector between the parent instruction and its dependent body.
+    pub(crate) connector: AbilityCondition,
+    /// The reflexive body that follows the connector.
     pub(crate) effect_chain: EffectChainIr,
+    /// CR 700.2b: modal metadata when the reflexive body is a mode choice.
+    pub(crate) modal: Option<ModalIr>,
+}
+
+/// CR 603.12: the two printed forms a reflexive parent can take.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) enum ReflexiveParent {
+    /// `"you may <instruction>. When you do, …"` — a resolution-time offer the
+    /// controller may decline (Caesar, Legion's Emperor). `payment_chain`
+    /// carries the printed instruction as an effect chain when one parsed; otherwise
+    /// lowering synthesizes an `Effect::PayCost` from `cost`.
+    MayPay {
+        cost: AbilityCost,
+        payment_chain: Option<EffectChainIr>,
+    },
+    /// `"<instruction>. When you do, …"` — the instruction is not an offer, it
+    /// simply happens (Cemetery Desecrator). The trigger parser
+    /// already lowered the printed instruction into this chain, so lowering
+    /// reuses it instead of re-parsing the same words a second time.
+    Mandatory { instruction: EffectChainIr },
 }
 
 /// CR 700.2: Typed inline-modal trigger body.
@@ -141,7 +203,7 @@ pub(crate) struct ReflexivePaymentIr {
 pub(crate) struct ModalIr {
     pub(crate) marker: EffectChainIr,
     pub(crate) choice: ModalChoice,
-    pub(crate) mode_abilities: Vec<AbilityDefinition>,
+    pub(crate) modes: Vec<ModalModeIr>,
 }
 
 /// CR 701.38: Typed vote trigger body.
@@ -284,6 +346,10 @@ pub(crate) struct TriggerModifiers {
     /// CR 603.5: Some triggered abilities' effects are optional (they contain
     /// "may"). They go on the stack regardless; the choice is made on resolution.
     pub(crate) optional: bool,
+    /// CR 608.2d: Event-relative player explicitly named by the root optional
+    /// subject, after any intervening-if wrapper has been removed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) optional_player: Option<TargetFilter>,
     /// CR 118.12: "unless [player] pays {cost}" tax modifier.
     pub(crate) unless_pay: Option<UnlessPayModifier>,
     /// Intervening-if condition extracted from effect text.
@@ -298,7 +364,7 @@ pub(crate) struct TriggerModifiers {
     pub(crate) has_up_to: bool,
     /// Lowered effect text (after comma split), for `effect_adds_mana_to_triggering_player`.
     pub(crate) effect_lower: String,
-    /// CR 109.4 + CR 603.7c: The relative-player scope the trigger condition
+    /// CR 109.4: The relative-player scope the trigger condition
     /// established for its effect body (`TargetPlayer` for "deals [combat]
     /// damage to a player" / "attacks a player", `ParentTargetController` for
     /// damage-source-controller triggers, `ScopedPlayer` for scoped-phase

@@ -11,8 +11,8 @@ use crate::parser::oracle_nom::error::OracleResult;
 use crate::parser::oracle_nom::primitives as nom_primitives;
 use crate::types::ability::{
     AbilityKind, AbilityTag, Comparator, Duration, Effect, FilterProp, LinkedExileScope,
-    ManaContribution, ManaProduction, ManaSpendRestriction, ObjectScope, QuantityExpr, QuantityRef,
-    TypeFilter, TypedFilter,
+    ManaContribution, ManaProduction, ManaSpendRestriction, ManaTargetRole, ObjectScope,
+    QuantityExpr, QuantityRef, TypeFilter, TypedFilter,
 };
 use crate::types::keywords::KeywordKind;
 use crate::types::mana::{
@@ -25,7 +25,7 @@ use super::super::oracle_keyword::parse_granted_keyword_fragment;
 use super::super::oracle_quantity::{
     parse_cda_quantity, parse_cda_quantity_with_context, parse_event_context_quantity,
 };
-use super::super::oracle_target::parse_type_phrase;
+use super::super::oracle_target::parse_type_phrase_folding;
 use super::super::oracle_util::{parse_mana_production, parse_number, TextPair};
 use crate::parser::oracle_ir::context::ParseContext;
 use crate::types::ability::TargetFilter;
@@ -65,7 +65,7 @@ fn try_parse_any_color_among_permanents_filter(
     let prefix_len = trimmed_lower.len() - rest.len();
     let trimmed_original = after_color.trim().trim_end_matches('.').trim();
     let type_text = trimmed_original.get(prefix_len..)?.trim();
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
         return None;
     }
@@ -91,7 +91,7 @@ fn try_parse_for_each_color_mana(text: &str, lower: &str) -> Option<Effect> {
     // CR 702.167c + CR 105.1: "For each color among the exiled cards used to craft
     // this creature, add one mana of that color" (Sunbird Effigy) — the iteration
     // source is the craft-material linked-exile pool, not a battlefield type
-    // phrase. Tried first so the craft noun phrase wins over `parse_type_phrase`.
+    // phrase. Tried first so the craft noun phrase wins over `parse_type_phrase_folding`.
     if let Ok((craft_rest, filter)) =
         crate::parser::oracle_nom::quantity::parse_craft_materials_filter(type_text_lower.trim())
     {
@@ -105,11 +105,11 @@ fn try_parse_for_each_color_mana(text: &str, lower: &str) -> Option<Effect> {
             });
         }
     }
-    // Recover original-cased slice for parse_type_phrase.
+    // Recover original-cased slice for parse_type_phrase_folding.
     let offset = lower_trimmed.len() - rest.len();
     let original_trimmed = text.trim_end_matches('.').trim();
     let type_text = &original_trimmed[offset..offset + type_text_lower.len()];
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
         return None;
     }
@@ -132,16 +132,27 @@ fn try_parse_for_each_color_mana(text: &str, lower: &str) -> Option<Effect> {
 /// the Phase triggers that carry these clauses (Belbe, Corrupted Observer) the
 /// active player is the trigger's scoped player, so the recipient resolves via
 /// `TargetFilter::ScopedPlayer`. "that player" is the same anaphor.
+///
+/// CR 115.1 + CR 106.4: "target player" is a genuine chosen target (Jetfire,
+/// Ingenious Scientist: "Target player adds that much {C}"), recorded as
+/// `TargetFilter::Player`. Unlike the anaphors it is not a context ref, so it
+/// also surfaces a player target slot at activation and its mana is deposited
+/// into the chosen player (see `mana_effect_recipient`).
 fn strip_mana_subject_prefix(text: &str) -> Option<(TargetFilter, &str)> {
     let lower = text.to_lowercase();
     nom_on_lower(text, &lower, |i| {
-        value(
-            TargetFilter::ScopedPlayer,
-            (
-                alt((tag("the active player "), tag("that player "))),
-                tag("adds "),
+        alt((
+            // CR 505.1 + CR 106.4: anaphoric subject — active/that player.
+            value(
+                TargetFilter::ScopedPlayer,
+                (
+                    alt((tag("the active player "), tag("that player "))),
+                    tag("adds "),
+                ),
             ),
-        )
+            // CR 115.1 + CR 106.4: a chosen target player is the recipient.
+            value(TargetFilter::Player, (tag("target player "), tag("adds "))),
+        ))
         .parse(i)
     })
 }
@@ -185,9 +196,19 @@ pub(super) fn try_parse_add_mana_effect_with_context(
         let synthetic = format!("add {rest}");
         let mut effect = try_parse_add_mana_effect_with_context(&synthetic, ctx)?;
         if let Effect::Mana { target, .. } = &mut effect {
-            if target.is_none() {
-                *target = Some(recipient);
-            }
+            // CR 601.2c: the inner "add …" clause may already have produced a
+            // COUNT SOURCE role (`for_each_clause_target_filter` /
+            // `apply_where_x_count_expression`). The subject is a second,
+            // independent instance of "target" — the RECIPIENT. Combine into
+            // `Both` rather than declining on `is_none()` (which dropped the
+            // recipient) or overwriting (which would drop the count source).
+            // `with_recipient` is the SINGLE authority for this combine and is
+            // shared with the subject-predicate stamping site in
+            // `parser/oracle_effect/mod.rs`.
+            *target = Some(match target.take() {
+                Some(role) => role.with_recipient(recipient),
+                None => ManaTargetRole::Recipient { recipient },
+            });
         }
         return Some(effect);
     }
@@ -302,7 +323,7 @@ pub(super) fn try_parse_add_mana_effect_with_context(
         let rest = rest.trim().trim_end_matches(['.', '"']).trim();
         let rest_lower = rest.to_lowercase();
 
-        // CR 603.7c + CR 106.3: "add one mana of any type that <source> produced"
+        // CR 608.2k + CR 106.3: "add one mana of any type that <source> produced"
         // (Vorinclex, Voice of Hunger: "land"; Roxanne, Starfall Savant: "Oasis or
         // artifact token"). The trailing `<source>` is an anaphor to the trigger
         // subject; only meaningful inside a TapsForMana trigger context, where the
@@ -314,7 +335,7 @@ pub(super) fn try_parse_add_mana_effect_with_context(
                     alt((
                         value((), tag("land")),
                         value((), tag("permanent")),
-                        // CR 603.7c + CR 106.3: Roxanne, Starfall Savant — the
+                        // CR 608.2k + CR 106.3: Roxanne, Starfall Savant — the
                         // anaphor names the tapped mana source, which is an Oasis
                         // OR an artifact token ("that Oasis or artifact token
                         // produced"). Same resolution: the added mana's type is
@@ -400,7 +421,7 @@ pub(super) fn try_parse_add_mana_effect_with_context(
             // surface it on the returned `Effect::Mana::target` so the caller
             // attaches a player target slot. All other any-color variants have
             // no player target — `mana_target` defaults to `None`.
-            let mut mana_target: Option<TargetFilter> = None;
+            let mut mana_target: Option<ManaTargetRole> = None;
             let produced = if nom_on_lower(after_color.trim(), &after_lower, |i| {
                 value((), tag("that a land an opponent controls could produce")).parse(i)
             })
@@ -566,7 +587,7 @@ pub(super) fn try_parse_add_mana_effect_with_context(
             .parse(i)
         }) {
             let after_lower = after_color.trim().to_lowercase();
-            let mut mana_target: Option<TargetFilter> = None;
+            let mut mana_target: Option<ManaTargetRole> = None;
             let count = if let Some((dynamic_qty, target)) =
                 try_parse_any_color_for_each_suffix(after_lower.as_str())
             {
@@ -586,6 +607,25 @@ pub(super) fn try_parse_add_mana_effect_with_context(
                 expiry: None,
                 target: mana_target.or(where_x_target),
             });
+        }
+
+        // CR 106.1b: "[count] {C}[{C}…]" -> count-prefixed COLORLESS mana
+        // ("adds that much {C}", Jetfire, Ingenious Scientist). The literal {C}
+        // symbol count is a per-unit multiplier applied to the prefix count
+        // (mirrors the symbol-first "{C}{C} for each X" scaling).
+        if let Some((symbol_count, after)) = parse_colorless_mana_production(rest) {
+            let after = after.trim().trim_end_matches(['.', '"']).trim();
+            if after.is_empty() {
+                return Some(Effect::Mana {
+                    produced: ManaProduction::Colorless {
+                        count: scale_for_each_count(symbol_count, count.clone()),
+                    },
+                    restrictions: vec![],
+                    grants: vec![],
+                    expiry: None,
+                    target: where_x_target,
+                });
+            }
         }
 
         // CR 106.1: "[count] {color}" -> single color repeated (e.g., "six {G}" -> 6 Green)
@@ -699,28 +739,32 @@ pub(super) fn try_parse_activate_only_condition(text: &str) -> Option<Effect> {
 /// CR 115.1 + CR 115.7: Detect a player target filter inside a for-each clause.
 ///
 /// When the for-each tail mentions "target opponent" or "target player", surface
-/// the corresponding `TargetFilter` so the wrapping ability can attach a player
-/// target slot. The actual count is resolved separately via `TargetZoneCardCount`
-/// or `TargetLifeTotal` against `ability.targets` at resolution time.
+/// the corresponding filter as a COUNT SOURCE role (CR 601.2c) so the wrapping
+/// ability can attach a player target slot. The actual count is resolved
+/// separately via `TargetZoneCardCount` or `TargetLifeTotal` against that role's
+/// own slot at resolution time.
+///
+/// The role is stamped HERE — at the point of grammatical knowledge — so no
+/// downstream consumer has to re-derive "recipient or count source" from the
+/// production's quantity shape.
 ///
 /// Returns `None` when the clause refers to a non-target subject (e.g. "Swamp
 /// you control" — Cabal Coffers' `ObjectCount`-class), in which case the parent
 /// `Effect::Mana` keeps `target: None`.
-fn for_each_clause_target_filter(for_each_rest: &str) -> Option<TargetFilter> {
+fn for_each_clause_target_filter(for_each_rest: &str) -> Option<ManaTargetRole> {
     use crate::types::ability::{ControllerRef, TypedFilter};
     let lower = for_each_rest.to_lowercase();
-    if nom_primitives::scan_contains(&lower, "target opponent") {
+    let count_source = if nom_primitives::scan_contains(&lower, "target opponent") {
         // CR 115.1: "target opponent" — same encoding as `parse_target` uses
         // (TypedFilter with `ControllerRef::Opponent`) so target legality and
         // multiplayer filtering reuse the existing opponent-only path.
-        Some(TargetFilter::Typed(
-            TypedFilter::default().controller(ControllerRef::Opponent),
-        ))
+        TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent))
     } else if nom_primitives::scan_contains(&lower, "target player") {
-        Some(TargetFilter::Player)
+        TargetFilter::Player
     } else {
-        None
-    }
+        return None;
+    };
+    Some(ManaTargetRole::CountSource { count_source })
 }
 
 /// CR 106.1: Detect a `for each [filter]` suffix on the "any color" branch and
@@ -742,7 +786,9 @@ fn for_each_clause_target_filter(for_each_rest: &str) -> Option<TargetFilter> {
 ///
 /// Returns `None` when no for-each suffix is present or the inner clause does
 /// not parse as a known quantity.
-fn try_parse_any_color_for_each_suffix(lower: &str) -> Option<(QuantityRef, Option<TargetFilter>)> {
+fn try_parse_any_color_for_each_suffix(
+    lower: &str,
+) -> Option<(QuantityRef, Option<ManaTargetRole>)> {
     let (rest, _) = preceded(
         nom::character::complete::multispace0::<_, OracleError<'_>>,
         tag("for each "),
@@ -864,7 +910,7 @@ fn parse_fixed_mana_group_list(text: &str) -> Option<Vec<ManaColor>> {
 pub(super) fn parse_mana_production_clause(
     text: &str,
     contribution: ManaContribution,
-) -> Option<(ManaProduction, Option<TargetFilter>)> {
+) -> Option<(ManaProduction, Option<ManaTargetRole>)> {
     if let Some(color_options) = parse_mana_color_set(text) {
         if color_options.len() > 1 {
             return Some((
@@ -1055,7 +1101,7 @@ pub(super) fn parse_mana_count_prefix(text: &str) -> Option<(QuantityExpr, &str)
 pub(super) fn apply_where_x_count_expression(
     count: QuantityExpr,
     where_x_expression: Option<&str>,
-) -> Option<(QuantityExpr, Option<TargetFilter>)> {
+) -> Option<(QuantityExpr, Option<ManaTargetRole>)> {
     match (&count, where_x_expression) {
         (
             QuantityExpr::Ref {
@@ -1075,8 +1121,10 @@ pub(super) fn apply_where_x_count_expression(
     }
 }
 
-/// CR 115.1: Extract target player filters from where-X expressions.
-fn where_x_expression_target_filter(expression: &str) -> Option<TargetFilter> {
+/// CR 115.1 + CR 601.2c: Extract the COUNT SOURCE role from a where-X
+/// expression ("where X is the number of Islands target opponent controls" —
+/// Carpet of Flowers). The named player feeds the count, never the pool.
+fn where_x_expression_target_filter(expression: &str) -> Option<ManaTargetRole> {
     let lower = expression.to_ascii_lowercase();
     let clause = tag::<_, _, OracleError<'_>>("the number of ")
         .parse(lower.as_str())
@@ -1351,7 +1399,7 @@ fn scan_mana_production_type(
                     nom_rest,
                 ),
                 |type_text: &str| {
-                    let (filter, remainder) = parse_type_phrase(type_text.trim());
+                    let (filter, remainder) = parse_type_phrase_folding(type_text.trim());
                     if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
                         return None;
                     }
@@ -1403,6 +1451,20 @@ fn scan_mana_production_type(
                     fixed_alternative: None,
                 },
                 alt((tag("mana of the chosen color"), tag("mana of that color"))),
+            ),
+            // CR 106.1b: "mana of ~'s last noted type" (Jeweled Amulet: "Add
+            // one mana of this artifact's last noted type" — `~` normalized
+            // from "this artifact" upstream). Engine-set (`Effect::
+            // NoteManaSpent`), not player-prompted, so this is a separate
+            // variant from `ChosenColor` above rather than a shared phrase.
+            value(
+                ManaProduction::NotedType {
+                    count: count.clone(),
+                },
+                alt((
+                    tag("mana of ~'s last noted type"),
+                    tag("mana of ~’s last noted type"),
+                )),
             ),
         ))
         .parse(input)
@@ -1476,25 +1538,35 @@ fn parse_restricted_spell_type_phrase(spell_part: &str) -> Option<String> {
     )
 }
 
-/// CR 106.6: Parse the negative spend restriction "this mana can't be spent to
-/// cast [a/an] non<TYPE> spell(s)" into a `SpellTypeOrAbilityActivation` whose
-/// `spell_type` is `<TYPE>` (the phrase with the leading "non" stripped) and
-/// whose ability scope is `Any`. The double-negative restricts spell-casting to
-/// `<TYPE>` spells while leaving every ability activation payable (CR 605/602) —
-/// Karn, Legacy Reforged; Hydraulic Helper. Returns `None` for any other
-/// phrasing so the positive-form parser and the existing gap behavior are
-/// untouched.
+/// CR 106.6 + CR 601.2g-h: Parse "this mana can't be spent to cast ..." restrictions.
+/// A spell-from-zone clause lowers to a prohibition of that cast class
+/// (`spells from your hand` -> `CannotCastSpellFromZone(Hand)`, Karolina Dean).
+/// An already-negative "from anywhere other than" clause is rejected rather
+/// than double-negated.
+/// The existing `non<TYPE>` form lowers to `SpellTypeOrAbilityActivation`, leaving
+/// ability payments unrestricted (Karn, Legacy Reforged; Hydraulic Helper).
 fn parse_negative_mana_spend_restriction(lower: &str) -> Option<ManaSpendRestriction> {
     let (_, rest) = nom_on_lower(lower, lower, |i| {
         // MTGJSON Oracle text is not apostrophe-normalized, so accept both the
         // ASCII (') and curly (U+2019) apostrophe forms of "can't".
         let (i, _) = tag("this mana ca").parse(i)?;
         let (i, _) = alt((tag("n't"), tag("n\u{2019}t"))).parse(i)?;
-        let (i, _) = tag(" be spent to cast ").parse(i)?;
+        value((), tag(" be spent to cast ")).parse(i)
+    })?;
+    let rest = rest.trim().trim_end_matches(['.', '"']).trim();
+
+    if let Some((zone, polarity)) = parse_spell_from_zone(rest) {
+        return match polarity {
+            ZoneSpendPolarity::From => Some(ManaSpendRestriction::CannotCastSpellFromZone(zone)),
+            ZoneSpendPolarity::NotFrom => None,
+        };
+    }
+
+    let rest_lower = rest.to_lowercase();
+    let (_, rest) = nom_on_lower(rest, &rest_lower, |i| {
         let (i, _) = opt(nom_primitives::parse_article).parse(i)?;
         value((), alt((tag("non-"), tag("non")))).parse(i)
     })?;
-    let rest = rest.trim().trim_end_matches(['.', '"']).trim();
     // `rest` is now "<type> spell(s)" (the article and "non" prefix already
     // consumed); reuse the shared type-phrase combinator to canonicalize the
     // spell type.
@@ -2409,14 +2481,81 @@ pub(super) fn parse_mana_spell_grant(lower: &str) -> Option<Vec<ManaSpellGrant>>
     if let Some(grant) = parse_conditional_keyword_grant(trimmed) {
         return Some(vec![grant]);
     }
+    if let Some(grant) = parse_conditional_cant_be_countered_grant(trimmed) {
+        return Some(vec![grant]);
+    }
+    if let Some(grant) = parse_conditional_enters_with_counters_grant(trimmed) {
+        return Some(vec![grant]);
+    }
     // Use nom tag for matching
     if value::<_, _, OracleError<'_>, _>((), tag("that spell can't be countered"))
         .parse(trimmed)
         .is_ok()
     {
-        return Some(vec![ManaSpellGrant::CantBeCountered]);
+        return Some(vec![ManaSpellGrant::CantBeCountered {
+            filter: TargetFilter::Any,
+        }]);
     }
     None
+}
+
+/// CR 106.6: Parse "If that mana is spent on an instant or sorcery spell,
+/// that spell can't be countered" (Boseiju, Who Shelters All).
+fn parse_conditional_cant_be_countered_grant(lower: &str) -> Option<ManaSpellGrant> {
+    let (rest, _) = tag::<_, _, OracleError<'_>>("if that mana is spent on ")
+        .parse(lower)
+        .ok()?;
+    let (rest, filter_text) = terminated(
+        take_until::<_, _, OracleError<'_>>(", that spell can't be countered"),
+        tag(", that spell can't be countered"),
+    )
+    .parse(rest)
+    .ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    Some(ManaSpellGrant::CantBeCountered {
+        filter: parse_spend_trigger_filter(filter_text.trim())?,
+    })
+}
+
+/// CR 106.6a + CR 614.1c: Parse mana whose spent-mana replacement effect has
+/// a counter-bearing battlefield entry result (Opal Palace class).
+fn parse_conditional_enters_with_counters_grant(lower: &str) -> Option<ManaSpellGrant> {
+    let (rest, _) = tag::<_, _, OracleError<'_>>("if you spend this mana to cast ")
+        .parse(lower)
+        .ok()?;
+    let (rest, filter_text) = terminated(
+        take_until::<_, _, OracleError<'_>>(", it enters with a number of additional "),
+        tag(", it enters with a number of additional "),
+    )
+    .parse(rest)
+    .ok()?;
+    let filter = parse_spend_trigger_filter(filter_text.trim())?;
+    let (rest, counter_type) = terminated(
+        nom_primitives::parse_counter_type_typed,
+        tag::<_, _, OracleError<'_>>(" counters on it equal to "),
+    )
+    .parse(rest)
+    .ok()?;
+    let (_, count) = all_consuming(terminated(
+        value(
+            QuantityExpr::Ref {
+                qty: QuantityRef::CommanderCastFromCommandZoneCount,
+            },
+            tag::<_, _, OracleError<'_>>(
+                "the number of times it's been cast from the command zone this game",
+            ),
+        ),
+        opt(char('.')),
+    ))
+    .parse(rest)
+    .ok()?;
+    Some(ManaSpellGrant::EntersWithCounters {
+        filter,
+        counter_type,
+        count,
+    })
 }
 
 /// CR 106.6 + CR 702.10: Parse mana-rider keyword grants:
@@ -2555,7 +2694,7 @@ pub(crate) fn parse_mana_spend_trigger(lower: &str) -> Option<ManaSpellGrant> {
 /// CR 106.6 spend restriction was never the right type — see
 /// [`ManaSpellGrant::TriggerOnSpend`].
 ///
-/// The type/color phrase is DELEGATED to `oracle_target::parse_type_phrase`, the
+/// The type/color phrase is DELEGATED to `oracle_target::parse_type_phrase_folding`, the
 /// engine's single authority for phrases like "red instant or sorcery". One call
 /// therefore covers the whole type × color class ("an instant or sorcery spell",
 /// "a red instant or sorcery spell", "a Dragon creature spell") instead of the
@@ -2565,6 +2704,20 @@ pub(crate) fn parse_mana_spend_trigger(lower: &str) -> Option<ManaSpellGrant> {
 ///
 /// Returns `None` for an unrecognized filter, so the clause stays a loud gap.
 fn parse_spend_trigger_filter(filter: &str) -> Option<TargetFilter> {
+    // CR 903.3d: "your commander" is a commander spell. The live object
+    // retains this designation while on the stack, so the standard object
+    // filter authority can evaluate it when mana is paid.
+    if let Ok((_, filter)) =
+        all_consuming(map(tag::<_, _, OracleError<'_>>("your commander"), |_| {
+            TargetFilter::Typed(TypedFilter {
+                properties: vec![FilterProp::IsCommander],
+                ..TypedFilter::default()
+            })
+        }))
+        .parse(filter)
+    {
+        return Some(filter);
+    }
     // CR 202.3: "a spell with mana value N or greater/less" — a post-`spell`
     // threshold, not a type phrase (the helper keeps the article).
     if let Some((comparator, value)) = parse_mana_value_threshold(filter) {
@@ -2619,7 +2772,7 @@ fn parse_spend_trigger_filter(filter: &str) -> Option<TargetFilter> {
     if !post.is_empty() || pre.is_empty() {
         return None;
     }
-    let (parsed, remainder) = parse_type_phrase(pre);
+    let (parsed, remainder) = parse_type_phrase_folding(pre);
     if !remainder.trim().is_empty() || matches!(parsed, TargetFilter::Any) {
         return None;
     }
@@ -2646,7 +2799,9 @@ fn extract_spell_grants(text: &str) -> (&str, Vec<ManaSpellGrant>) {
             let before_len = before.len();
             return (
                 text[..before_len].trim(),
-                vec![ManaSpellGrant::CantBeCountered],
+                vec![ManaSpellGrant::CantBeCountered {
+                    filter: TargetFilter::Any,
+                }],
             );
         }
     }
@@ -2786,7 +2941,7 @@ fn try_parse_amount_equal_to_with_context(
             value((), tag("equal to ")).parse(i)
         })?;
         let quantity_text = quantity_text.trim().trim_end_matches(['.', '"']);
-        // CR 601.2h + CR 603.7c: "the amount of mana spent to cast that spell"
+        // CR 601.2h: "the amount of mana spent to cast that spell"
         // resolves via `parse_event_context_quantity` to
         // triggering-spell spent-mana ref; fall back to `parse_cda_quantity` for
         // non-event quantities (e.g. "~'s power").
@@ -2836,6 +2991,7 @@ fn try_parse_amount_equal_to_with_context(
 mod tests {
     use super::*;
     use crate::types::ability::{ControllerRef, TypeFilter};
+    use crate::types::counter::CounterType;
 
     #[test]
     fn shares_type_with_it_in_trigger_context_uses_triggering_source() {
@@ -2985,7 +3141,7 @@ mod tests {
         );
     }
 
-    /// CR 603.7c + CR 106.3: Roxanne, Starfall Savant — the mana-echo anaphor
+    /// CR 608.2k + CR 106.3: Roxanne, Starfall Savant — the mana-echo anaphor
     /// names the tapped source, which is an Oasis OR an artifact token. The actual
     /// printed text is "add one mana of any type that Oasis or artifact token
     /// produced"; the bare "artifact token produced" and "Oasis produced" forms
@@ -3010,21 +3166,6 @@ mod tests {
                 "mana-echo must reuse TriggerEventManaType for {echo:?}"
             );
         }
-    }
-
-    #[test]
-    fn sunken_ruins_pattern_parses_as_combinations() {
-        // CR 605.3b: Shadowmoor/Eventide filter land shape.
-        let options = extract_combinations("Add {U}{U}, {U}{B}, or {B}{B}")
-            .expect("should parse filter-land pattern");
-        assert_eq!(
-            options,
-            vec![
-                vec![ManaColor::Blue, ManaColor::Blue],
-                vec![ManaColor::Blue, ManaColor::Black],
-                vec![ManaColor::Black, ManaColor::Black],
-            ]
-        );
     }
 
     #[test]
@@ -3161,7 +3302,7 @@ mod tests {
         assert_eq!(typed.controller, Some(ControllerRef::Opponent));
     }
 
-    /// CR 106.1 + CR 601.2h + CR 603.7c: "add an amount of {C} equal to the
+    /// CR 106.1 + CR 601.2h: "add an amount of {C} equal to the
     /// amount of mana spent to cast that spell" — Mana Sculpt's sub_ability.
     /// The `{C}` colorless branch routes to `ManaProduction::Colorless`
     /// (since `parse_mana_production` only recognizes W/U/B/R/G and would
@@ -3278,9 +3419,11 @@ mod tests {
             }
             other => panic!("expected AnyOneColor, got {other:?}"),
         }
-        let target = target.expect("target opponent should surface a player target filter");
-        let TargetFilter::Typed(typed) = target else {
-            panic!("expected Typed filter for target opponent, got {target:?}");
+        // CR 601.2c: the for-each clause names a COUNT SOURCE, never a recipient.
+        let role = target.expect("target opponent should surface a count-source role");
+        assert_eq!(role.recipient(), None, "for-each names no recipient");
+        let Some(TargetFilter::Typed(typed)) = role.count_source() else {
+            panic!("expected Typed count-source filter, got {role:?}");
         };
         assert_eq!(typed.controller, Some(ControllerRef::Opponent));
     }
@@ -3309,7 +3452,13 @@ mod tests {
                 }
             },
         );
-        assert_eq!(target, Some(TargetFilter::Player));
+        // CR 601.2c: "in target player's hand" is a COUNT SOURCE role.
+        assert_eq!(
+            target,
+            Some(ManaTargetRole::CountSource {
+                count_source: TargetFilter::Player
+            })
+        );
     }
 
     /// Cabal Coffers — "Add {B} for each Swamp you control" — must continue to
@@ -3369,6 +3518,7 @@ mod tests {
                     QuantityExpr::Ref {
                         qty: QuantityRef::PreviousEffectAmount {
                             channel: crate::types::ability::DamageChannel::Total,
+                            aggregate: crate::types::ability::AggregateFunction::Sum,
                         }
                     },
                     "for-each tail must dispatch to PreviousEffectAmount"
@@ -3418,10 +3568,13 @@ mod tests {
         }
         // CR 115.1: target must be the opponent player filter so the engine
         // surfaces a player target slot at cast/trigger time.
-        let target = target.expect("target opponent must surface a player target filter");
-        let TargetFilter::Typed(typed) = target else {
-            panic!("expected TargetFilter::Typed, got {target:?}");
+        // CR 601.2c: a count-source role, not a recipient.
+        let role = target.expect("target opponent must surface a count-source role");
+        assert_eq!(role.recipient(), None, "for-each names no recipient");
+        let Some(TargetFilter::Typed(typed)) = role.count_source() else {
+            panic!("expected Typed count-source filter, got {role:?}");
         };
+        let typed = typed.clone();
         assert_eq!(typed.controller, Some(ControllerRef::Opponent));
         // Sanity: this is a player target (no type filter).
         assert_eq!(
@@ -3508,8 +3661,12 @@ mod tests {
             typed.type_filters
         );
 
-        let Some(TargetFilter::Typed(target_typed)) = target else {
-            panic!("expected target opponent filter, got {target:?}");
+        // CR 601.2c (Carpet of Flowers): "the number of Islands target opponent
+        // controls" is a COUNT SOURCE, not a mana recipient.
+        let role = target.expect("target opponent must surface a count-source role");
+        assert_eq!(role.recipient(), None, "where-X names no recipient");
+        let Some(TargetFilter::Typed(target_typed)) = role.count_source() else {
+            panic!("expected Typed count-source filter, got {role:?}");
         };
         assert_eq!(target_typed.controller, Some(ControllerRef::Opponent));
     }
@@ -3825,6 +3982,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_commander_mana_entry_counter_grant() {
+        let grants = parse_mana_spell_grant(
+            "if you spend this mana to cast your commander, it enters with a number of additional +1/+1 counters on it equal to the number of times it's been cast from the command zone this game.",
+        )
+        .expect("Opal Palace mana rider must parse");
+        assert!(matches!(
+            grants.as_slice(),
+            [ManaSpellGrant::EntersWithCounters {
+                filter: TargetFilter::Typed(TypedFilter { properties, .. }),
+                counter_type: CounterType::Plus1Plus1,
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::CommanderCastFromCommandZoneCount,
+                },
+            }] if properties == &[FilterProp::IsCommander]
+        ));
+    }
+
     /// CR 106.6 + CR 702.10a: Hall of the Bandit Lord — any creature spell,
     /// permanent haste (no "until end of turn" rider).
     #[test]
@@ -3907,7 +4082,12 @@ mod tests {
             .expect("subject-led mana clause must parse to Effect::Mana");
         match effect {
             Effect::Mana { target, .. } => {
-                assert_eq!(target, Some(TargetFilter::ScopedPlayer));
+                assert_eq!(
+                    target,
+                    Some(ManaTargetRole::Recipient {
+                        recipient: TargetFilter::ScopedPlayer
+                    })
+                );
             }
             other => panic!("expected Effect::Mana, got {other:?}"),
         }
@@ -3927,7 +4107,9 @@ mod tests {
             } => {
                 assert_eq!(
                     target,
-                    Some(TargetFilter::ScopedPlayer),
+                    Some(ManaTargetRole::Recipient {
+                        recipient: TargetFilter::ScopedPlayer
+                    }),
                     "recipient must be the scoped phase player"
                 );
                 assert!(
@@ -3941,6 +4123,78 @@ mod tests {
                 );
             }
             other => panic!("expected Effect::Mana, got {other:?}"),
+        }
+    }
+
+    /// CR 115.1 + CR 106.4: "Target player adds that much {C}" (Jetfire,
+    /// Ingenious Scientist) — a chosen TARGET player is the recipient
+    /// (`TargetFilter::Player`, not the `ScopedPlayer` anaphor), and "that much"
+    /// is the counters-removed cost amount (`EventContextAmount`, resolved from
+    /// `chosen_x`). Revert-probe: without the "target player adds" arm in
+    /// `strip_mana_subject_prefix` this clause returns `None` (whole clause
+    /// unparsed).
+    #[test]
+    fn parse_add_mana_target_player_that_much_colorless() {
+        let effect = try_parse_add_mana_effect("target player adds that much {C}")
+            .expect("'target player adds' subject-led mana clause must parse");
+        match effect {
+            Effect::Mana {
+                produced: ManaProduction::Colorless { count },
+                target,
+                restrictions,
+                ..
+            } => {
+                assert_eq!(
+                    target,
+                    Some(ManaTargetRole::Recipient {
+                        recipient: TargetFilter::Player
+                    }),
+                    "recipient must be the chosen TARGET player, not an anaphor"
+                );
+                assert_eq!(
+                    count,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::EventContextAmount
+                    },
+                    "'that much' must be EventContextAmount, got {count:?}"
+                );
+                assert!(
+                    restrictions.is_empty(),
+                    "the bare add clause carries no restriction; the following \
+                     sentence attaches it"
+                );
+            }
+            other => panic!("expected Effect::Mana, got {other:?}"),
+        }
+    }
+
+    /// CR 106.1b: A fixed count-prefixed colorless amount ("Add three {C}.")
+    /// yields a `Fixed` quantity and NO target role — the sentence names no
+    /// player, so `target` stays `None`. Companion to
+    /// `parse_add_mana_target_player_that_much_colorless` (which carries a
+    /// recipient role): this guards the plain fixed-count path against
+    /// spuriously stamping a role or a dynamic quantity.
+    #[test]
+    fn parse_add_fixed_count_colorless_no_target() {
+        let effect =
+            try_parse_add_mana_effect("Add three {C}.").expect("'Add three {C}.' must parse");
+        match effect {
+            Effect::Mana {
+                produced: ManaProduction::Colorless { count },
+                target,
+                ..
+            } => {
+                assert_eq!(
+                    count,
+                    QuantityExpr::Fixed { value: 3 },
+                    "'three' must be a fixed count of 3, got {count:?}"
+                );
+                assert_eq!(
+                    target, None,
+                    "a bare fixed colorless add names no player, so no role"
+                );
+            }
+            other => panic!("expected colorless Effect::Mana, got {other:?}"),
         }
     }
 
@@ -4053,6 +4307,33 @@ mod tests {
                 ability: AbilityActivationScope::Any,
             }]
         );
+    }
+
+    #[test]
+    fn negated_spell_from_zone_lowers_to_cast_prohibition_once() {
+        let expected = vec![ManaSpendRestriction::CannotCastSpellFromZone(Zone::Hand)];
+
+        for text in [
+            "this mana can't be spent to cast spells from your hand",
+            "this mana can\u{2019}t be spent to cast a spell from your hand",
+        ] {
+            assert_eq!(
+                parse_mana_spend_restriction(text).map(|(restrictions, _)| restrictions),
+                Some(expected.clone()),
+                "negative zone restriction must parse fully: {text}"
+            );
+        }
+
+        for hostile in [
+            "this mana can't be spent to cast spells from anywhere other than your hand",
+            "this mana can't be spent to cast spells from your hand nonsense",
+        ] {
+            assert_eq!(
+                parse_mana_spend_restriction(hostile),
+                None,
+                "already-negative and trailing-tail shapes must remain unsupported: {hostile}"
+            );
+        }
     }
 
     // CR 106.6 + CR 107.3 + CR 202.3: Troyan, Gutsy Explorer — any-type
@@ -4243,42 +4524,35 @@ mod tests {
         );
     }
 
-    // CR 702.6a: Ronin, Shadow Stalker — plural "equip abilities" in the
-    // activation tail maps to `Any([SpellType("Equipment"), ActivateTagged(Equip)])`.
-    // Keyword-precise: only equip-tagged abilities qualify, not arbitrary
-    // activated abilities on Equipment permanents.
+    // CR 702.6a: both the plural and singular equip-activation tails map to the same
+    // `Any([SpellType("Equipment"), ActivateTagged(Equip)])`. Keyword-precise: only
+    // equip-tagged abilities qualify, not arbitrary activated abilities on Equipment
+    // permanents. Each row differs in BOTH halves (spell count and ability count), so
+    // both full input strings are retained.
     #[test]
-    fn mana_spend_restriction_equip_abilities_plural() {
-        let (restriction, grants) = parse_mana_spend_restriction(
-            "spend this mana only to cast equipment spells or activate equip abilities",
-        )
-        .expect("equip abilities plural must parse");
-        assert_eq!(
-            restriction,
-            vec![ManaSpendRestriction::Any(vec![
-                ManaSpendRestriction::SpellType("Equipment".to_string()),
-                ManaSpendRestriction::ActivateTagged(AbilityTag::Equip),
-            ])]
-        );
-        assert!(grants.is_empty());
-    }
-
-    // CR 702.6a: Freya Crescent — singular "an equip ability" in the activation
-    // tail maps to the same `Any([SpellType("Equipment"), ActivateTagged(Equip)])`.
-    #[test]
-    fn mana_spend_restriction_equip_ability_singular() {
-        let (restriction, grants) = parse_mana_spend_restriction(
-            "spend this mana only to cast an equipment spell or activate an equip ability",
-        )
-        .expect("equip ability singular must parse");
-        assert_eq!(
-            restriction,
-            vec![ManaSpendRestriction::Any(vec![
-                ManaSpendRestriction::SpellType("Equipment".to_string()),
-                ManaSpendRestriction::ActivateTagged(AbilityTag::Equip),
-            ])]
-        );
-        assert!(grants.is_empty());
+    fn mana_spend_restriction_equip_abilities_plural_and_singular() {
+        for (card, text) in [
+            (
+                "Ronin, Shadow Stalker",
+                "spend this mana only to cast equipment spells or activate equip abilities",
+            ),
+            (
+                "Freya Crescent",
+                "spend this mana only to cast an equipment spell or activate an equip ability",
+            ),
+        ] {
+            let (restriction, grants) = parse_mana_spend_restriction(text)
+                .unwrap_or_else(|| panic!("{card}: {text:?} must parse"));
+            assert_eq!(
+                restriction,
+                vec![ManaSpendRestriction::Any(vec![
+                    ManaSpendRestriction::SpellType("Equipment".to_string()),
+                    ManaSpendRestriction::ActivateTagged(AbilityTag::Equip),
+                ])],
+                "{card}: wrong restriction for {text:?}"
+            );
+            assert!(grants.is_empty(), "{card}: {text:?} must grant nothing");
+        }
     }
 
     // CR 105.2a + CR 106.6: The Great Henge-style compound rider is an AND,

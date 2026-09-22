@@ -61,7 +61,12 @@ pub(super) fn handle_ability_mode_choice(
             events,
         )
     } else {
-        handle_triggered_mode_choice(
+        // Round-20 seam 2: the finisher wraps the result HERE, at the public
+        // `SelectModes` entry, and never inside `handle_triggered_mode_choice`.
+        // That function is re-entered inside trigger dispatch (via
+        // `resolve_random_modal_trigger`), where a `Priority` result is
+        // discarded — consuming the recipient there would lose it mid-batch.
+        let produced = handle_triggered_mode_choice(
             state,
             TriggeredModeChoice {
                 player,
@@ -72,7 +77,10 @@ pub(super) fn handle_ability_mode_choice(
                 indices,
             },
             events,
-        )
+        )?;
+        Ok(triggers::finish_trigger_construction_action(
+            state, events, produced,
+        ))
     }?;
 
     Ok(waiting_for)
@@ -289,8 +297,12 @@ pub(super) fn resolve_random_modal_trigger(
         // CR 603.3c: No legal mode — drop the trigger. The interactive branches
         // already removed the in-flight stack entry before this point, so just
         // clear the cursor here.
-        super::stack::pop_uncommitted_pending_trigger_entry(state);
+        super::stack::pop_uncommitted_pending_trigger_entry(
+            state,
+            super::lifecycle::DelayedTerminalDisposition::NoLegalChoice,
+        );
         state.pending_trigger = None;
+        state.pending_trigger_firing = None;
         return Ok(None);
     };
 
@@ -443,10 +455,11 @@ fn handle_triggered_mode_choice(
             // stays set — construction continues through target selection.
             if !triggers::mutate_pending_trigger_entry(state, &trigger.ability) {
                 // Unexpected dangling cursor: the entry is gone before the target
-                // prompt could open. Recover per CR 608.2b / CR 800.4a (a stack
-                // object that has left the stack does not resolve) — record the
-                // diagnostic, abandon, return priority (re-normalized next pass;
-                // CR 117.3b would give the active player).
+                // prompt could open. Recover per CR 608.1 (resolution selects the
+                // spell or ability on top of the stack, so an entry absent from it
+                // is never selected to begin resolving) — record the diagnostic,
+                // abandon, return priority (re-normalized next pass; CR 117.3b
+                // would give the active player).
                 triggers::restore_trigger_event_context(state, mode_context_snapshot);
                 triggers::abandon_ceased_pending_trigger(state, &trigger.ability);
                 return Ok(WaitingFor::Priority { player });
@@ -515,10 +528,11 @@ fn handle_triggered_mode_choice(
         // may fire this entry.
         if !triggers::finalize_pending_trigger_entry(state, &trigger.ability) {
             // Unexpected dangling cursor: the entry is no longer on the stack.
-            // Recover per CR 608.2b / CR 800.4a (a stack object that has left the
-            // stack does not resolve) — record the diagnostic, abandon, and hand
-            // back priority instead of panicking (re-normalized next pass; CR
-            // 117.3b would give the active player).
+            // Recover per CR 608.1 (resolution selects the spell or ability on
+            // top of the stack, so an entry absent from it is never selected to
+            // begin resolving) — record the diagnostic, abandon, and hand back
+            // priority instead of panicking (re-normalized next pass; CR 117.3b
+            // would give the active player).
             triggers::abandon_ceased_pending_trigger(state, &trigger.ability);
             priority::clear_priority_passes(state);
             return Ok(WaitingFor::Priority { player });

@@ -43,6 +43,8 @@ const AZORS_GATEWAY_ORACLE: &str = "{1}, {T}: Draw a card, then exile a card fro
 
 fn sanctum_of_the_sun_back_face() -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
+        trigger_printed_origins: Vec::new(),
         name: "Sanctum of the Sun".to_string(),
         power: None,
         toughness: None,
@@ -68,6 +70,7 @@ fn sanctum_of_the_sun_back_face() -> BackFaceData {
         casting_restrictions: vec![],
         casting_options: vec![],
         layout_kind: None,
+        parse_warnings: vec![],
     }
 }
 

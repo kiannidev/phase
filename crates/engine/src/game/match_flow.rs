@@ -61,7 +61,7 @@ fn entries_to_count_map(entries: &[DeckEntry]) -> HashMap<String, u32> {
 /// `current_main`/`current_sideboard` and only the revealed companion copy is
 /// returned (CR 400.11a).
 fn restore_revealed_sideboard_companions(state: &mut GameState) {
-    if state.format_config.format.uses_commander() {
+    if state.format_config.uses_commander {
         return;
     }
 
@@ -203,6 +203,7 @@ fn deck_payload_from_current_pools(state: &GameState) -> Result<DeckPayload, Str
         // cEDH bracket validation ran at game 1 setup; decks haven't
         // changed between games, so re-validation is unnecessary.
         ai_difficulties: vec![],
+        booster_pack_pool: state.booster_pack_pool.as_deref().cloned(),
     })
 }
 
@@ -215,6 +216,16 @@ pub fn handle_game_over_transition(state: &mut GameState) {
         WaitingFor::GameOver { winner } => winner,
         _ => return,
     };
+
+    // CR 104.1 + CR 723.1: a game that has ended takes no further turn and no
+    // further combat phase. Four sites in `game/engine.rs` (the CR 732.2a loop
+    // crowns and the interactive winning drain) park this wait themselves
+    // without routing through `elimination::end_game`, so the teardown has to
+    // happen where the ending is observed as well as where it is written. It
+    // runs before the `match_type != Bo3` arm below, so a best-of-one's
+    // terminal snapshot is clean too, and before the sideboard prompt is built,
+    // so the prompt is derived with no controller in place.
+    crate::game::turn_control::end_all_player_control(state);
 
     let archenemy = crate::game::topology::archenemy(state);
     if state.match_config.match_type != MatchType::Bo3
@@ -312,6 +323,11 @@ pub fn apply_trusted_match_forfeit(
         winner: Some(winner),
     };
 
+    // CR 104.1 + CR 723.1: the forfeit completes the match before parking the
+    // wait, so `handle_game_over_transition` early-returns on it and never runs
+    // — this is the one ending that has to end player control itself.
+    crate::game::turn_control::end_all_player_control(state);
+
     Ok(vec![GameEvent::GameOver {
         winner: Some(winner),
     }])
@@ -331,12 +347,13 @@ pub(crate) fn sideboard_submission_bounds(
     state: &GameState,
     player: PlayerId,
 ) -> (u32, Option<u32>) {
-    // CR 100.2a / CR 100.2b: `deck_size` is a *minimum* deck size, and CR 100.5
-    // adds that there is no maximum deck size for non-Commander decks.
-    // Sideboarding is therefore not a one-for-one swap: a player who registered
-    // 60/15 may legally present 61, 70, or all 75 cards in their main deck. The
-    // registered total bounds the *pool* (checked separately), never the
-    // main-deck size.
+    // CR 100.2a / CR 100.2b: `deck_size.min_cards()` is the floor of the
+    // format's `DeckSizeRule`, and CR 100.5 adds that there is no maximum deck
+    // size for non-Commander decks (the `Minimum` variant). Sideboarding is
+    // therefore not a one-for-one swap: under a `Minimum` rule a player who
+    // registered 60/15 may legally present 61, 70, or all 75 cards in their
+    // main deck. The registered total bounds the *pool* (checked separately),
+    // never the main-deck size.
     //
     // Clamping to the registered total keeps the floor satisfiable: a match
     // whose deck was registered below the format minimum (scenario decks, and
@@ -349,12 +366,13 @@ pub(crate) fn sideboard_submission_bounds(
         .iter()
         .find(|p| p.player == player)
         .map_or(0, |pool| total_count(&pool.registered_main));
-    let min_main_deck_size = u32::from(state.format_config.deck_size).min(registered_main_total);
+    let min_main_deck_size =
+        u32::from(state.format_config.deck_size.min_cards()).min(registered_main_total);
 
     // CR 100.4a: the sideboard cap is per-format. `Forbidden` formats (the
     // Commander family) have no sideboard at all, which bounds it at zero and
     // therefore pins the whole pool in the main deck.
-    let max_sideboard_size = match state.format_config.format.sideboard_policy() {
+    let max_sideboard_size = match state.format_config.sideboard_policy {
         SideboardPolicy::Forbidden => Some(0),
         SideboardPolicy::Limited(max) => Some(max),
         SideboardPolicy::Unlimited => None,
@@ -514,6 +532,19 @@ fn restart_between_games_with_starting_player(
     let interaction_session = state.interaction_session_id.clone();
 
     load_deck_into_state(&mut next_state, &payload);
+    // The booster shelf is stocked only at rehydrate, which this rebuild never
+    // reaches: it holds no card database, and `load_deck_into_state` resets the
+    // shelf. Carry it for every source, set products and Cube alike. Whether a
+    // game stocks one depends only on the registered deck pools, sideboards
+    // included, which sideboarding cannot extend; what it holds comes from the
+    // card database and `booster_pack_pool`, neither of which changes within a
+    // match. Game one's shelf (for set products, game one's seeded sample of
+    // sets) therefore still serves every later game, and without it a pack
+    // opener in game two opens nothing. A restore of a later game re-stocks
+    // set products from that game's own seed, so its sample of sets can differ
+    // from the carried one. The shelf is `#[serde(skip)]` and outside state
+    // identity, and either sample is an equally random draw of sets.
+    next_state.booster_shelf = state.booster_shelf.clone();
     let start = super::engine::start_game_with_starting_player(&mut next_state, starting_player);
     events.extend(start.events);
 
@@ -556,9 +587,11 @@ mod tests {
     use super::*;
     use crate::game::deck_loading::PlayerDeckPayload;
     use crate::game::engine::{apply_as_current, start_game};
+    use crate::types::ability::ControlWindow;
     use crate::types::actions::GameAction;
     use crate::types::card::CardFace;
     use crate::types::card_type::{CardType, CoreType};
+    use crate::types::game_state::{ActivePlayerControl, ScheduledTurnControl};
     use crate::types::mana::ManaCost;
 
     fn basic_land(name: &str) -> CardFace {
@@ -691,6 +724,183 @@ mod tests {
         );
     }
 
+    /// CR 723.1: a two-seat game in a live match with one player-control effect
+    /// over the active seat. The controller is deliberately *not* the active
+    /// player: a latch whose controller is the active seat routes every seat to
+    /// itself and reads identically to no latch at all.
+    fn state_with_live_player_control(match_type: MatchType) -> GameState {
+        let mut state = GameState::new_two_player(7);
+        state.match_config.match_type = match_type;
+        state.match_phase = MatchPhase::InGame;
+
+        let target_player = state.active_player;
+        let controller = opponent(target_player);
+        state.scheduled_turn_controls.push(ScheduledTurnControl {
+            target_player,
+            controller,
+            timestamp: 1,
+            grant_extra_turn_after: false,
+            window: ControlWindow::NextTurn,
+        });
+        state.active_full_turn_control = Some(ActivePlayerControl {
+            controller,
+            timestamp: 1,
+        });
+        crate::game::turn_control::recompute_active_player_control(&mut state);
+
+        assert_ne!(
+            controller, state.active_player,
+            "reach guard: a latch controlling the active seat is invisible to every routed read"
+        );
+        assert_eq!(
+            state.match_phase,
+            MatchPhase::InGame,
+            "reach guard: the transition's `match_phase` guard is passable"
+        );
+        assert_eq!(
+            state.turn_decision_controller,
+            Some(controller),
+            "reach guard: CR 723.1 control is live before the game ends"
+        );
+        state
+    }
+
+    /// CR 104.1 + CR 723.1: no player-control effect survives the game, in any of
+    /// the places one is recorded. `clause` names what the calling row discriminates.
+    fn assert_no_control_survives(state: &GameState, clause: &str) {
+        assert_eq!(
+            state.turn_decision_controller, None,
+            "a decision controller outlived the game (clause: {clause})"
+        );
+        assert_eq!(
+            state.turn_decision_control_timestamp, None,
+            "a control timestamp outlived the game (clause: {clause})"
+        );
+        assert_eq!(
+            state.active_full_turn_control, None,
+            "a full-turn control window outlived the game (clause: {clause})"
+        );
+        assert_eq!(
+            state.active_combat_phase_control, None,
+            "a combat-phase control window outlived the game (clause: {clause})"
+        );
+        assert!(
+            state.scheduled_turn_controls.is_empty(),
+            "a scheduled control outlived the game (clause: {clause})"
+        );
+    }
+
+    /// CR 104.1: four sites in `game/engine.rs` park `WaitingFor::GameOver`
+    /// themselves without routing through `elimination::end_game`, so the
+    /// teardown has to run where the ending is observed too.
+    #[test]
+    fn an_open_coded_game_end_ends_player_control() {
+        let mut state = state_with_live_player_control(MatchType::Bo3);
+        state.waiting_for = WaitingFor::GameOver {
+            winner: Some(PlayerId(1)),
+        };
+
+        handle_game_over_transition(&mut state);
+
+        assert!(
+            state.game_end.is_none(),
+            "reach guard: this row exercises the open-coded park, not `end_game`'s"
+        );
+        assert_no_control_survives(
+            &state,
+            "the teardown's call in `handle_game_over_transition`",
+        );
+    }
+
+    /// The teardown sits *inside* `handle_game_over_transition`, before its
+    /// `match_type != Bo3` arm returns, so a best-of-one's terminal snapshot is
+    /// clean too.
+    #[test]
+    fn an_open_coded_best_of_one_end_leaves_a_clean_terminal_snapshot() {
+        let mut state = state_with_live_player_control(MatchType::Bo1);
+        state.waiting_for = WaitingFor::GameOver {
+            winner: Some(PlayerId(1)),
+        };
+
+        handle_game_over_transition(&mut state);
+
+        assert_eq!(
+            state.match_phase,
+            MatchPhase::Completed,
+            "reach guard: this row took the `match_type != Bo3` arm"
+        );
+        assert!(
+            state.game_end.is_none(),
+            "reach guard: this row exercises the open-coded park, not `end_game`'s"
+        );
+        assert_no_control_survives(
+            &state,
+            "the teardown's position before the `match_type != Bo3` return",
+        );
+    }
+
+    /// The forfeit completes the match before parking the wait, so every later
+    /// `handle_game_over_transition` early-returns: it is the one ending that has
+    /// to end player control itself.
+    #[test]
+    fn a_trusted_match_forfeit_ends_player_control() {
+        let mut state = state_with_live_player_control(MatchType::Bo3);
+
+        let events =
+            apply_trusted_match_forfeit(&mut state, PlayerId(0), MatchForfeitCause::MatchConcede)
+                .expect("two-seat Bo3 match concede is trusted");
+
+        assert_eq!(
+            events.len(),
+            1,
+            "reach guard: the forfeit ran and emitted its game-over event"
+        );
+        assert!(
+            state.match_forfeit_result.is_some(),
+            "reach guard: the forfeit recorded its result"
+        );
+        assert_eq!(
+            state.waiting_for,
+            WaitingFor::GameOver {
+                winner: Some(PlayerId(1))
+            },
+            "reach guard: the forfeit parked the terminal wait"
+        );
+        assert!(
+            state.game_end.is_none(),
+            "reach guard: a forfeit never routes through `end_game`"
+        );
+        assert_no_control_survives(
+            &state,
+            "the teardown's call in `apply_trusted_match_forfeit`",
+        );
+    }
+
+    /// The teardown is keyed on the game actually being over, not on the
+    /// transition being called: hoisted above the `waiting_for` match it would
+    /// end control in a live game. Paired positive:
+    /// `an_open_coded_game_end_ends_player_control`, over the same builder.
+    #[test]
+    fn the_transition_leaves_control_alone_while_the_game_is_live() {
+        let mut state = state_with_live_player_control(MatchType::Bo3);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        let controller = state
+            .turn_decision_controller
+            .expect("the builder's reach guard installed a live controller");
+
+        handle_game_over_transition(&mut state);
+
+        assert_eq!(
+            state.turn_decision_controller,
+            Some(controller),
+            "CR 723.1: control outlives a transition call in a game that has not ended"
+        );
+        assert_eq!(state.scheduled_turn_controls.len(), 1);
+        assert!(state.active_full_turn_control.is_some());
+    }
+
     #[test]
     fn trusted_match_forfeit_rejects_non_bo3_and_completed_matches_without_mutation() {
         let mut state = GameState::new_two_player(7);
@@ -789,10 +999,11 @@ mod tests {
         assert!(bad_pool.is_err());
     }
 
-    /// CR 100.2a + CR 100.5: `deck_size` is a minimum, not an exact size, so a
-    /// player may side a card *in* without siding one out and submit a larger
-    /// main deck than they registered. This is the case the old exact-equality
-    /// check rejected.
+    /// CR 100.2a + CR 100.5: under a `DeckSizeRule::Minimum` rule
+    /// `deck_size.min_cards()` is a floor, not an exact size, so a player may
+    /// side a card *in* without siding one out and submit a larger main deck
+    /// than they registered. This is the case the old exact-equality check
+    /// rejected.
     #[test]
     fn sideboard_accepts_main_deck_larger_than_registered() {
         let mut state = GameState::new_two_player(3);
@@ -1422,5 +1633,61 @@ mod tests {
                 "no slot bound for {owner:?}, who is acting in game 2"
             );
         }
+    }
+
+    #[test]
+    fn choose_play_draw_logs_new_game_context_not_the_previous_game() {
+        use crate::types::game_state::PlayerDeckPool;
+        use crate::types::phase::Phase;
+
+        let mut state = GameState::new_two_player(21);
+        state.match_config.match_type = MatchType::Bo3;
+        state.match_phase = MatchPhase::BetweenGames;
+        state.game_number = 2;
+        state.next_game_chooser = Some(PlayerId(0));
+        // This is the action boundary snapshot consumed by the log resolver.
+        // A restart must not stamp its GameStarted or TurnStarted entries with it.
+        state.turn_number = 73;
+        state.phase = Phase::End;
+        state.deck_pools = vec![
+            PlayerDeckPool {
+                player: PlayerId(0),
+                current_main: std::sync::Arc::new(vec![entry("P0", 40)]),
+                ..Default::default()
+            },
+            PlayerDeckPool {
+                player: PlayerId(1),
+                current_main: std::sync::Arc::new(vec![entry("P1", 40)]),
+                ..Default::default()
+            },
+        ];
+        state.waiting_for = WaitingFor::BetweenGamesChoosePlayDraw {
+            player: PlayerId(0),
+            game_number: 2,
+            score: state.match_score,
+        };
+
+        let result = apply_as_current(&mut state, GameAction::ChoosePlayDraw { play_first: true })
+            .expect("between-games choose play/draw must start game two");
+
+        assert!(matches!(
+            result.events.as_slice(),
+            [
+                GameEvent::GameStarted,
+                GameEvent::TurnStarted {
+                    player_id: PlayerId(0),
+                    turn_number: 1,
+                },
+                ..
+            ]
+        ));
+        assert_eq!(result.log_entries[0].turn, 0);
+        assert_eq!(result.log_entries[0].phase, Phase::Untap);
+        assert_eq!(result.log_entries[1].turn, 1);
+        assert_eq!(result.log_entries[1].phase, Phase::Untap);
+        assert!(
+            result.log_entries.iter().all(|entry| entry.turn <= 1),
+            "a fresh game must not inherit the previous game's turn 73 context"
+        );
     }
 }

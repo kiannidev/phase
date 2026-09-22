@@ -5,7 +5,7 @@ import type { DeckEntry } from "../../services/deckParser";
 import type { ParsedItem, UnsupportedCard } from "../../services/deckCompatibility";
 import { hasAlternatePrintingsSync, resolveOracleIdSync } from "../../services/scryfall";
 import { usePrintingsLoaded } from "../../hooks/usePrintingsLoaded";
-import { mouseHoverPreview } from "./hoverPreview";
+import { mouseHoverPreview, type CardHoverHandler } from "./hoverPreview";
 
 const CATEGORY_COLORS: Record<string, string> = {
   keyword: "text-sky-400",
@@ -57,7 +57,7 @@ export interface CardEntryRowProps {
    *  permitting the increment so a not-yet-loaded limit never blocks a legal
    *  add. */
   canIncrement?: (name: string) => boolean;
-  onCardHover?: (cardName: string | null) => void;
+  onCardHover?: CardHoverHandler;
   unsupported?: UnsupportedCard;
   onChooseArt?: (cardName: string, x: number, y: number) => void;
   /** When defined and the card is commander-eligible in the current format,
@@ -67,14 +67,14 @@ export interface CardEntryRowProps {
   /** Eligibility predicate paired with `onSetAsCommander`. The row consults it
    *  per-entry so the parent doesn't have to fan out card-data lookups. */
   isCommanderEligible?: (name: string) => boolean;
-  /** "compact" (default) keeps the row controls hover-revealed — used by the
-   *  in-game BO3 sideboard modal. "comfortable" makes them always-visible and
-   *  touch-sized for the deck builder (hover reveal is invisible on touch). */
+  /** "compact" (default) keeps the row controls hover-revealed. "comfortable"
+   *  makes them always-visible and touch-sized, which is what any surface
+   *  reachable on touch needs (hover reveal is invisible there). */
   density?: "comfortable" | "compact";
   /** When provided, the alternate-art (✦) badge becomes a tap target that
    *  opens the printing picker — the touch path for art selection (right-click
    *  context menus don't exist on touch). */
-  onOpenArtPicker?: (name: string) => void;
+  onOpenArtPicker?: (name: string, launcher: HTMLButtonElement) => void;
   /** Destination name shown on the move button (e.g. "Sideboard",
    *  "Maybeboard", "Main"). When provided, the move control renders as a
    *  labelled "→ {label}" pill so the move target is explicit on touch (where
@@ -117,6 +117,7 @@ export function CardEntryRow({
   const printingsLoaded = usePrintingsLoaded();
   const oracleId = printingsLoaded ? resolveOracleIdSync(entry.name) : null;
   const hasAlternates = oracleId ? hasAlternatePrintingsSync(oracleId) : false;
+  const hoverInfo = { name: entry.name, sourcePrinting: entry.sourcePrinting };
   // Labelled "→ {target}" pill when the destination name is known (deck
   // builder); bare directional arrow otherwise (BO3 sideboard modal). The
   // labelled variant widens to fit text, so it overrides the square sizing.
@@ -147,8 +148,8 @@ export function CardEntryRow({
             own actions. */}
         <span
           className={`${unsupported ? "text-amber-200/80" : "text-gray-300"} ${onCardHover ? "cursor-pointer" : ""}`}
-          onClick={() => onCardHover?.(entry.name)}
-          {...mouseHoverPreview(onCardHover, entry.name)}
+          onClick={() => onCardHover?.(hoverInfo)}
+          {...mouseHoverPreview(onCardHover, hoverInfo)}
         >
           <span className="mr-1 text-gray-500">{entry.count}x</span>
           {entry.name}
@@ -167,7 +168,10 @@ export function CardEntryRow({
             onOpenArtPicker ? (
               <button
                 type="button"
-                onClick={(e) => { e.stopPropagation(); onOpenArtPicker(entry.name); }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onOpenArtPicker(entry.name, e.currentTarget);
+                }}
                 className="ml-1 inline-flex h-4 w-4 items-center justify-center rounded-sm bg-sky-500/60 text-[9px] leading-none text-sky-100 hover:bg-sky-500/80"
                 aria-label={t("card.chooseArtFor", { name: entry.name })}
                 title={t("card.alternateArtTap")}

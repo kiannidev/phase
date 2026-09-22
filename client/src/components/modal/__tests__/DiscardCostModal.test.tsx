@@ -1,6 +1,10 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import type {
+  InteractionId,
+  ViewerInteraction,
+} from "../../../adapter/generated/interaction/index.ts";
 import type { GameObject, WaitingFor } from "../../../adapter/types.ts";
 import { useGameStore } from "../../../stores/gameStore.ts";
 import { useMultiplayerStore } from "../../../stores/multiplayerStore.ts";
@@ -67,7 +71,11 @@ function makeObject(id: number, name: string, zone: GameObject["zone"] = "Hand")
   });
 }
 
-function setWaitingFor(waitingFor: WaitingFor, objects?: Record<string, GameObject>) {
+function setWaitingFor(
+  waitingFor: WaitingFor,
+  objects?: Record<string, GameObject>,
+  viewerInteraction: ViewerInteraction | null = null,
+) {
   const state = buildGameState({
     objects: objects ?? {},
     waiting_for: waitingFor,
@@ -78,7 +86,46 @@ function setWaitingFor(waitingFor: WaitingFor, objects?: Record<string, GameObje
     gameMode: "online",
     gameState: state,
     waitingFor,
+    viewerInteraction,
   });
+}
+
+function effectZoneChoiceInteraction(interactionId: string): ViewerInteraction {
+  return {
+    waitingForKind: { simultaneous: null, terminal: false, code: "select" },
+    authorizedSubmitters: [0],
+    canSubmit: true,
+    autoPassRecommended: false,
+    opportunities: [
+      {
+        interactionId: interactionId as InteractionId,
+        response: {
+          type: "schema",
+          data: {
+            spec: {
+              type: "select",
+              data: {
+                constraint: { type: "count", data: { min: 1, max: 1 } },
+                confirm: "explicit",
+              },
+            },
+            candidates: [],
+          },
+        },
+        surfaces: [],
+        progress: {
+          selected: 0,
+          minimum: 1,
+          maximum: 1,
+          aggregate: null,
+          confirmable: false,
+        },
+      },
+    ],
+    attachmentFans: {},
+    attachmentViews: {},
+    availability: { type: "inputRequired" },
+  };
 }
 
 describe("Discard cost modal", () => {
@@ -155,7 +202,7 @@ describe("Discard cost modal", () => {
         type: "BlightChoice",
         data: {
           player: 0,
-          count: 1,
+          counters: 1,
           creatures: [],
           pending_cast: buildPendingCast(),
         },
@@ -199,7 +246,7 @@ describe("Discard cost modal", () => {
     expect(screen.getByText("Discard for mana ability")).toBeInTheDocument();
   });
 
-  it("describes untap selection without saying sacrifice", () => {
+  it("defers battlefield untap selection to the native board layer", () => {
     setWaitingFor(
       buildEffectZoneChoiceWaitingFor({
           player: 0,
@@ -219,9 +266,7 @@ describe("Discard cost modal", () => {
 
     render(<CardChoiceModal />);
 
-    expect(screen.getByText("Untap")).toBeInTheDocument();
-    expect(screen.getByText("Choose up to 5 permanents to untap")).toBeInTheDocument();
-    expect(screen.queryByText(/sacrifice/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading")).toBeNull();
   });
 
   it("describes optional attach selection without saying sacrifice and allows decline", () => {
@@ -300,6 +345,127 @@ describe("Discard cost modal", () => {
     expect(screen.queryByText(/battlefield/i)).not.toBeInTheDocument();
   });
 
+  it("clears a prior zone-choice pick before confirming the next prompt", () => {
+    const firstPrompt = buildEffectZoneChoiceWaitingFor({
+      player: 0,
+      cards: [10],
+      count: 1,
+      min_count: 0,
+      up_to: false,
+      source_id: 1,
+      effect_kind: "ChangeZone",
+      zone: "Graveyard",
+      destination: "Battlefield",
+    });
+    const secondPrompt = buildEffectZoneChoiceWaitingFor({
+      player: 0,
+      cards: [11],
+      count: 1,
+      min_count: 0,
+      up_to: false,
+      source_id: 1,
+      effect_kind: "ChangeZone",
+      zone: "Graveyard",
+      destination: "Battlefield",
+    });
+    const objects: Record<string, GameObject> = {
+      10: { ...makeObject(10, "Midnight Reaper"), zone: "Graveyard" },
+      11: { ...makeObject(11, "Verdant Sun's Avatar"), zone: "Graveyard" },
+    };
+
+    setWaitingFor(firstPrompt, objects);
+    render(<CardChoiceModal />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Loading Midnight Reaper" }));
+
+    act(() => {
+      setWaitingFor(secondPrompt, objects);
+    });
+
+    const confirm = screen.getByRole("button", { name: "Put (0/1)" });
+    expect(confirm).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Loading Verdant Sun's Avatar" }));
+    fireEvent.click(confirm);
+
+    expect(dispatchMock).toHaveBeenCalledWith({
+      type: "SelectCards",
+      data: { cards: [11] },
+    });
+  });
+
+  it("retains a zone-choice pick when the same prompt is refreshed", () => {
+    const prompt = buildEffectZoneChoiceWaitingFor({
+      player: 0,
+      cards: [10],
+      count: 1,
+      min_count: 0,
+      up_to: false,
+      source_id: 1,
+      effect_kind: "ChangeZone",
+      zone: "Graveyard",
+      destination: "Battlefield",
+    });
+    const objects: Record<string, GameObject> = {
+      10: { ...makeObject(10, "Midnight Reaper"), zone: "Graveyard" },
+    };
+    const interaction = effectZoneChoiceInteraction("zone-choice-1");
+
+    setWaitingFor(prompt, objects, interaction);
+    render(<CardChoiceModal />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Loading Midnight Reaper" }));
+
+    act(() => {
+      setWaitingFor(
+        { ...prompt, data: { ...prompt.data } },
+        objects,
+        interaction,
+      );
+    });
+
+    const confirm = screen.getByRole("button", { name: "Put (1/1)" });
+    expect(confirm).toBeEnabled();
+    fireEvent.click(confirm);
+
+    expect(dispatchMock).toHaveBeenCalledWith({
+      type: "SelectCards",
+      data: { cards: [10] },
+    });
+  });
+
+  it("clears a pick for a distinct zone-choice interaction with identical data", () => {
+    const prompt = buildEffectZoneChoiceWaitingFor({
+      player: 0,
+      cards: [10],
+      count: 1,
+      min_count: 0,
+      up_to: false,
+      source_id: 1,
+      effect_kind: "ChangeZone",
+      zone: "Graveyard",
+      destination: "Battlefield",
+    });
+    const objects: Record<string, GameObject> = {
+      10: { ...makeObject(10, "Midnight Reaper"), zone: "Graveyard" },
+    };
+
+    setWaitingFor(prompt, objects, effectZoneChoiceInteraction("zone-choice-1"));
+    render(<CardChoiceModal />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Loading Midnight Reaper" }));
+
+    act(() => {
+      setWaitingFor(
+        { ...prompt, data: { ...prompt.data } },
+        objects,
+        effectZoneChoiceInteraction("zone-choice-2"),
+      );
+    });
+
+    expect(screen.getByRole("button", { name: "Put (0/1)" })).toBeDisabled();
+  });
+
   it("allocates any-combination mana with color steppers", () => {
     setWaitingFor({
       type: "ChooseManaColor",
@@ -373,6 +539,43 @@ describe("Discard cost modal", () => {
       data: {
         choice: { type: "Combination", data: ["White", "White"] },
       },
+    });
+  });
+
+  it("uses available width for single-color choices and dispatches the selected color", () => {
+    setWaitingFor({
+      type: "ChooseManaColor",
+      data: {
+        player: 0,
+        choice: {
+          type: "SingleColor",
+          data: { options: ["White", "Blue", "Black", "Red", "Green", "Colorless"] },
+        },
+        context: { type: "ManaAbility", data: {} },
+      },
+    });
+
+    render(<CardChoiceModal />);
+
+    const dialog = screen
+      .getByRole("heading", { name: "Choose Mana Color" })
+      .closest(".card-scale-reset")?.parentElement;
+    expect(dialog).toHaveClass("w-full", "lg:w-fit", "max-w-md");
+
+    const green = screen.getByRole("button", { name: "Green" });
+    expect(green.parentElement).toHaveClass(
+      "w-full",
+      "flex-wrap",
+      "lg:w-fit",
+      "lg:flex-nowrap",
+    );
+
+    fireEvent.click(green);
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+
+    expect(dispatchMock).toHaveBeenCalledWith({
+      type: "ChooseManaColor",
+      data: { choice: { type: "SingleColor", data: "Green" }, count: 1 },
     });
   });
 

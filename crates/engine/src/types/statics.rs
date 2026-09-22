@@ -719,6 +719,40 @@ pub(crate) fn is_cost_modify_mode_reduce(mode: &CostModifyMode) -> bool {
     matches!(mode, CostModifyMode::Reduce)
 }
 
+/// CR 118.7b/c/d: How far a mana-cost REDUCTION reaches when one of its colored
+/// or colorless units finds no matching component left in the cost being reduced.
+///
+/// Orthogonal to [`CostModifyMode`], which is the direction axis. This is the
+/// reach axis, and it is meaningful only for [`CostModifyMode::Reduce`] — a
+/// `Raise` only ever adds mana, and `Minimum` is a floor, so neither can strand
+/// a unit that needs a spillover decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum CostReductionReach {
+    /// CR 118.7b/c/d (the rules default): a reduction unit whose color/colorless
+    /// component is absent from the cost (118.7b), or that exceeds what that
+    /// component had left (118.7c/d), reduces GENERIC mana instead. Aang, Master
+    /// of Elements — "Spells you cast cost {W}{U}{B}{R}{G} less to cast. (This
+    /// can reduce generic costs.)" — is the card that makes this visible.
+    #[default]
+    SpillsToGeneric,
+    /// "This effect reduces only the amount of colored mana you pay." The card
+    /// overrides CR 118.7b/c/d: an unmatched or excess unit is simply lost and
+    /// never touches the generic component. Morophon, the Boundless (whose
+    /// ruling spells it out: {4}{R}{W}{W} becomes {4}{W}), Edgewalker and
+    /// Ragemonger (whose reminder text gives worked examples), Bard Class,
+    /// Head of the Class, Nekrataal Avatar, Vorthos, Steward of Myth, and the
+    /// Defiler cycle ("... only the amount of blue mana you pay").
+    ColoredManaOnly,
+}
+
+impl CostReductionReach {
+    /// Serde `skip_serializing_if` for the CR 118.7b default, so card data that
+    /// predates this axis round-trips byte-identically.
+    pub(crate) fn is_spills_to_generic(&self) -> bool {
+        matches!(self, CostReductionReach::SpillsToGeneric)
+    }
+}
+
 /// CR 116.2: Stable registry string for a [`SpecialAction`], used by the
 /// `StaticMode::ReduceActionCost` Display/FromStr round-trip.
 fn special_action_registry_str(action: SpecialAction) -> &'static str {
@@ -804,6 +838,126 @@ pub enum AttackDefenderScope {
     /// combat"). Resolved against the static source's controller at the
     /// declare-attackers step.
     Controller,
+    /// CR 508.5: the specific permanent (planeswalker or battle) carrying this
+    /// static, as opposed to any other permanent its controller happens to
+    /// defend (The Eternal Wanderer: "No more than one creature can attack
+    /// ~ each combat"). Unlike `Controller`, this does NOT restrict attacks
+    /// against the source's controller directly or against that controller's
+    /// other planeswalkers/battles — only attacks declared against THIS
+    /// object. Resolved against the static source's live `ObjectId` at the
+    /// declare-attackers step (re-scanned each combat via
+    /// `battlefield_active_statics`, so no snapshot is needed even if the
+    /// permanent leaves and re-enters the battlefield between combats).
+    ThisPermanent,
+}
+
+/// CR 508.1d + CR 611.2 / CR 604.2: how the required defending player of a
+/// [`StaticMode::MustAttackDefender`] requirement is determined. Struct variants
+/// (NOT tuple/newtype) so internal `#[serde(tag = "type")]` tagging stays valid
+/// — this mirrors [`super::ability::QuantityExpr`] (`Fixed { value }` |
+/// `Ref { qty }`), which uses struct variants for the same serde reason: a
+/// newtype variant wrapping a `#[serde(transparent)]` scalar (`PlayerId(u8)`)
+/// or an already-`#[serde(tag)]` map (`PlayerFilter`) cannot be internally
+/// tagged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type")]
+pub enum RequiredDefender {
+    /// CR 611.2: the specific player determined during the resolution of the
+    /// spell/ability that generates the continuous effect (`Effect::ForceAttack`,
+    /// Encore) and stored as a literal. Not re-evaluated — contrast the static
+    /// form below (CR 611.2c: "this works differently than a continuous effect
+    /// from a static ability").
+    Fixed { player: PlayerId },
+    /// CR 604.1 / CR 604.2 + CR 508.1d: a player CLASS re-evaluated each
+    /// declare-attackers step against live game state (Galactus, "an opponent
+    /// with the most life among your opponents"). A static-ability continuous
+    /// effect is continuously applied; the requirement is re-checked each
+    /// declare-attackers step. Resolved via `game::effects::matches_player_scope`.
+    Matching { filter: PlayerFilter },
+    /// CR 506.3 + CR 508.1 + CR 611.2: a specific PERMANENT defender. CR 506.3
+    /// makes "a player, a planeswalker, or a battle" one defender category, and
+    /// the engine already models that category as one type
+    /// (`combat::AttackTarget`), so the required-defender axis spans it rather
+    /// than forking a parallel player-only/permanent-only static pair. Gideon
+    /// Jura: "+2: During target opponent's next turn, creatures that player
+    /// controls attack Gideon Jura if able."
+    ///
+    /// The permanent is snapshotted at resolution (CR 611.2) as an
+    /// [`ObjectIncarnationRef`], NOT a bare `ObjectId` — CR 400.7: a permanent
+    /// that leaves and re-enters the battlefield is a new object, and the engine
+    /// reuses `ObjectId` as storage identity, so a bare id would let a
+    /// re-entered Gideon inherit a requirement aimed at the old one. Mirrors
+    /// [`StaticMode::MustBlockAttacker`]'s identical pin.
+    ///
+    /// Which `AttackTarget` kind the permanent presents is derived LIVE at each
+    /// declare-attackers step from its current card types, never pre-committed
+    /// here: a Gideon that animated itself is still a planeswalker (CR 306.1)
+    /// and still attackable, while one that has left the battlefield is not
+    /// attackable at all. CR 508.1d then simply drops the unobeyable
+    /// requirement — matching the official ruling: "If a creature controlled by
+    /// the affected player can't attack Gideon Jura (because he's no longer on
+    /// the battlefield, for example), that player may have it attack you,
+    /// another one of your planeswalkers, or nothing at all."
+    Permanent { permanent: ObjectIncarnationRef },
+}
+
+impl From<PlayerId> for RequiredDefender {
+    fn from(player: PlayerId) -> Self {
+        Self::Fixed { player }
+    }
+}
+
+/// CR 611.2 / CR 604.2: Back-compatible `Deserialize` for [`RequiredDefender`].
+/// Accepts BOTH the canonical tagged struct form (`{"type":"Fixed","player":N}`
+/// / `{"type":"Matching","filter":{…}}`) and the legacy bare `PlayerId` integer
+/// (`N`) that pre-`RequiredDefender` `MustAttackPlayer` snapshots stored when the
+/// field was a plain `PlayerId`. Mirrors the `QuantityExpr` migration so every
+/// serialized static round-trips without regenerating captured data. `Serialize`
+/// stays derived (tagged) so new writes are canonical. Struct variants keep this
+/// sound: `{"type":"Matching","filter":{"type":"PlayerAttribute",…}}` nests the
+/// `PlayerFilter` map under `filter`, so the inner `type` never collides with the
+/// outer tag — the exact failure a newtype variant would have.
+impl<'de> Deserialize<'de> for RequiredDefender {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match &value {
+            // Legacy: a bare integer is the old concrete `PlayerId`.
+            serde_json::Value::Number(n) => {
+                let raw = n.as_u64().ok_or_else(|| {
+                    serde::de::Error::custom("expected u8 PlayerId for RequiredDefender")
+                })?;
+                let id = u8::try_from(raw).map_err(|_| {
+                    serde::de::Error::custom("RequiredDefender PlayerId out of u8 range")
+                })?;
+                Ok(RequiredDefender::Fixed {
+                    player: PlayerId(id),
+                })
+            }
+            // Canonical tagged form — delegate to a derived mirror.
+            serde_json::Value::Object(_) => {
+                #[derive(Deserialize)]
+                #[serde(tag = "type")]
+                enum Tagged {
+                    Fixed { player: PlayerId },
+                    Matching { filter: PlayerFilter },
+                    Permanent { permanent: ObjectIncarnationRef },
+                }
+                let tagged: Tagged =
+                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                Ok(match tagged {
+                    Tagged::Fixed { player } => RequiredDefender::Fixed { player },
+                    Tagged::Matching { filter } => RequiredDefender::Matching { filter },
+                    Tagged::Permanent { permanent } => RequiredDefender::Permanent { permanent },
+                })
+            }
+            _ => Err(serde::de::Error::custom(
+                "expected an integer or a tagged object for RequiredDefender",
+            )),
+        }
+    }
 }
 
 /// All static ability modes from Forge's static ability registry.
@@ -845,7 +999,12 @@ pub enum StaticMode {
     /// defending-player cap ("no more than `max` creatures can attack *you*
     /// each combat" — Judoon Enforcers), restricting only attackers whose
     /// defending player (CR 508.5) is this static's controller, so opponents
-    /// may still be attacked freely (CR 802.1 multiplayer range of influence).
+    /// may still be attacked freely (CR 802.1 multiplayer range of influence);
+    /// `Some(AttackDefenderScope::ThisPermanent)` is a defending-PERMANENT cap
+    /// ("no more than `max` creatures can attack ~ each combat" — The Eternal
+    /// Wanderer), restricting only attackers declared against this static's
+    /// own source object, leaving the source's controller and every other
+    /// permanent freely attackable.
     MaxAttackersEachCombat {
         max: u32,
         #[serde(default)]
@@ -941,6 +1100,32 @@ pub enum StaticMode {
     CantCauseSacrificeOrExile {
         cause: ProhibitionScope,
     },
+    /// CR 701.9a (discard) + CR 701.21a (sacrifice) + CR 609.3 + CR 109.5:
+    /// "Spells and abilities <cause> can't cause you to <action list>." Sigarda,
+    /// Host of Herons / Tajuru Preserver ("... sacrifice permanents") and
+    /// Tamiyo, Collector of Tales ("... discard cards or sacrifice
+    /// permanents"). Unlike `CantCauseSacrificeOrExile` (triggered abilities
+    /// ONLY, and filtered to a specific `StaticDefinition::affected` object
+    /// subset), this protects the player wholesale against ANY spell or
+    /// ability controlled by a player matching `cause` — not just triggered
+    /// abilities — and is not filtered by which permanent/card would be
+    /// affected. When a muzzled spell/ability would force the protected
+    /// player to perform a listed action, that action is treated as
+    /// impossible for them and produces no game-state change for that player
+    /// (CR 609.3: an effect that can't do something does only as much as
+    /// possible) — a scoped multi-player instruction (e.g. "each player
+    /// sacrifices/discards") still affects every OTHER player normally.
+    ///
+    /// `actions` reuses [`CostCategory`] — already the single-authority
+    /// classifier over "what kind of action is this" for ability costs (see
+    /// its doc comment) — rather than a parallel enum for the same set of
+    /// keyword actions (CR 701.9 discard, CR 701.21 sacrifice). A future
+    /// forced action (e.g. "can't cause you to pay life") slots in as an
+    /// additional `CostCategory` variant rather than a new architecture.
+    CantCauseForcedAction {
+        cause: ProhibitionScope,
+        actions: Vec<CostCategory>,
+    },
     CastWithFlash,
     /// CR 701.38d: While voting, the controller of this permanent may vote an
     /// additional time. Each active source grants +1 to the controller's
@@ -1001,9 +1186,8 @@ pub enum StaticMode {
     ///
     /// `frequency`: None = all activations; Some(OncePerTurn) = first per turn.
     ///
-    /// Parser-complete structured gap; runtime hook deferred.
-    /// CR 702.29a (docs/MagicCompRules.txt:4202), CR 702.122a (docs/MagicCompRules.txt:4870),
-    /// CR 118.9 (docs/MagicCompRules.txt:1014).
+    /// Parser-complete structured gap; runtime hook deferred. CR 702.29a, CR 702.122a,
+    /// CR 118.9.
     AlternativeKeywordCost {
         keyword: KeywordKind,
         cost: AbilityCost,
@@ -1020,8 +1204,21 @@ pub enum StaticMode {
         spell_filter: Option<TargetFilter>,
         /// Dynamic multiplier (e.g. "for each [thing] you control").
         /// Only meaningful for `Reduce` and `Raise` — always `None` for `Minimum`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "super::ability::deserialize_optional_quantity_ref_compat"
+        )]
         dynamic_count: Option<QuantityRef>,
+        /// CR 118.7b/c/d: whether an unmatched colored/colorless reduction unit
+        /// spills over into generic mana. Only meaningful for `Reduce`.
+        /// `#[serde(default)]` keeps card data serialized before this axis
+        /// existed reading as the CR 118.7b default.
+        #[serde(
+            default,
+            skip_serializing_if = "CostReductionReach::is_spills_to_generic"
+        )]
+        reach: CostReductionReach,
     },
     /// CR 601.2f + CR 118.8: Imposes an additional non-mana cost on spells or
     /// spells matching `spell_filter`. Distinct from [`StaticMode::ModifyCost`],
@@ -1061,7 +1258,11 @@ pub enum StaticMode {
         minimum_mana: Option<u32>,
         /// CR 601.2f: Dynamic multiplier for the adjustment (e.g., "for each Dragon you control").
         /// When present, the total adjustment is `amount * resolve_quantity(dynamic_count)`.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "super::ability::deserialize_optional_quantity_ref_compat"
+        )]
         dynamic_count: Option<QuantityRef>,
         /// CR 605.1a: "unless they're mana abilities" / "that aren't mana abilities"
         /// exemption (Suppression Field, Zirda the Dawnwaker). Reuses the same
@@ -1145,15 +1346,34 @@ pub enum StaticMode {
     /// runtime-implemented; other arms are inert.
     PlayerProtection(super::keywords::ProtectionTarget),
     MustAttack,
-    /// CR 508.1d: This creature must attack a *specific* player if able ("target
-    /// creature attacks you this combat if able"; Alluring Siren, Dulcet Sirens).
-    /// Unlike the generic
-    /// [`MustAttack`] (attack any defender), this carries the `PlayerId` that must
-    /// be attacked. Data-carrying variant — not registry-registered (see
-    /// `coverage::is_data_carrying_static`); enforced by direct pattern-match in
-    /// `combat.rs` declare-attackers validation. Mirrors [`MustBlockAttacker`].
-    MustAttackPlayer {
-        player: PlayerId,
+    /// CR 508.1d: This creature must attack a *specific* defender if able. Per
+    /// CR 506.3 a defender is "a player, a planeswalker, or a battle"; the
+    /// required one is a [`RequiredDefender`]:
+    /// - `Fixed { player }` — a resolution-time snapshot id (Alluring Siren,
+    ///   Dulcet Sirens, Encore; grafted via `Effect::ForceAttack`), CR 611.2.
+    /// - `Matching { filter }` — a printed static's live player class re-evaluated
+    ///   each declare-attackers step (Galactus, "an opponent with the most life
+    ///   among your opponents"), CR 604.1 / CR 604.2.
+    /// - `Permanent { permanent }` — a snapshotted planeswalker/battle (Gideon
+    ///   Jura's "+2: … creatures that player controls attack Gideon Jura if
+    ///   able"), CR 611.2 + CR 400.7.
+    ///
+    /// Unlike the generic [`MustAttack`] (attack any defender), this narrows the
+    /// requirement to specific defenders. Data-carrying variant — not
+    /// registry-registered (see `coverage::is_data_carrying_static`); enforced by
+    /// direct pattern-match in `combat.rs` declare-attackers validation (the
+    /// resolver at `must_attack_defender_directives_for_creature` resolves the
+    /// `RequiredDefender` to concrete `AttackTarget`s).
+    /// Mirrors [`MustBlockAttacker`].
+    ///
+    /// `serde(alias)`: pre-widening snapshots (game-state saves, P2P resume,
+    /// undo journals) wrote this variant as `MustAttackPlayer` with a `player`
+    /// field, so both the variant name and the field keep a read alias. New
+    /// writes emit the canonical names.
+    #[serde(alias = "MustAttackPlayer")]
+    MustAttackDefender {
+        #[serde(alias = "player")]
+        defender: RequiredDefender,
     },
     MustBlock,
     /// CR 702.39a / CR 509.1c: This creature must block a *specific* attacker if
@@ -1576,6 +1796,11 @@ pub enum StaticMode {
     /// only if the variant population grows beyond two.
     SuppressTriggers {
         source_filter: TargetFilter,
+        /// Optional filter over the permanent whose triggered ability would
+        /// fire. `None` retains Torpor Orb's event-wide suppression; `Some`
+        /// models Elesh Norn's controller-scoped restriction.
+        #[serde(default)]
+        trigger_source_filter: Option<TargetFilter>,
         events: Vec<SuppressedTriggerEvent>,
     },
 
@@ -1615,7 +1840,7 @@ pub enum StaticMode {
     /// into one attach gate, so a single typed variant covers both Equipment
     /// (CR 301.5) and Aura (CR 303.4) — the `filter` (a reused `TargetFilter`)
     /// expresses "a creature with power N or greater", "a legendary creature",
-    /// "an {type}", etc. Corpus: Strata Scythe, Brass Knuckles ("a creature with
+    /// "an {type}", etc. Corpus: O-Naginata, Gate Smasher ("a creature with
     /// power/toughness N or greater"), Konda's Banner ("a legendary creature").
     ///
     /// Data-carrying variant (holds `TargetFilter`) — not registry-registered
@@ -1826,9 +2051,10 @@ pub enum StaticMode {
     LegendRuleDoesntApply,
     /// Speed may increase beyond 4, and 4+ still counts as max speed for that player.
     SpeedCanIncreaseBeyondFour,
-    /// CR 118.12a: Defiler cycle — "As an additional cost to cast [color] permanent
-    /// spells, you may pay [N] life. Those spells cost {C} less to cast."
-    /// Optional life payment during casting with conditional mana reduction.
+    /// CR 118.8 + CR 118.8b: Defiler cycle — "As an additional cost to cast [color]
+    /// permanent spells, you may pay [N] life. Those spells cost {C} less to cast."
+    /// The life payment is an OPTIONAL additional cost (CR 118.8b), announced per
+    /// CR 601.2b, with the conditional mana reduction constrained by CR 118.7b/c/d.
     DefilerCostReduction {
         /// The color of permanent spells this applies to
         color: ManaColor,
@@ -1836,6 +2062,16 @@ pub enum StaticMode {
         life_cost: u32,
         /// Mana cost reduction if life is paid
         mana_reduction: ManaCost,
+        /// CR 118.7b/c/d: all five printed Defilers close with "This effect
+        /// reduces only the amount of [color] mana you pay", which is carried
+        /// here rather than assumed. The parser accepts the template without
+        /// that rider too — MTGJSON sometimes splits the Oracle text across
+        /// lines — and such a shape correctly keeps the CR 118.7b default.
+        #[serde(
+            default,
+            skip_serializing_if = "CostReductionReach::is_spills_to_generic"
+        )]
+        reach: CostReductionReach,
     },
     /// CR 614.1b + CR 614.10: "Skip your [step] step" — replacement effect that replaces
     /// the named step with nothing. Parameterized by Phase to cover draw/untap/upkeep.
@@ -2053,6 +2289,7 @@ pub enum StaticModeKind {
     RestrictLibrarySearchToTop,
     ControlPlayersDuringOwnLibrarySearch,
     CantCauseSacrificeOrExile,
+    CantCauseForcedAction,
     CastWithFlash,
     GrantsExtraVote,
     GrantsExtraVillainousChoice,
@@ -2070,7 +2307,7 @@ pub enum StaticModeKind {
     CantLoseLife,
     PlayerProtection,
     MustAttack,
-    MustAttackPlayer,
+    MustAttackDefender,
     MustBlock,
     MustBlockAttacker,
     CantDraw,
@@ -2191,6 +2428,7 @@ impl StaticMode {
             StaticMode::CantCauseSacrificeOrExile { .. } => {
                 StaticModeKind::CantCauseSacrificeOrExile
             }
+            StaticMode::CantCauseForcedAction { .. } => StaticModeKind::CantCauseForcedAction,
             StaticMode::CastWithFlash => StaticModeKind::CastWithFlash,
             StaticMode::GrantsExtraVote => StaticModeKind::GrantsExtraVote,
             StaticMode::GrantsExtraVillainousChoice => StaticModeKind::GrantsExtraVillainousChoice,
@@ -2208,7 +2446,7 @@ impl StaticMode {
             StaticMode::CantLoseLife => StaticModeKind::CantLoseLife,
             StaticMode::PlayerProtection(..) => StaticModeKind::PlayerProtection,
             StaticMode::MustAttack => StaticModeKind::MustAttack,
-            StaticMode::MustAttackPlayer { .. } => StaticModeKind::MustAttackPlayer,
+            StaticMode::MustAttackDefender { .. } => StaticModeKind::MustAttackDefender,
             StaticMode::MustBlock => StaticModeKind::MustBlock,
             StaticMode::MustBlockAttacker { .. } => StaticModeKind::MustBlockAttacker,
             StaticMode::CantDraw { .. } => StaticModeKind::CantDraw,
@@ -2384,7 +2622,20 @@ impl Hash for StaticMode {
             }
             StaticMode::ExtraBlockers { count } => count.hash(state),
             StaticMode::MustBlockAttacker { attacker } => attacker.hash(state),
-            StaticMode::MustAttackPlayer { player } => player.hash(state),
+            // CR 508.1d: `RequiredDefender::Matching` wraps a non-Hash
+            // `PlayerFilter`; hash the discriminant for every arm and the
+            // concrete id only for the hashable ones (precedent: the non-Hash
+            // TargetFilter arms below). Equal values still hash equal.
+            StaticMode::MustAttackDefender { defender } => {
+                std::mem::discriminant(defender).hash(state);
+                match defender {
+                    RequiredDefender::Fixed { player } => player.hash(state),
+                    // CR 400.7: the incarnation pin is fully hashable, so a
+                    // permanent defender contributes its exact identity.
+                    RequiredDefender::Permanent { permanent } => permanent.hash(state),
+                    RequiredDefender::Matching { .. } => {}
+                }
+            }
             StaticMode::MaxAttackersEachCombat { max, defender } => {
                 max.hash(state);
                 defender.hash(state);
@@ -2517,6 +2768,11 @@ impl Hash for StaticMode {
             | StaticMode::CantSearchLibrary { .. }
             | StaticMode::ControlPlayersDuringOwnLibrarySearch { .. }
             | StaticMode::CantCauseSacrificeOrExile { .. }
+            // CR 701.9a + CR 701.21a: data-carrying (`actions: Vec<CostCategory>`
+            // is not Hash-collision-safe to enumerate); consumed by direct match
+            // in game/static_abilities.rs::forced_action_muzzled, never used as a
+            // HashMap key.
+            | StaticMode::CantCauseForcedAction { .. }
             // CR 614.1c: data-carrying (CounterType + count); consumed by direct
             // match in change_zone.rs, never used as a HashMap key.
             | StaticMode::EntersWithAdditionalCounters { .. }
@@ -2566,6 +2822,7 @@ impl StaticMode {
             | StaticMode::RestrictLibrarySearchToTop { .. }
             | StaticMode::ControlPlayersDuringOwnLibrarySearch { .. }
             | StaticMode::CantCauseSacrificeOrExile { .. }
+            | StaticMode::CantCauseForcedAction { .. }
             | StaticMode::CastWithFlash
             | StaticMode::GrantsExtraVote
             | StaticMode::GrantsExtraVillainousChoice
@@ -2583,7 +2840,7 @@ impl StaticMode {
             | StaticMode::CantLoseLife
             | StaticMode::PlayerProtection(_)
             | StaticMode::MustAttack
-            | StaticMode::MustAttackPlayer { .. }
+            | StaticMode::MustAttackDefender { .. }
             | StaticMode::MustBlock
             | StaticMode::MustBlockAttacker { .. }
             | StaticMode::CantDraw { .. }
@@ -2684,6 +2941,9 @@ impl fmt::Display for StaticMode {
                 Some(AttackDefenderScope::Controller) => {
                     write!(f, "MaxAttackersEachCombat({max},Controller)")
                 }
+                Some(AttackDefenderScope::ThisPermanent) => {
+                    write!(f, "MaxAttackersEachCombat({max},ThisPermanent)")
+                }
             },
             StaticMode::MaxBlockersEachCombat { max } => {
                 write!(f, "MaxBlockersEachCombat({max})")
@@ -2700,6 +2960,10 @@ impl fmt::Display for StaticMode {
             }
             StaticMode::CantCauseSacrificeOrExile { cause } => {
                 write!(f, "CantCauseSacrificeOrExile({cause})")
+            }
+            StaticMode::CantCauseForcedAction { cause, actions } => {
+                let parts: Vec<String> = actions.iter().map(|a| format!("{a:?}")).collect();
+                write!(f, "CantCauseForcedAction({cause},{})", parts.join("+"))
             }
             StaticMode::SuppressTriggers { events, .. } => {
                 let parts: Vec<String> = events.iter().map(|e| e.to_string()).collect();
@@ -2780,8 +3044,8 @@ impl fmt::Display for StaticMode {
                 write!(f, "PlayerProtection({target:?})")
             }
             StaticMode::MustAttack => write!(f, "MustAttack"),
-            StaticMode::MustAttackPlayer { player } => {
-                write!(f, "MustAttackPlayer({player:?})")
+            StaticMode::MustAttackDefender { defender } => {
+                write!(f, "MustAttackDefender({defender:?})")
             }
             StaticMode::MustBlock => write!(f, "MustBlock"),
             StaticMode::MustBlockAttacker { attacker } => {
@@ -3154,6 +3418,7 @@ impl FromStr for StaticMode {
                 amount: ManaCost::zero(),
                 spell_filter: None,
                 dynamic_count: None,
+                reach: CostReductionReach::SpillsToGeneric,
             },
             s if s.starts_with("ReduceAbilityCost(") => {
                 // Parse "ReduceAbilityCost([+|-]keyword,amount[,minimum_mana])".
@@ -3251,6 +3516,7 @@ impl FromStr for StaticMode {
                 amount: ManaCost::zero(),
                 spell_filter: None,
                 dynamic_count: None,
+                reach: CostReductionReach::SpillsToGeneric,
             },
             // CR 601.2f: Cost-floor static (Trinisphere class). Legacy unit-string
             // defaults to a zero floor — meaningful instances are constructed via
@@ -3260,6 +3526,7 @@ impl FromStr for StaticMode {
                 amount: ManaCost::zero(),
                 spell_filter: None,
                 dynamic_count: None,
+                reach: CostReductionReach::SpillsToGeneric,
             },
             "CantPayCost" => StaticMode::CantPayCost {
                 who: ProhibitionScope::AllPlayers,
@@ -3625,6 +3892,11 @@ impl FromStr for StaticMode {
                         return Ok(StaticMode::CantCauseSacrificeOrExile { cause });
                     }
                     return Ok(StaticMode::Other(other.to_string()));
+                } else if other.starts_with("CantCauseForcedAction(") {
+                    // CR 701.9a + CR 701.21a: Data-carrying — `actions` has no
+                    // `CostCategory` FromStr inverse, so round-trip preserves the
+                    // discriminant only. Mirrors SuppressTriggers.
+                    return Ok(StaticMode::Other(other.to_string()));
                 } else if other.starts_with("SuppressTriggers(") {
                     // CR 603.2g: Data-carrying — round-trip preserves discriminant only.
                     // Callers that need the full filter/events read from the typed field.
@@ -3785,8 +4057,9 @@ fn parse_static_mode_u32_arg(s: &str, prefix: &str) -> Option<u32> {
         .ok()
 }
 
-/// Round-trip the `MaxAttackersEachCombat(max[,Controller])` Display form back
-/// to its `(max, defender)` arguments. Mirrors the two `fmt::Display` branches.
+/// Round-trip the `MaxAttackersEachCombat(max[,Controller|ThisPermanent])`
+/// Display form back to its `(max, defender)` arguments. Mirrors the three
+/// `fmt::Display` branches.
 fn parse_max_attackers_each_combat_args(s: &str) -> Option<(u32, Option<AttackDefenderScope>)> {
     let args = s
         .strip_prefix("MaxAttackersEachCombat")?
@@ -3796,6 +4069,9 @@ fn parse_max_attackers_each_combat_args(s: &str) -> Option<(u32, Option<AttackDe
         None => Some((args.parse().ok()?, None)),
         Some((max, "Controller")) => {
             Some((max.parse().ok()?, Some(AttackDefenderScope::Controller)))
+        }
+        Some((max, "ThisPermanent")) => {
+            Some((max.parse().ok()?, Some(AttackDefenderScope::ThisPermanent)))
         }
         Some(_) => None,
     }
@@ -3883,6 +4159,7 @@ fn deserialize_legacy_cost_modify_string(s: &str) -> Option<StaticMode> {
         amount: ManaCost::zero(),
         spell_filter: None,
         dynamic_count: None,
+        reach: CostReductionReach::SpillsToGeneric,
     })
 }
 
@@ -3892,8 +4169,15 @@ struct LegacyModifyCostPayload {
     amount: ManaCost,
     #[serde(default)]
     spell_filter: Option<TargetFilter>,
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "super::ability::deserialize_optional_quantity_ref_compat"
+    )]
     dynamic_count: Option<QuantityRef>,
+    /// CR 118.7b: absent in every legacy payload (the axis postdates this
+    /// shape), so it defaults to the rules-default spillover.
+    #[serde(default)]
+    reach: CostReductionReach,
 }
 
 fn deserialize_legacy_modify_cost_object(
@@ -3919,6 +4203,7 @@ fn deserialize_legacy_modify_cost_object(
                 amount: payload.amount,
                 spell_filter: payload.spell_filter,
                 dynamic_count: payload.dynamic_count,
+                reach: payload.reach,
             }
         }),
     )
@@ -4122,6 +4407,10 @@ mod tests {
             StaticMode::MaxAttackersEachCombat {
                 max: 1,
                 defender: Some(AttackDefenderScope::Controller),
+            },
+            StaticMode::MaxAttackersEachCombat {
+                max: 1,
+                defender: Some(AttackDefenderScope::ThisPermanent),
             },
             StaticMode::MaxBlockersEachCombat { max: 3 },
             StaticMode::CantBeBlockedByMoreThan { max: 2 },
@@ -4446,6 +4735,102 @@ mod tests {
         assert_eq!(w2.mode, StaticMode::GrantsExtraVote);
     }
 
+    /// CR 611.2: the grafted `Fixed` required defender serializes to the canonical
+    /// tagged struct form and round-trips.
+    #[test]
+    fn required_defender_fixed_round_trips_tagged() {
+        let d = RequiredDefender::Fixed {
+            player: PlayerId(2),
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(json, r#"{"type":"Fixed","player":2}"#);
+        let back: RequiredDefender = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, d);
+    }
+
+    /// CR 604.1: the `Matching` required defender nests its `#[serde(tag="type")]`
+    /// `PlayerFilter` under `filter`, so the inner `type` never collides with the
+    /// outer tag — the exact serde failure a newtype variant would have hit.
+    #[test]
+    fn required_defender_matching_round_trips_without_tag_collision() {
+        let d = RequiredDefender::Matching {
+            filter: PlayerFilter::Opponent,
+        };
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(json, r#"{"type":"Matching","filter":{"type":"Opponent"}}"#);
+        let back: RequiredDefender = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, d);
+    }
+
+    /// Pre-`RequiredDefender` `MustAttackPlayer` snapshots stored a bare `PlayerId`
+    /// integer; the custom `Deserialize` must load it as `Fixed { player }`.
+    #[test]
+    fn required_defender_deserializes_legacy_bare_player_id() {
+        let back: RequiredDefender = serde_json::from_str("3").unwrap();
+        assert_eq!(
+            back,
+            RequiredDefender::Fixed {
+                player: PlayerId(3)
+            }
+        );
+    }
+
+    /// A malformed tagged object errors rather than silently defaulting.
+    #[test]
+    fn required_defender_rejects_malformed_tag() {
+        assert!(serde_json::from_str::<RequiredDefender>(r#"{"type":"Bogus"}"#).is_err());
+    }
+
+    /// The production serde path: `MustAttackDefender` carries a
+    /// `RequiredDefender`, and EVERY form must round-trip through the derived
+    /// `StaticMode` (de)serialization (card-data export + game-state snapshots).
+    ///
+    /// `Permanent` is the one with a hand-rolled `Deserialize` on both sides —
+    /// `RequiredDefender`'s custom impl plus `ObjectIncarnationRef`'s
+    /// legacy-integer shim — so a missed arm in either would surface only here.
+    #[test]
+    fn must_attack_defender_round_trips_through_static_mode() {
+        for mode in [
+            StaticMode::MustAttackDefender {
+                defender: RequiredDefender::Fixed {
+                    player: PlayerId(1),
+                },
+            },
+            StaticMode::MustAttackDefender {
+                defender: RequiredDefender::Matching {
+                    filter: PlayerFilter::Opponent,
+                },
+            },
+            // CR 506.3 + CR 400.7: the permanent defender, pinned by incarnation.
+            StaticMode::MustAttackDefender {
+                defender: RequiredDefender::Permanent {
+                    permanent: ObjectIncarnationRef::of(crate::types::identifiers::ObjectId(7), 3),
+                },
+            },
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let back: StaticMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(mode, back);
+        }
+    }
+
+    /// Legacy `MustAttackPlayer` snapshots serialized the `player` field as a bare
+    /// `PlayerId` integer; the derived `StaticMode` deser must materialize it as
+    /// `Fixed { player }` via `RequiredDefender`'s back-compat `Deserialize`.
+    #[test]
+    fn must_attack_player_deserializes_legacy_bare_player_field() {
+        let legacy = r#"{"MustAttackPlayer":{"player":1}}"#;
+        let mode: StaticMode = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            mode,
+            StaticMode::MustAttackDefender {
+                defender: RequiredDefender::Fixed {
+                    player: PlayerId(1)
+                },
+            }
+        );
+    }
+
     /// CR 609.4b: `SpendManaAsAnyColor` widened from a unit variant to a struct
     /// variant carrying `spell_filter: Option<TargetFilter>` (Vizier of the
     /// Menagerie spell-class scoping). This pins three serde behaviors:
@@ -4530,8 +4915,56 @@ mod tests {
                     amount: ManaCost::generic(2),
                     spell_filter: None,
                     dynamic_count: None,
+                    reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
                 }
             );
+        }
+    }
+
+    #[test]
+    fn cost_modifiers_migrate_legacy_dynamic_aggregates_and_emit_canonical_non_null_values() {
+        #[derive(serde::Deserialize)]
+        struct Wrapper {
+            #[serde(deserialize_with = "deserialize_static_mode_fwd")]
+            mode: StaticMode,
+        }
+
+        let aggregate = r#"{"type":"Aggregate","function":"Sum","property":"Power","filter":{"type":"Typed","type_filters":["Creature"],"properties":[]}}"#;
+        let tracked = r#"{"type":"TrackedSetAggregate","function":"Max","property":"ManaValue","source":"TriggeringBatch"}"#;
+        let current_modify = format!(
+            r#"{{"ModifyCost":{{"mode":"Reduce","amount":{{"type":"Cost","shards":[],"generic":1}},"spell_filter":null,"dynamic_count":{aggregate}}}}}"#
+        );
+        let current_ability = format!(
+            r#"{{"ReduceAbilityCost":{{"keyword":"activated","amount":2,"dynamic_count":{tracked}}}}}"#
+        );
+        let legacy_reduce = format!(
+            r#"{{"mode":{{"ReduceCost":{{"amount":{{"type":"Cost","shards":[],"generic":3}},"spell_filter":null,"dynamic_count":{aggregate}}}}}}}"#
+        );
+
+        let modes = [
+            serde_json::from_str::<StaticMode>(&current_modify).unwrap(),
+            serde_json::from_str::<StaticMode>(&current_ability).unwrap(),
+            serde_json::from_str::<Wrapper>(&legacy_reduce)
+                .unwrap()
+                .mode,
+        ];
+
+        for mode in modes {
+            let dynamic_count = match &mode {
+                StaticMode::ModifyCost { dynamic_count, .. }
+                | StaticMode::ReduceAbilityCost { dynamic_count, .. } => dynamic_count,
+                other => panic!("expected a cost modifier, got {other:?}"),
+            };
+            assert!(matches!(
+                dynamic_count,
+                Some(QuantityRef::PropertyAggregate(_))
+            ));
+
+            let canonical = serde_json::to_string(&mode).unwrap();
+            assert!(canonical.contains(r#""dynamic_count":{"type":"PropertyAggregate""#));
+            assert!(!canonical.contains(r#""dynamic_count":null"#));
+            assert!(!canonical.contains(r#""type":"Aggregate""#));
+            assert!(!canonical.contains("TrackedSetAggregate"));
         }
     }
 
@@ -4559,6 +4992,7 @@ mod tests {
                     amount: ManaCost::zero(),
                     spell_filter: None,
                     dynamic_count: None,
+                    reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
                 }
             );
         }
@@ -4596,12 +5030,14 @@ mod tests {
         // CR 603.2g: SuppressTriggers display enumerates the event set.
         let mode = StaticMode::SuppressTriggers {
             source_filter: TargetFilter::SelfRef,
+            trigger_source_filter: None,
             events: vec![SuppressedTriggerEvent::EntersBattlefield],
         };
         assert_eq!(mode.to_string(), "SuppressTriggers(EntersBattlefield)");
 
         let mode = StaticMode::SuppressTriggers {
             source_filter: TargetFilter::SelfRef,
+            trigger_source_filter: None,
             events: vec![
                 SuppressedTriggerEvent::EntersBattlefield,
                 SuppressedTriggerEvent::Dies,

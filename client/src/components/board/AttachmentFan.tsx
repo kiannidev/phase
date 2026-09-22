@@ -3,12 +3,18 @@ import { createPortal } from "react-dom";
 import { motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 
+import type { InteractionSubmission } from "../../adapter/generated/interaction/index.ts";
 import type { ObjectId } from "../../adapter/types.ts";
-import { dispatchInteraction } from "../../game/dispatch.ts";
+import { dispatchAction, dispatchInteraction } from "../../game/dispatch.ts";
+import { useCanActForWaitingState } from "../../hooks/usePlayerId.ts";
 import { cardImageLookup, tokenFiltersForObject } from "../../services/cardImageLookup.ts";
-import { useAppNotificationStore } from "../../stores/appToastStore.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
+import {
+  collectObjectActions,
+  deriveActivationAffordances,
+  resolveObjectActivation,
+} from "../../viewmodel/cardActionChoice.ts";
 import { CardImage } from "../card/CardImage.tsx";
 import { fanGeometry, spreadFactor } from "../card/fanGeometry.ts";
 
@@ -52,8 +58,17 @@ function fanCardSizingStyle(cardCount: number): CSSProperties {
  * independent object), and the fan lets the player choose which one without
  * hunting the peek.
  *
- * The fan NEVER invents a choice — each card lights up (cyan) and dispatches
- * only what the engine's live prompt actually offers for that object. Terminal
+ * Membership is not this component's decision. `viewerInteraction.attachmentViews`
+ * publishes what is attached to the host, ordered and both-direction validated by
+ * the engine; the fan renders that list and never scans `attachments` itself.
+ *
+ * The fan NEVER invents a choice either. It has exactly two engine-owned sources
+ * per card: the submission the projection published for that card (mode 1), and
+ * — for a card it published none for — the permanent's own legal-action bucket
+ * read through `deriveActivationAffordances` (mode 2, the same authority the
+ * battlefield ring uses). Both live side by side in one fan, because a published
+ * pick for one attachment says nothing about its neighbours. Each card lights up
+ * (cyan) and dispatches only what one of those two offers for that object.
  * One-step picks close the fan. Multi-step decisions stay in their dedicated
  * engine-authored interaction surfaces instead of asking this display to build
  * a response payload.
@@ -61,34 +76,49 @@ function fanCardSizingStyle(cardCount: number): CSSProperties {
  * convenience opened from the "⧉" badge, not a forced modal.
  */
 export function AttachmentFan() {
-  const { t } = useTranslation("game");
   const hostId = useUiStore((s) => s.attachmentFanHostId);
   const setAttachmentFanHost = useUiStore((s) => s.setAttachmentFanHost);
   const dismissPreview = useUiStore((s) => s.dismissPreview);
-  const showNotification = useAppNotificationStore((s) => s.showNotification);
 
   const objects = useGameStore((s) => s.gameState?.objects);
   const viewerInteraction = useGameStore((s) => s.viewerInteraction);
-  const host = hostId != null ? objects?.[hostId] : undefined;
-  const interactionFan = useMemo(
+  const waitingFor = useGameStore((s) => s.waitingFor);
+  const legalActionsByObject = useGameStore((s) => s.legalActionsByObject);
+  const canActForWaitingState = useCanActForWaitingState();
+  const setPendingAbilityChoice = useUiStore((s) => s.setPendingAbilityChoice);
+  // Mode 2's gate: THE same affordance sets the battlefield ring uses, so the fan
+  // can never offer what the board would not. `AttachmentFan` is a single portaled
+  // overlay (GamePage.tsx:1885), not a per-permanent component — one subscription,
+  // not an O(board) cost.
+  const affordances = useMemo(
     () =>
-      hostId == null
-        ? null
-        : (viewerInteraction?.attachmentFans[hostId] ?? null),
+      deriveActivationAffordances(waitingFor, canActForWaitingState, legalActionsByObject, objects),
+    [waitingFor, canActForWaitingState, legalActionsByObject, objects],
+  );
+  const canActivate = useCallback(
+    (id: ObjectId) =>
+      affordances.activatableObjectIds.has(id) || affordances.manaTappableObjectIds.has(id),
+    [affordances],
+  );
+  const host = hostId != null ? objects?.[hostId] : undefined;
+  // THE membership authority: the engine publishes what is attached to this
+  // host, in its own order, with a submission on any card it published a
+  // one-step pick for. This display neither walks `attachments` nor decides who
+  // belongs in the fan — it renders the projection and counts it.
+  const attachmentView = useMemo(
+    () => (hostId == null ? null : (viewerInteraction?.attachmentViews[hostId] ?? null)),
     [hostId, viewerInteraction],
   );
+  const submissionById = useMemo(() => {
+    const table = new Map<ObjectId, InteractionSubmission>();
+    for (const card of attachmentView?.cards ?? []) {
+      if (card.submission !== null) table.set(card.objectId, card.submission);
+    }
+    return table;
+  }, [attachmentView]);
 
-  // During an interaction, the engine projection is the sole authority for
-  // which direct attachments belong in the fan. The fallback preserves the
-  // existing read-only badge outside an interaction, where no choice is being
-  // exposed and therefore no interaction capability exists to consume.
   const cardIds = host
-    ? [
-        host.id,
-        ...(interactionFan
-          ? interactionFan.children.map((child) => child.objectId)
-          : host.attachments),
-      ]
+    ? [host.id, ...(attachmentView?.cards ?? []).map((card) => card.objectId)]
     : [];
 
   const close = useCallback(() => {
@@ -110,19 +140,67 @@ export function AttachmentFan() {
 
   const handlePick = useCallback(
     (id: ObjectId) => {
-      const child = interactionFan?.children.find((candidate) => candidate.objectId === id);
-      if (!child || !viewerInteraction?.canSubmit) return;
-      void dispatchInteraction(child.submission).then(close).catch((error: unknown) => {
-        showNotification({
-          title: t("actionError.title", { action: t("permanent.fanPick") }),
-          description: error instanceof Error ? error.message : t("actionError.unknownEngineError"),
-        });
-      });
+      // Mode 1 — the engine published a pick for THIS card: forward its opaque
+      // submission, nothing else. Decided per card, because the projection
+      // carries a pick for some members and none for others.
+      const submission = submissionById.get(id);
+      if (submission) {
+        if (!viewerInteraction?.canSubmit) return;
+        void dispatchInteraction(submission).then(close).catch(() => undefined);
+        return;
+      }
+      // Mode 2 — no prompt is open, so the fan is a reachability surface for the
+      // permanent's OWN legal actions. Gate and dispatch both come from the shared
+      // authority the battlefield uses. CR 301.5 / CR 303.4: an attached permanent
+      // is its own object.
+      if (!canActivate(id)) return;
+      const store = useGameStore.getState();
+      const verdict = resolveObjectActivation(
+        collectObjectActions(store.legalActionsByObject, id),
+        store.gameState?.objects[id],
+        affordances,
+        id,
+      );
+      // `close()` MUST precede opening the modal: the fan is a `fixed inset-0
+      // z-[120]` backdrop with an `onClick={close}` catcher and DialogHost anchors
+      // at z-40, so a fan left mounted would both paint over and swallow clicks for
+      // the modal it just opened. It stays inside the two acting arms because
+      // `kind: "none"` must leave the fan exactly as it was.
+      switch (verdict.kind) {
+        case "dispatch":
+          close();
+          void dispatchAction(verdict.action).catch(() => undefined);
+          return;
+        case "choose":
+          close();
+          setPendingAbilityChoice({ objectId: id, actions: verdict.actions });
+          return;
+        case "none":
+          // Reachable only through the render→click staleness window: the ring was
+          // painted from a bucket this click no longer sees. Doing nothing (and
+          // leaving the fan open) is correct.
+          return;
+        default: {
+          // CLAUDE.md "exhaustive match without wildcard fallbacks": a new
+          // ObjectActivation variant is a compile error here, never a silent drop.
+          const _exhaustive: never = verdict;
+          return _exhaustive;
+        }
+      }
     },
-    [close, interactionFan, showNotification, t, viewerInteraction?.canSubmit],
+    [
+      affordances,
+      canActivate,
+      close,
+      submissionById,
+      setPendingAbilityChoice,
+      viewerInteraction?.canSubmit,
+    ],
   );
 
-  if (hostId == null || !host || cardIds.length === 0) return null;
+  // A fan of just the host is not a fan. With no published membership there is
+  // nothing to spread, and this display does not go looking for members itself.
+  if (hostId == null || !host || (attachmentView?.cards.length ?? 0) === 0) return null;
 
   // Shared compact whole-row fan — sized by the total card count so the host +
   // its attachments stay within the overlay's viewport budget.
@@ -155,7 +233,11 @@ export function AttachmentFan() {
             rotation={fan.rotation(i)}
             arcOffset={fan.arc(i)}
             zIndex={i}
-            selectable={interactionFan !== null && id !== host.id}
+            selectable={
+              id !== host.id &&
+              ((submissionById.has(id) && viewerInteraction?.canSubmit === true) ||
+                canActivate(id))
+            }
             onPick={handlePick}
           />
         ))}
@@ -207,6 +289,7 @@ function FanCard({
         if (selectable) onPick(objectId);
       }}
       aria-label={obj.name}
+      data-object-id={objectId}
       className={`relative leading-[0] select-none ${selectable ? "cursor-pointer" : "cursor-default"}`}
       style={{ marginLeft, zIndex }}
     >
@@ -221,7 +304,8 @@ function FanCard({
           tokenFilters={isToken ? tokenFiltersForObject(obj) : undefined}
           tokenImageRef={isToken ? obj.token_image_ref : undefined}
           oracleText={isToken ? obj.token_rules_text : undefined}
-          faceDown={obj.face_down}
+          faceDown={obj.face_down === true}
+          faceDownCause={obj.face_down ? obj.face_down_cause : undefined}
           className="!w-[var(--fan-card-w)] !h-[var(--fan-card-h)]"
         />
       </div>

@@ -33,9 +33,14 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
   new Set<WaitingFor["type"]>([
     // Active priority — passes via PassButton / mana payment / cast.
     "Priority",
+    // Resolve All's explicit standing-pass authorization. The final Grant
+    // materializes the shared engine session directly; there is no client-side
+    // Ready hand-off to drive.
+    "ResolveAllConsent",
     // CR 701.42 / CR 508.4: meld pair and attacking-entry destination dialogs.
     "MeldPairChoice",
     "MeldAttackTargetChoice",
+    "EntryAttackTargetChoice",
     // Cast / activation chain — ManaPayment + PhyrexianPayment share ManaPaymentUI.
     ...MANA_PAYMENT_WAITING_FOR_TYPES,
     "ManaSourceSelection",
@@ -46,6 +51,9 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "OptionalCostChoice",
     "ActivationCostOneOfChoice",
     "DefilerPayment",
+    // CR 601.2f: caster-elected cost-reduction ordering
+    // (CostReductionOrderModal).
+    "OrderCostReductions",
     "ModeChoice",
     "AbilityModeChoice",
     "ModalFaceChoice",
@@ -91,20 +99,25 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "PrecastCopyShortcutOffer",
     "RespondToPrecastCopyShortcut",
     "ReplacementChoice",
+    "EntryControllerChoice",
     "CopyTargetChoice",
     "CopyRetarget",
     "ExploreChoice",
     // CR 303.4 + CR 115.1: return-as-Aura / non-spell Aura entry host pick.
     // Resolved on the board (object hosts) or via player HUD glow (Curse /
-    // enchant-player Auras) — see TargetingOverlay + PlayerHud/OpponentHud.
+    // enchant-player Auras). Legal picks come from `getWaitingForClickTargetRefs`
+    // (viewmodel/gameStateView.ts), which every click surface reads.
     "ReturnAsAuraTarget",
     "EquipTarget",
     "CrewVehicle",
     "StationTarget",
     "SaddleMount",
     "ScryChoice",
+    "RippleRevealChoice",
+    "RippleBottomOrder",
     "ArrangePlanarDeckTopChoice",
     "CoinFlipKeepChoice",
+    "DieKeepChoice",
     "DigChoice",
     "SurveilChoice",
     "RevealChoice",
@@ -115,6 +128,9 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     // CR 701.4a: behold a [quality] — single-pick from a mixed-zone candidate
     // list (BeholdChoiceModal, rendered via CardChoiceModal).
     "BeholdChoice",
+    // CR 701.71a: empower Jace N — single-pick among the controller's Jace
+    // planeswalker tokens (EmpowerJaceChoiceModal, rendered via CardChoiceModal).
+    "EmpowerJaceChoice",
     "ChooseOneOfBranch",
     "ConniveDiscard",
     "DiscardChoice",
@@ -159,6 +175,7 @@ export const HANDLED_WAITING_FOR_TYPES: ReadonlySet<WaitingFor["type"]> =
     "PairChoice",
     "OpponentMayChoice",
     "OptionalEffectChoice",
+    "ResolutionOptionalPaymentChoice",
     "UnlessPayment",
     "UnlessPaymentChooseCost",
     "WardDiscardChoice",
@@ -262,6 +279,8 @@ export function waitingForReason(
       return { key: "status.reason.discarding" };
     case "OrderTriggers":
       return { key: "status.reason.orderingTriggers" };
+    case "OrderCostReductions":
+      return { key: "status.reason.orderingCostReductions" };
     case "Priority": {
       // CR 117: the priority window. The engine-provided stack depth and phase
       // tell us what kind of window this is — purely descriptive labeling.

@@ -85,6 +85,18 @@ pub fn resolve(
                 obj.tapped = true;
             }
         }
+        // CR 702.174g: "Gift an extra turn" means "The chosen player takes an
+        // extra turn after this one." CR 500.7 owns the queue, so this routes
+        // through the same authority `Effect::ExtraTurn` uses rather than
+        // touching `extra_turns` directly.
+        //
+        // "After this one" is the ANCHOR: the extra turn follows the turn during
+        // which the gift resolved, which is `state.active_player`'s — not the
+        // recipient's next turn. `enqueue_extra_turn` takes that anchor exactly
+        // as the effect resolver passes it.
+        GiftKind::ExtraTurn => {
+            crate::game::turns::enqueue_extra_turn(state, opponent, state.active_player, events);
+        }
     }
 
     events.push(GameEvent::EffectResolved {
@@ -154,29 +166,25 @@ fn create_gift_token(
     }
 
     crate::game::layers::mark_layers_full(state);
-    crate::game::restrictions::record_battlefield_entry(state, obj_id);
     crate::game::restrictions::record_token_created(state, obj_id);
 
     // CR 111.1 + CR 603.6a: Token creation is a zone change from outside the
     // game — emit `ZoneChanged { from: None }` so ETB triggers (Soul Warden,
     // Panharmonicon, etc.) fire for gift tokens through the normal code path.
-    let zone_change_record = state
-        .objects
-        .get(&obj_id)
-        .expect("token just created")
-        .snapshot_for_zone_change(obj_id, None, Zone::Battlefield);
-    events.push(GameEvent::ZoneChanged {
-        object_id: obj_id,
-        from: None,
-        to: Zone::Battlefield,
-        record: Box::new(zone_change_record),
-    });
-
-    events.push(GameEvent::TokenCreated {
-        object_id: obj_id,
-        name: name.to_string(),
+    //
+    // CR 400.7 + CR 608.2i + CR 603.2c: route the record and the entry pair through the single
+    // `from: None → Battlefield` authority so the emitted `ZoneChanged` carries this turn's real
+    // zone-change index instead of the `0` placeholder. The authority performs the CR 608.2i
+    // battlefield-entry bookkeeping itself, so the co-located `record_battlefield_entry` call is
+    // deleted — keeping it would double-count `battlefield_entries_this_turn`.
+    super::token::push_committed_token_entry_events(
+        state,
+        obj_id,
+        name.to_string(),
         source_id,
-    });
+        events,
+    )
+    .expect("token just created");
 
     obj_id
 }
@@ -221,6 +229,64 @@ mod tests {
         assert!(events.iter().any(
             |e| matches!(e, GameEvent::CardDrawn { player_id, .. } if *player_id == PlayerId(1))
         ));
+    }
+
+    /// CR 702.174g + CR 500.7: the promised extra turn is queued for the chosen
+    /// player, anchored after the turn during which the gift resolved.
+    #[test]
+    fn gift_extra_turn_queues_a_turn_for_the_recipient() {
+        let mut state = GameState::new_two_player(42);
+        let mut events = Vec::new();
+
+        let ability = make_gift_ability(GiftKind::ExtraTurn, true);
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert_eq!(
+            state
+                .extra_turns
+                .iter()
+                .map(|turn| (turn.player, turn.anchor))
+                .collect::<Vec<_>>(),
+            vec![(PlayerId(1), state.active_player)],
+            "CR 702.174g: the CHOSEN player takes the extra turn, after this one"
+        );
+        assert_eq!(
+            events,
+            vec![
+                GameEvent::ExtraTurnCreated {
+                    player_id: PlayerId(1),
+                    anchor: state.active_player,
+                },
+                GameEvent::EffectResolved {
+                    kind: EffectKind::GiftDelivery,
+                    source_id: ObjectId(100),
+                    subject: None,
+                },
+            ]
+        );
+        let turn = &state.extra_turns[0];
+        let GameEvent::ExtraTurnCreated { player_id, anchor } = &events[0] else {
+            unreachable!();
+        };
+        assert_eq!((*player_id, *anchor), (turn.player, turn.anchor));
+    }
+
+    /// The negative that keeps the row above honest: an unpromised gift queues
+    /// nothing, so the assertion is about the promise and not about the queue
+    /// being writable.
+    #[test]
+    fn gift_extra_turn_queues_nothing_when_not_promised() {
+        let mut state = GameState::new_two_player(42);
+        let mut events = Vec::new();
+
+        let ability = make_gift_ability(GiftKind::ExtraTurn, false);
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(state.extra_turns.is_empty());
+        assert!(events.is_empty());
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, GameEvent::ExtraTurnCreated { .. })));
     }
 
     #[test]

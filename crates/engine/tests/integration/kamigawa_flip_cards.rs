@@ -45,6 +45,8 @@ fn white_mana_cost() -> ManaCost {
 /// reusing the double-faced applicator would violate CR 710.1c.
 fn kenzo_alternative_face() -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
+        trigger_printed_origins: Vec::new(),
         name: "Kenzo the Hardhearted".to_string(),
         power: Some(3),
         toughness: Some(4),
@@ -70,6 +72,7 @@ fn kenzo_alternative_face() -> BackFaceData {
         casting_restrictions: vec![],
         casting_options: vec![],
         layout_kind: Some(LayoutKind::Flip),
+        parse_warnings: vec![],
     }
 }
 
@@ -104,6 +107,8 @@ Whenever this creature deals damage to an opponent, flip it.";
 /// A 2/2 Legendary Creature — Goblin Shaman with a damage-prevention static.
 fn tok_tok_alternative_face() -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
+        trigger_printed_origins: Vec::new(),
         name: "Tok-Tok, Volcano Born".to_string(),
         power: Some(2),
         toughness: Some(2),
@@ -129,6 +134,7 @@ fn tok_tok_alternative_face() -> BackFaceData {
         casting_restrictions: vec![],
         casting_options: vec![],
         layout_kind: Some(LayoutKind::Flip),
+        parse_warnings: vec![],
     }
 }
 
@@ -205,6 +211,7 @@ fn resolve_trigger_body(
                 source_name: source_name.to_string(),
                 subject_match_count: None,
                 die_result: None,
+                provenance: None,
             },
         },
         &mut vec![],

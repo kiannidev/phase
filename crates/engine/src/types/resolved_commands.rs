@@ -16,10 +16,13 @@ use super::card::TokenImageRef;
 use super::card_type::CoreType;
 use super::counter::CounterType;
 use super::game_state::{
-    DelayedTrigger, SpellCastRecord, StackEntry, StackEntryKind, StackPaidSnapshot,
+    CastOccurrence, DelayedTrigger, SpellCastRecord, StackEntry, StackEntryKind, StackPaidSnapshot,
     TransientContinuousEffect, ZoneChangeRecord,
 };
-use super::identifiers::{ObjectId, ObjectIncarnationRef, LEGACY_INCARNATION};
+use super::identifiers::{
+    DelayedTriggerInstanceId, DelayedTriggerToken, ObjectId, ObjectIncarnationRef, TriggerFiring,
+    LEGACY_INCARNATION,
+};
 use super::mana::{ManaPipId, ManaUnit};
 use super::player::{PlayerCounterKind, PlayerId};
 use super::proposed_event::{CopyTokenSpec, TokenSpec};
@@ -262,6 +265,9 @@ pub enum ResolvedAttachmentReplayInvariantError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedDelayedTriggerCommand {
     pub trigger: DelayedTrigger,
+    /// CR 603.7: The exact installation identity, minted live and replayed verbatim.
+    #[serde(default)]
+    pub token: DelayedTriggerToken,
     pub expected_installed_count: usize,
     pub cause: RulesExecutionNodeRef,
 }
@@ -271,6 +277,26 @@ pub struct ResolvedDelayedTriggerCommand {
 pub enum ResolvedDelayedTriggerReplayInvariantError {
     #[error("delayed-trigger install precondition mismatch: expected {expected} already installed, found {found}")]
     InstalledCountPreconditionMismatch { expected: usize, found: usize },
+    #[error("delayed-trigger install command {token:?} has no provenance")]
+    MissingProvenance { token: DelayedTriggerToken },
+    #[error(
+        "delayed-trigger provenance token {provenance:?} does not match command token {command:?}"
+    )]
+    ProvenanceTokenMismatch {
+        command: DelayedTriggerToken,
+        provenance: DelayedTriggerToken,
+    },
+    #[error("delayed-trigger provenance source {provenance:?} does not match trigger source {trigger:?}")]
+    ProvenanceSourceMismatch {
+        trigger: ObjectId,
+        provenance: ObjectId,
+    },
+    #[error("delayed-trigger provenance must use nonzero token and instance")]
+    ZeroProvenance,
+    #[error("delayed-trigger provenance token {token:?} is already installed")]
+    DuplicateProvenanceToken { token: DelayedTriggerToken },
+    #[error("delayed-trigger provenance instance {instance:?} is already installed")]
+    DuplicateProvenanceInstance { instance: DelayedTriggerInstanceId },
 }
 
 /// One exact CR 611.2a transient continuous-effect installation.
@@ -780,6 +806,12 @@ pub enum ResolvedLedgerEdit {
         expected_turn_count: u32,
         expected_game_count: u32,
     },
+    /// CR 700.13: Record the first committed crime of the turn after its
+    /// targeting action is successfully placed on the stack.
+    CrimeCommitted {
+        player: PlayerId,
+        expected_turn_count: u32,
+    },
     /// CR 603.2c: Record one constrained trigger occurrence.
     TriggerFired {
         trigger: TriggerDefinitionRef,
@@ -873,6 +905,8 @@ pub enum ResolvedZoneChangeReplayInvariantError {
     DestinationPositionMismatch { expected: usize, found: usize },
     #[error("zone-change turn-record index mismatch: expected {expected}, found {found}")]
     TurnRecordIndexMismatch { expected: usize, found: usize },
+    #[error("zone-change recorded-turn mismatch: expected {expected}, found {found}")]
+    RecordedTurnMismatch { expected: u32, found: u32 },
     #[error("zone-change battlefield entry is missing its timestamp")]
     MissingBattlefieldEntryTimestamp,
     #[error("zone-change nonbattlefield entry unexpectedly has a timestamp")]
@@ -887,10 +921,30 @@ pub enum ResolvedZoneChangeReplayInvariantError {
 /// records stack positions, frame identities, or displaced frame payloads.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ResolvedFrameTransition {
-    Push { frame: ResolutionFrame },
-    InsertParentOfActive { frame: ResolutionFrame },
-    PopExpected { kind: FrameKind },
-    ReplaceActive { frame: ResolutionFrame },
+    Push {
+        frame: ResolutionFrame,
+    },
+    InsertParentOfActive {
+        frame: ResolutionFrame,
+    },
+    /// Park a prompt-less frame beneath the frame owning the live prompt.
+    ///
+    /// The operand is still native and no position is recorded: the applier
+    /// asks the stack where a parked frame belongs, and the stack answers from
+    /// its own shape. That keeps replay exact — the same frames plus the same
+    /// operand yield the same placement — while leaving the caller no position
+    /// to guess at. See [`ParkedFramePlacement`].
+    ///
+    /// [`ParkedFramePlacement`]: crate::types::resolution::ParkedFramePlacement
+    ParkBeneathLivePrompt {
+        frame: ResolutionFrame,
+    },
+    PopExpected {
+        kind: FrameKind,
+    },
+    ReplaceActive {
+        frame: ResolutionFrame,
+    },
 }
 
 /// One exact resolution-frame transition under its causal rules-execution node.
@@ -1017,6 +1071,10 @@ pub struct ResolvedStackPushCommand {
     /// Boxed because `StackEntryKind` embeds a whole `ResolvedAbility`, which
     /// would otherwise widen every `ResolvedRulesCommand` in the journal.
     pub entry: Box<StackEntry>,
+    /// Private CR 603.7 firing classification; present exactly for a triggered
+    /// ability, allowing replay to restore the stack side-map atomically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) trigger_firing: Option<TriggerFiring>,
     pub origin: ResolvedStackPushOrigin,
     /// Zero-based index the entry occupies after the push (CR 405.2).
     pub resulting_position: usize,
@@ -1032,6 +1090,8 @@ pub enum ResolvedStackPushReplayInvariantError {
     DuplicateStackEntry(ObjectId),
     #[error("stack-push command references an unknown controller {0:?}")]
     UnknownController(PlayerId),
+    #[error("stack-push trigger firing does not match entry kind")]
+    TriggerFiringShapeMismatch,
 }
 
 /// One exact CR 601.2i cast finalization, retagging an announced stack entry.
@@ -1082,6 +1142,12 @@ pub struct ResolvedStackEntryFinalizeCommand {
     pub resulting_kind: Box<StackEntryKind>,
     pub expected_old_paid_facts: Option<Box<StackPaidSnapshot>>,
     pub resulting_paid_facts: Box<StackPaidSnapshot>,
+    /// The spell object's occurrence carrier settles with the finalized entry.
+    /// Legacy journals predate this provenance and therefore replay `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_old_cast_occurrence: Option<CastOccurrence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resulting_cast_occurrence: Option<CastOccurrence>,
     pub cause: RulesExecutionNodeRef,
 }
 
@@ -1100,6 +1166,8 @@ pub enum ResolvedStackEntryFinalizeReplayInvariantError {
     EntryKindMismatch(usize),
     #[error("stack-entry finalize expected different pre-existing paid facts for {0:?}")]
     PaidFactsMismatch(ObjectId),
+    #[error("stack-entry finalize expected different cast provenance for {0:?}")]
+    CastOccurrenceMismatch(ObjectId),
 }
 
 /// One exact CR 603.3d removal of an uncommitted triggered ability.
@@ -1604,6 +1672,7 @@ pub enum ResolvedLedgerEditReplayInvariantError {
     UnknownPlayer(PlayerId),
     SpellCastPreconditionMismatch,
     AbilityActivationPreconditionMismatch,
+    CrimeCommittedPreconditionMismatch,
     CardsDrawnPreconditionMismatch,
     DrawnObjectMismatch {
         expected: ObjectIncarnationRef,
@@ -1633,6 +1702,9 @@ impl std::fmt::Display for ResolvedLedgerEditReplayInvariantError {
                 f,
                 "resolved activated-ability command does not match its ledger prefix"
             ),
+            Self::CrimeCommittedPreconditionMismatch => {
+                write!(f, "resolved crime command does not match its ledger prefix")
+            }
             Self::CardsDrawnPreconditionMismatch => write!(
                 f,
                 "resolved draw-bookkeeping command does not match its ledger prefix"
@@ -2992,19 +3064,60 @@ impl ResolvedRulesJournal {
                 }
             }
             ResolvedRulesCommand::StackEntryFinalize(command) => {
-                // Cause-only. There is no allocator receipt to cross-check:
-                // CR 601.2i retags an entry that CR 601.2a already created, so
-                // this authority draws no id and no timestamp and holds no
-                // high-water a forged journal could jump. Its remaining
-                // preconditions (CR 405.2 position, entry identity, the
-                // pre-finalize kind, and the prior paid facts) are all
-                // state-dependent and are enforced by
-                // `stack::apply_resolved_stack_entry_finalize`, where
-                // the state exists to check them against.
                 if entry.node != command.cause {
                     return Err(ResolvedRulesJournalError::InvalidSerializedAuthority(
                         "stack-entry finalize command has an unrelated cause".to_string(),
                     ));
+                }
+                // CR 601.2i: a non-legacy occurrence is not free-form metadata.
+                // It must name the earlier SpellCast edit at the recorded
+                // per-caster coordinate, and that record must identify the
+                // finalized spell object. The ledger write and the finalizer
+                // can be emitted by adjacent rules nodes in the casting
+                // pipeline, so their shared receipt is the occurrence/object
+                // tuple rather than node identity.
+                if let Some(occurrence) = command.resulting_cast_occurrence {
+                    let matching_cast = self
+                        .entries
+                        .iter()
+                        .take_while(|candidate| candidate.ordinal != entry.ordinal)
+                        .any(|candidate| {
+                            matches!(
+                                candidate.command.as_ref(),
+                                Some(ResolvedRulesCommand::LedgerEdit(ledger))
+                                    if matches!(
+                                        &ledger.edit,
+                                        ResolvedLedgerEdit::SpellCast {
+                                            player,
+                                            record,
+                                            expected_turn_history_len,
+                                            ..
+                                        } if *player == occurrence.caster
+                                            && *expected_turn_history_len
+                                                == occurrence.turn_journal_index
+                                            && record.spell_object_id == Some(command.object)
+                                    )
+                            )
+                        });
+                    if !matching_cast {
+                        return Err(ResolvedRulesJournalError::InvalidSerializedAuthority(
+                            "stack-entry finalize cast provenance has no matching prior spell-cast ledger edit"
+                                .to_string(),
+                        ));
+                    }
+                    let graph_matches = matches!(
+                        command.resulting_kind.as_ref(),
+                        StackEntryKind::Spell { ability, .. }
+                            if ability.as_deref().is_none_or(|ability| {
+                                ability.cast_occurrence_matches_recursive(occurrence)
+                            })
+                    );
+                    if !graph_matches {
+                        return Err(ResolvedRulesJournalError::InvalidSerializedAuthority(
+                            "stack-entry finalize cast provenance disagrees with its resulting ability graph"
+                                .to_string(),
+                        ));
+                    }
                 }
             }
             ResolvedRulesCommand::UncommittedTriggerRemoval(command) => {
@@ -3150,6 +3263,10 @@ pub(crate) fn ledger_edit_is_invalid(edit: &ResolvedLedgerEdit) -> bool {
             expected_game_count,
             ..
         } => *expected_turn_count == u32::MAX || *expected_game_count == u32::MAX,
+        ResolvedLedgerEdit::CrimeCommitted {
+            expected_turn_count,
+            ..
+        } => *expected_turn_count != 0,
         ResolvedLedgerEdit::CardsDrawn {
             drawn_object,
             attempted_empty_library,
@@ -3204,7 +3321,7 @@ pub(crate) fn ledger_edit_is_invalid(edit: &ResolvedLedgerEdit) -> bool {
                 || *resulting_first_card_drawn_this_turn != expected_first
         }
         ResolvedLedgerEdit::TriggerFired {
-            edit: ResolvedTriggerLedgerEdit::MaxTimesPerTurn { expected_old },
+            edit: ResolvedTriggerLedgerEdit::MaxTimesPerTurn { expected_old, .. },
             ..
         } => *expected_old == u32::MAX,
         ResolvedLedgerEdit::TriggerFired { .. }

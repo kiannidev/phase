@@ -13,8 +13,10 @@ import type { ScryfallCard } from "../../services/scryfall";
 
 import { MoveList } from "./MoveList";
 import { mouseHoverPreview } from "./hoverPreview";
+import type { CardHoverHandler } from "./hoverPreview";
 import { groupAccent, groupKey, groupOrder, groupTitleKey, type GroupMode } from "./deckGrouping";
 import { isMaybeboardPolicy, useSideboardPolicy } from "./useSideboardPolicy";
+import { copyText } from "../../services/copyText";
 
 interface DeckListProps {
   deck: ParsedDeck;
@@ -27,7 +29,7 @@ interface DeckListProps {
   canIncrementCard: (name: string) => boolean;
   onMoveCard: (name: string, from: "main" | "sideboard") => void;
   onImport: (deck: ParsedDeck) => void;
-  onCardHover?: (cardName: string | null) => void;
+  onCardHover?: CardHoverHandler;
   format?: string;
   compatibility?: DeckCompatibilityResult | null;
   onChooseArt?: (cardName: string, x: number, y: number) => void;
@@ -37,7 +39,7 @@ interface DeckListProps {
   onSetAsCommander?: (name: string) => void;
   isCommanderEligible?: (name: string) => boolean;
   /** Touch path for art selection — forwarded to each row's ✦ badge. */
-  onOpenArtPicker?: (name: string) => void;
+  onOpenArtPicker?: (name: string, launcher: HTMLButtonElement) => void;
   /** Designated commander(s). Rendered as a pinned section above the section
    *  tabs (mirroring the visual stack's Commander lane) so the commander stays
    *  visible/removable in list view — on mobile the Info-panel CommanderPanel
@@ -192,7 +194,7 @@ export function DeckList({
   };
 
   const handleCopyToClipboard = async () => {
-    await navigator.clipboard.writeText(exportText);
+    if (!(await copyText(exportText))) return;
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
@@ -252,8 +254,13 @@ export function DeckList({
             >
               <span
                 className={`text-fuchsia-50 ${onCardHover ? "cursor-pointer" : ""}`}
-                onClick={() => onCardHover?.(name)}
-                {...mouseHoverPreview(onCardHover, name)}
+                onClick={() =>
+                  onCardHover?.({ name, scryfallId: cardDataCache.get(name)?.id })
+                }
+                {...mouseHoverPreview(onCardHover, {
+                  name,
+                  scryfallId: cardDataCache.get(name)?.id,
+                })}
               >
                 {name}
               </span>

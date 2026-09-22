@@ -236,6 +236,25 @@ pub(crate) fn flipped_normal_copiable_values(obj: &GameObject) -> Option<Copiabl
                 .cloned()
                 .collect(),
         ),
+        trigger_printed_origins: Arc::new(
+            normal_face
+                .printed_ref
+                .clone()
+                .map(|printed_ref| {
+                    normal_face
+                        .trigger_definitions
+                        .iter_all()
+                        .enumerate()
+                        .map(|(printed_occurrence, _)| {
+                            Some(crate::types::ability::TriggerPrintedOrigin {
+                                printed_ref: printed_ref.clone(),
+                                printed_occurrence,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        ),
         // CR 707.2 + CR 611.2b: runtime replacements durably parked in the
         // definition set are not printed characteristics — same exclusion the
         // unflipped path applies via `copiable_replacement_definitions`.
@@ -248,6 +267,11 @@ pub(crate) fn flipped_normal_copiable_values(obj: &GameObject) -> Option<Copiabl
                 .collect(),
         ),
         static_definitions: Arc::new(normal_face.static_definitions.iter_all().cloned().collect()),
+        // CR 710.1 + CR 710.2: a flip card is a single card whose normal and
+        // alternative characteristics share one face — never one of CR 709.5's
+        // shared-type-line Room permanents, so there is no half data to carry.
+        room_halves: None,
+        name_origin: Default::default(),
     })
 }
 
@@ -325,8 +349,10 @@ pub(crate) fn apply_flipped_face_to_object(obj: &mut GameObject, face: BackFaceD
     // CR 710.1b: alternative power and toughness.
     obj.power = face.power;
     obj.base_power = face.power;
+    obj.layer_base_power = face.power;
     obj.toughness = face.toughness;
     obj.base_toughness = face.toughness;
+    obj.layer_base_toughness = face.toughness;
 
     // CR 306.5b + CR 310.4b: loyalty/defense track the alternative type line.
     obj.loyalty = face.loyalty;
@@ -376,12 +402,14 @@ pub(crate) fn apply_flipped_face_to_object(obj: &mut GameObject, face: BackFaceD
 mod tests {
     use super::*;
     use crate::game::zones::create_object;
-    use crate::types::ability::{AbilityDefinition, AbilityKind, Effect};
+    use crate::types::ability::{AbilityDefinition, AbilityKind, Effect, TriggerDefinition};
+    use crate::types::card::PrintedCardRef;
     use crate::types::card_type::{CardType, CoreType, Supertype};
     use crate::types::identifiers::CardId;
     use crate::types::keywords::Keyword;
     use crate::types::mana::{ManaColor, ManaCost, ManaCostShard};
     use crate::types::player::PlayerId;
+    use crate::types::triggers::TriggerMode;
 
     /// `{W}` — Bushi Tenderfoot's printed mana cost (CR 202.1).
     fn white_mana_cost() -> ManaCost {
@@ -428,6 +456,8 @@ mod tests {
         obj.base_color = vec![ManaColor::White];
 
         obj.back_face = Some(BackFaceData {
+            is_swap_snapshot: false,
+            trigger_printed_origins: Vec::new(),
             name: "Kenzo the Hardhearted".to_string(),
             power: Some(3),
             toughness: Some(4),
@@ -456,6 +486,7 @@ mod tests {
             casting_restrictions: vec![],
             casting_options: vec![],
             layout_kind: Some(crate::types::card::LayoutKind::Flip),
+            parse_warnings: vec![],
         });
 
         id
@@ -511,6 +542,40 @@ mod tests {
             "CR 710.1c: color must not change when the permanent flips"
         );
         assert_eq!(obj.base_color, vec![ManaColor::White]);
+    }
+
+    #[test]
+    fn flipped_normal_copy_uses_the_normal_faces_trigger_origin() {
+        let mut state = GameState::new_two_player(42);
+        let id = setup_flip_card(&mut state);
+        let normal_ref = PrintedCardRef {
+            oracle_id: "flip-oracle".to_string(),
+            face_name: "Bushi Tenderfoot".to_string(),
+        };
+        let alternative_ref = PrintedCardRef {
+            oracle_id: "flip-oracle".to_string(),
+            face_name: "Kenzo the Hardhearted".to_string(),
+        };
+        {
+            let obj = state.objects.get_mut(&id).unwrap();
+            obj.base_printed_ref = Some(normal_ref.clone());
+            obj.printed_ref = Some(normal_ref.clone());
+            let trigger = TriggerDefinition::new(TriggerMode::ChangesZone);
+            obj.base_trigger_definitions = Arc::new(vec![trigger.clone()]);
+            obj.trigger_definitions = vec![trigger].into();
+            obj.back_face.as_mut().unwrap().printed_ref = Some(alternative_ref);
+        }
+
+        flip_permanent(&mut state, id, &mut Vec::new()).unwrap();
+        let values = flipped_normal_copiable_values(&state.objects[&id]).unwrap();
+
+        assert_eq!(
+            values.trigger_printed_origins.as_slice(),
+            &[Some(crate::types::ability::TriggerPrintedOrigin {
+                printed_ref: normal_ref,
+                printed_occurrence: 0,
+            })]
+        );
     }
 
     /// CR 710.4: flipping is one-way — a second flip instruction is a no-op and
@@ -847,7 +912,7 @@ mod tests {
         let become_copy = ResolvedAbility::new(
             Effect::BecomeCopy {
                 target: TargetFilter::Any,
-                recipient: TargetFilter::SelfRef,
+                recipient: crate::types::ability::CopyRecipient::Source,
                 duration: Some(Duration::Permanent),
                 mana_value_limit: None,
                 additional_modifications: Vec::new(),

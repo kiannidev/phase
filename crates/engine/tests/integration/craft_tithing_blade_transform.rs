@@ -363,6 +363,8 @@ fn tithing_blade_crafts_into_transformed_sepulcher() {
 /// idiom in `game/transform.rs` tests and `integration_bending.rs`).
 fn consuming_sepulcher_back_face() -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
+        trigger_printed_origins: Vec::new(),
         name: "Consuming Sepulcher".to_string(),
         power: None,
         toughness: None,
@@ -391,6 +393,7 @@ fn consuming_sepulcher_back_face() -> BackFaceData {
         casting_restrictions: vec![],
         casting_options: vec![],
         layout_kind: None,
+        parse_warnings: vec![],
     }
 }
 

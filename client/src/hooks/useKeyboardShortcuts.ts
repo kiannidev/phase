@@ -1,6 +1,10 @@
 import { useEffect } from "react";
 
-import { isAuthorityRemote, useGameStore } from "../stores/gameStore";
+import {
+  canExportAuthoritativeState,
+  isAuthorityRemote,
+  useGameStore,
+} from "../stores/gameStore";
 import { useUiStore } from "../stores/uiStore";
 import { dispatchAction } from "../game/dispatch";
 import { getPlayerId } from "./usePlayerId";
@@ -8,7 +12,7 @@ import { useAltToggle } from "./useAltToggle";
 import { useShiftHeld } from "./useShiftHeld";
 import {
   copyGameStateDebugSnapshot,
-  exportGameStateDebugZip,
+  exportAuthoritativeGameStateZip,
 } from "../services/gameStateExport";
 
 /**
@@ -79,6 +83,7 @@ export function useKeyboardShortcuts(): void {
         stateHistory,
         gameMode,
         manaPaymentShortcutActions,
+        adapter,
       } = useGameStore.getState();
       const uiState = useUiStore.getState();
 
@@ -186,9 +191,19 @@ export function useKeyboardShortcuts(): void {
         case "D":
           if (e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
             e.preventDefault();
-            if (gameState) {
-              exportGameStateDebugZip(gameState)
-                .then((filename) => console.log(`[Debug] Game state exported to ${filename}`))
+            if (adapter?.exportPersistenceState && canExportAuthoritativeState(gameMode)) {
+              exportAuthoritativeGameStateZip(adapter)
+                .then((result) => {
+                  if (result.kind === "failed") {
+                    console.error("[Debug] Game state export failed");
+                  } else if (result.kind === "requested") {
+                    console.log(`[Debug] Game state export requested (${result.filename})`);
+                  } else if (result.path) {
+                    console.log(`[Debug] Game state exported to ${result.path}`);
+                  } else {
+                    console.log(`[Debug] Game state exported ${result.filename}`);
+                  }
+                })
                 .catch((err) => console.error("[Debug] Failed to export:", err));
             }
           } else if (!e.ctrlKey && !e.metaKey) {

@@ -17,10 +17,10 @@ function pickRandomImage(): string {
   return BATTLEFIELDS[Math.floor(Math.random() * BATTLEFIELDS.length)].image;
 }
 
-function resolveBackground(
+export function resolveBackground(
   boardBackground: BoardBackground,
   customUrl: string,
-  deckColor: ManaColor | null,
+  deckColor: ManaColor | null | undefined,
   lockedRef: React.RefObject<string | null>,
 ): ResolvedBackground | null {
   if (boardBackground === "none") return null;
@@ -37,11 +37,24 @@ function resolveBackground(
   }
 
   if (boardBackground === "auto-wubrg") {
-    // Lock in a color-matched image on first color detection (includes full deck)
-    if (deckColor && !lockedRef.current) {
-      lockedRef.current = getRandomBattlefield(deckColor).image;
-    }
-    return lockedRef.current ? { kind: "image", src: lockedRef.current } : null;
+    // The lock is authoritative once set: the component memo short-circuits
+    // the deck scan to `undefined` on every render after the first lock, so
+    // this must honor an existing lock BEFORE the undefined-wait below.
+    // Checking the wait first loses the lock on the very next render — any
+    // gameState identity change (tap, phase tick, new frame) re-runs the
+    // memo guard to undefined and the layer drops to transparent (black
+    // board). (At mount the lock is fresh and re-locks, so StrictMode's dev
+    // double-render is not the trigger; the first post-lock update is.)
+    if (lockedRef.current) return { kind: "image", src: lockedRef.current };
+
+    // No seat/game state yet — hold off so the lock is never seeded from a
+    // partial deck.
+    if (deckColor === undefined) return null;
+
+    // Lock in a color-matched image on first color detection (includes full deck).
+    // Colorless decks have no WUBRG color to match, so use the normal random pool.
+    lockedRef.current = deckColor ? getRandomBattlefield(deckColor).image : pickRandomImage();
+    return { kind: "image", src: lockedRef.current };
   }
 
   const plain = PLAIN_BACKGROUND_MAP[boardBackground];
@@ -81,10 +94,10 @@ export function BattlefieldBackground() {
     // (lockedRef). For every other background mode, and on every action after
     // the lock, the result is discarded. Without this guard the scan re-ran on
     // every gameState change (mana tap, phase tick, priority pass) for nothing.
-    if (boardBackground !== "auto-wubrg" || lockedRef.current) return null;
-    if (!gameState) return null;
+    if (boardBackground !== "auto-wubrg" || lockedRef.current) return undefined;
+    if (!gameState) return undefined;
     const player = gameState.players[playerId];
-    if (!player) return null;
+    if (!player) return undefined;
     return getDeckDominantColor(
       player.library,
       player.hand,

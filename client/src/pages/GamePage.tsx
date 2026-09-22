@@ -1,5 +1,6 @@
 import {
   type CSSProperties,
+  type RefObject,
   useCallback,
   useEffect,
   useMemo,
@@ -14,12 +15,14 @@ import type { TFunction } from "i18next";
 import type {
   CompanionRevealChoice,
   DeckCardCount,
+  FormatConfig,
   GameFormat,
   MatchConfig,
   ObjectId,
   SerializedAbilityCost,
+  AiDecisionDiagnosticReceipt,
 } from "../adapter/types";
-import { supportsMatchConcede } from "../adapter/types";
+import { supportsAiDecisionDiagnostics, supportsMatchConcede } from "../adapter/types";
 import type {
   InteractionManaRestriction,
   InteractionPresentationSurface,
@@ -40,6 +43,7 @@ import { AnimationOverlay } from "../components/animation/AnimationOverlay.tsx";
 import { RevealOverlay } from "../components/animation/RevealOverlay.tsx";
 import { TurnBanner } from "../components/animation/TurnBanner.tsx";
 import { DiceRollOverlay } from "../components/animation/DiceRollOverlay.tsx";
+import { ScryOutcomeOverlay } from "../components/animation/ScryOutcomeOverlay.tsx";
 import { flashStartingPlayerContest } from "../game/diceContest.ts";
 import { loopDetectionModeFromQuery } from "../game/loopDetectionMode.ts";
 import { BattlefieldBackground } from "../components/board/BattlefieldBackground.tsx";
@@ -55,6 +59,7 @@ import { GameBoard } from "../components/board/GameBoard.tsx";
 import { CardImage } from "../components/card/CardImage.tsx";
 import { GameCardPreview } from "../components/card/GameCardPreview.tsx";
 import { CardReportDialog } from "../components/card/CardReportDialog.tsx";
+import { isFocusTargetAvailable } from "../components/ui/focusTarget.ts";
 import { ActionButton } from "../components/board/ActionButton.tsx";
 import { FullControlToggle } from "../components/controls/FullControlToggle.tsx";
 import { CombatPhaseIndicator } from "../components/controls/PhaseStopBar.tsx";
@@ -79,6 +84,7 @@ import { CardDataMissingModal } from "../components/modal/CardDataMissingModal.t
 import { UnhandledWaitingForModal } from "../components/modal/UnhandledWaitingForModal.tsx";
 import { AdventureCastModal } from "../components/modal/AdventureCastModal.tsx";
 import { CascadeChoiceModal } from "../components/modal/CascadeChoiceModal.tsx";
+import { RippleRevealChoiceModal } from "../components/modal/RippleRevealChoiceModal.tsx";
 import { FreeCastWindowModal } from "../components/modal/FreeCastWindowModal.tsx";
 import { ModalFaceModal } from "../components/modal/ModalFaceModal.tsx";
 import { AlternativeCostModal } from "../components/modal/AlternativeCostModal.tsx";
@@ -88,6 +94,7 @@ import { SpliceOfferModal } from "../components/modal/SpliceOfferModal.tsx";
 import { CardChoiceModal } from "../components/modal/CardChoiceModal.tsx";
 import { ChoiceModal } from "../components/modal/ChoiceModal.tsx";
 import { OptionalEffectModalContent } from "../components/modal/OptionalEffectModal.tsx";
+import { ResolutionOptionalPaymentModalContent } from "../components/modal/ResolutionOptionalPaymentModal.tsx";
 import { OptionalCostModalContent } from "../components/modal/OptionalCostModal.tsx";
 import { ChooseOneOfBranchModal } from "../components/modal/ChooseOneOfBranchModal.tsx";
 import { LifeRedistributionModal } from "../components/modal/LifeRedistributionModal.tsx";
@@ -98,7 +105,9 @@ import {
   RespondToPrecastCopyShortcutModal,
 } from "../components/modal/PrecastCopyShortcutModal.tsx";
 import { ReplacementModal } from "../components/modal/ReplacementModal.tsx";
+import { ResolveAllConsentModal } from "../components/modal/ResolveAllConsentModal.tsx";
 import { TriggerOrderModal } from "../components/modal/TriggerOrderModal.tsx";
+import { CostReductionOrderModal } from "../components/modal/CostReductionOrderModal.tsx";
 import { PeekTab } from "../components/modal/DialogShell.tsx";
 import { PeekRestoreTab } from "../components/modal/DialogHost.tsx";
 import { useModalPeek } from "../components/modal/useModalPeek.ts";
@@ -109,6 +118,7 @@ import { ZoneOpponentChooserModal } from "../components/modal/ZoneOpponentChoose
 import { PileOpponentModal } from "../components/modal/PileOpponentModal.tsx";
 import { AnnouncingOpponentModal } from "../components/modal/AnnouncingOpponentModal.tsx";
 import { GiftRecipientModal } from "../components/modal/GiftRecipientModal.tsx";
+import { EntryControllerModal } from "../components/modal/EntryControllerModal.tsx";
 import { TributeModal } from "../components/modal/TributeModal.tsx";
 import { CombatTaxModal } from "../components/modal/CombatTaxModal.tsx";
 import { TopOrBottomChoiceModalContent } from "../components/modal/TopOrBottomChoiceModal.tsx";
@@ -131,6 +141,7 @@ import {
   type SettingsTabId,
 } from "../components/settings/PreferencesModal.tsx";
 import { DebugPanel } from "../components/chrome/DebugPanel.tsx";
+import { AiDecisionOverlay } from "../components/chrome/AiDecisionOverlay.tsx";
 import { GameMenu } from "../components/chrome/GameMenu.tsx";
 import { ConcedeDialog } from "../components/multiplayer/ConcedeDialog.tsx";
 import { TakebackRequestDialog } from "../components/multiplayer/TakebackRequestDialog.tsx";
@@ -142,7 +153,7 @@ import { DisconnectChoiceDialog } from "../components/hud/DisconnectChoiceDialog
 import { PlayerEnchantmentsDialog } from "../components/hud/PlayerEnchantmentsDialog.tsx";
 import { AttachmentFan } from "../components/board/AttachmentFan.tsx";
 import { PausedBanner } from "../components/chrome/PausedBanner.tsx";
-import type { P2PAdapterEvent } from "../adapter/p2p-adapter.ts";
+import { P2PHostAdapter, type P2PAdapterEvent } from "../adapter/p2p-adapter.ts";
 import { WebSocketAdapter } from "../adapter/ws-adapter.ts";
 import type { WsAdapterEvent } from "../adapter/ws-adapter.ts";
 import { MANA_PAYMENT_WAITING_FOR_TYPES } from "../game/waitingForRegistry.ts";
@@ -150,7 +161,7 @@ import { useGameDispatch } from "../hooks/useGameDispatch.ts";
 import { useInspectHoverProps } from "../hooks/useInspectHoverProps.ts";
 import { useKeyboardShortcuts } from "../hooks/useKeyboardShortcuts.ts";
 import { clearPromptOverlayState } from "../game/sessionCleanup.ts";
-import { clearGame, loadActiveGame, useGameStore } from "../stores/gameStore.ts";
+import { clearGame, hasRemoteHumans, loadActiveGame, useGameStore } from "../stores/gameStore.ts";
 import { useUiStore } from "../stores/uiStore.ts";
 import { usePreferencesStore } from "../stores/preferencesStore.ts";
 import {
@@ -167,12 +178,16 @@ import { SpectatorChrome } from "../components/spectator/SpectatorChrome.tsx";
 import { useSpectatorMode } from "../hooks/useSpectatorMode.ts";
 import { GameProvider } from "../providers/GameProvider.tsx";
 import { useCanActForWaitingState, usePerspectivePlayerId, usePlayerId } from "../hooks/usePlayerId.ts";
+import { ABILITY_BLOCK_REASON_KEY } from "../viewmodel/abilityBlockReason.ts";
 import {
   abilityChoiceLabel,
+  abilityLabel,
   formatAbilityCost,
   loyaltyBadge,
+  stripCostPrefix,
   stripLoyaltyCostPrefix,
 } from "../viewmodel/costLabel.ts";
+import { renderDescription } from "../utils/description.ts";
 import { LoyaltyBadge } from "../components/ui/LoyaltyBadge.tsx";
 import {
   getCastableZoneViewerTarget,
@@ -181,6 +196,7 @@ import {
   getSeatCount,
   getWaitingForObjectChoiceIds,
   isSplitBoardActive,
+  resolveMultiplayerBoardLayout,
   resolveFocusedOpponent,
   shouldRenderFocusedOpponentTopRow,
   type ZoneViewerTarget,
@@ -248,7 +264,9 @@ export function GamePage() {
   // Without this gate, refreshing `/game/<id>?mode=p2p-host` against a
   // Full-mode server would attempt `openBrokerClient` and surface an
   // "Expected LobbyOnly server, got Full" error to the user.
-  const locationState = location.state as { useBroker?: boolean } | null;
+  const locationState = location.state as
+    | { useBroker?: boolean; formatConfig?: FormatConfig }
+    | null;
   const cachedServerMode = useMultiplayerStore((s) => s.serverInfo?.mode);
   const useBroker = locationState?.useBroker ?? (cachedServerMode === "LobbyOnly");
   const rawMode = searchParams.get("mode");
@@ -262,6 +280,11 @@ export function GamePage() {
   const roomNameParam = searchParams.get("roomName");
   const sourceParam = searchParams.get("source") ?? undefined;
   const draftIdParam = searchParams.get("draftId") ?? undefined;
+  // The lobby authority this join/spectate was launched from. Produced by
+  // our own navigation from a canonical `LobbySource.url`; a hand-edited
+  // value surfaces through the adapter's existing handshake error path, the
+  // same way a hand-edited `code` does.
+  const serverParam = searchParams.get("server") ?? undefined;
   const playerCount = playersParam ? Number(playersParam) : undefined;
   const activeGameMeta = useMemo(
     () => (gameId ? loadActiveGame() : null),
@@ -271,6 +294,12 @@ export function GamePage() {
     activeGameMeta && activeGameMeta.id === gameId
       ? activeGameMeta.formatConfig
       : undefined;
+  // The setup screen's edited config (starting life), handed over on the
+  // navigation that started this game. `GameSetupPage`'s native-engine route
+  // writes no resume pointer, so router state is the only channel that
+  // reaches both engine routes; `savedFormatConfig` still wins because it
+  // survives a hard refresh, and the two agree whenever both are present.
+  const setupFormatConfig = locationState?.formatConfig;
   // Memoize so the `GameProvider` `useEffect` dep array doesn't
   // tear-down/rebuild the P2P session on every parent re-render. Without
   // `useMemo`, each render constructs a fresh object reference from
@@ -283,10 +312,10 @@ export function GamePage() {
       if (savedFormatConfig && isDirectSetupFormat(savedFormatConfig.format)) {
         return savedFormatConfig;
       }
-      return directSetupFormatConfig(formatParam);
+      return setupFormatConfig ?? directSetupFormatConfig(formatParam);
     }
     return savedFormatConfig ?? (formatParam ? FORMAT_DEFAULTS[formatParam] : undefined);
-  }, [formatParam, rawMode, savedFormatConfig]);
+  }, [formatParam, rawMode, savedFormatConfig, setupFormatConfig]);
   // CR 103.1: 0 = play first, 1 = draw first, undefined = random
   const firstPlayer = firstParam === "play" ? 0 : firstParam === "draw" ? 1 : undefined;
   const matchConfig = useMemo<MatchConfig>(
@@ -534,11 +563,14 @@ export function GamePage() {
             deckRejected: true,
             reason: event.reason,
             joinCode,
+            // Carry the origin back: the retry must re-join the same server,
+            // not whichever one this client hosts on.
+            server: serverParam,
           },
         });
         break;
     }
-  }, [gameId, navigate, joinCode, isOnlineMode, t]);
+  }, [gameId, navigate, joinCode, serverParam, isOnlineMode, t]);
 
   const handleP2PEvent = useCallback((event: P2PAdapterEvent) => {
     switch (event.type) {
@@ -744,6 +776,7 @@ export function GamePage() {
       roomName={roomNameParam ?? undefined}
       source={sourceParam}
       draftId={draftIdParam}
+      serverUrl={serverParam}
       onWsEvent={mode === "ai" || mode === "online" || mode === "spectate" ? handleWsEvent : undefined}
       onP2PEvent={
         mode === "p2p-host" || mode === "p2p-join" ? handleP2PEvent : undefined
@@ -926,6 +959,38 @@ function GamePageContent({
   const [preferencesOpen, setPreferencesOpen] = useState<
     null | { tab?: SettingsTabId; highlight?: SettingsHighlight }
   >(null);
+  const gameMenuTriggerRef = useRef<HTMLButtonElement>(null);
+  const preferencesReturnFocusRef = useRef<HTMLElement | SVGElement | null>(null);
+  const zoneViewerReturnFocusRef = useRef<HTMLElement | SVGElement | null>(null);
+  const resolvedZoneViewerReturnFocusRef = useMemo<
+    RefObject<HTMLElement | SVGElement | null>
+  >(
+    () => ({
+      get current() {
+        const exactLauncher = zoneViewerReturnFocusRef.current;
+        // A manually opened pile is the most precise return target, but the
+        // final card can leave that pile while the viewer is open. Resolve at
+        // restoration time so the persistent game-menu trigger remains a
+        // connected fallback instead of allowing focus to fall to <body>.
+        return isFocusTargetAvailable(exactLauncher)
+          ? exactLauncher
+          : gameMenuTriggerRef.current;
+      },
+    }),
+    [],
+  );
+  const openPreferences = useCallback(
+    (request: { tab?: SettingsTabId; highlight?: SettingsHighlight } = {}) => {
+      // Toast and context-menu launchers unmount as settings opens. Hand focus
+      // to the persistent game-menu button first, and make that same durable
+      // element the modal's explicit restoration target.
+      const returnTarget = gameMenuTriggerRef.current;
+      preferencesReturnFocusRef.current = returnTarget;
+      returnTarget?.focus();
+      setPreferencesOpen(request);
+    },
+    [],
+  );
   const [boardContextMenu, setBoardContextMenu] = useState<{ x: number; y: number } | null>(null);
 
   const playerId = usePlayerId();
@@ -936,8 +1001,8 @@ function GamePageContent({
   const canActForWaitingState = useCanActForWaitingState();
   const boardChoiceLayerActive = useMemo(() => {
     const choice = getBoardChoiceView(waitingFor, objects);
-    return canActForWaitingState && choice?.player === playerId;
-  }, [canActForWaitingState, objects, playerId, waitingFor]);
+    return canActForWaitingState && choice != null;
+  }, [canActForWaitingState, objects, waitingFor]);
   const helpSheetOpen = useUiStore((s) => s.helpSheetOpen);
   const setHelpSheetOpen = useUiStore((s) => s.setHelpSheetOpen);
   const dismissedFlowHelpNudge = usePreferencesStore((s) => s.dismissedFlowHelpNudge);
@@ -946,13 +1011,44 @@ function GamePageContent({
   const cardReportDialogOpen = useUiStore((s) => s.cardReportDialogOpen);
   const multiplayerBoardLayout = usePreferencesStore((s) => s.multiplayerBoardLayout);
   const setMultiplayerBoardLayout = usePreferencesStore((s) => s.setMultiplayerBoardLayout);
+  const multiplayerSplitLayoutNudgeDismissed = usePreferencesStore(
+    (s) => s.multiplayerSplitLayoutNudgeDismissed,
+  );
+  const setMultiplayerSplitLayoutNudgeDismissed = usePreferencesStore(
+    (s) => s.setMultiplayerSplitLayoutNudgeDismissed,
+  );
   const debugPanelOpen = useUiStore((s) => s.debugPanelOpen);
   const debugClickModeButtonVisible = useUiStore((s) => s.debugClickModeButtonVisible);
+  const logPanelOpen = useUiStore((s) => s.logPanelOpen);
   const toggleDebugClickModeButtonVisible = useUiStore(
     (s) => s.toggleDebugClickModeButtonVisible,
   );
   const opponentDisplayName = useMultiplayerStore((s) => s.opponentDisplayName);
   const adapter = useGameStore((s) => s.adapter);
+  const aiDecisionCaptureEnabled = useUiStore((s) => s.aiDecisionCaptureEnabled);
+  const setAiDecisionCaptureEnabled = useUiStore((s) => s.setAiDecisionCaptureEnabled);
+  const [aiDecisionReceipt, setAiDecisionReceipt] = useState<AiDecisionDiagnosticReceipt | null>(null);
+  // GamePage owns the only local diagnostic subscription. Adapter events remain
+  // gameplay-only so no receipt can enter P2P/server state or wire traffic.
+  useEffect(() => {
+    setAiDecisionReceipt(null);
+    if (!supportsAiDecisionDiagnostics(adapter)) {
+      return;
+    }
+    adapter.setAiDecisionDiagnosticsEnabled(aiDecisionCaptureEnabled);
+    if (!aiDecisionCaptureEnabled) {
+      return;
+    }
+    const unsubscribe = adapter.subscribeAiDecisionDiagnostics(setAiDecisionReceipt);
+    return () => {
+      unsubscribe();
+      adapter.setAiDecisionDiagnosticsEnabled(false);
+    };
+  }, [adapter, aiDecisionCaptureEnabled]);
+  // The AUTHORITATIVE game mode. The URL-derived `mode` prop structurally
+  // cannot contain `native-ai` (desktop solo arrives as `rawMode === "ai"`), so
+  // it cannot answer "is anyone else at this table?".
+  const storeGameMode = useGameStore((s) => s.gameMode);
   const focusedOpponent = useUiStore((s) => s.focusedOpponent);
   const opponents = useMemo(() => {
     return getOpponentIds(gameState, perspectivePlayerId);
@@ -960,14 +1056,40 @@ function GamePageContent({
   const activeOpponentId =
     resolveFocusedOpponent(focusedOpponent, opponents) ?? opponents[0] ?? null;
   const seatCount = getSeatCount(gameState);
-  const splitBoardActive = isSplitBoardActive(multiplayerBoardLayout, seatCount);
-  const renderFocusedOpponentTopRow = shouldRenderFocusedOpponentTopRow(
+  const resolvedMultiplayerBoardLayout = resolveMultiplayerBoardLayout(
     multiplayerBoardLayout,
+    seatCount,
+    isMobile,
+  );
+  const untapForcedSplit =
+    seatCount > 2 &&
+    canActForWaitingState &&
+    getBoardChoiceView(waitingFor, objects)?.intent === "untap";
+  const effectiveMultiplayerBoardLayout = untapForcedSplit
+    ? "split"
+    : resolvedMultiplayerBoardLayout;
+  const splitBoardActive = isSplitBoardActive(effectiveMultiplayerBoardLayout, seatCount);
+  const renderFocusedOpponentTopRow = shouldRenderFocusedOpponentTopRow(
+    effectiveMultiplayerBoardLayout,
     seatCount,
   );
   const handleToggleMultiplayerBoardLayout = useCallback(() => {
-    setMultiplayerBoardLayout(multiplayerBoardLayout === "split" ? "focused" : "split");
-  }, [multiplayerBoardLayout, setMultiplayerBoardLayout]);
+    setMultiplayerBoardLayout(
+      resolvedMultiplayerBoardLayout === "split" ? "focused" : "split",
+    );
+  }, [resolvedMultiplayerBoardLayout, setMultiplayerBoardLayout]);
+  const handleTryMultiplayerSplitLayout = useCallback(() => {
+    setMultiplayerBoardLayout("split");
+  }, [setMultiplayerBoardLayout]);
+  const handleDismissMultiplayerSplitLayoutNudge = useCallback(() => {
+    setMultiplayerSplitLayoutNudgeDismissed(true);
+  }, [setMultiplayerSplitLayoutNudgeDismissed]);
+  const showMultiplayerSplitLayoutNudge =
+    seatCount > 2 &&
+    !isMobile &&
+    multiplayerBoardLayout === "focused" &&
+    !untapForcedSplit &&
+    !multiplayerSplitLayoutNudgeDismissed;
   const gridTemplateRows = splitBoardActive ? splitGridTemplateRows : focusedGridTemplateRows;
   const handleKickPlayer = useCallback((pid: number) => {
     const adapter = useGameStore.getState().adapter as
@@ -975,6 +1097,9 @@ function GamePageContent({
       | null;
     void adapter?.kickPlayer?.(pid);
   }, []);
+  const handleResumeP2P = useCallback(() => {
+    if (adapter instanceof P2PHostAdapter) adapter.requestResume();
+  }, [adapter]);
 
   // Memoize the HUD elements passed to GameBoard. GameBoard is wrapped in
   // React.memo, which shallow-compares props; without stable element
@@ -1133,6 +1258,7 @@ function GamePageContent({
     // zone control glow prompts the user to pick.
     if (groups.size === 1 && firstHit) {
       dismissedCastableZoneViewerKeyRef.current = null;
+      zoneViewerReturnFocusRef.current = gameMenuTriggerRef.current;
       setViewingZone(firstHit);
       return;
     }
@@ -1145,6 +1271,7 @@ function GamePageContent({
     if (castableTarget) {
       const autoOpenKey = castableZoneViewerAutoOpenKey(castableTarget);
       if (dismissedCastableZoneViewerKeyRef.current !== autoOpenKey) {
+        zoneViewerReturnFocusRef.current = gameMenuTriggerRef.current;
         setViewingZone({
           zone: castableTarget.zone,
           playerId: castableTarget.playerId,
@@ -1163,6 +1290,13 @@ function GamePageContent({
     }
     setViewingZone(null);
   }, [viewingZone]);
+
+  const prepareZoneViewerActionClose = useCallback(() => {
+    // A cast/play action can remove the final card only after its asynchronous
+    // engine dispatch resolves. Choose the durable launcher before the viewer
+    // closes so focus never lands on a pile that disappears moments later.
+    zoneViewerReturnFocusRef.current = gameMenuTriggerRef.current;
+  }, []);
 
   const handleDeclareCompanion = useCallback(
     (choice: CompanionRevealChoice | null) => {
@@ -1243,6 +1377,11 @@ function GamePageContent({
   const gamePageStyle = {
     "--game-top-overlay-offset": `${topOverlayOffsetPx}px`,
     "--game-split-safe-top": "0px",
+    "--game-left-rail-offset": "0px",
+    // Where the targeting prompt starts, which is the only part of its
+    // placement this page can state: the split layout puts seat panes at the
+    // very top of the board, so the prompt clears them. How TALL the block is
+    // stays the block's own business — see TargetingOverlay.
     "--game-targeting-prompt-top": splitBoardActive
       ? isMobile ? "4.25rem" : "4.75rem"
       : "0.25rem",
@@ -1254,7 +1393,13 @@ function GamePageContent({
     ? { width: "38px", height: "53px" }
     : { width: "clamp(45px, 4.5vw, 70px)", height: "clamp(63px, 6.3vw, 98px)" };
   const handleViewZone = useCallback(
-    (zone: "graveyard" | "exile" | "library", zonePlayerId: number) => {
+    (
+      zone: "graveyard" | "exile" | "library",
+      zonePlayerId: number,
+      launcher?: HTMLButtonElement,
+    ) => {
+      zoneViewerReturnFocusRef.current =
+        launcher ?? gameMenuTriggerRef.current;
       setViewingZone({ zone, playerId: zonePlayerId });
     },
     [],
@@ -1327,9 +1472,12 @@ function GamePageContent({
 
   return (
     <div
-      ref={containerRef}
-      className={`game-no-select relative h-[100dvh] w-full overflow-hidden bg-gray-950${showDebugBounds ? " debug-bounds" : ""}`}
-      style={gamePageStyle}
+      className={`game-no-select flex h-[100dvh] w-full flex-col bg-gray-950 lg:flex-row${showDebugBounds ? " debug-bounds" : ""}`}
+    >
+      <div
+        ref={containerRef}
+        className="relative min-h-0 min-w-0 flex-1 overflow-hidden contain-paint"
+        style={gamePageStyle}
       onContextMenu={(e) => {
         e.preventDefault();
         const target = e.target as HTMLElement | null;
@@ -1347,7 +1495,7 @@ function GamePageContent({
     >
       <SpectatorChrome />
       <BattlefieldBackground key={`${boardBackground}-${playerId}`} />
-      <StackDisplay />
+      <StackDisplay effectiveMultiplayerBoardLayout={effectiveMultiplayerBoardLayout} />
 
       {/* Persistent Sandbox banner — visible to all players whenever the
           game's format_config has debug actions enabled. Not dismissible. */}
@@ -1424,17 +1572,23 @@ function GamePageContent({
                     <ExilePile
                       playerId={activeOpponentId}
                       size={pileSize}
-                      onClick={() => handleViewZone("exile", activeOpponentId)}
+                      onClick={(launcher) =>
+                        handleViewZone("exile", activeOpponentId, launcher)
+                      }
                     />
                     <LibraryPile
                       playerId={activeOpponentId}
                       size={pileSize}
-                      onView={() => handleViewZone("library", activeOpponentId)}
+                      onView={(launcher) =>
+                        handleViewZone("library", activeOpponentId, launcher)
+                      }
                     />
                     <GraveyardPile
                       playerId={activeOpponentId}
                       size={pileSize}
-                      onClick={() => handleViewZone("graveyard", activeOpponentId)}
+                      onClick={(launcher) =>
+                        handleViewZone("graveyard", activeOpponentId, launcher)
+                      }
                     />
                   </>
                 ) : null}
@@ -1446,6 +1600,7 @@ function GamePageContent({
         {/* Row 2: Battlefield — takes remaining space; HUDs passed inline to PlayerAreas */}
         <div className="relative z-30 flex min-h-0 min-w-0 flex-col">
           <GameBoard
+            effectiveMultiplayerBoardLayout={effectiveMultiplayerBoardLayout}
             oppHud={oppHud}
             playerHud={playerHud}
             showOpponentCards={showAiHand}
@@ -1459,16 +1614,16 @@ function GamePageContent({
             band would drag the hand vertically. Instead we give the row a
             CONSTANT height equal to the DEFAULT band and pin it to the track's
             bottom (`self-end`, the viewport edge, which never moves). The height
-            mirrors the resolver's default track exactly — `min(18%, 150px)` of
-            the grid's CONTENT box (`100dvh` minus the top-overlay padding) — but
+            uses the shared `--game-player-row-height` contract (also consumed by
+            board-choice controls) to mirror the resolver's default track. It is
             computed in viewport units so it ignores the LIVE (resized) track,
-            which a plain `18%` on a grid item would track instead. The hand thus
-            keeps its default resting position and stays put on resize; a grown
-            band opens empty space ABOVE the row (trading with the battlefield)
-            rather than shoving the hand up. */}
+            which a plain percentage on a grid item would track instead. The hand
+            thus keeps its default resting position and stays put on resize; a
+            grown band opens empty space ABOVE the row (trading with the
+            battlefield) rather than shoving the hand up. */}
         <div
           className="relative min-w-0 self-end overflow-visible"
-          style={{ height: "min(calc(0.18 * (100dvh - var(--game-top-overlay-offset, 0px))), 150px)" }}
+          style={{ height: "var(--game-player-row-height)" }}
           data-flex-zone="player-row"
         >
           <div className="flex items-end justify-center" data-flex-zone="playerHandRow">
@@ -1476,31 +1631,42 @@ function GamePageContent({
                 PlayerHand's own fan (see ZoneFanCard), so the row is just the hand.
                 The `playerHandRow` flex-zone hook drives the mobile hand-lift
                 transform in index.css. */}
-            <PlayerHand />
+            <PlayerHand interactionDisabled={boardChoiceLayerActive} />
           </div>
           <DraggableWidget
             target={{ kind: "widget", key: "playerPiles" }}
             flexZone="playerPiles"
             scaleKey="playerPiles"
             className="pointer-events-none absolute left-0 top-0 bottom-0 z-10 flex w-fit flex-col items-start justify-end gap-0.5 p-1 lg:gap-1 lg:p-3 [&>*]:pointer-events-auto [&>div>*]:pointer-events-auto"
-            // Anchor box-scale to the bottom-left dock corner.
-            style={{ ...playerZoneRailStyle, transformOrigin: "bottom left" }}
+            // Anchor box-scale to the bottom-left dock corner. No left-rail
+            // offset here: this pile is absolutely positioned inside the board
+            // grid, whose padding already accounts for a left-docked log panel.
+            style={{
+              ...playerZoneRailStyle,
+              transformOrigin: "bottom left",
+            }}
           >
             <div className="flex items-end gap-2">
               <ExilePile
                 playerId={perspectivePlayerId}
                 size={pileSize}
-                onClick={() => handleViewZone("exile", perspectivePlayerId)}
+                onClick={(launcher) =>
+                  handleViewZone("exile", perspectivePlayerId, launcher)
+                }
               />
               <GraveyardPile
                 playerId={perspectivePlayerId}
                 size={pileSize}
-                onClick={() => handleViewZone("graveyard", perspectivePlayerId)}
+                onClick={(launcher) =>
+                  handleViewZone("graveyard", perspectivePlayerId, launcher)
+                }
               />
               <LibraryPile
                 playerId={perspectivePlayerId}
                 size={pileSize}
-                onView={() => handleViewZone("library", perspectivePlayerId)}
+                onView={(launcher) =>
+                  handleViewZone("library", perspectivePlayerId, launcher)
+                }
               />
             </div>
           </DraggableWidget>
@@ -1574,8 +1740,7 @@ function GamePageContent({
         </div>
       </DraggableWidget>
 
-      <GameLogPanel />
-      <MobileHandDrawer />
+      <MobileHandDrawer interactionDisabled={boardChoiceLayerActive} />
       <FlexEditOverlay />
 
       {/* Game menu — top-left hamburger */}
@@ -1585,9 +1750,23 @@ function GamePageContent({
         isOnlineMode={isOnlineMode}
         showAiHand={showAiHand}
         onToggleAiHand={() => setShowAiHand((v) => !v)}
-        multiplayerBoardLayout={seatCount > 2 ? multiplayerBoardLayout : undefined}
-        onToggleMultiplayerBoardLayout={seatCount > 2 ? handleToggleMultiplayerBoardLayout : undefined}
-        onSettingsClick={() => setPreferencesOpen({})}
+        logPanelOpen={logPanelOpen}
+        onToggleGameLog={() => useUiStore.getState().toggleLogPanel()}
+        multiplayerBoardLayout={
+          seatCount > 2 && !untapForcedSplit ? resolvedMultiplayerBoardLayout : undefined
+        }
+        onToggleMultiplayerBoardLayout={
+          seatCount > 2 && !untapForcedSplit ? handleToggleMultiplayerBoardLayout : undefined
+        }
+        showMultiplayerSplitLayoutNudge={showMultiplayerSplitLayoutNudge}
+        onTryMultiplayerSplitLayout={
+          showMultiplayerSplitLayoutNudge ? handleTryMultiplayerSplitLayout : undefined
+        }
+        onDismissMultiplayerSplitLayoutNudge={
+          showMultiplayerSplitLayoutNudge ? handleDismissMultiplayerSplitLayoutNudge : undefined
+        }
+        onSettingsClick={() => openPreferences()}
+        menuTriggerRef={gameMenuTriggerRef}
         onHelpClick={() => setHelpSheetOpen(true)}
         onConcede={onShowConcedeDialog}
         // Takeback is a TRANSPORT capability, not a mode policy: only
@@ -1611,6 +1790,7 @@ function GamePageContent({
             ? handleRequestTakeback
             : undefined
         }
+        takebackAudience={hasRemoteHumans(storeGameMode) ? "table" : "solo"}
         showSandboxTools={mode === "ai" || mode === "local" || isSandboxGame}
         onSandboxToolsClick={() => useUiStore.getState().openSandboxTools()}
         debugClickModeButtonVisible={debugClickModeButtonVisible}
@@ -1619,7 +1799,7 @@ function GamePageContent({
         onReportCardClick={() => useUiStore.getState().openCardReportDialog()}
       />
       <HelpSheet />
-      <CardReportDialog />
+      <CardReportDialog returnFocusRef={gameMenuTriggerRef} />
 
       {/* The page's toast surface, not an online-only one: solo games raise
           toasts too (the native-engine fallback notice). Only online games get
@@ -1627,7 +1807,7 @@ function GamePageContent({
           to re-dial and would just restart itself. */}
       <ConnectionToast
         onRetry={isOnlineMode ? () => window.location.reload() : undefined}
-        onSettings={() => setPreferencesOpen({})}
+        onSettings={() => openPreferences()}
       />
 
 
@@ -1654,7 +1834,11 @@ function GamePageContent({
       )}
 
       {/* P2P pause banner — visible to everyone while paused. */}
-      <PausedBanner isVisible={pauseReason !== null} reason={pauseReason ?? ""} />
+      <PausedBanner
+        isVisible={pauseReason !== null}
+        reason={pauseReason ?? ""}
+        onResume={isP2PHost && adapter instanceof P2PHostAdapter ? handleResumeP2P : undefined}
+      />
 
       {/* P2P host-only disconnect decision modal. */}
       {isP2PHost && disconnectChoice !== null && (
@@ -1747,7 +1931,14 @@ function GamePageContent({
       </AnimatePresence>
 
       {/* Overlay layers */}
-      <DebugPanel />
+      <DebugPanel
+        aiDecisionDiagnosticsAvailable={supportsAiDecisionDiagnostics(adapter)}
+      />
+      <AiDecisionOverlay
+        receipt={aiDecisionReceipt}
+        visible={aiDecisionCaptureEnabled}
+        onClose={() => setAiDecisionCaptureEnabled(false)}
+      />
       <ResolutionProgressOverlay />
 
       {preferencesOpen && (
@@ -1755,6 +1946,7 @@ function GamePageContent({
           onClose={() => setPreferencesOpen(null)}
           initialTab={preferencesOpen.tab}
           highlight={preferencesOpen.highlight}
+          returnFocusRef={preferencesReturnFocusRef}
         />
       )}
 
@@ -1764,7 +1956,7 @@ function GamePageContent({
           y={boardContextMenu.y}
           onClose={() => setBoardContextMenu(null)}
           onChangeBackground={() =>
-            setPreferencesOpen({ tab: "gameplay", highlight: "board-background" })
+            openPreferences({ tab: "gameplay", highlight: "board-background" })
           }
           onCustomizeLayout={() => useUiStore.getState().setFlexEditMode(true)}
           onToggleGameLog={() => useUiStore.getState().toggleLogPanel()}
@@ -1775,8 +1967,8 @@ function GamePageContent({
         />
       )}
 
-      <DebugCardContextMenu />
-      <DebugLibraryViewer />
+      <DebugCardContextMenu surface="game" />
+      <DebugLibraryViewer returnFocusRef={gameMenuTriggerRef} />
 
       {/* Animation overlay (above board, below modals) */}
       <AnimationOverlay containerRef={containerRef} />
@@ -1784,10 +1976,11 @@ function GamePageContent({
       <RevealOverlay />
       <TurnBanner />
       <DiceRollOverlay />
+      <ScryOutcomeOverlay />
 
       {/* Combat SVG overlays: blocker assignments + attack target arrows */}
-      <BlockAssignmentLines />
-      <AttackTargetLines />
+      <BlockAssignmentLines effectiveMultiplayerBoardLayout={effectiveMultiplayerBoardLayout} />
+      <AttackTargetLines effectiveMultiplayerBoardLayout={effectiveMultiplayerBoardLayout} />
       {/* Per-attacker "needs N blockers" badges (menace / "blocked by N or more").
           Self-gates: renders nothing unless the local player is assigning blockers
           to attackers that carry a minimum-blocker requirement. */}
@@ -1799,10 +1992,6 @@ function GamePageContent({
           supplied constraints. Display-only. */}
       <AttackRequirementBadges />
       <BlockerConstraintBadges />
-
-      {/* Card preview overlay. Owns its own inspect-state subscriptions so a
-          hover doesn't re-render GamePageContent (and the whole battlefield). */}
-      <GameCardPreview />
 
       {/* WaitingFor-driven prompt overlays (only for human player).
           Wrapped in DialogHost so any active dialog can be peeked away to
@@ -1825,8 +2014,11 @@ function GamePageContent({
           canActForWaitingState && <AssistPaymentUI />}
         {waitingFor?.type === "ReplacementChoice" &&
           canActForWaitingState && <ReplacementModal />}
+        {canActForWaitingState && <ResolveAllConsentModal playerId={playerId} />}
         {waitingFor?.type === "OrderTriggers" &&
           canActForWaitingState && <TriggerOrderModal />}
+        {waitingFor?.type === "OrderCostReductions" &&
+          canActForWaitingState && <CostReductionOrderModal />}
         <BattleProtectorModal />
         <MeldChoiceModal />
         <AssistChoosePlayerModal />
@@ -1835,6 +2027,7 @@ function GamePageContent({
         <PileOpponentModal />
         <AnnouncingOpponentModal />
         <GiftRecipientModal />
+        <EntryControllerModal />
         <TributeModal />
         <CombatTaxModal />
         <AlternativeCostModal />
@@ -1849,6 +2042,7 @@ function GamePageContent({
         <LifeRedistributionModal />
         <AdventureCastModal />
         <CascadeChoiceModal />
+        <RippleRevealChoiceModal />
         <SpellbookDraftModal />
         <FreeCastWindowModal />
         <ModalFaceModal />
@@ -1864,7 +2058,7 @@ function GamePageContent({
         {/* Ability choice picker (planeswalkers, multi-ability permanents) */}
         <AbilityChoiceModal />
 
-        {/* Player-attached Aura viewer (Curse cycle, Faith's Fetters, etc.).
+        {/* Player-attached Aura viewer (Curse cycle, Paradox Haze, etc.).
             Mounted here — not from inside HudPlate where the badge lives —
             so the dialog's `fixed inset-0` shell anchors to the viewport
             instead of HudPlate's transform-CB bounding box. */}
@@ -1896,6 +2090,11 @@ function GamePageContent({
             <OptionalEffectModal />
           )}
 
+        {/* Optional immediate payment branch ("discard a card or pay {2}") */}
+        {waitingFor?.type === "ResolutionOptionalPaymentChoice" && (
+          <ResolutionOptionalPaymentModal />
+        )}
+
         {/* CR 401.4: Owner puts permanent on top or bottom of library */}
         {(waitingFor?.type === "TopOrBottomChoice" || waitingFor?.type === "ClashCardPlacement") &&
           canActForWaitingState && (
@@ -1912,11 +2111,6 @@ function GamePageContent({
         {waitingFor?.type === "CipherEncodeChoice" &&
           canActForWaitingState && (
             <CipherEncodeModal />
-          )}
-
-        {waitingFor?.type === "UntapChoice" &&
-          canActForWaitingState && (
-            <UntapChoiceModal />
           )}
 
         {/* CR 701.43d: Optional "exert as it attacks" choice (Combat Celebrant). */}
@@ -1955,6 +2149,8 @@ function GamePageContent({
           zone={viewingZone.zone}
           playerId={viewingZone.playerId}
           onClose={handleZoneViewerClose}
+          onPrepareActionClose={prepareZoneViewerActionClose}
+          returnFocusRef={resolvedZoneViewerReturnFocusRef}
         />
       )}
 
@@ -2091,6 +2287,7 @@ function GamePageContent({
                 : undefined
             }
             onCancel={onHideConcedeDialog}
+            returnFocusRef={gameMenuTriggerRef}
           />
           <TakebackRequestDialog
             isOpen={pendingTakeback !== null}
@@ -2143,6 +2340,11 @@ function GamePageContent({
         onExit={handleUnhandledExit}
         exitLabel={isOnlineMode ? t("gamePage.actions.concedeGame") : t("gamePage.actions.returnToMenuLower")}
       />
+      </div>
+      <GameLogPanel />
+      {/* This is a peer of the board and log columns: a preview opened from a
+          log card must not be clipped by the paint-contained board column. */}
+      <GameCardPreview />
     </div>
   );
 }
@@ -2793,11 +2995,36 @@ function GameOverScreen({
     params.delete("roomName");
     if (mode) params.set("mode", mode);
     params.set("difficulty", difficulty);
-    navigate(`/game/${newId}?${params.toString()}`);
+    // `format` names the format but carries none of its edited knobs, and the
+    // saved active-game record is keyed to the game id we are leaving — so a
+    // custom starting life would revert to the format default here. Hand over
+    // the config the engine actually played with, on the same router-state
+    // channel `GameSetupPage` uses to start a game.
+    navigate(`/game/${newId}?${params.toString()}`, {
+      state: { formatConfig: gameState?.format_config },
+    });
   };
 
   const handleBackToDraft = () => {
     navigate("/draft/quick?resume=1");
+  };
+
+  /**
+   * There are TWO "back to pod" affordances in a `draft-match` game — this
+   * game-over button and the in-game menu's "Back to draft"
+   * (`GameMenu.tsx`) — and a third exit through Concede
+   * (`useConcedeHandler`). All three ask the same question, so all three ask
+   * `endCommanderSession`, which owns the answer and the reasoning: a pairwise
+   * pod match must survive being left, a Commander launch must not.
+   *
+   * `finally`, not `then` — a teardown that rejects must not strand the player
+   * on the game-over screen.
+   */
+  const handleBackToPod = () => {
+    void useMultiplayerDraftStore
+      .getState()
+      .endCommanderSession()
+      .finally(() => navigate("/draft-pod"));
   };
 
   return (
@@ -2889,7 +3116,7 @@ function GameOverScreen({
             ) : isDraftPodMatch ? (
               <button
                 disabled={!resultRecorded}
-                onClick={() => navigate("/draft-pod")}
+                onClick={handleBackToPod}
                 className={gameButtonClass({
                   tone: isVictory ? "amber" : "slate",
                   size: "lg",
@@ -2991,6 +3218,8 @@ export function manaRestrictionLabel(
       return t("gamePage.manaRestrictions.onlyForSpellColor", restriction.data);
     case "onlyForSpellFromZone":
       return t("gamePage.manaRestrictions.onlyForSpellFromZone", restriction.data);
+    case "cannotCastSpellFromZone":
+      return t("gamePage.manaRestrictions.cannotCastSpellFromZone", restriction.data);
     case "onlyForFaceDownSpell":
       return t("gamePage.manaRestrictions.onlyForFaceDownSpell");
     case "onlyForAny":
@@ -3082,7 +3311,22 @@ function AbilityChoiceModal() {
   const webSlingingCosts = useGameStore(
     (s) => s.gameState?.derived?.web_slinging_costs,
   );
+  // CR 709.5b: engine-published Room halves, already resolved through the
+  // COPIED halves for a permanent that copies a Room.
+  const roomHalfIdentities = useGameStore(
+    (s) => s.gameState?.derived?.room_half_identities,
+  );
   const viewerInteraction = useGameStore((s) => s.viewerInteraction);
+  // CR 118.3: the engine-authored "can't pay this cost right now" read-out.
+  // Read from the store slice (not from `uiStore.pendingAbilityChoice`) so the
+  // rows stay live against the current state rather than latched to whatever
+  // was true when the choice was queued.
+  // `?? {}` is load-bearing, not defensive noise: a store SNAPSHOT that predates
+  // this slice (a restored session, or any consumer holding an older store
+  // shape) yields `undefined`, and subscripting it would crash the whole game
+  // page for a display-only feature. Mirrors `legalResultState`'s own
+  // `result.activationBlockReasons ?? {}` default.
+  const activationBlockReasons = useGameStore((s) => s.activationBlockReasons) ?? {};
 
   if (!pending || !obj) return null;
 
@@ -3122,12 +3366,14 @@ function AbilityChoiceModal() {
       subtitle={subtitle}
       previewCardName={obj.name}
       previewCardTypes={obj.card_types}
-      options={pending.actions.map((action, i) => {
+      options={[
+        ...pending.actions.map((action, i) => {
         let { label, description } = abilityChoiceLabel(
           action,
           obj,
           objects,
           webSlingingCosts,
+          roomHalfIdentities,
         );
         if (action.type === "TapLandForMana") {
           const surfaces = action.interactionActionId
@@ -3149,16 +3395,62 @@ function AbilityChoiceModal() {
             // badge already expresses its cost, so keeping the effect in the
             // secondary description would visually detach it from that badge.
             label: description ?? stripLoyaltyCostPrefix(label),
-            labelTone: "secondary",
+            // `as const`: a spread element no longer receives `ChoiceOption[]`
+            // as its contextual type, so this would otherwise widen to `string`.
+            labelTone: "secondary" as const,
             icon: (
               <LoyaltyBadge amount={badge.amount} kind="cost" />
             ),
           };
         }
         return { id: String(i), label, description };
-      })}
+        }),
+        // CR 118.3: display-only rows for abilities the engine is withholding
+        // solely because the cost is unpayable right now. Appended AFTER the
+        // action rows so the positional `id = String(i)` <-> `pending.actions[Number(id)]`
+        // contract above is preserved byte-for-byte.
+        //
+        // No de-duplication against the offered rows is needed: the engine's
+        // read-out and its offered set are produced by the SAME
+        // `activation_verdict` core, so an ability is in exactly one of them.
+        ...(activationBlockReasons[String(pending.objectId)] ?? []).map((entry) => {
+          // CR 201.5: `~` is the engine's self-reference token; bind it to the
+          // host object, the idiom both shipped consumers use. A runtime-granted
+          // index has no printed description, so the row falls back to the
+          // reason alone (matching `PermanentCard`'s badge).
+          const ability = entry.ability_index < obj.abilities.length
+            ? obj.abilities[entry.ability_index]
+            : undefined;
+          const reason = t(ABILITY_BLOCK_REASON_KEY[entry.type]);
+          // Same label/description split the OFFERED rows above get from
+          // `abilityChoiceLabel` (`costLabel.ts`: `abilityLabel` for the label,
+          // `stripCostPrefix` for the description). A blocked `{3}` and an
+          // offered `{3}` therefore render identically in the same list and
+          // differ only by the disabled styling — which is the comparison the
+          // reported defect is about, since the card face shows both. Reusing
+          // the shipped helpers rather than re-deriving the split here keeps the
+          // two row kinds from drifting apart. `RichLabel` inside `ChoiceModal`
+          // renders `{3}` as a real mana pip, so no cost plumbing is needed.
+          const effect = ability?.description
+            ? renderDescription(stripCostPrefix(ability.description), obj.name)
+            : undefined;
+          return {
+            id: `blocked:${entry.ability_index}`,
+            label: ability ? renderDescription(abilityLabel(ability), obj.name) : reason,
+            description: effect ? `${effect} — ${reason}` : ability ? reason : undefined,
+            disabled: true,
+          };
+        }),
+      ]}
       onChoose={(id) => {
-        dispatch(pending.actions[Number(id)]);
+        // CR 118.3: blocked rows are display-only and carry a non-numeric id.
+        // Without this guard `Number("blocked:0")` is `NaN`, so
+        // `pending.actions[NaN]` is `undefined` and a malformed dispatch
+        // reaches the engine.
+        if (id.startsWith("blocked:")) return;
+        const action = pending.actions[Number(id)];
+        if (!action) return;
+        dispatch(action);
         setPending(null);
       }}
       onClose={() => setPending(null)}
@@ -3256,6 +3548,22 @@ function OptionalEffectModal() {
   return <OptionalEffectModalContent waitingFor={waitingFor} objects={objects} dispatch={dispatch} />;
 }
 
+function ResolutionOptionalPaymentModal() {
+  const dispatch = useGameDispatch();
+  const waitingFor = useGameStore((s) => s.waitingFor);
+  const canActForWaitingState = useCanActForWaitingState();
+
+  if (waitingFor?.type !== "ResolutionOptionalPaymentChoice") return null;
+
+  return (
+    <ResolutionOptionalPaymentModalContent
+      waitingFor={waitingFor}
+      canActForWaitingState={canActForWaitingState}
+      dispatch={dispatch}
+    />
+  );
+}
+
 // ── Top or Bottom Choice Modal (CR 401.4) ──────────────────────────────
 
 function TopOrBottomModal() {
@@ -3288,50 +3596,6 @@ function CipherEncodeModal() {
   if (waitingFor?.type !== "CipherEncodeChoice") return null;
 
   return <CipherEncodeChoiceModalContent waitingFor={waitingFor} objects={objects} dispatch={dispatch} />;
-}
-
-// ── Untap Choice Modal ─────────────────────────────────────────────────
-
-function UntapChoiceModal() {
-  const { t } = useTranslation("game");
-  const dispatch = useGameDispatch();
-  const waitingFor = useGameStore((s) => s.waitingFor);
-  const objects = useGameStore((s) => s.gameState?.objects);
-
-  if (waitingFor?.type !== "UntapChoice") return null;
-
-  const objectId = waitingFor.data.candidates[0];
-  if (objectId == null) return null;
-
-  const object = objects?.[objectId];
-  const name = object?.name ?? t("gamePage.untap.permanentFallback");
-
-  return (
-    <ChoiceModal
-      title={t("gamePage.untap.title", { name })}
-      subtitle={t("gamePage.untap.subtitle")}
-      previewCardName={object?.name}
-      previewCardTypes={object?.card_types}
-      options={[
-        {
-          id: "untap",
-          label: t("gamePage.untap.untap"),
-          description: t("gamePage.untap.untapDescription", { name }),
-        },
-        {
-          id: "keep-tapped",
-          label: t("gamePage.untap.keepTapped"),
-          description: t("gamePage.untap.keepTappedDescription", { name }),
-        },
-      ]}
-      onChoose={(id) =>
-        dispatch({
-          type: "ChooseUntap",
-          data: { object_id: objectId, untap: id === "untap" },
-        })
-      }
-    />
-  );
 }
 
 // ── Exert Choice Modal (CR 701.43d: exert as it attacks) ────────────────
@@ -3439,9 +3703,51 @@ function formatManaCost(cost: { type: string; shards?: string[]; generic?: numbe
 }
 
 function formatUnlessCost(
-  cost: { type: string; cost?: { type: string; shards?: string[]; generic?: number }; amount?: number; count?: number },
+  cost:
+    // CR 702.21a + CR 122.1 + CR 104.3d: Ward's player-counter cost is a real
+    // discriminated variant with required fields (the engine's
+    // `AbilityCost::GetPlayerCounters` always sends both) — rendered
+    // unchanged, not reinterpreted (no lowercasing, no fallback defaults).
+    | {
+        type: "GetPlayerCounters";
+        count: number;
+        counter_kind: "Poison" | "Experience" | "Rad" | "Ticket";
+      }
+    | {
+        type: string;
+        cost?: { type: string; shards?: string[]; generic?: number };
+        amount?: number;
+        count?: number;
+      },
   t: TFunction<"game">,
 ): string {
+  // `"counter_kind" in cost` narrows via property presence rather than a
+  // `cost.type` literal comparison — the sibling union member's `type: string`
+  // is too wide for a `switch (cost.type)`/`cost.type === "GetPlayerCounters"`
+  // check to exclude it, so `cost.counter_kind` would otherwise fail to
+  // type-check inside that branch. The exhaustive switch below maps each
+  // engine value to its i18n key explicitly rather than interpolating
+  // `cost.counter_kind` directly into the key template — that would make the
+  // display layer depend on the engine's serde string matching the locale
+  // JSON's key names, an implicit coupling the compiler can't check. This way
+  // a future `PlayerCounterKind` variant fails to compile here instead of
+  // silently rendering a missing translation.
+  if ("counter_kind" in cost) {
+    const kindKey: "Poison" | "Experience" | "Rad" | "Ticket" = (() => {
+      switch (cost.counter_kind) {
+        case "Poison":
+          return "Poison";
+        case "Experience":
+          return "Experience";
+        case "Rad":
+          return "Rad";
+        case "Ticket":
+          return "Ticket";
+      }
+    })();
+    const kind = t(`gamePage.cost.playerCounterKind.${kindKey}`);
+    return t("gamePage.cost.playerCounters", { count: cost.count, kind });
+  }
   switch (cost.type) {
     // Legacy `UnlessCost` JSON (pre-2026-05-09 fold) — preserved for
     // saved-game compat.
@@ -3634,7 +3940,10 @@ function MeldChoiceModal() {
     );
   }
 
-  if (waitingFor?.type === "MeldAttackTargetChoice") {
+  if (
+    waitingFor?.type === "MeldAttackTargetChoice" ||
+    waitingFor?.type === "EntryAttackTargetChoice"
+  ) {
     const targets = waitingFor.data.valid_targets;
     return (
       <ChoiceModal

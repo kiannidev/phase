@@ -1,8 +1,8 @@
 //! `KeepablesByLandCount` — baseline land-count + castability mulligan policy.
 //!
-//! CR 103.5 (`docs/MagicCompRules.txt:295`): deciding whether to keep or
-//! mulligan an opening hand. This policy is the deck-agnostic baseline — it
-//! checks land count, color availability, and early castability.
+//! CR 103.5: deciding whether to keep or mulligan an opening hand. This
+//! policy is the deck-agnostic baseline — it checks land count, color
+//! availability, and early castability.
 //!
 //! The minimum kept-hand size is NOT this policy's concern — it belongs to
 //! `card_floor::MulliganCardFloor`, the single process-level authority, whose
@@ -46,7 +46,6 @@ impl MulliganPolicy for KeepablesByLandCount {
         mulligans_taken: u8,
     ) -> MulliganScore {
         let hand_size = hand.len();
-
         // After 2+ mulligans, be much more lenient — keep any hand with at
         // least 1 land + 1 spell.
         if mulligans_taken >= 2 {

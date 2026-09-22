@@ -18,6 +18,7 @@ import { GameCardPreview } from "../GameCardPreview.tsx";
 // assert the forwarded name without loading Scryfall assets. Mirrors the mocks
 // in CardPreview.test.tsx.
 vi.mock("../../../hooks/useCardImage.ts", () => ({
+  useCardBackImage: () => ({ src: "card-back.png", isLoading: false }),
   useCardImage: () => ({
     src: "card.png",
     isLoading: false,
@@ -62,11 +63,15 @@ afterEach(() => {
   useGameStore.setState({ gameState: null, spellCosts: {} });
   useUiStore.setState({
     inspectedObjectId: null,
+    inspectedCardName: null,
     inspectedFaceIndex: 0,
+    previewPlacement: "cursor",
+    previewSource: null,
     isDragging: false,
     mobileHandGesture: null,
     shiftHeld: false,
     altHeld: false,
+    previewSticky: false,
   });
   // GameCardPreview adds a third store; reset it so "shift" mode doesn't leak.
   usePreferencesStore.setState({ cardPreviewMode: "follow" });
@@ -75,6 +80,101 @@ afterEach(() => {
 describe("GameCardPreview", () => {
   it("forwards the inspected object's name to the preview", () => {
     inspect(battlefieldObject());
+
+    render(<GameCardPreview />);
+
+    expect(screen.getAllByAltText("Pithing Needle").length).toBeGreaterThan(0);
+  });
+
+  it("previews a public historical log card after its live object is gone", () => {
+    useGameStore.setState({ gameState: null, spellCosts: {} });
+    useUiStore.setState({
+      inspectedObjectId: 999,
+      inspectedCardName: "Pithing Needle",
+      previewSticky: true,
+    });
+
+    render(<GameCardPreview />);
+
+    expect(screen.getAllByAltText("Pithing Needle").length).toBeGreaterThan(0);
+  });
+
+  it("docks a preview opened from a modal even when cursor-follow is preferred", () => {
+    inspect(battlefieldObject());
+    useUiStore.setState({ previewPlacement: "side" });
+
+    const { container } = render(<GameCardPreview />);
+
+    expect(container.querySelector<HTMLElement>("[data-card-preview]")).toHaveStyle({
+      right: "calc(env(safe-area-inset-right) + 1rem + var(--game-right-rail-offset, 0px))",
+    });
+  });
+
+  it("disables hand pointer interaction and clears a stale hand preview for a board choice", () => {
+    const handCard = gameObjectFactory
+      .withId(201)
+      .inHand()
+      .named("Hand Card")
+      .build();
+    const gameState = gameStateFactory
+      .withPlayers({ id: 0, hand: [handCard.id] }, 1)
+      .withObjects(handCard)
+      .build();
+    useGameStore.setState({ gameState, spellCosts: {} });
+    useUiStore.setState({
+      inspectedObjectId: handCard.id,
+      previewSource: "playerHand",
+      previewSticky: true,
+    });
+
+    const { container } = render(
+      <PlayerHand interactionDisabled />,
+    );
+
+    expect(container.querySelector("[data-player-hand]")).toHaveClass("pointer-events-none");
+    expect(useUiStore.getState().inspectedObjectId).toBeNull();
+    expect(useUiStore.getState().previewSticky).toBe(false);
+  });
+
+  it("preserves a modal sticky preview of the same hand object when interaction becomes disabled", () => {
+    const handCard = gameObjectFactory
+      .withId(202)
+      .inHand()
+      .named("Hand Card")
+      .build();
+    const gameState = gameStateFactory
+      .withPlayers({ id: 0, hand: [handCard.id] }, 1)
+      .withObjects(handCard)
+      .build();
+    useGameStore.setState({ gameState, spellCosts: {} });
+
+    const { container, rerender } = render(
+      <>
+        <PlayerHand />
+        <GameCardPreview />
+      </>,
+    );
+
+    act(() => {
+      useUiStore.getState().inspectObjectSticky(handCard.id, 0, "side");
+    });
+    rerender(
+      <>
+        <PlayerHand interactionDisabled />
+        <GameCardPreview />
+      </>,
+    );
+
+    expect(useUiStore.getState().inspectedObjectId).toBe(handCard.id);
+    expect(useUiStore.getState().previewSource).toBeNull();
+    expect(container.querySelector("[data-card-preview]")).not.toBeNull();
+    expect(screen.getAllByAltText("Hand Card").length).toBeGreaterThan(0);
+  });
+
+  it("keeps an explicit sticky preview visible in Hold Shift mode", () => {
+    inspect(battlefieldObject());
+    usePreferencesStore.setState({ cardPreviewMode: "shift" });
+    useUiStore.setState({ previewSticky: true });
 
     render(<GameCardPreview />);
 
@@ -142,6 +242,7 @@ describe("GameCardPreview", () => {
       expect(preview).toHaveStyle({ bottom: "0px" });
       expect(within(preview!).getByAltText("Hovered Card")).toBeInTheDocument();
     });
+    expect(useUiStore.getState().previewSource).toBe("playerHand");
   });
 
   it("keeps the held card in the stable fan until direct dragging begins", () => {
@@ -248,11 +349,74 @@ describe("GameCardPreview", () => {
     expect(screen.getAllByAltText("Insectile Aberration").length).toBeGreaterThan(0);
   });
 
-  it("never previews a face-down permanent (hidden information)", () => {
+  it("previews a markerless face-down permanent as the generic back — identity stays hidden (#7551 review)", () => {
+    // No recorded cause (older saves): there is no marker printing, but the
+    // hover must still answer — with the generic card back, which reveals
+    // nothing (CR 708.2a: the public face is a blank 2/2).
     inspect(battlefieldObject({ face_down: true }));
 
-    const { container } = render(<GameCardPreview />);
+    render(<GameCardPreview />);
 
-    expect(container.firstChild).toBeNull();
+    expect(screen.getAllByAltText("Card back").length).toBeGreaterThan(0);
+    expect(screen.queryByAltText("Pithing Needle")).toBeNull();
+  });
+
+  it("previews the Ixidron class (TurnedFaceDown) as the generic back (#7551 review)", () => {
+    // `TurnedFaceDown` (an effect turned it face down, CR 708.2a) has no
+    // printed marker token — same generic-back path as the unknown cause.
+    inspect(
+      battlefieldObject({
+        face_down: true,
+        face_down_cause: "TurnedFaceDown" as never,
+        name: "",
+      }),
+    );
+
+    render(<GameCardPreview />);
+
+    expect(screen.getAllByAltText("Card back").length).toBeGreaterThan(0);
+    expect(screen.queryByAltText("Pithing Needle")).toBeNull();
+  });
+
+  it("previews a face-down permanent when the engine projects its identity", () => {
+    inspect(battlefieldObject({ face_down: true, display_visible_to_viewer: true }));
+
+    render(<GameCardPreview />);
+
+    expect(screen.getAllByAltText("Pithing Needle").length).toBeGreaterThan(0);
+  });
+
+  it("peeks the STORED face of the viewer's own face-down permanent (#7547)", () => {
+    // The live face is blanked per CR 708.2a; the preview is the CR 708.5
+    // peek, so it resolves the stored real face — on any hovered face index.
+    inspect(
+      battlefieldObject({
+        face_down: true,
+        display_visible_to_viewer: true,
+        name: "",
+        back_face: { name: "Hooded Hydra", layout_kind: null } as never,
+      }),
+    );
+
+    render(<GameCardPreview />);
+
+    expect(screen.getAllByAltText("Hooded Hydra").length).toBeGreaterThan(0);
+  });
+
+  it("previews an OPPONENT's face-down permanent as its cause marker (#7547)", () => {
+    // The identity stays hidden; the marker carries the mechanic's reminder
+    // text, which is exactly what an opponent may know.
+    inspect(
+      battlefieldObject({
+        face_down: true,
+        face_down_cause: "Morph" as never,
+        name: "",
+      }),
+    );
+
+    render(<GameCardPreview />);
+
+    expect(screen.getAllByAltText("Morph").length).toBeGreaterThan(0);
+    expect(screen.queryByAltText("Pithing Needle")).toBeNull();
   });
 });

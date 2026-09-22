@@ -24,6 +24,8 @@ Activate only if an opponent has eight or more cards in their graveyard.";
 
 fn true_scriptures_back_face() -> BackFaceData {
     BackFaceData {
+        is_swap_snapshot: false,
+        trigger_printed_origins: Vec::new(),
         name: "The True Scriptures".to_string(),
         power: None,
         toughness: None,
@@ -49,6 +51,7 @@ fn true_scriptures_back_face() -> BackFaceData {
         casting_restrictions: vec![],
         casting_options: vec![],
         layout_kind: None,
+        parse_warnings: vec![],
     }
 }
 

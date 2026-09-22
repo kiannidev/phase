@@ -28,8 +28,12 @@ use crate::types::game_state::{
 };
 use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
+use crate::types::resolution::ChildStackDepth;
 
 use super::resolve_ability_chain;
+#[cfg(test)]
+use crate::game::ability_utils::build_resolved_from_def;
+use crate::game::ability_utils::build_resolved_from_def_with_chain_root;
 
 /// CR 701.38a + CR 101.4: Initiate a vote. Builds the APNAP voter queue
 /// starting from `starting_with` (resolved against the ability controller),
@@ -235,6 +239,10 @@ pub fn resolve(
         candidate_objects,
         outcome_template,
         visibility,
+        // CR 608.2h: propagate so a counter-gated "that many" nested in a
+        // per-choice/outcome sub-effect still resolves against the live
+        // chain-root target once the tally fans out.
+        chain_root_targets: ability.context.chain_root_targets.clone(),
     };
 
     // Stash the parent's sub_ability tail so it resumes after the tally fans
@@ -273,6 +281,7 @@ pub fn resolve_tally(
     tally_mode: VoteTally,
     candidate_objects: &[ObjectId],
     outcome_template: Option<&AbilityDefinition>,
+    chain_root_targets: &[TargetRef],
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
     // For named votes the per-choice slots are parallel to `options`; object
@@ -301,6 +310,7 @@ pub fn resolve_tally(
                 tie,
                 candidate_objects,
                 outcome_template,
+                chain_root_targets,
                 events,
             );
         }
@@ -348,62 +358,12 @@ pub fn resolve_tally(
         if per_choice_player_scope.is_some() {
             // player_scope path — single dispatch, fan-out handled by
             // resolve_ability_chain's player_scope driver.
-            let chain = ResolvedAbility {
-                effect: (*per_choice_effect[idx].effect).clone(),
-                targets: Vec::new(),
+            let chain = build_resolved_from_def_with_chain_root(
+                &per_choice_effect[idx],
                 source_id,
-                source_incarnation: None,
-                trigger_source: None,
-                trigger_definition_ref: None,
-                force_block_attacker: None,
                 controller,
-                original_controller: None,
-                scoped_player: None,
-                target_chooser: None,
-                kind: per_choice_effect[idx].kind,
-                sub_ability: per_choice_effect[idx]
-                    .sub_ability
-                    .as_ref()
-                    .map(|sub| Box::new(resolved_from_def(sub, source_id, controller))),
-                else_ability: None,
-                duration: per_choice_effect[idx].duration.clone(),
-                condition: per_choice_effect[idx].condition.clone(),
-                context: Default::default(),
-                optional_targeting: per_choice_effect[idx].optional_targeting,
-                optional: per_choice_effect[idx].optional,
-                optional_for: None,
-                multi_target: None,
-                target_constraints: Vec::new(),
-                target_choice_timing: per_choice_effect[idx].target_choice_timing,
-                description: per_choice_effect[idx].description.clone(),
-                selected_mode_labels: Vec::new(),
-                repeat_for: None,
-                min_x_value: per_choice_effect[idx].min_x_value,
-                announced_x: per_choice_effect[idx].announced_x.clone(),
-                cant_be_copied: per_choice_effect[idx].cant_be_copied,
-                copy_count_status: crate::types::ability::CopyCountStatus::Pending,
-                forward_result: per_choice_effect[idx].forward_result,
-                unless_pay: None,
-                distribution: None,
-                player_scope: per_choice_player_scope,
-                starting_with: per_choice_effect[idx].starting_with.clone(),
-                chosen_x: None,
-                cost_paid_object: None,
-                cost_paid_object_ids: Vec::new(),
-                effect_context_object: None,
-                amassed_army_object: None,
-                ability_index: None,
-                may_trigger_origin: None,
-                target_selection_mode: per_choice_effect[idx].target_selection_mode,
-                chosen_players: Vec::new(),
-                repeat_until: None,
-                replacement_applied: Default::default(),
-                sub_link: crate::types::ability::SubAbilityLink::ContinuationStep,
-                sibling_condition: crate::types::ability::SiblingCondition::Dependent,
-                modal: None,
-                mode_abilities: vec![],
-                parent_target_missing_reason: None,
-            };
+                chain_root_targets.to_vec(),
+            );
             resolve_ability_chain(state, &chain, events, 1)?;
         } else if per_choice_effect[idx]
             .effect
@@ -415,62 +375,12 @@ pub fn resolve_tally(
             // `QuantityRef::VoteCount`, so the effect resolves as ONE aggregate
             // event whose `resolve_ref` sums the full tally — do NOT repeat it
             // per ballot, which would multiply the tally by itself.
-            let chain = ResolvedAbility {
-                effect: (*per_choice_effect[idx].effect).clone(),
-                targets: Vec::new(),
+            let chain = build_resolved_from_def_with_chain_root(
+                &per_choice_effect[idx],
                 source_id,
-                source_incarnation: None,
-                trigger_source: None,
-                trigger_definition_ref: None,
-                force_block_attacker: None,
                 controller,
-                original_controller: None,
-                scoped_player: None,
-                target_chooser: None,
-                kind: per_choice_effect[idx].kind,
-                sub_ability: per_choice_effect[idx]
-                    .sub_ability
-                    .as_ref()
-                    .map(|sub| Box::new(resolved_from_def(sub, source_id, controller))),
-                else_ability: None,
-                duration: per_choice_effect[idx].duration.clone(),
-                condition: per_choice_effect[idx].condition.clone(),
-                context: Default::default(),
-                optional_targeting: per_choice_effect[idx].optional_targeting,
-                optional: per_choice_effect[idx].optional,
-                optional_for: None,
-                multi_target: None,
-                target_constraints: Vec::new(),
-                target_choice_timing: per_choice_effect[idx].target_choice_timing,
-                description: per_choice_effect[idx].description.clone(),
-                selected_mode_labels: Vec::new(),
-                repeat_for: None,
-                min_x_value: per_choice_effect[idx].min_x_value,
-                announced_x: per_choice_effect[idx].announced_x.clone(),
-                cant_be_copied: per_choice_effect[idx].cant_be_copied,
-                copy_count_status: crate::types::ability::CopyCountStatus::Pending,
-                forward_result: per_choice_effect[idx].forward_result,
-                unless_pay: None,
-                distribution: None,
-                player_scope: None,
-                starting_with: per_choice_effect[idx].starting_with.clone(),
-                chosen_x: None,
-                cost_paid_object: None,
-                cost_paid_object_ids: Vec::new(),
-                effect_context_object: None,
-                amassed_army_object: None,
-                ability_index: None,
-                may_trigger_origin: None,
-                target_selection_mode: per_choice_effect[idx].target_selection_mode,
-                chosen_players: Vec::new(),
-                repeat_until: None,
-                replacement_applied: Default::default(),
-                sub_link: crate::types::ability::SubAbilityLink::ContinuationStep,
-                sibling_condition: crate::types::ability::SiblingCondition::Dependent,
-                modal: None,
-                mode_abilities: vec![],
-                parent_target_missing_reason: None,
-            };
+                chain_root_targets.to_vec(),
+            );
             resolve_ability_chain(state, &chain, events, 1)?;
         } else {
             // CR 701.38d + CR 608.2c: Per-ballot iteration. Each ballot that
@@ -490,13 +400,18 @@ pub fn resolve_tally(
             // If a ballot parks an interactive choice (e.g. ChooseFromZoneChoice),
             // stash remaining voters and return early; the drain function resumes.
             let initial_waiting_for = state.waiting_for.clone();
-            let stack_depth_before_ballot = state.resolution_stack.len();
+            let stack_depth_before_ballot = state.resolution_stack.capture_child_boundary();
             let mut remaining_voters: Vec<PlayerId> = choice_ballots.clone();
 
             while let Some(voter) = remaining_voters.first().copied() {
                 remaining_voters.remove(0);
-                let ballot_ability =
-                    build_per_ballot_ability(&per_choice_effect[idx], voter, source_id, controller);
+                let ballot_ability = build_per_ballot_ability(
+                    &per_choice_effect[idx],
+                    voter,
+                    source_id,
+                    controller,
+                    chain_root_targets,
+                );
                 resolve_ability_chain(state, &ballot_ability, events, 1)?;
 
                 // If the inner effect parked an interactive choice, suspend.
@@ -508,6 +423,7 @@ pub fn resolve_tally(
                             remaining_voters,
                             source_id,
                             controller,
+                            chain_root_targets: chain_root_targets.to_vec(),
                         },
                         stack_depth_before_ballot,
                     );
@@ -555,6 +471,7 @@ fn resolve_top_votes_tally(
     tie: TieResolution,
     candidate_objects: &[ObjectId],
     outcome_template: Option<&AbilityDefinition>,
+    chain_root_targets: &[TargetRef],
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
     state.last_vote_ballots = ballots.clone();
@@ -589,7 +506,12 @@ fn resolve_top_votes_tally(
                 // winner is exiled (not a battlefield rescan).
                 Some(template) => {
                     if let Some(&winner_obj) = candidate_objects.get(winner as usize) {
-                        let mut chain = resolved_from_def(template, source_id, controller);
+                        let mut chain = build_resolved_from_def_with_chain_root(
+                            template,
+                            source_id,
+                            controller,
+                            chain_root_targets.to_vec(),
+                        );
                         chain.targets = vec![TargetRef::Object(winner_obj)];
                         resolve_ability_chain(state, &chain, events, 1)?;
                     }
@@ -597,7 +519,12 @@ fn resolve_top_votes_tally(
                 // Named vote: `per_choice_effect` is populated.
                 None => {
                     if let Some(winning_effect) = per_choice_effect.get(winner as usize) {
-                        let chain = resolved_from_def(winning_effect, source_id, controller);
+                        let chain = build_resolved_from_def_with_chain_root(
+                            winning_effect,
+                            source_id,
+                            controller,
+                            chain_root_targets.to_vec(),
+                        );
                         resolve_ability_chain(state, &chain, events, 1)?;
                     }
                 }
@@ -622,7 +549,12 @@ fn resolve_top_votes_tally(
                         // rescan).
                         Some(template) => {
                             if let Some(&winner_obj) = candidate_objects.get(idx) {
-                                let mut chain = resolved_from_def(template, source_id, controller);
+                                let mut chain = build_resolved_from_def_with_chain_root(
+                                    template,
+                                    source_id,
+                                    controller,
+                                    chain_root_targets.to_vec(),
+                                );
                                 chain.targets = vec![TargetRef::Object(winner_obj)];
                                 resolve_ability_chain(state, &chain, events, 1)?;
                             }
@@ -630,8 +562,12 @@ fn resolve_top_votes_tally(
                         // Named vote: `per_choice_effect` is populated.
                         None => {
                             if let Some(winning_effect) = per_choice_effect.get(idx) {
-                                let chain =
-                                    resolved_from_def(winning_effect, source_id, controller);
+                                let chain = build_resolved_from_def_with_chain_root(
+                                    winning_effect,
+                                    source_id,
+                                    controller,
+                                    chain_root_targets.to_vec(),
+                                );
                                 resolve_ability_chain(state, &chain, events, 1)?;
                             }
                         }
@@ -647,78 +583,6 @@ fn resolve_top_votes_tally(
         subject: None,
     });
     Ok(())
-}
-
-/// Convert a stored `AbilityDefinition` (typically a sub-effect) into a
-/// `ResolvedAbility` carrying the same source/controller as the parent Vote.
-fn resolved_from_def(
-    def: &AbilityDefinition,
-    source_id: crate::types::identifiers::ObjectId,
-    controller: PlayerId,
-) -> ResolvedAbility {
-    ResolvedAbility {
-        effect: (*def.effect).clone(),
-        targets: Vec::new(),
-        source_id,
-        source_incarnation: None,
-        trigger_source: None,
-        trigger_definition_ref: None,
-        force_block_attacker: None,
-        controller,
-        original_controller: None,
-        scoped_player: None,
-        target_chooser: None,
-        kind: def.kind,
-        sub_ability: def
-            .sub_ability
-            .as_ref()
-            .map(|sub| Box::new(resolved_from_def(sub, source_id, controller))),
-        else_ability: None,
-        duration: def.duration.clone(),
-        condition: def.condition.clone(),
-        context: Default::default(),
-        optional_targeting: def.optional_targeting,
-        optional: def.optional,
-        optional_for: None,
-        multi_target: None,
-        target_constraints: Vec::new(),
-        target_choice_timing: def.target_choice_timing,
-        description: def.description.clone(),
-        selected_mode_labels: Vec::new(),
-        repeat_for: None,
-        min_x_value: def.min_x_value,
-        announced_x: def.announced_x.clone(),
-        cant_be_copied: def.cant_be_copied,
-        copy_count_status: crate::types::ability::CopyCountStatus::Pending,
-        forward_result: def.forward_result,
-        unless_pay: None,
-        distribution: None,
-        player_scope: None,
-        // CR 101.4 + CR 800.4: Carry through the parent def's turn-order
-        // override so vote sub-effects resolve with consistent iteration
-        // semantics. None for non-Join-Forces vote chains.
-        starting_with: def.starting_with.clone(),
-        chosen_x: None,
-        cost_paid_object: None,
-        cost_paid_object_ids: Vec::new(),
-        effect_context_object: None,
-        amassed_army_object: None,
-        ability_index: None,
-        may_trigger_origin: None,
-        target_selection_mode: def.target_selection_mode,
-        chosen_players: Vec::new(),
-        repeat_until: None,
-        replacement_applied: Default::default(),
-        // CR 608.2c: Carry the parent-link kind through to the resolved ability.
-        sub_link: def.sub_link,
-        // CR 608.2c: Carry the replication marker through (Dependent for vote sub-effects).
-        sibling_condition: def.sibling_condition,
-        // CR 700.2b + CR 603.3c: Carry the reflexive modal choice + per-mode
-        // abilities through (None for vote sub-effects).
-        modal: def.modal.clone(),
-        mode_abilities: def.mode_abilities.clone(),
-        parent_target_missing_reason: None,
-    }
 }
 
 /// CR 701.38a: Resolve `ControllerRef::You` (and friends) to the concrete
@@ -810,8 +674,14 @@ fn build_per_ballot_ability(
     voter: PlayerId,
     source_id: crate::types::identifiers::ObjectId,
     controller: PlayerId,
+    chain_root_targets: &[TargetRef],
 ) -> ResolvedAbility {
-    let mut ability = resolved_from_def(template, source_id, controller);
+    let mut ability = build_resolved_from_def_with_chain_root(
+        template,
+        source_id,
+        controller,
+        chain_root_targets.to_vec(),
+    );
     ability.scoped_player = Some(voter);
     ability.original_controller = Some(controller);
     ability
@@ -834,11 +704,13 @@ pub(crate) fn drain_active_vote_ballot(state: &mut GameState, events: &mut Vec<G
     let source_id = pending.source_id;
     let controller = pending.controller;
     let template = pending.ability_template;
-    let stack_depth_before_ballot = state.resolution_stack.len();
+    let chain_root_targets = pending.chain_root_targets;
+    let stack_depth_before_ballot = state.resolution_stack.capture_child_boundary();
 
     while let Some(voter) = remaining_voters.first().copied() {
         remaining_voters.remove(0);
-        let ballot_ability = build_per_ballot_ability(&template, voter, source_id, controller);
+        let ballot_ability =
+            build_per_ballot_ability(&template, voter, source_id, controller, &chain_root_targets);
         if resolve_ability_chain(state, &ballot_ability, events, 1).is_err() {
             // On error, drop remaining ballots (matches existing error handling).
             return;
@@ -853,6 +725,7 @@ pub(crate) fn drain_active_vote_ballot(state: &mut GameState, events: &mut Vec<G
                     remaining_voters,
                     source_id,
                     controller,
+                    chain_root_targets,
                 },
                 stack_depth_before_ballot,
             );
@@ -874,9 +747,13 @@ pub(crate) fn drain_active_vote_ballot(state: &mut GameState, events: &mut Vec<G
 fn park_vote_ballot_after_current_ballot(
     state: &mut GameState,
     pending: PendingVoteBallotIteration,
-    stack_depth_before_ballot: usize,
+    stack_depth_before_ballot: ChildStackDepth,
 ) {
-    match state.resolution_stack.len().cmp(&stack_depth_before_ballot) {
+    match state
+        .resolution_stack
+        .capture_child_boundary()
+        .cmp(&stack_depth_before_ballot)
+    {
         std::cmp::Ordering::Less => {
             panic!("vote ballot removed a parent frame before it could be re-parked")
         }
@@ -892,12 +769,54 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityKind, CardSelectionMode, Chooser, TargetFilter, VoteVisibility, ZoneOwner,
+        AbilityKind, CardSelectionMode, Chooser, PerPlayerScope, TargetFilter, VoteVisibility,
+        ZoneOwner,
     };
     use crate::types::actions::GameAction;
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::resolution::{FrameKind, ResolutionFrame};
     use crate::types::zones::Zone;
+
+    #[test]
+    fn vote_definition_routes_preserve_unassigned_distribution_unit() {
+        let source_id = ObjectId(1);
+        let controller = PlayerId(0);
+
+        let mut player_scope = AbilityDefinition::new(AbilityKind::Database, Effect::NoOp)
+            .player_scope(crate::types::ability::PlayerFilter::VotedFor { choice_index: 0 });
+        player_scope.distribute = Some(crate::types::game_state::DistributionUnit::Damage);
+        let player_scope_runtime = build_resolved_from_def(&player_scope, source_id, controller);
+
+        let mut aggregate = AbilityDefinition::new(
+            AbilityKind::Database,
+            Effect::GainLife {
+                amount: QuantityExpr::Ref {
+                    qty: crate::types::ability::QuantityRef::VoteCount { choice_index: 0 },
+                },
+                player: TargetFilter::Controller,
+            },
+        );
+        aggregate.distribute = Some(crate::types::game_state::DistributionUnit::Life);
+        let aggregate_runtime = build_resolved_from_def(&aggregate, source_id, controller);
+
+        let mut per_ballot = AbilityDefinition::new(AbilityKind::Database, Effect::NoOp);
+        per_ballot.distribute = Some(crate::types::game_state::DistributionUnit::Counters(
+            "charge".to_string(),
+        ));
+        let per_ballot_runtime =
+            build_per_ballot_ability(&per_ballot, PlayerId(1), source_id, controller, &[]);
+
+        assert_eq!(player_scope_runtime.distribute, player_scope.distribute);
+        assert_eq!(aggregate_runtime.distribute, aggregate.distribute);
+        assert_eq!(per_ballot_runtime.distribute, per_ballot.distribute);
+
+        let ordinary = build_resolved_from_def(
+            &AbilityDefinition::new(AbilityKind::Database, Effect::NoOp),
+            source_id,
+            controller,
+        );
+        assert!(ordinary.distribute.is_none());
+    }
 
     /// CR 701.38a + CR 101.4: Initiating a Vote sets `WaitingFor::VoteChoice`
     /// for the controller, queuing the opponent next, with no extra-vote
@@ -911,6 +830,7 @@ mod tests {
         let token_def = AbilityDefinition::new(AbilityKind::Spell, Effect::Investigate); // simple stand-in
 
         let ability = ResolvedAbility {
+            detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::Vote {
                 choices: vec!["evidence".to_string(), "bribery".to_string()],
                 per_choice_effect: vec![Box::new(inv_def), Box::new(token_def)],
@@ -922,10 +842,14 @@ mod tests {
             },
             targets: vec![],
             source_id: ObjectId(1),
+            cast_occurrence: None,
             source_incarnation: None,
             trigger_source: None,
             trigger_definition_ref: None,
             force_block_attacker: None,
+            target_incarnations: Vec::new(),
+            selected_target_incarnations: Vec::new(),
+            illegal_target_slots: Vec::new(),
             controller,
             original_controller: None,
             scoped_player: None,
@@ -938,12 +862,14 @@ mod tests {
             context: Default::default(),
             optional_targeting: false,
             optional: false,
+            optional_player: None,
             optional_for: None,
             multi_target: None,
             target_constraints: Vec::new(),
             target_choice_timing: crate::types::ability::TargetChoiceTiming::Stack,
             description: None,
             selected_mode_labels: Vec::new(),
+            modal_instruction_ordinal: None,
             repeat_for: None,
             min_x_value: 0,
             announced_x: None,
@@ -952,11 +878,13 @@ mod tests {
             forward_result: false,
             unless_pay: None,
             distribution: None,
+            distribute: None,
             player_scope: None,
             starting_with: None,
             chosen_x: None,
             cost_paid_object: None,
-            cost_paid_object_ids: Vec::new(),
+            noted_mana_payment: None,
+            cost_paid_objects: Vec::new(),
             effect_context_object: None,
             amassed_army_object: None,
             ability_index: None,
@@ -1019,6 +947,7 @@ mod tests {
             })
             .collect();
         ResolvedAbility {
+            detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::Vote {
                 choices,
                 per_choice_effect,
@@ -1030,10 +959,14 @@ mod tests {
             },
             targets: vec![],
             source_id: ObjectId(1),
+            cast_occurrence: None,
             source_incarnation: None,
             trigger_source: None,
             trigger_definition_ref: None,
             force_block_attacker: None,
+            target_incarnations: Vec::new(),
+            selected_target_incarnations: Vec::new(),
+            illegal_target_slots: Vec::new(),
             controller,
             original_controller: None,
             scoped_player: None,
@@ -1046,12 +979,14 @@ mod tests {
             context: Default::default(),
             optional_targeting: false,
             optional: false,
+            optional_player: None,
             optional_for: None,
             multi_target: None,
             target_constraints: Vec::new(),
             target_choice_timing: crate::types::ability::TargetChoiceTiming::Stack,
             description: None,
             selected_mode_labels: Vec::new(),
+            modal_instruction_ordinal: None,
             repeat_for: None,
             min_x_value: 0,
             announced_x: None,
@@ -1060,11 +995,13 @@ mod tests {
             forward_result: false,
             unless_pay: None,
             distribution: None,
+            distribute: None,
             player_scope: None,
             starting_with: None,
             chosen_x: None,
             cost_paid_object: None,
-            cost_paid_object_ids: Vec::new(),
+            noted_mana_payment: None,
+            cost_paid_objects: Vec::new(),
             effect_context_object: None,
             amassed_army_object: None,
             ability_index: None,
@@ -1234,6 +1171,7 @@ mod tests {
             VoteTally::PerVote,
             &[],
             None,
+            &[],
             &mut events,
         )
         .expect("tally resolves");
@@ -1283,9 +1221,11 @@ mod tests {
                     count: 1,
                     zone: Zone::Graveyard,
                     additional_zones: Vec::new(),
-                    zone_owner: ZoneOwner::EachPlayer,
+                    zone_owner: ZoneOwner::Each(PerPlayerScope::AllPlayers),
                     filter: None,
-                    chooser: Chooser::Controller,
+                    chooser: Chooser::Controller.into(),
+                    candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                    reciprocal_role: None,
                     up_to: false,
                     constraint: None,
                     selection: CardSelectionMode::Chosen,
@@ -1314,6 +1254,7 @@ mod tests {
             VoteTally::PerVote,
             &[],
             None,
+            &[],
             &mut events,
         )
         .expect("first ballot pauses on the first player choice");
@@ -1460,13 +1401,18 @@ mod tests {
 
         // Build a ResolvedAbility from the parsed AbilityDefinition.
         let ability = ResolvedAbility {
+            detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: (*parsed_def.effect).clone(),
             targets: vec![],
             source_id: ObjectId(1),
+            cast_occurrence: None,
             source_incarnation: None,
             trigger_source: None,
             trigger_definition_ref: None,
             force_block_attacker: None,
+            target_incarnations: Vec::new(),
+            selected_target_incarnations: Vec::new(),
+            illegal_target_slots: Vec::new(),
             controller,
             original_controller: None,
             scoped_player: None,
@@ -1479,12 +1425,14 @@ mod tests {
             context: Default::default(),
             optional_targeting: false,
             optional: false,
+            optional_player: None,
             optional_for: None,
             multi_target: None,
             target_constraints: Vec::new(),
             target_choice_timing: crate::types::ability::TargetChoiceTiming::Stack,
             description: None,
             selected_mode_labels: Vec::new(),
+            modal_instruction_ordinal: None,
             repeat_for: None,
             min_x_value: 0,
             announced_x: None,
@@ -1493,11 +1441,13 @@ mod tests {
             forward_result: false,
             unless_pay: None,
             distribution: None,
+            distribute: None,
             player_scope: None,
             starting_with: None,
             chosen_x: None,
             cost_paid_object: None,
-            cost_paid_object_ids: Vec::new(),
+            noted_mana_payment: None,
+            cost_paid_objects: Vec::new(),
             effect_context_object: None,
             amassed_army_object: None,
             ability_index: None,
@@ -1617,6 +1567,7 @@ mod tests {
             })
             .collect();
         let ability = ResolvedAbility {
+            detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::Vote {
                 choices: vec!["friend".to_string(), "foe".to_string()],
                 per_choice_effect,
@@ -1628,10 +1579,14 @@ mod tests {
             },
             targets: vec![],
             source_id,
+            cast_occurrence: None,
             source_incarnation: None,
             trigger_source: None,
             trigger_definition_ref: None,
             force_block_attacker: None,
+            target_incarnations: Vec::new(),
+            selected_target_incarnations: Vec::new(),
+            illegal_target_slots: Vec::new(),
             controller,
             original_controller: None,
             scoped_player: None,
@@ -1644,12 +1599,14 @@ mod tests {
             context: Default::default(),
             optional_targeting: false,
             optional: false,
+            optional_player: None,
             optional_for: None,
             multi_target: None,
             target_constraints: Vec::new(),
             target_choice_timing: crate::types::ability::TargetChoiceTiming::Stack,
             description: None,
             selected_mode_labels: Vec::new(),
+            modal_instruction_ordinal: None,
             repeat_for: None,
             min_x_value: 0,
             announced_x: None,
@@ -1658,11 +1615,13 @@ mod tests {
             forward_result: false,
             unless_pay: None,
             distribution: None,
+            distribute: None,
             player_scope: None,
             starting_with: None,
             chosen_x: None,
             cost_paid_object: None,
-            cost_paid_object_ids: Vec::new(),
+            noted_mana_payment: None,
+            cost_paid_objects: Vec::new(),
             effect_context_object: None,
             amassed_army_object: None,
             ability_index: None,
@@ -1753,6 +1712,7 @@ mod tests {
             candidate_objects: crate::im::Vector::new(),
             outcome_template: None,
             visibility: VoteVisibility::Open,
+            chain_root_targets: Vec::new(),
         };
         let err = apply(
             &mut state,
@@ -1796,6 +1756,7 @@ mod tests {
             candidate_objects: crate::im::Vector::new(),
             outcome_template: None,
             visibility: VoteVisibility::Open,
+            chain_root_targets: Vec::new(),
         };
         assert_eq!(state.waiting_for.acting_player(), Some(controller));
     }
@@ -1906,6 +1867,7 @@ mod tests {
             VoteTally::PerVote,
             &[],
             None,
+            &[],
             &mut events,
         )
         .expect("resolve_tally succeeds");
@@ -1993,7 +1955,9 @@ mod tests {
             Box::new(AbilityDefinition::new(AbilityKind::Spell, Effect::NoOp)),
             Box::new(AbilityDefinition::new(
                 AbilityKind::Spell,
-                Effect::BecomeMonarch,
+                Effect::BecomeMonarch {
+                    target: crate::types::ability::TargetFilter::Controller,
+                },
             )),
         ];
         let options = vec!["innocent".to_string(), "guilty".to_string()];
@@ -2014,6 +1978,7 @@ mod tests {
             },
             &[],
             None,
+            &[],
             &mut events,
         )
         .expect("threshold tally resolves");
@@ -2039,7 +2004,9 @@ mod tests {
             Box::new(AbilityDefinition::new(AbilityKind::Spell, Effect::NoOp)),
             Box::new(AbilityDefinition::new(
                 AbilityKind::Spell,
-                Effect::BecomeMonarch,
+                Effect::BecomeMonarch {
+                    target: crate::types::ability::TargetFilter::Controller,
+                },
             )),
         ];
         let options = vec!["innocent".to_string(), "guilty".to_string()];
@@ -2060,6 +2027,7 @@ mod tests {
             },
             &[],
             None,
+            &[],
             &mut events,
         )
         .expect("threshold tally resolves");
@@ -2241,6 +2209,7 @@ mod tests {
             },
             &[],
             None,
+            &[],
             &mut events,
         )
         .expect("all-tied tally resolves");
@@ -2278,6 +2247,7 @@ mod tests {
             },
             &[],
             None,
+            &[],
             &mut events,
         )
         .expect("zero-tally tally resolves");
@@ -2354,7 +2324,7 @@ mod tests {
             .core_types
             .push(CoreType::Creature);
 
-        let ability = resolved_from_def(&vote_def, source_id, controller);
+        let ability = build_resolved_from_def(&vote_def, source_id, controller);
         let mut events = Vec::new();
         resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
 
@@ -2431,7 +2401,7 @@ mod tests {
         let mut state = GameState::new_two_player(42);
         let controller = state.players[0].id;
         let opp = state.players[1].id;
-        let ability = resolved_from_def(&def, ObjectId(1), controller);
+        let ability = build_resolved_from_def(&def, ObjectId(1), controller);
         let mut events = Vec::new();
         resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
 
@@ -2533,7 +2503,7 @@ mod tests {
             .core_types
             .push(CoreType::Creature);
 
-        let ability = resolved_from_def(&vote_def, source_id, controller);
+        let ability = build_resolved_from_def(&vote_def, source_id, controller);
         let mut events = Vec::new();
         resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
         let voter = match &state.waiting_for {
@@ -2611,7 +2581,7 @@ mod tests {
         let opp_b = make_creature(&mut state, 3, "Bear B");
         let opp_c = make_creature(&mut state, 4, "Bear C");
 
-        let ability = resolved_from_def(&vote_def, source_id, controller);
+        let ability = build_resolved_from_def(&vote_def, source_id, controller);
         let mut events = Vec::new();
         resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
 
@@ -2733,7 +2703,7 @@ mod tests {
         }
         let last_bear = *opp_ids.last().unwrap();
 
-        let ability = resolved_from_def(&vote_def, source_id, controller);
+        let ability = build_resolved_from_def(&vote_def, source_id, controller);
         let mut events = Vec::new();
         resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
 

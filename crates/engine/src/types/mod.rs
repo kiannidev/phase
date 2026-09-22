@@ -1,11 +1,16 @@
 pub mod ability;
+pub mod ability_visit;
+pub mod action_rejection;
 pub mod action_stable_order;
 pub mod actions;
 pub mod attribution;
 pub mod card;
 pub mod card_type;
+pub mod casting_costs;
 pub mod counter;
+pub mod custom_format;
 pub mod definitions;
+pub(crate) mod deterministic_serde;
 pub mod events;
 pub mod format;
 pub mod game_state;
@@ -36,7 +41,8 @@ pub use ability::{
     ReplacementDefinition, ResolvedAbility, StaticCondition, StaticDefinition, TargetFilter,
     TargetRef, TriggerCondition, TriggerDefinition, TypeFilter, TypedFilter,
 };
-pub use actions::GameAction;
+pub use action_rejection::{ActionRejection, ActionRejectionCode, ActionRejectionDisposition};
+pub use actions::{GameAction, ResolutionOptionalPaymentChoice};
 pub use attribution::{EffectRef, ObjectAttribution};
 pub use card::{CardFace, CardLayout, CardRules, Rarity};
 pub use card_type::{is_land_subtype, CardType, CoreType, Supertype};
@@ -46,10 +52,10 @@ pub use events::GameEvent;
 pub use format::{DeckCopyLimit, FormatConfig, GameFormat};
 pub use game_state::{
     ActionResult, BattlefieldEntryRecord, CommanderDamageEntry, CostResume, GameState, LKISnapshot,
-    LandPlayRecord, NextSpellModifier, PayCostKind, PendingNextSpellModifier, PendingReplacement,
-    PendingSpellCostReduction, PlayerDeckPool, PriorityPassingMode, ScheduledTurnControl,
-    SpellCastRecord, StackEntry, StackEntryKind, TransientContinuousEffect, WaitingFor,
-    ZoneChangeRecord,
+    LandPlayRecord, LoopDetectSample, NextSpellModifier, PayCostKind, PendingNextSpellModifier,
+    PendingReplacement, PendingSpellCostReduction, PlayerDeckPool, PriorityPassingMode,
+    ResolutionOptionalPaymentOption, ScheduledTurnControl, SpellCastRecord, StackEntry,
+    StackEntryKind, TransientContinuousEffect, WaitingFor, ZoneChangeRecord,
 };
 pub use identifiers::{
     CardId, ObjectId, ObjectIdentityBinding, ObjectIncarnationRef, ObjectProvenance,
@@ -61,7 +67,10 @@ pub use interaction::{
 };
 pub use keywords::{Keyword, PartnerType, ProtectionTarget};
 pub use layers::{ActiveContinuousEffect, Layer};
-pub use log::{GameLogEntry, LogCategory, LogSegment};
+pub use log::{
+    GameLogEntry, LogBoundary, LogCategory, LogImportance, LogPresentation, LogSegment, LogTone,
+    LogVisibility,
+};
 pub use mana::{
     ManaColor, ManaCost, ManaCostShard, ManaPool, ManaRestriction, ManaSourceOutput,
     ManaSourcePenalty, ManaSourceSelection, ManaType, ManaUnit, SpellMeta, TapsForManaSelection,
@@ -74,12 +83,14 @@ pub use phase::Phase;
 pub use player::{Player, PlayerId};
 pub use proposed_event::{AppliedReplacementKey, ProposedEvent, ReplacementId};
 pub use replacements::ReplacementEvent;
-pub use replay::{RecordedAction, ReplayHeader, ReplayLog, REPLAY_FORMAT_VERSION};
+pub use replay::{
+    RecordedAction, RecordedActionKind, ReplayHeader, ReplayLog, REPLAY_FORMAT_VERSION,
+};
 pub use resolution::{
-    AbilityContinuationFrame, ChangeZoneFrame, DirectChoiceGate, FrameGate, FrameKind,
-    MultiDrawFrame, OptionalEffectFrame, PerCategoryZoneChoiceFrame, RepeatedOptionalPaymentFrame,
-    ResolutionFrame, ResolutionStack, ResolutionStackError, ResolutionStateWire,
-    RESOLUTION_STATE_WIRE_VERSION,
+    AbilityContinuationFrame, ChangeZoneFrame, ChildStackDepth, DirectChoiceGate, FrameGate,
+    FrameKind, MultiDrawFrame, OptionalEffectFrame, PerCategoryZoneChoiceFrame,
+    RepeatedOptionalPaymentFrame, ResolutionFrame, ResolutionStack, ResolutionStackError,
+    ResolutionStateWire, RESOLUTION_STATE_WIRE_VERSION,
 };
 pub use resolved_commands::{
     ManaPaymentRecipient, ProducedManaUnit, ResolvedCommandJournalEntry, ResolvedCommandOrdinal,

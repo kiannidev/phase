@@ -161,7 +161,12 @@ pub fn refill_infinite_mana(state: &mut GameState) {
     super::public_state::mark_mana_display_dirty(state);
 }
 
-fn mana_type_to_demand_index(mt: ManaType) -> Option<usize> {
+/// WUBRG slot a mana type occupies in a [`ColorDemand`], or `None` for
+/// colorless — which has no colored-demand slot (CR 107.4c). The single
+/// authority for the index order every `ColorDemand` producer and consumer
+/// shares, so callers outside this module read a demand array by the same
+/// mapping that builds one.
+pub fn mana_type_to_demand_index(mt: ManaType) -> Option<usize> {
     match mt {
         ManaType::White => Some(0),
         ManaType::Blue => Some(1),
@@ -779,212 +784,21 @@ pub fn can_pay_for_spell(
     spell: Option<&PaymentContext<'_>>,
     permissions: crate::types::mana::CostPermissionContext,
 ) -> bool {
-    let any_color = permissions.any_color;
-    let max_life_payments = permissions.max_life;
-    let life_colors = permissions.life_colors;
-    match cost {
-        ManaCost::NoCost
-        | ManaCost::SelfManaCost
-        | ManaCost::SelfManaValue
-        | ManaCost::SelfManaCostReduced { .. } => true,
-        ManaCost::Cost { shards, generic } => {
-            // Clone pool to simulate payment
-            let mut sim = pool.clone();
-            let mut life_budget = max_life_payments;
-
-            // CR 107.4f + CR 118.3: Phyrexian shards are deferred until after
-            // non-Phyrexian shards are resolved. A greedy "prefer mana" policy
-            // for Phyrexian shards can starve the generic portion (e.g. 3 Islands
-            // + cost {3}{U/P}: spending U for the shard leaves only 2 for generic
-            // 3, but paying 2 life instead leaves 3U for generic). Deferral lets
-            // us see remaining pool capacity before committing mana vs life.
-            enum PhyrexianDeferred {
-                Single(ManaType),
-                Hybrid(ManaType, ManaType),
-                // CR 107.4f: K'rrik-promoted {2/C} — pay 1 colored, 2 generic, OR 2 life.
-                TwoGeneric(ManaType),
-            }
-            let mut deferred_phyrexian: Vec<PhyrexianDeferred> = Vec::new();
-
-            // Pay non-Phyrexian colored shards first
-            for shard in shards {
-                // CR 107.4f: Apply K'rrik-style promotion before dispatch so the
-                // post-promotion arms handle life-as-payment uniformly.
-                match effective_shard_requirement(shard_to_mana_type(*shard), life_colors) {
-                    ShardRequirement::Single(mt) => {
-                        // CR 609.4b: When any_color is true, any mana can pay colored costs.
-                        if any_color && mt != ManaType::Colorless {
-                            if spend_any_for_required_colors(&mut sim, &[mt], spell, None, &[])
-                                .is_none()
-                            {
-                                return false;
-                            }
-                        } else if spend_eligible(&mut sim, mt, spell, &[]).is_none() {
-                            return false;
-                        }
-                    }
-                    // CR 107.4e: Hybrid mana — can be paid with either color.
-                    ShardRequirement::Hybrid(a, b) => {
-                        if any_color {
-                            if spend_any_for_required_colors(&mut sim, &[a, b], spell, None, &[])
-                                .is_none()
-                            {
-                                return false;
-                            }
-                        } else if spend_eligible(&mut sim, a, spell, &[]).is_none()
-                            && spend_eligible(&mut sim, b, spell, &[]).is_none()
-                        {
-                            return false;
-                        }
-                    }
-                    // CR 107.4f: Phyrexian mana — defer decision.
-                    ShardRequirement::Phyrexian(color) => {
-                        deferred_phyrexian.push(PhyrexianDeferred::Single(color));
-                    }
-                    // CR 107.4e: Monocolored hybrid {2/C} — pay 1 colored or 2 generic.
-                    ShardRequirement::TwoGenericHybrid(color) => {
-                        // CR 609.4b: When any_color, any mana satisfies the colored half.
-                        if any_color {
-                            if spend_any_for_required_colors(&mut sim, &[color], spell, None, &[])
-                                .is_none()
-                            {
-                                return false;
-                            }
-                        } else if spend_eligible(&mut sim, color, spell, &[]).is_none() {
-                            if spend_generic_eligible(&mut sim, spell, None, &[]).is_none() {
-                                return false;
-                            }
-                            if spend_generic_eligible(&mut sim, spell, None, &[]).is_none() {
-                                return false;
-                            }
-                        }
-                    }
-                    // CR 107.4h: Snow mana {S} — paid with mana from a snow source.
-                    ShardRequirement::Snow => {
-                        if !spend_snow(&mut sim, spell, &[]) {
-                            return false;
-                        }
-                    }
-                    ShardRequirement::TwoOrMoreColorSource => {
-                        if spend_two_or_more_color_source_eligible(&mut sim, spell, &[]).is_none() {
-                            return false;
-                        }
-                    }
-                    // CR 107.3: {X} — can be 0, so always satisfiable in a can-pay check.
-                    ShardRequirement::X => {}
-                    // CR 107.4e: Colorless hybrid {C/color} — pay colorless or colored.
-                    ShardRequirement::ColorlessHybrid(color) => {
-                        if any_color {
-                            if spend_any_for_required_colors(
-                                &mut sim,
-                                &[ManaType::Colorless, color],
-                                spell,
-                                None,
-                                &[],
-                            )
-                            .is_none()
-                            {
-                                return false;
-                            }
-                        } else if spend_eligible(&mut sim, ManaType::Colorless, spell, &[])
-                            .is_none()
-                            && spend_eligible(&mut sim, color, spell, &[]).is_none()
-                        {
-                            return false;
-                        }
-                    }
-                    // CR 107.4f: Hybrid Phyrexian — defer decision.
-                    ShardRequirement::HybridPhyrexian(a, b) => {
-                        deferred_phyrexian.push(PhyrexianDeferred::Hybrid(a, b));
-                    }
-                    // CR 107.4f: K'rrik-promoted {2/C} — defer like other
-                    // Phyrexian-shape shards so the life-vs-mana decision sees
-                    // the full pool remaining after non-Phyrexian shards.
-                    ShardRequirement::TwoGenericHybridPhyrexian(color) => {
-                        deferred_phyrexian.push(PhyrexianDeferred::TwoGeneric(color));
-                    }
-                }
-            }
-
-            // CR 107.4f + CR 118.3 + CR 119.8: Resolve deferred Phyrexian shards.
-            // For each shard, pay with mana only if the pool will still have enough
-            // to cover the generic cost plus remaining Phyrexian shards that might
-            // also need mana. Otherwise fall back to life payment.
-            let total_pool_after_shards = sim.total();
-            let mut mana_spent_on_phyrexian: usize = 0;
-            for deferred in &deferred_phyrexian {
-                let remaining_after_this =
-                    total_pool_after_shards.saturating_sub(mana_spent_on_phyrexian);
-                let still_needed_for_generic = *generic as usize;
-                let can_spare_mana = remaining_after_this > still_needed_for_generic;
-
-                let mana_ok = if can_spare_mana {
-                    match deferred {
-                        PhyrexianDeferred::Single(color) => {
-                            if any_color {
-                                spend_any_for_required_colors(&mut sim, &[*color], spell, None, &[])
-                                    .is_some()
-                            } else {
-                                spend_eligible(&mut sim, *color, spell, &[]).is_some()
-                            }
-                        }
-                        PhyrexianDeferred::Hybrid(a, b) => {
-                            if any_color {
-                                spend_any_for_required_colors(&mut sim, &[*a, *b], spell, None, &[])
-                                    .is_some()
-                            } else {
-                                spend_eligible(&mut sim, *a, spell, &[]).is_some()
-                                    || spend_eligible(&mut sim, *b, spell, &[]).is_some()
-                            }
-                        }
-                        // CR 107.4f + CR 107.4e: {2/C} promoted by K'rrik —
-                        // try 1 colored mana first; fall back to 2 generic
-                        // (atomic — restore on partial failure); life option
-                        // still consumed via the budget arm below.
-                        PhyrexianDeferred::TwoGeneric(color) => {
-                            if any_color {
-                                spend_any_for_required_colors(&mut sim, &[*color], spell, None, &[])
-                                    .is_some()
-                            } else if spend_eligible(&mut sim, *color, spell, &[]).is_some() {
-                                true
-                            } else {
-                                let mut backup = sim.clone();
-                                if spend_generic_eligible(&mut backup, spell, None, &[]).is_some()
-                                    && spend_generic_eligible(&mut backup, spell, None, &[])
-                                        .is_some()
-                                {
-                                    sim = backup;
-                                    true
-                                } else {
-                                    false
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    false
-                };
-
-                if mana_ok {
-                    mana_spent_on_phyrexian += 1;
-                } else {
-                    // CR 118.3 + CR 119.8: Life fallback requires budget.
-                    if life_budget == 0 {
-                        return false;
-                    }
-                    life_budget -= 1;
-                }
-            }
-
-            // Pay generic
-            for _ in 0..*generic {
-                if spend_generic_eligible(&mut sim, spell, None, &[]).is_none() {
-                    return false;
-                }
-            }
-            true
-        }
-    }
+    // CR 601.2h: A cost is payable only when the atomic selector can produce a
+    // complete payment; partial payments are not allowed.
+    // CR 118.3a: The selected mana units are only previewed here. The caller's
+    // pool is not mutated until the committed payment removes those exact units.
+    select_mana_payment(
+        pool,
+        cost,
+        None,
+        spell,
+        permissions.any_color,
+        None,
+        permissions.life_colors,
+        &[],
+    )
+    .is_ok_and(|(_, life_payments)| life_payments.len() <= permissions.max_life as usize)
 }
 
 /// Pay a mana cost from the pool (CR 601.2h).
@@ -1134,17 +948,46 @@ pub(crate) fn reduce_cost_by_pool(
         }
     }
 
-    // CR 107.4b: Generic may be paid with any eligible mana. When a nested
-    // sub-cost's outer-cost `demand` is supplied, a generic pip is counted
-    // covered ONLY if a non-demanded scratch unit can pay it — a demanded unit
-    // left over is reserved for the outer cost's colored shard (CR 118.10), so
-    // the pip stays in `residual_generic` and auto-tap will tap another source
-    // for it. Without `demand` the prior least-available ordering is preserved.
-    for _ in 0..generic {
-        if spend_generic_non_demanded(&mut scratch, spell, demand, &[]).is_some() {
+    // CR 107.4b + CR 601.2b/h: Generic may be paid with any eligible mana, except
+    // for generic pips constrained by a "Spend only [colors] mana on X" restriction.
+    let (restricted_x_types, restricted_x_count) = match spell {
+        Some(PaymentContext::Spell(meta)) => {
+            if let Some(colors) = &meta.spend_only_on_x_colors {
+                let types: Vec<ManaType> = colors.iter().copied().map(ManaType::from).collect();
+                let count = generic.min(meta.spend_only_on_x_generic_count) as usize;
+                (types, count)
+            } else {
+                (Vec::new(), 0)
+            }
+        }
+        _ => (Vec::new(), 0),
+    };
+
+    let mut paid_restricted = 0;
+    for _ in 0..restricted_x_count {
+        if spend_restricted_x_generic_eligible(
+            &mut scratch,
+            &restricted_x_types,
+            spell,
+            any_color,
+            demand,
+            &[],
+        )
+        .is_some()
+        {
             residual_generic = residual_generic.saturating_sub(1);
+            paid_restricted += 1;
         } else {
             break;
+        }
+    }
+    if paid_restricted == restricted_x_count {
+        for _ in restricted_x_count..generic as usize {
+            if spend_generic_non_demanded(&mut scratch, spell, demand, &[]).is_some() {
+                residual_generic = residual_generic.saturating_sub(1);
+            } else {
+                break;
+            }
         }
     }
 
@@ -1600,18 +1443,35 @@ fn pay_cost_with_demand_and_choices_once(
                 }
             }
 
-            // CR 107.4b: Generic mana can be paid with any type of mana.
-            // Prefer colorless first, then a non-demanded color, then least-available
-            // color to preserve flexibility. `hand_demand` (combined upstream with the
-            // outer cost's reserved colors for nested sub-costs) softly deprioritizes
-            // a color another cost still needs (CR 118.10) without ever hard-blocking
-            // a payable spend (CR 601.2h: partial payments aren't allowed and an
-            // unpayable cost can't be paid, so a payable one must never be blocked).
-            // Note: this extends the demand signal — previously honored only by the
-            // hybrid-color path — to the generic spend, so a normal cast now also
-            // deprioritizes a hand-demanded color when filling generic. This only
-            // reorders WHICH eligible unit pays a generic pip; it never refuses one.
-            for _ in 0..*generic {
+            // CR 107.4b + CR 601.2b/h: Generic mana can be paid with any type of mana,
+            // except for generic pips constrained by a "Spend only [colors] mana on X" restriction.
+            let (restricted_x_types, restricted_x_count) = match spell {
+                Some(PaymentContext::Spell(meta)) => {
+                    if let Some(colors) = &meta.spend_only_on_x_colors {
+                        let types: Vec<ManaType> =
+                            colors.iter().copied().map(ManaType::from).collect();
+                        let count = (*generic).min(meta.spend_only_on_x_generic_count) as usize;
+                        (types, count)
+                    } else {
+                        (Vec::new(), 0)
+                    }
+                }
+                _ => (Vec::new(), 0),
+            };
+
+            for _ in 0..restricted_x_count {
+                let unit = spend_restricted_x_generic_eligible(
+                    pool,
+                    &restricted_x_types,
+                    spell,
+                    any_color,
+                    hand_demand,
+                    pins,
+                )
+                .ok_or(PaymentError::InsufficientMana)?;
+                spent.push(unit);
+            }
+            for _ in restricted_x_count..(*generic as usize) {
                 let unit = spend_generic_eligible(pool, spell, hand_demand, pins)
                     .ok_or(PaymentError::InsufficientMana)?;
                 spent.push(unit);
@@ -2442,6 +2302,53 @@ fn spend_any_for_required_colors(
     spend_any_eligible(pool, spell, demand, pins)
 }
 
+/// CR 601.2b / CR 601.2h: Spend mana for a generic pip that is restricted to specific colors
+/// by a "Spend only [colors] mana on X" casting restriction (e.g. Consume Spirit, Soul Burn, Emblazoned Golem).
+fn spend_restricted_x_generic_eligible(
+    pool: &mut ManaPool,
+    allowed_colors: &[ManaType],
+    spell: Option<&PaymentContext<'_>>,
+    any_color: bool,
+    demand: Option<&ColorDemand>,
+    pins: &[ManaPipId],
+) -> Option<ManaUnit> {
+    if any_color {
+        return spend_any_for_required_colors(pool, allowed_colors, spell, demand, pins);
+    }
+    if !pins.is_empty() {
+        if let Some(pos) = pool.mana.iter().position(|unit| {
+            pins.contains(&unit.pip_id)
+                && allowed_colors.contains(&unit.color)
+                && !unit.is_convoke_payment()
+                && spell_permits_unit(spell, unit)
+        }) {
+            return Some(pool.mana.swap_remove(pos));
+        }
+    }
+    if allowed_colors.len() == 1 {
+        return spend_eligible(pool, allowed_colors[0], spell, pins);
+    }
+    let mut best: Option<(ManaType, bool, usize)> = None;
+    for &color in allowed_colors {
+        let count = eligible_color_count(pool, color, spell);
+        if count > 0 {
+            let would_dip_into_reserve = demand
+                .and_then(|d| mana_type_to_demand_index(color).map(|i| count <= d[i] as usize))
+                .unwrap_or(false);
+            let better = match best {
+                None => true,
+                Some((_, best_dip, best_count)) => {
+                    (would_dip_into_reserve, count) < (best_dip, best_count)
+                }
+            };
+            if better {
+                best = Some((color, would_dip_into_reserve, count));
+            }
+        }
+    }
+    best.and_then(|(color, _, _)| spend_eligible(pool, color, spell, pins))
+}
+
 /// Planner-layer generic spend that respects an outer cost's colored `demand`.
 ///
 /// CR 107.4b + CR 118.10: A generic pip can be paid with any mana, but when an
@@ -2615,10 +2522,6 @@ fn spend_any_unit(pool: &mut ManaPool, pins: &[ManaPipId]) -> Option<ManaUnit> {
     })
 }
 
-fn spend_snow(pool: &mut ManaPool, spell: Option<&PaymentContext<'_>>, pins: &[ManaPipId]) -> bool {
-    spend_snow_unit(pool, spell, pins).is_some()
-}
-
 /// CR 107.4h: Snow mana {S} — paid with one mana of any type from a snow source.
 /// CR 601.2g: honors the spell context so a "can't spend mana" spell (Hogaak)
 /// cannot pay a {S} shard from real pool snow mana.
@@ -2772,6 +2675,116 @@ mod tests {
         pool
     }
 
+    #[test]
+    fn can_pay_for_spell_delegates_to_atomic_selector_across_payment_shapes() {
+        let ordinary = spell_meta(false);
+        let context = PaymentContext::Spell(&ordinary);
+        let cases = [
+            (
+                pool_with(&[(ManaType::Black, 2), (ManaType::Blue, 1)]),
+                ManaCost::Cost {
+                    shards: vec![ManaCostShard::Black, ManaCostShard::Black],
+                    generic: 1,
+                },
+                crate::types::mana::CostPermissionContext::default(),
+                true,
+            ),
+            (
+                pool_with(&[(ManaType::Green, 2)]),
+                ManaCost::Cost {
+                    shards: vec![ManaCostShard::WhiteBlue],
+                    generic: 1,
+                },
+                crate::types::mana::CostPermissionContext {
+                    any_color: true,
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                ManaPool::default(),
+                ManaCost::Cost {
+                    shards: vec![ManaCostShard::PhyrexianBlue],
+                    generic: 0,
+                },
+                crate::types::mana::CostPermissionContext::default(),
+                false,
+            ),
+            (
+                ManaPool::default(),
+                ManaCost::Cost {
+                    shards: vec![ManaCostShard::PhyrexianBlue],
+                    generic: 0,
+                },
+                crate::types::mana::CostPermissionContext {
+                    max_life: 1,
+                    ..Default::default()
+                },
+                true,
+            ),
+        ];
+
+        for (pool, cost, permissions, expected) in cases {
+            let before = fingerprint(&pool.mana);
+            let selected = select_mana_payment(
+                &pool,
+                &cost,
+                None,
+                Some(&context),
+                permissions.any_color,
+                None,
+                permissions.life_colors,
+                &[],
+            )
+            .is_ok_and(|(_, life)| life.len() <= permissions.max_life as usize);
+            assert_eq!(selected, expected);
+            assert_eq!(
+                can_pay_for_spell(&pool, &cost, Some(&context), permissions),
+                selected
+            );
+            assert_eq!(fingerprint(&pool.mana), before, "preview mutated the pool");
+        }
+
+        let mut restricted = make_unit(ManaType::Black);
+        restricted.restrictions = vec![ManaRestriction::OnlyForActivation];
+        let pool = ManaPool {
+            mana: vec![restricted],
+        };
+        let cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::Black],
+            generic: 0,
+        };
+        assert!(!can_pay_for_spell(
+            &pool,
+            &cost,
+            Some(&context),
+            crate::types::mana::CostPermissionContext::default(),
+        ));
+
+        let fallback_pool = pool_with(&[(ManaType::White, 1), (ManaType::Blue, 1)]);
+        let fallback_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::WhiteBlue],
+            generic: 1,
+        };
+        assert!(select_mana_payment(
+            &fallback_pool,
+            &fallback_cost,
+            Some(&[10, 0, 0, 0, 0]),
+            Some(&context),
+            false,
+            None,
+            crate::types::mana::LifePaymentColors::EMPTY,
+            &[],
+        )
+        .is_ok());
+        assert!(can_pay_for_spell(
+            &fallback_pool,
+            &fallback_cost,
+            Some(&context),
+            crate::types::mana::CostPermissionContext::default(),
+        ));
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct ManaUnitFingerprint {
         color: ManaType,
@@ -2809,7 +2822,9 @@ mod tests {
             supertype: Some(crate::types::mana::ManaSupertype::Snow),
             source_could_produce_two_or_more_colors: true,
             restrictions: vec![ManaRestriction::OnlyForSpell],
-            grants: vec![ManaSpellGrant::CantBeCountered],
+            grants: vec![ManaSpellGrant::CantBeCountered {
+                filter: TargetFilter::Any,
+            }],
             expiry: Some(ManaExpiry::EndOfTurn),
         }
     }
@@ -2846,16 +2861,8 @@ mod tests {
 
     fn spell_meta(cant_spend_mana: bool) -> SpellMeta {
         SpellMeta {
-            types: Vec::new(),
-            subtypes: Vec::new(),
-            keyword_kinds: Vec::new(),
-            cast_from_zone: None,
-            mana_value: None,
-            color_count: None,
-            colors: vec![],
-            has_x_in_cost: false,
-            is_face_down: false,
             cant_spend_mana,
+            ..Default::default()
         }
     }
 
@@ -3856,6 +3863,8 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            spend_only_on_x_colors: None,
+            spend_only_on_x_generic_count: 0,
         };
         let elf_ctx = PaymentContext::Spell(&elf);
         assert!(can_pay_for_spell(
@@ -3881,6 +3890,8 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            spend_only_on_x_colors: None,
+            spend_only_on_x_generic_count: 0,
         };
         let goblin_ctx = PaymentContext::Spell(&goblin);
         assert!(!can_pay_for_spell(
@@ -3932,6 +3943,8 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            spend_only_on_x_colors: None,
+            spend_only_on_x_generic_count: 0,
         };
         let thought_knot_ctx = PaymentContext::Spell(&thought_knot);
         assert!(can_pay_for_spell(
@@ -3956,6 +3969,8 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            spend_only_on_x_colors: None,
+            spend_only_on_x_generic_count: 0,
         };
         let colored_eldrazi_ctx = PaymentContext::Spell(&colored_eldrazi);
         assert!(!can_pay_for_spell(
@@ -4017,6 +4032,8 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            spend_only_on_x_colors: None,
+            spend_only_on_x_generic_count: 0,
         };
         let colored_spell_ctx = PaymentContext::Spell(&colored_spell);
         assert!(!can_pay_for_spell(
@@ -4092,6 +4109,8 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            spend_only_on_x_colors: None,
+            spend_only_on_x_generic_count: 0,
         };
         assert!(
             !can_pay_for_spell(
@@ -4135,6 +4154,8 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            spend_only_on_x_colors: None,
+            spend_only_on_x_generic_count: 0,
         };
         assert!(
             can_pay_for_spell(
@@ -4237,6 +4258,8 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            spend_only_on_x_colors: None,
+            spend_only_on_x_generic_count: 0,
         };
         let flashback_ctx = PaymentContext::Spell(&flashback_spell);
         assert!(can_pay_for_spell(
@@ -4261,6 +4284,8 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            spend_only_on_x_colors: None,
+            spend_only_on_x_generic_count: 0,
         };
         let normal_ctx = PaymentContext::Spell(&normal_spell);
         assert!(!can_pay_for_spell(
@@ -4308,6 +4333,8 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            spend_only_on_x_colors: None,
+            spend_only_on_x_generic_count: 0,
         };
         let gy_ctx = PaymentContext::Spell(&graveyard_flashback_spell);
         assert!(can_pay_for_spell(
@@ -4332,6 +4359,8 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            spend_only_on_x_colors: None,
+            spend_only_on_x_generic_count: 0,
         };
         let hand_ctx = PaymentContext::Spell(&hand_flashback_spell);
         assert!(!can_pay_for_spell(

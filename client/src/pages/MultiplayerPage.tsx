@@ -1310,6 +1310,36 @@ function MultiplayerPageContent({
   );
 }
 
+function MultiplayerOfflineUnavailable({ onHome }: { onHome: () => void }) {
+  const { t } = useTranslation(["multiplayer", "menu"]);
+  const embedded = useInShell();
+
+  return (
+    <div className="menu-scene relative flex min-h-screen flex-col overflow-hidden">
+      {!embedded && <MenuParticles />}
+      <div className="menu-scene__vignette" />
+      <div className="menu-scene__sigil menu-scene__sigil--left" />
+      <div className="menu-scene__sigil menu-scene__sigil--right" />
+      <div className="menu-scene__haze" />
+      <MenuShell
+        eyebrow={t("page.eyebrow", { ns: "multiplayer" })}
+        title={t("page.offlineUnavailableTitle", { ns: "multiplayer" })}
+        description={t("page.offlineUnavailableDescription", { ns: "multiplayer" })}
+        layout="stacked"
+      >
+        <MenuPanel className="relative z-10 flex w-full max-w-3xl flex-col items-start gap-4 px-5 py-6">
+          <button
+            onClick={onHome}
+            className={menuButtonClass({ tone: "neutral", size: "sm" })}
+          >
+            {t("nav.home", { ns: "menu" })}
+          </button>
+        </MenuPanel>
+      </MenuShell>
+    </div>
+  );
+}
+
 // ── Draft Lobby Panel ─────────────────────────────────────────────────
 //
 // Minimal inline panel shown when the user has joined (as guest) a
